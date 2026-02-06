@@ -21,7 +21,7 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "${REPO_ROOT}"
 
 IMAGE_TAG=${IMAGE_TAG:-latest}
-IMAGE_NAME=${IMAGE_NAME:-gateway-api-ref}
+IMAGE_NAME=${IMAGE_NAME:-gari}
 
 echo "Building docker image ${IMAGE_NAME}:${IMAGE_TAG}..."
 docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" .
@@ -41,12 +41,12 @@ cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: gateway-api-ref-controller
+  name: gari-controller
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: gateway-api-ref-controller
+  name: gari-controller
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["httproutes"]
@@ -55,31 +55,31 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: gateway-api-ref-controller
+  name: gari-controller
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: gateway-api-ref-controller
+  name: gari-controller
 subjects:
 - kind: ServiceAccount
-  name: gateway-api-ref-controller
+  name: gari-controller
   namespace: default
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: gateway-api-ref-controller
+  name: gari-controller
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: gateway-api-ref-controller
+      app: gari-controller
   template:
     metadata:
       labels:
-        app: gateway-api-ref-controller
+        app: gari-controller
     spec:
-      serviceAccountName: gateway-api-ref-controller
+      serviceAccountName: gari-controller
       containers:
       - name: controller
         image: ${IMAGE_NAME}:${IMAGE_TAG}
@@ -92,10 +92,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: gateway-proxy
+  name: gari-proxy
 spec:
   selector:
-    app: gateway-api-ref-controller
+    app: gari-controller
   ports:
   - port: 80
     targetPort: 8000

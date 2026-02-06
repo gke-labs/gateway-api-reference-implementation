@@ -38,10 +38,10 @@ func TestGatewayAPI(t *testing.T) {
 	gitRoot := h.GetGitRoot()
 
 	// 1. Build and load images
-	h.DockerBuild("gateway-api-ref:e2e", filepath.Join(gitRoot, "Dockerfile"), gitRoot)
+	h.DockerBuild("gari:e2e", filepath.Join(gitRoot, "Dockerfile"), gitRoot)
 	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), filepath.Join(gitRoot, "tests/toolbox"))
 
-	h.KindLoad("gateway-api-ref:e2e")
+	h.KindLoad("gari:e2e")
 	h.KindLoad("toolbox:e2e")
 
 	// 2. Install Gateway API CRDs
@@ -52,12 +52,12 @@ func TestGatewayAPI(t *testing.T) {
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: gateway-api-ref-controller
+  name: gari-controller
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: gateway-api-ref-controller
+  name: gari-controller
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["httproutes"]
@@ -66,34 +66,34 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: gateway-api-ref-controller
+  name: gari-controller
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: gateway-api-ref-controller
+  name: gari-controller
 subjects:
 - kind: ServiceAccount
-  name: gateway-api-ref-controller
+  name: gari-controller
   namespace: default
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: gateway-api-ref-controller
+  name: gari-controller
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: gateway-api-ref-controller
+      app: gari-controller
   template:
     metadata:
       labels:
-        app: gateway-api-ref-controller
+        app: gari-controller
     spec:
-      serviceAccountName: gateway-api-ref-controller
+      serviceAccountName: gari-controller
       containers:
       - name: controller
-        image: gateway-api-ref:e2e
+        image: gari:e2e
         imagePullPolicy: Never
         args: ["--proxy-bind-address", ":8000"]
         ports:
@@ -103,16 +103,16 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: gateway-proxy
+  name: gari-proxy
 spec:
   selector:
-    app: gateway-api-ref-controller
+    app: gari-controller
   ports:
   - port: 80
     targetPort: 8000
 `
 	h.KubectlApplyContent(controllerManifest)
-	h.WaitForDeployment("gateway-api-ref-controller", 2*time.Minute)
+	h.WaitForDeployment("gari-controller", 2*time.Minute)
 
 	// 4. Deploy Backend (Toolbox Server)
 	backendManifest := `
@@ -203,7 +203,7 @@ spec:
   - name: toolbox
     image: toolbox:e2e
     imagePullPolicy: Never
-    command: ["/app/toolbox", "client", "http://gateway-proxy", "example.com"]
+    command: ["/app/toolbox", "client", "http://gari-proxy", "example.com"]
   restartPolicy: Never
 `
 	h.KubectlApplyContent(clientManifest)
