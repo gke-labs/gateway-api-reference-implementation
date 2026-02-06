@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"bytes"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -45,15 +46,30 @@ func (h *Harness) Setup() {
 		h.t.Fatalf("kubectl not found: %v", err)
 	}
 
-	// Ensure we are using the correct context
-	// Kind by default creates a context named kind-<name>.
-	// If the cluster name is "kind", the context is "kind-kind".
-	// However, in some environments the context might just be "kind" or already set.
-	contextName := "kind-" + h.clusterName
-	cmd := exec.Command("kubectl", "config", "use-context", contextName)
-	if err := cmd.Run(); err != nil {
-		h.t.Logf("Warning: failed to switch to context %s: %v. Continuing with current context.", contextName, err)
+	// Create kind cluster if it doesn't exist
+	clusters := h.runCmd("kind", "get", "clusters")
+	exists := false
+	for _, cluster := range strings.Split(clusters, "\n") {
+		if strings.TrimSpace(cluster) == h.clusterName {
+			exists = true
+			break
+		}
 	}
+
+	if !exists {
+		h.t.Logf("Creating kind cluster %s", h.clusterName)
+		h.runCmd("kind", "create", "cluster", "--name", h.clusterName)
+		h.t.Cleanup(func() {
+			if os.Getenv("SKIP_CLEANUP") == "" {
+				h.t.Logf("Deleting kind cluster %s", h.clusterName)
+				h.runCmd("kind", "delete", "cluster", "--name", h.clusterName)
+			}
+		})
+	}
+
+	// Ensure we are using the correct context
+	contextName := "kind-" + h.clusterName
+	h.runCmd("kubectl", "config", "use-context", contextName)
 }
 
 func (h *Harness) GetGitRoot() string {
