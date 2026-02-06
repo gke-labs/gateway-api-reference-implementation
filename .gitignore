@@ -1,0 +1,6 @@
+# Binaries
+/gateway-api-reference-implementation
+
+# Go
+vendor/
+*.log
