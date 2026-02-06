@@ -1,6 +1,15 @@
 # gateway-api-reference-implementation
 
-A minimal implementation of the Gateway API
+A minimal implementation of the Gateway API.
+
+## Goals
+
+The goal of this project is to create a simple, pure Go implementation of the [Gateway API](https://gateway-api.sigs.k8s.io/).
+
+- **Reference Implementation**: This project aims to be a reference implementation rather than a high-performance one. It prioritizes clarity and correctness over speed.
+- **Full Feature Support**: We want to support all Gateway API features.
+- **Fallback Model**: We are exploring a model where this reference implementation can serve as a fallback for specialized implementations for configurations they cannot accelerate.
+- **Pure Go**: The implementation should be written in pure Go.
 
 ## Contributing
 
