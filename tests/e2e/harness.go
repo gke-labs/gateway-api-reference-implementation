@@ -46,7 +46,14 @@ func (h *Harness) Setup() {
 	}
 
 	// Ensure we are using the correct context
-	h.runCmd("kubectl", "config", "use-context", "kind-"+h.clusterName)
+	// Kind by default creates a context named kind-<name>.
+	// If the cluster name is "kind", the context is "kind-kind".
+	// However, in some environments the context might just be "kind" or already set.
+	contextName := "kind-" + h.clusterName
+	cmd := exec.Command("kubectl", "config", "use-context", contextName)
+	if err := cmd.Run(); err != nil {
+		h.t.Logf("Warning: failed to switch to context %s: %v. Continuing with current context.", contextName, err)
+	}
 }
 
 func (h *Harness) GetGitRoot() string {

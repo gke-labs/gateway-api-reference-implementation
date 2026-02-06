@@ -21,7 +21,7 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "${REPO_ROOT}"
 
 IMAGE_TAG=${IMAGE_TAG:-latest}
-IMAGE_NAME=${IMAGE_NAME:-gari}
+IMAGE_NAME=${IMAGE_NAME:-gari-controller}
 
 echo "Building docker image ${IMAGE_NAME}:${IMAGE_TAG}..."
 docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" .

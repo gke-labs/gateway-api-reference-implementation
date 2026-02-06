@@ -38,10 +38,10 @@ func TestGatewayAPI(t *testing.T) {
 	gitRoot := h.GetGitRoot()
 
 	// 1. Build and load images
-	h.DockerBuild("gari:e2e", filepath.Join(gitRoot, "Dockerfile"), gitRoot)
+	h.DockerBuild("gari-controller:e2e", filepath.Join(gitRoot, "Dockerfile"), gitRoot)
 	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), filepath.Join(gitRoot, "tests/toolbox"))
 
-	h.KindLoad("gari:e2e")
+	h.KindLoad("gari-controller:e2e")
 	h.KindLoad("toolbox:e2e")
 
 	// 2. Install Gateway API CRDs
@@ -93,7 +93,7 @@ spec:
       serviceAccountName: gari-controller
       containers:
       - name: controller
-        image: gari:e2e
+        image: gari-controller:e2e
         imagePullPolicy: Never
         args: ["--proxy-bind-address", ":8000"]
         ports:
