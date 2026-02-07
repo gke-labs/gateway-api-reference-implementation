@@ -1,5 +1,6 @@
 # Binaries
 /gateway-api-reference-implementation
+.build/
 
 # Go
 vendor/
