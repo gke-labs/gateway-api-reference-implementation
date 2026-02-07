@@ -23,7 +23,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/tests"
@@ -50,10 +49,7 @@ func TestConformance(t *testing.T) {
 	h.DeployController()
 
 	// 3. Run Conformance Tests
-	cfg, err := config.GetConfig()
-	if err != nil {
-		t.Fatalf("Error loading Kubernetes config: %v", err)
-	}
+	cfg := h.RESTConfig()
 
 	s := runtime.NewScheme()
 	if err := scheme.AddToScheme(s); err != nil {

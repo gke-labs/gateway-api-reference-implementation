@@ -23,6 +23,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 type Harness struct {
@@ -102,6 +105,17 @@ metadata:
   namespace: metallb-system
 `
 	h.KubectlApplyContent(metallbConfig)
+}
+
+func (h *Harness) RESTConfig() *rest.Config {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	configOverrides := &clientcmd.ConfigOverrides{}
+	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+	cfg, err := kubeConfig.ClientConfig()
+	if err != nil {
+		h.t.Fatalf("Failed to load Kubernetes config: %v", err)
+	}
+	return cfg
 }
 
 func (h *Harness) GetGitRoot() string {
