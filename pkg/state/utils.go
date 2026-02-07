@@ -18,7 +18,8 @@ import (
 	"strings"
 )
 
-func intersectHostnames(routeHostnames []string, listenerHostname string) []string {
+// IntersectHostnames calculates the intersection of route hostnames and a listener hostname.
+func IntersectHostnames(routeHostnames []string, listenerHostname string) []string {
 	if listenerHostname == "" || listenerHostname == "*" {
 		if len(routeHostnames) == 0 {
 			return []string{"*"}
@@ -32,14 +33,15 @@ func intersectHostnames(routeHostnames []string, listenerHostname string) []stri
 
 	var result []string
 	for _, rh := range routeHostnames {
-		if intersection, ok := intersect(rh, listenerHostname); ok {
+		if intersection, ok := Intersect(rh, listenerHostname); ok {
 			result = append(result, intersection)
 		}
 	}
 	return result
 }
 
-func intersect(h1, h2 string) (string, bool) {
+// Intersect calculates the intersection of two hostnames, including wildcard support.
+func Intersect(h1, h2 string) (string, bool) {
 	if h1 == "*" || h1 == "" {
 		return h2, true
 	}
@@ -80,4 +82,13 @@ func intersect(h1, h2 string) (string, bool) {
 	}
 
 	return "", false
+}
+
+// ValueOf returns the value of the pointer if it is not nil, otherwise the zero value of the type.
+func ValueOf[T any](t *T) T {
+	if t == nil {
+		var zero T
+		return zero
+	}
+	return *t
 }

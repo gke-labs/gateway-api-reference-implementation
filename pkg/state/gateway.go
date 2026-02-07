@@ -54,13 +54,27 @@ type InternalRoute struct {
 }
 
 type InternalRule struct {
-	Matches []InternalMatch
-	Backend InternalBackend
+	Matches  []InternalMatch
+	Backend  *InternalBackend
+	Redirect *InternalRedirect
 }
 
 type InternalBackend struct {
 	Host string
 	Port int32
+}
+
+type InternalRedirect struct {
+	Scheme     *string
+	Hostname   *gatewayv1.PreciseHostname
+	Path       *InternalPathRedirect
+	Port       *gatewayv1.PortNumber
+	StatusCode *int
+}
+
+type InternalPathRedirect struct {
+	Type  gatewayv1.HTTPPathModifierType
+	Value string
 }
 
 type InternalMatch struct {
@@ -102,11 +116,11 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 					continue
 				}
 				// Namespace check (optional for now as per current implementation)
-				if parentRef.Namespace != nil && string(*parentRef.Namespace) != s.Namespace {
+				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
 					continue
 				}
 
-				if parentRef.SectionName != nil && *parentRef.SectionName != listener.Name {
+				if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
 					continue
 				}
 				bound = true
@@ -120,12 +134,9 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 
 			// Calculate intersected hostnames
 			routeHostnames := route.GetHostnames()
-			var listenerHostname string
-			if listener.Hostname != nil {
-				listenerHostname = string(*listener.Hostname)
-			}
+			listenerHostname := ValueOf(listener.Hostname)
 
-			effectiveHostnames := intersectHostnames(routeHostnames, listenerHostname)
+			effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
 			if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
 				// No intersection, skip this listener
 				continue
@@ -136,62 +147,89 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 			}
 
 			for _, rule := range route.Spec.Rules {
-				for _, backendRef := range rule.BackendRefs {
-					if backendRef.Kind != nil && *backendRef.Kind != "Service" {
-						continue
-					}
-
-					if backendRef.Port == nil {
-						continue
-					}
-
-					backend := InternalBackend{
-						Host: fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, route.Namespace),
-						Port: int32(*backendRef.Port),
-					}
-
-					iRule := InternalRule{
-						Backend: backend,
-					}
-
-					for _, match := range rule.Matches {
-						iMatch := InternalMatch{}
-						if match.Path != nil {
-							pathType := gatewayv1.PathMatchPathPrefix
-							if match.Path.Type != nil {
-								pathType = *match.Path.Type
+				var redirect *InternalRedirect
+				for _, filter := range rule.Filters {
+					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
+						r := filter.RequestRedirect
+						redirect = &InternalRedirect{
+							Scheme:     r.Scheme,
+							Hostname:   r.Hostname,
+							Port:       r.Port,
+							StatusCode: r.StatusCode,
+						}
+						if r.Path != nil {
+							var pathValue string
+							if r.Path.Type == gatewayv1.FullPathHTTPPathModifier {
+								pathValue = ValueOf(r.Path.ReplaceFullPath)
+							} else if r.Path.Type == gatewayv1.PrefixMatchHTTPPathModifier {
+								pathValue = ValueOf(r.Path.ReplacePrefixMatch)
 							}
-							iMatch.Path = &InternalPathMatch{
-								Type:  pathType,
-								Value: *match.Path.Value,
+							redirect.Path = &InternalPathRedirect{
+								Type:  r.Path.Type,
+								Value: pathValue,
 							}
 						}
-						for _, header := range match.Headers {
-							headerType := gatewayv1.HeaderMatchExact
-							if header.Type != nil {
-								headerType = *header.Type
-							}
-							hm := InternalHeaderMatch{
-								Type:            headerType,
-								Name:            string(header.Name),
-								MatchExactValue: header.Value,
-							}
-							if headerType == gatewayv1.HeaderMatchRegularExpression {
-								re, err := regexp.Compile(header.Value)
-								if err == nil {
-									hm.MatchRegularExpressionValue = re
-								}
-							}
-							iMatch.Headers = append(iMatch.Headers, hm)
-						}
-						iRule.Matches = append(iRule.Matches, iMatch)
+						break
 					}
-
-					ir.Rules = append(ir.Rules, iRule)
-
-					// For minimal implementation, we just take the first Service backendRef for each rule
-					break
 				}
+
+				iRule := InternalRule{
+					Redirect: redirect,
+				}
+
+				if redirect == nil {
+					for _, backendRef := range rule.BackendRefs {
+						if ValueOf(backendRef.Kind) != "Service" && backendRef.Kind != nil {
+							continue
+						}
+
+						if backendRef.Port == nil {
+							continue
+						}
+
+						iRule.Backend = &InternalBackend{
+							Host: fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, route.Namespace),
+							Port: int32(*backendRef.Port),
+						}
+
+						// For minimal implementation, we just take the first Service backendRef for each rule
+						break
+					}
+				}
+
+				for _, match := range rule.Matches {
+					iMatch := InternalMatch{}
+					if match.Path != nil {
+						iMatch.Path = &InternalPathMatch{
+							Type:  ValueOf(match.Path.Type),
+							Value: ValueOf(match.Path.Value),
+						}
+						if iMatch.Path.Type == "" {
+							iMatch.Path.Type = gatewayv1.PathMatchPathPrefix
+						}
+					}
+					for _, header := range match.Headers {
+						headerType := ValueOf(header.Type)
+						if headerType == "" {
+							headerType = gatewayv1.HeaderMatchExact
+						}
+						hm := InternalHeaderMatch{
+							Type:            headerType,
+							Name:            string(header.Name),
+							MatchExactValue: header.Value,
+						}
+						if headerType == gatewayv1.HeaderMatchRegularExpression {
+							re, err := regexp.Compile(header.Value)
+							if err == nil {
+								hm.MatchRegularExpressionValue = re
+							}
+						}
+						iMatch.Headers = append(iMatch.Headers, hm)
+					}
+					iRule.Matches = append(iRule.Matches, iMatch)
+				}
+
+				ir.Rules = append(ir.Rules, iRule)
 			}
 			internalRoutes = append(internalRoutes, ir)
 			_ = matchingParentRef // keep for now

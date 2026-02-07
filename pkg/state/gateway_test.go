@@ -110,7 +110,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
 						},
 					},
 				},
@@ -192,7 +192,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"foo.example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: InternalBackend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
+							Backend: &InternalBackend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
 						},
 					},
 				},
@@ -288,7 +288,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 									},
 								},
 							},
-							Backend: InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
 						},
 					},
 				},

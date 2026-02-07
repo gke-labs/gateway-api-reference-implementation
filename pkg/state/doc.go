@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package controller
-
-func ptr[T any](v T) *T {
-	return &v
-}
+// Package state holds the last-observed state of the Kubernetes objects.
+// It provides helper methods to compute the internal configuration used by the proxy
+// based on these objects. The state is initially unoptimized, but can be
+// enhanced with memoization in the future.
+package state

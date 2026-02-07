@@ -96,8 +96,8 @@ func TestIntersectHostnames(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := intersectHostnames(tt.routeHostnames, tt.listenerHostname); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("intersectHostnames() = %v, want %v", got, tt.want)
+			if got := IntersectHostnames(tt.routeHostnames, tt.listenerHostname); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("IntersectHostnames() = %v, want %v", got, tt.want)
 			}
 		})
 	}

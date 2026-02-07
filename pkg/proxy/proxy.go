@@ -16,6 +16,7 @@ package proxy
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -50,7 +51,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	routes := p.routes
 	p.mu.RUnlock()
 
-	var bestBackend *state.InternalBackend
+	var bestRule *state.InternalRule
 	var bestMatch *state.InternalMatch
 
 	for _, route := range routes {
@@ -59,28 +60,35 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		for _, rule := range route.Rules {
-			for _, match := range rule.Matches {
+			rRule := rule
+			for _, match := range rRule.Matches {
 				m := match
 				if p.matchMatch(m, r) {
 					if p.isBetterMatch(&m, bestMatch) {
 						bestMatch = &m
-						bestBackend = &rule.Backend
+						bestRule = &rRule
 					}
 				}
 			}
-			if len(rule.Matches) == 0 {
+			if len(rRule.Matches) == 0 {
 				// Rule with no matches always matches, but is the least specific
-				if bestBackend == nil {
-					bestBackend = &rule.Backend
+				if bestRule == nil {
+					bestRule = &rRule
 					bestMatch = &state.InternalMatch{}
 				}
 			}
 		}
 	}
 
-	if bestBackend != nil {
-		p.forward(w, r, *bestBackend)
-		return
+	if bestRule != nil {
+		if bestRule.Redirect != nil {
+			p.redirect(w, r, *bestRule.Redirect, bestMatch)
+			return
+		}
+		if bestRule.Backend != nil {
+			p.forward(w, r, *bestRule.Backend)
+			return
+		}
 	}
 
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
@@ -138,6 +146,11 @@ func (p *Proxy) getPathLen(m *state.InternalMatch) int {
 }
 
 func (p *Proxy) matchHostname(hostnames []string, host string) bool {
+	// Strip port if present
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
 	if len(hostnames) == 0 {
 		return true
 	}
@@ -213,6 +226,45 @@ func (p *Proxy) hasPathPrefix(path, prefix string) bool {
 		}
 	}
 	return false
+}
+
+func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {
+	newURL := *r.URL
+	newURL.Scheme = state.ValueOf(redirect.Scheme)
+	if newURL.Scheme == "" {
+		newURL.Scheme = "http"
+	}
+
+	if hostname := state.ValueOf(redirect.Hostname); hostname != "" {
+		newURL.Host = string(hostname)
+	}
+
+	if port := state.ValueOf(redirect.Port); port != 0 {
+		host := newURL.Hostname()
+		newURL.Host = fmt.Sprintf("%s:%d", host, port)
+	}
+
+	if redirect.Path != nil {
+		switch redirect.Path.Type {
+		case gatewayv1.FullPathHTTPPathModifier:
+			newURL.Path = redirect.Path.Value
+		case gatewayv1.PrefixMatchHTTPPathModifier:
+			if match != nil && match.Path != nil && match.Path.Type == gatewayv1.PathMatchPathPrefix {
+				prefix := match.Path.Value
+				if strings.HasPrefix(r.URL.Path, prefix) {
+					newURL.Path = redirect.Path.Value + r.URL.Path[len(prefix):]
+				}
+			}
+		}
+	}
+
+	statusCode := state.ValueOf(redirect.StatusCode)
+	if statusCode == 0 {
+		statusCode = http.StatusFound
+	}
+
+	log.Log.Info("Redirecting request", "host", r.Host, "path", r.URL.Path, "target", newURL.String(), "status", statusCode)
+	http.Redirect(w, r, newURL.String(), statusCode)
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend) {
