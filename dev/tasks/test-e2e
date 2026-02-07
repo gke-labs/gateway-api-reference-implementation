@@ -41,6 +41,19 @@ if [[ ! -x "${KUBECTL_BIN}" ]]; then
 fi
 ln -sf "../src/kubectl/${KUBECTL_VERSION}/bin/kubectl" "${REPO_ROOT}/.build/bin/kubectl"
 
+# Install docker CLI
+DOCKER_VERSION="29.2.1"
+DOCKER_BIN="${REPO_ROOT}/.build/src/docker/${DOCKER_VERSION}/bin/docker"
+if [[ ! -x "${DOCKER_BIN}" ]]; then
+    echo "Installing docker ${DOCKER_VERSION}..."
+    mkdir -p "$(dirname "${DOCKER_BIN}")"
+    curl -sLo "${REPO_ROOT}/.build/src/docker/${DOCKER_VERSION}/docker.tgz" "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz"
+    tar -C "$(dirname "${DOCKER_BIN}")" -xzf "${REPO_ROOT}/.build/src/docker/${DOCKER_VERSION}/docker.tgz" --strip-components=1 docker/docker
+    rm "${REPO_ROOT}/.build/src/docker/${DOCKER_VERSION}/docker.tgz"
+    chmod +x "${DOCKER_BIN}"
+fi
+ln -sf "../src/docker/${DOCKER_VERSION}/bin/docker" "${REPO_ROOT}/.build/bin/docker"
+
 export PATH="${REPO_ROOT}/.build/bin:${PATH}"
 export RUN_E2E=1
 
