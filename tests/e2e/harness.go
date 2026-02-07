@@ -107,6 +107,7 @@ metadata:
 	h.KubectlApplyContent(metallbConfig)
 }
 
+// RESTConfig returns the configuration for talking to the test kind cluster started from this harness.
 func (h *Harness) RESTConfig() *rest.Config {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	configOverrides := &clientcmd.ConfigOverrides{}
