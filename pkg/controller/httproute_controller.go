@@ -127,7 +127,7 @@ func (r *HTTPRouteReconciler) extractRoutes(routes *gatewayv1.HTTPRouteList) []p
 							pathType = *match.Path.Type
 						}
 						pMatch.Path = &proxy.PathMatch{
-							Type:  string(pathType),
+							Type:  proxy.PathMatchType(pathType),
 							Value: *match.Path.Value,
 						}
 					}
