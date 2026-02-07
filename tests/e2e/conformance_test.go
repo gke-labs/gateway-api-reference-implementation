@@ -81,6 +81,7 @@ func TestConformance(t *testing.T) {
 
 	selectedTests := []suite.ConformanceTest{
 		tests.HTTPRouteSimpleSameNamespace,
+		tests.HTTPRouteMatching,
 	}
 
 	cSuite.Setup(t, selectedTests)
