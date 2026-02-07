@@ -80,11 +80,11 @@ func (h *Harness) Setup() {
 func (h *Harness) InstallMetallb() {
 	h.t.Log("Installing Metallb")
 	h.runCmd("kubectl", "apply", "-f", "https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml")
-	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=ready", "pod", "--selector=app=metallb", "--timeout=90s")
+	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=available", "deployment/controller", "--timeout=90s")
 
 	// Configure Metallb with a range of IPs from the kind network
 	h.runCmd("docker", "network", "inspect", "kind")
-	
+
 	metallbConfig := `
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
