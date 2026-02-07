@@ -1,6 +1,6 @@
 module github.com/gke-labs/gateway-api-reference-implementation
 
-go 1.24.12
+go 1.25.7
 
 require (
 	k8s.io/api v0.34.1
