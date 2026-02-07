@@ -83,6 +83,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteSimpleSameNamespace,
 		tests.HTTPRouteMatching,
 		tests.HTTPRouteExactPathMatching,
+		tests.HTTPRouteHeaderMatching,
 	}
 
 	cSuite.Setup(t, selectedTests)
