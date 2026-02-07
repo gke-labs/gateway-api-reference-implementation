@@ -19,12 +19,9 @@ import (
 	"testing"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
-
-func ptr[T any](v T) *T {
-	return &v
-}
 
 func TestExtractRoutes(t *testing.T) {
 	tests := []struct {
@@ -37,6 +34,9 @@ func TestExtractRoutes(t *testing.T) {
 			routes: &gatewayv1.HTTPRouteList{
 				Items: []gatewayv1.HTTPRoute{
 					{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
 						Spec: gatewayv1.HTTPRouteSpec{
 							Hostnames: []gatewayv1.Hostname{"example.com"},
 							Rules: []gatewayv1.HTTPRouteRule{
@@ -59,7 +59,7 @@ func TestExtractRoutes(t *testing.T) {
 				},
 			},
 			expected: map[string]proxy.Backend{
-				"example.com": {Host: "backend-svc", Port: 80},
+				"example.com": {Host: "backend-svc.default.svc.cluster.local", Port: 80},
 			},
 		},
 		{
@@ -67,6 +67,9 @@ func TestExtractRoutes(t *testing.T) {
 			routes: &gatewayv1.HTTPRouteList{
 				Items: []gatewayv1.HTTPRoute{
 					{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "test-ns",
+						},
 						Spec: gatewayv1.HTTPRouteSpec{
 							Hostnames: []gatewayv1.Hostname{"example.com", "foo.bar"},
 							Rules: []gatewayv1.HTTPRouteRule{
@@ -88,8 +91,8 @@ func TestExtractRoutes(t *testing.T) {
 				},
 			},
 			expected: map[string]proxy.Backend{
-				"example.com": {Host: "backend-svc", Port: 8080},
-				"foo.bar":     {Host: "backend-svc", Port: 8080},
+				"example.com": {Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
+				"foo.bar":     {Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
 			},
 		},
 	}

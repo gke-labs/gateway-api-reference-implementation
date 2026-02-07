@@ -49,6 +49,9 @@ func (p *Proxy) UpdateRoutes(routes map[string]Backend) {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.RLock()
 	backend, ok := p.routes[r.Host]
+	if !ok {
+		backend, ok = p.routes["*"]
+	}
 	p.mu.RUnlock()
 
 	if !ok {

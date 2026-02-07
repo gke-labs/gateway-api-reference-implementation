@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"io/fs"
 	"os"
 	"testing"
 
@@ -24,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/tests"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
 )
@@ -75,6 +77,7 @@ func TestConformance(t *testing.T) {
 		Debug:                      true,
 		CleanupBaseResources:       true,
 		EnableAllSupportedFeatures: true,
+		ManifestFS:                 []fs.FS{conformance.Manifests},
 	})
 	if err != nil {
 		t.Fatalf("error creating conformance test suite: %v", err)

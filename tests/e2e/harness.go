@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,9 +69,39 @@ func (h *Harness) Setup() {
 		})
 	}
 
-	// Ensure we are using the correct context
+	// Ensure we are using the correct context and namespace
 	contextName := "kind-" + h.clusterName
 	h.runCmd("kubectl", "config", "use-context", contextName)
+	h.runCmd("kubectl", "config", "set-context", "--current", "--namespace=default")
+
+	h.InstallMetallb()
+}
+
+func (h *Harness) InstallMetallb() {
+	h.t.Log("Installing Metallb")
+	h.runCmd("kubectl", "apply", "-f", "https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml")
+	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=ready", "pod", "--selector=app=metallb", "--timeout=90s")
+
+	// Configure Metallb with a range of IPs from the kind network
+	h.runCmd("docker", "network", "inspect", "kind")
+	
+	metallbConfig := `
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: example
+  namespace: metallb-system
+spec:
+  addresses:
+  - 172.18.255.200-172.18.255.250
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: empty
+  namespace: metallb-system
+`
+	h.KubectlApplyContent(metallbConfig)
 }
 
 func (h *Harness) GetGitRoot() string {
@@ -93,7 +124,7 @@ func (h *Harness) KindLoad(tag string) {
 }
 
 func (h *Harness) KubectlApplyContent(content string) {
-	h.t.Log("Applying kubectl content")
+	h.t.Logf("Applying kubectl content:\n%s", content)
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(content)
 	var stderr bytes.Buffer
@@ -105,12 +136,12 @@ func (h *Harness) KubectlApplyContent(content string) {
 
 func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
 	h.t.Logf("Waiting for deployment %s to be ready", name)
-	h.runCmd("kubectl", "wait", "--for=condition=available", "--timeout="+timeout.String(), "deployment/"+name)
+	h.runCmd("kubectl", "wait", "--namespace", "default", "--for=condition=available", "--timeout="+timeout.String(), "deployment/"+name)
 }
 
 func (h *Harness) DeletePod(name string) {
 	h.t.Logf("Deleting pod %s", name)
-	exec.Command("kubectl", "delete", "pod", name, "--ignore-not-found").Run()
+	exec.Command("kubectl", "delete", "pod", name, "--namespace", "default", "--ignore-not-found").Run()
 }
 
 func (h *Harness) WaitForPodSuccess(name string, timeout time.Duration) {
@@ -121,7 +152,7 @@ func (h *Harness) WaitForPodSuccess(name string, timeout time.Duration) {
 			h.t.Fatalf("Timeout waiting for pod %s to succeed", name)
 		}
 
-		out, err := exec.Command("kubectl", "get", "pod", name, "-o", "jsonpath={.status.phase}").Output()
+		out, err := exec.Command("kubectl", "get", "pod", name, "--namespace", "default", "-o", "jsonpath={.status.phase}").Output()
 		if err == nil {
 			phase := strings.TrimSpace(string(out))
 			if phase == "Succeeded" {
@@ -136,7 +167,7 @@ func (h *Harness) WaitForPodSuccess(name string, timeout time.Duration) {
 }
 
 func (h *Harness) GetPodLogs(name string) string {
-	out, err := exec.Command("kubectl", "logs", name).Output()
+	out, err := exec.Command("kubectl", "logs", name, "--namespace", "default").Output()
 	if err != nil {
 		h.t.Fatalf("Failed to get pod logs for %s: %v", name, err)
 	}
@@ -165,11 +196,12 @@ func (h *Harness) DeployController() {
 	h.DockerBuild("gari-controller:e2e", filepath.Join(gitRoot, "Dockerfile"), gitRoot)
 	h.KindLoad("gari-controller:e2e")
 
-	controllerManifest := `
+	controllerManifest := fmt.Sprintf(`
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: gari-controller
+  namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -177,8 +209,14 @@ metadata:
   name: gari-controller
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes"]
+  resources: ["httproutes", "gateways", "gatewayclasses"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: [""]
+  resources: ["services"]
   verbs: ["get", "list", "watch"]
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status"]
+  verbs: ["update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -193,10 +231,18 @@ subjects:
   name: gari-controller
   namespace: default
 ---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: reference-class
+spec:
+  controllerName: github.com/gke-labs/gateway-api-reference-implementation
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gari-controller
+  namespace: default
 spec:
   replicas: 1
   selector:
@@ -206,6 +252,8 @@ spec:
     metadata:
       labels:
         app: gari-controller
+      annotations:
+        restartedAt: "%s"
     spec:
       serviceAccountName: gari-controller
       containers:
@@ -221,13 +269,15 @@ apiVersion: v1
 kind: Service
 metadata:
   name: gari-proxy
+  namespace: default
 spec:
+  type: LoadBalancer
   selector:
     app: gari-controller
   ports:
   - port: 80
     targetPort: 8000
-`
+`, time.Now().Format(time.RFC3339))
 	h.KubectlApplyContent(controllerManifest)
 	h.WaitForDeployment("gari-controller", 2*time.Minute)
 }
@@ -243,6 +293,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend
+  namespace: default
 spec:
   replicas: 1
   selector:
@@ -265,6 +316,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: backend
+  namespace: default
 spec:
   selector:
     app: backend
