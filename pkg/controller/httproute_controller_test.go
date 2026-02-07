@@ -27,7 +27,7 @@ func TestExtractRoutes(t *testing.T) {
 	tests := []struct {
 		name     string
 		routes   *gatewayv1.HTTPRouteList
-		expected map[string]proxy.Backend
+		expected []proxy.HTTPRoute
 	}{
 		{
 			name: "single route with single backend",
@@ -58,8 +58,15 @@ func TestExtractRoutes(t *testing.T) {
 					},
 				},
 			},
-			expected: map[string]proxy.Backend{
-				"example.com": {Host: "backend-svc.default.svc.cluster.local", Port: 80},
+			expected: []proxy.HTTPRoute{
+				{
+					Hostnames: []string{"example.com"},
+					Rules: []proxy.RouteRule{
+						{
+							Backend: proxy.Backend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+						},
+					},
+				},
 			},
 		},
 		{
@@ -90,9 +97,15 @@ func TestExtractRoutes(t *testing.T) {
 					},
 				},
 			},
-			expected: map[string]proxy.Backend{
-				"example.com": {Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
-				"foo.bar":     {Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
+			expected: []proxy.HTTPRoute{
+				{
+					Hostnames: []string{"example.com", "foo.bar"},
+					Rules: []proxy.RouteRule{
+						{
+							Backend: proxy.Backend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
+						},
+					},
+				},
 			},
 		},
 	}
