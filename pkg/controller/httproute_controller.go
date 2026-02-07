@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"regexp"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,6 +46,17 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Update status
 	// For each parentRef, we should add a ParentStatus
 	var parentStatuses []gatewayv1.RouteParentStatus
+
+	acceptedStatus := metav1.ConditionTrue
+	acceptedReason := gatewayv1.RouteReasonAccepted
+	acceptedMessage := "Route accepted by reference implementation"
+
+	if err := r.validateRoute(&route); err != nil {
+		acceptedStatus = metav1.ConditionFalse
+		acceptedReason = gatewayv1.RouteReasonUnsupportedValue
+		acceptedMessage = fmt.Sprintf("Invalid route: %v", err)
+	}
+
 	for _, parentRef := range route.Spec.ParentRefs {
 		// For simplicity, we assume all parents are Gateways and we accept them if they are in the same namespace
 		// or if we want to be more thorough, we should check the Gateway and its GatewayClass.
@@ -56,11 +68,11 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			Conditions: []metav1.Condition{
 				{
 					Type:               string(gatewayv1.RouteConditionAccepted),
-					Status:             metav1.ConditionTrue,
+					Status:             acceptedStatus,
 					ObservedGeneration: route.Generation,
 					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.RouteReasonAccepted),
-					Message:            "Route accepted by reference implementation",
+					Reason:             string(acceptedReason),
+					Message:            acceptedMessage,
 				},
 				{
 					Type:               string(gatewayv1.RouteConditionResolvedRefs),
@@ -79,12 +91,17 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
+	// If the route is not accepted, we should not update the proxy
+	if acceptedStatus == metav1.ConditionFalse {
+		return ctrl.Result{}, nil
+	}
+
 	var routes gatewayv1.HTTPRouteList
 	if err := r.List(ctx, &routes); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	newRoutes := r.extractRoutes(&routes)
+	newRoutes := r.extractRoutes(ctx, &routes)
 
 	r.Proxy.UpdateRoutes(newRoutes)
 	l.Info("Updated proxy routes", "count", len(newRoutes))
@@ -92,9 +109,44 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{}, nil
 }
 
-func (r *HTTPRouteReconciler) extractRoutes(routes *gatewayv1.HTTPRouteList) []proxy.HTTPRoute {
+func (r *HTTPRouteReconciler) validateRoute(route *gatewayv1.HTTPRoute) error {
+	for _, rule := range route.Spec.Rules {
+		for _, match := range rule.Matches {
+			for _, header := range match.Headers {
+				if header.Type != nil && *header.Type == gatewayv1.HeaderMatchRegularExpression {
+					if _, err := regexp.Compile(header.Value); err != nil {
+						return fmt.Errorf("invalid regular expression in header match: %w", err)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (r *HTTPRouteReconciler) extractRoutes(ctx context.Context, routes *gatewayv1.HTTPRouteList) []proxy.HTTPRoute {
+	l := log.FromContext(ctx)
 	var newRoutes []proxy.HTTPRoute
 	for _, route := range routes.Items {
+		// Only extract routes that are accepted
+		accepted := false
+		for _, ps := range route.Status.Parents {
+			if ps.ControllerName == ControllerName {
+				for _, c := range ps.Conditions {
+					if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
+						accepted = true
+						break
+					}
+				}
+			}
+			if accepted {
+				break
+			}
+		}
+		if !accepted {
+			continue
+		}
+
 		pr := proxy.HTTPRoute{}
 		for _, hostname := range route.Spec.Hostnames {
 			pr.Hostnames = append(pr.Hostnames, string(hostname))
@@ -136,11 +188,21 @@ func (r *HTTPRouteReconciler) extractRoutes(routes *gatewayv1.HTTPRouteList) []p
 						if header.Type != nil {
 							headerType = *header.Type
 						}
-						pMatch.Headers = append(pMatch.Headers, proxy.HeaderMatch{
-							Type:  string(headerType),
-							Name:  string(header.Name),
-							Value: header.Value,
-						})
+						hm := proxy.HeaderMatch{
+							Type:            string(headerType),
+							Name:            string(header.Name),
+							MatchExactValue: header.Value,
+						}
+						if headerType == gatewayv1.HeaderMatchRegularExpression {
+							re, err := regexp.Compile(header.Value)
+							if err != nil {
+								// In a real controller we would set a condition on the route
+								l.Error(err, "invalid regular expression in header match", "value", header.Value)
+								continue
+							}
+							hm.MatchRegularExpressionValue = re
+						}
+						pMatch.Headers = append(pMatch.Headers, hm)
 					}
 					pRule.Matches = append(pRule.Matches, pMatch)
 				}

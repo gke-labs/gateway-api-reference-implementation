@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -55,6 +56,21 @@ func TestExtractRoutes(t *testing.T) {
 								},
 							},
 						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ControllerName: ControllerName,
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
 					},
 				},
 			},
@@ -88,6 +104,21 @@ func TestExtractRoutes(t *testing.T) {
 													Name: "backend-svc",
 													Port: ptr(gatewayv1.PortNumber(8080)),
 												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ControllerName: ControllerName,
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
 											},
 										},
 									},
@@ -140,6 +171,21 @@ func TestExtractRoutes(t *testing.T) {
 								},
 							},
 						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ControllerName: ControllerName,
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
 					},
 				},
 			},
@@ -166,7 +212,7 @@ func TestExtractRoutes(t *testing.T) {
 	reconciler := &HTTPRouteReconciler{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := reconciler.extractRoutes(tt.routes)
+			actual := reconciler.extractRoutes(context.Background(), tt.routes)
 			if !reflect.DeepEqual(actual, tt.expected) {
 				t.Errorf("expected %v, got %v", tt.expected, actual)
 			}
