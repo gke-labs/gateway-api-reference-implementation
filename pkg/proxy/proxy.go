@@ -24,11 +24,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// Backend holds the computed state for a backend service.
 type Backend struct {
 	Host string
 	Port int32
 }
 
+// PathMatchType defines how a path should be matched.
 type PathMatchType string
 
 const (
@@ -37,6 +39,7 @@ const (
 	PathMatchTypeNone       PathMatchType = "None"
 )
 
+// Weight returns the precedence weight for the path match type.
 func (t PathMatchType) Weight() int {
 	switch t {
 	case PathMatchTypeExact:
@@ -50,32 +53,38 @@ func (t PathMatchType) Weight() int {
 	}
 }
 
+// PathMatch holds the computed state for a path match.
 type PathMatch struct {
 	Type  PathMatchType
 	Value string
 }
 
+// HeaderMatch holds the computed state for a header match.
 type HeaderMatch struct {
 	Type  string // Exact
 	Name  string
 	Value string
 }
 
+// RouteMatch holds the computed state for a single match rule.
 type RouteMatch struct {
 	Path    *PathMatch
 	Headers []HeaderMatch
 }
 
+// RouteRule holds the computed state for a single rule within an HTTPRoute.
 type RouteRule struct {
 	Matches []RouteMatch
 	Backend Backend
 }
 
+// HTTPRoute holds the computed state from a Gateway API HTTPRoute object.
 type HTTPRoute struct {
 	Hostnames []string
 	Rules     []RouteRule
 }
 
+// Proxy is a minimal implementation of a Gateway API proxy.
 type Proxy struct {
 	mu     sync.RWMutex
 	routes []HTTPRoute
