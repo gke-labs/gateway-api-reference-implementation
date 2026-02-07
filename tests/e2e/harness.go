@@ -85,23 +85,8 @@ func (h *Harness) InstallMetallb() {
 	// Configure Metallb with a range of IPs from the kind network
 	h.runCmd("docker", "network", "inspect", "kind")
 
-	metallbConfig := `
-apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata:
-  name: example
-  namespace: metallb-system
-spec:
-  addresses:
-  - 172.18.255.200-172.18.255.250
----
-apiVersion: metallb.io/v1beta1
-kind: L2Advertisement
-metadata:
-  name: empty
-  namespace: metallb-system
-`
-	h.KubectlApplyContent(metallbConfig)
+	gitRoot := h.GetGitRoot()
+	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/metallb-config.yaml"))
 }
 
 func (h *Harness) GetGitRoot() string {
@@ -132,6 +117,11 @@ func (h *Harness) KubectlApplyContent(content string) {
 	if err := cmd.Run(); err != nil {
 		h.t.Fatalf("kubectl apply failed: %v\nStderr: %s", err, stderr.String())
 	}
+}
+
+func (h *Harness) KubectlApplyFile(path string) {
+	h.t.Logf("Applying kubectl file: %s", path)
+	h.runCmd("kubectl", "apply", "-f", path)
 }
 
 func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
@@ -196,99 +186,15 @@ func (h *Harness) DeployController() {
 	h.DockerBuild("gari-controller:e2e", filepath.Join(gitRoot, "Dockerfile"), gitRoot)
 	h.KindLoad("gari-controller:e2e")
 
-	controllerManifest := fmt.Sprintf(`
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: gari-controller
-  namespace: default
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: gari-controller
-rules:
-- apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes", "gateways", "gatewayclasses"]
-  verbs: ["get", "list", "watch", "update", "patch"]
-- apiGroups: [""]
-  resources: ["services"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status"]
-  verbs: ["update", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: gari-controller
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: gari-controller
-subjects:
-- kind: ServiceAccount
-  name: gari-controller
-  namespace: default
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: GatewayClass
-metadata:
-  name: reference-class
-spec:
-  controllerName: github.com/gke-labs/gateway-api-reference-implementation
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: gari-controller
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: gari-controller
-  template:
-    metadata:
-      labels:
-        app: gari-controller
-      annotations:
-        restartedAt: "%s"
-    spec:
-      serviceAccountName: gari-controller
-      containers:
-      - name: controller
-        image: gari-controller:e2e
-        imagePullPolicy: Never
-        args: ["--proxy-bind-address", ":8000"]
-        ports:
-        - containerPort: 8000
-          name: proxy
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: gari-proxy
-  namespace: default
-spec:
-  type: LoadBalancer
-  selector:
-    app: gari-controller
-  ports:
-  - port: 80
-    targetPort: 8000
-`, time.Now().Format(time.RFC3339))
-	h.KubectlApplyContent(controllerManifest)
+	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/controller.yaml"))
+	h.runCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
+	h.runCmd("kubectl", "annotate", "deployment/gari-controller", "restartedAt="+time.Now().Format(time.RFC3339), "--namespace=default", "--overwrite")
+
 	h.WaitForDeployment("gari-controller", 2*time.Minute)
 }
 
-func (h *Harness) DeployBackend() {
-	h.t.Log("Deploying Backend")
-	gitRoot := h.GetGitRoot()
-	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), filepath.Join(gitRoot, "tests/toolbox"))
-	h.KindLoad("toolbox:e2e")
-
-	backendManifest := `
+func (h *Harness) BackendManifest() string {
+	return `
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -324,6 +230,30 @@ spec:
   - port: 8080
     targetPort: 8080
 `
-	h.KubectlApplyContent(backendManifest)
+}
+
+func (h *Harness) ClientManifest(url string, host string) string {
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-client
+spec:
+  containers:
+  - name: toolbox
+    image: toolbox:e2e
+    imagePullPolicy: Never
+    command: ["/app/toolbox", "client", "%s", "%s"]
+  restartPolicy: Never
+`, url, host)
+}
+
+func (h *Harness) DeployBackend() {
+	h.t.Log("Deploying Backend")
+	gitRoot := h.GetGitRoot()
+	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), filepath.Join(gitRoot, "tests/toolbox"))
+	h.KindLoad("toolbox:e2e")
+
+	h.KubectlApplyContent(h.BackendManifest())
 	h.WaitForDeployment("backend", 2*time.Minute)
 }

@@ -36,69 +36,7 @@ echo "Installing Gateway API CRDs..."
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
 
 echo "Deploying controller..."
-# Generate a simple manifest for deployment
-cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: gari-controller
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: gari-controller
-rules:
-- apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes"]
-  verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: gari-controller
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: gari-controller
-subjects:
-- kind: ServiceAccount
-  name: gari-controller
-  namespace: default
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: gari-controller
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: gari-controller
-  template:
-    metadata:
-      labels:
-        app: gari-controller
-    spec:
-      serviceAccountName: gari-controller
-      containers:
-      - name: controller
-        image: ${IMAGE_NAME}:${IMAGE_TAG}
-        imagePullPolicy: IfNotPresent
-        args: ["--proxy-bind-address", ":8000"]
-        ports:
-        - containerPort: 8000
-          name: proxy
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: gari-proxy
-spec:
-  selector:
-    app: gari-controller
-  ports:
-  - port: 80
-    targetPort: 8000
-EOF
+kubectl apply -f k8s/controller.yaml
+kubectl set image deployment/gari-controller controller="${IMAGE_NAME}:${IMAGE_TAG}"
 
 echo "Deployment complete."

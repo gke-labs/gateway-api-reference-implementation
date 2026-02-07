@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -44,39 +45,7 @@ func TestGatewayAPI(t *testing.T) {
 	h.DeployBackend()
 
 	// 4. Create Gateway API Resources
-	gwResources := `
-apiVersion: gateway.networking.k8s.io/v1
-kind: GatewayClass
-metadata:
-  name: reference-class
-spec:
-  controllerName: github.com/gke-labs/gateway-api-reference-implementation
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: reference-gateway
-spec:
-  gatewayClassName: reference-class
-  listeners:
-  - name: http
-    protocol: HTTP
-    port: 80
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: test-route
-spec:
-  parentRefs:
-  - name: reference-gateway
-  hostnames: ["example.com"]
-  rules:
-  - backendRefs:
-    - name: backend
-      port: 8080
-`
-	h.KubectlApplyContent(gwResources)
+	h.KubectlApplyFile(filepath.Join(h.GetGitRoot(), "k8s/example-gateway.yaml"))
 	// Give the controller some time to reconcile
 	time.Sleep(5 * time.Second)
 
@@ -84,20 +53,7 @@ spec:
 	clientPodName := "test-client"
 	h.DeletePod(clientPodName)
 
-	clientManifest := `
-apiVersion: v1
-kind: Pod
-metadata:
-  name: test-client
-spec:
-  containers:
-  - name: toolbox
-    image: toolbox:e2e
-    imagePullPolicy: Never
-    command: ["/app/toolbox", "client", "http://gari-proxy", "example.com"]
-  restartPolicy: Never
-`
-	h.KubectlApplyContent(clientManifest)
+	h.KubectlApplyContent(h.ClientManifest("http://gari-proxy", "example.com"))
 	h.WaitForPodSuccess(clientPodName, 1*time.Minute)
 
 	logs := h.GetPodLogs(clientPodName)
