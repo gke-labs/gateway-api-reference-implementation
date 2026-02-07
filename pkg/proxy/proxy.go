@@ -20,6 +20,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -187,10 +188,18 @@ func (p *Proxy) matchHostname(hostnames []string, host string) bool {
 	if len(hostnames) == 0 {
 		return true
 	}
-	// TODO: Support wildcard hostnames
 	for _, h := range hostnames {
-		if h == "*" || h == host {
+		if h == "*" {
 			return true
+		}
+		if h == host {
+			return true
+		}
+		if strings.HasPrefix(h, "*.") {
+			suffix := h[1:] // .example.com
+			if strings.HasSuffix(host, suffix) {
+				return true
+			}
 		}
 	}
 	return false
