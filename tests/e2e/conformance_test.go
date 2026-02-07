@@ -19,11 +19,12 @@ import (
 	"os"
 	"testing"
 
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/tests"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
@@ -55,11 +56,14 @@ func TestConformance(t *testing.T) {
 	if err := scheme.AddToScheme(s); err != nil {
 		t.Fatalf("Error adding standard Kubernetes types to scheme: %v", err)
 	}
-	if err := v1.AddToScheme(s); err != nil {
+	if err := apiextensionsv1.AddToScheme(s); err != nil {
 		t.Fatalf("Error adding apiextensions types to scheme: %v", err)
 	}
 	if err := gatewayv1.AddToScheme(s); err != nil {
-		t.Fatalf("Error adding Gateway API types to scheme: %v", err)
+		t.Fatalf("Error adding Gateway API v1 types to scheme: %v", err)
+	}
+	if err := gatewayv1beta1.AddToScheme(s); err != nil {
+		t.Fatalf("Error adding Gateway API v1beta1 types to scheme: %v", err)
 	}
 
 	cl, err := client.New(cfg, client.Options{Scheme: s})
@@ -69,6 +73,7 @@ func TestConformance(t *testing.T) {
 
 	cSuite, err := suite.NewConformanceTestSuite(suite.ConformanceOptions{
 		Client:                     cl,
+		RestConfig:                 cfg,
 		GatewayClassName:           "reference-class",
 		Debug:                      true,
 		CleanupBaseResources:       true,
@@ -84,6 +89,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteMatching,
 		tests.HTTPRouteExactPathMatching,
 		tests.HTTPRouteHeaderMatching,
+		tests.HTTPRouteHostnameIntersection,
 	}
 
 	cSuite.Setup(t, selectedTests)
