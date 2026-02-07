@@ -23,3 +23,14 @@ The `gateway-api-reference-implementation` is intended to be a simple, pure Go, 
     - One idea per PR.
     - Well-structured commits.
     - Reference issues in the commit body.
+
+### Commands
+
+The project uses the `ap` tool for various tasks. Since `ap` is a custom tool, it should be run using `go run`:
+
+- `go run github.com/gke-labs/gke-labs-infra/ap@latest generate`: Regenerate any code and format.
+- `go run github.com/gke-labs/gke-labs-infra/ap@latest test`: Run unit tests.
+- `go run github.com/gke-labs/gke-labs-infra/ap@latest e2e`: Run e2e tests.
+- `go run github.com/gke-labs/gke-labs-infra/ap@latest lint`: For deeper static analysis.
+
+**Reminder**: Coding agents MUST run at least `ap generate` before sending PRs, and preferably `ap e2e` as well!

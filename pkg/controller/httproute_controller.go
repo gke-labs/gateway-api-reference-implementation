@@ -92,17 +92,20 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{}, nil
 }
 
-func (r *HTTPRouteReconciler) extractRoutes(routes *gatewayv1.HTTPRouteList) map[string]proxy.Backend {
-	newRoutes := make(map[string]proxy.Backend)
+func (r *HTTPRouteReconciler) extractRoutes(routes *gatewayv1.HTTPRouteList) []proxy.HTTPRoute {
+	var newRoutes []proxy.HTTPRoute
 	for _, route := range routes.Items {
+		pr := proxy.HTTPRoute{}
+		for _, hostname := range route.Spec.Hostnames {
+			pr.Hostnames = append(pr.Hostnames, string(hostname))
+		}
+
 		for _, rule := range route.Spec.Rules {
 			for _, backendRef := range rule.BackendRefs {
 				if backendRef.Kind != nil && *backendRef.Kind != "Service" {
 					continue
 				}
 
-				// For minimal implementation, we just take the first Service backendRef
-				// and map all hostnames of this route to it.
 				if backendRef.Port == nil {
 					continue
 				}
@@ -112,20 +115,43 @@ func (r *HTTPRouteReconciler) extractRoutes(routes *gatewayv1.HTTPRouteList) map
 					Port: int32(*backendRef.Port),
 				}
 
-				if len(route.Spec.Hostnames) == 0 {
-					newRoutes["*"] = backend
-				} else {
-					for _, hostname := range route.Spec.Hostnames {
-						newRoutes[string(hostname)] = backend
-					}
+				pRule := proxy.RouteRule{
+					Backend: backend,
 				}
 
-				// Just take the first one for now as per "minimal"
+				for _, match := range rule.Matches {
+					pMatch := proxy.RouteMatch{}
+					if match.Path != nil {
+						pathType := gatewayv1.PathMatchPathPrefix
+						if match.Path.Type != nil {
+							pathType = *match.Path.Type
+						}
+						pMatch.Path = &proxy.PathMatch{
+							Type:  proxy.PathMatchType(pathType),
+							Value: *match.Path.Value,
+						}
+					}
+					for _, header := range match.Headers {
+						headerType := gatewayv1.HeaderMatchExact
+						if header.Type != nil {
+							headerType = *header.Type
+						}
+						pMatch.Headers = append(pMatch.Headers, proxy.HeaderMatch{
+							Type:  string(headerType),
+							Name:  string(header.Name),
+							Value: header.Value,
+						})
+					}
+					pRule.Matches = append(pRule.Matches, pMatch)
+				}
+
+				pr.Rules = append(pr.Rules, pRule)
+
+				// For minimal implementation, we just take the first Service backendRef for each rule
 				break
 			}
-			// Just take the first rule for now
-			break
 		}
+		newRoutes = append(newRoutes, pr)
 	}
 	return newRoutes
 }
