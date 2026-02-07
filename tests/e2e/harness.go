@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -151,4 +152,126 @@ func (h *Harness) runCmd(name string, args ...string) string {
 		h.t.Fatalf("Command %s %v failed: %v\nStdout: %s\nStderr: %s", name, args, err, stdout.String(), stderr.String())
 	}
 	return stdout.String()
+}
+
+func (h *Harness) InstallGatewayAPI() {
+	h.t.Log("Installing Gateway API CRDs")
+	h.runCmd("kubectl", "apply", "-f", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml")
+}
+
+func (h *Harness) DeployController() {
+	h.t.Log("Deploying Controller")
+	gitRoot := h.GetGitRoot()
+	h.DockerBuild("gari-controller:e2e", filepath.Join(gitRoot, "Dockerfile"), gitRoot)
+	h.KindLoad("gari-controller:e2e")
+
+	controllerManifest := `
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gari-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gari-controller
+rules:
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["httproutes"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gari-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gari-controller
+subjects:
+- kind: ServiceAccount
+  name: gari-controller
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gari-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gari-controller
+  template:
+    metadata:
+      labels:
+        app: gari-controller
+    spec:
+      serviceAccountName: gari-controller
+      containers:
+      - name: controller
+        image: gari-controller:e2e
+        imagePullPolicy: Never
+        args: ["--proxy-bind-address", ":8000"]
+        ports:
+        - containerPort: 8000
+          name: proxy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gari-proxy
+spec:
+  selector:
+    app: gari-controller
+  ports:
+  - port: 80
+    targetPort: 8000
+`
+	h.KubectlApplyContent(controllerManifest)
+	h.WaitForDeployment("gari-controller", 2*time.Minute)
+}
+
+func (h *Harness) DeployBackend() {
+	h.t.Log("Deploying Backend")
+	gitRoot := h.GetGitRoot()
+	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), filepath.Join(gitRoot, "tests/toolbox"))
+	h.KindLoad("toolbox:e2e")
+
+	backendManifest := `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+      - name: toolbox
+        image: toolbox:e2e
+        imagePullPolicy: Never
+        args: ["server"]
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+spec:
+  selector:
+    app: backend
+  ports:
+  - port: 8080
+    targetPort: 8080
+`
+	h.KubectlApplyContent(backendManifest)
+	h.WaitForDeployment("backend", 2*time.Minute)
 }
