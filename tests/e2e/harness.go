@@ -85,8 +85,7 @@ func (h *Harness) InstallMetallb() {
 	// Configure Metallb with a range of IPs from the kind network
 	h.runCmd("docker", "network", "inspect", "kind")
 
-	gitRoot := h.GetGitRoot()
-	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/metallb-config.yaml"))
+	h.KubectlApplyContent(h.MetallbConfigManifest())
 }
 
 func (h *Harness) GetGitRoot() string {
@@ -229,6 +228,55 @@ spec:
   ports:
   - port: 8080
     targetPort: 8080
+`
+}
+
+func (h *Harness) MetallbConfigManifest() string {
+	return `
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: example
+  namespace: metallb-system
+spec:
+  addresses:
+  - 172.18.255.200-172.18.255.250
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: empty
+  namespace: metallb-system
+`
+}
+
+func (h *Harness) ExampleGatewayManifest() string {
+	return `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reference-gateway
+  namespace: default
+spec:
+  gatewayClassName: reference-class
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: test-route
+  namespace: default
+spec:
+  parentRefs:
+  - name: reference-gateway
+  hostnames: ["example.com"]
+  rules:
+  - backendRefs:
+    - name: backend
+      port: 8080
 `
 }
 

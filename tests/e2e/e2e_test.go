@@ -16,7 +16,6 @@ package e2e
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +44,7 @@ func TestGatewayAPI(t *testing.T) {
 	h.DeployBackend()
 
 	// 4. Create Gateway API Resources
-	h.KubectlApplyFile(filepath.Join(h.GetGitRoot(), "k8s/example-gateway.yaml"))
+	h.KubectlApplyContent(h.ExampleGatewayManifest())
 	// Give the controller some time to reconcile
 	time.Sleep(5 * time.Second)
 
