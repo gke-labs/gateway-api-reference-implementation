@@ -28,10 +28,29 @@ func TestExtractRoutes(t *testing.T) {
 	tests := []struct {
 		name     string
 		routes   *gatewayv1.HTTPRouteList
+		gateways *gatewayv1.GatewayList
 		expected []proxy.HTTPRoute
 	}{
 		{
 			name: "single route with single backend",
+			gateways: &gatewayv1.GatewayList{
+				Items: []gatewayv1.Gateway{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "reference-gateway",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.GatewaySpec{
+							Listeners: []gatewayv1.Listener{
+								{
+									Name:     "http",
+									Protocol: gatewayv1.HTTPProtocolType,
+								},
+							},
+						},
+					},
+				},
+			},
 			routes: &gatewayv1.HTTPRouteList{
 				Items: []gatewayv1.HTTPRoute{
 					{
@@ -39,6 +58,13 @@ func TestExtractRoutes(t *testing.T) {
 							Namespace: "default",
 						},
 						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
 							Hostnames: []gatewayv1.Hostname{"example.com"},
 							Rules: []gatewayv1.HTTPRouteRule{
 								{
@@ -60,6 +86,9 @@ func TestExtractRoutes(t *testing.T) {
 							RouteStatus: gatewayv1.RouteStatus{
 								Parents: []gatewayv1.RouteParentStatus{
 									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
 										ControllerName: ControllerName,
 										Conditions: []metav1.Condition{
 											{
@@ -86,7 +115,26 @@ func TestExtractRoutes(t *testing.T) {
 			},
 		},
 		{
-			name: "multiple hostnames",
+			name: "multiple hostnames with intersection",
+			gateways: &gatewayv1.GatewayList{
+				Items: []gatewayv1.Gateway{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "reference-gateway",
+							Namespace: "test-ns",
+						},
+						Spec: gatewayv1.GatewaySpec{
+							Listeners: []gatewayv1.Listener{
+								{
+									Name:     "http",
+									Protocol: gatewayv1.HTTPProtocolType,
+									Hostname: ptr(gatewayv1.Hostname("*.example.com")),
+								},
+							},
+						},
+					},
+				},
+			},
 			routes: &gatewayv1.HTTPRouteList{
 				Items: []gatewayv1.HTTPRoute{
 					{
@@ -94,7 +142,14 @@ func TestExtractRoutes(t *testing.T) {
 							Namespace: "test-ns",
 						},
 						Spec: gatewayv1.HTTPRouteSpec{
-							Hostnames: []gatewayv1.Hostname{"example.com", "foo.bar"},
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Hostnames: []gatewayv1.Hostname{"example.com", "foo.example.com", "bar.com"},
 							Rules: []gatewayv1.HTTPRouteRule{
 								{
 									BackendRefs: []gatewayv1.HTTPBackendRef{
@@ -114,6 +169,9 @@ func TestExtractRoutes(t *testing.T) {
 							RouteStatus: gatewayv1.RouteStatus{
 								Parents: []gatewayv1.RouteParentStatus{
 									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
 										ControllerName: ControllerName,
 										Conditions: []metav1.Condition{
 											{
@@ -130,7 +188,7 @@ func TestExtractRoutes(t *testing.T) {
 			},
 			expected: []proxy.HTTPRoute{
 				{
-					Hostnames: []string{"example.com", "foo.bar"},
+					Hostnames: []string{"foo.example.com"},
 					Rules: []proxy.RouteRule{
 						{
 							Backend: proxy.Backend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
@@ -141,6 +199,24 @@ func TestExtractRoutes(t *testing.T) {
 		},
 		{
 			name: "exact path match",
+			gateways: &gatewayv1.GatewayList{
+				Items: []gatewayv1.Gateway{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "reference-gateway",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.GatewaySpec{
+							Listeners: []gatewayv1.Listener{
+								{
+									Name:     "http",
+									Protocol: gatewayv1.HTTPProtocolType,
+								},
+							},
+						},
+					},
+				},
+			},
 			routes: &gatewayv1.HTTPRouteList{
 				Items: []gatewayv1.HTTPRoute{
 					{
@@ -148,6 +224,13 @@ func TestExtractRoutes(t *testing.T) {
 							Namespace: "default",
 						},
 						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
 							Rules: []gatewayv1.HTTPRouteRule{
 								{
 									Matches: []gatewayv1.HTTPRouteMatch{
@@ -175,6 +258,9 @@ func TestExtractRoutes(t *testing.T) {
 							RouteStatus: gatewayv1.RouteStatus{
 								Parents: []gatewayv1.RouteParentStatus{
 									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
 										ControllerName: ControllerName,
 										Conditions: []metav1.Condition{
 											{
@@ -191,6 +277,7 @@ func TestExtractRoutes(t *testing.T) {
 			},
 			expected: []proxy.HTTPRoute{
 				{
+					Hostnames: []string{"*"},
 					Rules: []proxy.RouteRule{
 						{
 							Matches: []proxy.RouteMatch{
@@ -212,7 +299,7 @@ func TestExtractRoutes(t *testing.T) {
 	reconciler := &HTTPRouteReconciler{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := reconciler.extractRoutes(context.Background(), tt.routes)
+			actual := reconciler.extractRoutes(context.Background(), tt.routes, tt.gateways)
 			if !reflect.DeepEqual(actual, tt.expected) {
 				t.Errorf("expected %v, got %v", tt.expected, actual)
 			}
