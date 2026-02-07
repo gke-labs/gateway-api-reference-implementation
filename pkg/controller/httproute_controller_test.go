@@ -108,6 +108,59 @@ func TestExtractRoutes(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "exact path match",
+			routes: &gatewayv1.HTTPRouteList{
+				Items: []gatewayv1.HTTPRoute{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									Matches: []gatewayv1.HTTPRouteMatch{
+										{
+											Path: &gatewayv1.HTTPPathMatch{
+												Type:  ptr(gatewayv1.PathMatchExact),
+												Value: ptr("/foo"),
+											},
+										},
+									},
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-svc",
+													Port: ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []proxy.HTTPRoute{
+				{
+					Rules: []proxy.RouteRule{
+						{
+							Matches: []proxy.RouteMatch{
+								{
+									Path: &proxy.PathMatch{
+										Type:  proxy.PathMatchTypeExact,
+										Value: "/foo",
+									},
+								},
+							},
+							Backend: proxy.Backend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	reconciler := &HTTPRouteReconciler{}
