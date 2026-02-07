@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -61,9 +62,10 @@ type PathMatch struct {
 
 // HeaderMatch holds the computed state for a header match.
 type HeaderMatch struct {
-	Type  string // Exact
-	Name  string
-	Value string
+	Type                        string // Exact, RegularExpression
+	Name                        string
+	MatchExactValue             string
+	MatchRegularExpressionValue *regexp.Regexp
 }
 
 // RouteMatch holds the computed state for a single match rule.
@@ -209,7 +211,22 @@ func (p *Proxy) matchMatch(match RouteMatch, r *http.Request) bool {
 	}
 
 	for _, hm := range match.Headers {
-		if r.Header.Get(hm.Name) != hm.Value {
+		values := r.Header[http.CanonicalHeaderKey(hm.Name)]
+		matched := false
+		for _, v := range values {
+			if hm.Type == "RegularExpression" {
+				if hm.MatchRegularExpressionValue != nil && hm.MatchRegularExpressionValue.MatchString(v) {
+					matched = true
+					break
+				}
+			} else {
+				if v == hm.MatchExactValue {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
 			return false
 		}
 	}
