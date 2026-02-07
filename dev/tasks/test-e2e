@@ -17,6 +17,31 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Install kind
+KIND_VERSION="v0.31.0"
+KIND_BIN="${REPO_ROOT}/.build/src/kind/${KIND_VERSION}/bin/kind"
+if [[ ! -x "${KIND_BIN}" ]]; then
+    echo "Installing kind ${KIND_VERSION}..."
+    mkdir -p "$(dirname "${KIND_BIN}")"
+    GOBIN="$(dirname "${KIND_BIN}")" go install "sigs.k8s.io/kind@${KIND_VERSION}"
+fi
+mkdir -p "${REPO_ROOT}/.build/bin"
+ln -sf "../src/kind/${KIND_VERSION}/bin/kind" "${REPO_ROOT}/.build/bin/kind"
+
+# Install kubectl
+KUBECTL_VERSION="v1.35.0"
+KUBECTL_BIN="${REPO_ROOT}/.build/src/kubectl/${KUBECTL_VERSION}/bin/kubectl"
+if [[ ! -x "${KUBECTL_BIN}" ]]; then
+    echo "Installing kubectl ${KUBECTL_VERSION}..."
+    mkdir -p "$(dirname "${KUBECTL_BIN}")"
+    curl -sLo "${KUBECTL_BIN}" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/$(go env GOOS)/$(go env GOARCH)/kubectl"
+    chmod +x "${KUBECTL_BIN}"
+fi
+ln -sf "../src/kubectl/${KUBECTL_VERSION}/bin/kubectl" "${REPO_ROOT}/.build/bin/kubectl"
+
+export PATH="${REPO_ROOT}/.build/bin:${PATH}"
 export RUN_E2E=1
 
 echo "Running basic E2E tests..."
