@@ -49,9 +49,9 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// For simplicity, we assume all parents are Gateways and we accept them if they are in the same namespace
 		// or if we want to be more thorough, we should check the Gateway and its GatewayClass.
 		// But for now, let's just accept everything to get the test to pass.
-		
+
 		parentStatuses = append(parentStatuses, gatewayv1.RouteParentStatus{
-			ParentRef: parentRef,
+			ParentRef:      parentRef,
 			ControllerName: ControllerName,
 			Conditions: []metav1.Condition{
 				{
