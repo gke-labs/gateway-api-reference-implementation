@@ -1,0 +1,15 @@
+{
+	"name": "Gateway API Reference Implementation",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"golang.go"
+			]
+		}
+	},
+	"remoteUser": "root",
+	"postCreateCommand": "go mod download"
+}
