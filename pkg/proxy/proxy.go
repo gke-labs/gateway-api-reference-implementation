@@ -29,8 +29,29 @@ type Backend struct {
 	Port int32
 }
 
+type PathMatchType string
+
+const (
+	PathMatchTypeExact      PathMatchType = "Exact"
+	PathMatchTypePathPrefix PathMatchType = "PathPrefix"
+	PathMatchTypeNone       PathMatchType = "None"
+)
+
+func (t PathMatchType) Weight() int {
+	switch t {
+	case PathMatchTypeExact:
+		return 3
+	case PathMatchTypePathPrefix:
+		return 2
+	case PathMatchTypeNone:
+		return 1
+	default:
+		return 0
+	}
+}
+
 type PathMatch struct {
-	Type  string // Exact, PathPrefix
+	Type  PathMatchType
 	Value string
 }
 
@@ -123,7 +144,7 @@ func (p *Proxy) isBetterMatch(current, best *RouteMatch) bool {
 	bestType := p.getPathMatchType(best)
 
 	if currentType != bestType {
-		return p.comparePathMatchType(currentType, bestType)
+		return currentType.Weight() > bestType.Weight()
 	}
 
 	// 2. Longest path match wins
@@ -137,20 +158,11 @@ func (p *Proxy) isBetterMatch(current, best *RouteMatch) bool {
 	return len(current.Headers) > len(best.Headers)
 }
 
-func (p *Proxy) getPathMatchType(m *RouteMatch) string {
+func (p *Proxy) getPathMatchType(m *RouteMatch) PathMatchType {
 	if m.Path == nil {
-		return "None"
+		return PathMatchTypeNone
 	}
 	return m.Path.Type
-}
-
-func (p *Proxy) comparePathMatchType(a, b string) bool {
-	weights := map[string]int{
-		"Exact":      3,
-		"PathPrefix": 2,
-		"None":       1,
-	}
-	return weights[a] > weights[b]
 }
 
 func (p *Proxy) getPathLen(m *RouteMatch) int {
@@ -173,27 +185,14 @@ func (p *Proxy) matchHostname(hostnames []string, host string) bool {
 	return false
 }
 
-func (p *Proxy) matchRule(rule RouteRule, r *http.Request) bool {
-	if len(rule.Matches) == 0 {
-		return true
-	}
-
-	for _, match := range rule.Matches {
-		if p.matchMatch(match, r) {
-			return true
-		}
-	}
-	return false
-}
-
 func (p *Proxy) matchMatch(match RouteMatch, r *http.Request) bool {
 	if match.Path != nil {
 		switch match.Path.Type {
-		case "Exact":
+		case PathMatchTypeExact:
 			if r.URL.Path != match.Path.Value {
 				return false
 			}
-		case "PathPrefix":
+		case PathMatchTypePathPrefix:
 			if !p.hasPathPrefix(r.URL.Path, match.Path.Value) {
 				return false
 			}
