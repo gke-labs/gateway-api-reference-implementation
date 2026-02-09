@@ -21,6 +21,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -42,7 +43,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	var route gatewayv1.HTTPRoute
 	if err := r.Get(ctx, req.NamespacedName, &route); err != nil {
-		if client.IgnoreNotFound(err) == nil {
+		if apierrors.IsNotFound(err) {
 			r.State.DeleteHTTPRoute(req.NamespacedName)
 			r.updateProxy()
 		}

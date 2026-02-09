@@ -20,6 +20,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -84,7 +85,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var gw gatewayv1.Gateway
 	if err := r.Get(ctx, req.NamespacedName, &gw); err != nil {
-		if client.IgnoreNotFound(err) == nil {
+		if apierrors.IsNotFound(err) {
 			r.State.DeleteGateway(req.NamespacedName)
 			r.updateProxy()
 		}
