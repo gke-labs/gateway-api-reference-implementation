@@ -59,10 +59,14 @@ func TestGatewayAPI(t *testing.T) {
 	t.Logf("Client logs: %s", logs)
 
 	// 6. Verify
-	if !strings.Contains(logs, "Status: 200 OK") {
-		t.Errorf("Expected 200 OK, got: %s", logs)
-	}
-	if !strings.Contains(logs, "\"hostname\":\"example.com\"") {
-		t.Errorf("Expected hostname example.com in response body, got: %s", logs)
+	if !strings.Contains(logs, "Status: 200 OK") || !strings.Contains(logs, "\"hostname\":\"example.com\"") {
+		controllerLogs := h.runCmd("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
+		t.Logf("Controller logs: %s", controllerLogs)
+		if !strings.Contains(logs, "Status: 200 OK") {
+			t.Errorf("Expected 200 OK, got: %s", logs)
+		}
+		if !strings.Contains(logs, "\"hostname\":\"example.com\"") {
+			t.Errorf("Expected hostname example.com in response body, got: %s", logs)
+		}
 	}
 }

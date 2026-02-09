@@ -16,8 +16,12 @@ package state
 
 import (
 	"fmt"
+	"net"
+	"net/http"
 	"regexp"
+	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -53,9 +57,36 @@ type InternalRoute struct {
 	Rules     []InternalRule
 }
 
+func (ir *InternalRoute) MatchHostname(host string) bool {
+	// Strip port if present
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	if len(ir.Hostnames) == 0 {
+		return true
+	}
+	for _, h := range ir.Hostnames {
+		if h == "*" {
+			return true
+		}
+		if h == host {
+			return true
+		}
+		if strings.HasPrefix(h, "*.") {
+			suffix := h[1:] // .example.com
+			if strings.HasSuffix(host, suffix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type InternalRule struct {
-	Matches []InternalMatch
-	Backend InternalBackend
+	Matches  []InternalMatch
+	Backend  *InternalBackend
+	Redirect *InternalRedirect
 }
 
 type InternalBackend struct {
@@ -63,9 +94,79 @@ type InternalBackend struct {
 	Port int32
 }
 
+type InternalRedirect struct {
+	Scheme     *string
+	Hostname   *gatewayv1.PreciseHostname
+	Path       *InternalPathRedirect
+	Port       *gatewayv1.PortNumber
+	StatusCode *int
+}
+
+type InternalPathRedirect struct {
+	Type  gatewayv1.HTTPPathModifierType
+	Value string
+}
+
 type InternalMatch struct {
 	Path    *InternalPathMatch
 	Headers []InternalHeaderMatch
+}
+
+func (im *InternalMatch) Matches(path string, header http.Header) bool {
+	if im.Path != nil {
+		switch im.Path.Type {
+		case gatewayv1.PathMatchExact:
+			if path != im.Path.Value {
+				return false
+			}
+		case gatewayv1.PathMatchPathPrefix:
+			if !hasPathPrefix(path, im.Path.Value) {
+				return false
+			}
+		}
+	}
+
+	for _, hm := range im.Headers {
+		values := header[http.CanonicalHeaderKey(hm.Name)]
+		matched := false
+		for _, v := range values {
+			if hm.Type == gatewayv1.HeaderMatchRegularExpression {
+				if hm.MatchRegularExpressionValue != nil && hm.MatchRegularExpressionValue.MatchString(v) {
+					matched = true
+					break
+				}
+			} else {
+				if v == hm.MatchExactValue {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	return true
+}
+
+func hasPathPrefix(path, prefix string) bool {
+	if prefix == "/" {
+		return true
+	}
+	if path == prefix {
+		return true
+	}
+	if len(path) > len(prefix) && path[len(prefix)] == '/' && path[:len(prefix)] == prefix {
+		return true
+	}
+	// Also handle case where prefix ends with /
+	if len(prefix) > 0 && prefix[len(prefix)-1] == '/' {
+		if len(path) >= len(prefix) && path[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
 }
 
 type InternalPathMatch struct {
@@ -80,6 +181,91 @@ type InternalHeaderMatch struct {
 	MatchRegularExpressionValue *regexp.Regexp
 }
 
+func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *InternalMatch) {
+	var bestRule *InternalRule
+	var bestMatch *InternalMatch
+
+	for i := range routes {
+		route := &routes[i]
+		if !route.MatchHostname(r.Host) {
+			continue
+		}
+
+		for j := range route.Rules {
+			rule := &route.Rules[j]
+			for k := range rule.Matches {
+				match := &rule.Matches[k]
+				if match.Matches(r.URL.Path, r.Header) {
+					if isBetterMatch(match, bestMatch) {
+						bestMatch = match
+						bestRule = rule
+					}
+				}
+			}
+			if len(rule.Matches) == 0 {
+				// Rule with no matches always matches, but is the least specific
+				if bestRule == nil {
+					bestRule = rule
+					bestMatch = &InternalMatch{}
+				}
+			}
+		}
+	}
+
+	return bestRule, bestMatch
+}
+
+func isBetterMatch(current, best *InternalMatch) bool {
+	if best == nil {
+		return true
+	}
+
+	// 1. Path match type priority: Exact > PathPrefix > None
+	currentType := getPathMatchType(current)
+	bestType := getPathMatchType(best)
+
+	if currentType != bestType {
+		return getPathMatchTypeWeight(currentType) > getPathMatchTypeWeight(bestType)
+	}
+
+	// 2. Longest path match wins
+	currentPathLen := getPathLen(current)
+	bestPathLen := getPathLen(best)
+	if currentPathLen != bestPathLen {
+		return currentPathLen > bestPathLen
+	}
+
+	// 3. Most header matches win
+	return len(current.Headers) > len(best.Headers)
+}
+
+func getPathMatchType(m *InternalMatch) gatewayv1.PathMatchType {
+	if m.Path == nil {
+		return ""
+	}
+	return m.Path.Type
+}
+
+func getPathMatchTypeWeight(t gatewayv1.PathMatchType) int {
+	switch t {
+	case gatewayv1.PathMatchExact:
+		return 3
+	case gatewayv1.PathMatchPathPrefix:
+		return 2
+	case "":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func getPathLen(m *InternalMatch) int {
+	if m.Path == nil {
+		return 0
+	}
+	return len(m.Path.Value)
+}
+
 func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerName string) []InternalRoute {
 	var internalRoutes []InternalRoute
 
@@ -90,28 +276,29 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 		}
 
 		for _, route := range routes {
-			if !route.IsAccepted(controllerName) {
-				continue
-			}
-
 			// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
 			bound := false
 			var matchingParentRef *gatewayv1.ParentReference
-			for _, parentRef := range route.Spec.ParentRefs {
+			for i := range route.Spec.ParentRefs {
+				parentRef := &route.Spec.ParentRefs[i]
 				if string(parentRef.Name) != s.Name {
 					continue
 				}
 				// Namespace check (optional for now as per current implementation)
-				if parentRef.Namespace != nil && string(*parentRef.Namespace) != s.Namespace {
+				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
 					continue
 				}
 
-				if parentRef.SectionName != nil && *parentRef.SectionName != listener.Name {
+				if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
 					continue
 				}
-				bound = true
-				matchingParentRef = &parentRef
-				break
+
+				// Dynamically compute acceptance for this listener
+				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}); cond.Status == metav1.ConditionTrue {
+					bound = true
+					matchingParentRef = parentRef
+					break
+				}
 			}
 
 			if !bound {
@@ -120,12 +307,9 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 
 			// Calculate intersected hostnames
 			routeHostnames := route.GetHostnames()
-			var listenerHostname string
-			if listener.Hostname != nil {
-				listenerHostname = string(*listener.Hostname)
-			}
+			listenerHostname := ValueOf(listener.Hostname)
 
-			effectiveHostnames := intersectHostnames(routeHostnames, listenerHostname)
+			effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
 			if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
 				// No intersection, skip this listener
 				continue
@@ -136,62 +320,93 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 			}
 
 			for _, rule := range route.Spec.Rules {
-				for _, backendRef := range rule.BackendRefs {
-					if backendRef.Kind != nil && *backendRef.Kind != "Service" {
-						continue
-					}
-
-					if backendRef.Port == nil {
-						continue
-					}
-
-					backend := InternalBackend{
-						Host: fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, route.Namespace),
-						Port: int32(*backendRef.Port),
-					}
-
-					iRule := InternalRule{
-						Backend: backend,
-					}
-
-					for _, match := range rule.Matches {
-						iMatch := InternalMatch{}
-						if match.Path != nil {
-							pathType := gatewayv1.PathMatchPathPrefix
-							if match.Path.Type != nil {
-								pathType = *match.Path.Type
+				var redirect *InternalRedirect
+				for _, filter := range rule.Filters {
+					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
+						r := filter.RequestRedirect
+						redirect = &InternalRedirect{
+							Scheme:     r.Scheme,
+							Hostname:   r.Hostname,
+							Port:       r.Port,
+							StatusCode: r.StatusCode,
+						}
+						if r.Path != nil {
+							var pathValue string
+							if r.Path.Type == gatewayv1.FullPathHTTPPathModifier {
+								pathValue = ValueOf(r.Path.ReplaceFullPath)
+							} else if r.Path.Type == gatewayv1.PrefixMatchHTTPPathModifier {
+								pathValue = ValueOf(r.Path.ReplacePrefixMatch)
 							}
-							iMatch.Path = &InternalPathMatch{
-								Type:  pathType,
-								Value: *match.Path.Value,
+							redirect.Path = &InternalPathRedirect{
+								Type:  r.Path.Type,
+								Value: pathValue,
 							}
 						}
-						for _, header := range match.Headers {
-							headerType := gatewayv1.HeaderMatchExact
-							if header.Type != nil {
-								headerType = *header.Type
-							}
-							hm := InternalHeaderMatch{
-								Type:            headerType,
-								Name:            string(header.Name),
-								MatchExactValue: header.Value,
-							}
-							if headerType == gatewayv1.HeaderMatchRegularExpression {
-								re, err := regexp.Compile(header.Value)
-								if err == nil {
-									hm.MatchRegularExpressionValue = re
-								}
-							}
-							iMatch.Headers = append(iMatch.Headers, hm)
-						}
-						iRule.Matches = append(iRule.Matches, iMatch)
+						break
 					}
-
-					ir.Rules = append(ir.Rules, iRule)
-
-					// For minimal implementation, we just take the first Service backendRef for each rule
-					break
 				}
+
+				iRule := InternalRule{
+					Redirect: redirect,
+				}
+
+				if redirect == nil {
+					for _, backendRef := range rule.BackendRefs {
+						kind := ValueOf(backendRef.Kind)
+						if kind == "" {
+							kind = "Service"
+						}
+						if kind != "Service" {
+							continue
+						}
+
+						if backendRef.Port == nil {
+							continue
+						}
+
+						iRule.Backend = &InternalBackend{
+							Host: fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, route.Namespace),
+							Port: int32(*backendRef.Port),
+						}
+
+						// For minimal implementation, we just take the first Service backendRef for each rule
+						break
+					}
+				}
+
+				for _, match := range rule.Matches {
+					iMatch := InternalMatch{}
+					if match.Path != nil {
+						iMatch.Path = &InternalPathMatch{
+							Type:  ValueOf(match.Path.Type),
+							Value: ValueOf(match.Path.Value),
+						}
+						if iMatch.Path.Type == "" {
+							iMatch.Path.Type = gatewayv1.PathMatchPathPrefix
+						}
+					}
+					for _, header := range match.Headers {
+						headerType := ValueOf(header.Type)
+						if headerType == "" {
+							headerType = gatewayv1.HeaderMatchExact
+						}
+						hm := InternalHeaderMatch{
+							Type:            headerType,
+							Name:            string(header.Name),
+							MatchExactValue: header.Value,
+						}
+						if headerType == gatewayv1.HeaderMatchRegularExpression {
+							re, err := regexp.Compile(header.Value)
+							if err == nil {
+								hm.MatchRegularExpressionValue = re
+							}
+						}
+						iMatch.Headers = append(iMatch.Headers, hm)
+					}
+					iRule.Matches = append(iRule.Matches, iMatch)
+				}
+
+				ir.Rules = append(ir.Rules, iRule)
 			}
 			internalRoutes = append(internalRoutes, ir)
 			_ = matchingParentRef // keep for now

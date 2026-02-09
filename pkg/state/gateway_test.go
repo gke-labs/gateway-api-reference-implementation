@@ -22,10 +22,6 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-func ptr[T any](v T) *T {
-	return &v
-}
-
 func TestBuildInternalRoutes(t *testing.T) {
 	controllerName := "test-controller"
 	tests := []struct {
@@ -74,9 +70,9 @@ func TestBuildInternalRoutes(t *testing.T) {
 										{
 											BackendRef: gatewayv1.BackendRef{
 												BackendObjectReference: gatewayv1.BackendObjectReference{
-													Kind: ptr(gatewayv1.Kind("Service")),
+													Kind: Ptr(gatewayv1.Kind("Service")),
 													Name: "backend-svc",
-													Port: ptr(gatewayv1.PortNumber(80)),
+													Port: Ptr(gatewayv1.PortNumber(80)),
 												},
 											},
 										},
@@ -110,7 +106,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
 						},
 					},
 				},
@@ -129,7 +125,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 							{
 								Name:     "http",
 								Protocol: gatewayv1.HTTPProtocolType,
-								Hostname: ptr(gatewayv1.Hostname("*.example.com")),
+								Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
 							},
 						},
 					},
@@ -158,7 +154,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 											BackendRef: gatewayv1.BackendRef{
 												BackendObjectReference: gatewayv1.BackendObjectReference{
 													Name: "backend-svc",
-													Port: ptr(gatewayv1.PortNumber(8080)),
+													Port: Ptr(gatewayv1.PortNumber(8080)),
 												},
 											},
 										},
@@ -192,7 +188,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"foo.example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: InternalBackend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
+							Backend: &InternalBackend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
 						},
 					},
 				},
@@ -236,8 +232,8 @@ func TestBuildInternalRoutes(t *testing.T) {
 									Matches: []gatewayv1.HTTPRouteMatch{
 										{
 											Path: &gatewayv1.HTTPPathMatch{
-												Type:  ptr(gatewayv1.PathMatchExact),
-												Value: ptr("/foo"),
+												Type:  Ptr(gatewayv1.PathMatchExact),
+												Value: Ptr("/foo"),
 											},
 										},
 									},
@@ -246,7 +242,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 											BackendRef: gatewayv1.BackendRef{
 												BackendObjectReference: gatewayv1.BackendObjectReference{
 													Name: "backend-svc",
-													Port: ptr(gatewayv1.PortNumber(80)),
+													Port: Ptr(gatewayv1.PortNumber(80)),
 												},
 											},
 										},
@@ -288,7 +284,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 									},
 								},
 							},
-							Backend: InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
 						},
 					},
 				},

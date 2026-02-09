@@ -16,6 +16,7 @@ package proxy
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -50,169 +51,81 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	routes := p.routes
 	p.mu.RUnlock()
 
-	var bestBackend *state.InternalBackend
-	var bestMatch *state.InternalMatch
+	bestRule, bestMatch := state.MatchRoute(routes, r)
 
-	for _, route := range routes {
-		if !p.matchHostname(route.Hostnames, r.Host) {
-			continue
+	if bestRule != nil {
+		if bestRule.Redirect != nil {
+			p.redirect(w, r, *bestRule.Redirect, bestMatch)
+			return
 		}
-
-		for _, rule := range route.Rules {
-			for _, match := range rule.Matches {
-				m := match
-				if p.matchMatch(m, r) {
-					if p.isBetterMatch(&m, bestMatch) {
-						bestMatch = &m
-						bestBackend = &rule.Backend
-					}
-				}
-			}
-			if len(rule.Matches) == 0 {
-				// Rule with no matches always matches, but is the least specific
-				if bestBackend == nil {
-					bestBackend = &rule.Backend
-					bestMatch = &state.InternalMatch{}
-				}
-			}
+		if bestRule.Backend != nil {
+			p.forward(w, r, *bestRule.Backend)
+			return
 		}
-	}
-
-	if bestBackend != nil {
-		p.forward(w, r, *bestBackend)
-		return
 	}
 
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
 }
 
-func (p *Proxy) isBetterMatch(current, best *state.InternalMatch) bool {
-	if best == nil {
-		return true
+func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {
+	newURL := &url.URL{
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
 	}
 
-	// 1. Path match type priority: Exact > PathPrefix > None
-	currentType := p.getPathMatchType(current)
-	bestType := p.getPathMatchType(best)
-
-	if currentType != bestType {
-		return p.getPathMatchTypeWeight(currentType) > p.getPathMatchTypeWeight(bestType)
+	// Inherit scheme
+	if r.TLS != nil {
+		newURL.Scheme = "https"
+	} else {
+		newURL.Scheme = "http"
+	}
+	if scheme := state.ValueOf(redirect.Scheme); scheme != "" {
+		newURL.Scheme = scheme
 	}
 
-	// 2. Longest path match wins
-	currentPathLen := p.getPathLen(current)
-	bestPathLen := p.getPathLen(best)
-	if currentPathLen != bestPathLen {
-		return currentPathLen > bestPathLen
-	}
+	// Inherit host and port
+	newURL.Host = r.Host
 
-	// 3. Most header matches win
-	return len(current.Headers) > len(best.Headers)
-}
-
-func (p *Proxy) getPathMatchType(m *state.InternalMatch) gatewayv1.PathMatchType {
-	if m.Path == nil {
-		return ""
-	}
-	return m.Path.Type
-}
-
-func (p *Proxy) getPathMatchTypeWeight(t gatewayv1.PathMatchType) int {
-	switch t {
-	case gatewayv1.PathMatchExact:
-		return 3
-	case gatewayv1.PathMatchPathPrefix:
-		return 2
-	case "":
-		return 1
-	default:
-		return 0
-	}
-}
-
-func (p *Proxy) getPathLen(m *state.InternalMatch) int {
-	if m.Path == nil {
-		return 0
-	}
-	return len(m.Path.Value)
-}
-
-func (p *Proxy) matchHostname(hostnames []string, host string) bool {
-	if len(hostnames) == 0 {
-		return true
-	}
-	for _, h := range hostnames {
-		if h == "*" {
-			return true
-		}
-		if h == host {
-			return true
-		}
-		if strings.HasPrefix(h, "*.") {
-			suffix := h[1:] // .example.com
-			if strings.HasSuffix(host, suffix) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (p *Proxy) matchMatch(match state.InternalMatch, r *http.Request) bool {
-	if match.Path != nil {
-		switch match.Path.Type {
-		case gatewayv1.PathMatchExact:
-			if r.URL.Path != match.Path.Value {
-				return false
-			}
-		case gatewayv1.PathMatchPathPrefix:
-			if !p.hasPathPrefix(r.URL.Path, match.Path.Value) {
-				return false
-			}
+	if hostname := state.ValueOf(redirect.Hostname); hostname != "" {
+		h, port, err := net.SplitHostPort(newURL.Host)
+		if err != nil {
+			// No port in current Host
+			newURL.Host = string(hostname)
+		} else {
+			_ = h
+			newURL.Host = net.JoinHostPort(string(hostname), port)
 		}
 	}
 
-	for _, hm := range match.Headers {
-		values := r.Header[http.CanonicalHeaderKey(hm.Name)]
-		matched := false
-		for _, v := range values {
-			if hm.Type == gatewayv1.HeaderMatchRegularExpression {
-				if hm.MatchRegularExpressionValue != nil && hm.MatchRegularExpressionValue.MatchString(v) {
-					matched = true
-					break
-				}
-			} else {
-				if v == hm.MatchExactValue {
-					matched = true
-					break
+	if port := state.ValueOf(redirect.Port); port != 0 {
+		h, _, err := net.SplitHostPort(newURL.Host)
+		if err != nil {
+			h = newURL.Host
+		}
+		newURL.Host = net.JoinHostPort(h, fmt.Sprintf("%d", port))
+	}
+
+	if redirect.Path != nil {
+		switch redirect.Path.Type {
+		case gatewayv1.FullPathHTTPPathModifier:
+			newURL.Path = redirect.Path.Value
+		case gatewayv1.PrefixMatchHTTPPathModifier:
+			if match != nil && match.Path != nil && match.Path.Type == gatewayv1.PathMatchPathPrefix {
+				prefix := match.Path.Value
+				if strings.HasPrefix(r.URL.Path, prefix) {
+					newURL.Path = redirect.Path.Value + r.URL.Path[len(prefix):]
 				}
 			}
 		}
-		if !matched {
-			return false
-		}
 	}
 
-	return true
-}
+	statusCode := state.ValueOf(redirect.StatusCode)
+	if statusCode == 0 {
+		statusCode = http.StatusFound
+	}
 
-func (p *Proxy) hasPathPrefix(path, prefix string) bool {
-	if prefix == "/" {
-		return true
-	}
-	if path == prefix {
-		return true
-	}
-	if len(path) > len(prefix) && path[len(prefix)] == '/' && path[:len(prefix)] == prefix {
-		return true
-	}
-	// Also handle case where prefix ends with /
-	if len(prefix) > 0 && prefix[len(prefix)-1] == '/' {
-		if len(path) >= len(prefix) && path[:len(prefix)] == prefix {
-			return true
-		}
-	}
-	return false
+	log.Log.Info("Redirecting request", "host", r.Host, "path", r.URL.Path, "target", newURL.String(), "status", statusCode)
+	http.Redirect(w, r, newURL.String(), statusCode)
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend) {

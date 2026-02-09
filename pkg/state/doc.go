@@ -12,4 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package controller
+// Package state holds the internal state of the Gateway API resources.
+// It maintains a mapping from Kubernetes API objects to internal representations
+// and provides helper methods to compute the proxy configuration.
+//
+// The state package follows a pattern where it holds the last-observed state of
+// Kubernetes objects and provides unoptimized (but potentially memoized in the future)
+// methods to derive the desired configuration for the proxy.
+package state
