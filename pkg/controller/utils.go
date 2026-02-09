@@ -13,7 +13,3 @@
 // limitations under the License.
 
 package controller
-
-func ptr[T any](v T) *T {
-	return &v
-}

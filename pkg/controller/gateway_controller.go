@@ -83,8 +83,8 @@ type GatewayReconciler struct {
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
-	var gw gatewayv1.Gateway
-	if err := r.Get(ctx, req.NamespacedName, &gw); err != nil {
+	gw := &gatewayv1.Gateway{}
+	if err := r.Get(ctx, req.NamespacedName, gw); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.State.DeleteGateway(req.NamespacedName)
 			r.updateProxy()
@@ -93,8 +93,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Check if the GatewayClass is managed by us
-	var gc gatewayv1.GatewayClass
-	if err := r.Get(ctx, client.ObjectKey{Name: string(gw.Spec.GatewayClassName)}, &gc); err != nil {
+	gc := &gatewayv1.GatewayClass{}
+	if err := r.Get(ctx, client.ObjectKey{Name: string(gw.Spec.GatewayClassName)}, gc); err != nil {
 		l.Error(err, "unable to fetch GatewayClass", "gatewayclass", gw.Spec.GatewayClassName)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -141,17 +141,17 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	gw.Status.Addresses = []gatewayv1.GatewayStatusAddress{
 		{
-			Type:  ptr(gatewayv1.IPAddressType),
+			Type:  state.Ptr(gatewayv1.IPAddressType),
 			Value: ip,
 		},
 	}
 
-	if err := r.Status().Update(ctx, &gw); err != nil {
+	if err := r.Status().Update(ctx, gw); err != nil {
 		l.Error(err, "unable to update Gateway status")
 		return ctrl.Result{}, err
 	}
 
-	r.State.UpsertGateway(&gw)
+	r.State.UpsertGateway(gw)
 	r.updateProxy()
 
 	l.Info("Updated Gateway status", "address", ip)

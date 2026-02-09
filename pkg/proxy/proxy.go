@@ -16,6 +16,7 @@ package proxy
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -67,19 +68,41 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {
-	newURL := *r.URL
-	newURL.Scheme = state.ValueOf(redirect.Scheme)
-	if newURL.Scheme == "" {
-		newURL.Scheme = "http"
+	newURL := &url.URL{
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
 	}
 
+	// Inherit scheme
+	if r.TLS != nil {
+		newURL.Scheme = "https"
+	} else {
+		newURL.Scheme = "http"
+	}
+	if scheme := state.ValueOf(redirect.Scheme); scheme != "" {
+		newURL.Scheme = scheme
+	}
+
+	// Inherit host and port
+	newURL.Host = r.Host
+
 	if hostname := state.ValueOf(redirect.Hostname); hostname != "" {
-		newURL.Host = string(hostname)
+		h, port, err := net.SplitHostPort(newURL.Host)
+		if err != nil {
+			// No port in current Host
+			newURL.Host = string(hostname)
+		} else {
+			_ = h
+			newURL.Host = net.JoinHostPort(string(hostname), port)
+		}
 	}
 
 	if port := state.ValueOf(redirect.Port); port != 0 {
-		host := newURL.Hostname()
-		newURL.Host = fmt.Sprintf("%s:%d", host, port)
+		h, _, err := net.SplitHostPort(newURL.Host)
+		if err != nil {
+			h = newURL.Host
+		}
+		newURL.Host = net.JoinHostPort(h, fmt.Sprintf("%d", port))
 	}
 
 	if redirect.Path != nil {

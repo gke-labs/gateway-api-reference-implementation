@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -184,26 +185,27 @@ func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *Intern
 	var bestRule *InternalRule
 	var bestMatch *InternalMatch
 
-	for _, route := range routes {
+	for i := range routes {
+		route := &routes[i]
 		if !route.MatchHostname(r.Host) {
 			continue
 		}
 
-		for _, rule := range route.Rules {
-			rRule := rule
-			for _, match := range rRule.Matches {
-				m := match
-				if m.Matches(r.URL.Path, r.Header) {
-					if isBetterMatch(&m, bestMatch) {
-						bestMatch = &m
-						bestRule = &rRule
+		for j := range route.Rules {
+			rule := &route.Rules[j]
+			for k := range rule.Matches {
+				match := &rule.Matches[k]
+				if match.Matches(r.URL.Path, r.Header) {
+					if isBetterMatch(match, bestMatch) {
+						bestMatch = match
+						bestRule = rule
 					}
 				}
 			}
-			if len(rRule.Matches) == 0 {
+			if len(rule.Matches) == 0 {
 				// Rule with no matches always matches, but is the least specific
 				if bestRule == nil {
-					bestRule = &rRule
+					bestRule = rule
 					bestMatch = &InternalMatch{}
 				}
 			}
@@ -274,14 +276,11 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 		}
 
 		for _, route := range routes {
-			if !route.IsAccepted(controllerName) {
-				continue
-			}
-
 			// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
 			bound := false
 			var matchingParentRef *gatewayv1.ParentReference
-			for _, parentRef := range route.Spec.ParentRefs {
+			for i := range route.Spec.ParentRefs {
+				parentRef := &route.Spec.ParentRefs[i]
 				if string(parentRef.Name) != s.Name {
 					continue
 				}
@@ -293,9 +292,13 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 				if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
 					continue
 				}
-				bound = true
-				matchingParentRef = &parentRef
-				break
+
+				// Dynamically compute acceptance for this listener
+				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}); cond.Status == metav1.ConditionTrue {
+					bound = true
+					matchingParentRef = parentRef
+					break
+				}
 			}
 
 			if !bound {
@@ -349,7 +352,11 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 
 				if redirect == nil {
 					for _, backendRef := range rule.BackendRefs {
-						if ValueOf(backendRef.Kind) != "Service" && backendRef.Kind != nil {
+						kind := ValueOf(backendRef.Kind)
+						if kind == "" {
+							kind = "Service"
+						}
+						if kind != "Service" {
 							continue
 						}
 

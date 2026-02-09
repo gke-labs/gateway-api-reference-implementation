@@ -39,8 +39,8 @@ type HTTPRouteReconciler struct {
 func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
-	var route gatewayv1.HTTPRoute
-	if err := r.Get(ctx, req.NamespacedName, &route); err != nil {
+	route := &gatewayv1.HTTPRoute{}
+	if err := r.Get(ctx, req.NamespacedName, route); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.State.DeleteHTTPRoute(req.NamespacedName)
 			r.updateProxy()
@@ -49,14 +49,14 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// If the route is not accepted, we still update the state but it won't be used for proxying
-	validationCondition := r.State.UpsertHTTPRoute(&route)
+	validationCondition := r.State.UpsertHTTPRoute(route)
 
 	// Update status
 	// For each parentRef, we should add a ParentStatus
 	var parentStatuses []gatewayv1.RouteParentStatus
 
 	gateways := r.State.GetGateways()
-	rs := state.HTTPRouteState{HTTPRoute: &route}
+	rs := state.HTTPRouteState{HTTPRoute: route}
 
 	for _, parentRef := range route.Spec.ParentRefs {
 		acceptedCondition := validationCondition
@@ -81,11 +81,12 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		})
 	}
 	route.Status.Parents = parentStatuses
-	if err := r.Status().Update(ctx, &route); err != nil {
+	if err := r.Status().Update(ctx, route); err != nil {
 		l.Error(err, "unable to update HTTPRoute status")
 		return ctrl.Result{}, err
 	}
 
+	r.State.UpsertHTTPRoute(route)
 	r.updateProxy()
 
 	l.Info("Updated HTTPRoute status and proxy")
