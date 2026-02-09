@@ -102,6 +102,33 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 	}
 }
 
+func (s *HTTPRouteState) ComputeResolvedRefsCondition() metav1.Condition {
+	resolvedRefsStatus := metav1.ConditionTrue
+	resolvedRefsReason := gatewayv1.RouteReasonResolvedRefs
+	resolvedRefsMessage := "All references resolved"
+
+	for _, rule := range s.Spec.Rules {
+		for _, backendRef := range rule.BackendRefs {
+			if backendRef.Kind != nil && *backendRef.Kind != "Service" {
+				resolvedRefsStatus = metav1.ConditionFalse
+				resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
+				resolvedRefsMessage = fmt.Sprintf("Unsupported backend kind: %s", *backendRef.Kind)
+				goto done
+			}
+		}
+	}
+
+done:
+	return metav1.Condition{
+		Type:               string(gatewayv1.RouteConditionResolvedRefs),
+		Status:             resolvedRefsStatus,
+		ObservedGeneration: s.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             string(resolvedRefsReason),
+		Message:            resolvedRefsMessage,
+	}
+}
+
 func (s *HTTPRouteState) IsAccepted(controllerName string) bool {
 	if s.HTTPRoute == nil {
 		return false

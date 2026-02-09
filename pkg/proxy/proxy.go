@@ -58,6 +58,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.redirect(w, r, *bestRule.Redirect, bestMatch)
 			return
 		}
+		if bestRule.Error != nil {
+			// Per Gateway API specification, if a rule matches but its backend is invalid
+			// or unresolved, the implementation SHOULD return an HTTP 500 Internal Server Error.
+			// This is also verified by conformance tests like HTTPRouteInvalidBackendRefUnknownKind.
+			http.Error(w, bestRule.Error.HTTPMessage, bestRule.Error.HTTPStatusCode)
+			return
+		}
 		if bestRule.Backend != nil {
 			p.forward(w, r, *bestRule.Backend)
 			return

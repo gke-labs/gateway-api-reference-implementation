@@ -69,14 +69,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			ControllerName: ControllerName,
 			Conditions: []metav1.Condition{
 				acceptedCondition,
-				{
-					Type:               string(gatewayv1.RouteConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: route.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.RouteReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
+				rs.ComputeResolvedRefsCondition(),
 			},
 		})
 	}
