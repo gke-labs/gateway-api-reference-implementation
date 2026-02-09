@@ -16,7 +16,10 @@ package state
 
 import (
 	"fmt"
+	"net"
+	"net/http"
 	"regexp"
+	"strings"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -53,6 +56,32 @@ type InternalRoute struct {
 	Rules     []InternalRule
 }
 
+func (ir *InternalRoute) MatchHostname(host string) bool {
+	// Strip port if present
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	if len(ir.Hostnames) == 0 {
+		return true
+	}
+	for _, h := range ir.Hostnames {
+		if h == "*" {
+			return true
+		}
+		if h == host {
+			return true
+		}
+		if strings.HasPrefix(h, "*.") {
+			suffix := h[1:] // .example.com
+			if strings.HasSuffix(host, suffix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type InternalRule struct {
 	Matches  []InternalMatch
 	Backend  *InternalBackend
@@ -82,6 +111,63 @@ type InternalMatch struct {
 	Headers []InternalHeaderMatch
 }
 
+func (im *InternalMatch) Matches(path string, header http.Header) bool {
+	if im.Path != nil {
+		switch im.Path.Type {
+		case gatewayv1.PathMatchExact:
+			if path != im.Path.Value {
+				return false
+			}
+		case gatewayv1.PathMatchPathPrefix:
+			if !hasPathPrefix(path, im.Path.Value) {
+				return false
+			}
+		}
+	}
+
+	for _, hm := range im.Headers {
+		values := header[http.CanonicalHeaderKey(hm.Name)]
+		matched := false
+		for _, v := range values {
+			if hm.Type == gatewayv1.HeaderMatchRegularExpression {
+				if hm.MatchRegularExpressionValue != nil && hm.MatchRegularExpressionValue.MatchString(v) {
+					matched = true
+					break
+				}
+			} else {
+				if v == hm.MatchExactValue {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	return true
+}
+
+func hasPathPrefix(path, prefix string) bool {
+	if prefix == "/" {
+		return true
+	}
+	if path == prefix {
+		return true
+	}
+	if len(path) > len(prefix) && path[len(prefix)] == '/' && path[:len(prefix)] == prefix {
+		return true
+	}
+	// Also handle case where prefix ends with /
+	if len(prefix) > 0 && prefix[len(prefix)-1] == '/' {
+		if len(path) >= len(prefix) && path[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
+}
+
 type InternalPathMatch struct {
 	Type  gatewayv1.PathMatchType
 	Value string
@@ -92,6 +178,90 @@ type InternalHeaderMatch struct {
 	Name                        string
 	MatchExactValue             string
 	MatchRegularExpressionValue *regexp.Regexp
+}
+
+func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *InternalMatch) {
+	var bestRule *InternalRule
+	var bestMatch *InternalMatch
+
+	for _, route := range routes {
+		if !route.MatchHostname(r.Host) {
+			continue
+		}
+
+		for _, rule := range route.Rules {
+			rRule := rule
+			for _, match := range rRule.Matches {
+				m := match
+				if m.Matches(r.URL.Path, r.Header) {
+					if isBetterMatch(&m, bestMatch) {
+						bestMatch = &m
+						bestRule = &rRule
+					}
+				}
+			}
+			if len(rRule.Matches) == 0 {
+				// Rule with no matches always matches, but is the least specific
+				if bestRule == nil {
+					bestRule = &rRule
+					bestMatch = &InternalMatch{}
+				}
+			}
+		}
+	}
+
+	return bestRule, bestMatch
+}
+
+func isBetterMatch(current, best *InternalMatch) bool {
+	if best == nil {
+		return true
+	}
+
+	// 1. Path match type priority: Exact > PathPrefix > None
+	currentType := getPathMatchType(current)
+	bestType := getPathMatchType(best)
+
+	if currentType != bestType {
+		return getPathMatchTypeWeight(currentType) > getPathMatchTypeWeight(bestType)
+	}
+
+	// 2. Longest path match wins
+	currentPathLen := getPathLen(current)
+	bestPathLen := getPathLen(best)
+	if currentPathLen != bestPathLen {
+		return currentPathLen > bestPathLen
+	}
+
+	// 3. Most header matches win
+	return len(current.Headers) > len(best.Headers)
+}
+
+func getPathMatchType(m *InternalMatch) gatewayv1.PathMatchType {
+	if m.Path == nil {
+		return ""
+	}
+	return m.Path.Type
+}
+
+func getPathMatchTypeWeight(t gatewayv1.PathMatchType) int {
+	switch t {
+	case gatewayv1.PathMatchExact:
+		return 3
+	case gatewayv1.PathMatchPathPrefix:
+		return 2
+	case "":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func getPathLen(m *InternalMatch) int {
+	if m.Path == nil {
+		return 0
+	}
+	return len(m.Path.Value)
 }
 
 func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerName string) []InternalRoute {

@@ -15,8 +15,10 @@
 package state
 
 import (
+	"fmt"
 	"sync"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -51,12 +53,33 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 	delete(s.gateways, name)
 }
 
-func (s *State) UpsertHTTPRoute(route *gatewayv1.HTTPRoute) {
+func (s *State) UpsertHTTPRoute(route *gatewayv1.HTTPRoute) metav1.Condition {
+	rs := &HTTPRouteState{
+		HTTPRoute: route,
+	}
+
+	status := metav1.ConditionTrue
+	reason := gatewayv1.RouteReasonAccepted
+	message := "Route accepted by reference implementation"
+
+	if err := rs.Validate(); err != nil {
+		status = metav1.ConditionFalse
+		reason = gatewayv1.RouteReasonUnsupportedValue
+		message = fmt.Sprintf("Invalid route: %v", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.httpRoutes[types.NamespacedName{Namespace: route.Namespace, Name: route.Name}] = &HTTPRouteState{
-		HTTPRoute: route,
+	s.httpRoutes[types.NamespacedName{Namespace: route.Namespace, Name: route.Name}] = rs
+
+	return metav1.Condition{
+		Type:               string(gatewayv1.RouteConditionAccepted),
+		Status:             status,
+		ObservedGeneration: route.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             string(reason),
+		Message:            message,
 	}
 }
 
