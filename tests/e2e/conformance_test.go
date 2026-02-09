@@ -101,6 +101,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteHostnameIntersection,
 		tests.HTTPRoute303Redirect,
 		tests.HTTPRoute307Redirect,
+		tests.HTTPRoute308Redirect,
 	}
 
 	cSuite.Setup(t, selectedTests)
