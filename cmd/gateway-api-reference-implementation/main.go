@@ -119,14 +119,14 @@ func run(ctx context.Context) error {
 		State:  st,
 		Proxy:  p,
 	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("unable to create controller HTTPRoute: %w", err)
+		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
 	}
 
 	if err = (&controller.GatewayClassReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("unable to create controller GatewayClass: %w", err)
+		return fmt.Errorf("error creating GatewayClass controller: %w", err)
 	}
 
 	if err = (&controller.GatewayReconciler{
@@ -135,7 +135,7 @@ func run(ctx context.Context) error {
 		State:  st,
 		Proxy:  p,
 	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("unable to create controller Gateway: %w", err)
+		return fmt.Errorf("error creating Gateway controller: %w", err)
 	}
 
 	g.Go(func() error {
