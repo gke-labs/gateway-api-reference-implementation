@@ -17,7 +17,10 @@ package controller
 import (
 	"context"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -73,6 +76,8 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 type GatewayReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	State  *state.State
+	Proxy  *proxy.Proxy
 }
 
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -80,6 +85,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var gw gatewayv1.Gateway
 	if err := r.Get(ctx, req.NamespacedName, &gw); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.State.DeleteGateway(req.NamespacedName)
+			r.updateProxy()
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -142,9 +151,23 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	r.State.UpsertGateway(&gw)
+	r.updateProxy()
+
 	l.Info("Updated Gateway status", "address", ip)
 
 	return ctrl.Result{}, nil
+}
+
+func (r *GatewayReconciler) updateProxy() {
+	gateways := r.State.GetGateways()
+	routes := r.State.GetHTTPRoutes()
+
+	var proxyRoutes []state.InternalRoute
+	for _, gw := range gateways {
+		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, ControllerName)...)
+	}
+	r.Proxy.UpdateRoutes(proxyRoutes)
 }
 
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {

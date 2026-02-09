@@ -19,87 +19,27 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"regexp"
 	"strings"
 	"sync"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
-
-// Backend holds the computed state for a backend service.
-type Backend struct {
-	Host string
-	Port int32
-}
-
-// PathMatchType defines how a path should be matched.
-type PathMatchType string
-
-const (
-	PathMatchTypeExact      PathMatchType = "Exact"
-	PathMatchTypePathPrefix PathMatchType = "PathPrefix"
-	PathMatchTypeNone       PathMatchType = "None"
-)
-
-// Weight returns the precedence weight for the path match type.
-func (t PathMatchType) Weight() int {
-	switch t {
-	case PathMatchTypeExact:
-		return 3
-	case PathMatchTypePathPrefix:
-		return 2
-	case PathMatchTypeNone:
-		return 1
-	default:
-		return 0
-	}
-}
-
-// PathMatch holds the computed state for a path match.
-type PathMatch struct {
-	Type  PathMatchType
-	Value string
-}
-
-// HeaderMatch holds the computed state for a header match.
-type HeaderMatch struct {
-	Type                        string // Exact, RegularExpression
-	Name                        string
-	MatchExactValue             string
-	MatchRegularExpressionValue *regexp.Regexp
-}
-
-// RouteMatch holds the computed state for a single match rule.
-type RouteMatch struct {
-	Path    *PathMatch
-	Headers []HeaderMatch
-}
-
-// RouteRule holds the computed state for a single rule within an HTTPRoute.
-type RouteRule struct {
-	Matches []RouteMatch
-	Backend Backend
-}
-
-// HTTPRoute holds the computed state from a Gateway API HTTPRoute object.
-type HTTPRoute struct {
-	Hostnames []string
-	Rules     []RouteRule
-}
 
 // Proxy is a minimal implementation of a Gateway API proxy.
 type Proxy struct {
 	mu     sync.RWMutex
-	routes []HTTPRoute
+	routes []state.InternalRoute
 }
 
 func NewProxy() *Proxy {
 	return &Proxy{
-		routes: []HTTPRoute{},
+		routes: []state.InternalRoute{},
 	}
 }
 
-func (p *Proxy) UpdateRoutes(routes []HTTPRoute) {
+func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.routes = routes
@@ -110,8 +50,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	routes := p.routes
 	p.mu.RUnlock()
 
-	var bestBackend *Backend
-	var bestMatch *RouteMatch
+	var bestBackend *state.InternalBackend
+	var bestMatch *state.InternalMatch
 
 	for _, route := range routes {
 		if !p.matchHostname(route.Hostnames, r.Host) {
@@ -132,7 +72,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// Rule with no matches always matches, but is the least specific
 				if bestBackend == nil {
 					bestBackend = &rule.Backend
-					bestMatch = &RouteMatch{}
+					bestMatch = &state.InternalMatch{}
 				}
 			}
 		}
@@ -146,7 +86,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
 }
 
-func (p *Proxy) isBetterMatch(current, best *RouteMatch) bool {
+func (p *Proxy) isBetterMatch(current, best *state.InternalMatch) bool {
 	if best == nil {
 		return true
 	}
@@ -156,7 +96,7 @@ func (p *Proxy) isBetterMatch(current, best *RouteMatch) bool {
 	bestType := p.getPathMatchType(best)
 
 	if currentType != bestType {
-		return currentType.Weight() > bestType.Weight()
+		return p.getPathMatchTypeWeight(currentType) > p.getPathMatchTypeWeight(bestType)
 	}
 
 	// 2. Longest path match wins
@@ -170,14 +110,27 @@ func (p *Proxy) isBetterMatch(current, best *RouteMatch) bool {
 	return len(current.Headers) > len(best.Headers)
 }
 
-func (p *Proxy) getPathMatchType(m *RouteMatch) PathMatchType {
+func (p *Proxy) getPathMatchType(m *state.InternalMatch) gatewayv1.PathMatchType {
 	if m.Path == nil {
-		return PathMatchTypeNone
+		return ""
 	}
 	return m.Path.Type
 }
 
-func (p *Proxy) getPathLen(m *RouteMatch) int {
+func (p *Proxy) getPathMatchTypeWeight(t gatewayv1.PathMatchType) int {
+	switch t {
+	case gatewayv1.PathMatchExact:
+		return 3
+	case gatewayv1.PathMatchPathPrefix:
+		return 2
+	case "":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (p *Proxy) getPathLen(m *state.InternalMatch) int {
 	if m.Path == nil {
 		return 0
 	}
@@ -205,14 +158,14 @@ func (p *Proxy) matchHostname(hostnames []string, host string) bool {
 	return false
 }
 
-func (p *Proxy) matchMatch(match RouteMatch, r *http.Request) bool {
+func (p *Proxy) matchMatch(match state.InternalMatch, r *http.Request) bool {
 	if match.Path != nil {
 		switch match.Path.Type {
-		case PathMatchTypeExact:
+		case gatewayv1.PathMatchExact:
 			if r.URL.Path != match.Path.Value {
 				return false
 			}
-		case PathMatchTypePathPrefix:
+		case gatewayv1.PathMatchPathPrefix:
 			if !p.hasPathPrefix(r.URL.Path, match.Path.Value) {
 				return false
 			}
@@ -223,7 +176,7 @@ func (p *Proxy) matchMatch(match RouteMatch, r *http.Request) bool {
 		values := r.Header[http.CanonicalHeaderKey(hm.Name)]
 		matched := false
 		for _, v := range values {
-			if hm.Type == "RegularExpression" {
+			if hm.Type == gatewayv1.HeaderMatchRegularExpression {
 				if hm.MatchRegularExpressionValue != nil && hm.MatchRegularExpressionValue.MatchString(v) {
 					matched = true
 					break
@@ -262,7 +215,7 @@ func (p *Proxy) hasPathPrefix(path, prefix string) bool {
 	return false
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend Backend) {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend) {
 	target := &url.URL{
 		Scheme: "http",
 		Host:   fmt.Sprintf("%s:%d", backend.Host, backend.Port),

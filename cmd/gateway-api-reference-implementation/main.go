@@ -21,6 +21,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -78,6 +79,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	st := state.NewState()
 	p := proxy.NewProxy()
 	go func() {
 		setupLog.Info("starting proxy server", "addr", proxyAddr)
@@ -90,6 +92,7 @@ func main() {
 	if err = (&controller.HTTPRouteReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		State:  st,
 		Proxy:  p,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "HTTPRoute")
@@ -107,6 +110,8 @@ func main() {
 	if err = (&controller.GatewayReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		State:  st,
+		Proxy:  p,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Gateway")
 		os.Exit(1)
