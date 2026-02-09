@@ -102,6 +102,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRoute303Redirect,
 		tests.HTTPRoute307Redirect,
 		tests.HTTPRoute308Redirect,
+		tests.HTTPRouteInvalidBackendRefUnknownKind,
 	}
 
 	cSuite.Setup(t, selectedTests)
