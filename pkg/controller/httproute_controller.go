@@ -20,6 +20,7 @@ import (
 	"regexp"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -32,6 +33,7 @@ import (
 type HTTPRouteReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	State  *state.State
 	Proxy  *proxy.Proxy
 }
 
@@ -40,6 +42,10 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	var route gatewayv1.HTTPRoute
 	if err := r.Get(ctx, req.NamespacedName, &route); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			r.State.DeleteHTTPRoute(req.NamespacedName)
+			r.updateProxy()
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -91,27 +97,24 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	// If the route is not accepted, we should not update the proxy
-	if acceptedStatus == metav1.ConditionFalse {
-		return ctrl.Result{}, nil
-	}
+	// If the route is not accepted, we still update the state but it won't be used for proxying
+	r.State.UpsertHTTPRoute(&route)
+	r.updateProxy()
 
-	var routes gatewayv1.HTTPRouteList
-	if err := r.List(ctx, &routes); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	var gateways gatewayv1.GatewayList
-	if err := r.List(ctx, &gateways); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	newRoutes := r.extractRoutes(ctx, &routes, &gateways)
-
-	r.Proxy.UpdateRoutes(newRoutes)
-	l.Info("Updated proxy routes", "count", len(newRoutes))
+	l.Info("Updated HTTPRoute status and proxy")
 
 	return ctrl.Result{}, nil
+}
+
+func (r *HTTPRouteReconciler) updateProxy() {
+	gateways := r.State.GetGateways()
+	routes := r.State.GetHTTPRoutes()
+
+	var proxyRoutes []state.InternalRoute
+	for _, gw := range gateways {
+		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, ControllerName)...)
+	}
+	r.Proxy.UpdateRoutes(proxyRoutes)
 }
 
 func (r *HTTPRouteReconciler) validateRoute(route *gatewayv1.HTTPRoute) error {
@@ -127,143 +130,6 @@ func (r *HTTPRouteReconciler) validateRoute(route *gatewayv1.HTTPRoute) error {
 		}
 	}
 	return nil
-}
-
-func (r *HTTPRouteReconciler) extractRoutes(ctx context.Context, routes *gatewayv1.HTTPRouteList, gateways *gatewayv1.GatewayList) []proxy.HTTPRoute {
-	l := log.FromContext(ctx)
-	var newRoutes []proxy.HTTPRoute
-
-	gwMap := make(map[string]*gatewayv1.Gateway)
-	for i := range gateways.Items {
-		gwMap[gateways.Items[i].Name] = &gateways.Items[i]
-	}
-
-	for _, route := range routes.Items {
-		// Only extract routes that are accepted
-		acceptedParents := make(map[string]bool)
-		for _, ps := range route.Status.Parents {
-			if ps.ControllerName == ControllerName {
-				for _, c := range ps.Conditions {
-					if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
-						acceptedParents[string(ps.ParentRef.Name)] = true
-						break
-					}
-				}
-			}
-		}
-
-		if len(acceptedParents) == 0 {
-			continue
-		}
-
-		for _, parentRef := range route.Spec.ParentRefs {
-			if !acceptedParents[string(parentRef.Name)] {
-				continue
-			}
-
-			gw, ok := gwMap[string(parentRef.Name)]
-			if !ok {
-				continue
-			}
-
-			for _, listener := range gw.Spec.Listeners {
-				// Check if listener is compatible with HTTPRoute
-				if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
-					continue
-				}
-
-				// If ParentRef has SectionName, it must match listener name
-				if parentRef.SectionName != nil && *parentRef.SectionName != listener.Name {
-					continue
-				}
-
-				// Calculate intersected hostnames
-				var routeHostnames []string
-				for _, h := range route.Spec.Hostnames {
-					routeHostnames = append(routeHostnames, string(h))
-				}
-
-				var listenerHostname string
-				if listener.Hostname != nil {
-					listenerHostname = string(*listener.Hostname)
-				}
-
-				effectiveHostnames := intersectHostnames(routeHostnames, listenerHostname)
-				if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
-					// No intersection, skip this listener
-					continue
-				}
-
-				pr := proxy.HTTPRoute{
-					Hostnames: effectiveHostnames,
-				}
-
-				for _, rule := range route.Spec.Rules {
-					for _, backendRef := range rule.BackendRefs {
-						if backendRef.Kind != nil && *backendRef.Kind != "Service" {
-							continue
-						}
-
-						if backendRef.Port == nil {
-							continue
-						}
-
-						backend := proxy.Backend{
-							Host: fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, route.Namespace),
-							Port: int32(*backendRef.Port),
-						}
-
-						pRule := proxy.RouteRule{
-							Backend: backend,
-						}
-
-						for _, match := range rule.Matches {
-							pMatch := proxy.RouteMatch{}
-							if match.Path != nil {
-								pathType := gatewayv1.PathMatchPathPrefix
-								if match.Path.Type != nil {
-									pathType = *match.Path.Type
-								}
-								pMatch.Path = &proxy.PathMatch{
-									Type:  proxy.PathMatchType(pathType),
-									Value: *match.Path.Value,
-								}
-							}
-							for _, header := range match.Headers {
-								headerType := gatewayv1.HeaderMatchExact
-								if header.Type != nil {
-									headerType = *header.Type
-								}
-								hm := proxy.HeaderMatch{
-									Type:            string(headerType),
-									Name:            string(header.Name),
-									MatchExactValue: header.Value,
-								}
-								if headerType == gatewayv1.HeaderMatchRegularExpression {
-									re, err := regexp.Compile(header.Value)
-									if err != nil {
-										// In a real controller we would set a condition on the route
-										l.Error(err, "invalid regular expression in header match", "value", header.Value)
-										continue
-									}
-									hm.MatchRegularExpressionValue = re
-								}
-								pMatch.Headers = append(pMatch.Headers, hm)
-							}
-							pRule.Matches = append(pRule.Matches, pMatch)
-						}
-
-						pr.Rules = append(pr.Rules, pRule)
-
-						// For minimal implementation, we just take the first Service backendRef for each rule
-						break
-					}
-				}
-				newRoutes = append(newRoutes, pr)
-			}
-		}
-	}
-	return newRoutes
 }
 
 func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
