@@ -15,13 +15,16 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -45,6 +48,14 @@ func init() {
 }
 
 func main() {
+	ctx := ctrl.SetupSignalHandler()
+	if err := run(ctx); err != nil {
+		setupLog.Error(err, "fatal error")
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context) error {
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
@@ -62,7 +73,12 @@ func main() {
 
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		return fmt.Errorf("unable to get kubeconfig: %w", err)
+	}
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
@@ -75,19 +91,27 @@ func main() {
 		LeaderElectionID:       "gateway-api-reference-implementation",
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
+		return fmt.Errorf("unable to start manager: %w", err)
 	}
 
 	st := state.NewState()
 	p := proxy.NewProxy()
-	go func() {
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
 		setupLog.Info("starting proxy server", "addr", proxyAddr)
-		if err := http.ListenAndServe(proxyAddr, p); err != nil {
-			setupLog.Error(err, "proxy server failed")
-			os.Exit(1)
+		srv := &http.Server{Addr: proxyAddr, Handler: p}
+		go func() {
+			<-ctx.Done()
+			setupLog.Info("shutting down proxy server")
+			_ = srv.Shutdown(context.Background())
+		}()
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("proxy server failed: %w", err)
 		}
-	}()
+		return nil
+	})
 
 	if err = (&controller.HTTPRouteReconciler{
 		Client: mgr.GetClient(),
@@ -95,16 +119,14 @@ func main() {
 		State:  st,
 		Proxy:  p,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "HTTPRoute")
-		os.Exit(1)
+		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
 	}
 
 	if err = (&controller.GatewayClassReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "GatewayClass")
-		os.Exit(1)
+		return fmt.Errorf("error creating GatewayClass controller: %w", err)
 	}
 
 	if err = (&controller.GatewayReconciler{
@@ -113,13 +135,16 @@ func main() {
 		State:  st,
 		Proxy:  p,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Gateway")
-		os.Exit(1)
+		return fmt.Errorf("error creating Gateway controller: %w", err)
 	}
 
-	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
-		os.Exit(1)
-	}
+	g.Go(func() error {
+		setupLog.Info("starting manager")
+		if err := mgr.Start(ctx); err != nil {
+			return fmt.Errorf("problem running manager: %w", err)
+		}
+		return nil
+	})
+
+	return g.Wait()
 }
