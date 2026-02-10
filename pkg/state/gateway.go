@@ -83,10 +83,29 @@ func (ir *InternalRoute) MatchHostname(host string) bool {
 	return false
 }
 
+// ErrorState represents an error that should be surfaced to the user.
+// It includes both the API condition for status reporting and the HTTP response details for the proxy.
+type ErrorState struct {
+	// Condition is the status condition to be reported in the API.
+	// This provides a machine-readable reason for the error.
+	Condition metav1.Condition
+
+	// HTTPStatusCode is the status code to return in the HTTP response.
+	// This is the "user-facing" status code.
+	HTTPStatusCode int
+
+	// HTTPMessage is the message to return in the HTTP response body.
+	// This is the "user-facing" error message.
+	HTTPMessage string
+}
+
 type InternalRule struct {
 	Matches  []InternalMatch
 	Backend  *InternalBackend
 	Redirect *InternalRedirect
+	// Error, if non-nil, indicates that this rule is invalid and should
+	// return an error response if matched.
+	Error *ErrorState
 }
 
 type InternalBackend struct {
@@ -319,6 +338,8 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 				Hostnames: effectiveHostnames,
 			}
 
+			resolvedRefsCond := route.ComputeResolvedRefsCondition()
+
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
 				for _, filter := range rule.Filters {
@@ -350,13 +371,29 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 					Redirect: redirect,
 				}
 
-				if redirect == nil {
+				if resolvedRefsCond.Status == metav1.ConditionFalse {
+					iRule.Error = &ErrorState{
+						Condition:      resolvedRefsCond,
+						HTTPStatusCode: http.StatusInternalServerError,
+						HTTPMessage:    resolvedRefsCond.Message,
+					}
+				} else if redirect == nil {
 					for _, backendRef := range rule.BackendRefs {
 						kind := ValueOf(backendRef.Kind)
 						if kind == "" {
 							kind = "Service"
 						}
 						if kind != "Service" {
+							iRule.Error = &ErrorState{
+								Condition: metav1.Condition{
+									Type:    string(gatewayv1.RouteConditionResolvedRefs),
+									Status:  metav1.ConditionFalse,
+									Reason:  string(gatewayv1.RouteReasonInvalidKind),
+									Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
+								},
+								HTTPStatusCode: http.StatusInternalServerError,
+								HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+							}
 							continue
 						}
 
@@ -368,6 +405,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 							Host: fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, route.Namespace),
 							Port: int32(*backendRef.Port),
 						}
+						iRule.Error = nil
 
 						// For minimal implementation, we just take the first Service backendRef for each rule
 						break
