@@ -21,7 +21,9 @@ import (
 	"regexp"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -109,8 +111,9 @@ type InternalRule struct {
 }
 
 type InternalBackend struct {
-	Host string
-	Port int32
+	Host        string
+	Port        int32
+	AppProtocol *string
 }
 
 type InternalRedirect struct {
@@ -285,7 +288,7 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerName string) []InternalRoute {
+func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, controllerName string) []InternalRoute {
 	var internalRoutes []InternalRoute
 
 	for _, listener := range s.Spec.Listeners {
@@ -401,9 +404,24 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, controllerN
 							continue
 						}
 
+						backendSvcName := types.NamespacedName{
+							Namespace: route.Namespace,
+							Name:      string(backendRef.Name),
+						}
+						var appProtocol *string
+						if svc, ok := services[backendSvcName]; ok {
+							for _, port := range svc.Spec.Ports {
+								if port.Port == int32(*backendRef.Port) {
+									appProtocol = port.AppProtocol
+									break
+								}
+							}
+						}
+
 						iRule.Backend = &InternalBackend{
-							Host: fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, route.Namespace),
-							Port: int32(*backendRef.Port),
+							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, route.Namespace),
+							Port:        int32(*backendRef.Port),
+							AppProtocol: appProtocol,
 						}
 						iRule.Error = nil
 

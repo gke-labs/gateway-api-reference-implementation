@@ -24,6 +24,8 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -60,9 +62,11 @@ func run(ctx context.Context) error {
 	var enableLeaderElection bool
 	var probeAddr string
 	var proxyAddr string
+	var enableH2C bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&proxyAddr, "proxy-bind-address", ":8000", "The address the proxy binds to.")
+	flag.BoolVar(&enableH2C, "enable-h2c", false, "Enable H2C support on the proxy server.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -101,7 +105,18 @@ func run(ctx context.Context) error {
 
 	g.Go(func() error {
 		setupLog.Info("starting proxy server", "addr", proxyAddr)
-		srv := &http.Server{Addr: proxyAddr, Handler: p}
+		var handler http.Handler = p
+		if enableH2C {
+			// h2c.NewHandler enables HTTP/2 Cleartext (H2C) support.
+			// This is required to pass the HTTPRouteBackendProtocolH2C conformance test
+			// when the test client uses HTTP/2 Prior Knowledge.
+			h2s := &http2.Server{}
+			handler = h2c.NewHandler(p, h2s)
+		}
+		srv := &http.Server{
+			Addr:    proxyAddr,
+			Handler: handler,
+		}
 		go func() {
 			<-ctx.Done()
 			setupLog.Info("shutting down proxy server")
@@ -136,6 +151,15 @@ func run(ctx context.Context) error {
 		Proxy:  p,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating Gateway controller: %w", err)
+	}
+
+	if err = (&controller.ServiceReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		State:  st,
+		Proxy:  p,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Service controller: %w", err)
 	}
 
 	g.Go(func() error {

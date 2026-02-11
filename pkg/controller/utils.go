@@ -13,3 +13,20 @@
 // limitations under the License.
 
 package controller
+
+import (
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+)
+
+func updateProxy(st *state.State, p *proxy.Proxy) {
+	gateways := st.GetGateways()
+	routes := st.GetHTTPRoutes()
+	services := st.GetServices()
+
+	var proxyRoutes []state.InternalRoute
+	for _, gw := range gateways {
+		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, ControllerName)...)
+	}
+	p.UpdateRoutes(proxyRoutes)
+}
