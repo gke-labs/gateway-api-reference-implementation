@@ -160,14 +160,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 }
 
 func (r *GatewayReconciler) updateProxy() {
-	gateways := r.State.GetGateways()
-	routes := r.State.GetHTTPRoutes()
-
-	var proxyRoutes []state.InternalRoute
-	for _, gw := range gateways {
-		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, ControllerName)...)
-	}
-	r.Proxy.UpdateRoutes(proxyRoutes)
+	updateProxy(r.State, r.Proxy)
 }
 
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {

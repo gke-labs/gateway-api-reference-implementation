@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"sync"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -28,13 +29,36 @@ type State struct {
 
 	gateways   map[types.NamespacedName]*GatewayState
 	httpRoutes map[types.NamespacedName]*HTTPRouteState
+	services   map[types.NamespacedName]*corev1.Service
 }
 
 func NewState() *State {
 	return &State{
 		gateways:   make(map[types.NamespacedName]*GatewayState),
 		httpRoutes: make(map[types.NamespacedName]*HTTPRouteState),
+		services:   make(map[types.NamespacedName]*corev1.Service),
 	}
+}
+
+func (s *State) UpsertService(svc *corev1.Service) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.services[types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}] = svc
+}
+
+func (s *State) DeleteService(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.services, name)
+}
+
+func (s *State) GetService(name types.NamespacedName) *corev1.Service {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.services[name]
 }
 
 func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
@@ -110,4 +134,15 @@ func (s *State) GetHTTPRoutes() []*HTTPRouteState {
 		routes = append(routes, route)
 	}
 	return routes
+}
+
+func (s *State) GetServices() map[types.NamespacedName]*corev1.Service {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	services := make(map[types.NamespacedName]*corev1.Service)
+	for k, v := range s.services {
+		services[k] = v
+	}
+	return services
 }

@@ -15,6 +15,8 @@
 package proxy
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,6 +26,7 @@ import (
 	"sync"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"golang.org/x/net/http2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -142,6 +145,17 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", target.String())
+
+	if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
+		proxy.Transport = &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		}
+	}
+
+	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", target.String(), "appProtocol", state.ValueOf(backend.AppProtocol))
 	proxy.ServeHTTP(w, r)
 }
