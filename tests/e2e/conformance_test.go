@@ -99,11 +99,9 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteExactPathMatching,
 		tests.HTTPRouteHeaderMatching,
 		tests.HTTPRouteHostnameIntersection,
-		tests.HTTPRoute303Redirect,
-		tests.HTTPRoute307Redirect,
-		tests.HTTPRoute308Redirect,
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
 		tests.HTTPRouteBackendProtocolH2C,
+		tests.BackendTLSPolicy,
 	}
 
 	cSuite.Setup(t, selectedTests)

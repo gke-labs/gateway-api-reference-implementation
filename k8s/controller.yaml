@@ -10,13 +10,13 @@ metadata:
   name: gari-controller
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes", "gateways", "gatewayclasses"]
+  resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: [""]
-  resources: ["services"]
+  resources: ["services", "configmaps"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status"]
+  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status"]
   verbs: ["update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -57,12 +57,14 @@ spec:
       serviceAccountName: gari-controller
       containers:
       - name: controller
-        image: gari-controller:latest
-        imagePullPolicy: IfNotPresent
+        image: gari-controller:e2e
+        imagePullPolicy: Never
         args: ["--proxy-bind-address", ":8000"]
         ports:
         - containerPort: 8000
           name: proxy
+        - containerPort: 8443
+          name: proxy-https
 ---
 apiVersion: v1
 kind: Service
@@ -76,3 +78,7 @@ spec:
   ports:
   - port: 80
     targetPort: 8000
+    name: http
+  - port: 443
+    targetPort: 8443
+    name: https
