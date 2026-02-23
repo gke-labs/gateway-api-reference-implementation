@@ -114,6 +114,12 @@ type InternalBackend struct {
 	Host        string
 	Port        int32
 	AppProtocol *string
+	TLSConfig   *InternalTLSConfig
+}
+
+type InternalTLSConfig struct {
+	Hostname string
+	CACerts  [][]byte
 }
 
 type InternalRedirect struct {
@@ -288,7 +294,7 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, controllerName string) []InternalRoute {
+func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
 	var internalRoutes []InternalRoute
 
 	for _, listener := range s.Spec.Listeners {
@@ -404,8 +410,13 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							continue
 						}
 
+						backendSvcNamespace := route.Namespace
+						if backendRef.Namespace != nil {
+							backendSvcNamespace = string(*backendRef.Namespace)
+						}
+
 						backendSvcName := types.NamespacedName{
-							Namespace: route.Namespace,
+							Namespace: backendSvcNamespace,
 							Name:      string(backendRef.Name),
 						}
 						var appProtocol *string
@@ -418,10 +429,45 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							}
 						}
 
+						// Check for BackendTLSPolicy
+						var tlsConfig *InternalTLSConfig
+						for _, policy := range backendTLSPolicies {
+							for _, targetRef := range policy.Spec.TargetRefs {
+								if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+									string(targetRef.Name) == string(backendRef.Name) &&
+									policy.Namespace == backendSvcNamespace {
+									// Found a policy targeting this service
+									https := "https"
+									appProtocol = &https
+
+									var caCerts [][]byte
+									for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+										if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+											cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+											if cm, ok := configMaps[cmName]; ok {
+												if data, ok := cm.Data["ca.crt"]; ok {
+													caCerts = append(caCerts, []byte(data))
+												} else if data, ok := cm.BinaryData["ca.crt"]; ok {
+													caCerts = append(caCerts, data)
+												}
+											}
+										}
+									}
+
+									tlsConfig = &InternalTLSConfig{
+										Hostname: string(policy.Spec.Validation.Hostname),
+										CACerts:  caCerts,
+									}
+									break
+								}
+							}
+						}
+
 						iRule.Backend = &InternalBackend{
-							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, route.Namespace),
+							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
 							Port:        int32(*backendRef.Port),
 							AppProtocol: appProtocol,
+							TLSConfig:   tlsConfig,
 						}
 						iRule.Error = nil
 

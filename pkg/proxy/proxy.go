@@ -17,6 +17,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -139,14 +140,39 @@ func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend) {
+	scheme := "http"
+	if state.ValueOf(backend.AppProtocol) == "https" {
+		scheme = "https"
+	}
+
 	target := &url.URL{
-		Scheme: "http",
+		Scheme: scheme,
 		Host:   fmt.Sprintf("%s:%d", backend.Host, backend.Port),
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
-	if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
+	if scheme == "https" {
+		tlsConfig := &tls.Config{InsecureSkipVerify: false}
+		if backend.TLSConfig != nil {
+			if backend.TLSConfig.Hostname != "" {
+				tlsConfig.ServerName = backend.TLSConfig.Hostname
+			}
+			if len(backend.TLSConfig.CACerts) > 0 {
+				tlsConfig.RootCAs = x509.NewCertPool()
+				for _, cert := range backend.TLSConfig.CACerts {
+					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
+				}
+			} else {
+				tlsConfig.InsecureSkipVerify = true
+			}
+		} else {
+			tlsConfig.InsecureSkipVerify = true
+		}
+		proxy.Transport = &http.Transport{
+			TLSClientConfig: tlsConfig,
+		}
+	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
 		proxy.Transport = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
