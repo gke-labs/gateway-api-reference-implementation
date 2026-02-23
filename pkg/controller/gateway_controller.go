@@ -23,8 +23,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -48,20 +50,49 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Update status to Accepted
-	gc.Status.Conditions = []metav1.Condition{
+	newConditions := []metav1.Condition{
 		{
 			Type:               string(gatewayv1.GatewayClassConditionStatusAccepted),
 			Status:             metav1.ConditionTrue,
 			ObservedGeneration: gc.Generation,
-			LastTransitionTime: metav1.Now(),
 			Reason:             string(gatewayv1.GatewayClassReasonAccepted),
 			Message:            "GatewayClass accepted by reference implementation",
 		},
 	}
 
-	if err := r.Status().Update(ctx, &gc); err != nil {
-		l.Error(err, "unable to update GatewayClass status")
-		return ctrl.Result{}, err
+	updated := false
+	if len(gc.Status.Conditions) != len(newConditions) {
+		updated = true
+	} else {
+		for i := range newConditions {
+			matched := false
+			for j := range gc.Status.Conditions {
+				if gc.Status.Conditions[j].Type == newConditions[i].Type {
+					if gc.Status.Conditions[j].Status == newConditions[i].Status &&
+						gc.Status.Conditions[j].ObservedGeneration == newConditions[i].ObservedGeneration &&
+						gc.Status.Conditions[j].Reason == newConditions[i].Reason &&
+						gc.Status.Conditions[j].Message == newConditions[i].Message {
+						matched = true
+					}
+					break
+				}
+			}
+			if !matched {
+				updated = true
+				break
+			}
+		}
+	}
+
+	if updated {
+		for i := range newConditions {
+			newConditions[i].LastTransitionTime = metav1.Now()
+		}
+		gc.Status.Conditions = newConditions
+		if err := r.Status().Update(ctx, &gc); err != nil {
+			l.Error(err, "unable to update GatewayClass status")
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -121,12 +152,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Update status to Programmed and add address
-	gw.Status.Conditions = []metav1.Condition{
+	newConditions := []metav1.Condition{
 		{
 			Type:               string(gatewayv1.GatewayConditionProgrammed),
 			Status:             metav1.ConditionTrue,
 			ObservedGeneration: gw.Generation,
-			LastTransitionTime: metav1.Now(),
 			Reason:             string(gatewayv1.GatewayReasonProgrammed),
 			Message:            "Gateway programmed by reference implementation",
 		},
@@ -134,24 +164,148 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Type:               string(gatewayv1.GatewayConditionAccepted),
 			Status:             metav1.ConditionTrue,
 			ObservedGeneration: gw.Generation,
-			LastTransitionTime: metav1.Now(),
 			Reason:             string(gatewayv1.GatewayReasonAccepted),
 			Message:            "Gateway accepted by reference implementation",
 		},
 	}
-	gw.Status.Addresses = []gatewayv1.GatewayStatusAddress{
+	newAddresses := []gatewayv1.GatewayStatusAddress{
 		{
 			Type:  state.Ptr(gatewayv1.IPAddressType),
 			Value: ip,
 		},
 	}
 
-	if err := r.Status().Update(ctx, gw); err != nil {
-		l.Error(err, "unable to update Gateway status")
-		return ctrl.Result{}, err
+	// Compute listener status
+	routes := r.State.GetHTTPRoutes()
+	gs := state.GatewayState{Gateway: gw}
+	var newListenerStatuses []gatewayv1.ListenerStatus
+	for _, listener := range gw.Spec.Listeners {
+		attachedRoutes := 0
+		for _, route := range routes {
+			for _, parentRef := range route.Spec.ParentRefs {
+				if string(parentRef.Name) == gw.Name {
+					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
+						if route.IsAccepted(ControllerName) {
+							attachedRoutes++
+							break
+						}
+					}
+				}
+			}
+		}
+
+		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
+			Name:           listener.Name,
+			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
+			AttachedRoutes: int32(attachedRoutes),
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(gatewayv1.ListenerConditionProgrammed),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: gw.Generation,
+					LastTransitionTime: metav1.Now(),
+					Reason:             string(gatewayv1.ListenerReasonProgrammed),
+					Message:            "Listener programmed",
+				},
+				{
+					Type:               string(gatewayv1.ListenerConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: gw.Generation,
+					LastTransitionTime: metav1.Now(),
+					Reason:             string(gatewayv1.ListenerReasonAccepted),
+					Message:            "Listener accepted",
+				},
+				{
+					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: gw.Generation,
+					LastTransitionTime: metav1.Now(),
+					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+					Message:            "All references resolved",
+				},
+			},
+		})
+	}
+
+	updated := false
+	if len(gw.Status.Conditions) != len(newConditions) || len(gw.Status.Addresses) != len(newAddresses) || len(gw.Status.Listeners) != len(newListenerStatuses) {
+		updated = true
+	} else {
+		for i := range newConditions {
+			matched := false
+			for j := range gw.Status.Conditions {
+				if gw.Status.Conditions[j].Type == newConditions[i].Type {
+					if gw.Status.Conditions[j].Status == newConditions[i].Status &&
+						gw.Status.Conditions[j].ObservedGeneration == newConditions[i].ObservedGeneration &&
+						gw.Status.Conditions[j].Reason == newConditions[i].Reason &&
+						gw.Status.Conditions[j].Message == newConditions[i].Message {
+						matched = true
+					}
+					break
+				}
+			}
+			if !matched {
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			for i := range newAddresses {
+				if state.ValueOf(gw.Status.Addresses[i].Type) != state.ValueOf(newAddresses[i].Type) ||
+					gw.Status.Addresses[i].Value != newAddresses[i].Value {
+					updated = true
+					break
+				}
+			}
+		}
+		if !updated {
+			for i := range newListenerStatuses {
+				if gw.Status.Listeners[i].Name != newListenerStatuses[i].Name ||
+					gw.Status.Listeners[i].AttachedRoutes != newListenerStatuses[i].AttachedRoutes ||
+					len(gw.Status.Listeners[i].Conditions) != len(newListenerStatuses[i].Conditions) {
+					updated = true
+					break
+				}
+				// Also check if conditions changed (optional but safer)
+				for j := range newListenerStatuses[i].Conditions {
+					matched := false
+					for k := range gw.Status.Listeners[i].Conditions {
+						if gw.Status.Listeners[i].Conditions[k].Type == newListenerStatuses[i].Conditions[j].Type {
+							if gw.Status.Listeners[i].Conditions[k].Status == newListenerStatuses[i].Conditions[j].Status &&
+								gw.Status.Listeners[i].Conditions[k].ObservedGeneration == newListenerStatuses[i].Conditions[j].ObservedGeneration &&
+								gw.Status.Listeners[i].Conditions[k].Reason == newListenerStatuses[i].Conditions[j].Reason {
+								matched = true
+							}
+							break
+						}
+					}
+					if !matched {
+						updated = true
+						break
+					}
+				}
+				if updated {
+					break
+				}
+			}
+		}
+	}
+
+	if updated {
+		for i := range newConditions {
+			newConditions[i].LastTransitionTime = metav1.Now()
+		}
+		gw.Status.Conditions = newConditions
+		gw.Status.Addresses = newAddresses
+		gw.Status.Listeners = newListenerStatuses
+		if err := r.Status().Update(ctx, gw); err != nil {
+			l.Error(err, "unable to update Gateway status")
+			return ctrl.Result{}, err
+		}
 	}
 
 	r.State.UpsertGateway(gw)
+	_ = gs // keep for now
 	r.updateProxy()
 
 	l.Info("Updated Gateway status", "address", ip)
@@ -166,5 +320,23 @@ func (r *GatewayReconciler) updateProxy() {
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
+		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// When an HTTPRoute changes, reconcile all Gateways it references
+			route := obj.(*gatewayv1.HTTPRoute)
+			var requests []ctrl.Request
+			for _, parentRef := range route.Spec.ParentRefs {
+				if string(state.ValueOf(parentRef.Group)) == "" || string(state.ValueOf(parentRef.Group)) == "gateway.networking.k8s.io" {
+					if string(state.ValueOf(parentRef.Kind)) == "" || string(state.ValueOf(parentRef.Kind)) == "Gateway" {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: route.Namespace, // Assuming same namespace for now
+								Name:      string(parentRef.Name),
+							},
+						})
+					}
+				}
+			}
+			return requests
+		})).
 		Complete(r)
 }
