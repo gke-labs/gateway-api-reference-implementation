@@ -27,17 +27,46 @@ import (
 type State struct {
 	mu sync.RWMutex
 
-	gateways   map[types.NamespacedName]*GatewayState
-	httpRoutes map[types.NamespacedName]*HTTPRouteState
-	services   map[types.NamespacedName]*corev1.Service
+	gateways           map[types.NamespacedName]*GatewayState
+	httpRoutes         map[types.NamespacedName]*HTTPRouteState
+	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
+	services           map[types.NamespacedName]*corev1.Service
+	configMaps         map[types.NamespacedName]*corev1.ConfigMap
 }
 
 func NewState() *State {
 	return &State{
-		gateways:   make(map[types.NamespacedName]*GatewayState),
-		httpRoutes: make(map[types.NamespacedName]*HTTPRouteState),
-		services:   make(map[types.NamespacedName]*corev1.Service),
+		gateways:           make(map[types.NamespacedName]*GatewayState),
+		httpRoutes:         make(map[types.NamespacedName]*HTTPRouteState),
+		backendTLSPolicies: make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
+		services:           make(map[types.NamespacedName]*corev1.Service),
+		configMaps:         make(map[types.NamespacedName]*corev1.ConfigMap),
 	}
+}
+
+func (s *State) UpsertConfigMap(cm *corev1.ConfigMap) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.configMaps[types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}] = cm
+}
+
+func (s *State) DeleteConfigMap(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.configMaps, name)
+}
+
+func (s *State) GetConfigMaps() map[types.NamespacedName]*corev1.ConfigMap {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	cms := make(map[types.NamespacedName]*corev1.ConfigMap)
+	for k, v := range s.configMaps {
+		cms[k] = v
+	}
+	return cms
 }
 
 func (s *State) UpsertService(svc *corev1.Service) {
@@ -114,6 +143,20 @@ func (s *State) DeleteHTTPRoute(name types.NamespacedName) {
 	delete(s.httpRoutes, name)
 }
 
+func (s *State) UpsertBackendTLSPolicy(policy *gatewayv1.BackendTLSPolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.backendTLSPolicies[types.NamespacedName{Namespace: policy.Namespace, Name: policy.Name}] = policy
+}
+
+func (s *State) DeleteBackendTLSPolicy(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.backendTLSPolicies, name)
+}
+
 func (s *State) GetGateways() []*GatewayState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -134,6 +177,17 @@ func (s *State) GetHTTPRoutes() []*HTTPRouteState {
 		routes = append(routes, route)
 	}
 	return routes
+}
+
+func (s *State) GetBackendTLSPolicies() []*gatewayv1.BackendTLSPolicy {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var policies []*gatewayv1.BackendTLSPolicy
+	for _, policy := range s.backendTLSPolicies {
+		policies = append(policies, policy)
+	}
+	return policies
 }
 
 func (s *State) GetServices() map[types.NamespacedName]*corev1.Service {
