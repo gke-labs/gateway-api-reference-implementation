@@ -28,11 +28,13 @@ import (
 func TestBuildInternalRoutes(t *testing.T) {
 	controllerName := "test-controller"
 	tests := []struct {
-		name     string
-		routes   []*HTTPRouteState
-		gateway  *GatewayState
-		services map[types.NamespacedName]*corev1.Service
-		expected []InternalRoute
+		name               string
+		routes             []*HTTPRouteState
+		gateway            *GatewayState
+		services           map[types.NamespacedName]*corev1.Service
+		backendTLSPolicies []*gatewayv1.BackendTLSPolicy
+		configMaps         map[types.NamespacedName]*corev1.ConfigMap
+		expected           []InternalRoute
 	}{
 		{
 			name: "single route with single backend and appProtocol",
@@ -486,7 +488,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, controllerName)
+			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
 			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
 			if diff != "" {
 				t.Errorf("BuildInternalRoutes() mismatch (-want +got):\n%s", diff)

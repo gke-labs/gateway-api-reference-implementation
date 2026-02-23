@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -53,18 +54,17 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Update status
 	// For each parentRef, we should add a ParentStatus
-	var parentStatuses []gatewayv1.RouteParentStatus
-
 	gateways := r.State.GetGateways()
 	rs := state.HTTPRouteState{HTTPRoute: route}
 
+	var newParents []gatewayv1.RouteParentStatus
 	for _, parentRef := range route.Spec.ParentRefs {
 		acceptedCondition := validationCondition
 		if acceptedCondition.Status == metav1.ConditionTrue {
 			acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways)
 		}
 
-		parentStatuses = append(parentStatuses, gatewayv1.RouteParentStatus{
+		newParents = append(newParents, gatewayv1.RouteParentStatus{
 			ParentRef:      parentRef,
 			ControllerName: ControllerName,
 			Conditions: []metav1.Condition{
@@ -73,10 +73,48 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			},
 		})
 	}
-	route.Status.Parents = parentStatuses
-	if err := r.Status().Update(ctx, route); err != nil {
-		l.Error(err, "unable to update HTTPRoute status")
-		return ctrl.Result{}, err
+
+	updated := false
+	if len(route.Status.Parents) != len(newParents) {
+		updated = true
+	} else {
+		for i := range newParents {
+			if !reflect.DeepEqual(route.Status.Parents[i].ParentRef, newParents[i].ParentRef) ||
+				string(route.Status.Parents[i].ControllerName) != string(newParents[i].ControllerName) ||
+				len(route.Status.Parents[i].Conditions) != len(newParents[i].Conditions) {
+				updated = true
+				break
+			}
+			for j := range newParents[i].Conditions {
+				matched := false
+				for k := range route.Status.Parents[i].Conditions {
+					if route.Status.Parents[i].Conditions[k].Type == newParents[i].Conditions[j].Type {
+						if route.Status.Parents[i].Conditions[k].Status == newParents[i].Conditions[j].Status &&
+							route.Status.Parents[i].Conditions[k].ObservedGeneration == newParents[i].Conditions[j].ObservedGeneration &&
+							route.Status.Parents[i].Conditions[k].Reason == newParents[i].Conditions[j].Reason &&
+							route.Status.Parents[i].Conditions[k].Message == newParents[i].Conditions[j].Message {
+							matched = true
+						}
+						break
+					}
+				}
+				if !matched {
+					updated = true
+					break
+				}
+			}
+			if updated {
+				break
+			}
+		}
+	}
+
+	if updated {
+		route.Status.Parents = newParents
+		if err := r.Status().Update(ctx, route); err != nil {
+			l.Error(err, "unable to update HTTPRoute status")
+			return ctrl.Result{}, err
+		}
 	}
 
 	r.State.UpsertHTTPRoute(route)

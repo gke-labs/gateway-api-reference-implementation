@@ -16,10 +16,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"flag"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
@@ -62,10 +70,12 @@ func run(ctx context.Context) error {
 	var enableLeaderElection bool
 	var probeAddr string
 	var proxyAddr string
+	var proxyHTTPSAddr string
 	var enableH2C bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&proxyAddr, "proxy-bind-address", ":8000", "The address the proxy binds to.")
+	flag.StringVar(&proxyHTTPSAddr, "proxy-https-bind-address", ":8443", "The address the proxy binds to for HTTPS.")
 	flag.BoolVar(&enableH2C, "enable-h2c", false, "Enable H2C support on the proxy server.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -128,6 +138,33 @@ func run(ctx context.Context) error {
 		return nil
 	})
 
+	g.Go(func() error {
+		setupLog.Info("starting proxy HTTPS server", "addr", proxyHTTPSAddr)
+
+		// Generate a self-signed cert for the reference implementation
+		cert, err := generateSelfSignedCert()
+		if err != nil {
+			return fmt.Errorf("failed to generate self-signed cert: %w", err)
+		}
+
+		srv := &http.Server{
+			Addr:    proxyHTTPSAddr,
+			Handler: p,
+			TLSConfig: &tls.Config{
+				Certificates: []tls.Certificate{cert},
+			},
+		}
+		go func() {
+			<-ctx.Done()
+			setupLog.Info("shutting down proxy HTTPS server")
+			_ = srv.Shutdown(context.Background())
+		}()
+		if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("proxy HTTPS server failed: %w", err)
+		}
+		return nil
+	})
+
 	if err = (&controller.HTTPRouteReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -162,6 +199,24 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("error creating Service controller: %w", err)
 	}
 
+	if err = (&controller.BackendTLSPolicyReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		State:  st,
+		Proxy:  p,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating BackendTLSPolicy controller: %w", err)
+	}
+
+	if err = (&controller.ConfigMapReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		State:  st,
+		Proxy:  p,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating ConfigMap controller: %w", err)
+	}
+
 	g.Go(func() error {
 		setupLog.Info("starting manager")
 		if err := mgr.Start(ctx); err != nil {
@@ -171,4 +226,43 @@ func run(ctx context.Context) error {
 	})
 
 	return g.Wait()
+}
+
+func generateSelfSignedCert() (tls.Certificate, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	notBefore := time.Now()
+	notAfter := notBefore.Add(365 * 24 * time.Hour)
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"Gateway API Reference Implementation"},
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost", "https-listener.org", "abc.example.com"},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+
+	return tls.X509KeyPair(certPEM, keyPEM)
 }
