@@ -97,6 +97,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteSimpleSameNamespace,
 		tests.HTTPRouteMatching,
 		tests.HTTPRouteExactPathMatching,
+		tests.HTTPRouteMethodMatching,
 		tests.HTTPRouteHeaderMatching,
 		tests.HTTPRouteHostnameIntersection,
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
