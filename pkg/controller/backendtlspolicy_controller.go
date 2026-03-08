@@ -57,11 +57,54 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Find all Gateways that use this policy (via Services referenced in HTTPRoutes)
 	gateways := r.State.GetGateways()
 	routes := r.State.GetHTTPRoutes()
+	allPolicies := r.State.GetBackendTLSPolicies()
 
-	targetRef := policy.Spec.TargetRefs[0]
-	targetedServiceName := types.NamespacedName{
-		Namespace: policy.Namespace,
-		Name:      string(targetRef.Name),
+	// Conflict resolution
+	isConflicted := false
+	var conflictingPolicy string
+	for _, targetRef := range policy.Spec.TargetRefs {
+		if string(targetRef.Group) != "" && string(targetRef.Group) != "gateway.networking.k8s.io" {
+			continue
+		}
+		if string(targetRef.Kind) != "Service" {
+			continue
+		}
+
+		targetSvcNamespace := policy.Namespace
+		targetSvcName := string(targetRef.Name)
+
+		for _, p := range allPolicies {
+			if p.Namespace == policy.Namespace && p.Name == policy.Name {
+				continue
+			}
+
+			for _, t := range p.Spec.TargetRefs {
+				if (string(t.Group) == "" || string(t.Group) == "gateway.networking.k8s.io") && string(t.Kind) == "Service" {
+					if p.Namespace == targetSvcNamespace && string(t.Name) == targetSvcName {
+						// Found another policy targeting the same service
+						// Check if it's older
+						if p.CreationTimestamp.Time.Before(policy.CreationTimestamp.Time) {
+							isConflicted = true
+							conflictingPolicy = fmt.Sprintf("%s/%s", p.Namespace, p.Name)
+							break
+						}
+						if p.CreationTimestamp.Time.Equal(policy.CreationTimestamp.Time) {
+							if p.Namespace < policy.Namespace || (p.Namespace == policy.Namespace && p.Name < policy.Name) {
+								isConflicted = true
+								conflictingPolicy = fmt.Sprintf("%s/%s", p.Namespace, p.Name)
+								break
+							}
+						}
+					}
+				}
+			}
+			if isConflicted {
+				break
+			}
+		}
+		if isConflicted {
+			break
+		}
 	}
 
 	// Validate CA certificates
@@ -115,10 +158,16 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		resolvedRefsMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
 	}
 
+	if isConflicted {
+		acceptedStatus = metav1.ConditionFalse
+		acceptedReason = gatewayv1.PolicyReasonConflicted
+		acceptedMessage = fmt.Sprintf("Conflicted with older policy: %s", conflictingPolicy)
+	}
+
 	var ancestors []gatewayv1.PolicyAncestorStatus
 
 	for _, gw := range gateways {
-		usesService := false
+		usesPolicy := false
 		for _, route := range routes {
 			if route.MatchesGateway(gw.Gateway, ControllerName) {
 				for _, rule := range route.Spec.Rules {
@@ -128,23 +177,29 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 							if backendRef.Namespace != nil {
 								ns = string(*backendRef.Namespace)
 							}
-							if ns == targetedServiceName.Namespace && string(backendRef.Name) == targetedServiceName.Name {
-								usesService = true
-								break
+
+							for _, targetRef := range policy.Spec.TargetRefs {
+								if ns == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
+									usesPolicy = true
+									break
+								}
 							}
 						}
+						if usesPolicy {
+							break
+						}
 					}
-					if usesService {
+					if usesPolicy {
 						break
 					}
 				}
 			}
-			if usesService {
+			if usesPolicy {
 				break
 			}
 		}
 
-		if usesService {
+		if usesPolicy {
 			ancestors = append(ancestors, gatewayv1.PolicyAncestorStatus{
 				AncestorRef: gatewayv1.ParentReference{
 					Group:     state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")),
