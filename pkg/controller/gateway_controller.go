@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -30,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type GatewayClassReconciler struct {
@@ -177,6 +179,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
+	rgs := r.State.GetReferenceGrants()
+	secrets := r.State.GetSecrets()
 	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
@@ -189,6 +193,46 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 							attachedRoutes++
 							break
 						}
+					}
+				}
+			}
+		}
+
+		resolvedRefsCondition := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+			Message:            "All references resolved",
+		}
+
+		if listener.TLS != nil {
+			for _, ref := range listener.TLS.CertificateRefs {
+				refGroup := string(state.ValueOf(ref.Group))
+				refKind := string(state.ValueOf(ref.Kind))
+				if refKind == "" {
+					refKind = "Secret"
+				}
+
+				if (refGroup == "" || refGroup == "core") && refKind == "Secret" {
+					refNamespace := gw.Namespace
+					if ref.Namespace != nil {
+						refNamespace = string(*ref.Namespace)
+					}
+
+					if !isReferencePermitted(gw.Namespace, types.NamespacedName{Namespace: refNamespace, Name: string(ref.Name)}, "gateway.networking.k8s.io", "Gateway", "", "Secret", rgs) {
+						resolvedRefsCondition.Status = metav1.ConditionFalse
+						resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
+						resolvedRefsCondition.Message = fmt.Sprintf("Certificate reference to Secret %s/%s not permitted by ReferenceGrant", refNamespace, ref.Name)
+						break
+					}
+
+					if _, ok := secrets[types.NamespacedName{Namespace: refNamespace, Name: string(ref.Name)}]; !ok {
+						resolvedRefsCondition.Status = metav1.ConditionFalse
+						resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+						resolvedRefsCondition.Message = fmt.Sprintf("Secret %s/%s not found", refNamespace, ref.Name)
+						break
 					}
 				}
 			}
@@ -215,14 +259,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					Reason:             string(gatewayv1.ListenerReasonAccepted),
 					Message:            "Listener accepted",
 				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
+				resolvedRefsCondition,
 			},
 		})
 	}
@@ -335,6 +372,40 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 						})
 					}
 				}
+			}
+			return requests
+		})).
+		Watches(&gatewayv1beta1.ReferenceGrant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// When a ReferenceGrant changes, reconcile all Gateways (simple but effective for reference implementation)
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: gw.Namespace,
+						Name:      gw.Name,
+					},
+				})
+			}
+			return requests
+		})).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// When a Secret changes, reconcile all Gateways
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: gw.Namespace,
+						Name:      gw.Name,
+					},
+				})
 			}
 			return requests
 		})).
