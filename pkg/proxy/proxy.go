@@ -163,6 +163,47 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				for _, cert := range backend.TLSConfig.CACerts {
 					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
 				}
+
+				// Implement custom verification for SubjectAltNames
+				tlsConfig.InsecureSkipVerify = true
+				tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
+					opts := x509.VerifyOptions{
+						Roots:         tlsConfig.RootCAs,
+						Intermediates: x509.NewCertPool(),
+					}
+					for _, cert := range cs.PeerCertificates[1:] {
+						opts.Intermediates.AddCert(cert)
+					}
+
+					if len(backend.TLSConfig.SubjectAltNames) > 0 {
+						// Verify certificate chain first
+						if _, err := cs.PeerCertificates[0].Verify(opts); err != nil {
+							return err
+						}
+
+						// Check SANs
+						for _, san := range backend.TLSConfig.SubjectAltNames {
+							switch san.Type {
+							case gatewayv1.HostnameSubjectAltNameType:
+								if err := cs.PeerCertificates[0].VerifyHostname(san.Hostname); err == nil {
+									return nil
+								}
+							case gatewayv1.URISubjectAltNameType:
+								for _, certURI := range cs.PeerCertificates[0].URIs {
+									if certURI.String() == san.URI {
+										return nil
+									}
+								}
+							}
+						}
+						return fmt.Errorf("certificate does not match any specified SubjectAltNames")
+					}
+
+					// Default validation using Hostname
+					opts.DNSName = backend.TLSConfig.Hostname
+					_, err := cs.PeerCertificates[0].Verify(opts)
+					return err
+				}
 			} else {
 				tlsConfig.InsecureSkipVerify = true
 			}
