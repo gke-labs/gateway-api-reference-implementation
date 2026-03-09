@@ -66,34 +66,37 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// Validate CA certificates
 	var caCerts [][]byte
+	var invalidKindRefs []string
 	var unresolvedRefs []string
 	for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-		if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-			cm := &corev1.ConfigMap{}
-			if err := r.Get(ctx, types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}, cm); err != nil {
+		if string(caRef.Group) != "" || string(caRef.Kind) != "ConfigMap" {
+			invalidKindRefs = append(invalidKindRefs, string(caRef.Name))
+			continue
+		}
+
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}, cm); err != nil {
+			unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+			continue
+		}
+
+		var data []byte
+		if d, ok := cm.Data["ca.crt"]; ok {
+			data = []byte(d)
+		} else if d, ok := cm.BinaryData["ca.crt"]; ok {
+			data = d
+		}
+
+		if len(data) == 0 {
+			unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+		} else {
+			// Verify it's a valid PEM block
+			block, _ := pem.Decode(data)
+			if block == nil || block.Type != "CERTIFICATE" {
 				unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
 			} else {
-				var data []byte
-				if d, ok := cm.Data["ca.crt"]; ok {
-					data = []byte(d)
-				} else if d, ok := cm.BinaryData["ca.crt"]; ok {
-					data = d
-				}
-
-				if len(data) == 0 {
-					unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
-				} else {
-					// Verify it's a valid PEM block
-					block, _ := pem.Decode(data)
-					if block == nil || block.Type != "CERTIFICATE" {
-						unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
-					} else {
-						caCerts = append(caCerts, data)
-					}
-				}
+				caCerts = append(caCerts, data)
 			}
-		} else {
-			unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
 		}
 	}
 
@@ -105,13 +108,21 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	resolvedRefsReason := gatewayv1.BackendTLSPolicyReasonResolvedRefs
 	resolvedRefsMessage := "All references resolved"
 
-	if len(unresolvedRefs) > 0 {
+	if len(invalidKindRefs) > 0 {
 		acceptedStatus = metav1.ConditionFalse
-		acceptedReason = "NoValidCACertificate"
+		acceptedReason = gatewayv1.BackendTLSPolicyReasonNoValidCACertificate
+		acceptedMessage = fmt.Sprintf("Invalid CA certificate reference kind: %v", invalidKindRefs)
+
+		resolvedRefsStatus = metav1.ConditionFalse
+		resolvedRefsReason = gatewayv1.BackendTLSPolicyReasonInvalidKind
+		resolvedRefsMessage = fmt.Sprintf("Invalid CA certificate reference kind: %v", invalidKindRefs)
+	} else if len(unresolvedRefs) > 0 {
+		acceptedStatus = metav1.ConditionFalse
+		acceptedReason = gatewayv1.BackendTLSPolicyReasonNoValidCACertificate
 		acceptedMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
 
 		resolvedRefsStatus = metav1.ConditionFalse
-		resolvedRefsReason = "InvalidCACertificateRef"
+		resolvedRefsReason = gatewayv1.BackendTLSPolicyReasonInvalidCACertificateRef
 		resolvedRefsMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
 	}
 
