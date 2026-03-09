@@ -575,6 +575,151 @@ func TestBuildInternalRoutes(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "BackendTLSPolicy conflict resolution - oldest wins",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route1",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Hostnames: []gatewayv1.Hostname{"example.com"},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Kind: Ptr(gatewayv1.Kind("Service")),
+													Name: "backend-svc",
+													Port: Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "default", Name: "backend-svc"}: {
+					Spec: corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{
+							{
+								Port: 80,
+							},
+						},
+					},
+				},
+			},
+			backendTLSPolicies: []*gatewayv1.BackendTLSPolicy{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "policy-new",
+						Namespace:         "default",
+						CreationTimestamp: metav1.NewTime(metav1.Now().Add(10 * 1e9)),
+					},
+					Spec: gatewayv1.BackendTLSPolicySpec{
+						TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+							{
+								LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+									Group: "",
+									Kind:  "Service",
+									Name:  "backend-svc",
+								},
+							},
+						},
+						Validation: gatewayv1.BackendTLSPolicyValidation{
+							Hostname: "new.example.com",
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "policy-old",
+						Namespace:         "default",
+						CreationTimestamp: metav1.NewTime(metav1.Now().Add(-10 * 1e9)),
+					},
+					Spec: gatewayv1.BackendTLSPolicySpec{
+						TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+							{
+								LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+									Group: "",
+									Kind:  "Service",
+									Name:  "backend-svc",
+								},
+							},
+						},
+						Validation: gatewayv1.BackendTLSPolicyValidation{
+							Hostname: "old.example.com",
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"example.com"},
+					Rules: []InternalRule{
+						{
+							Backend: &InternalBackend{
+								Host:        "backend-svc.default.svc.cluster.local",
+								Port:        80,
+								AppProtocol: Ptr("https"),
+								TLSConfig: &InternalTLSConfig{
+									Hostname: "old.example.com",
+									CACerts:  nil,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {

@@ -103,6 +103,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
 		tests.HTTPRouteBackendProtocolH2C,
 		tests.BackendTLSPolicy,
+		tests.BackendTLSPolicyConflictResolution,
 	}
 
 	cSuite.Setup(t, selectedTests)

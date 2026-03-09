@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -306,6 +307,23 @@ func getPathLen(m *InternalMatch) int {
 }
 
 func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
+	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
+	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
+		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
+			return true
+		}
+		if backendTLSPolicies[i].CreationTimestamp.Time.After(backendTLSPolicies[j].CreationTimestamp.Time) {
+			return false
+		}
+		if backendTLSPolicies[i].Namespace < backendTLSPolicies[j].Namespace {
+			return true
+		}
+		if backendTLSPolicies[i].Namespace > backendTLSPolicies[j].Namespace {
+			return false
+		}
+		return backendTLSPolicies[i].Name < backendTLSPolicies[j].Name
+	})
+
 	var internalRoutes []InternalRoute
 
 	for _, listener := range s.Spec.Listeners {
@@ -443,6 +461,9 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						// Check for BackendTLSPolicy
 						var tlsConfig *InternalTLSConfig
 						for _, policy := range backendTLSPolicies {
+							if tlsConfig != nil {
+								break
+							}
 							for _, targetRef := range policy.Spec.TargetRefs {
 								if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
 									string(targetRef.Name) == string(backendRef.Name) &&
