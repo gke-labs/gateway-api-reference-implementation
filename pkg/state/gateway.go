@@ -437,6 +437,34 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 									string(targetRef.Name) == string(backendRef.Name) &&
 									policy.Namespace == backendSvcNamespace {
 									// Found a policy targeting this service
+									// Check if it is accepted
+									accepted := false
+									for _, ancestor := range policy.Status.Ancestors {
+										if string(ancestor.ControllerName) == controllerName {
+											for _, cond := range ancestor.Conditions {
+												if cond.Type == string(gatewayv1.PolicyConditionAccepted) && cond.Status == metav1.ConditionTrue {
+													accepted = true
+													break
+												}
+											}
+											break
+										}
+									}
+
+									if !accepted {
+										iRule.Error = &ErrorState{
+											Condition: metav1.Condition{
+												Type:    string(gatewayv1.PolicyConditionAccepted),
+												Status:  metav1.ConditionFalse,
+												Reason:  "NoValidCACertificate",
+												Message: "BackendTLSPolicy is not accepted",
+											},
+											HTTPStatusCode: http.StatusInternalServerError,
+											HTTPMessage:    "Invalid BackendTLSPolicy",
+										}
+										break
+									}
+
 									https := "https"
 									appProtocol = &https
 
