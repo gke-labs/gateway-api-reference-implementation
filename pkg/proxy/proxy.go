@@ -58,6 +58,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bestRule, bestMatch := state.MatchRoute(routes, r)
 
 	if bestRule != nil {
+		if bestRule.Name != "" {
+			log.Log.Info("Matched named rule", "ruleName", bestRule.Name, "host", r.Host, "path", r.URL.Path)
+		}
 		if bestRule.Redirect != nil {
 			p.redirect(w, r, *bestRule.Redirect, bestMatch)
 			return

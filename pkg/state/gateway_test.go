@@ -395,6 +395,136 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 		},
 		{
+			name: "multiple rules with names",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route1",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									Name: Ptr(gatewayv1.SectionName("named-rule")),
+									Matches: []gatewayv1.HTTPRouteMatch{
+										{
+											Path: &gatewayv1.HTTPPathMatch{
+												Type:  Ptr(gatewayv1.PathMatchExact),
+												Value: Ptr("/named"),
+											},
+										},
+									},
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-svc-1",
+													Port: Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+								{
+									Matches: []gatewayv1.HTTPRouteMatch{
+										{
+											Path: &gatewayv1.HTTPPathMatch{
+												Type:  Ptr(gatewayv1.PathMatchExact),
+												Value: Ptr("/unnamed"),
+											},
+										},
+									},
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-svc-2",
+													Port: Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"*"},
+					Rules: []InternalRule{
+						{
+							Name: "named-rule",
+							Matches: []InternalMatch{
+								{
+									Path: &InternalPathMatch{
+										Type:  gatewayv1.PathMatchExact,
+										Value: "/named",
+									},
+								},
+							},
+							Backend: &InternalBackend{Host: "backend-svc-1.default.svc.cluster.local", Port: 80},
+						},
+						{
+							Name: "",
+							Matches: []InternalMatch{
+								{
+									Path: &InternalPathMatch{
+										Type:  gatewayv1.PathMatchExact,
+										Value: "/unnamed",
+									},
+								},
+							},
+							Backend: &InternalBackend{Host: "backend-svc-2.default.svc.cluster.local", Port: 80},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "invalid backend kind",
 			gateway: &GatewayState{
 				Gateway: &gatewayv1.Gateway{
