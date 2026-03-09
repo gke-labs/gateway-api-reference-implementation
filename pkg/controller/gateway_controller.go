@@ -182,15 +182,26 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
 		for _, route := range routes {
-			for _, parentRef := range route.Spec.ParentRefs {
-				if string(parentRef.Name) == gw.Name {
-					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
-							attachedRoutes++
+			isAttached := false
+			for _, ps := range route.Status.Parents {
+				if string(ps.ControllerName) != ControllerName {
+					continue
+				}
+				ns := route.Namespace
+				if ps.ParentRef.Namespace != nil {
+					ns = string(*ps.ParentRef.Namespace)
+				}
+				if string(ps.ParentRef.Name) == gw.Name && ns == gw.Namespace {
+					if sn := state.ValueOf(ps.ParentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
+						if route.IsAcceptedByParent(ps) {
+							isAttached = true
 							break
 						}
 					}
 				}
+			}
+			if isAttached {
+				attachedRoutes++
 			}
 		}
 
@@ -327,9 +338,13 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			for _, parentRef := range route.Spec.ParentRefs {
 				if string(state.ValueOf(parentRef.Group)) == "" || string(state.ValueOf(parentRef.Group)) == "gateway.networking.k8s.io" {
 					if string(state.ValueOf(parentRef.Kind)) == "" || string(state.ValueOf(parentRef.Kind)) == "Gateway" {
+						ns := route.Namespace
+						if parentRef.Namespace != nil {
+							ns = string(*parentRef.Namespace)
+						}
 						requests = append(requests, ctrl.Request{
 							NamespacedName: types.NamespacedName{
-								Namespace: route.Namespace, // Assuming same namespace for now
+								Namespace: ns,
 								Name:      string(parentRef.Name),
 							},
 						})

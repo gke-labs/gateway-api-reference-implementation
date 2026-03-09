@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type GatewayState struct {
@@ -306,7 +307,7 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
+func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, referenceGrants []*gatewayv1beta1.ReferenceGrant, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
 	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
 	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
 		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
@@ -341,8 +342,13 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				if string(parentRef.Name) != s.Name {
 					continue
 				}
-				// Namespace check (optional for now as per current implementation)
-				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
+
+				// Namespace check
+				parentNamespace := route.Namespace
+				if parentRef.Namespace != nil {
+					parentNamespace = string(*parentRef.Namespace)
+				}
+				if parentNamespace != s.Namespace {
 					continue
 				}
 
@@ -376,7 +382,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				Hostnames: effectiveHostnames,
 			}
 
-			resolvedRefsCond := route.ComputeResolvedRefsCondition()
+			resolvedRefsCond := route.ComputeResolvedRefsCondition(referenceGrants)
 
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
@@ -442,6 +448,22 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						backendSvcNamespace := route.Namespace
 						if backendRef.Namespace != nil {
 							backendSvcNamespace = string(*backendRef.Namespace)
+						}
+
+						if backendSvcNamespace != route.Namespace {
+							if !isReferenceAllowed("HTTPRoute", route.Namespace, "Service", backendSvcNamespace, string(backendRef.Name), referenceGrants) {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
+										Message: fmt.Sprintf("Reference to Service %s/%s not permitted by ReferenceGrant", backendSvcNamespace, backendRef.Name),
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    fmt.Sprintf("Reference to Service %s/%s not permitted by ReferenceGrant", backendSvcNamespace, backendRef.Name),
+								}
+								continue
+							}
 						}
 
 						backendSvcName := types.NamespacedName{
@@ -551,4 +573,38 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 	}
 
 	return internalRoutes
+}
+
+func isReferenceAllowed(fromKind, fromNamespace, toKind, toNamespace, toName string, grants []*gatewayv1beta1.ReferenceGrant) bool {
+	if fromNamespace == toNamespace {
+		return true
+	}
+
+	for _, grant := range grants {
+		if grant.Namespace != toNamespace {
+			continue
+		}
+
+		fromAllowed := false
+		for _, from := range grant.Spec.From {
+			if string(from.Group) == "gateway.networking.k8s.io" && string(from.Kind) == fromKind && string(from.Namespace) == fromNamespace {
+				fromAllowed = true
+				break
+			}
+		}
+
+		if !fromAllowed {
+			continue
+		}
+
+		for _, to := range grant.Spec.To {
+			if string(to.Group) == "" && string(to.Kind) == toKind {
+				if to.Name == nil || string(*to.Name) == toName {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }

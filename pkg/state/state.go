@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type State struct {
@@ -30,6 +31,7 @@ type State struct {
 
 	gateways           map[types.NamespacedName]*GatewayState
 	httpRoutes         map[types.NamespacedName]*HTTPRouteState
+	referenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
 	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
 	services           map[types.NamespacedName]*corev1.Service
 	configMaps         map[types.NamespacedName]*corev1.ConfigMap
@@ -39,10 +41,36 @@ func NewState() *State {
 	return &State{
 		gateways:           make(map[types.NamespacedName]*GatewayState),
 		httpRoutes:         make(map[types.NamespacedName]*HTTPRouteState),
+		referenceGrants:    make(map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant),
 		backendTLSPolicies: make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
 		services:           make(map[types.NamespacedName]*corev1.Service),
 		configMaps:         make(map[types.NamespacedName]*corev1.ConfigMap),
 	}
+}
+
+func (s *State) UpsertReferenceGrant(rg *gatewayv1beta1.ReferenceGrant) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.referenceGrants[types.NamespacedName{Namespace: rg.Namespace, Name: rg.Name}] = rg
+}
+
+func (s *State) DeleteReferenceGrant(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.referenceGrants, name)
+}
+
+func (s *State) GetReferenceGrants() []*gatewayv1beta1.ReferenceGrant {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var grants []*gatewayv1beta1.ReferenceGrant
+	for _, rg := range s.referenceGrants {
+		grants = append(grants, rg)
+	}
+	return grants
 }
 
 func (s *State) UpsertConfigMap(cm *corev1.ConfigMap) {
