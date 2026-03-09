@@ -96,6 +96,7 @@ func TestConformance(t *testing.T) {
 	selectedTests := []suite.ConformanceTest{
 		tests.HTTPRouteSimpleSameNamespace,
 		tests.HTTPRouteMatching,
+		tests.HTTPRoutePathMatchOrder,
 		tests.HTTPRouteExactPathMatching,
 		tests.HTTPRouteHeaderMatching,
 		tests.HTTPRouteHostnameIntersection,

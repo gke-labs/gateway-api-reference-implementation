@@ -16,6 +16,7 @@ package state
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -176,6 +177,19 @@ func (s *State) GetHTTPRoutes() []*HTTPRouteState {
 	for _, route := range s.httpRoutes {
 		routes = append(routes, route)
 	}
+
+	// Sort by creation timestamp, then by namespace/name to ensure deterministic order
+	// and follow Gateway API precedence rules for ties.
+	sort.Slice(routes, func(i, j int) bool {
+		if !routes[i].CreationTimestamp.Equal(&routes[j].CreationTimestamp) {
+			return routes[i].CreationTimestamp.Before(&routes[j].CreationTimestamp)
+		}
+		if routes[i].Namespace != routes[j].Namespace {
+			return routes[i].Namespace < routes[j].Namespace
+		}
+		return routes[i].Name < routes[j].Name
+	})
+
 	return routes
 }
 
