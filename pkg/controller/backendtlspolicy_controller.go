@@ -19,6 +19,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"reflect"
+	"sort"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -175,31 +176,49 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 	}
 
+	// Sort ancestors for deterministic status
+	sort.Slice(ancestors, func(i, j int) bool {
+		ai := ancestors[i].AncestorRef
+		aj := ancestors[j].AncestorRef
+		if string(state.ValueOf(ai.Namespace)) != string(state.ValueOf(aj.Namespace)) {
+			return string(state.ValueOf(ai.Namespace)) < string(state.ValueOf(aj.Namespace))
+		}
+		return string(ai.Name) < string(aj.Name)
+	})
+
 	updated := false
 	if len(policy.Status.Ancestors) != len(ancestors) {
 		updated = true
 	} else {
 		for i := range ancestors {
 			if !reflect.DeepEqual(policy.Status.Ancestors[i].AncestorRef, ancestors[i].AncestorRef) ||
-				string(policy.Status.Ancestors[i].ControllerName) != string(ancestors[i].ControllerName) ||
-				len(policy.Status.Ancestors[i].Conditions) != len(ancestors[i].Conditions) {
+				string(policy.Status.Ancestors[i].ControllerName) != string(ancestors[i].ControllerName) {
+				updated = true
+				break
+			}
+			// Compare conditions
+			if len(policy.Status.Ancestors[i].Conditions) != len(ancestors[i].Conditions) {
 				updated = true
 				break
 			}
 			for j := range ancestors[i].Conditions {
-				matched := false
+				found := false
 				for k := range policy.Status.Ancestors[i].Conditions {
 					if policy.Status.Ancestors[i].Conditions[k].Type == ancestors[i].Conditions[j].Type {
-						if policy.Status.Ancestors[i].Conditions[k].Status == ancestors[i].Conditions[j].Status &&
-							policy.Status.Ancestors[i].Conditions[k].ObservedGeneration == ancestors[i].Conditions[j].ObservedGeneration &&
-							policy.Status.Ancestors[i].Conditions[k].Reason == ancestors[i].Conditions[j].Reason &&
-							policy.Status.Ancestors[i].Conditions[k].Message == ancestors[i].Conditions[j].Message {
-							matched = true
+						found = true
+						if policy.Status.Ancestors[i].Conditions[k].Status != ancestors[i].Conditions[j].Status ||
+							policy.Status.Ancestors[i].Conditions[k].ObservedGeneration != ancestors[i].Conditions[j].ObservedGeneration ||
+							policy.Status.Ancestors[i].Conditions[k].Reason != ancestors[i].Conditions[j].Reason ||
+							policy.Status.Ancestors[i].Conditions[k].Message != ancestors[i].Conditions[j].Message {
+							updated = true
+						} else {
+							// Keep the old transition time if nothing else changed
+							ancestors[i].Conditions[j].LastTransitionTime = policy.Status.Ancestors[i].Conditions[k].LastTransitionTime
 						}
 						break
 					}
 				}
-				if !matched {
+				if !found || updated {
 					updated = true
 					break
 				}
@@ -254,6 +273,38 @@ func (r *BackendTLSPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 						break
 					}
 				}
+			}
+			return requests
+		})).
+		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			var list gatewayv1.BackendTLSPolicyList
+			if err := mgr.GetClient().List(ctx, &list); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, policy := range list.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: policy.Namespace,
+						Name:      policy.Name,
+					},
+				})
+			}
+			return requests
+		})).
+		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			var list gatewayv1.BackendTLSPolicyList
+			if err := mgr.GetClient().List(ctx, &list); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, policy := range list.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: policy.Namespace,
+						Name:      policy.Name,
+					},
+				})
 			}
 			return requests
 		})).
