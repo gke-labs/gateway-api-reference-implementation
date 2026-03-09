@@ -146,12 +146,13 @@ func run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to generate self-signed cert: %w", err)
 		}
+		p.SetServerCert(cert)
 
 		srv := &http.Server{
 			Addr:    proxyHTTPSAddr,
 			Handler: p,
 			TLSConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
+				GetConfigForClient: p.GetConfigForClient,
 			},
 		}
 		go func() {

@@ -177,6 +177,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
+	configMaps := r.State.GetConfigMaps()
 	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
@@ -187,6 +188,43 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
 						if route.IsAccepted(ControllerName) {
 							attachedRoutes++
+							break
+						}
+					}
+				}
+			}
+		}
+
+		resolvedRefsCondition := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+			Message:            "All references resolved",
+		}
+
+		// Validate FrontendValidation references
+		if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+			var validation *gatewayv1.FrontendTLSValidation
+			for _, perPort := range gw.Spec.TLS.Frontend.PerPort {
+				if int32(perPort.Port) == int32(listener.Port) {
+					validation = perPort.TLS.Validation
+					break
+				}
+			}
+			if validation == nil {
+				validation = gw.Spec.TLS.Frontend.Default.Validation
+			}
+
+			if validation != nil {
+				for _, caRef := range validation.CACertificateRefs {
+					if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+						cmName := types.NamespacedName{Namespace: gw.Namespace, Name: string(caRef.Name)}
+						if _, ok := configMaps[cmName]; !ok {
+							resolvedRefsCondition.Status = metav1.ConditionFalse
+							resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonResolvedRefs)
+							resolvedRefsCondition.Message = "ConfigMap " + cmName.String() + " not found"
 							break
 						}
 					}
@@ -215,14 +253,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					Reason:             string(gatewayv1.ListenerReasonAccepted),
 					Message:            "Listener accepted",
 				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
+				resolvedRefsCondition,
 			},
 		})
 	}
@@ -335,6 +366,26 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 						})
 					}
 				}
+			}
+			return requests
+		})).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// When a ConfigMap changes, reconcile all Gateways that might reference it
+			// For simplicity, we just reconcile all Gateways in the same namespace.
+			// In a real implementation, we would index this.
+			cm := obj.(*corev1.ConfigMap)
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways, client.InNamespace(cm.Namespace)); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: gw.Namespace,
+						Name:      gw.Name,
+					},
+				})
 			}
 			return requests
 		})).

@@ -34,8 +34,9 @@ import (
 
 // Proxy is a minimal implementation of a Gateway API proxy.
 type Proxy struct {
-	mu     sync.RWMutex
-	routes []state.InternalRoute
+	mu         sync.RWMutex
+	routes     []state.InternalRoute
+	serverCert *tls.Certificate
 }
 
 func NewProxy() *Proxy {
@@ -44,10 +45,48 @@ func NewProxy() *Proxy {
 	}
 }
 
+func (p *Proxy) SetServerCert(cert tls.Certificate) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.serverCert = &cert
+}
+
 func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.routes = routes
+}
+
+func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	config := &tls.Config{
+		Certificates: []tls.Certificate{*p.serverCert},
+	}
+
+	// Find the best route for this SNI to get the ClientCAs
+	var bestRoute *state.InternalRoute
+	for i := range p.routes {
+		route := &p.routes[i]
+		if route.MatchHostname(hello.ServerName) {
+			// For simplicity, we just take the first matching route's ClientCAs
+			if len(route.ClientCAs) > 0 {
+				bestRoute = route
+				break
+			}
+		}
+	}
+
+	if bestRoute != nil && len(bestRoute.ClientCAs) > 0 {
+		config.ClientCAs = x509.NewCertPool()
+		for _, cert := range bestRoute.ClientCAs {
+			config.ClientCAs.AppendCertsFromPEM(cert)
+		}
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return config, nil
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {

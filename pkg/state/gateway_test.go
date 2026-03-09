@@ -720,6 +720,110 @@ func TestBuildInternalRoutes(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "Gateway with Frontend Client Certificate Validation",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "client-validation-gw",
+						Namespace: "test-ns",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						TLS: &gatewayv1.GatewayTLSConfig{
+							Frontend: &gatewayv1.FrontendTLSConfig{
+								Default: gatewayv1.TLSConfig{
+									Validation: &gatewayv1.FrontendTLSValidation{
+										CACertificateRefs: []gatewayv1.ObjectReference{
+											{
+												Kind: "ConfigMap",
+												Name: "ca-cert",
+											},
+										},
+									},
+								},
+							},
+						},
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "https",
+								Protocol: gatewayv1.HTTPSProtocolType,
+								Port:     443,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route1",
+							Namespace: "test-ns",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "client-validation-gw",
+									},
+								},
+							},
+							Hostnames: []gatewayv1.Hostname{"example.org"},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-svc",
+													Port: Ptr(gatewayv1.PortNumber(8080)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "client-validation-gw",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			configMaps: map[types.NamespacedName]*corev1.ConfigMap{
+				{Namespace: "test-ns", Name: "ca-cert"}: {
+					Data: map[string]string{
+						"ca.crt": "fake-ca-cert",
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"example.org"},
+					Rules: []InternalRule{
+						{
+							Backend: &InternalBackend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
+						},
+					},
+					ClientCAs: [][]byte{[]byte("fake-ca-cert")},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
