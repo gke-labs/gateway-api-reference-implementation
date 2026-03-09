@@ -30,7 +30,15 @@ func (s *HTTPRouteState) Validate() error {
 	if s.HTTPRoute == nil {
 		return nil
 	}
+	ruleNames := make(map[string]bool)
 	for _, rule := range s.Spec.Rules {
+		if rule.Name != nil {
+			name := string(*rule.Name)
+			if ruleNames[name] {
+				return fmt.Errorf("duplicate rule name: %s", name)
+			}
+			ruleNames[name] = true
+		}
 		for _, match := range rule.Matches {
 			for _, header := range match.Headers {
 				if ValueOf(header.Type) == gatewayv1.HeaderMatchRegularExpression {

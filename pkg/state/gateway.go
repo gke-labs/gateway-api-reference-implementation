@@ -102,6 +102,7 @@ type ErrorState struct {
 }
 
 type InternalRule struct {
+	Name     string
 	Matches  []InternalMatch
 	Backend  *InternalBackend
 	Redirect *InternalRedirect
@@ -377,6 +378,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				}
 
 				iRule := InternalRule{
+					Name:     string(ValueOf(rule.Name)),
 					Redirect: redirect,
 				}
 
