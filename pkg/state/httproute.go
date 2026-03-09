@@ -20,6 +20,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type HTTPRouteState struct {
@@ -57,8 +58,11 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 		// Check if Gateway exists and has matching listeners
 		var gw *GatewayState
 		for _, g := range gateways {
-			if g.Name == string(parentRef.Name) {
-				// Note: for now we only check name, but should check namespace too if specified
+			gwNamespace := s.Namespace
+			if parentRef.Namespace != nil {
+				gwNamespace = string(*parentRef.Namespace)
+			}
+			if g.Name == string(parentRef.Name) && g.Namespace == gwNamespace {
 				gw = g
 				break
 			}
@@ -67,7 +71,7 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 		if gw == nil {
 			acceptedStatus = metav1.ConditionFalse
 			acceptedReason = gatewayv1.RouteReasonNoMatchingParent
-			acceptedMessage = "Gateway not found"
+			acceptedMessage = fmt.Sprintf("Gateway %s/%s not found", ValueOf(parentRef.Namespace), parentRef.Name)
 		} else {
 			matched := false
 			for _, listener := range gw.Spec.Listeners {
@@ -75,6 +79,10 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 					continue
 				}
 				if sectionName := ValueOf(parentRef.SectionName); sectionName != "" && sectionName != listener.Name {
+					continue
+				}
+
+				if !isRouteAllowed(gw.Namespace, listener.AllowedRoutes, s.Namespace) {
 					continue
 				}
 
@@ -87,7 +95,7 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 			if !matched {
 				acceptedStatus = metav1.ConditionFalse
 				acceptedReason = gatewayv1.RouteReasonNoMatchingListenerHostname
-				acceptedMessage = "No matching listener hostname"
+				acceptedMessage = "No matching listener hostname or route not allowed by listener"
 			}
 		}
 	}
@@ -102,7 +110,25 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 	}
 }
 
-func (s *HTTPRouteState) ComputeResolvedRefsCondition() metav1.Condition {
+func isRouteAllowed(gwNamespace string, allowed *gatewayv1.AllowedRoutes, routeNamespace string) bool {
+	if allowed == nil || allowed.Namespaces == nil || allowed.Namespaces.From == nil {
+		return gwNamespace == routeNamespace
+	}
+
+	switch *allowed.Namespaces.From {
+	case gatewayv1.NamespacesFromAll:
+		return true
+	case gatewayv1.NamespacesFromSame:
+		return gwNamespace == routeNamespace
+	case gatewayv1.NamespacesFromSelector:
+		// TODO: Implement selector matching. For now, we don't have namespace labels.
+		// Conformance tests for cross-namespace often use 'All'.
+		return false
+	}
+	return gwNamespace == routeNamespace
+}
+
+func (s *HTTPRouteState) ComputeResolvedRefsCondition(referenceGrants []*gatewayv1beta1.ReferenceGrant) metav1.Condition {
 	resolvedRefsStatus := metav1.ConditionTrue
 	resolvedRefsReason := gatewayv1.RouteReasonResolvedRefs
 	resolvedRefsMessage := "All references resolved"
@@ -114,6 +140,20 @@ func (s *HTTPRouteState) ComputeResolvedRefsCondition() metav1.Condition {
 				resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
 				resolvedRefsMessage = fmt.Sprintf("Unsupported backend kind: %s", *backendRef.Kind)
 				goto done
+			}
+
+			backendSvcNamespace := s.Namespace
+			if backendRef.Namespace != nil {
+				backendSvcNamespace = string(*backendRef.Namespace)
+			}
+
+			if backendSvcNamespace != s.Namespace {
+				if !isReferenceAllowed("HTTPRoute", s.Namespace, "Service", backendSvcNamespace, string(backendRef.Name), referenceGrants) {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.RouteReasonRefNotPermitted
+					resolvedRefsMessage = fmt.Sprintf("Reference to Service %s/%s not permitted by ReferenceGrant", backendSvcNamespace, backendRef.Name)
+					goto done
+				}
 			}
 		}
 	}
@@ -135,11 +175,18 @@ func (s *HTTPRouteState) IsAccepted(controllerName string) bool {
 	}
 	for _, ps := range s.HTTPRoute.Status.Parents {
 		if string(ps.ControllerName) == controllerName {
-			for _, c := range ps.Conditions {
-				if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
-					return true
-				}
+			if s.IsAcceptedByParent(ps) {
+				return true
 			}
+		}
+	}
+	return false
+}
+
+func (s *HTTPRouteState) IsAcceptedByParent(ps gatewayv1.RouteParentStatus) bool {
+	for _, c := range ps.Conditions {
+		if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
+			return true
 		}
 	}
 	return false
@@ -152,8 +199,11 @@ func (s *HTTPRouteState) MatchesGateway(gw *gatewayv1.Gateway, controllerName st
 
 	for _, ps := range s.HTTPRoute.Status.Parents {
 		if string(ps.ControllerName) == controllerName {
-			if string(ps.ParentRef.Name) == gw.Name {
-				// Note: for now we only check name, but should check namespace too if specified
+			ns := s.Namespace
+			if ps.ParentRef.Namespace != nil {
+				ns = string(*ps.ParentRef.Namespace)
+			}
+			if string(ps.ParentRef.Name) == gw.Name && ns == gw.Namespace {
 				for _, c := range ps.Conditions {
 					if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
 						return true

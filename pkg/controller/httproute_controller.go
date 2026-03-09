@@ -23,11 +23,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type HTTPRouteReconciler struct {
@@ -55,6 +58,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Update status
 	// For each parentRef, we should add a ParentStatus
 	gateways := r.State.GetGateways()
+	grants := r.State.GetReferenceGrants()
 	rs := state.HTTPRouteState{HTTPRoute: route}
 
 	var newParents []gatewayv1.RouteParentStatus
@@ -69,7 +73,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			ControllerName: ControllerName,
 			Conditions: []metav1.Condition{
 				acceptedCondition,
-				rs.ComputeResolvedRefsCondition(),
+				rs.ComputeResolvedRefsCondition(grants),
 			},
 		})
 	}
@@ -132,5 +136,60 @@ func (r *HTTPRouteReconciler) updateProxy() {
 func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.HTTPRoute{}).
+		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			gw := obj.(*gatewayv1.Gateway)
+			var requests []ctrl.Request
+			// Reconcile all HTTPRoutes that reference this Gateway
+			routes := r.State.GetHTTPRoutes()
+			for _, route := range routes {
+				for _, parentRef := range route.Spec.ParentRefs {
+					ns := route.Namespace
+					if parentRef.Namespace != nil {
+						ns = string(*parentRef.Namespace)
+					}
+					if string(parentRef.Name) == gw.Name && ns == gw.Namespace {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: route.Namespace,
+								Name:      route.Name,
+							},
+						})
+						break
+					}
+				}
+			}
+			return requests
+		})).
+		Watches(&gatewayv1beta1.ReferenceGrant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			rg := obj.(*gatewayv1beta1.ReferenceGrant)
+			var requests []ctrl.Request
+			// Reconcile all HTTPRoutes that might be affected by this ReferenceGrant
+			routes := r.State.GetHTTPRoutes()
+			for _, route := range routes {
+				hasCrossNamespace := false
+				for _, rule := range route.Spec.Rules {
+					for _, br := range rule.BackendRefs {
+						if br.Namespace != nil && string(*br.Namespace) != route.Namespace {
+							if string(*br.Namespace) == rg.Namespace {
+								hasCrossNamespace = true
+								break
+							}
+						}
+					}
+					if hasCrossNamespace {
+						break
+					}
+				}
+				if hasCrossNamespace {
+					requests = append(requests, ctrl.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: route.Namespace,
+							Name:      route.Name,
+						},
+					})
+				}
+			}
+			return requests
+		})).
 		Complete(r)
 }
