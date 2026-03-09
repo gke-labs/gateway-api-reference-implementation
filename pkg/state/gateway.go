@@ -105,9 +105,20 @@ type InternalRule struct {
 	Matches  []InternalMatch
 	Backend  *InternalBackend
 	Redirect *InternalRedirect
+	Rewrite  *InternalRewrite
 	// Error, if non-nil, indicates that this rule is invalid and should
 	// return an error response if matched.
 	Error *ErrorState
+}
+
+type InternalRewrite struct {
+	Hostname *gatewayv1.PreciseHostname
+	Path     *InternalPathRewrite
+}
+
+type InternalPathRewrite struct {
+	Type  gatewayv1.HTTPPathModifierType
+	Value string
 }
 
 type InternalBackend struct {
@@ -351,6 +362,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
+				var rewrite *InternalRewrite
 				for _, filter := range rule.Filters {
 					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
 						r := filter.RequestRedirect
@@ -374,10 +386,29 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						}
 						break
 					}
+					if filter.Type == gatewayv1.HTTPRouteFilterURLRewrite {
+						r := filter.URLRewrite
+						rewrite = &InternalRewrite{
+							Hostname: r.Hostname,
+						}
+						if r.Path != nil {
+							var pathValue string
+							if r.Path.Type == gatewayv1.FullPathHTTPPathModifier {
+								pathValue = ValueOf(r.Path.ReplaceFullPath)
+							} else if r.Path.Type == gatewayv1.PrefixMatchHTTPPathModifier {
+								pathValue = ValueOf(r.Path.ReplacePrefixMatch)
+							}
+							rewrite.Path = &InternalPathRewrite{
+								Type:  r.Path.Type,
+								Value: pathValue,
+							}
+						}
+					}
 				}
 
 				iRule := InternalRule{
 					Redirect: redirect,
+					Rewrite:  rewrite,
 				}
 
 				if resolvedRefsCond.Status == metav1.ConditionFalse {

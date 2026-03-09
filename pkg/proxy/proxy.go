@@ -70,6 +70,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if bestRule.Backend != nil {
+			if bestRule.Rewrite != nil {
+				p.applyRewrite(r, *bestRule.Rewrite, bestMatch)
+			}
 			p.forward(w, r, *bestRule.Backend)
 			return
 		}
@@ -137,6 +140,33 @@ func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.
 
 	log.Log.Info("Redirecting request", "host", r.Host, "path", r.URL.Path, "target", newURL.String(), "status", statusCode)
 	http.Redirect(w, r, newURL.String(), statusCode)
+}
+
+func (p *Proxy) applyRewrite(r *http.Request, rewrite state.InternalRewrite, match *state.InternalMatch) {
+	if hostname := state.ValueOf(rewrite.Hostname); hostname != "" {
+		h, port, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			// No port in current Host
+			r.Host = string(hostname)
+		} else {
+			_ = h
+			r.Host = net.JoinHostPort(string(hostname), port)
+		}
+	}
+
+	if rewrite.Path != nil {
+		switch rewrite.Path.Type {
+		case gatewayv1.FullPathHTTPPathModifier:
+			r.URL.Path = rewrite.Path.Value
+		case gatewayv1.PrefixMatchHTTPPathModifier:
+			if match != nil && match.Path != nil && match.Path.Type == gatewayv1.PathMatchPathPrefix {
+				prefix := match.Path.Value
+				if strings.HasPrefix(r.URL.Path, prefix) {
+					r.URL.Path = rewrite.Path.Value + r.URL.Path[len(prefix):]
+				}
+			}
+		}
+	}
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend) {
