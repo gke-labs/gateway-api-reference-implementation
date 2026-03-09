@@ -176,12 +176,25 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Compute listener status
-	routes := r.State.GetHTTPRoutes()
+	httpRoutes := r.State.GetHTTPRoutes()
+	grpcRoutes := r.State.GetGRPCRoutes()
 	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
-		for _, route := range routes {
+		for _, route := range httpRoutes {
+			for _, parentRef := range route.Spec.ParentRefs {
+				if string(parentRef.Name) == gw.Name {
+					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
+						if route.IsAccepted(ControllerName) {
+							attachedRoutes++
+							break
+						}
+					}
+				}
+			}
+		}
+		for _, route := range grpcRoutes {
 			for _, parentRef := range route.Spec.ParentRefs {
 				if string(parentRef.Name) == gw.Name {
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
@@ -195,8 +208,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
-			Name:           listener.Name,
-			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
+			Name: listener.Name,
+			SupportedKinds: []gatewayv1.RouteGroupKind{
+				{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"},
+				{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "GRPCRoute"},
+			},
 			AttachedRoutes: int32(attachedRoutes),
 			Conditions: []metav1.Condition{
 				{
@@ -323,6 +339,24 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			// When an HTTPRoute changes, reconcile all Gateways it references
 			route := obj.(*gatewayv1.HTTPRoute)
+			var requests []ctrl.Request
+			for _, parentRef := range route.Spec.ParentRefs {
+				if string(state.ValueOf(parentRef.Group)) == "" || string(state.ValueOf(parentRef.Group)) == "gateway.networking.k8s.io" {
+					if string(state.ValueOf(parentRef.Kind)) == "" || string(state.ValueOf(parentRef.Kind)) == "Gateway" {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: route.Namespace, // Assuming same namespace for now
+								Name:      string(parentRef.Name),
+							},
+						})
+					}
+				}
+			}
+			return requests
+		})).
+		Watches(&gatewayv1.GRPCRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// When a GRPCRoute changes, reconcile all Gateways it references
+			route := obj.(*gatewayv1.GRPCRoute)
 			var requests []ctrl.Request
 			for _, parentRef := range route.Spec.ParentRefs {
 				if string(state.ValueOf(parentRef.Group)) == "" || string(state.ValueOf(parentRef.Group)) == "gateway.networking.k8s.io" {

@@ -30,8 +30,9 @@ func TestBuildInternalRoutes(t *testing.T) {
 	controllerName := "test-controller"
 	tests := []struct {
 		name               string
-		routes             []*HTTPRouteState
 		gateway            *GatewayState
+		routes             []*HTTPRouteState
+		grpcRoutes         []*GRPCRouteState
 		services           map[types.NamespacedName]*corev1.Service
 		backendTLSPolicies []*gatewayv1.BackendTLSPolicy
 		configMaps         map[types.NamespacedName]*corev1.ConfigMap
@@ -720,11 +721,113 @@ func TestBuildInternalRoutes(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "GRPCRoute header matching",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			grpcRoutes: []*GRPCRouteState{
+				{
+					GRPCRoute: &gatewayv1.GRPCRoute{
+						ObjectMeta: metav1.ObjectMeta{Name: "grpc-route", Namespace: "default"},
+						Spec: gatewayv1.GRPCRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{Name: "gw"},
+								},
+							},
+							Hostnames: []gatewayv1.Hostname{"example.com"},
+							Rules: []gatewayv1.GRPCRouteRule{
+								{
+									Matches: []gatewayv1.GRPCRouteMatch{
+										{
+											Headers: []gatewayv1.GRPCHeaderMatch{
+												{
+													Name:  "x-version",
+													Value: "v1",
+												},
+											},
+										},
+									},
+									BackendRefs: []gatewayv1.GRPCBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "grpc-svc",
+													Port: Ptr(gatewayv1.PortNumber(8080)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.GRPCRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef:      gatewayv1.ParentReference{Name: "gw"},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "default", Name: "grpc-svc"}: {
+					Spec: corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{{Port: 8080}},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"example.com"},
+					Rules: []InternalRule{
+						{
+							Matches: []InternalMatch{
+								{
+									Headers: []InternalHeaderMatch{
+										{
+											Type:            gatewayv1.HeaderMatchExact,
+											Name:            "x-version",
+											MatchExactValue: "v1",
+										},
+									},
+								},
+							},
+							Backend: &InternalBackend{
+								Host: "grpc-svc.default.svc.cluster.local",
+								Port: 8080,
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
+			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.grpcRoutes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
 			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
 			if diff != "" {
 				t.Errorf("BuildInternalRoutes() mismatch (-want +got):\n%s", diff)
