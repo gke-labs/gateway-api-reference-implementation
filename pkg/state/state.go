@@ -29,6 +29,7 @@ type State struct {
 
 	gateways           map[types.NamespacedName]*GatewayState
 	httpRoutes         map[types.NamespacedName]*HTTPRouteState
+	grpcRoutes         map[types.NamespacedName]*GRPCRouteState
 	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
 	services           map[types.NamespacedName]*corev1.Service
 	configMaps         map[types.NamespacedName]*corev1.ConfigMap
@@ -38,6 +39,7 @@ func NewState() *State {
 	return &State{
 		gateways:           make(map[types.NamespacedName]*GatewayState),
 		httpRoutes:         make(map[types.NamespacedName]*HTTPRouteState),
+		grpcRoutes:         make(map[types.NamespacedName]*GRPCRouteState),
 		backendTLSPolicies: make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
 		services:           make(map[types.NamespacedName]*corev1.Service),
 		configMaps:         make(map[types.NamespacedName]*corev1.ConfigMap),
@@ -141,6 +143,54 @@ func (s *State) DeleteHTTPRoute(name types.NamespacedName) {
 	defer s.mu.Unlock()
 
 	delete(s.httpRoutes, name)
+}
+
+func (s *State) UpsertGRPCRoute(route *gatewayv1.GRPCRoute) metav1.Condition {
+	rs := &GRPCRouteState{
+		GRPCRoute: route,
+	}
+
+	status := metav1.ConditionTrue
+	reason := gatewayv1.RouteReasonAccepted
+	message := "Route accepted by reference implementation"
+
+	if err := rs.Validate(); err != nil {
+		status = metav1.ConditionFalse
+		reason = gatewayv1.RouteReasonUnsupportedValue
+		message = fmt.Sprintf("Invalid route: %v", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.grpcRoutes[types.NamespacedName{Namespace: route.Namespace, Name: route.Name}] = rs
+
+	return metav1.Condition{
+		Type:               string(gatewayv1.RouteConditionAccepted),
+		Status:             status,
+		ObservedGeneration: route.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             string(reason),
+		Message:            message,
+	}
+}
+
+func (s *State) DeleteGRPCRoute(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.grpcRoutes, name)
+}
+
+func (s *State) GetGRPCRoutes() []*GRPCRouteState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var routes []*GRPCRouteState
+	for _, route := range s.grpcRoutes {
+		routes = append(routes, route)
+	}
+	return routes
 }
 
 func (s *State) UpsertBackendTLSPolicy(policy *gatewayv1.BackendTLSPolicy) {

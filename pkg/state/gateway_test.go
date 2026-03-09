@@ -30,12 +30,109 @@ func TestBuildInternalRoutes(t *testing.T) {
 	tests := []struct {
 		name               string
 		routes             []*HTTPRouteState
+		grpcRoutes         []*GRPCRouteState
 		gateway            *GatewayState
 		services           map[types.NamespacedName]*corev1.Service
 		backendTLSPolicies []*gatewayv1.BackendTLSPolicy
 		configMaps         map[types.NamespacedName]*corev1.ConfigMap
 		expected           []InternalRoute
 	}{
+		{
+			name: "grpc route exact method match",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			grpcRoutes: []*GRPCRouteState{
+				{
+					GRPCRoute: &gatewayv1.GRPCRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.GRPCRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Rules: []gatewayv1.GRPCRouteRule{
+								{
+									Matches: []gatewayv1.GRPCRouteMatch{
+										{
+											Method: &gatewayv1.GRPCMethodMatch{
+												Service: Ptr("my.service"),
+												Method:  Ptr("MyMethod"),
+											},
+										},
+									},
+									BackendRefs: []gatewayv1.GRPCBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-svc",
+													Port: Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.GRPCRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"*"},
+					Rules: []InternalRule{
+						{
+							Matches: []InternalMatch{
+								{
+									Path: &InternalPathMatch{
+										Type:  gatewayv1.PathMatchExact,
+										Value: "/my.service/MyMethod",
+									},
+								},
+							},
+							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+						},
+					},
+				},
+			},
+		},
 		{
 			name: "single route with single backend and appProtocol",
 			gateway: &GatewayState{
@@ -488,7 +585,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
+			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.grpcRoutes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
 			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
 			if diff != "" {
 				t.Errorf("BuildInternalRoutes() mismatch (-want +got):\n%s", diff)
