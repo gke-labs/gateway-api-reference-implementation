@@ -58,6 +58,7 @@ func (s *HTTPRouteState) GetNamespace() string {
 type InternalRoute struct {
 	Hostnames []string
 	Rules     []InternalRule
+	ClientCAs [][]byte
 }
 
 func (ir *InternalRoute) MatchHostname(host string) bool {
@@ -372,8 +373,38 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				continue
 			}
 
+			var clientCAs [][]byte
+			if s.Spec.TLS != nil && s.Spec.TLS.Frontend != nil {
+				var validation *gatewayv1.FrontendTLSValidation
+				for _, perPort := range s.Spec.TLS.Frontend.PerPort {
+					if int32(perPort.Port) == int32(listener.Port) {
+						validation = perPort.TLS.Validation
+						break
+					}
+				}
+				if validation == nil {
+					validation = s.Spec.TLS.Frontend.Default.Validation
+				}
+
+				if validation != nil {
+					for _, caRef := range validation.CACertificateRefs {
+						if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+							cmName := types.NamespacedName{Namespace: s.Namespace, Name: string(caRef.Name)}
+							if cm, ok := configMaps[cmName]; ok {
+								if data, ok := cm.Data["ca.crt"]; ok {
+									clientCAs = append(clientCAs, []byte(data))
+								} else if data, ok := cm.BinaryData["ca.crt"]; ok {
+									clientCAs = append(clientCAs, data)
+								}
+							}
+						}
+					}
+				}
+			}
+
 			ir := InternalRoute{
 				Hostnames: effectiveHostnames,
+				ClientCAs: clientCAs,
 			}
 
 			resolvedRefsCond := route.ComputeResolvedRefsCondition()
