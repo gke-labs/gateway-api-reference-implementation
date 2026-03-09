@@ -98,6 +98,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteMatching,
 		tests.HTTPRouteExactPathMatching,
 		tests.HTTPRouteHeaderMatching,
+		tests.HTTPRouteQueryParamMatching,
 		tests.HTTPRouteHostnameIntersection,
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
 		tests.HTTPRouteBackendProtocolH2C,
