@@ -429,6 +429,8 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							}
 						}
 
+						iRule.Error = nil
+
 						// Check for BackendTLSPolicy
 						var tlsConfig *InternalTLSConfig
 						for _, policy := range backendTLSPolicies {
@@ -441,35 +443,65 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 									appProtocol = &https
 
 									var caCerts [][]byte
+									var policyInvalid bool
+									var invalidReason string
 									for _, caRef := range policy.Spec.Validation.CACertificateRefs {
 										if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
 											cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
 											if cm, ok := configMaps[cmName]; ok {
-												if data, ok := cm.Data["ca.crt"]; ok {
-													caCerts = append(caCerts, []byte(data))
-												} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-													caCerts = append(caCerts, data)
+												var data []byte
+												if d, ok := cm.Data["ca.crt"]; ok {
+													data = []byte(d)
+												} else if d, ok := cm.BinaryData["ca.crt"]; ok {
+													data = d
 												}
+
+												if len(data) > 0 {
+													caCerts = append(caCerts, data)
+												} else {
+													policyInvalid = true
+													invalidReason = fmt.Sprintf("ConfigMap %s missing ca.crt", cmName)
+												}
+											} else {
+												policyInvalid = true
+												invalidReason = fmt.Sprintf("ConfigMap %s not found", cmName)
 											}
+										} else {
+											policyInvalid = true
+											invalidReason = fmt.Sprintf("Unsupported CA certificate reference: Group=%s, Kind=%s", caRef.Group, caRef.Kind)
 										}
 									}
 
-									tlsConfig = &InternalTLSConfig{
-										Hostname: string(policy.Spec.Validation.Hostname),
-										CACerts:  caCerts,
+									if policyInvalid {
+										iRule.Error = &ErrorState{
+											Condition: metav1.Condition{
+												Type:    string(gatewayv1.BackendTLSPolicyConditionResolvedRefs),
+												Status:  metav1.ConditionFalse,
+												Reason:  "InvalidBackendTLSPolicy",
+												Message: invalidReason,
+											},
+											HTTPStatusCode: http.StatusServiceUnavailable,
+											HTTPMessage:    invalidReason,
+										}
+									} else {
+										tlsConfig = &InternalTLSConfig{
+											Hostname: string(policy.Spec.Validation.Hostname),
+											CACerts:  caCerts,
+										}
 									}
 									break
 								}
 							}
 						}
 
-						iRule.Backend = &InternalBackend{
-							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-							Port:        int32(*backendRef.Port),
-							AppProtocol: appProtocol,
-							TLSConfig:   tlsConfig,
+						if iRule.Error == nil {
+							iRule.Backend = &InternalBackend{
+								Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
+								Port:        int32(*backendRef.Port),
+								AppProtocol: appProtocol,
+								TLSConfig:   tlsConfig,
+							}
 						}
-						iRule.Error = nil
 
 						// For minimal implementation, we just take the first Service backendRef for each rule
 						break

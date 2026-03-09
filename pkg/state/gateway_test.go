@@ -484,6 +484,123 @@ func TestBuildInternalRoutes(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "invalid BackendTLSPolicy kind",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route1",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-svc",
+													Port: Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			backendTLSPolicies: []*gatewayv1.BackendTLSPolicy{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "policy1",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.BackendTLSPolicySpec{
+						TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+							{
+								LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+									Group: gatewayv1.Group(""),
+									Kind:  gatewayv1.Kind("Service"),
+									Name:  gatewayv1.ObjectName("backend-svc"),
+								},
+							},
+						},
+						Validation: gatewayv1.BackendTLSPolicyValidation{
+							CACertificateRefs: []gatewayv1.LocalObjectReference{
+								{
+									Group: gatewayv1.Group("invalid.io"),
+									Kind:  gatewayv1.Kind("InvalidKind"),
+									Name:  gatewayv1.ObjectName("invalid-kind"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"*"},
+					Rules: []InternalRule{
+						{
+							Error: &ErrorState{
+								Condition: metav1.Condition{
+									Type:    string(gatewayv1.BackendTLSPolicyConditionResolvedRefs),
+									Status:  metav1.ConditionFalse,
+									Reason:  "InvalidBackendTLSPolicy",
+									Message: "Unsupported CA certificate reference: Group=invalid.io, Kind=InvalidKind",
+								},
+								HTTPStatusCode: 503,
+								HTTPMessage:    "Unsupported CA certificate reference: Group=invalid.io, Kind=InvalidKind",
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
