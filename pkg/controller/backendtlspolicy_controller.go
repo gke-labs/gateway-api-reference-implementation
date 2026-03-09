@@ -111,7 +111,7 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		acceptedMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
 
 		resolvedRefsStatus = metav1.ConditionFalse
-		resolvedRefsReason = "InvalidCACertificateRef"
+		resolvedRefsReason = gatewayv1.BackendTLSPolicyReasonInvalidCACertificateRef
 		resolvedRefsMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
 	}
 
