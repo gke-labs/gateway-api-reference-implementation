@@ -136,11 +136,12 @@ type InternalPathRedirect struct {
 }
 
 type InternalMatch struct {
-	Path    *InternalPathMatch
-	Headers []InternalHeaderMatch
+	Path        *InternalPathMatch
+	Headers     []InternalHeaderMatch
+	QueryParams []InternalQueryParamMatch
 }
 
-func (im *InternalMatch) Matches(path string, header http.Header) bool {
+func (im *InternalMatch) Matches(path string, header http.Header, query map[string][]string) bool {
 	if im.Path != nil {
 		switch im.Path.Type {
 		case gatewayv1.PathMatchExact:
@@ -165,6 +166,27 @@ func (im *InternalMatch) Matches(path string, header http.Header) bool {
 				}
 			} else {
 				if v == hm.MatchExactValue {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	for _, qm := range im.QueryParams {
+		values := query[qm.Name]
+		matched := false
+		for _, v := range values {
+			if qm.Type == gatewayv1.QueryParamMatchRegularExpression {
+				if qm.MatchRegularExpressionValue != nil && qm.MatchRegularExpressionValue.MatchString(v) {
+					matched = true
+					break
+				}
+			} else {
+				if v == qm.MatchExactValue {
 					matched = true
 					break
 				}
@@ -209,9 +231,18 @@ type InternalHeaderMatch struct {
 	MatchRegularExpressionValue *regexp.Regexp
 }
 
+type InternalQueryParamMatch struct {
+	Type                        gatewayv1.QueryParamMatchType
+	Name                        string
+	MatchExactValue             string
+	MatchRegularExpressionValue *regexp.Regexp
+}
+
 func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *InternalMatch) {
 	var bestRule *InternalRule
 	var bestMatch *InternalMatch
+
+	query := r.URL.Query()
 
 	for i := range routes {
 		route := &routes[i]
@@ -223,7 +254,7 @@ func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *Intern
 			rule := &route.Rules[j]
 			for k := range rule.Matches {
 				match := &rule.Matches[k]
-				if match.Matches(r.URL.Path, r.Header) {
+				if match.Matches(r.URL.Path, r.Header, query) {
 					if isBetterMatch(match, bestMatch) {
 						bestMatch = match
 						bestRule = rule
@@ -264,7 +295,12 @@ func isBetterMatch(current, best *InternalMatch) bool {
 	}
 
 	// 3. Most header matches win
-	return len(current.Headers) > len(best.Headers)
+	if len(current.Headers) != len(best.Headers) {
+		return len(current.Headers) > len(best.Headers)
+	}
+
+	// 4. Most query parameter matches win
+	return len(current.QueryParams) > len(best.QueryParams)
 }
 
 func getPathMatchType(m *InternalMatch) gatewayv1.PathMatchType {
@@ -504,6 +540,24 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							}
 						}
 						iMatch.Headers = append(iMatch.Headers, hm)
+					}
+					for _, queryParam := range match.QueryParams {
+						queryParamType := ValueOf(queryParam.Type)
+						if queryParamType == "" {
+							queryParamType = gatewayv1.QueryParamMatchExact
+						}
+						qm := InternalQueryParamMatch{
+							Type:            queryParamType,
+							Name:            string(queryParam.Name),
+							MatchExactValue: queryParam.Value,
+						}
+						if queryParamType == gatewayv1.QueryParamMatchRegularExpression {
+							re, err := regexp.Compile(queryParam.Value)
+							if err == nil {
+								qm.MatchRegularExpressionValue = re
+							}
+						}
+						iMatch.QueryParams = append(iMatch.QueryParams, qm)
 					}
 					iRule.Matches = append(iRule.Matches, iMatch)
 				}
