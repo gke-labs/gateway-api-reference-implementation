@@ -15,6 +15,7 @@
 package state
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -395,6 +396,96 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 		},
 		{
+			name: "method matching",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route1",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									Matches: []gatewayv1.HTTPRouteMatch{
+										{
+											Method: Ptr(gatewayv1.HTTPMethod("POST")),
+										},
+									},
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-svc",
+													Port: Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"*"},
+					Rules: []InternalRule{
+						{
+							Matches: []InternalMatch{
+								{
+									Method: Ptr(gatewayv1.HTTPMethod("POST")),
+								},
+							},
+							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "invalid backend kind",
 			gateway: &GatewayState{
 				Gateway: &gatewayv1.Gateway{
@@ -492,6 +583,84 @@ func TestBuildInternalRoutes(t *testing.T) {
 			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
 			if diff != "" {
 				t.Errorf("BuildInternalRoutes() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMatchRoute_Method(t *testing.T) {
+	routes := []InternalRoute{
+		{
+			Hostnames: []string{"example.com"},
+			Rules: []InternalRule{
+				{
+					Matches: []InternalMatch{
+						{
+							Method: Ptr(gatewayv1.HTTPMethod("POST")),
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchExact,
+								Value: "/submit",
+							},
+						},
+					},
+					Backend: &InternalBackend{Host: "post-backend", Port: 80},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							Method: Ptr(gatewayv1.HTTPMethod("GET")),
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchExact,
+								Value: "/submit",
+							},
+						},
+					},
+					Backend: &InternalBackend{Host: "get-backend", Port: 80},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name        string
+		method      string
+		path        string
+		wantBackend string
+	}{
+		{
+			name:        "match POST",
+			method:      "POST",
+			path:        "/submit",
+			wantBackend: "post-backend",
+		},
+		{
+			name:        "match GET",
+			method:      "GET",
+			path:        "/submit",
+			wantBackend: "get-backend",
+		},
+		{
+			name:        "no match for PUT",
+			method:      "PUT",
+			path:        "/submit",
+			wantBackend: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest(tt.method, "http://example.com"+tt.path, nil)
+			rule, _ := MatchRoute(routes, req)
+			if tt.wantBackend == "" {
+				if rule != nil {
+					t.Errorf("MatchRoute() matched rule %v, want no match", rule.Backend.Host)
+				}
+			} else {
+				if rule == nil {
+					t.Errorf("MatchRoute() matched no rule, want %s", tt.wantBackend)
+				} else if rule.Backend.Host != tt.wantBackend {
+					t.Errorf("MatchRoute() matched backend %s, want %s", rule.Backend.Host, tt.wantBackend)
+				}
 			}
 		})
 	}

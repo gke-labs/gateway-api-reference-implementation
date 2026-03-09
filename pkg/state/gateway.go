@@ -138,9 +138,15 @@ type InternalPathRedirect struct {
 type InternalMatch struct {
 	Path    *InternalPathMatch
 	Headers []InternalHeaderMatch
+	Method  *gatewayv1.HTTPMethod
 }
 
-func (im *InternalMatch) Matches(path string, header http.Header) bool {
+func (im *InternalMatch) Matches(method, path string, header http.Header) bool {
+	if im.Method != nil {
+		if string(*im.Method) != method {
+			return false
+		}
+	}
 	if im.Path != nil {
 		switch im.Path.Type {
 		case gatewayv1.PathMatchExact:
@@ -223,7 +229,7 @@ func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *Intern
 			rule := &route.Rules[j]
 			for k := range rule.Matches {
 				match := &rule.Matches[k]
-				if match.Matches(r.URL.Path, r.Header) {
+				if match.Matches(r.Method, r.URL.Path, r.Header) {
 					if isBetterMatch(match, bestMatch) {
 						bestMatch = match
 						bestRule = rule
@@ -264,7 +270,12 @@ func isBetterMatch(current, best *InternalMatch) bool {
 	}
 
 	// 3. Most header matches win
-	return len(current.Headers) > len(best.Headers)
+	if len(current.Headers) != len(best.Headers) {
+		return len(current.Headers) > len(best.Headers)
+	}
+
+	// 4. Method match wins
+	return current.Method != nil && best.Method == nil
 }
 
 func getPathMatchType(m *InternalMatch) gatewayv1.PathMatchType {
@@ -478,6 +489,9 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 
 				for _, match := range rule.Matches {
 					iMatch := InternalMatch{}
+					if match.Method != nil {
+						iMatch.Method = match.Method
+					}
 					if match.Path != nil {
 						iMatch.Path = &InternalPathMatch{
 							Type:  ValueOf(match.Path.Type),
