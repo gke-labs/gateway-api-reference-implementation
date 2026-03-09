@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.25.7
+FROM golang:1.26.1
 
 # Install git and other basics
 RUN apt-get update && apt-get install -y git curl
