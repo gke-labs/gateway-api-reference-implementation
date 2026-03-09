@@ -49,7 +49,7 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	// Update status to Accepted
+	// Update status to Accepted and SupportedVersion
 	newConditions := []metav1.Condition{
 		{
 			Type:               string(gatewayv1.GatewayClassConditionStatusAccepted),
@@ -58,37 +58,62 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			Reason:             string(gatewayv1.GatewayClassReasonAccepted),
 			Message:            "GatewayClass accepted by reference implementation",
 		},
+		{
+			Type:               string(gatewayv1.GatewayClassConditionStatusSupportedVersion),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gc.Generation,
+			Reason:             string(gatewayv1.GatewayClassReasonSupportedVersion),
+			Message:            "Gateway API CRD versions supported",
+		},
 	}
 
 	updated := false
-	if len(gc.Status.Conditions) != len(newConditions) {
-		updated = true
-	} else {
-		for i := range newConditions {
-			matched := false
-			for j := range gc.Status.Conditions {
-				if gc.Status.Conditions[j].Type == newConditions[i].Type {
-					if gc.Status.Conditions[j].Status == newConditions[i].Status &&
-						gc.Status.Conditions[j].ObservedGeneration == newConditions[i].ObservedGeneration &&
-						gc.Status.Conditions[j].Reason == newConditions[i].Reason &&
-						gc.Status.Conditions[j].Message == newConditions[i].Message {
-						matched = true
+	// We want to make sure all conditions have the latest observed generation
+	// as required by conformance tests.
+	finalConditions := make([]metav1.Condition, 0, len(gc.Status.Conditions))
+
+	// Start with conditions we manage
+	managedTypes := make(map[string]bool)
+	for _, nc := range newConditions {
+		managedTypes[nc.Type] = true
+
+		found := false
+		for _, oc := range gc.Status.Conditions {
+			if oc.Type == nc.Type {
+				found = true
+				if oc.Status != nc.Status || oc.ObservedGeneration != nc.ObservedGeneration || oc.Reason != nc.Reason || oc.Message != nc.Message {
+					updated = true
+					nc.LastTransitionTime = oc.LastTransitionTime
+					if oc.Status != nc.Status {
+						nc.LastTransitionTime = metav1.Now()
 					}
-					break
+					finalConditions = append(finalConditions, nc)
+				} else {
+					finalConditions = append(finalConditions, oc)
 				}
-			}
-			if !matched {
-				updated = true
 				break
 			}
+		}
+		if !found {
+			updated = true
+			nc.LastTransitionTime = metav1.Now()
+			finalConditions = append(finalConditions, nc)
+		}
+	}
+
+	// Then add conditions we don't manage, but update their observed generation if stale
+	for _, oc := range gc.Status.Conditions {
+		if !managedTypes[oc.Type] {
+			if oc.ObservedGeneration != gc.Generation {
+				updated = true
+				oc.ObservedGeneration = gc.Generation
+			}
+			finalConditions = append(finalConditions, oc)
 		}
 	}
 
 	if updated {
-		for i := range newConditions {
-			newConditions[i].LastTransitionTime = metav1.Now()
-		}
-		gc.Status.Conditions = newConditions
+		gc.Status.Conditions = finalConditions
 		if err := r.Status().Update(ctx, &gc); err != nil {
 			l.Error(err, "unable to update GatewayClass status")
 			return ctrl.Result{}, err
