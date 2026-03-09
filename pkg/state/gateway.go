@@ -118,8 +118,15 @@ type InternalBackend struct {
 }
 
 type InternalTLSConfig struct {
+	Hostname        string
+	CACerts         [][]byte
+	SubjectAltNames []InternalSubjectAltName
+}
+
+type InternalSubjectAltName struct {
+	Type     gatewayv1.SubjectAltNameType
 	Hostname string
-	CACerts  [][]byte
+	URI      string
 }
 
 type InternalRedirect struct {
@@ -454,9 +461,19 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 										}
 									}
 
+									var sans []InternalSubjectAltName
+									for _, san := range policy.Spec.Validation.SubjectAltNames {
+										sans = append(sans, InternalSubjectAltName{
+											Type:     san.Type,
+											Hostname: string(san.Hostname),
+											URI:      string(san.URI),
+										})
+									}
+
 									tlsConfig = &InternalTLSConfig{
-										Hostname: string(policy.Spec.Validation.Hostname),
-										CACerts:  caCerts,
+										Hostname:        string(policy.Spec.Validation.Hostname),
+										CACerts:         caCerts,
+										SubjectAltNames: sans,
 									}
 									break
 								}
