@@ -153,7 +153,7 @@ func run(ctx context.Context) error {
 			Addr:    proxyHTTPSAddr,
 			Handler: p,
 			TLSConfig: &tls.Config{
-				Certificates:        []tls.Certificate{cert},
+				Certificates:       []tls.Certificate{cert},
 				GetConfigForClient: p.GetConfigForClient,
 			},
 		}
