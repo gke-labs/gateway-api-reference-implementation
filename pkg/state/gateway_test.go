@@ -30,7 +30,8 @@ func TestBuildInternalRoutes(t *testing.T) {
 	controllerName := "test-controller"
 	tests := []struct {
 		name               string
-		routes             []*HTTPRouteState
+		httpRoutes         []*HTTPRouteState
+		grpcRoutes         []*GRPCRouteState
 		gateway            *GatewayState
 		services           map[types.NamespacedName]*corev1.Service
 		backendTLSPolicies []*gatewayv1.BackendTLSPolicy
@@ -55,7 +56,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					},
 				},
 			},
-			routes: []*HTTPRouteState{
+			httpRoutes: []*HTTPRouteState{
 				{
 					HTTPRoute: &gatewayv1.HTTPRoute{
 						ObjectMeta: metav1.ObjectMeta{
@@ -125,10 +126,15 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: &InternalBackend{
-								Host:        "backend-svc.default.svc.cluster.local",
-								Port:        80,
-								AppProtocol: Ptr("kubernetes.io/h2c"),
+							Backends: []InternalWeightedBackend{
+								{
+									InternalBackend: InternalBackend{
+										Host:        "backend-svc.default.svc.cluster.local",
+										Port:        80,
+										AppProtocol: Ptr("kubernetes.io/h2c"),
+									},
+									Weight: 1,
+								},
 							},
 						},
 					},
@@ -153,7 +159,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					},
 				},
 			},
-			routes: []*HTTPRouteState{
+			httpRoutes: []*HTTPRouteState{
 				{
 					HTTPRoute: &gatewayv1.HTTPRoute{
 						ObjectMeta: metav1.ObjectMeta{
@@ -211,7 +217,12 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backends: []InternalWeightedBackend{
+								{
+									InternalBackend: InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+									Weight:          1,
+								},
+							},
 						},
 					},
 				},
@@ -236,7 +247,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					},
 				},
 			},
-			routes: []*HTTPRouteState{
+			httpRoutes: []*HTTPRouteState{
 				{
 					HTTPRoute: &gatewayv1.HTTPRoute{
 						ObjectMeta: metav1.ObjectMeta{
@@ -293,7 +304,12 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"foo.example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: &InternalBackend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
+							Backends: []InternalWeightedBackend{
+								{
+									InternalBackend: InternalBackend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
+									Weight:          1,
+								},
+							},
 						},
 					},
 				},
@@ -317,7 +333,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					},
 				},
 			},
-			routes: []*HTTPRouteState{
+			httpRoutes: []*HTTPRouteState{
 				{
 					HTTPRoute: &gatewayv1.HTTPRoute{
 						ObjectMeta: metav1.ObjectMeta{
@@ -389,7 +405,12 @@ func TestBuildInternalRoutes(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backends: []InternalWeightedBackend{
+								{
+									InternalBackend: InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+									Weight:          1,
+								},
+							},
 						},
 					},
 				},
@@ -413,7 +434,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					},
 				},
 			},
-			routes: []*HTTPRouteState{
+			httpRoutes: []*HTTPRouteState{
 				{
 					HTTPRoute: &gatewayv1.HTTPRoute{
 						ObjectMeta: metav1.ObjectMeta{
@@ -479,7 +500,12 @@ func TestBuildInternalRoutes(t *testing.T) {
 									Method: Ptr(gatewayv1.HTTPMethod("POST")),
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backends: []InternalWeightedBackend{
+								{
+									InternalBackend: InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+									Weight:          1,
+								},
+							},
 						},
 					},
 				},
@@ -503,7 +529,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					},
 				},
 			},
-			routes: []*HTTPRouteState{
+			httpRoutes: []*HTTPRouteState{
 				{
 					HTTPRoute: &gatewayv1.HTTPRoute{
 						ObjectMeta: metav1.ObjectMeta{
@@ -593,7 +619,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					},
 				},
 			},
-			routes: []*HTTPRouteState{
+			httpRoutes: []*HTTPRouteState{
 				{
 					HTTPRoute: &gatewayv1.HTTPRoute{
 						ObjectMeta: metav1.ObjectMeta{
@@ -706,13 +732,18 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: &InternalBackend{
-								Host:        "backend-svc.default.svc.cluster.local",
-								Port:        80,
-								AppProtocol: Ptr("https"),
-								TLSConfig: &InternalTLSConfig{
-									Hostname: "old.example.com",
-									CACerts:  nil,
+							Backends: []InternalWeightedBackend{
+								{
+									InternalBackend: InternalBackend{
+										Host:        "backend-svc.default.svc.cluster.local",
+										Port:        80,
+										AppProtocol: Ptr("https"),
+										TLSConfig: &InternalTLSConfig{
+											Hostname: "old.example.com",
+											CACerts:  nil,
+										},
+									},
+									Weight: 1,
 								},
 							},
 						},
@@ -724,7 +755,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
+			actual := tt.gateway.BuildInternalRoutes(tt.httpRoutes, tt.grpcRoutes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
 			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
 			if diff != "" {
 				t.Errorf("BuildInternalRoutes() mismatch (-want +got):\n%s", diff)
@@ -748,7 +779,7 @@ func TestMatchRoute_Method(t *testing.T) {
 							},
 						},
 					},
-					Backend: &InternalBackend{Host: "post-backend", Port: 80},
+					Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "post-backend", Port: 80}, Weight: 1}},
 				},
 				{
 					Matches: []InternalMatch{
@@ -760,7 +791,7 @@ func TestMatchRoute_Method(t *testing.T) {
 							},
 						},
 					},
-					Backend: &InternalBackend{Host: "get-backend", Port: 80},
+					Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "get-backend", Port: 80}, Weight: 1}},
 				},
 			},
 		},
@@ -798,13 +829,13 @@ func TestMatchRoute_Method(t *testing.T) {
 			rule, _ := MatchRoute(routes, req)
 			if tt.wantBackend == "" {
 				if rule != nil {
-					t.Errorf("MatchRoute() matched rule %v, want no match", rule.Backend.Host)
+					t.Errorf("MatchRoute() matched rule %v, want no match", rule.Backends[0].Host)
 				}
 			} else {
 				if rule == nil {
 					t.Errorf("MatchRoute() matched no rule, want %s", tt.wantBackend)
-				} else if rule.Backend.Host != tt.wantBackend {
-					t.Errorf("MatchRoute() matched backend %s, want %s", rule.Backend.Host, tt.wantBackend)
+				} else if rule.Backends[0].Host != tt.wantBackend {
+					t.Errorf("MatchRoute() matched backend %s, want %s", rule.Backends[0].Host, tt.wantBackend)
 				}
 			}
 		})

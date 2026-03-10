@@ -26,7 +26,7 @@ func TestMatchRouteOrder(t *testing.T) {
 		name         string
 		routes       []InternalRoute
 		path         string
-		expectedRule *InternalRule
+		expectedHost string
 	}{
 		{
 			name: "Exact vs Prefix",
@@ -42,7 +42,7 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-prefix"},
+							Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "backend-prefix"}, Weight: 1}},
 						},
 						{
 							Matches: []InternalMatch{
@@ -53,15 +53,13 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-exact"},
+							Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "backend-exact"}, Weight: 1}},
 						},
 					},
 				},
 			},
-			path: "/match/exact",
-			expectedRule: &InternalRule{
-				Backend: &InternalBackend{Host: "backend-exact"},
-			},
+			path:         "/match/exact",
+			expectedHost: "backend-exact",
 		},
 		{
 			name: "Longest Prefix wins",
@@ -77,7 +75,7 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-short"},
+							Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "backend-short"}, Weight: 1}},
 						},
 						{
 							Matches: []InternalMatch{
@@ -88,15 +86,13 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-long"},
+							Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "backend-long"}, Weight: 1}},
 						},
 					},
 				},
 			},
-			path: "/match/prefix/one/any",
-			expectedRule: &InternalRule{
-				Backend: &InternalBackend{Host: "backend-long"},
-			},
+			path:         "/match/prefix/one/any",
+			expectedHost: "backend-long",
 		},
 		{
 			name: "First rule wins on tie",
@@ -112,7 +108,7 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-1"},
+							Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "backend-1"}, Weight: 1}},
 						},
 						{
 							Matches: []InternalMatch{
@@ -123,15 +119,13 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-2"},
+							Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "backend-2"}, Weight: 1}},
 						},
 					},
 				},
 			},
-			path: "/match",
-			expectedRule: &InternalRule{
-				Backend: &InternalBackend{Host: "backend-1"},
-			},
+			path:         "/match",
+			expectedHost: "backend-1",
 		},
 		{
 			name: "First route wins on tie across routes",
@@ -147,7 +141,7 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-A"},
+							Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "backend-A"}, Weight: 1}},
 						},
 					},
 				},
@@ -162,15 +156,13 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-B"},
+							Backends: []InternalWeightedBackend{{InternalBackend: InternalBackend{Host: "backend-B"}, Weight: 1}},
 						},
 					},
 				},
 			},
-			path: "/match",
-			expectedRule: &InternalRule{
-				Backend: &InternalBackend{Host: "backend-A"},
-			},
+			path:         "/match",
+			expectedHost: "backend-A",
 		},
 	}
 
@@ -183,8 +175,12 @@ func TestMatchRouteOrder(t *testing.T) {
 				t.Fatalf("Expected a match, but got nil")
 			}
 
-			if bestRule.Backend.Host != tt.expectedRule.Backend.Host {
-				t.Errorf("Expected backend %s, but got %s", tt.expectedRule.Backend.Host, bestRule.Backend.Host)
+			if len(bestRule.Backends) == 0 {
+				t.Fatalf("Expected backends, but got none")
+			}
+
+			if bestRule.Backends[0].Host != tt.expectedHost {
+				t.Errorf("Expected backend %s, but got %s", tt.expectedHost, bestRule.Backends[0].Host)
 			}
 		})
 	}
