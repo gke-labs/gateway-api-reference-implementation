@@ -380,7 +380,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						}
 						break
 					}
-					
+
 					if _, hasData := cm.Data["ca.crt"]; !hasData {
 						if _, hasBinData := cm.BinaryData["ca.crt"]; !hasBinData {
 							listenerError = &ErrorState{

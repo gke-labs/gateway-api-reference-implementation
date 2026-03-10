@@ -224,18 +224,18 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			// 1. Check for per-port override
 			hasPerPortOverride := false
 			if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
-			        for _, pp := range gw.Spec.TLS.Frontend.PerPort {
-			                if pp.Port == listener.Port {
-			                        validation = pp.TLS.Validation
-			                        hasPerPortOverride = true
-			                        break
-			                }
-			        }
+				for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+					if pp.Port == listener.Port {
+						validation = pp.TLS.Validation
+						hasPerPortOverride = true
+						break
+					}
+				}
 
-			        // 2. If no per-port override, use default
-			        if !hasPerPortOverride {
-			                validation = gw.Spec.TLS.Frontend.Default.Validation
-			        }
+				// 2. If no per-port override, use default
+				if !hasPerPortOverride {
+					validation = gw.Spec.TLS.Frontend.Default.Validation
+				}
 			}
 			if validation != nil {
 				validCACerts := 0

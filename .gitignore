@@ -5,3 +5,4 @@
 # Go
 vendor/
 *.log
+.gemini/
