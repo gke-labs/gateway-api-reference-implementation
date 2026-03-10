@@ -761,7 +761,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 											URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
 												Hostname: Ptr(gatewayv1.PreciseHostname("new.example.com")),
 												Path: &gatewayv1.HTTPPathModifier{
-													Type:            gatewayv1.PrefixMatchHTTPPathModifier,
+													Type:               gatewayv1.PrefixMatchHTTPPathModifier,
 													ReplacePrefixMatch: Ptr("/new-prefix"),
 												},
 											},
