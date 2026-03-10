@@ -18,17 +18,18 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"strings"
 	"sync"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"golang.org/x/net/http2"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -59,22 +60,55 @@ func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.routes = routes
 }
 
+func getHostnameMatchSpecificity(hostnames []string, host string) int {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	if len(hostnames) == 0 {
+		return 1 // Catch-all has the lowest specificity > 0
+	}
+
+	bestScore := -1
+	for _, h := range hostnames {
+		score := -1
+		if h == "*" {
+			score = 2
+		} else if h == host {
+			score = 1000 + len(host)
+		} else if strings.HasPrefix(h, "*.") {
+			suffix := h[1:]
+			if strings.HasSuffix(host, suffix) {
+				score = 100 + len(h)
+			}
+		}
+		if score > bestScore {
+			bestScore = score
+		}
+	}
+	return bestScore
+}
+
 func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 	p.mu.RLock()
 	routes := p.routes
 	defaultCerts := p.DefaultCertificates
 	p.mu.RUnlock()
 
-	// Find the best matching route for the SNI
+	// Find the most specific matching route for the SNI
 	var bestRoute *state.InternalRoute
+	bestScore := -1
+
 	for i := range routes {
 		route := &routes[i]
-		if route.MatchHostname(hello.ServerName) {
-			// For simplicity, we just take the first matching route with TLSConfig
-			if route.TLSConfig != nil {
-				bestRoute = route
-				break
-			}
+		if route.TLSConfig == nil {
+			continue // We only care about routes that configure TLS
+		}
+
+		score := getHostnameMatchSpecificity(route.Hostnames, hello.ServerName)
+		if score > 0 && score > bestScore {
+			bestScore = score
+			bestRoute = route
 		}
 	}
 
@@ -83,12 +117,15 @@ func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, err
 		// Note: We MUST include the certificates here as this config replaces the original one.
 		conf := &tls.Config{
 			Certificates: defaultCerts,
+			NextProtos:   []string{"h2", "http/1.1"},
 		}
 
 		if len(bestRoute.TLSConfig.CACerts) > 0 {
 			conf.ClientCAs = x509.NewCertPool()
 			for _, cert := range bestRoute.TLSConfig.CACerts {
-				conf.ClientCAs.AppendCertsFromPEM(cert)
+				if ok := conf.ClientCAs.AppendCertsFromPEM(cert); !ok {
+					log.Log.Error(nil, "failed to parse CA certificate from PEM")
+				}
 			}
 		}
 
@@ -102,7 +139,7 @@ func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, err
 			// RequestClientCert requests the cert but does not verify it.
 			conf.ClientAuth = tls.RequestClientCert
 		default:
-			conf.ClientAuth = tls.NoClientCert
+			conf.ClientAuth = tls.RequireAndVerifyClientCert
 		}
 
 		return conf, nil
@@ -212,6 +249,14 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			req.Header.Set("X-Forwarded-Client-Cert", base64.StdEncoding.EncodeToString(r.TLS.PeerCertificates[0].Raw))
+		}
+	}
 
 	if scheme == "https" {
 		tlsConfig := &tls.Config{InsecureSkipVerify: false}

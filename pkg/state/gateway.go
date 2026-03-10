@@ -382,31 +382,55 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 			var frontendTLSConfig *InternalFrontendTLSConfig
 			if s.Spec.TLS != nil && s.Spec.TLS.Frontend != nil {
 				var validation *gatewayv1.FrontendTLSValidation
+				foundPerPort := false
 				// Check for per-port configuration first
 				for _, pp := range s.Spec.TLS.Frontend.PerPort {
 					if int32(pp.Port) == int32(listener.Port) {
 						validation = pp.TLS.Validation
+						foundPerPort = true
 						break
 					}
 				}
 				// Use default if no per-port configuration
-				if validation == nil {
+				if !foundPerPort {
 					validation = s.Spec.TLS.Frontend.Default.Validation
 				}
 
 				if validation != nil {
 					var caCerts [][]byte
+					invalidRef := false
 					for _, caRef := range validation.CACertificateRefs {
 						if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-							cmName := types.NamespacedName{Namespace: s.Namespace, Name: string(caRef.Name)}
+							ns := s.Namespace
+							if caRef.Namespace != nil {
+								ns = string(*caRef.Namespace)
+							}
+							if ns != s.Namespace {
+								// Cross-namespace references without ReferenceGrant are invalid/unsupported here
+								invalidRef = true
+								break
+							}
+							cmName := types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}
 							if cm, ok := configMaps[cmName]; ok {
 								if data, ok := cm.Data["ca.crt"]; ok {
 									caCerts = append(caCerts, []byte(data))
 								} else if data, ok := cm.BinaryData["ca.crt"]; ok {
 									caCerts = append(caCerts, data)
+								} else {
+									invalidRef = true
+									break
 								}
+							} else {
+								invalidRef = true
+								break
 							}
+						} else {
+							invalidRef = true
+							break
 						}
+					}
+					if invalidRef {
+						continue // Skip creating frontend TLS config for invalid references
 					}
 					frontendTLSConfig = &InternalFrontendTLSConfig{
 						CACerts: caCerts,

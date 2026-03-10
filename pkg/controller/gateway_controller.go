@@ -172,11 +172,21 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Check if any listener or default config uses AllowInsecureFallback
 	insecure := false
 	if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
-		if gw.Spec.TLS.Frontend.Default.Validation != nil && gw.Spec.TLS.Frontend.Default.Validation.Mode == gatewayv1.AllowInsecureFallback {
-			insecure = true
-		} else {
-			for _, pp := range gw.Spec.TLS.Frontend.PerPort {
-				if pp.TLS.Validation != nil && pp.TLS.Validation.Mode == gatewayv1.AllowInsecureFallback {
+		for _, listener := range gw.Spec.Listeners {
+			if listener.Protocol == gatewayv1.HTTPSProtocolType {
+				var validation *gatewayv1.FrontendTLSValidation
+				foundPerPort := false
+				for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+					if int32(pp.Port) == int32(listener.Port) {
+						validation = pp.TLS.Validation
+						foundPerPort = true
+						break
+					}
+				}
+				if !foundPerPort && gw.Spec.TLS.Frontend.Default.Validation != nil {
+					validation = gw.Spec.TLS.Frontend.Default.Validation
+				}
+				if validation != nil && validation.Mode == gatewayv1.AllowInsecureFallback {
 					insecure = true
 					break
 				}
@@ -204,6 +214,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
 	gs := state.GatewayState{Gateway: gw}
+	configMaps := r.State.GetConfigMaps()
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
@@ -241,14 +252,71 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					Reason:             string(gatewayv1.ListenerReasonAccepted),
 					Message:            "Listener accepted",
 				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
+				func() metav1.Condition {
+					resolvedRefsCondition := metav1.Condition{
+						Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: gw.Generation,
+						LastTransitionTime: metav1.Now(),
+						Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+						Message:            "All references resolved",
+					}
+
+					if listener.Protocol == gatewayv1.HTTPSProtocolType && gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+						var validation *gatewayv1.FrontendTLSValidation
+						foundPerPort := false
+						for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+							if int32(pp.Port) == int32(listener.Port) {
+								validation = pp.TLS.Validation
+								foundPerPort = true
+								break
+							}
+						}
+						if !foundPerPort && gw.Spec.TLS.Frontend.Default.Validation != nil {
+							validation = gw.Spec.TLS.Frontend.Default.Validation
+						}
+
+						if validation != nil {
+							for _, caRef := range validation.CACertificateRefs {
+								if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+									ns := gw.Namespace
+									if caRef.Namespace != nil {
+										ns = string(*caRef.Namespace)
+									}
+									if ns != gw.Namespace {
+										resolvedRefsCondition.Status = metav1.ConditionFalse
+										resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
+										resolvedRefsCondition.Message = "Cross-namespace references are not permitted without ReferenceGrant"
+										break
+									}
+
+									cmName := types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}
+									if cm, ok := configMaps[cmName]; ok {
+										if _, ok := cm.Data["ca.crt"]; !ok {
+											if _, ok := cm.BinaryData["ca.crt"]; !ok {
+												resolvedRefsCondition.Status = metav1.ConditionFalse
+												resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+												resolvedRefsCondition.Message = "Missing ca.crt in ConfigMap"
+												break
+											}
+										}
+									} else {
+										resolvedRefsCondition.Status = metav1.ConditionFalse
+										resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+										resolvedRefsCondition.Message = "ConfigMap not found"
+										break
+									}
+								} else {
+									resolvedRefsCondition.Status = metav1.ConditionFalse
+									resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+									resolvedRefsCondition.Message = "Unsupported CACertificateRef Group/Kind"
+									break
+								}
+							}
+						}
+					}
+					return resolvedRefsCondition
+				}(),
 			},
 		})
 	}
