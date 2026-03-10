@@ -69,6 +69,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, bestRule.Error.HTTPMessage, bestRule.Error.HTTPStatusCode)
 			return
 		}
+		if bestRule.Rewrite != nil {
+			p.rewrite(r, *bestRule.Rewrite, bestMatch)
+		}
 		if bestRule.Backend != nil {
 			p.forward(w, r, *bestRule.Backend)
 			return
@@ -76,6 +79,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+}
+
+func (p *Proxy) rewrite(r *http.Request, rewrite state.InternalRewrite, match *state.InternalMatch) {
+	if hostname := state.ValueOf(rewrite.Hostname); hostname != "" {
+		r.Host = string(hostname)
+	}
+
+	if rewrite.Path != nil {
+		switch rewrite.Path.Type {
+		case gatewayv1.FullPathHTTPPathModifier:
+			r.URL.Path = rewrite.Path.Value
+		case gatewayv1.PrefixMatchHTTPPathModifier:
+			if match != nil && match.Path != nil && match.Path.Type == gatewayv1.PathMatchPathPrefix {
+				prefix := match.Path.Value
+				if strings.HasPrefix(r.URL.Path, prefix) {
+					r.URL.Path = rewrite.Path.Value + r.URL.Path[len(prefix):]
+				}
+			}
+		}
+	}
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {
