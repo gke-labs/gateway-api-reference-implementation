@@ -81,6 +81,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
 }
 
+// rewrite modifies the incoming *http.Request in place before it is forwarded to the backend.
 func (p *Proxy) rewrite(r *http.Request, rewrite state.InternalRewrite, match *state.InternalMatch) {
 	if hostname := state.ValueOf(rewrite.Hostname); hostname != "" {
 		r.Host = string(hostname)
@@ -90,12 +91,28 @@ func (p *Proxy) rewrite(r *http.Request, rewrite state.InternalRewrite, match *s
 		switch rewrite.Path.Type {
 		case gatewayv1.FullPathHTTPPathModifier:
 			r.URL.Path = rewrite.Path.Value
+			r.URL.RawPath = ""
 		case gatewayv1.PrefixMatchHTTPPathModifier:
-			if match != nil && match.Path != nil && match.Path.Type == gatewayv1.PathMatchPathPrefix {
-				prefix := match.Path.Value
-				if strings.HasPrefix(r.URL.Path, prefix) {
-					r.URL.Path = rewrite.Path.Value + r.URL.Path[len(prefix):]
+			prefix := "/"
+			isValidPrefixMatch := true
+			if match != nil && match.Path != nil {
+				if match.Path.Type == gatewayv1.PathMatchPathPrefix {
+					prefix = match.Path.Value
+				} else {
+					isValidPrefixMatch = false
 				}
+			}
+			if isValidPrefixMatch && strings.HasPrefix(r.URL.Path, prefix) {
+				suffix := r.URL.Path[len(prefix):]
+				if len(suffix) > 0 && !strings.HasPrefix(suffix, "/") {
+					suffix = "/" + suffix
+				}
+				newPath := rewrite.Path.Value + suffix
+				for strings.Contains(newPath, "//") {
+					newPath = strings.ReplaceAll(newPath, "//", "/")
+				}
+				r.URL.Path = newPath
+				r.URL.RawPath = ""
 			}
 		}
 	}
@@ -144,11 +161,25 @@ func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.
 		case gatewayv1.FullPathHTTPPathModifier:
 			newURL.Path = redirect.Path.Value
 		case gatewayv1.PrefixMatchHTTPPathModifier:
-			if match != nil && match.Path != nil && match.Path.Type == gatewayv1.PathMatchPathPrefix {
-				prefix := match.Path.Value
-				if strings.HasPrefix(r.URL.Path, prefix) {
-					newURL.Path = redirect.Path.Value + r.URL.Path[len(prefix):]
+			prefix := "/"
+			isValidPrefixMatch := true
+			if match != nil && match.Path != nil {
+				if match.Path.Type == gatewayv1.PathMatchPathPrefix {
+					prefix = match.Path.Value
+				} else {
+					isValidPrefixMatch = false
 				}
+			}
+			if isValidPrefixMatch && strings.HasPrefix(r.URL.Path, prefix) {
+				suffix := r.URL.Path[len(prefix):]
+				if len(suffix) > 0 && !strings.HasPrefix(suffix, "/") {
+					suffix = "/" + suffix
+				}
+				newPath := redirect.Path.Value + suffix
+				for strings.Contains(newPath, "//") {
+					newPath = strings.ReplaceAll(newPath, "//", "/")
+				}
+				newURL.Path = newPath
 			}
 		}
 	}

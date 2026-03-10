@@ -112,11 +112,16 @@ type InternalRule struct {
 	Error *ErrorState
 }
 
+// InternalRewrite represents the URL rewriting configuration for a route rule.
+// It specifies how the hostname or path of the request should be modified before
+// forwarding it to the backend.
 type InternalRewrite struct {
 	Hostname *gatewayv1.PreciseHostname
 	Path     *InternalPathRewrite
 }
 
+// InternalPathRewrite represents a path rewrite operation.
+// Value is the replacement string corresponding to the modifier Type.
 type InternalPathRewrite struct {
 	Type  gatewayv1.HTTPPathModifierType
 	Value string
@@ -392,6 +397,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
 				var rewrite *InternalRewrite
+				var filterErr *ErrorState
 				for _, filter := range rule.Filters {
 					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
 						r := filter.RequestRedirect
@@ -407,6 +413,17 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 								pathValue = ValueOf(r.Path.ReplaceFullPath)
 							} else if r.Path.Type == gatewayv1.PrefixMatchHTTPPathModifier {
 								pathValue = ValueOf(r.Path.ReplacePrefixMatch)
+							} else {
+								filterErr = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+										Message: fmt.Sprintf("Unsupported path modifier type: %s", r.Path.Type),
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    fmt.Sprintf("Unsupported path modifier type: %s", r.Path.Type),
+								}
 							}
 							redirect.Path = &InternalPathRedirect{
 								Type:  r.Path.Type,
@@ -424,6 +441,17 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 								pathValue = ValueOf(r.Path.ReplaceFullPath)
 							} else if r.Path.Type == gatewayv1.PrefixMatchHTTPPathModifier {
 								pathValue = ValueOf(r.Path.ReplacePrefixMatch)
+							} else {
+								filterErr = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+										Message: fmt.Sprintf("Unsupported path modifier type: %s", r.Path.Type),
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    fmt.Sprintf("Unsupported path modifier type: %s", r.Path.Type),
+								}
 							}
 							rewrite.Path = &InternalPathRewrite{
 								Type:  r.Path.Type,
@@ -436,6 +464,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				iRule := InternalRule{
 					Redirect: redirect,
 					Rewrite:  rewrite,
+					Error:    filterErr,
 				}
 
 				if resolvedRefsCond.Status == metav1.ConditionFalse {
@@ -444,6 +473,8 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						HTTPStatusCode: http.StatusInternalServerError,
 						HTTPMessage:    resolvedRefsCond.Message,
 					}
+				} else if filterErr != nil {
+					// retain filterErr
 				} else if redirect == nil {
 					for _, backendRef := range rule.BackendRefs {
 						kind := ValueOf(backendRef.Kind)

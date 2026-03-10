@@ -24,13 +24,15 @@ import (
 
 func TestProxyRewrite(t *testing.T) {
 	tests := []struct {
-		name         string
-		rewrite      state.InternalRewrite
-		match        *state.InternalMatch
-		initialPath  string
-		initialHost  string
-		expectedPath string
-		expectedHost string
+		name            string
+		rewrite         state.InternalRewrite
+		match           *state.InternalMatch
+		initialPath     string
+		initialRawPath  string
+		initialHost     string
+		expectedPath    string
+		expectedRawPath string
+		expectedHost    string
 	}{
 		{
 			name: "host rewrite",
@@ -56,6 +58,21 @@ func TestProxyRewrite(t *testing.T) {
 			expectedPath: "/new-path",
 		},
 		{
+			name: "full path rewrite with encoded path",
+			rewrite: state.InternalRewrite{
+				Path: &state.InternalPathRewrite{
+					Type:  gatewayv1.FullPathHTTPPathModifier,
+					Value: "/new-path",
+				},
+			},
+			initialHost:     "example.com",
+			expectedHost:    "example.com",
+			initialPath:     "/old path",
+			initialRawPath:  "/old%20path",
+			expectedPath:    "/new-path",
+			expectedRawPath: "",
+		},
+		{
 			name: "prefix path rewrite",
 			rewrite: state.InternalRewrite{
 				Path: &state.InternalPathRewrite{
@@ -74,13 +91,56 @@ func TestProxyRewrite(t *testing.T) {
 			initialPath:  "/old-prefix/suffix",
 			expectedPath: "/new-prefix/suffix",
 		},
+		{
+			name: "prefix path rewrite with missing match (default /)",
+			rewrite: state.InternalRewrite{
+				Path: &state.InternalPathRewrite{
+					Type:  gatewayv1.PrefixMatchHTTPPathModifier,
+					Value: "/new-root",
+				},
+			},
+			match:        nil, // simulates omitted match
+			initialHost:  "example.com",
+			expectedHost: "example.com",
+			initialPath:  "/some/path",
+			expectedPath: "/new-root/some/path",
+		},
+		{
+			name: "prefix path rewrite with encoded path",
+			rewrite: state.InternalRewrite{
+				Path: &state.InternalPathRewrite{
+					Type:  gatewayv1.PrefixMatchHTTPPathModifier,
+					Value: "/new-prefix",
+				},
+			},
+			match: &state.InternalMatch{
+				Path: &state.InternalPathMatch{
+					Type:  gatewayv1.PathMatchPathPrefix,
+					Value: "/old-prefix",
+				},
+			},
+			initialHost:     "example.com",
+			expectedHost:    "example.com",
+			initialPath:     "/old-prefix/some path",
+			initialRawPath:  "/old-prefix/some%20path",
+			expectedPath:    "/new-prefix/some path",
+			expectedRawPath: "",
+		},
 	}
 
 	p := NewProxy()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("GET", "http://"+tt.initialHost+tt.initialPath, nil)
+			targetPath := tt.initialPath
+			if tt.initialRawPath != "" {
+				targetPath = tt.initialRawPath
+			}
+			req := httptest.NewRequest("GET", "http://"+tt.initialHost+targetPath, nil)
 			req.Host = tt.initialHost
+			if tt.initialRawPath != "" {
+				// double check RawPath is set correctly by httptest
+				req.URL.RawPath = tt.initialRawPath
+			}
 
 			p.rewrite(req, tt.rewrite, tt.match)
 
@@ -89,6 +149,9 @@ func TestProxyRewrite(t *testing.T) {
 			}
 			if req.URL.Path != tt.expectedPath {
 				t.Errorf("expected path %s, got %s", tt.expectedPath, req.URL.Path)
+			}
+			if req.URL.RawPath != tt.expectedRawPath {
+				t.Errorf("expected RawPath %q, got %q", tt.expectedRawPath, req.URL.RawPath)
 			}
 		})
 	}
