@@ -194,9 +194,32 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		var supportedKinds []gatewayv1.RouteGroupKind
+		if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
+			for _, k := range listener.AllowedRoutes.Kinds {
+				group := gatewayv1.Group(gatewayv1.GroupName)
+				if k.Group != nil && *k.Group != "" {
+					group = *k.Group
+				}
+				if group == gatewayv1.Group(gatewayv1.GroupName) && k.Kind == "HTTPRoute" {
+					supportedKinds = append(supportedKinds, gatewayv1.RouteGroupKind{
+						Group: state.Ptr(group),
+						Kind:  k.Kind,
+					})
+				}
+			}
+		} else {
+			supportedKinds = []gatewayv1.RouteGroupKind{
+				{Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)), Kind: "HTTPRoute"},
+			}
+		}
+		if supportedKinds == nil {
+			supportedKinds = make([]gatewayv1.RouteGroupKind, 0)
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
-			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
+			SupportedKinds: supportedKinds,
 			AttachedRoutes: int32(attachedRoutes),
 			Conditions: []metav1.Condition{
 				{
@@ -315,22 +338,21 @@ func (r *GatewayReconciler) computeResolvedRefsCondition(gw *gatewayv1.Gateway, 
 		Message:            "All references resolved",
 	}
 
-	if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
+	if listener.AllowedRoutes != nil {
 		for _, k := range listener.AllowedRoutes.Kinds {
-			group := "gateway.networking.k8s.io"
+			group := gatewayv1.GroupName
 			if k.Group != nil && *k.Group != "" {
 				group = string(*k.Group)
 			}
 
-			if group != "gateway.networking.k8s.io" || k.Kind != "HTTPRoute" {
+			if group != gatewayv1.GroupName || k.Kind != "HTTPRoute" {
 				condition.Status = metav1.ConditionFalse
-				condition.Reason = "InvalidRouteKind"
-				condition.Message = fmt.Sprintf("Group %q and Kind %q is not supported", group, k.Kind)
+				condition.Reason = string(gatewayv1.ListenerReasonInvalidRouteKinds)
+				condition.Message = fmt.Sprintf("Group %q and Kind %q are not supported", group, k.Kind)
 				return condition
 			}
 		}
 	}
-
 	return condition
 }
 
