@@ -49,11 +49,33 @@ func MatchOrigin(origin, pattern string) bool {
 		pHost = pURL.Host
 	}
 
+	oHost = strings.ToLower(oHost)
+	pHost = strings.ToLower(pHost)
+
+	if oPort == "" {
+		if oURL.Scheme == "http" {
+			oPort = "80"
+		} else if oURL.Scheme == "https" {
+			oPort = "443"
+		}
+	}
+	if pPort == "" {
+		if pURL.Scheme == "http" {
+			pPort = "80"
+		} else if pURL.Scheme == "https" {
+			pPort = "443"
+		}
+	}
+
 	if oPort != pPort {
 		return false
 	}
 
 	if pHost == "*" {
+		return true
+	}
+
+	if oHost == pHost {
 		return true
 	}
 
@@ -63,7 +85,7 @@ func MatchOrigin(origin, pattern string) bool {
 		parts := strings.Split(pHost, "*")
 		if len(parts) == 2 {
 			// prefix*suffix
-			return strings.HasPrefix(oHost, parts[0]) && strings.HasSuffix(oHost, parts[1])
+			return len(oHost) >= len(parts[0])+len(parts[1]) && strings.HasPrefix(oHost, parts[0]) && strings.HasSuffix(oHost, parts[1])
 		}
 		// Fallback for multiple wildcards if ever allowed
 		rePattern := "^" + strings.ReplaceAll(pHost, "*", ".*") + "$"

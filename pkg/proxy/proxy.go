@@ -101,12 +101,39 @@ func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.I
 		}
 	}
 
+	isPreflight := r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
+	reqMethod := r.Header.Get("Access-Control-Request-Method")
+
 	if !allowed {
-		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		if isPreflight {
 			w.WriteHeader(http.StatusForbidden)
 			return true
 		}
 		return false
+	}
+
+	// Validate preflight method
+	var methods []string
+	useWildcardMethod := false
+	methodAllowed := false
+
+	if isPreflight {
+		for _, m := range cors.AllowMethods {
+			if string(m) == "*" {
+				useWildcardMethod = true
+				methodAllowed = true
+				continue
+			}
+			if string(m) == reqMethod {
+				methodAllowed = true
+			}
+			methods = append(methods, string(m))
+		}
+
+		if !methodAllowed {
+			w.WriteHeader(http.StatusNoContent)
+			return true
+		}
 	}
 
 	// Origin is allowed
@@ -128,19 +155,10 @@ func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.I
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
 
-	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+	if isPreflight {
 		// Preflight request
 
 		// Access-Control-Allow-Methods
-		var methods []string
-		useWildcardMethod := false
-		for _, m := range cors.AllowMethods {
-			if string(m) == "*" {
-				useWildcardMethod = true
-				break
-			}
-			methods = append(methods, string(m))
-		}
 		if useWildcardMethod && !cors.AllowCredentials {
 			w.Header().Set("Access-Control-Allow-Methods", "*")
 		} else if useWildcardMethod && cors.AllowCredentials {
@@ -157,7 +175,7 @@ func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.I
 		for _, h := range cors.AllowHeaders {
 			if string(h) == "*" {
 				useWildcardHeader = true
-				break
+				continue
 			}
 			headers = append(headers, string(h))
 		}
@@ -185,7 +203,7 @@ func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.I
 		for _, h := range cors.ExposeHeaders {
 			if string(h) == "*" {
 				useWildcardExpose = true
-				break
+				continue
 			}
 			exposeHeaders = append(exposeHeaders, string(h))
 		}

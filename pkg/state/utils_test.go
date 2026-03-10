@@ -117,6 +117,18 @@ func TestMatchOrigin(t *testing.T) {
 			want:    true,
 		},
 		{
+			name:    "case insensitive host match",
+			origin:  "http://ExAmPle.com",
+			pattern: "http://example.com",
+			want:    true,
+		},
+		{
+			name:    "overlapping wildcard match rejected",
+			origin:  "http://foo.com",
+			pattern: "http://foo*foo.com",
+			want:    false,
+		},
+		{
 			name:    "mismatch scheme",
 			origin:  "https://example.com",
 			pattern: "http://example.com",
