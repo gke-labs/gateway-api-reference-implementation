@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -194,28 +195,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
-		var supportedKinds []gatewayv1.RouteGroupKind
-		if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
-			for _, k := range listener.AllowedRoutes.Kinds {
-				group := gatewayv1.Group(gatewayv1.GroupName)
-				if k.Group != nil && *k.Group != "" {
-					group = *k.Group
-				}
-				if group == gatewayv1.Group(gatewayv1.GroupName) && k.Kind == "HTTPRoute" {
-					supportedKinds = append(supportedKinds, gatewayv1.RouteGroupKind{
-						Group: state.Ptr(group),
-						Kind:  k.Kind,
-					})
-				}
-			}
-		} else {
-			supportedKinds = []gatewayv1.RouteGroupKind{
-				{Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)), Kind: "HTTPRoute"},
-			}
-		}
-		if supportedKinds == nil {
-			supportedKinds = make([]gatewayv1.RouteGroupKind, 0)
-		}
+		resolvedRefsCondition, supportedKinds := r.computeResolvedRefsAndSupportedKinds(gw, listener)
 
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
@@ -238,7 +218,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					Reason:             string(gatewayv1.ListenerReasonAccepted),
 					Message:            "Listener accepted",
 				},
-				r.computeResolvedRefsCondition(gw, listener),
+				resolvedRefsCondition,
 			},
 		})
 	}
@@ -328,7 +308,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
-func (r *GatewayReconciler) computeResolvedRefsCondition(gw *gatewayv1.Gateway, listener gatewayv1.Listener) metav1.Condition {
+func (r *GatewayReconciler) computeResolvedRefsAndSupportedKinds(gw *gatewayv1.Gateway, listener gatewayv1.Listener) (metav1.Condition, []gatewayv1.RouteGroupKind) {
 	condition := metav1.Condition{
 		Type:               string(gatewayv1.ListenerConditionResolvedRefs),
 		Status:             metav1.ConditionTrue,
@@ -338,22 +318,48 @@ func (r *GatewayReconciler) computeResolvedRefsCondition(gw *gatewayv1.Gateway, 
 		Message:            "All references resolved",
 	}
 
-	if listener.AllowedRoutes != nil {
+	var supportedKinds []gatewayv1.RouteGroupKind
+
+	if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
+		var unsupportedMsgs []string
+		hasHTTPRoute := false
+
 		for _, k := range listener.AllowedRoutes.Kinds {
-			group := gatewayv1.GroupName
-			if k.Group != nil && *k.Group != "" {
-				group = string(*k.Group)
+			group := gatewayv1.Group(gatewayv1.GroupName)
+			if k.Group != nil {
+				group = *k.Group
 			}
 
-			if group != gatewayv1.GroupName || k.Kind != "HTTPRoute" {
-				condition.Status = metav1.ConditionFalse
-				condition.Reason = string(gatewayv1.ListenerReasonInvalidRouteKinds)
-				condition.Message = fmt.Sprintf("Group %q and Kind %q are not supported", group, k.Kind)
-				return condition
+			if group == gatewayv1.Group(gatewayv1.GroupName) && k.Kind == "HTTPRoute" {
+				if !hasHTTPRoute {
+					supportedKinds = append(supportedKinds, gatewayv1.RouteGroupKind{
+						Group: state.Ptr(group),
+						Kind:  k.Kind,
+					})
+					hasHTTPRoute = true
+				}
+			} else {
+				unsupportedMsgs = append(unsupportedMsgs, fmt.Sprintf("Group %q and Kind %q are not supported", group, k.Kind))
 			}
 		}
+
+		if len(unsupportedMsgs) > 0 {
+			condition.Status = metav1.ConditionFalse
+			condition.Reason = string(gatewayv1.ListenerReasonInvalidRouteKinds)
+			condition.Message = strings.Join(unsupportedMsgs, ", ")
+		}
+
+		if supportedKinds == nil {
+			supportedKinds = make([]gatewayv1.RouteGroupKind, 0)
+		}
+	} else {
+		// TODO: Dynamically default to other route types based on listener protocol in the future (e.g. TCPRoute for TCP)
+		supportedKinds = []gatewayv1.RouteGroupKind{
+			{Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)), Kind: "HTTPRoute"},
+		}
 	}
-	return condition
+
+	return condition, supportedKinds
 }
 
 func (r *GatewayReconciler) updateProxy() {
