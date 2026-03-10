@@ -17,6 +17,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -74,22 +75,51 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if bestRule.Backend != nil {
-			if len(bestRule.Mirrors) > 0 {
-				r.Body = http.MaxBytesReader(w, r.Body, 1*1024*1024) // 1MB limit for mirroring
-				body, err := io.ReadAll(r.Body)
-				if err != nil {
-					log.Log.Error(err, "Error reading request body for mirroring")
-					if err.Error() == "http: request body too large" {
-						http.Error(w, "Request body too large for mirroring", http.StatusRequestEntityTooLarge)
+			var mirrorBody []byte
+			var shouldMirror = len(bestRule.Mirrors) > 0
+			if shouldMirror {
+				buf := make([]byte, 1024*1024+1)
+				n, err := io.ReadFull(r.Body, buf)
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					mirrorBody = buf[:n]
+					r.Body.Close()
+					if len(mirrorBody) == 0 {
+						r.Body = http.NoBody
 					} else {
-						http.Error(w, "Error reading request body", http.StatusInternalServerError)
+						r.Body = io.NopCloser(bytes.NewReader(mirrorBody))
 					}
+				} else if err == nil {
+					log.Log.Info("Request body too large to mirror, skipping mirror filters", "host", r.Host)
+					shouldMirror = false
+					r.Body = struct {
+						io.Reader
+						io.Closer
+					}{
+						Reader: io.MultiReader(bytes.NewReader(buf), r.Body),
+						Closer: r.Body,
+					}
+				} else {
+					log.Log.Error(err, "Error reading request body for mirroring")
+					http.Error(w, "Error reading request body", http.StatusInternalServerError)
 					return
 				}
-				r.Body = io.NopCloser(bytes.NewBuffer(body))
+			}
+
+			if shouldMirror {
 				for _, mirror := range bestRule.Mirrors {
 					mReq := r.Clone(context.WithoutCancel(r.Context()))
-					mReq.Body = io.NopCloser(bytes.NewBuffer(body))
+					removeHopByHopHeaders(mReq.Header)
+					if len(mirrorBody) == 0 {
+						mReq.Body = http.NoBody
+						if mReq.ContentLength == 0 {
+							mReq.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
+						}
+					} else {
+						mReq.Body = io.NopCloser(bytes.NewReader(mirrorBody))
+						mReq.GetBody = func() (io.ReadCloser, error) {
+							return io.NopCloser(bytes.NewReader(mirrorBody)), nil
+						}
+					}
 					go p.mirror(mReq, *mirror)
 				}
 			}
@@ -115,16 +145,24 @@ func (p *Proxy) mirror(req *http.Request, backend state.InternalBackend) {
 
 	req.URL.Scheme = target.Scheme
 	req.URL.Host = target.Host
-	req.Host = target.Host
 	req.RequestURI = "" // RequestURI must be empty for client requests
 
 	key := fmt.Sprintf("%s-%s:%d", scheme, backend.Host, backend.Port)
+	if backend.TLSConfig != nil {
+		h := sha256.New()
+		h.Write([]byte(backend.TLSConfig.Hostname))
+		for _, cert := range backend.TLSConfig.CACerts {
+			h.Write(cert)
+		}
+		key = fmt.Sprintf("%s-%x", key, h.Sum(nil))
+	}
+
 	clientVal, ok := p.mirrorClients.Load(key)
 	var client *http.Client
 	if ok {
 		client = clientVal.(*http.Client)
 	} else {
-		client = &http.Client{
+		newClient := &http.Client{
 			Timeout: 10 * time.Second, // Timeout to prevent goroutine leaks
 		}
 		if scheme == "https" {
@@ -140,17 +178,14 @@ func (p *Proxy) mirror(req *http.Request, backend state.InternalBackend) {
 							log.Log.V(1).Info("Failed to parse CA certificate for mirror backend", "host", backend.Host)
 						}
 					}
-				} else {
-					tlsConfig.InsecureSkipVerify = true
 				}
-			} else {
-				tlsConfig.InsecureSkipVerify = true
 			}
-			client.Transport = &http.Transport{
-				TLSClientConfig: tlsConfig,
-			}
+			transport := http.DefaultTransport.(*http.Transport).Clone()
+			transport.TLSClientConfig = tlsConfig
+			newClient.Transport = transport
 		}
-		p.mirrorClients.Store(key, client)
+		actualClient, _ := p.mirrorClients.LoadOrStore(key, newClient)
+		client = actualClient.(*http.Client)
 	}
 
 	log.Log.V(1).Info("Mirroring request", "host", req.Host, "path", req.URL.Path, "target", target.String())
@@ -249,11 +284,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				for _, cert := range backend.TLSConfig.CACerts {
 					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
 				}
-			} else {
-				tlsConfig.InsecureSkipVerify = true
 			}
-		} else {
-			tlsConfig.InsecureSkipVerify = true
 		}
 		proxy.Transport = &http.Transport{
 			TLSClientConfig: tlsConfig,
@@ -270,4 +301,29 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 
 	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", target.String(), "appProtocol", state.ValueOf(backend.AppProtocol))
 	proxy.ServeHTTP(w, r)
+}
+
+var hopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func removeHopByHopHeaders(h http.Header) {
+	for _, f := range h["Connection"] {
+		for _, sf := range strings.Split(f, ",") {
+			if sf = strings.TrimSpace(sf); sf != "" {
+				h.Del(sf)
+			}
+		}
+	}
+	for _, hop := range hopHeaders {
+		h.Del(hop)
+	}
 }
