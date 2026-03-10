@@ -54,7 +54,7 @@ func (r *GRPCRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Update status
 	// For each parentRef, we should add a ParentStatus
 	gateways := r.State.GetGateways()
-		rs := state.NewGRPCRouteState(route)
+	rs := state.NewGRPCRouteState(route)
 
 	var newParents []gatewayv1.RouteParentStatus
 	for _, parentRef := range route.Spec.ParentRefs {

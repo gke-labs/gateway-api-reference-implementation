@@ -55,7 +55,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Update status
 	// For each parentRef, we should add a ParentStatus
 	gateways := r.State.GetGateways()
-		rs := state.NewHTTPRouteState(route)
+	rs := state.NewHTTPRouteState(route)
 
 	var newParents []gatewayv1.RouteParentStatus
 	for _, parentRef := range route.Spec.ParentRefs {

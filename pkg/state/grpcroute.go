@@ -186,12 +186,12 @@ func (s *GRPCRouteState) MatchesGateway(gw *GatewayState) bool {
 		if parentRef.Kind != nil && string(*parentRef.Kind) != "Gateway" {
 			continue
 		}
-		
+
 		namespace := s.Namespace
 		if parentRef.Namespace != nil {
 			namespace = string(*parentRef.Namespace)
 		}
-		
+
 		if string(parentRef.Name) == gw.Name && namespace == gw.Namespace {
 			cond := s.ComputeAcceptedCondition(parentRef, []*GatewayState{gw})
 			if cond.Status == metav1.ConditionTrue {
