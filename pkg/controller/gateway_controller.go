@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -177,7 +178,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
-	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
@@ -215,14 +215,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					Reason:             string(gatewayv1.ListenerReasonAccepted),
 					Message:            "Listener accepted",
 				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
+				r.computeResolvedRefsCondition(gw, listener),
 			},
 		})
 	}
@@ -305,12 +298,40 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	r.State.UpsertGateway(gw)
-	_ = gs // keep for now
 	r.updateProxy()
 
 	l.Info("Updated Gateway status", "address", ip)
 
 	return ctrl.Result{}, nil
+}
+
+func (r *GatewayReconciler) computeResolvedRefsCondition(gw *gatewayv1.Gateway, listener gatewayv1.Listener) metav1.Condition {
+	condition := metav1.Condition{
+		Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gw.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+		Message:            "All references resolved",
+	}
+
+	if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
+		for _, k := range listener.AllowedRoutes.Kinds {
+			group := "gateway.networking.k8s.io"
+			if k.Group != nil && *k.Group != "" {
+				group = string(*k.Group)
+			}
+
+			if group != "gateway.networking.k8s.io" || k.Kind != "HTTPRoute" {
+				condition.Status = metav1.ConditionFalse
+				condition.Reason = "InvalidRouteKind"
+				condition.Message = fmt.Sprintf("Group %q and Kind %q is not supported", group, k.Kind)
+				return condition
+			}
+		}
+	}
+
+	return condition
 }
 
 func (r *GatewayReconciler) updateProxy() {
