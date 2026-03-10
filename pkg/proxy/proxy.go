@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -69,13 +70,43 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, bestRule.Error.HTTPMessage, bestRule.Error.HTTPStatusCode)
 			return
 		}
-		if bestRule.Backend != nil {
-			p.forward(w, r, *bestRule.Backend)
+		if len(bestRule.Backends) > 0 {
+			backend := p.pickBackend(bestRule.Backends)
+			p.forward(w, r, backend)
 			return
 		}
 	}
 
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+}
+
+func (p *Proxy) pickBackend(backends []state.InternalWeightedBackend) state.InternalBackend {
+	if len(backends) == 1 {
+		return backends[0].InternalBackend
+	}
+
+	var totalWeight int32
+	for _, b := range backends {
+		totalWeight += b.Weight
+	}
+
+	if totalWeight == 0 {
+		// If all weights are 0, we can pick any (e.g. the first one) 
+		// or return an error. For reference implementation, we pick the first one.
+		return backends[0].InternalBackend
+	}
+
+	// Use a simple random selection based on weight for this reference implementation
+	r := rand.Int31n(totalWeight)
+	var currentWeight int32
+	for _, b := range backends {
+		currentWeight += b.Weight
+		if r < currentWeight {
+			return b.InternalBackend
+		}
+	}
+
+	return backends[0].InternalBackend
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {

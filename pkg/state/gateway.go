@@ -104,11 +104,16 @@ type ErrorState struct {
 
 type InternalRule struct {
 	Matches  []InternalMatch
-	Backend  *InternalBackend
+	Backends []InternalWeightedBackend
 	Redirect *InternalRedirect
 	// Error, if non-nil, indicates that this rule is invalid and should
 	// return an error response if matched.
 	Error *ErrorState
+}
+
+type InternalWeightedBackend struct {
+	InternalBackend
+	Weight int32
 }
 
 type InternalBackend struct {
@@ -306,7 +311,7 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
+func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRoutes []*GRPCRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
 	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
 	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
 		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
@@ -327,226 +332,380 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 	var internalRoutes []InternalRoute
 
 	for _, listener := range s.Spec.Listeners {
-		// Check if listener is compatible with HTTPRoute
-		if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
-			continue
-		}
+		// HTTPRoutes
+		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
+			for _, route := range httpRoutes {
+				// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
+				bound := false
+				var matchingParentRef *gatewayv1.ParentReference
+				for i := range route.Spec.ParentRefs {
+					parentRef := &route.Spec.ParentRefs[i]
+					if string(parentRef.Name) != s.Name {
+						continue
+					}
+					// Namespace check (optional for now as per current implementation)
+					if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
+						continue
+					}
 
-		for _, route := range routes {
-			// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
-			bound := false
-			var matchingParentRef *gatewayv1.ParentReference
-			for i := range route.Spec.ParentRefs {
-				parentRef := &route.Spec.ParentRefs[i]
-				if string(parentRef.Name) != s.Name {
-					continue
-				}
-				// Namespace check (optional for now as per current implementation)
-				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
-					continue
-				}
+					if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
+						continue
+					}
 
-				if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
-					continue
-				}
-
-				// Dynamically compute acceptance for this listener
-				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}); cond.Status == metav1.ConditionTrue {
-					bound = true
-					matchingParentRef = parentRef
-					break
-				}
-			}
-
-			if !bound {
-				continue
-			}
-
-			// Calculate intersected hostnames
-			routeHostnames := route.GetHostnames()
-			listenerHostname := ValueOf(listener.Hostname)
-
-			effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
-			if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
-				// No intersection, skip this listener
-				continue
-			}
-
-			ir := InternalRoute{
-				Hostnames: effectiveHostnames,
-			}
-
-			resolvedRefsCond := route.ComputeResolvedRefsCondition()
-
-			for _, rule := range route.Spec.Rules {
-				var redirect *InternalRedirect
-				for _, filter := range rule.Filters {
-					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
-						r := filter.RequestRedirect
-						redirect = &InternalRedirect{
-							Scheme:     r.Scheme,
-							Hostname:   r.Hostname,
-							Port:       r.Port,
-							StatusCode: r.StatusCode,
-						}
-						if r.Path != nil {
-							var pathValue string
-							if r.Path.Type == gatewayv1.FullPathHTTPPathModifier {
-								pathValue = ValueOf(r.Path.ReplaceFullPath)
-							} else if r.Path.Type == gatewayv1.PrefixMatchHTTPPathModifier {
-								pathValue = ValueOf(r.Path.ReplacePrefixMatch)
-							}
-							redirect.Path = &InternalPathRedirect{
-								Type:  r.Path.Type,
-								Value: pathValue,
-							}
-						}
+					// Dynamically compute acceptance for this listener
+					if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}); cond.Status == metav1.ConditionTrue {
+						bound = true
+						matchingParentRef = parentRef
 						break
 					}
 				}
 
-				iRule := InternalRule{
-					Redirect: redirect,
+				if !bound {
+					continue
 				}
 
-				if resolvedRefsCond.Status == metav1.ConditionFalse {
-					iRule.Error = &ErrorState{
-						Condition:      resolvedRefsCond,
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    resolvedRefsCond.Message,
-					}
-				} else if redirect == nil {
-					for _, backendRef := range rule.BackendRefs {
-						kind := ValueOf(backendRef.Kind)
-						if kind == "" {
-							kind = "Service"
-						}
-						if kind != "Service" {
-							iRule.Error = &ErrorState{
-								Condition: metav1.Condition{
-									Type:    string(gatewayv1.RouteConditionResolvedRefs),
-									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonInvalidKind),
-									Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
-								},
-								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+				// Calculate intersected hostnames
+				routeHostnames := route.GetHostnames()
+				listenerHostname := ValueOf(listener.Hostname)
+
+				effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
+				if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
+					// No intersection, skip this listener
+					continue
+				}
+
+				ir := InternalRoute{
+					Hostnames: effectiveHostnames,
+				}
+
+				resolvedRefsCond := route.ComputeResolvedRefsCondition()
+
+				for _, rule := range route.Spec.Rules {
+					var redirect *InternalRedirect
+					for _, filter := range rule.Filters {
+						if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
+							r := filter.RequestRedirect
+							redirect = &InternalRedirect{
+								Scheme:     r.Scheme,
+								Hostname:   r.Hostname,
+								Port:       r.Port,
+								StatusCode: r.StatusCode,
 							}
-							continue
-						}
-
-						if backendRef.Port == nil {
-							continue
-						}
-
-						backendSvcNamespace := route.Namespace
-						if backendRef.Namespace != nil {
-							backendSvcNamespace = string(*backendRef.Namespace)
-						}
-
-						backendSvcName := types.NamespacedName{
-							Namespace: backendSvcNamespace,
-							Name:      string(backendRef.Name),
-						}
-						var appProtocol *string
-						if svc, ok := services[backendSvcName]; ok {
-							for _, port := range svc.Spec.Ports {
-								if port.Port == int32(*backendRef.Port) {
-									appProtocol = port.AppProtocol
-									break
+							if r.Path != nil {
+								var pathValue string
+								if r.Path.Type == gatewayv1.FullPathHTTPPathModifier {
+									pathValue = ValueOf(r.Path.ReplaceFullPath)
+								} else if r.Path.Type == gatewayv1.PrefixMatchHTTPPathModifier {
+									pathValue = ValueOf(r.Path.ReplacePrefixMatch)
+								}
+								redirect.Path = &InternalPathRedirect{
+									Type:  r.Path.Type,
+									Value: pathValue,
 								}
 							}
+							break
 						}
+					}
 
-						// Check for BackendTLSPolicy
-						var tlsConfig *InternalTLSConfig
-						for _, policy := range backendTLSPolicies {
-							if tlsConfig != nil {
-								break
+					iRule := InternalRule{
+						Redirect: redirect,
+					}
+
+					if resolvedRefsCond.Status == metav1.ConditionFalse {
+						iRule.Error = &ErrorState{
+							Condition:      resolvedRefsCond,
+							HTTPStatusCode: http.StatusInternalServerError,
+							HTTPMessage:    resolvedRefsCond.Message,
+						}
+					} else if redirect == nil {
+						for _, backendRef := range rule.BackendRefs {
+							kind := ValueOf(backendRef.Kind)
+							if kind == "" {
+								kind = "Service"
 							}
-							for _, targetRef := range policy.Spec.TargetRefs {
-								if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
-									string(targetRef.Name) == string(backendRef.Name) &&
-									policy.Namespace == backendSvcNamespace {
-									// Found a policy targeting this service
-									https := "https"
-									appProtocol = &https
+							if kind != "Service" {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonInvalidKind),
+										Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+								}
+								continue
+							}
 
-									var caCerts [][]byte
-									for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-										if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-											cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-											if cm, ok := configMaps[cmName]; ok {
-												if data, ok := cm.Data["ca.crt"]; ok {
-													caCerts = append(caCerts, []byte(data))
-												} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-													caCerts = append(caCerts, data)
+							if backendRef.Port == nil {
+								continue
+							}
+
+							backendSvcNamespace := route.Namespace
+							if backendRef.Namespace != nil {
+								backendSvcNamespace = string(*backendRef.Namespace)
+							}
+
+							backendSvcName := types.NamespacedName{
+								Namespace: backendSvcNamespace,
+								Name:      string(backendRef.Name),
+							}
+							var appProtocol *string
+							if svc, ok := services[backendSvcName]; ok {
+								for _, port := range svc.Spec.Ports {
+									if port.Port == int32(*backendRef.Port) {
+										appProtocol = port.AppProtocol
+										break
+									}
+								}
+							}
+
+							// Check for BackendTLSPolicy
+							var tlsConfig *InternalTLSConfig
+							for _, policy := range backendTLSPolicies {
+								if tlsConfig != nil {
+									break
+								}
+								for _, targetRef := range policy.Spec.TargetRefs {
+									if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+										string(targetRef.Name) == string(backendRef.Name) &&
+										policy.Namespace == backendSvcNamespace {
+										// Found a policy targeting this service
+										https := "https"
+										appProtocol = &https
+
+										var caCerts [][]byte
+										for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+											if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+												cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+												if cm, ok := configMaps[cmName]; ok {
+													if data, ok := cm.Data["ca.crt"]; ok {
+														caCerts = append(caCerts, []byte(data))
+													} else if data, ok := cm.BinaryData["ca.crt"]; ok {
+														caCerts = append(caCerts, data)
+													}
 												}
 											}
 										}
-									}
 
-									tlsConfig = &InternalTLSConfig{
-										Hostname: string(policy.Spec.Validation.Hostname),
-										CACerts:  caCerts,
+										tlsConfig = &InternalTLSConfig{
+											Hostname: string(policy.Spec.Validation.Hostname),
+											CACerts:  caCerts,
+										}
+										break
 									}
-									break
 								}
 							}
-						}
 
-						iRule.Backend = &InternalBackend{
-							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-							Port:        int32(*backendRef.Port),
-							AppProtocol: appProtocol,
-							TLSConfig:   tlsConfig,
-						}
-						iRule.Error = nil
+							weight := int32(1)
+							if backendRef.Weight != nil {
+								weight = *backendRef.Weight
+							}
 
-						// For minimal implementation, we just take the first Service backendRef for each rule
+							iRule.Backends = append(iRule.Backends, InternalWeightedBackend{
+								InternalBackend: InternalBackend{
+									Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
+									Port:        int32(*backendRef.Port),
+									AppProtocol: appProtocol,
+									TLSConfig:   tlsConfig,
+								},
+								Weight: weight,
+							})
+							iRule.Error = nil
+						}
+					}
+
+					for _, match := range rule.Matches {
+						iMatch := InternalMatch{}
+						if match.Method != nil {
+							iMatch.Method = match.Method
+						}
+						if match.Path != nil {
+							iMatch.Path = &InternalPathMatch{
+								Type:  ValueOf(match.Path.Type),
+								Value: ValueOf(match.Path.Value),
+							}
+							if iMatch.Path.Type == "" {
+								iMatch.Path.Type = gatewayv1.PathMatchPathPrefix
+							}
+						}
+						for _, header := range match.Headers {
+							headerType := ValueOf(header.Type)
+							if headerType == "" {
+								headerType = gatewayv1.HeaderMatchExact
+							}
+							hm := InternalHeaderMatch{
+								Type:            headerType,
+								Name:            string(header.Name),
+								MatchExactValue: header.Value,
+							}
+							if headerType == gatewayv1.HeaderMatchRegularExpression {
+								re, err := regexp.Compile(header.Value)
+								if err == nil {
+									hm.MatchRegularExpressionValue = re
+								}
+							}
+							iMatch.Headers = append(iMatch.Headers, hm)
+						}
+						iRule.Matches = append(iRule.Matches, iMatch)
+					}
+
+					ir.Rules = append(ir.Rules, iRule)
+				}
+				internalRoutes = append(internalRoutes, ir)
+				_ = matchingParentRef // keep for now
+			}
+		}
+
+		// GRPCRoutes
+		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == "TLS" {
+			for _, route := range grpcRoutes {
+				bound := false
+				for i := range route.Spec.ParentRefs {
+					parentRef := &route.Spec.ParentRefs[i]
+					if string(parentRef.Name) != s.Name {
+						continue
+					}
+					if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
+						continue
+					}
+					if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
+						continue
+					}
+
+					if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}); cond.Status == metav1.ConditionTrue {
+						bound = true
 						break
 					}
 				}
 
-				for _, match := range rule.Matches {
-					iMatch := InternalMatch{}
-					if match.Method != nil {
-						iMatch.Method = match.Method
-					}
-					if match.Path != nil {
-						iMatch.Path = &InternalPathMatch{
-							Type:  ValueOf(match.Path.Type),
-							Value: ValueOf(match.Path.Value),
-						}
-						if iMatch.Path.Type == "" {
-							iMatch.Path.Type = gatewayv1.PathMatchPathPrefix
-						}
-					}
-					for _, header := range match.Headers {
-						headerType := ValueOf(header.Type)
-						if headerType == "" {
-							headerType = gatewayv1.HeaderMatchExact
-						}
-						hm := InternalHeaderMatch{
-							Type:            headerType,
-							Name:            string(header.Name),
-							MatchExactValue: header.Value,
-						}
-						if headerType == gatewayv1.HeaderMatchRegularExpression {
-							re, err := regexp.Compile(header.Value)
-							if err == nil {
-								hm.MatchRegularExpressionValue = re
-							}
-						}
-						iMatch.Headers = append(iMatch.Headers, hm)
-					}
-					iRule.Matches = append(iRule.Matches, iMatch)
+				if !bound {
+					continue
 				}
 
-				ir.Rules = append(ir.Rules, iRule)
+				routeHostnames := route.GetHostnames()
+				listenerHostname := ValueOf(listener.Hostname)
+				effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
+				if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
+					continue
+				}
+
+				ir := InternalRoute{
+					Hostnames: effectiveHostnames,
+				}
+
+				resolvedRefsCond := route.ComputeResolvedRefsCondition()
+
+				for _, rule := range route.Spec.Rules {
+					iRule := InternalRule{}
+
+					if resolvedRefsCond.Status == metav1.ConditionFalse {
+						iRule.Error = &ErrorState{
+							Condition:      resolvedRefsCond,
+							HTTPStatusCode: http.StatusInternalServerError,
+							HTTPMessage:    resolvedRefsCond.Message,
+						}
+					} else {
+						for _, backendRef := range rule.BackendRefs {
+							kind := ValueOf(backendRef.Kind)
+							if kind == "" {
+								kind = "Service"
+							}
+							if kind != "Service" {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonInvalidKind),
+										Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+								}
+								continue
+							}
+
+							if backendRef.Port == nil {
+								continue
+							}
+
+							backendSvcNamespace := route.Namespace
+							if backendRef.Namespace != nil {
+								backendSvcNamespace = string(*backendRef.Namespace)
+							}
+
+							weight := int32(1)
+							if backendRef.Weight != nil {
+								weight = *backendRef.Weight
+							}
+
+							// For GRPCRoute, we often use h2c or https
+							h2c := "kubernetes.io/h2c"
+							appProtocol := &h2c
+							if listener.Protocol == gatewayv1.HTTPSProtocolType {
+								https := "https"
+								appProtocol = &https
+							}
+
+							iRule.Backends = append(iRule.Backends, InternalWeightedBackend{
+								InternalBackend: InternalBackend{
+									Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
+									Port:        int32(*backendRef.Port),
+									AppProtocol: appProtocol,
+								},
+								Weight: weight,
+							})
+						}
+					}
+
+					for _, match := range rule.Matches {
+						iMatch := InternalMatch{}
+						if match.Method != nil {
+							// Translate gRPC service/method to path match
+							service := ValueOf(match.Method.Service)
+							method := ValueOf(match.Method.Method)
+							if service != "" || method != "" {
+								path := "/"
+								if service != "" {
+									path += service
+								}
+								path += "/"
+								if method != "" {
+									path += method
+								}
+								iMatch.Path = &InternalPathMatch{
+									Type:  gatewayv1.PathMatchPathPrefix,
+									Value: path,
+								}
+							}
+						}
+						for _, header := range match.Headers {
+							headerType := ValueOf(header.Type)
+							if headerType == "" {
+								headerType = gatewayv1.GRPCHeaderMatchExact
+							}
+							hm := InternalHeaderMatch{
+								Name:            string(header.Name),
+								MatchExactValue: header.Value,
+							}
+							if headerType == gatewayv1.GRPCHeaderMatchRegularExpression {
+								hm.Type = gatewayv1.HeaderMatchRegularExpression
+								re, err := regexp.Compile(header.Value)
+								if err == nil {
+									hm.MatchRegularExpressionValue = re
+								}
+							} else {
+								hm.Type = gatewayv1.HeaderMatchExact
+							}
+							iMatch.Headers = append(iMatch.Headers, hm)
+						}
+						iRule.Matches = append(iRule.Matches, iMatch)
+					}
+
+					ir.Rules = append(ir.Rules, iRule)
+				}
+				internalRoutes = append(internalRoutes, ir)
 			}
-			internalRoutes = append(internalRoutes, ir)
-			_ = matchingParentRef // keep for now
 		}
 	}
 
