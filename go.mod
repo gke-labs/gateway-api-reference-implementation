@@ -7,13 +7,13 @@ require (
 	golang.org/x/net v0.49.0
 	golang.org/x/sync v0.19.0
 	k8s.io/api v0.35.1
-	k8s.io/apiextensions-apiserver v0.35.0
+	k8s.io/apiextensions-apiserver v0.35.1
 	k8s.io/apimachinery v0.35.1
 	k8s.io/client-go v0.35.1
 	k8s.io/klog/v2 v2.130.1
 	sigs.k8s.io/controller-runtime v0.23.1
 	sigs.k8s.io/gateway-api v1.5.0
-	sigs.k8s.io/gateway-api/conformance v0.0.0-20260206193030-8ecfe98081f7
+	sigs.k8s.io/gateway-api/conformance v1.5.0
 )
 
 require (
