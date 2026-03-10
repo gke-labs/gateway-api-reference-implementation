@@ -41,11 +41,13 @@ type Proxy struct {
 	mu            sync.RWMutex
 	routes        []state.InternalRoute
 	mirrorClients sync.Map
+	mirrorSem     chan struct{}
 }
 
 func NewProxy() *Proxy {
 	return &Proxy{
-		routes: []state.InternalRoute{},
+		routes:    []state.InternalRoute{},
+		mirrorSem: make(chan struct{}, 1000), // semaphore to limit concurrent mirrors
 	}
 }
 
@@ -53,6 +55,17 @@ func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.routes = routes
+
+	// Evict unused mirror clients to prevent idle connections from leaking permanently
+	p.mirrorClients.Range(func(key, value any) bool {
+		if client, ok := value.(*http.Client); ok && client.Transport != nil {
+			if transport, ok := client.Transport.(*http.Transport); ok {
+				transport.CloseIdleConnections()
+			}
+		}
+		p.mirrorClients.Delete(key)
+		return true
+	})
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -78,30 +91,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var mirrorBody []byte
 			var shouldMirror = len(bestRule.Mirrors) > 0
 			if shouldMirror {
-				buf := make([]byte, 1024*1024+1)
-				n, err := io.ReadFull(r.Body, buf)
-				if err == io.EOF || err == io.ErrUnexpectedEOF {
-					mirrorBody = buf[:n]
-					r.Body.Close()
-					if len(mirrorBody) == 0 {
-						r.Body = http.NoBody
-					} else {
-						r.Body = io.NopCloser(bytes.NewReader(mirrorBody))
-					}
-				} else if err == nil {
-					log.Log.Info("Request body too large to mirror, skipping mirror filters", "host", r.Host)
+				if r.ContentLength > 1024*1024 {
+					log.Log.Info("Content-Length too large to mirror, skipping mirror filters", "host", r.Host)
 					shouldMirror = false
-					r.Body = struct {
-						io.Reader
-						io.Closer
-					}{
-						Reader: io.MultiReader(bytes.NewReader(buf), r.Body),
-						Closer: r.Body,
-					}
 				} else {
-					log.Log.Error(err, "Error reading request body for mirroring")
-					http.Error(w, "Error reading request body", http.StatusInternalServerError)
-					return
+					lr := io.LimitReader(r.Body, 1024*1024+1)
+					bodyBytes, err := io.ReadAll(lr)
+					if err != nil {
+						log.Log.Error(err, "Error reading request body for mirroring")
+						http.Error(w, "Error reading request body", http.StatusInternalServerError)
+						return
+					}
+					if len(bodyBytes) > 1024*1024 {
+						log.Log.Info("Request body too large to mirror, skipping mirror filters", "host", r.Host)
+						shouldMirror = false
+						r.Body = struct {
+							io.Reader
+							io.Closer
+						}{
+							Reader: io.MultiReader(bytes.NewReader(bodyBytes), r.Body),
+							Closer: r.Body,
+						}
+					} else {
+						mirrorBody = bodyBytes
+						r.Body.Close()
+						if len(mirrorBody) == 0 {
+							r.Body = http.NoBody
+						} else {
+							r.Body = io.NopCloser(bytes.NewReader(mirrorBody))
+						}
+					}
 				}
 			}
 
@@ -109,6 +128,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				for _, mirror := range bestRule.Mirrors {
 					mReq := r.Clone(context.WithoutCancel(r.Context()))
 					removeHopByHopHeaders(mReq.Header)
+					mReq.Trailer = nil
 					if len(mirrorBody) == 0 {
 						mReq.Body = http.NoBody
 						if mReq.ContentLength == 0 {
@@ -120,7 +140,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							return io.NopCloser(bytes.NewReader(mirrorBody)), nil
 						}
 					}
-					go p.mirror(mReq, *mirror)
+					select {
+					case p.mirrorSem <- struct{}{}:
+						go func(mr *http.Request, mb state.InternalBackend) {
+							defer func() { <-p.mirrorSem }()
+							p.mirror(mr, mb)
+						}(mReq, *mirror)
+					default:
+						log.Log.Error(nil, "Mirror semaphore full, dropping mirror request", "host", r.Host)
+					}
 				}
 			}
 			p.forward(w, r, *bestRule.Backend)
@@ -164,7 +192,24 @@ func (p *Proxy) mirror(req *http.Request, backend state.InternalBackend) {
 	} else {
 		newClient := &http.Client{
 			Timeout: 10 * time.Second, // Timeout to prevent goroutine leaks
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		}
+
+		transport := &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+
 		if scheme == "https" {
 			tlsConfig := &tls.Config{InsecureSkipVerify: false}
 			if backend.TLSConfig != nil {
@@ -180,10 +225,10 @@ func (p *Proxy) mirror(req *http.Request, backend state.InternalBackend) {
 					}
 				}
 			}
-			transport := http.DefaultTransport.(*http.Transport).Clone()
 			transport.TLSClientConfig = tlsConfig
-			newClient.Transport = transport
 		}
+		newClient.Transport = transport
+
 		actualClient, _ := p.mirrorClients.LoadOrStore(key, newClient)
 		client = actualClient.(*http.Client)
 	}

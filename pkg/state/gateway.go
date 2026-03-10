@@ -523,19 +523,23 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				}
 
 				if redirect == nil {
+					var ruleErr *ErrorState
 					for _, backendRef := range rule.BackendRefs {
 						backend, errState := resolveBackend(backendRef.BackendObjectReference, route.Namespace, services, backendTLSPolicies, configMaps)
 						if errState != nil {
-							iRule.Error = errState
-							continue
+							ruleErr = errState
+							break // Fail the rule immediately if any backend is invalid
 						}
 
-						if backend != nil {
+						if backend != nil && iRule.Backend == nil {
 							iRule.Backend = backend
-							iRule.Error = nil
-							// For minimal implementation, we just take the first Service backendRef for each rule
-							break
+							// For minimal implementation, we just take the first valid Service backendRef for each rule
 						}
+					}
+
+					if ruleErr != nil {
+						iRule.Error = ruleErr
+						iRule.Backend = nil
 					}
 				}
 
