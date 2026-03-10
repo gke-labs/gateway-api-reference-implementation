@@ -174,6 +174,15 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
 	}
 
+	if err = (&controller.GRPCRouteReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		State:  st,
+		Proxy:  p,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating GRPCRoute controller: %w", err)
+	}
+
 	if err = (&controller.GatewayClassReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
