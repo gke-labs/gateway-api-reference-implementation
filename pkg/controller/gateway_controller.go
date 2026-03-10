@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -118,11 +119,16 @@ type GatewayReconciler struct {
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
+	// If we are scoped to a specific gateway, ignore others
+	if r.GatewayName != "" && (req.Name != r.GatewayName || req.Namespace != r.GatewayNamespace) {
+		return ctrl.Result{}, nil
+	}
+
 	gw := &gatewayv1.Gateway{}
 	if err := r.Get(ctx, req.NamespacedName, gw); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.State.DeleteGateway(req.NamespacedName)
-			r.updateProxy()
+			r.UpdateProxy()
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -138,66 +144,81 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	if r.SkipStatusUpdate {
+	if r.Proxy == nil {
+		// Operator mode: Sync infrastructure and update basic status (Accepted, Address)
+		svc, err := r.syncInfrastructure(ctx, gw)
+		if err != nil {
+			l.Error(err, "unable to sync infrastructure")
+			return ctrl.Result{}, err
+		}
+
+		var ip string
+		if len(svc.Status.LoadBalancer.Ingress) > 0 {
+			ip = svc.Status.LoadBalancer.Ingress[0].IP
+		}
+
+		if ip == "" {
+			l.Info("Gateway service has no LoadBalancer IP yet")
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		// Update status to Accepted and add address
+		newConditions := []metav1.Condition{
+			{
+				Type:               string(gatewayv1.GatewayConditionAccepted),
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: gw.Generation,
+				Reason:             string(gatewayv1.GatewayReasonAccepted),
+				Message:            "Gateway accepted by reference implementation",
+			},
+		}
+		newAddresses := []gatewayv1.GatewayStatusAddress{
+			{
+				Type:  state.Ptr(gatewayv1.IPAddressType),
+				Value: ip,
+			},
+		}
+
+		updated := false
+		if !hasCondition(gw.Status.Conditions, newConditions[0]) || !reflect.DeepEqual(gw.Status.Addresses, newAddresses) {
+			updated = true
+		}
+
+		if updated {
+			for i := range newConditions {
+				newConditions[i].LastTransitionTime = metav1.Now()
+			}
+			gw.Status.Conditions = mergeConditions(gw.Status.Conditions, newConditions)
+			gw.Status.Addresses = newAddresses
+			if err := r.Status().Update(ctx, gw); err != nil {
+				l.Error(err, "unable to update Gateway status")
+				return ctrl.Result{}, err
+			}
+		}
+
 		r.State.UpsertGateway(gw)
-		r.updateProxy()
+		l.Info("Updated Gateway status (Operator)", "address", ip)
 		return ctrl.Result{}, nil
 	}
 
-	// Sync infrastructure
-	svc, err := r.syncInfrastructure(ctx, gw)
-	if err != nil {
-		l.Error(err, "unable to sync infrastructure")
-		return ctrl.Result{}, err
-	}
-
-	var ip string
-	if len(svc.Status.LoadBalancer.Ingress) > 0 {
-		ip = svc.Status.LoadBalancer.Ingress[0].IP
-	}
-
-	if ip == "" {
-		l.Info("Gateway service has no LoadBalancer IP yet")
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
-
-	// Update status to Programmed and add address
-	newConditions := []metav1.Condition{
-		{
-			Type:               string(gatewayv1.GatewayConditionProgrammed),
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: gw.Generation,
-			Reason:             string(gatewayv1.GatewayReasonProgrammed),
-			Message:            "Gateway programmed by reference implementation",
-		},
-		{
-			Type:               string(gatewayv1.GatewayConditionAccepted),
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: gw.Generation,
-			Reason:             string(gatewayv1.GatewayReasonAccepted),
-			Message:            "Gateway accepted by reference implementation",
-		},
-	}
-	newAddresses := []gatewayv1.GatewayStatusAddress{
-		{
-			Type:  state.Ptr(gatewayv1.IPAddressType),
-			Value: ip,
-		},
-	}
+	// Gateway mode: Update Programmed/Listener status and proxy config
+	r.State.UpsertGateway(gw)
 
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
-	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
 		for _, route := range routes {
-			for _, parentRef := range route.Spec.ParentRefs {
-				if string(parentRef.Name) == gw.Name {
-					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
-							attachedRoutes++
-							break
+			if route.MatchesGateway(gw, ControllerName) {
+				// Count how many listeners on this gateway the route is attached to
+				for _, parentRef := range route.Spec.ParentRefs {
+					if string(parentRef.Name) == gw.Name {
+						if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
+							if route.IsAccepted(ControllerName) {
+								attachedRoutes++
+								break
+							}
 						}
 					}
 				}
@@ -237,76 +258,26 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		})
 	}
 
+	newConditions := []metav1.Condition{
+		{
+			Type:               string(gatewayv1.GatewayConditionProgrammed),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			Reason:             string(gatewayv1.GatewayReasonProgrammed),
+			Message:            "Gateway programmed by reference implementation",
+		},
+	}
+
 	updated := false
-	if len(gw.Status.Conditions) != len(newConditions) || len(gw.Status.Addresses) != len(newAddresses) || len(gw.Status.Listeners) != len(newListenerStatuses) {
+	if !hasCondition(gw.Status.Conditions, newConditions[0]) || !reflect.DeepEqual(gw.Status.Listeners, newListenerStatuses) {
 		updated = true
-	} else {
-		for i := range newConditions {
-			matched := false
-			for j := range gw.Status.Conditions {
-				if gw.Status.Conditions[j].Type == newConditions[i].Type {
-					if gw.Status.Conditions[j].Status == newConditions[i].Status &&
-						gw.Status.Conditions[j].ObservedGeneration == newConditions[i].ObservedGeneration &&
-						gw.Status.Conditions[j].Reason == newConditions[i].Reason &&
-						gw.Status.Conditions[j].Message == newConditions[i].Message {
-						matched = true
-					}
-					break
-				}
-			}
-			if !matched {
-				updated = true
-				break
-			}
-		}
-		if !updated {
-			for i := range newAddresses {
-				if state.ValueOf(gw.Status.Addresses[i].Type) != state.ValueOf(newAddresses[i].Type) ||
-					gw.Status.Addresses[i].Value != newAddresses[i].Value {
-					updated = true
-					break
-				}
-			}
-		}
-		if !updated {
-			for i := range newListenerStatuses {
-				if gw.Status.Listeners[i].Name != newListenerStatuses[i].Name ||
-					gw.Status.Listeners[i].AttachedRoutes != newListenerStatuses[i].AttachedRoutes ||
-					len(gw.Status.Listeners[i].Conditions) != len(newListenerStatuses[i].Conditions) {
-					updated = true
-					break
-				}
-				// Also check if conditions changed (optional but safer)
-				for j := range newListenerStatuses[i].Conditions {
-					matched := false
-					for k := range gw.Status.Listeners[i].Conditions {
-						if gw.Status.Listeners[i].Conditions[k].Type == newListenerStatuses[i].Conditions[j].Type {
-							if gw.Status.Listeners[i].Conditions[k].Status == newListenerStatuses[i].Conditions[j].Status &&
-								gw.Status.Listeners[i].Conditions[k].ObservedGeneration == newListenerStatuses[i].Conditions[j].ObservedGeneration &&
-								gw.Status.Listeners[i].Conditions[k].Reason == newListenerStatuses[i].Conditions[j].Reason {
-								matched = true
-							}
-							break
-						}
-					}
-					if !matched {
-						updated = true
-						break
-					}
-				}
-				if updated {
-					break
-				}
-			}
-		}
 	}
 
 	if updated {
 		for i := range newConditions {
 			newConditions[i].LastTransitionTime = metav1.Now()
 		}
-		gw.Status.Conditions = newConditions
-		gw.Status.Addresses = newAddresses
+		gw.Status.Conditions = mergeConditions(gw.Status.Conditions, newConditions)
 		gw.Status.Listeners = newListenerStatuses
 		if err := r.Status().Update(ctx, gw); err != nil {
 			l.Error(err, "unable to update Gateway status")
@@ -314,17 +285,39 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	r.State.UpsertGateway(gw)
-	_ = gs // keep for now
-	r.updateProxy()
-
-	l.Info("Updated Gateway status", "address", ip)
+	r.UpdateProxy()
+	l.Info("Updated Gateway status (Gateway)")
 
 	return ctrl.Result{}, nil
 }
 
-func (r *GatewayReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy)
+func hasCondition(conditions []metav1.Condition, target metav1.Condition) bool {
+	for _, c := range conditions {
+		if c.Type == target.Type && c.Status == target.Status && c.Reason == target.Reason && c.ObservedGeneration == target.ObservedGeneration {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeConditions(existing []metav1.Condition, newConds []metav1.Condition) []metav1.Condition {
+	res := make([]metav1.Condition, len(existing))
+	copy(res, existing)
+
+	for _, n := range newConds {
+		found := false
+		for i, e := range res {
+			if e.Type == n.Type {
+				res[i] = n
+				found = true
+				break
+			}
+		}
+		if !found {
+			res = append(res, n)
+		}
+	}
+	return res
 }
 
 func (r *GatewayReconciler) syncInfrastructure(ctx context.Context, gw *gatewayv1.Gateway) (*corev1.Service, error) {
@@ -401,7 +394,11 @@ func (r *GatewayReconciler) syncInfrastructure(ctx context.Context, gw *gatewayv
 				Image:           image,
 				ImagePullPolicy: corev1.PullNever,
 				Command:         []string{"/gari-gateway"},
-				Args:            []string{"--enable-h2c"},
+				Args: []string{
+					"--enable-h2c",
+					fmt.Sprintf("--gateway-name=%s", gw.Name),
+					fmt.Sprintf("--gateway-namespace=%s", gw.Namespace),
+				},
 				Ports: []corev1.ContainerPort{
 					{Name: "http", ContainerPort: 8000},
 					{Name: "https", ContainerPort: 8443},

@@ -106,14 +106,6 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("error creating Gateway controller: %w", err)
 	}
 
-	if err = (&controller.HTTPRouteReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
-	}
-
-	if err = (&controller.BackendTLSPolicyReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating BackendTLSPolicy controller: %w", err)
-	}
-
 	setupLog.Info("starting operator manager")
 	if err := mgr.Start(ctx); err != nil {
 		return fmt.Errorf("problem running manager: %w", err)

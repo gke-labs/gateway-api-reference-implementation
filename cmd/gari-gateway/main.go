@@ -71,11 +71,15 @@ func run(ctx context.Context) error {
 	var proxyAddr string
 	var proxyHTTPSAddr string
 	var enableH2C bool
+	var gatewayName string
+	var gatewayNamespace string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&proxyAddr, "proxy-bind-address", ":8000", "The address the proxy binds to.")
 	flag.StringVar(&proxyHTTPSAddr, "proxy-https-bind-address", ":8443", "The address the proxy binds to for HTTPS.")
 	flag.BoolVar(&enableH2C, "enable-h2c", false, "Enable H2C support on the proxy server.")
+	flag.StringVar(&gatewayName, "gateway-name", "", "The name of the Gateway this proxy is serving.")
+	flag.StringVar(&gatewayNamespace, "gateway-namespace", "", "The namespace of the Gateway this proxy is serving.")
 
 	logConfig := textlogger.NewConfig()
 	logConfig.AddFlags(flag.CommandLine)
@@ -111,7 +115,9 @@ func run(ctx context.Context) error {
 		Scheme:           mgr.GetScheme(),
 		State:            st,
 		Proxy:            p,
-		SkipStatusUpdate: true,
+		SkipStatusUpdate: false,
+		GatewayName:      gatewayName,
+		GatewayNamespace: gatewayNamespace,
 	}
 
 	if err = (&controller.GatewayReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {

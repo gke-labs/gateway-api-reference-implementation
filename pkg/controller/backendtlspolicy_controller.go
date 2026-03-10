@@ -19,6 +19,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
@@ -44,20 +45,35 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if err := r.Get(ctx, req.NamespacedName, policy); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.State.DeleteBackendTLSPolicy(req.NamespacedName)
-			r.updateProxy()
+			r.UpdateProxy()
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	r.State.UpsertBackendTLSPolicy(policy)
 
-	if r.SkipStatusUpdate {
-		r.updateProxy()
+	if r.Proxy == nil {
+		r.UpdateProxy()
 		return ctrl.Result{}, nil
 	}
 
-	// Find all Gateways that use this policy (via Services referenced in HTTPRoutes)
+	// Gateway mode: Update status for our Gateway and update proxy config
+
+	// Find if our Gateway uses this policy (via Services referenced in HTTPRoutes)
 	gateways := r.State.GetGateways()
+	var ourGateway *state.GatewayState
+	for _, gw := range gateways {
+		if gw.Name == r.GatewayName && gw.Namespace == r.GatewayNamespace {
+			ourGateway = gw
+			break
+		}
+	}
+
+	if ourGateway == nil {
+		// Our gateway not found in state yet, wait for it
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
 	routes := r.State.GetHTTPRoutes()
 	allPolicies := r.State.GetBackendTLSPolicies()
 
@@ -166,126 +182,104 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		acceptedMessage = fmt.Sprintf("Conflicted with older policy: %s", conflictingPolicy)
 	}
 
-	var ancestors []gatewayv1.PolicyAncestorStatus
-
-	for _, gw := range gateways {
-		usesPolicy := false
-		for _, route := range routes {
-			if route.MatchesGateway(gw.Gateway, ControllerName) {
-				for _, rule := range route.Spec.Rules {
-					for _, backendRef := range rule.BackendRefs {
-						if string(state.ValueOf(backendRef.Kind)) == "Service" || state.ValueOf(backendRef.Kind) == "" {
-							ns := route.Namespace
-							if backendRef.Namespace != nil {
-								ns = string(*backendRef.Namespace)
-							}
-
-							for _, targetRef := range policy.Spec.TargetRefs {
-								if ns == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
-									usesPolicy = true
-									break
-								}
-							}
+	usesPolicy := false
+	for _, route := range routes {
+		if route.MatchesGateway(ourGateway.Gateway, ControllerName) {
+			for _, rule := range route.Spec.Rules {
+				for _, backendRef := range rule.BackendRefs {
+					if string(state.ValueOf(backendRef.Kind)) == "Service" || state.ValueOf(backendRef.Kind) == "" {
+						ns := route.Namespace
+						if backendRef.Namespace != nil {
+							ns = string(*backendRef.Namespace)
 						}
-						if usesPolicy {
-							break
+
+						for _, targetRef := range policy.Spec.TargetRefs {
+							if ns == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
+								usesPolicy = true
+								break
+							}
 						}
 					}
 					if usesPolicy {
 						break
 					}
 				}
-			}
-			if usesPolicy {
-				break
-			}
-		}
-
-		if usesPolicy {
-			ancestors = append(ancestors, gatewayv1.PolicyAncestorStatus{
-				AncestorRef: gatewayv1.ParentReference{
-					Group:     state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")),
-					Kind:      state.Ptr(gatewayv1.Kind("Gateway")),
-					Namespace: state.Ptr(gatewayv1.Namespace(gw.Namespace)),
-					Name:      gatewayv1.ObjectName(gw.Name),
-				},
-				ControllerName: gatewayv1.GatewayController(ControllerName),
-				Conditions: []metav1.Condition{
-					{
-						Type:               string(gatewayv1.PolicyConditionAccepted),
-						Status:             acceptedStatus,
-						ObservedGeneration: policy.Generation,
-						LastTransitionTime: metav1.Now(),
-						Reason:             string(acceptedReason),
-						Message:            acceptedMessage,
-					},
-					{
-						Type:               string(gatewayv1.BackendTLSPolicyConditionResolvedRefs),
-						Status:             resolvedRefsStatus,
-						ObservedGeneration: policy.Generation,
-						LastTransitionTime: metav1.Now(),
-						Reason:             string(resolvedRefsReason),
-						Message:            resolvedRefsMessage,
-					},
-				},
-			})
-		}
-	}
-
-	updated := false
-	if len(policy.Status.Ancestors) != len(ancestors) {
-		updated = true
-	} else {
-		for i := range ancestors {
-			if !reflect.DeepEqual(policy.Status.Ancestors[i].AncestorRef, ancestors[i].AncestorRef) ||
-				string(policy.Status.Ancestors[i].ControllerName) != string(ancestors[i].ControllerName) ||
-				len(policy.Status.Ancestors[i].Conditions) != len(ancestors[i].Conditions) {
-				updated = true
-				break
-			}
-			for j := range ancestors[i].Conditions {
-				matched := false
-				for k := range policy.Status.Ancestors[i].Conditions {
-					if policy.Status.Ancestors[i].Conditions[k].Type == ancestors[i].Conditions[j].Type {
-						if policy.Status.Ancestors[i].Conditions[k].Status == ancestors[i].Conditions[j].Status &&
-							policy.Status.Ancestors[i].Conditions[k].ObservedGeneration == ancestors[i].Conditions[j].ObservedGeneration &&
-							policy.Status.Ancestors[i].Conditions[k].Reason == ancestors[i].Conditions[j].Reason &&
-							policy.Status.Ancestors[i].Conditions[k].Message == ancestors[i].Conditions[j].Message {
-							matched = true
-						}
-						break
-					}
-				}
-				if !matched {
-					updated = true
+				if usesPolicy {
 					break
 				}
 			}
-			if updated {
-				break
-			}
+		}
+		if usesPolicy {
+			break
 		}
 	}
 
-	if updated {
-		policy.Status.Ancestors = ancestors
-		if err := r.Status().Update(ctx, policy); err != nil {
-			l.Error(err, "unable to update BackendTLSPolicy status")
-			return ctrl.Result{}, err
+	if usesPolicy {
+		ourAncestorStatus := gatewayv1.PolicyAncestorStatus{
+			AncestorRef: gatewayv1.ParentReference{
+				Group:     state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")),
+				Kind:      state.Ptr(gatewayv1.Kind("Gateway")),
+				Namespace: state.Ptr(gatewayv1.Namespace(ourGateway.Namespace)),
+				Name:      gatewayv1.ObjectName(ourGateway.Name),
+			},
+			ControllerName: gatewayv1.GatewayController(ControllerName),
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(gatewayv1.PolicyConditionAccepted),
+					Status:             acceptedStatus,
+					ObservedGeneration: policy.Generation,
+					LastTransitionTime: metav1.Now(),
+					Reason:             string(acceptedReason),
+					Message:            acceptedMessage,
+				},
+				{
+					Type:               string(gatewayv1.BackendTLSPolicyConditionResolvedRefs),
+					Status:             resolvedRefsStatus,
+					ObservedGeneration: policy.Generation,
+					LastTransitionTime: metav1.Now(),
+					Reason:             string(resolvedRefsReason),
+					Message:            resolvedRefsMessage,
+				},
+			},
+		}
+
+		updated := false
+		newAncestors := make([]gatewayv1.PolicyAncestorStatus, 0, len(policy.Status.Ancestors))
+		found := false
+		for _, a := range policy.Status.Ancestors {
+			if string(a.AncestorRef.Name) == r.GatewayName && (a.AncestorRef.Namespace == nil || string(*a.AncestorRef.Namespace) == r.GatewayNamespace) {
+				if !reflect.DeepEqual(a, ourAncestorStatus) {
+					newAncestors = append(newAncestors, ourAncestorStatus)
+					updated = true
+				} else {
+					newAncestors = append(newAncestors, a)
+				}
+				found = true
+			} else {
+				newAncestors = append(newAncestors, a)
+			}
+		}
+		if !found {
+			newAncestors = append(newAncestors, ourAncestorStatus)
+			updated = true
+		}
+
+		if updated {
+			policy.Status.Ancestors = newAncestors
+			if err := r.Status().Update(ctx, policy); err != nil {
+				l.Error(err, "unable to update BackendTLSPolicy status")
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
 	r.State.UpsertBackendTLSPolicy(policy)
 	_ = caCerts // keep for now
-	r.updateProxy()
+	r.UpdateProxy()
 
 	l.Info("Updated BackendTLSPolicy status and proxy")
 
 	return ctrl.Result{}, nil
-}
-
-func (r *BackendTLSPolicyReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy)
 }
 
 func (r *BackendTLSPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {

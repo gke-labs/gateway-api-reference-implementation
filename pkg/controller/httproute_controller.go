@@ -39,7 +39,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err := r.Get(ctx, req.NamespacedName, route); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.State.DeleteHTTPRoute(req.NamespacedName)
-			r.updateProxy()
+			r.UpdateProxy()
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -47,86 +47,77 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// If the route is not accepted, we still update the state but it won't be used for proxying
 	validationCondition := r.State.UpsertHTTPRoute(route)
 
-	if r.SkipStatusUpdate {
-		r.updateProxy()
+	// In operator mode, we don't update HTTPRoute status.
+	// The gari-gateway instances for each Gateway update their respective status entry.
+	if r.Proxy == nil {
+		r.UpdateProxy()
 		return ctrl.Result{}, nil
 	}
 
-	// Update status
-	// For each parentRef, we should add a ParentStatus
+	// Gateway mode: Update status for our Gateway and update proxy config
 	gateways := r.State.GetGateways()
 	rs := state.HTTPRouteState{HTTPRoute: route}
 
-	var newParents []gatewayv1.RouteParentStatus
+	// We only manage ParentStatus entries that refer to our Gateway
+	var ourParentStatus *gatewayv1.RouteParentStatus
 	for _, parentRef := range route.Spec.ParentRefs {
-		acceptedCondition := validationCondition
-		if acceptedCondition.Status == metav1.ConditionTrue {
-			acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways)
-		}
+		if string(parentRef.Name) == r.GatewayName && (parentRef.Namespace == nil || string(*parentRef.Namespace) == r.GatewayNamespace) {
+			acceptedCondition := validationCondition
+			if acceptedCondition.Status == metav1.ConditionTrue {
+				acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways)
+			}
 
-		newParents = append(newParents, gatewayv1.RouteParentStatus{
-			ParentRef:      parentRef,
-			ControllerName: ControllerName,
-			Conditions: []metav1.Condition{
-				acceptedCondition,
-				rs.ComputeResolvedRefsCondition(),
-			},
-		})
+			ourParentStatus = &gatewayv1.RouteParentStatus{
+				ParentRef:      parentRef,
+				ControllerName: ControllerName,
+				Conditions: []metav1.Condition{
+					acceptedCondition,
+					rs.ComputeResolvedRefsCondition(),
+				},
+			}
+			break
+		}
 	}
 
-	updated := false
-	if len(route.Status.Parents) != len(newParents) {
-		updated = true
-	} else {
-		for i := range newParents {
-			if !reflect.DeepEqual(route.Status.Parents[i].ParentRef, newParents[i].ParentRef) ||
-				string(route.Status.Parents[i].ControllerName) != string(newParents[i].ControllerName) ||
-				len(route.Status.Parents[i].Conditions) != len(newParents[i].Conditions) {
-				updated = true
-				break
-			}
-			for j := range newParents[i].Conditions {
-				matched := false
-				for k := range route.Status.Parents[i].Conditions {
-					if route.Status.Parents[i].Conditions[k].Type == newParents[i].Conditions[j].Type {
-						if route.Status.Parents[i].Conditions[k].Status == newParents[i].Conditions[j].Status &&
-							route.Status.Parents[i].Conditions[k].ObservedGeneration == newParents[i].Conditions[j].ObservedGeneration &&
-							route.Status.Parents[i].Conditions[k].Reason == newParents[i].Conditions[j].Reason &&
-							route.Status.Parents[i].Conditions[k].Message == newParents[i].Conditions[j].Message {
-							matched = true
-						}
-						break
-					}
-				}
-				if !matched {
+	if ourParentStatus != nil {
+		// Update the status by merging our entry with existing ones
+		updated := false
+		newParents := make([]gatewayv1.RouteParentStatus, 0, len(route.Status.Parents))
+		found := false
+		for _, p := range route.Status.Parents {
+			if string(p.ParentRef.Name) == r.GatewayName && (p.ParentRef.Namespace == nil || string(*p.ParentRef.Namespace) == r.GatewayNamespace) {
+				if !reflect.DeepEqual(p, *ourParentStatus) {
+					newParents = append(newParents, *ourParentStatus)
 					updated = true
-					break
+				} else {
+					newParents = append(newParents, p)
 				}
-			}
-			if updated {
-				break
+				found = true
+			} else {
+				newParents = append(newParents, p)
 			}
 		}
-	}
+		if !found {
+			newParents = append(newParents, *ourParentStatus)
+			updated = true
+		}
 
-	if updated {
-		route.Status.Parents = newParents
-		if err := r.Status().Update(ctx, route); err != nil {
-			l.Error(err, "unable to update HTTPRoute status")
-			return ctrl.Result{}, err
+		if updated {
+			// Using Update for now as in the rest of the project, but merging manually to avoid clobbering
+			route.Status.Parents = newParents
+			if err := r.Status().Update(ctx, route); err != nil {
+				l.Error(err, "unable to update HTTPRoute status")
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
 	r.State.UpsertHTTPRoute(route)
-	r.updateProxy()
+	r.UpdateProxy()
 
 	l.Info("Updated HTTPRoute status and proxy")
 
 	return ctrl.Result{}, nil
-}
-
-func (r *HTTPRouteReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy)
 }
 
 func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {

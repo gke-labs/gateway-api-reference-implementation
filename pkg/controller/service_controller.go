@@ -35,21 +35,17 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.Get(ctx, req.NamespacedName, svc); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.State.DeleteService(req.NamespacedName)
-			r.updateProxy()
+			r.UpdateProxy()
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	r.State.UpsertService(svc)
-	r.updateProxy()
+	r.UpdateProxy()
 
 	l.Info("Updated Service and proxy")
 
 	return ctrl.Result{}, nil
-}
-
-func (r *ServiceReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy)
 }
 
 func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {

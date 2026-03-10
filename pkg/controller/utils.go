@@ -27,21 +27,31 @@ type GatewayControllerOptions struct {
 	State            *state.State
 	Proxy            *proxy.Proxy
 	SkipStatusUpdate bool
+
+	GatewayName      string
+	GatewayNamespace string
 }
 
-func updateProxy(st *state.State, p *proxy.Proxy) {
-	if p == nil {
+func (o *GatewayControllerOptions) UpdateProxy() {
+	if o.Proxy == nil {
 		return
 	}
-	gateways := st.GetGateways()
-	routes := st.GetHTTPRoutes()
-	services := st.GetServices()
-	backendTLSPolicies := st.GetBackendTLSPolicies()
-	configMaps := st.GetConfigMaps()
+	gateways := o.State.GetGateways()
+	routes := o.State.GetHTTPRoutes()
+	services := o.State.GetServices()
+	backendTLSPolicies := o.State.GetBackendTLSPolicies()
+	configMaps := o.State.GetConfigMaps()
 
 	var proxyRoutes []state.InternalRoute
 	for _, gw := range gateways {
+		// If GatewayName is set, only build routes for that gateway
+		if o.GatewayName != "" && gw.Name != o.GatewayName {
+			continue
+		}
+		if o.GatewayNamespace != "" && gw.Namespace != o.GatewayNamespace {
+			continue
+		}
 		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, ControllerName)...)
 	}
-	p.UpdateRoutes(proxyRoutes)
+	o.Proxy.UpdateRoutes(proxyRoutes)
 }

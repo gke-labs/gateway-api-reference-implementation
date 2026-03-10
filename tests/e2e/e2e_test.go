@@ -52,7 +52,7 @@ func TestGatewayAPI(t *testing.T) {
 	clientPodName := "test-client"
 	h.DeletePod(clientPodName)
 
-	h.KubectlApplyContent(h.ClientManifest("http://gari-proxy", "example.com"))
+	h.KubectlApplyContent(h.ClientManifest("http://gari-reference-gateway", "example.com"))
 	h.WaitForPodSuccess(clientPodName, 1*time.Minute)
 
 	logs := h.GetPodLogs(clientPodName)
