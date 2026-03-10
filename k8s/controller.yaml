@@ -34,7 +34,7 @@ metadata:
   name: gari-gateway
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes", "gateways", "backendtlspolicies"]
+  resources: ["httproutes", "gateways", "backendtlspolicies", "gatewayclasses"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "httproutes/status", "backendtlspolicies/status"]
