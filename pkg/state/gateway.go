@@ -15,6 +15,7 @@
 package state
 
 import (
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -62,8 +63,8 @@ type InternalRoute struct {
 }
 
 type InternalFrontendTLSConfig struct {
-	CACerts [][]byte
-	Mode    gatewayv1.FrontendValidationModeType
+	ClientCAs *x509.CertPool
+	Mode      gatewayv1.FrontendValidationModeType
 }
 
 func (ir *InternalRoute) MatchHostname(host string) bool {
@@ -397,7 +398,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				}
 
 				if validation != nil {
-					var caCerts [][]byte
+					clientCAs := x509.NewCertPool()
 					invalidRef := false
 					for _, caRef := range validation.CACertificateRefs {
 						if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
@@ -413,9 +414,9 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							cmName := types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}
 							if cm, ok := configMaps[cmName]; ok {
 								if data, ok := cm.Data["ca.crt"]; ok {
-									caCerts = append(caCerts, []byte(data))
+									clientCAs.AppendCertsFromPEM([]byte(data))
 								} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-									caCerts = append(caCerts, data)
+									clientCAs.AppendCertsFromPEM(data)
 								} else {
 									invalidRef = true
 									break
@@ -430,14 +431,19 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						}
 					}
 					if invalidRef {
-						continue // Skip creating frontend TLS config for invalid references
-					}
-					frontendTLSConfig = &InternalFrontendTLSConfig{
-						CACerts: caCerts,
-						Mode:    validation.Mode,
-					}
-					if frontendTLSConfig.Mode == "" {
-						frontendTLSConfig.Mode = gatewayv1.AllowValidOnly
+						// Fail closed on invalid refs
+						frontendTLSConfig = &InternalFrontendTLSConfig{
+							ClientCAs: x509.NewCertPool(),
+							Mode:      gatewayv1.AllowValidOnly,
+						}
+					} else {
+						frontendTLSConfig = &InternalFrontendTLSConfig{
+							ClientCAs: clientCAs,
+							Mode:      validation.Mode,
+						}
+						if frontendTLSConfig.Mode == "" {
+							frontendTLSConfig.Mode = gatewayv1.AllowValidOnly
+						}
 					}
 				}
 			}

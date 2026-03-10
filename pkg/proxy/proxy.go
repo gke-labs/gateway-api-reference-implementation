@@ -101,10 +101,6 @@ func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, err
 
 	for i := range routes {
 		route := &routes[i]
-		if route.TLSConfig == nil {
-			continue // We only care about routes that configure TLS
-		}
-
 		score := getHostnameMatchSpecificity(route.Hostnames, hello.ServerName)
 		if score > 0 && score > bestScore {
 			bestScore = score
@@ -118,15 +114,7 @@ func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, err
 		conf := &tls.Config{
 			Certificates: defaultCerts,
 			NextProtos:   []string{"h2", "http/1.1"},
-		}
-
-		if len(bestRoute.TLSConfig.CACerts) > 0 {
-			conf.ClientCAs = x509.NewCertPool()
-			for _, cert := range bestRoute.TLSConfig.CACerts {
-				if ok := conf.ClientCAs.AppendCertsFromPEM(cert); !ok {
-					log.Log.Error(nil, "failed to parse CA certificate from PEM")
-				}
-			}
+			ClientCAs:    bestRoute.TLSConfig.ClientCAs,
 		}
 
 		switch bestRoute.TLSConfig.Mode {
@@ -141,7 +129,6 @@ func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, err
 		default:
 			conf.ClientAuth = tls.RequireAndVerifyClientCert
 		}
-
 		return conf, nil
 	}
 
@@ -255,6 +242,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		originalDirector(req)
 		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 			req.Header.Set("X-Forwarded-Client-Cert", base64.StdEncoding.EncodeToString(r.TLS.PeerCertificates[0].Raw))
+		} else {
+			req.Header.Del("X-Forwarded-Client-Cert")
 		}
 	}
 

@@ -231,93 +231,103 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		programmedCondition := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionProgrammed),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonProgrammed),
+			Message:            "Listener programmed",
+		}
+
+		acceptedCondition := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionAccepted),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonAccepted),
+			Message:            "Listener accepted",
+		}
+
+		resolvedRefsCondition := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+			Message:            "All references resolved",
+		}
+
+		if listener.Protocol == gatewayv1.HTTPSProtocolType && gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+			var validation *gatewayv1.FrontendTLSValidation
+			foundPerPort := false
+			for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+				if int32(pp.Port) == int32(listener.Port) {
+					validation = pp.TLS.Validation
+					foundPerPort = true
+					break
+				}
+			}
+			if !foundPerPort && gw.Spec.TLS.Frontend.Default.Validation != nil {
+				validation = gw.Spec.TLS.Frontend.Default.Validation
+			}
+
+			if validation != nil {
+				for _, caRef := range validation.CACertificateRefs {
+					if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+						ns := gw.Namespace
+						if caRef.Namespace != nil {
+							ns = string(*caRef.Namespace)
+						}
+						if ns != gw.Namespace {
+							resolvedRefsCondition.Status = metav1.ConditionFalse
+							resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
+							resolvedRefsCondition.Message = "Cross-namespace references are not permitted without ReferenceGrant"
+							break
+						}
+
+						cmName := types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}
+						if cm, ok := configMaps[cmName]; ok {
+							if _, ok := cm.Data["ca.crt"]; ok {
+								// Found in Data
+							} else if _, ok := cm.BinaryData["ca.crt"]; ok {
+								// Found in BinaryData
+							} else {
+								resolvedRefsCondition.Status = metav1.ConditionFalse
+								resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+								resolvedRefsCondition.Message = "Missing ca.crt in ConfigMap"
+								break
+							}
+						} else {
+							resolvedRefsCondition.Status = metav1.ConditionFalse
+							resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+							resolvedRefsCondition.Message = "ConfigMap not found"
+							break
+						}
+					} else {
+						resolvedRefsCondition.Status = metav1.ConditionFalse
+						resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateKind)
+						resolvedRefsCondition.Message = "Unsupported CACertificateRef Group/Kind"
+						break
+					}
+				}
+
+				if resolvedRefsCondition.Status == metav1.ConditionFalse {
+					acceptedCondition.Status = metav1.ConditionFalse
+					acceptedCondition.Reason = string(gatewayv1.ListenerReasonNoValidCACertificate)
+					if resolvedRefsCondition.Reason == string(gatewayv1.ListenerReasonInvalidCACertificateKind) {
+						acceptedCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateKind)
+					}
+					acceptedCondition.Message = "Invalid CA Certificate Reference"
+				}
+			}
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
 			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
 			AttachedRoutes: int32(attachedRoutes),
-			Conditions: []metav1.Condition{
-				{
-					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonProgrammed),
-					Message:            "Listener programmed",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionAccepted),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonAccepted),
-					Message:            "Listener accepted",
-				},
-				func() metav1.Condition {
-					resolvedRefsCondition := metav1.Condition{
-						Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-						Status:             metav1.ConditionTrue,
-						ObservedGeneration: gw.Generation,
-						LastTransitionTime: metav1.Now(),
-						Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-						Message:            "All references resolved",
-					}
-
-					if listener.Protocol == gatewayv1.HTTPSProtocolType && gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
-						var validation *gatewayv1.FrontendTLSValidation
-						foundPerPort := false
-						for _, pp := range gw.Spec.TLS.Frontend.PerPort {
-							if int32(pp.Port) == int32(listener.Port) {
-								validation = pp.TLS.Validation
-								foundPerPort = true
-								break
-							}
-						}
-						if !foundPerPort && gw.Spec.TLS.Frontend.Default.Validation != nil {
-							validation = gw.Spec.TLS.Frontend.Default.Validation
-						}
-
-						if validation != nil {
-							for _, caRef := range validation.CACertificateRefs {
-								if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-									ns := gw.Namespace
-									if caRef.Namespace != nil {
-										ns = string(*caRef.Namespace)
-									}
-									if ns != gw.Namespace {
-										resolvedRefsCondition.Status = metav1.ConditionFalse
-										resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
-										resolvedRefsCondition.Message = "Cross-namespace references are not permitted without ReferenceGrant"
-										break
-									}
-
-									cmName := types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}
-									if cm, ok := configMaps[cmName]; ok {
-										if _, ok := cm.Data["ca.crt"]; !ok {
-											if _, ok := cm.BinaryData["ca.crt"]; !ok {
-												resolvedRefsCondition.Status = metav1.ConditionFalse
-												resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
-												resolvedRefsCondition.Message = "Missing ca.crt in ConfigMap"
-												break
-											}
-										}
-									} else {
-										resolvedRefsCondition.Status = metav1.ConditionFalse
-										resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
-										resolvedRefsCondition.Message = "ConfigMap not found"
-										break
-									}
-								} else {
-									resolvedRefsCondition.Status = metav1.ConditionFalse
-									resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
-									resolvedRefsCondition.Message = "Unsupported CACertificateRef Group/Kind"
-									break
-								}
-							}
-						}
-					}
-					return resolvedRefsCondition
-				}(),
-			},
+			Conditions:     []metav1.Condition{programmedCondition, acceptedCondition, resolvedRefsCondition},
 		})
 	}
 
@@ -414,6 +424,23 @@ func (r *GatewayReconciler) updateProxy() {
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// Find all Gateways and enqueue them
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: gw.Namespace,
+						Name:      gw.Name,
+					},
+				})
+			}
+			return requests
+		})).
 		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			// When an HTTPRoute changes, reconcile all Gateways it references
 			route := obj.(*gatewayv1.HTTPRoute)
