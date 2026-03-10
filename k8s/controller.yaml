@@ -21,9 +21,27 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterrolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status"]
   verbs: ["update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gari-gateway
+rules:
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["httproutes", "gateways", "backendtlspolicies"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gateways/status", "httproutes/status", "backendtlspolicies/status"]
+  verbs: ["update", "patch"]
+- apiGroups: [""]
+  resources: ["services", "configmaps"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
