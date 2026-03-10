@@ -36,11 +36,7 @@ import (
 )
 
 type BackendTLSPolicyReconciler struct {
-	client.Client
-	Scheme           *runtime.Scheme
-	State            *state.State
-	Proxy            *proxy.Proxy
-	SkipStatusUpdate bool
+	GatewayControllerOptions
 }
 
 func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

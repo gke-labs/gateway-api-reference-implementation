@@ -31,10 +31,7 @@ import (
 )
 
 type ConfigMapReconciler struct {
-	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	GatewayControllerOptions
 }
 
 func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

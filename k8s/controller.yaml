@@ -68,26 +68,8 @@ spec:
         env:
         - name: CONTROLLER_IMAGE
           value: gari-controller:e2e
-        args: ["--proxy-bind-address", ":8000"]
         ports:
-        - containerPort: 8000
-          name: proxy
-        - containerPort: 8443
-          name: proxy-https
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: gari-proxy
-  namespace: default
-spec:
-  type: LoadBalancer
-  selector:
-    app: gari-controller
-  ports:
-  - port: 80
-    targetPort: 8000
-    name: http
-  - port: 443
-    targetPort: 8443
-    name: https
+        - containerPort: 8080
+          name: metrics
+        - containerPort: 8081
+          name: health

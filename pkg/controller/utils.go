@@ -17,9 +17,22 @@ package controller
 import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+type GatewayControllerOptions struct {
+	client.Client
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	SkipStatusUpdate bool
+}
+
 func updateProxy(st *state.State, p *proxy.Proxy) {
+	if p == nil {
+		return
+	}
 	gateways := st.GetGateways()
 	routes := st.GetHTTPRoutes()
 	services := st.GetServices()

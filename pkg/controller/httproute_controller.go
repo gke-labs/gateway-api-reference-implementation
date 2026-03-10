@@ -31,11 +31,7 @@ import (
 )
 
 type HTTPRouteReconciler struct {
-	client.Client
-	Scheme           *runtime.Scheme
-	State            *state.State
-	Proxy            *proxy.Proxy
-	SkipStatusUpdate bool
+	GatewayControllerOptions
 }
 
 func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

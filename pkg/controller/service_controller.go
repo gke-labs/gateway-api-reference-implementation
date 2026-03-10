@@ -28,10 +28,7 @@ import (
 )
 
 type ServiceReconciler struct {
-	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	GatewayControllerOptions
 }
 
 func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

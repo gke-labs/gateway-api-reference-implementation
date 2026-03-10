@@ -39,9 +39,7 @@ import (
 )
 
 type GatewayClassReconciler struct {
-	client.Client
-	Scheme           *runtime.Scheme
-	SkipStatusUpdate bool
+	GatewayControllerOptions
 }
 
 func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -116,11 +114,7 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 type GatewayReconciler struct {
-	client.Client
-	Scheme           *runtime.Scheme
-	State            *state.State
-	Proxy            *proxy.Proxy
-	SkipStatusUpdate bool
+	GatewayControllerOptions
 }
 
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -408,7 +402,8 @@ func (r *GatewayReconciler) syncInfrastructure(ctx context.Context, gw *gatewayv
 				Name:            "proxy",
 				Image:           image,
 				ImagePullPolicy: corev1.PullNever,
-				Args:            []string{"--proxy-only", "--enable-h2c"},
+				Command:         []string{"/gari-gateway"},
+				Args:            []string{"--enable-h2c"},
 				Ports: []corev1.ContainerPort{
 					{Name: "http", ContainerPort: 8000},
 					{Name: "https", ContainerPort: 8443},
