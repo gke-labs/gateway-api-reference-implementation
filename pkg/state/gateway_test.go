@@ -723,6 +723,15 @@ func TestBuildInternalRoutes(t *testing.T) {
 	}
 
 	for _, tt := range tests {
+		for _, r := range tt.routes {
+			if r != nil && r.HTTPRoute != nil {
+				var h []string
+				for _, sn := range r.Spec.Hostnames {
+					h = append(h, string(sn))
+				}
+				r.hostnames = h
+			}
+		}
 		t.Run(tt.name, func(t *testing.T) {
 			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
 			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))

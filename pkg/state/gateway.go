@@ -35,7 +35,7 @@ type GatewayState struct {
 func (s *GatewayState) GetHTTPRoutes(allRoutes []*HTTPRouteState, controllerName string) []*HTTPRouteState {
 	var matches []*HTTPRouteState
 	for _, route := range allRoutes {
-		if route.MatchesGateway(s.Gateway, controllerName) {
+		if route.MatchesGateway(s) {
 			matches = append(matches, route)
 		}
 	}
@@ -45,7 +45,7 @@ func (s *GatewayState) GetHTTPRoutes(allRoutes []*HTTPRouteState, controllerName
 func (s *GatewayState) GetGRPCRoutes(allRoutes []*GRPCRouteState, controllerName string) []*GRPCRouteState {
 	var matches []*GRPCRouteState
 	for _, route := range allRoutes {
-		if route.MatchesGateway(s.Gateway, controllerName) {
+		if route.MatchesGateway(s) {
 			matches = append(matches, route)
 		}
 	}
@@ -53,11 +53,7 @@ func (s *GatewayState) GetGRPCRoutes(allRoutes []*GRPCRouteState, controllerName
 }
 
 func (s *HTTPRouteState) GetHostnames() []string {
-	var hostnames []string
-	for _, h := range s.Spec.Hostnames {
-		hostnames = append(hostnames, string(h))
-	}
-	return hostnames
+	return s.hostnames
 }
 
 func (s *HTTPRouteState) GetNamespace() string {
@@ -65,11 +61,7 @@ func (s *HTTPRouteState) GetNamespace() string {
 }
 
 func (s *GRPCRouteState) GetHostnames() []string {
-	var hostnames []string
-	for _, h := range s.Spec.Hostnames {
-		hostnames = append(hostnames, string(h))
-	}
-	return hostnames
+	return s.hostnames
 }
 
 func (s *GRPCRouteState) GetNamespace() string {

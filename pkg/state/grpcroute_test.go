@@ -76,7 +76,14 @@ func TestGRPCRouteComputeAcceptedCondition(t *testing.T) {
 					Hostnames: tt.routeHostnames,
 				},
 			}
-			s := &GRPCRouteState{GRPCRoute: route}
+			s := NewGRPCRouteState(route)
+		if s != nil && s.GRPCRoute != nil {
+			var h []string
+			for _, sn := range s.Spec.Hostnames {
+				h = append(h, string(sn))
+			}
+			s.hostnames = h
+		}
 			gw := &GatewayState{
 				Gateway: &gatewayv1.Gateway{
 					ObjectMeta: metav1.ObjectMeta{

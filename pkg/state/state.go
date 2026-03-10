@@ -109,10 +109,19 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 	delete(s.gateways, name)
 }
 
-func (s *State) UpsertHTTPRoute(route *gatewayv1.HTTPRoute) metav1.Condition {
-	rs := &HTTPRouteState{
-		HTTPRoute: route,
+func NewHTTPRouteState(route *gatewayv1.HTTPRoute) *HTTPRouteState {
+	var hostnames []string
+	for _, h := range route.Spec.Hostnames {
+		hostnames = append(hostnames, string(h))
 	}
+	return &HTTPRouteState{
+		HTTPRoute: route,
+		hostnames: hostnames,
+	}
+}
+
+func (s *State) UpsertHTTPRoute(route *gatewayv1.HTTPRoute) metav1.Condition {
+	rs := NewHTTPRouteState(route)
 
 	status := metav1.ConditionTrue
 	reason := gatewayv1.RouteReasonAccepted
@@ -146,10 +155,19 @@ func (s *State) DeleteHTTPRoute(name types.NamespacedName) {
 	delete(s.httpRoutes, name)
 }
 
-func (s *State) UpsertGRPCRoute(route *gatewayv1.GRPCRoute) metav1.Condition {
-	rs := &GRPCRouteState{
-		GRPCRoute: route,
+func NewGRPCRouteState(route *gatewayv1.GRPCRoute) *GRPCRouteState {
+	var hostnames []string
+	for _, h := range route.Spec.Hostnames {
+		hostnames = append(hostnames, string(h))
 	}
+	return &GRPCRouteState{
+		GRPCRoute: route,
+		hostnames: hostnames,
+	}
+}
+
+func (s *State) UpsertGRPCRoute(route *gatewayv1.GRPCRoute) metav1.Condition {
+	rs := NewGRPCRouteState(route)
 
 	status := metav1.ConditionTrue
 	reason := gatewayv1.RouteReasonAccepted
