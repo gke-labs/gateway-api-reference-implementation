@@ -222,21 +222,23 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			var validation *gatewayv1.FrontendTLSValidation
 
 			// 1. Check for per-port override
+			hasPerPortOverride := false
 			if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
-				for _, pp := range gw.Spec.TLS.Frontend.PerPort {
-					if pp.Port == listener.Port {
-						validation = pp.TLS.Validation
-						break
-					}
-				}
+			        for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+			                if pp.Port == listener.Port {
+			                        validation = pp.TLS.Validation
+			                        hasPerPortOverride = true
+			                        break
+			                }
+			        }
 
-				// 2. If no per-port override, use default
-				if validation == nil {
-					validation = gw.Spec.TLS.Frontend.Default.Validation
-				}
+			        // 2. If no per-port override, use default
+			        if !hasPerPortOverride {
+			                validation = gw.Spec.TLS.Frontend.Default.Validation
+			        }
 			}
-
 			if validation != nil {
+				validCACerts := 0
 				for _, caRef := range validation.CACertificateRefs {
 					ns := gw.Namespace
 					if caRef.Namespace != nil {
@@ -245,15 +247,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 					if caRef.Kind != "ConfigMap" || (caRef.Group != "" && caRef.Group != "core" && caRef.Group != "gateway.networking.k8s.io") {
 						resolvedRefsCond.Status = metav1.ConditionFalse
-						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateKind)
 						resolvedRefsCond.Message = "Unsupported CA certificate ref kind/group"
-
-						acceptedCond.Status = metav1.ConditionFalse
-						acceptedCond.Reason = string(gatewayv1.ListenerReasonNoValidCACertificate)
-
-						programmedCond.Status = metav1.ConditionFalse
-						programmedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
-						break
+						continue
 					}
 
 					cm := &corev1.ConfigMap{}
@@ -262,16 +258,28 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 							resolvedRefsCond.Status = metav1.ConditionFalse
 							resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
 							resolvedRefsCond.Message = "CA certificate ConfigMap not found"
-
-							acceptedCond.Status = metav1.ConditionFalse
-							acceptedCond.Reason = string(gatewayv1.ListenerReasonNoValidCACertificate)
-
-							programmedCond.Status = metav1.ConditionFalse
-							programmedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
-							break
 						}
-						// For other errors, we don't set conditions yet, but ideally we should
+						continue
 					}
+
+					if _, hasData := cm.Data["ca.crt"]; !hasData {
+						if _, hasBinData := cm.BinaryData["ca.crt"]; !hasBinData {
+							resolvedRefsCond.Status = metav1.ConditionFalse
+							resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+							resolvedRefsCond.Message = "CA certificate ConfigMap missing ca.crt key"
+							continue
+						}
+					}
+
+					validCACerts++
+				}
+
+				if validCACerts == 0 && len(validation.CACertificateRefs) > 0 {
+					acceptedCond.Status = metav1.ConditionFalse
+					acceptedCond.Reason = string(gatewayv1.ListenerReasonNoValidCACertificate)
+
+					programmedCond.Status = metav1.ConditionFalse
+					programmedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
 				}
 			}
 		}
@@ -395,20 +403,57 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return requests
 		})).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			// When a ConfigMap changes, reconcile all Gateways in the same namespace
-			// (Simplified for reference implementation)
+			// When a ConfigMap changes, check if any Gateway references it
 			var gateways gatewayv1.GatewayList
 			if err := r.List(ctx, &gateways, client.InNamespace(obj.GetNamespace())); err != nil {
 				return nil
 			}
 			var requests []ctrl.Request
 			for _, gw := range gateways.Items {
-				requests = append(requests, ctrl.Request{
-					NamespacedName: types.NamespacedName{
-						Namespace: gw.Namespace,
-						Name:      gw.Name,
-					},
-				})
+				referenced := false
+				for _, listener := range gw.Spec.Listeners {
+					if listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
+						if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+							var validations []*gatewayv1.FrontendTLSValidation
+							for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+								if pp.TLS.Validation != nil {
+									validations = append(validations, pp.TLS.Validation)
+								}
+							}
+							if gw.Spec.TLS.Frontend.Default.Validation != nil {
+								validations = append(validations, gw.Spec.TLS.Frontend.Default.Validation)
+							}
+							for _, validation := range validations {
+								for _, caRef := range validation.CACertificateRefs {
+									if caRef.Kind == "ConfigMap" && string(caRef.Name) == obj.GetName() {
+										ns := gw.Namespace
+										if caRef.Namespace != nil {
+											ns = string(*caRef.Namespace)
+										}
+										if ns == obj.GetNamespace() {
+											referenced = true
+											break
+										}
+									}
+								}
+								if referenced {
+									break
+								}
+							}
+						}
+					}
+					if referenced {
+						break
+					}
+				}
+				if referenced {
+					requests = append(requests, ctrl.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: gw.Namespace,
+							Name:      gw.Name,
+						},
+					})
+				}
 			}
 			return requests
 		})).

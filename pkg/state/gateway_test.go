@@ -821,7 +821,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 								Condition: metav1.Condition{
 									Type:   string(gatewayv1.ListenerConditionResolvedRefs),
 									Status: metav1.ConditionFalse,
-									Reason: "InvalidCACertificateRef",
+									Reason: string(gatewayv1.ListenerReasonInvalidCACertificateRef),
 								},
 								HTTPStatusCode: http.StatusForbidden,
 								HTTPMessage:    "CA certificate ConfigMap not found",
