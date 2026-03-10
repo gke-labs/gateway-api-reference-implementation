@@ -15,10 +15,12 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -70,12 +72,74 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if bestRule.Backend != nil {
+			if len(bestRule.Mirrors) > 0 {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					log.Log.Error(err, "Error reading request body for mirroring")
+				} else {
+					r.Body = io.NopCloser(bytes.NewBuffer(body))
+					for _, mirror := range bestRule.Mirrors {
+						mReq := r.Clone(context.Background())
+						mReq.Body = io.NopCloser(bytes.NewBuffer(body))
+						go p.mirror(mReq, *mirror)
+					}
+				}
+			}
 			p.forward(w, r, *bestRule.Backend)
 			return
 		}
 	}
 
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+}
+
+func (p *Proxy) mirror(req *http.Request, backend state.InternalBackend) {
+	scheme := "http"
+	if state.ValueOf(backend.AppProtocol) == "https" {
+		scheme = "https"
+	}
+
+	target := &url.URL{
+		Scheme: scheme,
+		Host:   fmt.Sprintf("%s:%d", backend.Host, backend.Port),
+		Path:   req.URL.Path,
+	}
+
+	req.URL.Scheme = target.Scheme
+	req.URL.Host = target.Host
+	req.Host = target.Host
+	req.RequestURI = "" // RequestURI must be empty for client requests
+
+	client := &http.Client{}
+	if scheme == "https" {
+		tlsConfig := &tls.Config{InsecureSkipVerify: false}
+		if backend.TLSConfig != nil {
+			if backend.TLSConfig.Hostname != "" {
+				tlsConfig.ServerName = backend.TLSConfig.Hostname
+			}
+			if len(backend.TLSConfig.CACerts) > 0 {
+				tlsConfig.RootCAs = x509.NewCertPool()
+				for _, cert := range backend.TLSConfig.CACerts {
+					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
+				}
+			} else {
+				tlsConfig.InsecureSkipVerify = true
+			}
+		} else {
+			tlsConfig.InsecureSkipVerify = true
+		}
+		client.Transport = &http.Transport{
+			TLSClientConfig: tlsConfig,
+		}
+	}
+
+	log.Log.Info("Mirroring request", "host", req.Host, "path", req.URL.Path, "target", target.String())
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Log.Error(err, "Error mirroring request", "target", target.String())
+		return
+	}
+	defer resp.Body.Close()
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {

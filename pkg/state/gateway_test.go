@@ -810,3 +810,125 @@ func TestMatchRoute_Method(t *testing.T) {
 		})
 	}
 }
+func TestBuildInternalRoutes_Mirror(t *testing.T) {
+	controllerName := "test-controller"
+
+	gateway := &GatewayState{
+		Gateway: &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "reference-gateway",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.GatewaySpec{
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "http",
+						Protocol: gatewayv1.HTTPProtocolType,
+					},
+				},
+			},
+		},
+	}
+
+	routes := []*HTTPRouteState{
+		{
+			HTTPRoute: &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "route-mirror",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{
+							{
+								Name: "reference-gateway",
+							},
+						},
+					},
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							BackendRefs: []gatewayv1.HTTPBackendRef{
+								{
+									BackendRef: gatewayv1.BackendRef{
+										BackendObjectReference: gatewayv1.BackendObjectReference{
+											Name: "primary-svc",
+											Port: Ptr(gatewayv1.PortNumber(80)),
+										},
+									},
+								},
+							},
+							Filters: []gatewayv1.HTTPRouteFilter{
+								{
+									Type: gatewayv1.HTTPRouteFilterRequestMirror,
+									RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Name: "mirror-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				Status: gatewayv1.HTTPRouteStatus{
+					RouteStatus: gatewayv1.RouteStatus{
+						Parents: []gatewayv1.RouteParentStatus{
+							{
+								ParentRef: gatewayv1.ParentReference{
+									Name: "reference-gateway",
+								},
+								ControllerName: gatewayv1.GatewayController(controllerName),
+								Conditions: []metav1.Condition{
+									{
+										Type:   string(gatewayv1.RouteConditionAccepted),
+										Status: metav1.ConditionTrue,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "primary-svc"}: {
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{{Port: 80}},
+			},
+		},
+		{Namespace: "default", Name: "mirror-svc"}: {
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{{Port: 8080}},
+			},
+		},
+	}
+
+	expected := []InternalRoute{
+		{
+			Hostnames: []string{"*"},
+			Rules: []InternalRule{
+				{
+					Backend: &InternalBackend{
+						Host: "primary-svc.default.svc.cluster.local",
+						Port: 80,
+					},
+					Mirrors: []*InternalBackend{
+						{
+							Host: "mirror-svc.default.svc.cluster.local",
+							Port: 8080,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	actual := gateway.BuildInternalRoutes(routes, services, nil, nil, controllerName)
+
+	if diff := cmp.Diff(expected, actual); diff != "" {
+		t.Errorf("BuildInternalRoutes() mismatch (-expected +actual):\n%s", diff)
+	}
+}
