@@ -91,7 +91,7 @@ func (p *Proxy) pickBackend(backends []state.InternalWeightedBackend) state.Inte
 	}
 
 	if totalWeight == 0 {
-		// If all weights are 0, we can pick any (e.g. the first one) 
+		// If all weights are 0, we can pick any (e.g. the first one)
 		// or return an error. For reference implementation, we pick the first one.
 		return backends[0].InternalBackend
 	}
