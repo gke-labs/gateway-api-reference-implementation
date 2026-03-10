@@ -17,6 +17,7 @@ package controller
 import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -54,4 +55,33 @@ func (o *GatewayControllerOptions) UpdateProxy() {
 		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, ControllerName)...)
 	}
 	o.Proxy.UpdateRoutes(proxyRoutes)
+}
+
+func hasCondition(conditions []metav1.Condition, target metav1.Condition) bool {
+	for _, c := range conditions {
+		if c.Type == target.Type && c.Status == target.Status && c.Reason == target.Reason && c.ObservedGeneration == target.ObservedGeneration {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeConditions(existing []metav1.Condition, newConds []metav1.Condition) []metav1.Condition {
+	res := make([]metav1.Condition, len(existing))
+	copy(res, existing)
+
+	for _, n := range newConds {
+		found := false
+		for i, e := range res {
+			if e.Type == n.Type {
+				res[i] = n
+				found = true
+				break
+			}
+		}
+		if !found {
+			res = append(res, n)
+		}
+	}
+	return res
 }

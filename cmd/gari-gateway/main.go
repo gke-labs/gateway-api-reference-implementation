@@ -120,8 +120,8 @@ func run(ctx context.Context) error {
 		GatewayNamespace: gatewayNamespace,
 	}
 
-	if err = (&controller.GatewayReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating Gateway controller: %w", err)
+	if err = (&controller.GatewayProxyReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Gateway proxy controller: %w", err)
 	}
 
 	if err = (&controller.HTTPRouteReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {

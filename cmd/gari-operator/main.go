@@ -102,8 +102,8 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("error creating GatewayClass controller: %w", err)
 	}
 
-	if err = (&controller.GatewayReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating Gateway controller: %w", err)
+	if err = (&controller.GatewayOperatorReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Gateway operator controller: %w", err)
 	}
 
 	setupLog.Info("starting operator manager")
