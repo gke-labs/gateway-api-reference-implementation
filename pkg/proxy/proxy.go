@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"golang.org/x/net/http2"
@@ -36,8 +37,9 @@ import (
 
 // Proxy is a minimal implementation of a Gateway API proxy.
 type Proxy struct {
-	mu     sync.RWMutex
-	routes []state.InternalRoute
+	mu            sync.RWMutex
+	routes        []state.InternalRoute
+	mirrorClients sync.Map
 }
 
 func NewProxy() *Proxy {
@@ -73,16 +75,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if bestRule.Backend != nil {
 			if len(bestRule.Mirrors) > 0 {
+				r.Body = http.MaxBytesReader(w, r.Body, 1*1024*1024) // 1MB limit for mirroring
 				body, err := io.ReadAll(r.Body)
 				if err != nil {
 					log.Log.Error(err, "Error reading request body for mirroring")
-				} else {
-					r.Body = io.NopCloser(bytes.NewBuffer(body))
-					for _, mirror := range bestRule.Mirrors {
-						mReq := r.Clone(context.Background())
-						mReq.Body = io.NopCloser(bytes.NewBuffer(body))
-						go p.mirror(mReq, *mirror)
+					if err.Error() == "http: request body too large" {
+						http.Error(w, "Request body too large for mirroring", http.StatusRequestEntityTooLarge)
+					} else {
+						http.Error(w, "Error reading request body", http.StatusInternalServerError)
 					}
+					return
+				}
+				r.Body = io.NopCloser(bytes.NewBuffer(body))
+				for _, mirror := range bestRule.Mirrors {
+					mReq := r.Clone(context.WithoutCancel(r.Context()))
+					mReq.Body = io.NopCloser(bytes.NewBuffer(body))
+					go p.mirror(mReq, *mirror)
 				}
 			}
 			p.forward(w, r, *bestRule.Backend)
@@ -110,36 +118,50 @@ func (p *Proxy) mirror(req *http.Request, backend state.InternalBackend) {
 	req.Host = target.Host
 	req.RequestURI = "" // RequestURI must be empty for client requests
 
-	client := &http.Client{}
-	if scheme == "https" {
-		tlsConfig := &tls.Config{InsecureSkipVerify: false}
-		if backend.TLSConfig != nil {
-			if backend.TLSConfig.Hostname != "" {
-				tlsConfig.ServerName = backend.TLSConfig.Hostname
-			}
-			if len(backend.TLSConfig.CACerts) > 0 {
-				tlsConfig.RootCAs = x509.NewCertPool()
-				for _, cert := range backend.TLSConfig.CACerts {
-					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
+	key := fmt.Sprintf("%s-%s:%d", scheme, backend.Host, backend.Port)
+	clientVal, ok := p.mirrorClients.Load(key)
+	var client *http.Client
+	if ok {
+		client = clientVal.(*http.Client)
+	} else {
+		client = &http.Client{
+			Timeout: 10 * time.Second, // Timeout to prevent goroutine leaks
+		}
+		if scheme == "https" {
+			tlsConfig := &tls.Config{InsecureSkipVerify: false}
+			if backend.TLSConfig != nil {
+				if backend.TLSConfig.Hostname != "" {
+					tlsConfig.ServerName = backend.TLSConfig.Hostname
+				}
+				if len(backend.TLSConfig.CACerts) > 0 {
+					tlsConfig.RootCAs = x509.NewCertPool()
+					for _, cert := range backend.TLSConfig.CACerts {
+						if ok := tlsConfig.RootCAs.AppendCertsFromPEM(cert); !ok {
+							log.Log.V(1).Info("Failed to parse CA certificate for mirror backend", "host", backend.Host)
+						}
+					}
+				} else {
+					tlsConfig.InsecureSkipVerify = true
 				}
 			} else {
 				tlsConfig.InsecureSkipVerify = true
 			}
-		} else {
-			tlsConfig.InsecureSkipVerify = true
+			client.Transport = &http.Transport{
+				TLSClientConfig: tlsConfig,
+			}
 		}
-		client.Transport = &http.Transport{
-			TLSClientConfig: tlsConfig,
-		}
+		p.mirrorClients.Store(key, client)
 	}
 
-	log.Log.Info("Mirroring request", "host", req.Host, "path", req.URL.Path, "target", target.String())
+	log.Log.V(1).Info("Mirroring request", "host", req.Host, "path", req.URL.Path, "target", target.String())
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Log.Error(err, "Error mirroring request", "target", target.String())
 		return
 	}
 	defer resp.Body.Close()
+	// Drain the response body to allow connection reuse
+	_, _ = io.Copy(io.Discard, resp.Body)
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {

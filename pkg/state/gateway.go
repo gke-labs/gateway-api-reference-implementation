@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -332,7 +333,16 @@ func resolveBackend(
 	}
 
 	if backendRef.Port == nil {
-		return nil, nil
+		return nil, &ErrorState{
+			Condition: metav1.Condition{
+				Type:    string(gatewayv1.RouteConditionResolvedRefs),
+				Status:  metav1.ConditionFalse,
+				Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+				Message: "Port is required for Service backends",
+			},
+			HTTPStatusCode: http.StatusInternalServerError,
+			HTTPMessage:    "Port is required for Service backends",
+		}
 	}
 
 	backendSvcNamespace := defaultNamespace
@@ -469,8 +479,6 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				Hostnames: effectiveHostnames,
 			}
 
-			resolvedRefsCond := route.ComputeResolvedRefsCondition()
-
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
 				var mirrors []*InternalBackend
@@ -499,9 +507,10 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 					case gatewayv1.HTTPRouteFilterRequestMirror:
 						m := filter.RequestMirror
 						if backend, errState := resolveBackend(m.BackendRef, route.Namespace, services, backendTLSPolicies, configMaps); errState != nil {
-							// For mirrors, if resolution fails, we might just skip it or report error.
-							// But conformance tests might expect it to not fail the whole rule if only mirror is broken?
-							// Actually, if ANY reference is invalid, ResolvedRefs should be false.
+							// For mirrors, if resolution fails, we do not fail the primary request.
+							// The Gateway API spec dictates that invalid mirror requests are dropped,
+							// but the route's ResolvedRefs condition is set to False (handled in ComputeResolvedRefsCondition).
+							log.Log.V(1).Info("Invalid mirror backend reference dropped", "error", errState.HTTPMessage)
 						} else if backend != nil {
 							mirrors = append(mirrors, backend)
 						}
@@ -513,13 +522,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 					Mirrors:  mirrors,
 				}
 
-				if resolvedRefsCond.Status == metav1.ConditionFalse {
-					iRule.Error = &ErrorState{
-						Condition:      resolvedRefsCond,
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    resolvedRefsCond.Message,
-					}
-				} else if redirect == nil {
+				if redirect == nil {
 					for _, backendRef := range rule.BackendRefs {
 						backend, errState := resolveBackend(backendRef.BackendObjectReference, route.Namespace, services, backendTLSPolicies, configMaps)
 						if errState != nil {

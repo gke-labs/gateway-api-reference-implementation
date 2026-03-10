@@ -115,6 +115,29 @@ func (s *HTTPRouteState) ComputeResolvedRefsCondition() metav1.Condition {
 				resolvedRefsMessage = fmt.Sprintf("Unsupported backend kind: %s", *backendRef.Kind)
 				goto done
 			}
+			if backendRef.Port == nil {
+				resolvedRefsStatus = metav1.ConditionFalse
+				resolvedRefsReason = gatewayv1.RouteReasonUnsupportedValue
+				resolvedRefsMessage = "Port is required for Service backends"
+				goto done
+			}
+		}
+		for _, filter := range rule.Filters {
+			if filter.Type == gatewayv1.HTTPRouteFilterRequestMirror {
+				m := filter.RequestMirror
+				if m.BackendRef.Kind != nil && *m.BackendRef.Kind != "Service" {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
+					resolvedRefsMessage = fmt.Sprintf("Unsupported mirror backend kind: %s", *m.BackendRef.Kind)
+					goto done
+				}
+				if m.BackendRef.Port == nil {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.RouteReasonUnsupportedValue
+					resolvedRefsMessage = "Port is required for mirror Service backends"
+					goto done
+				}
+			}
 		}
 	}
 
