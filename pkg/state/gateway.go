@@ -332,6 +332,55 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 			continue
 		}
 
+		var listenerError *ErrorState
+		if listener.Protocol == gatewayv1.HTTPSProtocolType {
+			var validation *gatewayv1.FrontendTLSValidation
+			if s.Spec.TLS != nil && s.Spec.TLS.Frontend != nil {
+				for _, pp := range s.Spec.TLS.Frontend.PerPort {
+					if pp.Port == listener.Port {
+						validation = pp.TLS.Validation
+						break
+					}
+				}
+				if validation == nil {
+					validation = s.Spec.TLS.Frontend.Default.Validation
+				}
+			}
+
+			if validation != nil {
+				for _, caRef := range validation.CACertificateRefs {
+					ns := s.Namespace
+					if caRef.Namespace != nil {
+						ns = string(*caRef.Namespace)
+					}
+					if caRef.Kind != "ConfigMap" || (caRef.Group != "" && caRef.Group != "core" && caRef.Group != "gateway.networking.k8s.io") {
+						listenerError = &ErrorState{
+							Condition: metav1.Condition{
+								Type:   string(gatewayv1.ListenerConditionResolvedRefs),
+								Status: metav1.ConditionFalse,
+								Reason: string(gatewayv1.ListenerReasonInvalidCACertificateRef),
+							},
+							HTTPStatusCode: http.StatusForbidden,
+							HTTPMessage:    "Unsupported CA certificate ref",
+						}
+						break
+					}
+					if _, ok := configMaps[types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}]; !ok {
+						listenerError = &ErrorState{
+							Condition: metav1.Condition{
+								Type:   string(gatewayv1.ListenerConditionResolvedRefs),
+								Status: metav1.ConditionFalse,
+								Reason: string(gatewayv1.ListenerReasonInvalidCACertificateRef),
+							},
+							HTTPStatusCode: http.StatusForbidden,
+							HTTPMessage:    "CA certificate ConfigMap not found",
+						}
+						break
+					}
+				}
+			}
+		}
+
 		for _, route := range routes {
 			// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
 			bound := false
@@ -409,7 +458,9 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 					Redirect: redirect,
 				}
 
-				if resolvedRefsCond.Status == metav1.ConditionFalse {
+				if listenerError != nil {
+					iRule.Error = listenerError
+				} else if resolvedRefsCond.Status == metav1.ConditionFalse {
 					iRule.Error = &ErrorState{
 						Condition:      resolvedRefsCond,
 						HTTPStatusCode: http.StatusInternalServerError,
