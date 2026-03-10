@@ -58,6 +58,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bestRule, bestMatch := state.MatchRoute(routes, r)
 
 	if bestRule != nil {
+		if bestRule.CORS != nil {
+			if p.handleCORS(w, r, bestRule.CORS) {
+				return
+			}
+		}
 		if bestRule.Redirect != nil {
 			p.redirect(w, r, *bestRule.Redirect, bestMatch)
 			return
@@ -76,6 +81,122 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+}
+
+func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.InternalCORS) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+
+	allowed := false
+	for _, ao := range cors.AllowOrigins {
+		if string(ao) == "*" {
+			allowed = true
+			break
+		}
+		if state.MatchOrigin(origin, string(ao)) {
+			allowed = true
+			break
+		}
+	}
+
+	if !allowed {
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			w.WriteHeader(http.StatusForbidden)
+			return true
+		}
+		return false
+	}
+
+	// Origin is allowed
+	if cors.AllowCredentials {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
+
+	useWildcardOrigin := false
+	for _, ao := range cors.AllowOrigins {
+		if string(ao) == "*" {
+			useWildcardOrigin = true
+			break
+		}
+	}
+
+	if useWildcardOrigin && !cors.AllowCredentials {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
+
+	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		// Preflight request
+
+		// Access-Control-Allow-Methods
+		var methods []string
+		useWildcardMethod := false
+		for _, m := range cors.AllowMethods {
+			if string(m) == "*" {
+				useWildcardMethod = true
+				break
+			}
+			methods = append(methods, string(m))
+		}
+		if useWildcardMethod && !cors.AllowCredentials {
+			w.Header().Set("Access-Control-Allow-Methods", "*")
+		} else if useWildcardMethod && cors.AllowCredentials {
+			if m := r.Header.Get("Access-Control-Request-Method"); m != "" {
+				w.Header().Set("Access-Control-Allow-Methods", m)
+			}
+		} else if len(methods) > 0 {
+			w.Header().Set("Access-Control-Allow-Methods", strings.Join(methods, ", "))
+		}
+
+		// Access-Control-Allow-Headers
+		var headers []string
+		useWildcardHeader := false
+		for _, h := range cors.AllowHeaders {
+			if string(h) == "*" {
+				useWildcardHeader = true
+				break
+			}
+			headers = append(headers, string(h))
+		}
+		if useWildcardHeader && !cors.AllowCredentials {
+			w.Header().Set("Access-Control-Allow-Headers", "*")
+		} else if useWildcardHeader && cors.AllowCredentials {
+			if h := r.Header.Get("Access-Control-Request-Headers"); h != "" {
+				w.Header().Set("Access-Control-Allow-Headers", h)
+			}
+		} else if len(headers) > 0 {
+			w.Header().Set("Access-Control-Allow-Headers", strings.Join(headers, ", "))
+		}
+
+		// Access-Control-Max-Age
+		w.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", cors.MaxAge))
+
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+
+	// Normal request
+	if len(cors.ExposeHeaders) > 0 {
+		var exposeHeaders []string
+		useWildcardExpose := false
+		for _, h := range cors.ExposeHeaders {
+			if string(h) == "*" {
+				useWildcardExpose = true
+				break
+			}
+			exposeHeaders = append(exposeHeaders, string(h))
+		}
+		if useWildcardExpose && !cors.AllowCredentials {
+			w.Header().Set("Access-Control-Expose-Headers", "*")
+		} else if len(exposeHeaders) > 0 {
+			w.Header().Set("Access-Control-Expose-Headers", strings.Join(exposeHeaders, ", "))
+		}
+	}
+
+	return false
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {

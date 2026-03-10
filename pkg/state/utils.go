@@ -15,8 +15,66 @@
 package state
 
 import (
+	"net"
+	"net/url"
+	"regexp"
 	"strings"
 )
+
+// MatchOrigin matches an origin against a pattern, supporting wildcards.
+func MatchOrigin(origin, pattern string) bool {
+	if origin == pattern {
+		return true
+	}
+
+	oURL, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	pURL, err := url.Parse(pattern)
+	if err != nil {
+		return false
+	}
+
+	if oURL.Scheme != pURL.Scheme {
+		return false
+	}
+
+	oHost, oPort, _ := net.SplitHostPort(oURL.Host)
+	if oHost == "" {
+		oHost = oURL.Host
+	}
+	pHost, pPort, _ := net.SplitHostPort(pURL.Host)
+	if pHost == "" {
+		pHost = pURL.Host
+	}
+
+	if oPort != pPort {
+		return false
+	}
+
+	if pHost == "*" {
+		return true
+	}
+
+	if strings.Contains(pHost, "*") {
+		// Handle greedy wildcard match to the left
+		// pattern like *.example.com or foo*.example.com
+		parts := strings.Split(pHost, "*")
+		if len(parts) == 2 {
+			// prefix*suffix
+			return strings.HasPrefix(oHost, parts[0]) && strings.HasSuffix(oHost, parts[1])
+		}
+		// Fallback for multiple wildcards if ever allowed
+		rePattern := "^" + strings.ReplaceAll(pHost, "*", ".*") + "$"
+		re, err := regexp.Compile(rePattern)
+		if err == nil {
+			return re.MatchString(oHost)
+		}
+	}
+
+	return false
+}
 
 // IntersectHostnames calculates the intersection of route hostnames and a listener hostname.
 func IntersectHostnames(routeHostnames []string, listenerHostname string) []string {

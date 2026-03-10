@@ -102,3 +102,69 @@ func TestIntersectHostnames(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchOrigin(t *testing.T) {
+	tests := []struct {
+		name    string
+		origin  string
+		pattern string
+		want    bool
+	}{
+		{
+			name:    "exact match",
+			origin:  "http://example.com",
+			pattern: "http://example.com",
+			want:    true,
+		},
+		{
+			name:    "mismatch scheme",
+			origin:  "https://example.com",
+			pattern: "http://example.com",
+			want:    false,
+		},
+		{
+			name:    "mismatch host",
+			origin:  "http://foo.com",
+			pattern: "http://bar.com",
+			want:    false,
+		},
+		{
+			name:    "wildcard subdomain",
+			origin:  "http://foo.example.com",
+			pattern: "http://*.example.com",
+			want:    true,
+		},
+		{
+			name:    "wildcard subdomain deep",
+			origin:  "http://a.b.example.com",
+			pattern: "http://*.example.com",
+			want:    true,
+		},
+		{
+			name:    "wildcard only host",
+			origin:  "http://anything.com",
+			pattern: "http://*",
+			want:    true,
+		},
+		{
+			name:    "port match",
+			origin:  "http://example.com:8080",
+			pattern: "http://example.com:8080",
+			want:    true,
+		},
+		{
+			name:    "port mismatch",
+			origin:  "http://example.com:8080",
+			pattern: "http://example.com:8081",
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := MatchOrigin(tt.origin, tt.pattern); got != tt.want {
+				t.Errorf("MatchOrigin(%q, %q) = %v, want %v", tt.origin, tt.pattern, got, tt.want)
+			}
+		})
+	}
+}
