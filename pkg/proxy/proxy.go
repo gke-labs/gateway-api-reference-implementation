@@ -50,6 +50,24 @@ func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.routes = routes
 }
 
+// GetConfigForClient is used to reject L4 connections for listeners with invalid TLS configurations.
+// TODO: Technical Debt - Actual client certificate validation (tls.Config.ClientAuth and ClientCAs)
+// is not yet implemented on the HTTPS server itself.
+func (p *Proxy) GetConfigForClient(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+	p.mu.RLock()
+	routes := p.routes
+	p.mu.RUnlock()
+
+	req, _ := http.NewRequest("GET", "https://"+chi.ServerName+"/", nil)
+	bestRule, _ := state.MatchRoute(routes, req)
+
+	if bestRule != nil && bestRule.Error != nil && bestRule.Error.HTTPStatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("invalid listener configuration: %s", bestRule.Error.HTTPMessage)
+	}
+
+	return nil, nil
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.RLock()
 	routes := p.routes

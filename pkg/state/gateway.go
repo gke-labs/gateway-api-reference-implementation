@@ -332,6 +332,93 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 			continue
 		}
 
+		var listenerError *ErrorState
+		if listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
+			var validation *gatewayv1.FrontendTLSValidation
+			hasPerPortOverride := false
+			if s.Spec.TLS != nil && s.Spec.TLS.Frontend != nil {
+				for _, pp := range s.Spec.TLS.Frontend.PerPort {
+					if pp.Port == listener.Port {
+						validation = pp.TLS.Validation
+						hasPerPortOverride = true
+						break
+					}
+				}
+				if !hasPerPortOverride {
+					validation = s.Spec.TLS.Frontend.Default.Validation
+				}
+			}
+
+			if validation != nil {
+				validCACerts := 0
+				var lastError *ErrorState
+
+				for _, caRef := range validation.CACertificateRefs {
+					ns := s.Namespace
+					if caRef.Namespace != nil && string(*caRef.Namespace) != s.Namespace {
+						lastError = &ErrorState{
+							Condition: metav1.Condition{
+								Type:   string(gatewayv1.ListenerConditionResolvedRefs),
+								Status: metav1.ConditionFalse,
+								Reason: string(gatewayv1.ListenerReasonRefNotPermitted),
+							},
+							HTTPStatusCode: http.StatusForbidden,
+							HTTPMessage:    "Cross-namespace CA certificate references require ReferenceGrant",
+						}
+						continue
+					}
+					if caRef.Namespace != nil {
+						ns = string(*caRef.Namespace)
+					}
+					if caRef.Kind != "ConfigMap" || (caRef.Group != "" && caRef.Group != "core" && caRef.Group != "gateway.networking.k8s.io") {
+						lastError = &ErrorState{
+							Condition: metav1.Condition{
+								Type:   string(gatewayv1.ListenerConditionResolvedRefs),
+								Status: metav1.ConditionFalse,
+								Reason: string(gatewayv1.ListenerReasonInvalidCACertificateKind),
+							},
+							HTTPStatusCode: http.StatusForbidden,
+							HTTPMessage:    "Unsupported CA certificate ref",
+						}
+						continue
+					}
+					cm, ok := configMaps[types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}]
+					if !ok {
+						lastError = &ErrorState{
+							Condition: metav1.Condition{
+								Type:   string(gatewayv1.ListenerConditionResolvedRefs),
+								Status: metav1.ConditionFalse,
+								Reason: string(gatewayv1.ListenerReasonInvalidCACertificateRef),
+							},
+							HTTPStatusCode: http.StatusForbidden,
+							HTTPMessage:    "CA certificate ConfigMap not found",
+						}
+						continue
+					}
+
+					if _, hasData := cm.Data["ca.crt"]; !hasData {
+						if _, hasBinData := cm.BinaryData["ca.crt"]; !hasBinData {
+							lastError = &ErrorState{
+								Condition: metav1.Condition{
+									Type:   string(gatewayv1.ListenerConditionResolvedRefs),
+									Status: metav1.ConditionFalse,
+									Reason: string(gatewayv1.ListenerReasonInvalidCACertificateRef),
+								},
+								HTTPStatusCode: http.StatusForbidden,
+								HTTPMessage:    "CA certificate ConfigMap missing ca.crt key",
+							}
+							continue
+						}
+					}
+					validCACerts++
+				}
+
+				if validCACerts == 0 && len(validation.CACertificateRefs) > 0 {
+					listenerError = lastError
+				}
+			}
+		}
+
 		for _, route := range routes {
 			// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
 			bound := false
@@ -409,7 +496,9 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 					Redirect: redirect,
 				}
 
-				if resolvedRefsCond.Status == metav1.ConditionFalse {
+				if listenerError != nil {
+					iRule.Error = listenerError
+				} else if resolvedRefsCond.Status == metav1.ConditionFalse {
 					iRule.Error = &ErrorState{
 						Condition:      resolvedRefsCond,
 						HTTPStatusCode: http.StatusInternalServerError,

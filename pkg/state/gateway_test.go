@@ -712,8 +712,119 @@ func TestBuildInternalRoutes(t *testing.T) {
 								AppProtocol: Ptr("https"),
 								TLSConfig: &InternalTLSConfig{
 									Hostname: "old.example.com",
-									CACerts:  nil,
 								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid default frontend validation",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						TLS: &gatewayv1.GatewayTLSConfig{
+							Frontend: &gatewayv1.FrontendTLSConfig{
+								Default: gatewayv1.TLSConfig{
+									Validation: &gatewayv1.FrontendTLSValidation{
+										CACertificateRefs: []gatewayv1.ObjectReference{
+											{
+												Kind: "ConfigMap",
+												Name: "non-existent",
+											},
+										},
+									},
+								},
+							},
+						},
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "https",
+								Protocol: gatewayv1.HTTPSProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route1",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Hostnames: []gatewayv1.Hostname{"example.com"},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Kind: Ptr(gatewayv1.Kind("Service")),
+													Name: "backend-svc",
+													Port: Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "default", Name: "backend-svc"}: {
+					Spec: corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{{Port: 80}},
+					},
+				},
+			},
+			configMaps: map[types.NamespacedName]*corev1.ConfigMap{},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"example.com"},
+					Rules: []InternalRule{
+						{
+							Error: &ErrorState{
+								Condition: metav1.Condition{
+									Type:   string(gatewayv1.ListenerConditionResolvedRefs),
+									Status: metav1.ConditionFalse,
+									Reason: string(gatewayv1.ListenerReasonInvalidCACertificateRef),
+								},
+								HTTPStatusCode: http.StatusForbidden,
+								HTTPMessage:    "CA certificate ConfigMap not found",
 							},
 						},
 					},

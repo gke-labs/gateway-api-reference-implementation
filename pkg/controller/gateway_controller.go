@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -177,7 +178,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
-	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
@@ -194,36 +194,110 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		resolvedRefsCond := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+			Message:            "All references resolved",
+		}
+		acceptedCond := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionAccepted),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonAccepted),
+			Message:            "Listener accepted",
+		}
+		programmedCond := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionProgrammed),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonProgrammed),
+			Message:            "Listener programmed",
+		}
+
+		if listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
+			var validation *gatewayv1.FrontendTLSValidation
+
+			// 1. Check for per-port override
+			hasPerPortOverride := false
+			if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+				for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+					if pp.Port == listener.Port {
+						validation = pp.TLS.Validation
+						hasPerPortOverride = true
+						break
+					}
+				}
+
+				// 2. If no per-port override, use default
+				if !hasPerPortOverride {
+					validation = gw.Spec.TLS.Frontend.Default.Validation
+				}
+			}
+			if validation != nil {
+				validCACerts := 0
+				for _, caRef := range validation.CACertificateRefs {
+					ns := gw.Namespace
+					if caRef.Namespace != nil && string(*caRef.Namespace) != gw.Namespace {
+						resolvedRefsCond.Status = metav1.ConditionFalse
+						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
+						resolvedRefsCond.Message = "Cross-namespace CA certificate references require ReferenceGrant, which is not supported"
+						continue
+					}
+					if caRef.Namespace != nil {
+						ns = string(*caRef.Namespace)
+					}
+
+					if caRef.Kind != "ConfigMap" || (caRef.Group != "" && caRef.Group != "core" && caRef.Group != "gateway.networking.k8s.io") {
+						resolvedRefsCond.Status = metav1.ConditionFalse
+						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateKind)
+						resolvedRefsCond.Message = "Unsupported CA certificate ref kind/group"
+						continue
+					}
+
+					cm := &corev1.ConfigMap{}
+					if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}, cm); err != nil {
+						resolvedRefsCond.Status = metav1.ConditionFalse
+						if apierrors.IsNotFound(err) {
+							resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+							resolvedRefsCond.Message = "CA certificate ConfigMap not found"
+						} else {
+							resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+							resolvedRefsCond.Message = fmt.Sprintf("Error retrieving CA certificate ConfigMap: %v", err)
+						}
+						continue
+					}
+					if _, hasData := cm.Data["ca.crt"]; !hasData {
+						if _, hasBinData := cm.BinaryData["ca.crt"]; !hasBinData {
+							resolvedRefsCond.Status = metav1.ConditionFalse
+							resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+							resolvedRefsCond.Message = "CA certificate ConfigMap missing ca.crt key"
+							continue
+						}
+					}
+
+					validCACerts++
+				}
+
+				if validCACerts == 0 && len(validation.CACertificateRefs) > 0 {
+					acceptedCond.Status = metav1.ConditionFalse
+					acceptedCond.Reason = string(gatewayv1.ListenerReasonNoValidCACertificate)
+
+					programmedCond.Status = metav1.ConditionFalse
+					programmedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
+				}
+			}
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
 			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
 			AttachedRoutes: int32(attachedRoutes),
-			Conditions: []metav1.Condition{
-				{
-					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonProgrammed),
-					Message:            "Listener programmed",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionAccepted),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonAccepted),
-					Message:            "Listener accepted",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
-			},
+			Conditions:     []metav1.Condition{programmedCond, acceptedCond, resolvedRefsCond},
 		})
 	}
 
@@ -305,7 +379,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	r.State.UpsertGateway(gw)
-	_ = gs // keep for now
 	r.updateProxy()
 
 	l.Info("Updated Gateway status", "address", ip)
@@ -334,6 +407,61 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 							},
 						})
 					}
+				}
+			}
+			return requests
+		})).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// When a ConfigMap changes, check if any Gateway references it
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				referenced := false
+				for _, listener := range gw.Spec.Listeners {
+					if listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
+						if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+							var validations []*gatewayv1.FrontendTLSValidation
+							for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+								if pp.TLS.Validation != nil {
+									validations = append(validations, pp.TLS.Validation)
+								}
+							}
+							if gw.Spec.TLS.Frontend.Default.Validation != nil {
+								validations = append(validations, gw.Spec.TLS.Frontend.Default.Validation)
+							}
+							for _, validation := range validations {
+								for _, caRef := range validation.CACertificateRefs {
+									if caRef.Kind == "ConfigMap" && string(caRef.Name) == obj.GetName() {
+										ns := gw.Namespace
+										if caRef.Namespace != nil {
+											ns = string(*caRef.Namespace)
+										}
+										if ns == obj.GetNamespace() {
+											referenced = true
+											break
+										}
+									}
+								}
+								if referenced {
+									break
+								}
+							}
+						}
+					}
+					if referenced {
+						break
+					}
+				}
+				if referenced {
+					requests = append(requests, ctrl.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: gw.Namespace,
+							Name:      gw.Name,
+						},
+					})
 				}
 			}
 			return requests
