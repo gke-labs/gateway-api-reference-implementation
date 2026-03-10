@@ -169,7 +169,7 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	for _, gw := range gateways {
 		usesPolicy := false
 		for _, route := range routes {
-			if route.MatchesGateway(gw.Gateway, ControllerName) {
+			if route.MatchesGateway(gw) {
 				for _, rule := range route.Spec.Rules {
 					for _, backendRef := range rule.BackendRefs {
 						if string(state.ValueOf(backendRef.Kind)) == "Service" || state.ValueOf(backendRef.Kind) == "" {

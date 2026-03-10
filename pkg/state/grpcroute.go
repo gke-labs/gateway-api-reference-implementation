@@ -16,25 +16,39 @@ package state
 
 import (
 	"fmt"
+
 	"regexp"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-type HTTPRouteState struct {
-	*gatewayv1.HTTPRoute
+type GRPCRouteState struct {
+	*gatewayv1.GRPCRoute
 	hostnames []string
 }
 
-func (s *HTTPRouteState) Validate() error {
-	if s == nil || s.HTTPRoute == nil {
+func (s *GRPCRouteState) Validate() error {
+	if s == nil || s.GRPCRoute == nil {
 		return nil
 	}
+
 	for _, rule := range s.Spec.Rules {
 		for _, match := range rule.Matches {
+			if match.Method != nil && match.Method.Type != nil && *match.Method.Type == gatewayv1.GRPCMethodMatchRegularExpression {
+				if match.Method.Service != nil {
+					if _, err := regexp.Compile(*match.Method.Service); err != nil {
+						return fmt.Errorf("invalid regular expression in service match: %w", err)
+					}
+				}
+				if match.Method.Method != nil {
+					if _, err := regexp.Compile(*match.Method.Method); err != nil {
+						return fmt.Errorf("invalid regular expression in method match: %w", err)
+					}
+				}
+			}
 			for _, header := range match.Headers {
-				if ValueOf(header.Type) == gatewayv1.HeaderMatchRegularExpression {
+				if header.Type != nil && *header.Type == gatewayv1.GRPCHeaderMatchRegularExpression {
 					if _, err := regexp.Compile(header.Value); err != nil {
 						return fmt.Errorf("invalid regular expression in header match: %w", err)
 					}
@@ -45,7 +59,7 @@ func (s *HTTPRouteState) Validate() error {
 	return nil
 }
 
-func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentReference, gateways []*GatewayState) metav1.Condition {
+func (s *GRPCRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentReference, gateways []*GatewayState) metav1.Condition {
 	acceptedStatus := metav1.ConditionTrue
 	acceptedReason := gatewayv1.RouteReasonAccepted
 	acceptedMessage := "Route accepted by reference implementation"
@@ -120,7 +134,7 @@ done:
 	}
 }
 
-func (s *HTTPRouteState) ComputeResolvedRefsCondition() metav1.Condition {
+func (s *GRPCRouteState) ComputeResolvedRefsCondition() metav1.Condition {
 	resolvedRefsStatus := metav1.ConditionTrue
 	resolvedRefsReason := gatewayv1.RouteReasonResolvedRefs
 	resolvedRefsMessage := "All references resolved"
@@ -147,8 +161,8 @@ done:
 	}
 }
 
-func (s *HTTPRouteState) IsAccepted(gateways []*GatewayState) bool {
-	if s == nil || s.HTTPRoute == nil {
+func (s *GRPCRouteState) IsAccepted(gateways []*GatewayState) bool {
+	if s == nil || s.GRPCRoute == nil {
 		return false
 	}
 	for _, parentRef := range s.Spec.ParentRefs {
@@ -160,8 +174,8 @@ func (s *HTTPRouteState) IsAccepted(gateways []*GatewayState) bool {
 	return false
 }
 
-func (s *HTTPRouteState) MatchesGateway(gw *GatewayState) bool {
-	if s == nil || s.HTTPRoute == nil {
+func (s *GRPCRouteState) MatchesGateway(gw *GatewayState) bool {
+	if s == nil || s.GRPCRoute == nil {
 		return false
 	}
 

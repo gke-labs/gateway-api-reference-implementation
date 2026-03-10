@@ -185,7 +185,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			for _, parentRef := range route.Spec.ParentRefs {
 				if string(parentRef.Name) == gw.Name {
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
+						if route.IsAccepted([]*state.GatewayState{&gs}) {
 							attachedRoutes++
 							break
 						}
