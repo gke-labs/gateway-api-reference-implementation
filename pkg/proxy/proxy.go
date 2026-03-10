@@ -36,6 +36,9 @@ import (
 type Proxy struct {
 	mu     sync.RWMutex
 	routes []state.InternalRoute
+
+	// DefaultCertificates are used when no other certificates are available.
+	DefaultCertificates []tls.Certificate
 }
 
 func NewProxy() *Proxy {
@@ -44,10 +47,68 @@ func NewProxy() *Proxy {
 	}
 }
 
+func (p *Proxy) SetDefaultCertificates(certs []tls.Certificate) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.DefaultCertificates = certs
+}
+
 func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.routes = routes
+}
+
+func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+	p.mu.RLock()
+	routes := p.routes
+	defaultCerts := p.DefaultCertificates
+	p.mu.RUnlock()
+
+	// Find the best matching route for the SNI
+	var bestRoute *state.InternalRoute
+	for i := range routes {
+		route := &routes[i]
+		if route.MatchHostname(hello.ServerName) {
+			// For simplicity, we just take the first matching route with TLSConfig
+			if route.TLSConfig != nil {
+				bestRoute = route
+				break
+			}
+		}
+	}
+
+	if bestRoute != nil && bestRoute.TLSConfig != nil {
+		// Create a new config based on the SNI matching route.
+		// Note: We MUST include the certificates here as this config replaces the original one.
+		conf := &tls.Config{
+			Certificates: defaultCerts,
+		}
+
+		if len(bestRoute.TLSConfig.CACerts) > 0 {
+			conf.ClientCAs = x509.NewCertPool()
+			for _, cert := range bestRoute.TLSConfig.CACerts {
+				conf.ClientCAs.AppendCertsFromPEM(cert)
+			}
+		}
+
+		switch bestRoute.TLSConfig.Mode {
+		case gatewayv1.AllowValidOnly:
+			conf.ClientAuth = tls.RequireAndVerifyClientCert
+		case gatewayv1.AllowInsecureFallback:
+			// AllowInsecureFallback: In this mode, the gateway will accept connections
+			// even if the client certificate is not presented or fails verification.
+			// Go's VerifyClientCertIfGiven rejects if the cert is provided but fails verification.
+			// RequestClientCert requests the cert but does not verify it.
+			conf.ClientAuth = tls.RequestClientCert
+		default:
+			conf.ClientAuth = tls.NoClientCert
+		}
+
+		return conf, nil
+	}
+
+	return nil, nil
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {

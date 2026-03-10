@@ -168,6 +168,32 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Message:            "Gateway accepted by reference implementation",
 		},
 	}
+
+	// Check if any listener or default config uses AllowInsecureFallback
+	insecure := false
+	if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+		if gw.Spec.TLS.Frontend.Default.Validation != nil && gw.Spec.TLS.Frontend.Default.Validation.Mode == gatewayv1.AllowInsecureFallback {
+			insecure = true
+		} else {
+			for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+				if pp.TLS.Validation != nil && pp.TLS.Validation.Mode == gatewayv1.AllowInsecureFallback {
+					insecure = true
+					break
+				}
+			}
+		}
+	}
+
+	if insecure {
+		newConditions = append(newConditions, metav1.Condition{
+			Type:               string(gatewayv1.GatewayConditionInsecureFrontendValidationMode),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			Reason:             string(gatewayv1.GatewayReasonConfigurationChanged),
+			Message:            "Gateway is configured with AllowInsecureFallback for client certificate validation",
+		})
+	}
+
 	newAddresses := []gatewayv1.GatewayStatusAddress{
 		{
 			Type:  state.Ptr(gatewayv1.IPAddressType),

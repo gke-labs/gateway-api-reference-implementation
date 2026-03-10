@@ -105,6 +105,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteBackendProtocolH2C,
 		tests.BackendTLSPolicy,
 		tests.BackendTLSPolicyConflictResolution,
+		tests.GatewayFrontendClientCertificateValidationInsecureFallback,
 	}
 
 	cSuite.Setup(t, selectedTests)

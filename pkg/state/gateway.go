@@ -58,6 +58,12 @@ func (s *HTTPRouteState) GetNamespace() string {
 type InternalRoute struct {
 	Hostnames []string
 	Rules     []InternalRule
+	TLSConfig *InternalFrontendTLSConfig
+}
+
+type InternalFrontendTLSConfig struct {
+	CACerts [][]byte
+	Mode    gatewayv1.FrontendValidationModeType
 }
 
 func (ir *InternalRoute) MatchHostname(host string) bool {
@@ -372,8 +378,49 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				continue
 			}
 
+			// Extract frontend TLS validation config if present
+			var frontendTLSConfig *InternalFrontendTLSConfig
+			if s.Spec.TLS != nil && s.Spec.TLS.Frontend != nil {
+				var validation *gatewayv1.FrontendTLSValidation
+				// Check for per-port configuration first
+				for _, pp := range s.Spec.TLS.Frontend.PerPort {
+					if int32(pp.Port) == int32(listener.Port) {
+						validation = pp.TLS.Validation
+						break
+					}
+				}
+				// Use default if no per-port configuration
+				if validation == nil {
+					validation = s.Spec.TLS.Frontend.Default.Validation
+				}
+
+				if validation != nil {
+					var caCerts [][]byte
+					for _, caRef := range validation.CACertificateRefs {
+						if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+							cmName := types.NamespacedName{Namespace: s.Namespace, Name: string(caRef.Name)}
+							if cm, ok := configMaps[cmName]; ok {
+								if data, ok := cm.Data["ca.crt"]; ok {
+									caCerts = append(caCerts, []byte(data))
+								} else if data, ok := cm.BinaryData["ca.crt"]; ok {
+									caCerts = append(caCerts, data)
+								}
+							}
+						}
+					}
+					frontendTLSConfig = &InternalFrontendTLSConfig{
+						CACerts: caCerts,
+						Mode:    validation.Mode,
+					}
+					if frontendTLSConfig.Mode == "" {
+						frontendTLSConfig.Mode = gatewayv1.AllowValidOnly
+					}
+				}
+			}
+
 			ir := InternalRoute{
 				Hostnames: effectiveHostnames,
+				TLSConfig: frontendTLSConfig,
 			}
 
 			resolvedRefsCond := route.ComputeResolvedRefsCondition()
