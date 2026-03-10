@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -241,6 +242,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				validCACerts := 0
 				for _, caRef := range validation.CACertificateRefs {
 					ns := gw.Namespace
+					if caRef.Namespace != nil && string(*caRef.Namespace) != gw.Namespace {
+						resolvedRefsCond.Status = metav1.ConditionFalse
+						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
+						resolvedRefsCond.Message = "Cross-namespace CA certificate references require ReferenceGrant, which is not supported"
+						continue
+					}
 					if caRef.Namespace != nil {
 						ns = string(*caRef.Namespace)
 					}
@@ -254,14 +261,16 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 					cm := &corev1.ConfigMap{}
 					if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}, cm); err != nil {
+						resolvedRefsCond.Status = metav1.ConditionFalse
 						if apierrors.IsNotFound(err) {
-							resolvedRefsCond.Status = metav1.ConditionFalse
 							resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
 							resolvedRefsCond.Message = "CA certificate ConfigMap not found"
+						} else {
+							resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+							resolvedRefsCond.Message = fmt.Sprintf("Error retrieving CA certificate ConfigMap: %v", err)
 						}
 						continue
 					}
-
 					if _, hasData := cm.Data["ca.crt"]; !hasData {
 						if _, hasBinData := cm.BinaryData["ca.crt"]; !hasBinData {
 							resolvedRefsCond.Status = metav1.ConditionFalse
@@ -405,7 +414,7 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			// When a ConfigMap changes, check if any Gateway references it
 			var gateways gatewayv1.GatewayList
-			if err := r.List(ctx, &gateways, client.InNamespace(obj.GetNamespace())); err != nil {
+			if err := r.List(ctx, &gateways); err != nil {
 				return nil
 			}
 			var requests []ctrl.Request
