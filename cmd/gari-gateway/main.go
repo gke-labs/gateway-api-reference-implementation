@@ -67,19 +67,19 @@ func main() {
 
 func run(ctx context.Context) error {
 	var metricsAddr string
-	var enableLeaderElection bool
 	var probeAddr string
 	var proxyAddr string
 	var proxyHTTPSAddr string
 	var enableH2C bool
+	var gatewayName string
+	var gatewayNamespace string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&proxyAddr, "proxy-bind-address", ":8000", "The address the proxy binds to.")
 	flag.StringVar(&proxyHTTPSAddr, "proxy-https-bind-address", ":8443", "The address the proxy binds to for HTTPS.")
 	flag.BoolVar(&enableH2C, "enable-h2c", false, "Enable H2C support on the proxy server.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&gatewayName, "gateway-name", "", "The name of the Gateway this proxy is serving.")
+	flag.StringVar(&gatewayNamespace, "gateway-namespace", "", "The namespace of the Gateway this proxy is serving.")
 
 	logConfig := textlogger.NewConfig()
 	logConfig.AddFlags(flag.CommandLine)
@@ -101,8 +101,7 @@ func run(ctx context.Context) error {
 			Port: 9443,
 		}),
 		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "gateway-api-reference-implementation",
+		LeaderElection:         false,
 	})
 	if err != nil {
 		return fmt.Errorf("unable to start manager: %w", err)
@@ -111,15 +110,42 @@ func run(ctx context.Context) error {
 	st := state.NewState()
 	p := proxy.NewProxy()
 
+	opts := controller.GatewayControllerOptions{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		SkipStatusUpdate: false,
+		GatewayName:      gatewayName,
+		GatewayNamespace: gatewayNamespace,
+	}
+
+	if err = (&controller.GatewayProxyReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Gateway proxy controller: %w", err)
+	}
+
+	if err = (&controller.HTTPRouteReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
+	}
+
+	if err = (&controller.BackendTLSPolicyReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating BackendTLSPolicy controller: %w", err)
+	}
+
+	if err = (&controller.ServiceReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Service controller: %w", err)
+	}
+
+	if err = (&controller.ConfigMapReconciler{GatewayControllerOptions: opts}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating ConfigMap controller: %w", err)
+	}
+
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		setupLog.Info("starting proxy server", "addr", proxyAddr)
 		var handler http.Handler = p
 		if enableH2C {
-			// h2c.NewHandler enables HTTP/2 Cleartext (H2C) support.
-			// This is required to pass the HTTPRouteBackendProtocolH2C conformance test
-			// when the test client uses HTTP/2 Prior Knowledge.
 			h2s := &http2.Server{}
 			handler = h2c.NewHandler(p, h2s)
 		}
@@ -140,13 +166,10 @@ func run(ctx context.Context) error {
 
 	g.Go(func() error {
 		setupLog.Info("starting proxy HTTPS server", "addr", proxyHTTPSAddr)
-
-		// Generate a self-signed cert for the reference implementation
 		cert, err := generateSelfSignedCert()
 		if err != nil {
 			return fmt.Errorf("failed to generate self-signed cert: %w", err)
 		}
-
 		srv := &http.Server{
 			Addr:    proxyHTTPSAddr,
 			Handler: p,
@@ -164,58 +187,6 @@ func run(ctx context.Context) error {
 		}
 		return nil
 	})
-
-	if err = (&controller.HTTPRouteReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		State:  st,
-		Proxy:  p,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
-	}
-
-	if err = (&controller.GatewayClassReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating GatewayClass controller: %w", err)
-	}
-
-	if err = (&controller.GatewayReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		State:  st,
-		Proxy:  p,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating Gateway controller: %w", err)
-	}
-
-	if err = (&controller.ServiceReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		State:  st,
-		Proxy:  p,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating Service controller: %w", err)
-	}
-
-	if err = (&controller.BackendTLSPolicyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		State:  st,
-		Proxy:  p,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating BackendTLSPolicy controller: %w", err)
-	}
-
-	if err = (&controller.ConfigMapReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		State:  st,
-		Proxy:  p,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating ConfigMap controller: %w", err)
-	}
 
 	g.Go(func() error {
 		setupLog.Info("starting manager")

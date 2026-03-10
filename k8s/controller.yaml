@@ -13,11 +13,35 @@ rules:
   resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: [""]
-  resources: ["services", "configmaps"]
+  resources: ["services", "configmaps", "serviceaccounts"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
   verbs: ["get", "list", "watch"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterrolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status"]
   verbs: ["update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gari-gateway
+rules:
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["httproutes", "gateways", "backendtlspolicies", "gatewayclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gateways/status", "httproutes/status", "backendtlspolicies/status"]
+  verbs: ["update", "patch"]
+- apiGroups: [""]
+  resources: ["services", "configmaps"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -59,26 +83,11 @@ spec:
       - name: controller
         image: gari-controller:e2e
         imagePullPolicy: Never
-        args: ["--proxy-bind-address", ":8000"]
+        env:
+        - name: CONTROLLER_IMAGE
+          value: gari-controller:e2e
         ports:
-        - containerPort: 8000
-          name: proxy
-        - containerPort: 8443
-          name: proxy-https
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: gari-proxy
-  namespace: default
-spec:
-  type: LoadBalancer
-  selector:
-    app: gari-controller
-  ports:
-  - port: 80
-    targetPort: 8000
-    name: http
-  - port: 443
-    targetPort: 8443
-    name: https
+        - containerPort: 8080
+          name: metrics
+        - containerPort: 8081
+          name: health

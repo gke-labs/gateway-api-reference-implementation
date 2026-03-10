@@ -17,18 +17,71 @@ package controller
 import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func updateProxy(st *state.State, p *proxy.Proxy) {
-	gateways := st.GetGateways()
-	routes := st.GetHTTPRoutes()
-	services := st.GetServices()
-	backendTLSPolicies := st.GetBackendTLSPolicies()
-	configMaps := st.GetConfigMaps()
+type GatewayControllerOptions struct {
+	client.Client
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	SkipStatusUpdate bool
+
+	GatewayName      string
+	GatewayNamespace string
+}
+
+func (o *GatewayControllerOptions) UpdateProxy() {
+	if o.Proxy == nil {
+		return
+	}
+	gateways := o.State.GetGateways()
+	routes := o.State.GetHTTPRoutes()
+	services := o.State.GetServices()
+	backendTLSPolicies := o.State.GetBackendTLSPolicies()
+	configMaps := o.State.GetConfigMaps()
 
 	var proxyRoutes []state.InternalRoute
 	for _, gw := range gateways {
+		// If GatewayName is set, only build routes for that gateway
+		if o.GatewayName != "" && gw.Name != o.GatewayName {
+			continue
+		}
+		if o.GatewayNamespace != "" && gw.Namespace != o.GatewayNamespace {
+			continue
+		}
 		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, ControllerName)...)
 	}
-	p.UpdateRoutes(proxyRoutes)
+	o.Proxy.UpdateRoutes(proxyRoutes)
+}
+
+func hasCondition(conditions []metav1.Condition, target metav1.Condition) bool {
+	for _, c := range conditions {
+		if c.Type == target.Type && c.Status == target.Status && c.Reason == target.Reason && c.ObservedGeneration == target.ObservedGeneration {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeConditions(existing []metav1.Condition, newConds []metav1.Condition) []metav1.Condition {
+	res := make([]metav1.Condition, len(existing))
+	copy(res, existing)
+
+	for _, n := range newConds {
+		found := false
+		for i, e := range res {
+			if e.Type == n.Type {
+				res[i] = n
+				found = true
+				break
+			}
+		}
+		if !found {
+			res = append(res, n)
+		}
+	}
+	return res
 }

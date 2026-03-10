@@ -17,10 +17,12 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o gateway-api-reference-implementation cmd/gateway-api-reference-implementation/main.go
+RUN CGO_ENABLED=0 go build -o gari-operator cmd/gari-operator/main.go
+RUN CGO_ENABLED=0 go build -o gari-gateway cmd/gari-gateway/main.go
 
 FROM alpine:3.19
 WORKDIR /
-COPY --from=builder /app/gateway-api-reference-implementation .
+COPY --from=builder /app/gari-operator .
+COPY --from=builder /app/gari-gateway .
 USER 65532:65532
-ENTRYPOINT ["/gateway-api-reference-implementation"]
+ENTRYPOINT ["/gari-operator"]
