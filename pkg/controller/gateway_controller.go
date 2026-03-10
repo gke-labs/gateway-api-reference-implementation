@@ -181,21 +181,23 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	routes := r.State.GetHTTPRoutes()
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
+		resolvedRefsCondition, supportedKinds := r.computeResolvedRefsAndSupportedKinds(gw.Generation, listener)
+
 		attachedRoutes := 0
-		for _, route := range routes {
-			for _, parentRef := range route.Spec.ParentRefs {
-				if string(parentRef.Name) == gw.Name {
-					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
-							attachedRoutes++
-							break
+		if len(supportedKinds) > 0 {
+			for _, route := range routes {
+				for _, parentRef := range route.Spec.ParentRefs {
+					if string(parentRef.Name) == gw.Name {
+						if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
+							if route.IsAccepted(ControllerName) {
+								attachedRoutes++
+								break
+							}
 						}
 					}
 				}
 			}
 		}
-
-		resolvedRefsCondition, supportedKinds := r.computeResolvedRefsAndSupportedKinds(gw, listener)
 
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
@@ -308,11 +310,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
-func (r *GatewayReconciler) computeResolvedRefsAndSupportedKinds(gw *gatewayv1.Gateway, listener gatewayv1.Listener) (metav1.Condition, []gatewayv1.RouteGroupKind) {
+func (r *GatewayReconciler) computeResolvedRefsAndSupportedKinds(generation int64, listener gatewayv1.Listener) (metav1.Condition, []gatewayv1.RouteGroupKind) {
 	condition := metav1.Condition{
 		Type:               string(gatewayv1.ListenerConditionResolvedRefs),
 		Status:             metav1.ConditionTrue,
-		ObservedGeneration: gw.Generation,
+		ObservedGeneration: generation,
 		LastTransitionTime: metav1.Now(),
 		Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
 		Message:            "All references resolved",
@@ -322,7 +324,8 @@ func (r *GatewayReconciler) computeResolvedRefsAndSupportedKinds(gw *gatewayv1.G
 
 	if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
 		var unsupportedMsgs []string
-		hasHTTPRoute := false
+		seenKinds := make(map[string]bool)
+		seenUnsupportedMsgs := make(map[string]bool)
 
 		for _, k := range listener.AllowedRoutes.Kinds {
 			group := gatewayv1.Group(gatewayv1.GroupName)
@@ -330,16 +333,22 @@ func (r *GatewayReconciler) computeResolvedRefsAndSupportedKinds(gw *gatewayv1.G
 				group = *k.Group
 			}
 
+			kindKey := fmt.Sprintf("%s/%s", group, k.Kind)
+
 			if group == gatewayv1.Group(gatewayv1.GroupName) && k.Kind == "HTTPRoute" {
-				if !hasHTTPRoute {
+				if !seenKinds[kindKey] {
 					supportedKinds = append(supportedKinds, gatewayv1.RouteGroupKind{
 						Group: state.Ptr(group),
 						Kind:  k.Kind,
 					})
-					hasHTTPRoute = true
+					seenKinds[kindKey] = true
 				}
 			} else {
-				unsupportedMsgs = append(unsupportedMsgs, fmt.Sprintf("Group %q and Kind %q are not supported", group, k.Kind))
+				msg := fmt.Sprintf("Group %q and Kind %q are not supported", group, k.Kind)
+				if !seenUnsupportedMsgs[msg] {
+					unsupportedMsgs = append(unsupportedMsgs, msg)
+					seenUnsupportedMsgs[msg] = true
+				}
 			}
 		}
 
@@ -350,12 +359,16 @@ func (r *GatewayReconciler) computeResolvedRefsAndSupportedKinds(gw *gatewayv1.G
 		}
 
 		if supportedKinds == nil {
-			supportedKinds = make([]gatewayv1.RouteGroupKind, 0)
+			supportedKinds = []gatewayv1.RouteGroupKind{}
 		}
 	} else {
 		// TODO: Dynamically default to other route types based on listener protocol in the future (e.g. TCPRoute for TCP)
-		supportedKinds = []gatewayv1.RouteGroupKind{
-			{Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)), Kind: "HTTPRoute"},
+		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
+			supportedKinds = []gatewayv1.RouteGroupKind{
+				{Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)), Kind: "HTTPRoute"},
+			}
+		} else {
+			supportedKinds = []gatewayv1.RouteGroupKind{}
 		}
 	}
 
