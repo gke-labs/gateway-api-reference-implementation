@@ -63,7 +63,7 @@ func runServer() {
 
 		body, _ := io.ReadAll(r.Body)
 
-		resp := map[string]interface{}{
+		resp := map[string]any{
 			"headers":  headers,
 			"body":     string(body),
 			"method":   r.Method,

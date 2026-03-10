@@ -62,6 +62,17 @@ func TestGatewayAPI(t *testing.T) {
 	if !strings.Contains(logs, "Status: 200 OK") || (!strings.Contains(logs, "\"hostname\":\"example.com\"") && !strings.Contains(logs, "\"host\": \"example.com\"")) {
 		controllerLogs := h.runCmd("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
 		t.Logf("Controller logs: %s", controllerLogs)
+
+		// Also get logs from all gari-proxy pods
+		podList := h.runCmd("kubectl", "get", "pods", "-l", "app=gari-proxy", "--no-headers", "-o", "custom-columns=:metadata.name")
+		for _, podName := range strings.Split(strings.TrimSpace(podList), "\n") {
+			if podName == "" {
+				continue
+			}
+			podLogs := h.runCmd("kubectl", "logs", podName)
+			t.Logf("Proxy pod %s logs: %s", podName, podLogs)
+		}
+
 		if !strings.Contains(logs, "Status: 200 OK") {
 			t.Errorf("Expected 200 OK, got: %s", logs)
 		}
