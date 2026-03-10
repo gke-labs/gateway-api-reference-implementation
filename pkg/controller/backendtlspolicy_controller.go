@@ -37,9 +37,10 @@ import (
 
 type BackendTLSPolicyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	SkipStatusUpdate bool
 }
 
 func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -52,6 +53,13 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			r.updateProxy()
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	r.State.UpsertBackendTLSPolicy(policy)
+
+	if r.SkipStatusUpdate {
+		r.updateProxy()
+		return ctrl.Result{}, nil
 	}
 
 	// Find all Gateways that use this policy (via Services referenced in HTTPRoutes)

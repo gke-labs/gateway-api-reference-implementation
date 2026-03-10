@@ -16,16 +16,22 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -34,7 +40,8 @@ import (
 
 type GatewayClassReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme           *runtime.Scheme
+	SkipStatusUpdate bool
 }
 
 func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -46,6 +53,10 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if gc.Spec.ControllerName != ControllerName {
+		return ctrl.Result{}, nil
+	}
+
+	if r.SkipStatusUpdate {
 		return ctrl.Result{}, nil
 	}
 
@@ -106,9 +117,10 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 type GatewayReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	SkipStatusUpdate bool
 }
 
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -134,10 +146,16 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	// Find the LoadBalancer IP of the gari-proxy service
-	var svc corev1.Service
-	if err := r.Get(ctx, client.ObjectKey{Name: "gari-proxy", Namespace: "default"}, &svc); err != nil {
-		l.Error(err, "unable to fetch gari-proxy service")
+	if r.SkipStatusUpdate {
+		r.State.UpsertGateway(gw)
+		r.updateProxy()
+		return ctrl.Result{}, nil
+	}
+
+	// Sync infrastructure
+	svc, err := r.syncInfrastructure(ctx, gw)
+	if err != nil {
+		l.Error(err, "unable to sync infrastructure")
 		return ctrl.Result{}, err
 	}
 
@@ -147,8 +165,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if ip == "" {
-		l.Info("gari-proxy service has no LoadBalancer IP yet")
-		return ctrl.Result{Requeue: true}, nil
+		l.Info("Gateway service has no LoadBalancer IP yet")
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	// Update status to Programmed and add address
@@ -317,9 +335,137 @@ func (r *GatewayReconciler) updateProxy() {
 	updateProxy(r.State, r.Proxy)
 }
 
+func (r *GatewayReconciler) syncInfrastructure(ctx context.Context, gw *gatewayv1.Gateway) (*corev1.Service, error) {
+	image := os.Getenv("CONTROLLER_IMAGE")
+	if image == "" {
+		image = "gari-controller:e2e"
+	}
+
+	labels := map[string]string{
+		"app":                                    "gari-proxy",
+		"gateway.networking.k8s.io/gateway-name": gw.Name,
+	}
+	if gw.Spec.Infrastructure != nil {
+		for k, v := range gw.Spec.Infrastructure.Labels {
+			labels[string(k)] = string(v)
+		}
+	}
+
+	annotations := map[string]string{}
+	if gw.Spec.Infrastructure != nil {
+		for k, v := range gw.Spec.Infrastructure.Annotations {
+			annotations[string(k)] = string(v)
+		}
+	}
+
+	// 1. Create/Update ServiceAccount
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        fmt.Sprintf("gari-%s", gw.Name),
+			Namespace:   gw.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+	}
+	if err := controllerutil.SetControllerReference(gw, sa, r.Scheme); err != nil {
+		return nil, err
+	}
+	if _, err := ctrl.CreateOrUpdate(ctx, r.Client, sa, func() error {
+		sa.Labels = labels
+		sa.Annotations = annotations
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// 2. Create/Update Deployment
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        fmt.Sprintf("gari-%s", gw.Name),
+			Namespace:   gw.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+	}
+	if err := controllerutil.SetControllerReference(gw, deploy, r.Scheme); err != nil {
+		return nil, err
+	}
+
+	if _, err := ctrl.CreateOrUpdate(ctx, r.Client, deploy, func() error {
+		deploy.Labels = labels
+		deploy.Annotations = annotations
+		deploy.Spec.Replicas = state.Ptr(int32(1))
+		deploy.Spec.Selector = &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"gateway.networking.k8s.io/gateway-name": gw.Name,
+			},
+		}
+		deploy.Spec.Template.ObjectMeta.Labels = labels
+		deploy.Spec.Template.ObjectMeta.Annotations = annotations
+		deploy.Spec.Template.Spec.ServiceAccountName = sa.Name
+		deploy.Spec.Template.Spec.Containers = []corev1.Container{
+			{
+				Name:            "proxy",
+				Image:           image,
+				ImagePullPolicy: corev1.PullNever,
+				Args:            []string{"--proxy-only", "--enable-h2c"},
+				Ports: []corev1.ContainerPort{
+					{Name: "http", ContainerPort: 8000},
+					{Name: "https", ContainerPort: 8443},
+				},
+			},
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// 3. Create/Update Service
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        fmt.Sprintf("gari-%s", gw.Name),
+			Namespace:   gw.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+	}
+	if err := controllerutil.SetControllerReference(gw, svc, r.Scheme); err != nil {
+		return nil, err
+	}
+
+	if _, err := ctrl.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		svc.Labels = labels
+		svc.Annotations = annotations
+		svc.Spec.Type = corev1.ServiceTypeLoadBalancer
+		svc.Spec.Selector = map[string]string{
+			"gateway.networking.k8s.io/gateway-name": gw.Name,
+		}
+		svc.Spec.Ports = []corev1.ServicePort{
+			{
+				Name:       "http",
+				Port:       80,
+				TargetPort: intstr.FromString("http"),
+			},
+			{
+				Name:       "https",
+				Port:       443,
+				TargetPort: intstr.FromString("https"),
+			},
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return svc, nil
+}
+
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.ServiceAccount{}).
 		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			// When an HTTPRoute changes, reconcile all Gateways it references
 			route := obj.(*gatewayv1.HTTPRoute)

@@ -32,9 +32,10 @@ import (
 
 type HTTPRouteReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	SkipStatusUpdate bool
 }
 
 func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -51,6 +52,11 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// If the route is not accepted, we still update the state but it won't be used for proxying
 	validationCondition := r.State.UpsertHTTPRoute(route)
+
+	if r.SkipStatusUpdate {
+		r.updateProxy()
+		return ctrl.Result{}, nil
+	}
 
 	// Update status
 	// For each parentRef, we should add a ParentStatus

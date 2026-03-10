@@ -13,7 +13,13 @@ rules:
   resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: [""]
-  resources: ["services", "configmaps"]
+  resources: ["services", "configmaps", "serviceaccounts"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status"]
@@ -59,6 +65,9 @@ spec:
       - name: controller
         image: gari-controller:e2e
         imagePullPolicy: Never
+        env:
+        - name: CONTROLLER_IMAGE
+          value: gari-controller:e2e
         args: ["--proxy-bind-address", ":8000"]
         ports:
         - containerPort: 8000

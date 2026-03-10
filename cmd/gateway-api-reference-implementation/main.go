@@ -72,11 +72,13 @@ func run(ctx context.Context) error {
 	var proxyAddr string
 	var proxyHTTPSAddr string
 	var enableH2C bool
+	var proxyOnly bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&proxyAddr, "proxy-bind-address", ":8000", "The address the proxy binds to.")
 	flag.StringVar(&proxyHTTPSAddr, "proxy-https-bind-address", ":8443", "The address the proxy binds to for HTTPS.")
 	flag.BoolVar(&enableH2C, "enable-h2c", false, "Enable H2C support on the proxy server.")
+	flag.BoolVar(&proxyOnly, "proxy-only", false, "Run in proxy-only mode, skipping controller reconcilers.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -166,26 +168,29 @@ func run(ctx context.Context) error {
 	})
 
 	if err = (&controller.HTTPRouteReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		State:  st,
-		Proxy:  p,
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		SkipStatusUpdate: proxyOnly,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
 	}
 
 	if err = (&controller.GatewayClassReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		SkipStatusUpdate: proxyOnly,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating GatewayClass controller: %w", err)
 	}
 
 	if err = (&controller.GatewayReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		State:  st,
-		Proxy:  p,
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		SkipStatusUpdate: proxyOnly,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating Gateway controller: %w", err)
 	}
@@ -200,10 +205,11 @@ func run(ctx context.Context) error {
 	}
 
 	if err = (&controller.BackendTLSPolicyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		State:  st,
-		Proxy:  p,
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		SkipStatusUpdate: proxyOnly,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating BackendTLSPolicy controller: %w", err)
 	}
