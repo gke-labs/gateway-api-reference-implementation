@@ -314,6 +314,7 @@ func resolveBackend(
 	services map[types.NamespacedName]*corev1.Service,
 	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	secrets map[types.NamespacedName]*corev1.Secret,
 ) (*InternalBackend, *ErrorState) {
 	kind := ValueOf(backendRef.Kind)
 	if kind == "" {
@@ -409,7 +410,7 @@ func resolveBackend(
 	}, nil
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
+func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, secrets map[types.NamespacedName]*corev1.Secret, controllerName string) []InternalRoute {
 	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
 	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
 		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
@@ -506,7 +507,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						}
 					case gatewayv1.HTTPRouteFilterRequestMirror:
 						m := filter.RequestMirror
-						if backend, errState := resolveBackend(m.BackendRef, route.Namespace, services, backendTLSPolicies, configMaps); errState != nil {
+						if backend, errState := resolveBackend(m.BackendRef, route.Namespace, services, backendTLSPolicies, configMaps, secrets); errState != nil {
 							// For mirrors, if resolution fails, we do not fail the primary request.
 							// The Gateway API spec dictates that invalid mirror requests are dropped,
 							// but the route's ResolvedRefs condition is set to False (handled in ComputeResolvedRefsCondition).
@@ -525,10 +526,10 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				if redirect == nil {
 					var ruleErr *ErrorState
 					for _, backendRef := range rule.BackendRefs {
-						backend, errState := resolveBackend(backendRef.BackendObjectReference, route.Namespace, services, backendTLSPolicies, configMaps)
+						backend, errState := resolveBackend(backendRef.BackendObjectReference, route.Namespace, services, backendTLSPolicies, configMaps, secrets)
 						if errState != nil {
 							ruleErr = errState
-							break // Fail the rule immediately if any backend is invalid
+							continue // Do not fail immediately, keep looking for valid backends
 						}
 
 						if backend != nil && iRule.Backend == nil {
@@ -537,9 +538,9 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						}
 					}
 
-					if ruleErr != nil {
+					if iRule.Backend == nil && ruleErr != nil {
+						// Only fail the rule if no valid backends were found
 						iRule.Error = ruleErr
-						iRule.Backend = nil
 					}
 				}
 

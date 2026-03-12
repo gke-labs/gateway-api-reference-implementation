@@ -724,7 +724,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
+			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, tt.backendTLSPolicies, tt.configMaps, nil, controllerName)
 			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
 			if diff != "" {
 				t.Errorf("BuildInternalRoutes() mismatch (-want +got):\n%s", diff)
@@ -926,7 +926,7 @@ func TestBuildInternalRoutes_Mirror(t *testing.T) {
 		},
 	}
 
-	actual := gateway.BuildInternalRoutes(routes, services, nil, nil, controllerName)
+	actual := gateway.BuildInternalRoutes(routes, services, nil, nil, nil, controllerName)
 
 	if diff := cmp.Diff(expected, actual); diff != "" {
 		t.Errorf("BuildInternalRoutes() mismatch (-expected +actual):\n%s", diff)

@@ -15,7 +15,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -51,19 +50,50 @@ func NewProxy() *Proxy {
 	}
 }
 
+func (p *Proxy) getMirrorKey(backend *state.InternalBackend) string {
+	scheme := "http"
+	if backend.TLSConfig != nil {
+		scheme = "https"
+	}
+	key := fmt.Sprintf("%s-%s:%d", scheme, backend.Host, backend.Port)
+	if backend.TLSConfig != nil {
+		h := sha256.New()
+		h.Write([]byte(backend.TLSConfig.Hostname))
+		h.Write([]byte{0})
+		for _, cert := range backend.TLSConfig.CACerts {
+			h.Write(cert)
+			h.Write([]byte{0})
+		}
+		key = fmt.Sprintf("%s-%x", key, h.Sum(nil))
+	}
+	return key
+}
+
 func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.routes = routes
 
-	// Evict unused mirror clients to prevent idle connections from leaking permanently
-	p.mirrorClients.Range(func(key, value any) bool {
-		if client, ok := value.(*http.Client); ok && client.Transport != nil {
-			if transport, ok := client.Transport.(*http.Transport); ok {
-				transport.CloseIdleConnections()
+	// Calculate active mirror keys
+	activeKeys := make(map[string]struct{})
+	for _, route := range routes {
+		for _, rule := range route.Rules {
+			for _, mirror := range rule.Mirrors {
+				activeKeys[p.getMirrorKey(mirror)] = struct{}{}
 			}
 		}
-		p.mirrorClients.Delete(key)
+	}
+
+	// Evict unused mirror clients to prevent idle connections from leaking permanently
+	p.mirrorClients.Range(func(key, value any) bool {
+		if _, active := activeKeys[key.(string)]; !active {
+			if client, ok := value.(*http.Client); ok && client.Transport != nil {
+				if transport, ok := client.Transport.(*http.Transport); ok {
+					transport.CloseIdleConnections()
+				}
+			}
+			p.mirrorClients.Delete(key)
+		}
 		return true
 	})
 }
@@ -88,58 +118,48 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if bestRule.Backend != nil {
-			var mirrorBody []byte
+			var mirrorReaders []io.Reader
 			var shouldMirror = len(bestRule.Mirrors) > 0
 			if shouldMirror {
 				if r.ContentLength > 1024*1024 {
-					log.Log.Info("Content-Length too large to mirror, skipping mirror filters", "host", r.Host)
+					log.Log.V(1).Info("Content-Length too large to mirror, skipping mirror filters", "host", r.Host)
 					shouldMirror = false
-				} else {
-					lr := io.LimitReader(r.Body, 1024*1024+1)
-					bodyBytes, err := io.ReadAll(lr)
-					if err != nil {
-						log.Log.Error(err, "Error reading request body for mirroring")
-						http.Error(w, "Error reading request body", http.StatusInternalServerError)
-						return
+				} else if r.ContentLength > 0 || r.ContentLength == -1 {
+					var writers []io.Writer
+					for i := 0; i < len(bestRule.Mirrors); i++ {
+						pr, pw := io.Pipe()
+						mirrorReaders = append(mirrorReaders, pr)
+						writers = append(writers, pw)
 					}
-					if len(bodyBytes) > 1024*1024 {
-						log.Log.Info("Request body too large to mirror, skipping mirror filters", "host", r.Host)
-						shouldMirror = false
-						r.Body = struct {
-							io.Reader
-							io.Closer
-						}{
-							Reader: io.MultiReader(bytes.NewReader(bodyBytes), r.Body),
-							Closer: r.Body,
-						}
+					var mw io.Writer
+					if len(writers) == 1 {
+						mw = writers[0]
 					} else {
-						mirrorBody = bodyBytes
-						r.Body.Close()
-						if len(mirrorBody) == 0 {
-							r.Body = http.NoBody
-						} else {
-							r.Body = io.NopCloser(bytes.NewReader(mirrorBody))
-						}
+						mw = io.MultiWriter(writers...)
+					}
+					r.Body = &teeReadCloser{
+						r: io.TeeReader(r.Body, mw),
+						c: r.Body,
+						w: writers,
 					}
 				}
 			}
 
 			if shouldMirror {
-				for _, mirror := range bestRule.Mirrors {
+				for i, mirror := range bestRule.Mirrors {
 					mReq := r.Clone(context.WithoutCancel(r.Context()))
 					removeHopByHopHeaders(mReq.Header)
+					mReq.Header.Del("Host")
+					mReq.Host = ""
 					mReq.Trailer = nil
-					if len(mirrorBody) == 0 {
+					
+					if r.ContentLength == 0 {
 						mReq.Body = http.NoBody
-						if mReq.ContentLength == 0 {
-							mReq.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
-						}
+						mReq.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
 					} else {
-						mReq.Body = io.NopCloser(bytes.NewReader(mirrorBody))
-						mReq.GetBody = func() (io.ReadCloser, error) {
-							return io.NopCloser(bytes.NewReader(mirrorBody)), nil
-						}
+						mReq.Body = io.NopCloser(mirrorReaders[i])
 					}
+
 					select {
 					case p.mirrorSem <- struct{}{}:
 						go func(mr *http.Request, mb state.InternalBackend) {
@@ -147,7 +167,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							p.mirror(mr, mb)
 						}(mReq, *mirror)
 					default:
-						log.Log.Error(nil, "Mirror semaphore full, dropping mirror request", "host", r.Host)
+						log.Log.V(1).Info("Mirror concurrency limit reached, skipping mirror request", "host", r.Host)
+						if r.ContentLength != 0 {
+							go io.Copy(io.Discard, mirrorReaders[i])
+						}
 					}
 				}
 			}
@@ -371,4 +394,31 @@ func removeHopByHopHeaders(h http.Header) {
 	for _, hop := range hopHeaders {
 		h.Del(hop)
 	}
+}
+
+type teeReadCloser struct {
+	r io.Reader
+	c io.Closer
+	w []io.Writer
+}
+
+func (t *teeReadCloser) Read(p []byte) (n int, err error) {
+	n, err = t.r.Read(p)
+	if err != nil {
+		for _, w := range t.w {
+			if pw, ok := w.(*io.PipeWriter); ok {
+				pw.CloseWithError(err)
+			}
+		}
+	}
+	return
+}
+
+func (t *teeReadCloser) Close() error {
+	for _, w := range t.w {
+		if pw, ok := w.(*io.PipeWriter); ok {
+			pw.Close()
+		}
+	}
+	return t.c.Close()
 }
