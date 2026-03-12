@@ -59,7 +59,6 @@ func (s *HTTPRouteState) GetNamespace() string {
 type InternalRoute struct {
 	Hostnames []string
 	Rules     []InternalRule
-	TLSConfig *InternalFrontendTLSConfig
 }
 
 type InternalFrontendTLSConfig struct {
@@ -379,78 +378,8 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				continue
 			}
 
-			// Extract frontend TLS validation config if present
-			var frontendTLSConfig *InternalFrontendTLSConfig
-			if s.Spec.TLS != nil && s.Spec.TLS.Frontend != nil {
-				var validation *gatewayv1.FrontendTLSValidation
-				foundPerPort := false
-				// Check for per-port configuration first
-				for _, pp := range s.Spec.TLS.Frontend.PerPort {
-					if int32(pp.Port) == int32(listener.Port) {
-						validation = pp.TLS.Validation
-						foundPerPort = true
-						break
-					}
-				}
-				// Use default if no per-port configuration
-				if !foundPerPort {
-					validation = s.Spec.TLS.Frontend.Default.Validation
-				}
-
-				if validation != nil {
-					clientCAs := x509.NewCertPool()
-					invalidRef := false
-					for _, caRef := range validation.CACertificateRefs {
-						if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-							ns := s.Namespace
-							if caRef.Namespace != nil {
-								ns = string(*caRef.Namespace)
-							}
-							if ns != s.Namespace {
-								// Cross-namespace references without ReferenceGrant are invalid/unsupported here
-								invalidRef = true
-								break
-							}
-							cmName := types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}
-							if cm, ok := configMaps[cmName]; ok {
-								if data, ok := cm.Data["ca.crt"]; ok {
-									clientCAs.AppendCertsFromPEM([]byte(data))
-								} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-									clientCAs.AppendCertsFromPEM(data)
-								} else {
-									invalidRef = true
-									break
-								}
-							} else {
-								invalidRef = true
-								break
-							}
-						} else {
-							invalidRef = true
-							break
-						}
-					}
-					if invalidRef {
-						// Fail closed on invalid refs
-						frontendTLSConfig = &InternalFrontendTLSConfig{
-							ClientCAs: x509.NewCertPool(),
-							Mode:      gatewayv1.AllowValidOnly,
-						}
-					} else {
-						frontendTLSConfig = &InternalFrontendTLSConfig{
-							ClientCAs: clientCAs,
-							Mode:      validation.Mode,
-						}
-						if frontendTLSConfig.Mode == "" {
-							frontendTLSConfig.Mode = gatewayv1.AllowValidOnly
-						}
-					}
-				}
-			}
-
 			ir := InternalRoute{
 				Hostnames: effectiveHostnames,
-				TLSConfig: frontendTLSConfig,
 			}
 
 			resolvedRefsCond := route.ComputeResolvedRefsCondition()
@@ -628,4 +557,63 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 	}
 
 	return internalRoutes
+}
+
+type InternalListener struct {
+	Hostname  string
+	TLSConfig *InternalFrontendTLSConfig
+}
+
+func (s *GatewayState) BuildInternalListeners(configMaps map[types.NamespacedName]*corev1.ConfigMap) []InternalListener {
+	var listeners []InternalListener
+
+	for _, listener := range s.Spec.Listeners {
+		if listener.Protocol != gatewayv1.HTTPSProtocolType {
+			continue
+		}
+
+		var frontendTLSConfig *InternalFrontendTLSConfig
+		if s.Spec.TLS != nil && s.Spec.TLS.Frontend != nil {
+			var validation *gatewayv1.FrontendTLSValidation
+			foundPerPort := false
+			// Check for per-port configuration first
+			for _, pp := range s.Spec.TLS.Frontend.PerPort {
+				if pp.Port == listener.Port {
+					validation = pp.TLS.Validation
+					foundPerPort = true
+					break
+				}
+			}
+			// Use default if no per-port configuration
+			if !foundPerPort {
+				validation = s.Spec.TLS.Frontend.Default.Validation
+			}
+
+			if validation != nil {
+				clientCAs, _, _, allInvalid := ResolveCACertificateRefs(validation, configMaps, s.Namespace)
+				if allInvalid {
+					// Fail closed on invalid refs
+					frontendTLSConfig = &InternalFrontendTLSConfig{
+						ClientCAs: x509.NewCertPool(),
+						Mode:      gatewayv1.AllowValidOnly,
+					}
+				} else {
+					frontendTLSConfig = &InternalFrontendTLSConfig{
+						ClientCAs: clientCAs,
+						Mode:      validation.Mode,
+					}
+					if frontendTLSConfig.Mode == "" {
+						frontendTLSConfig.Mode = gatewayv1.AllowValidOnly
+					}
+				}
+			}
+		}
+
+		listeners = append(listeners, InternalListener{
+			Hostname:  string(ValueOf(listener.Hostname)),
+			TLSConfig: frontendTLSConfig,
+		})
+	}
+
+	return listeners
 }

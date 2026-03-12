@@ -177,7 +177,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				var validation *gatewayv1.FrontendTLSValidation
 				foundPerPort := false
 				for _, pp := range gw.Spec.TLS.Frontend.PerPort {
-					if int32(pp.Port) == int32(listener.Port) {
+					if pp.Port == listener.Port {
 						validation = pp.TLS.Validation
 						foundPerPort = true
 						break
@@ -262,7 +262,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			var validation *gatewayv1.FrontendTLSValidation
 			foundPerPort := false
 			for _, pp := range gw.Spec.TLS.Frontend.PerPort {
-				if int32(pp.Port) == int32(listener.Port) {
+				if pp.Port == listener.Port {
 					validation = pp.TLS.Validation
 					foundPerPort = true
 					break
@@ -273,52 +273,20 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 
 			if validation != nil {
-				for _, caRef := range validation.CACertificateRefs {
-					if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-						ns := gw.Namespace
-						if caRef.Namespace != nil {
-							ns = string(*caRef.Namespace)
-						}
-						if ns != gw.Namespace {
-							resolvedRefsCondition.Status = metav1.ConditionFalse
-							resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
-							resolvedRefsCondition.Message = "Cross-namespace references are not permitted without ReferenceGrant"
-							break
-						}
-
-						cmName := types.NamespacedName{Namespace: ns, Name: string(caRef.Name)}
-						if cm, ok := configMaps[cmName]; ok {
-							if _, ok := cm.Data["ca.crt"]; ok {
-								// Found in Data
-							} else if _, ok := cm.BinaryData["ca.crt"]; ok {
-								// Found in BinaryData
-							} else {
-								resolvedRefsCondition.Status = metav1.ConditionFalse
-								resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
-								resolvedRefsCondition.Message = "Missing ca.crt in ConfigMap"
-								break
-							}
-						} else {
-							resolvedRefsCondition.Status = metav1.ConditionFalse
-							resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
-							resolvedRefsCondition.Message = "ConfigMap not found"
-							break
-						}
-					} else {
-						resolvedRefsCondition.Status = metav1.ConditionFalse
-						resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateKind)
-						resolvedRefsCondition.Message = "Unsupported CACertificateRef Group/Kind"
-						break
-					}
+				_, reason, message, allInvalid := state.ResolveCACertificateRefs(validation, configMaps, gw.Namespace)
+				if reason != "" {
+					resolvedRefsCondition.Status = metav1.ConditionFalse
+					resolvedRefsCondition.Reason = string(reason)
+					resolvedRefsCondition.Message = message
 				}
-
-				if resolvedRefsCondition.Status == metav1.ConditionFalse {
+				if allInvalid {
 					acceptedCondition.Status = metav1.ConditionFalse
 					acceptedCondition.Reason = string(gatewayv1.ListenerReasonNoValidCACertificate)
-					if resolvedRefsCondition.Reason == string(gatewayv1.ListenerReasonInvalidCACertificateKind) {
+					acceptedCondition.Message = "No valid CACertificateRefs found"
+					if reason == gatewayv1.ListenerReasonInvalidCACertificateKind {
 						acceptedCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateKind)
+						acceptedCondition.Message = message
 					}
-					acceptedCondition.Message = "Invalid CA Certificate Reference"
 				}
 			}
 		}
@@ -425,19 +393,42 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			// Find all Gateways and enqueue them
+			cm := obj.(*corev1.ConfigMap)
 			var gateways gatewayv1.GatewayList
 			if err := r.List(ctx, &gateways); err != nil {
 				return nil
 			}
 			var requests []ctrl.Request
 			for _, gw := range gateways.Items {
-				requests = append(requests, ctrl.Request{
-					NamespacedName: types.NamespacedName{
-						Namespace: gw.Namespace,
-						Name:      gw.Name,
-					},
-				})
+				// Check if this Gateway references the modified ConfigMap
+				if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+					referenced := false
+					checkRefs := func(validation *gatewayv1.FrontendTLSValidation) {
+						if validation == nil {
+							return
+						}
+						for _, ref := range validation.CACertificateRefs {
+							ns := gw.Namespace
+							if ref.Namespace != nil {
+								ns = string(*ref.Namespace)
+							}
+							if string(ref.Name) == cm.Name && ns == cm.Namespace {
+								referenced = true
+							}
+						}
+					}
+					if gw.Spec.TLS.Frontend.Default.Validation != nil {
+						checkRefs(gw.Spec.TLS.Frontend.Default.Validation)
+					}
+					for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+						checkRefs(pp.TLS.Validation)
+					}
+					if referenced {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name},
+						})
+					}
+				}
 			}
 			return requests
 		})).

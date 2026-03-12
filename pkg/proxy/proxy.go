@@ -16,9 +16,10 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"net/http"
@@ -35,8 +36,9 @@ import (
 
 // Proxy is a minimal implementation of a Gateway API proxy.
 type Proxy struct {
-	mu     sync.RWMutex
-	routes []state.InternalRoute
+	mu        sync.RWMutex
+	routes    []state.InternalRoute
+	listeners []state.InternalListener
 
 	// DefaultCertificates are used when no other certificates are available.
 	DefaultCertificates []tls.Certificate
@@ -44,7 +46,8 @@ type Proxy struct {
 
 func NewProxy() *Proxy {
 	return &Proxy{
-		routes: []state.InternalRoute{},
+		routes:    []state.InternalRoute{},
+		listeners: []state.InternalListener{},
 	}
 }
 
@@ -54,9 +57,10 @@ func (p *Proxy) SetDefaultCertificates(certs []tls.Certificate) {
 	p.DefaultCertificates = certs
 }
 
-func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
+func (p *Proxy) Update(listeners []state.InternalListener, routes []state.InternalRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.listeners = listeners
 	p.routes = routes
 }
 
@@ -91,33 +95,33 @@ func getHostnameMatchSpecificity(hostnames []string, host string) int {
 
 func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 	p.mu.RLock()
-	routes := p.routes
+	listeners := p.listeners
 	defaultCerts := p.DefaultCertificates
 	p.mu.RUnlock()
 
-	// Find the most specific matching route for the SNI
-	var bestRoute *state.InternalRoute
+	// Find the most specific matching listener for the SNI
+	var bestListener *state.InternalListener
 	bestScore := -1
 
-	for i := range routes {
-		route := &routes[i]
-		score := getHostnameMatchSpecificity(route.Hostnames, hello.ServerName)
+	for i := range listeners {
+		listener := &listeners[i]
+		score := getHostnameMatchSpecificity([]string{listener.Hostname}, hello.ServerName)
 		if score > 0 && score > bestScore {
 			bestScore = score
-			bestRoute = route
+			bestListener = listener
 		}
 	}
 
-	if bestRoute != nil && bestRoute.TLSConfig != nil {
-		// Create a new config based on the SNI matching route.
+	if bestListener != nil && bestListener.TLSConfig != nil {
+		// Create a new config based on the SNI matching listener.
 		// Note: We MUST include the certificates here as this config replaces the original one.
 		conf := &tls.Config{
 			Certificates: defaultCerts,
 			NextProtos:   []string{"h2", "http/1.1"},
-			ClientCAs:    bestRoute.TLSConfig.ClientCAs,
+			ClientCAs:    bestListener.TLSConfig.ClientCAs,
 		}
 
-		switch bestRoute.TLSConfig.Mode {
+		switch bestListener.TLSConfig.Mode {
 		case gatewayv1.AllowValidOnly:
 			conf.ClientAuth = tls.RequireAndVerifyClientCert
 		case gatewayv1.AllowInsecureFallback:
@@ -241,7 +245,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-			req.Header.Set("X-Forwarded-Client-Cert", base64.StdEncoding.EncodeToString(r.TLS.PeerCertificates[0].Raw))
+			req.Header.Set("X-Forwarded-Client-Cert", fmt.Sprintf(`Hash=%x;Cert="%s"`, sha256.Sum256(r.TLS.PeerCertificates[0].Raw), url.QueryEscape(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: r.TLS.PeerCertificates[0].Raw})))))
 		} else {
 			req.Header.Del("X-Forwarded-Client-Cert")
 		}
