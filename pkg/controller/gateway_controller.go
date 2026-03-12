@@ -168,6 +168,42 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Message:            "Gateway accepted by reference implementation",
 		},
 	}
+
+	// Check if any listener or default config uses AllowInsecureFallback
+	insecure := false
+	if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+		for _, listener := range gw.Spec.Listeners {
+			if listener.Protocol == gatewayv1.HTTPSProtocolType {
+				var validation *gatewayv1.FrontendTLSValidation
+				foundPerPort := false
+				for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+					if pp.Port == listener.Port {
+						validation = pp.TLS.Validation
+						foundPerPort = true
+						break
+					}
+				}
+				if !foundPerPort && gw.Spec.TLS.Frontend.Default.Validation != nil {
+					validation = gw.Spec.TLS.Frontend.Default.Validation
+				}
+				if validation != nil && validation.Mode == gatewayv1.AllowInsecureFallback {
+					insecure = true
+					break
+				}
+			}
+		}
+	}
+
+	if insecure {
+		newConditions = append(newConditions, metav1.Condition{
+			Type:               string(gatewayv1.GatewayConditionInsecureFrontendValidationMode),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			Reason:             string(gatewayv1.GatewayReasonConfigurationChanged),
+			Message:            "Gateway is configured with AllowInsecureFallback for client certificate validation",
+		})
+	}
+
 	newAddresses := []gatewayv1.GatewayStatusAddress{
 		{
 			Type:  state.Ptr(gatewayv1.IPAddressType),
@@ -178,6 +214,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
 	gs := state.GatewayState{Gateway: gw}
+	configMaps := r.State.GetConfigMaps()
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
@@ -194,36 +231,71 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		programmedCondition := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionProgrammed),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonProgrammed),
+			Message:            "Listener programmed",
+		}
+
+		acceptedCondition := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionAccepted),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonAccepted),
+			Message:            "Listener accepted",
+		}
+
+		resolvedRefsCondition := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+			Message:            "All references resolved",
+		}
+
+		if listener.Protocol == gatewayv1.HTTPSProtocolType && gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+			var validation *gatewayv1.FrontendTLSValidation
+			foundPerPort := false
+			for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+				if pp.Port == listener.Port {
+					validation = pp.TLS.Validation
+					foundPerPort = true
+					break
+				}
+			}
+			if !foundPerPort && gw.Spec.TLS.Frontend.Default.Validation != nil {
+				validation = gw.Spec.TLS.Frontend.Default.Validation
+			}
+
+			if validation != nil {
+				_, reason, message, allInvalid := state.ResolveCACertificateRefs(validation, configMaps, gw.Namespace)
+				if reason != "" {
+					resolvedRefsCondition.Status = metav1.ConditionFalse
+					resolvedRefsCondition.Reason = string(reason)
+					resolvedRefsCondition.Message = message
+				}
+				if allInvalid {
+					acceptedCondition.Status = metav1.ConditionFalse
+					acceptedCondition.Reason = string(gatewayv1.ListenerReasonNoValidCACertificate)
+					acceptedCondition.Message = "No valid CACertificateRefs found"
+					if reason == gatewayv1.ListenerReasonInvalidCACertificateKind {
+						acceptedCondition.Reason = string(gatewayv1.ListenerReasonInvalidCACertificateKind)
+						acceptedCondition.Message = message
+					}
+				}
+			}
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
 			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
 			AttachedRoutes: int32(attachedRoutes),
-			Conditions: []metav1.Condition{
-				{
-					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonProgrammed),
-					Message:            "Listener programmed",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionAccepted),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonAccepted),
-					Message:            "Listener accepted",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
-			},
+			Conditions:     []metav1.Condition{programmedCondition, acceptedCondition, resolvedRefsCondition},
 		})
 	}
 
@@ -320,6 +392,46 @@ func (r *GatewayReconciler) updateProxy() {
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			cm := obj.(*corev1.ConfigMap)
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				// Check if this Gateway references the modified ConfigMap
+				if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+					referenced := false
+					checkRefs := func(validation *gatewayv1.FrontendTLSValidation) {
+						if validation == nil {
+							return
+						}
+						for _, ref := range validation.CACertificateRefs {
+							ns := gw.Namespace
+							if ref.Namespace != nil {
+								ns = string(*ref.Namespace)
+							}
+							if string(ref.Name) == cm.Name && ns == cm.Namespace {
+								referenced = true
+							}
+						}
+					}
+					if gw.Spec.TLS.Frontend.Default.Validation != nil {
+						checkRefs(gw.Spec.TLS.Frontend.Default.Validation)
+					}
+					for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+						checkRefs(pp.TLS.Validation)
+					}
+					if referenced {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name},
+						})
+					}
+				}
+			}
+			return requests
+		})).
 		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			// When an HTTPRoute changes, reconcile all Gateways it references
 			route := obj.(*gatewayv1.HTTPRoute)

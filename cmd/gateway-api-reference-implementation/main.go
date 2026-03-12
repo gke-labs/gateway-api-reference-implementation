@@ -147,13 +147,17 @@ func run(ctx context.Context) error {
 			return fmt.Errorf("failed to generate self-signed cert: %w", err)
 		}
 
+		p.SetDefaultCertificates([]tls.Certificate{cert})
+
 		srv := &http.Server{
 			Addr:    proxyHTTPSAddr,
 			Handler: p,
 			TLSConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
+				Certificates:       []tls.Certificate{cert},
+				GetConfigForClient: p.GetConfigForClient,
 			},
 		}
+
 		go func() {
 			<-ctx.Done()
 			setupLog.Info("shutting down proxy HTTPS server")
