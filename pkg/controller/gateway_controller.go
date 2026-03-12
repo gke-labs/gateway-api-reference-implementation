@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -194,6 +195,99 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		resolvedRefsCond := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+			Message:            "All references resolved",
+		}
+
+		acceptedCond := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionAccepted),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonAccepted),
+			Message:            "Listener accepted",
+		}
+
+		// Validate FrontendValidation if present
+		if (listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType) && gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
+			var validation *gatewayv1.FrontendTLSValidation
+			if gw.Spec.TLS.Frontend.PerPort != nil {
+				for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+					if pp.Port == listener.Port {
+						validation = pp.TLS.Validation
+						break
+					}
+				}
+			}
+			if validation == nil && gw.Spec.TLS.Frontend.Default.Validation != nil {
+				validation = gw.Spec.TLS.Frontend.Default.Validation
+			}
+
+			if validation != nil {
+				allInvalid := true
+				for _, ref := range validation.CACertificateRefs {
+					valid := true
+					reason := ""
+					message := ""
+
+					if string(ref.Group) != "" {
+						valid = false
+						reason = "InvalidCACertificateKind"
+						message = fmt.Sprintf("Unsupported group: %s", string(ref.Group))
+					} else if string(ref.Kind) != "ConfigMap" {
+						valid = false
+						reason = "InvalidCACertificateKind"
+						message = fmt.Sprintf("Unsupported kind: %s", string(ref.Kind))
+					} else {
+						// Check if ConfigMap exists
+						ns := gw.Namespace
+						if ref.Namespace != nil {
+							ns = string(*ref.Namespace)
+						}
+						cm := &corev1.ConfigMap{}
+						err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: string(ref.Name)}, cm)
+						if err != nil {
+							valid = false
+							if apierrors.IsNotFound(err) {
+								reason = "InvalidCACertificateRef"
+								message = fmt.Sprintf("ConfigMap %s not found", string(ref.Name))
+							} else {
+								reason = "InvalidCACertificateRef"
+								message = fmt.Sprintf("Error fetching ConfigMap %s: %v", string(ref.Name), err)
+							}
+						} else {
+							if _, ok := cm.Data["ca.crt"]; !ok {
+								if _, ok := cm.BinaryData["ca.crt"]; !ok {
+									valid = false
+									reason = "InvalidCACertificateRef"
+									message = fmt.Sprintf("ConfigMap %s does not contain ca.crt", string(ref.Name))
+								}
+							}
+						}
+					}
+
+					if !valid {
+						resolvedRefsCond.Status = metav1.ConditionFalse
+						resolvedRefsCond.Reason = reason
+						resolvedRefsCond.Message = message
+					} else {
+						allInvalid = false
+					}
+				}
+
+				if allInvalid && len(validation.CACertificateRefs) > 0 {
+					acceptedCond.Status = metav1.ConditionFalse
+					acceptedCond.Reason = "NoValidCACertificate"
+					acceptedCond.Message = "No valid CA certificates found in FrontendValidation"
+				}
+			}
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
 			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
@@ -207,22 +301,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					Reason:             string(gatewayv1.ListenerReasonProgrammed),
 					Message:            "Listener programmed",
 				},
-				{
-					Type:               string(gatewayv1.ListenerConditionAccepted),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonAccepted),
-					Message:            "Listener accepted",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
+				acceptedCond,
+				resolvedRefsCond,
 			},
 		})
 	}
