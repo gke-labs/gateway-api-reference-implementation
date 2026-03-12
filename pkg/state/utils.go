@@ -23,10 +23,12 @@ import (
 
 // MatchOrigin matches an origin against a pattern, supporting wildcards.
 func MatchOrigin(origin, pattern string) bool {
+	if pattern == "*" {
+		return true
+	}
 	if origin == pattern {
 		return true
 	}
-
 	oURL, err := url.Parse(origin)
 	if err != nil {
 		return false
@@ -40,12 +42,12 @@ func MatchOrigin(origin, pattern string) bool {
 		return false
 	}
 
-	oHost, oPort, _ := net.SplitHostPort(oURL.Host)
-	if oHost == "" {
+	oHost, oPort, err := net.SplitHostPort(oURL.Host)
+	if err != nil {
 		oHost = oURL.Host
 	}
-	pHost, pPort, _ := net.SplitHostPort(pURL.Host)
-	if pHost == "" {
+	pHost, pPort, err := net.SplitHostPort(pURL.Host)
+	if err != nil {
 		pHost = pURL.Host
 	}
 
@@ -88,7 +90,11 @@ func MatchOrigin(origin, pattern string) bool {
 			return len(oHost) >= len(parts[0])+len(parts[1]) && strings.HasPrefix(oHost, parts[0]) && strings.HasSuffix(oHost, parts[1])
 		}
 		// Fallback for multiple wildcards if ever allowed
-		rePattern := "^" + strings.ReplaceAll(pHost, "*", ".*") + "$"
+		var escapedParts []string
+		for _, part := range parts {
+			escapedParts = append(escapedParts, regexp.QuoteMeta(part))
+		}
+		rePattern := "^" + strings.Join(escapedParts, ".*") + "$"
 		re, err := regexp.Compile(rePattern)
 		if err == nil {
 			return re.MatchString(oHost)

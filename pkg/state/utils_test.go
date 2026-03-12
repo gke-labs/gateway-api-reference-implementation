@@ -170,6 +170,24 @@ func TestMatchOrigin(t *testing.T) {
 			pattern: "http://example.com:8081",
 			want:    false,
 		},
+		{
+			name:    "standalone wildcard",
+			origin:  "http://example.com",
+			pattern: "*",
+			want:    true,
+		},
+		{
+			name:    "multiple wildcards regex escaping",
+			origin:  "http://a.b.example.com",
+			pattern: "http://*.*.example.com",
+			want:    true,
+		},
+		{
+			name:    "multiple wildcards regex escaping no dot match",
+			origin:  "http://abexample.com",
+			pattern: "http://*.*.example.com",
+			want:    false,
+		},
 	}
 
 	for _, tt := range tests {

@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -58,24 +59,30 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bestRule, bestMatch := state.MatchRoute(routes, r)
 
 	if bestRule != nil {
+		var applyCORS func(http.Header)
 		if bestRule.CORS != nil {
-			if p.handleCORS(w, r, bestRule.CORS) {
+			var handled bool
+			handled, applyCORS = p.handleCORS(w, r, bestRule.CORS)
+			if handled {
 				return
 			}
 		}
 		if bestRule.Redirect != nil {
+			if applyCORS != nil {
+				applyCORS(w.Header())
+			}
 			p.redirect(w, r, *bestRule.Redirect, bestMatch)
 			return
 		}
 		if bestRule.Error != nil {
-			// Per Gateway API specification, if a rule matches but its backend is invalid
-			// or unresolved, the implementation SHOULD return an HTTP 500 Internal Server Error.
-			// This is also verified by conformance tests like HTTPRouteInvalidBackendRefUnknownKind.
+			if applyCORS != nil {
+				applyCORS(w.Header())
+			}
 			http.Error(w, bestRule.Error.HTTPMessage, bestRule.Error.HTTPStatusCode)
 			return
 		}
 		if bestRule.Backend != nil {
-			p.forward(w, r, *bestRule.Backend)
+			p.forward(w, r, *bestRule.Backend, applyCORS)
 			return
 		}
 	}
@@ -83,10 +90,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
 }
 
-func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.InternalCORS) bool {
+func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.InternalCORS) (bool, func(http.Header)) {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		return false
+		return false, nil
 	}
 
 	allowed := false
@@ -107,9 +114,9 @@ func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.I
 	if !allowed {
 		if isPreflight {
 			w.WriteHeader(http.StatusForbidden)
-			return true
+			return true, nil
 		}
-		return false
+		return false, nil
 	}
 
 	// Validate preflight method
@@ -129,16 +136,14 @@ func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.I
 			}
 			methods = append(methods, string(m))
 		}
+		if reqMethod == "GET" || reqMethod == "HEAD" || reqMethod == "POST" {
+			methodAllowed = true
+		}
 
 		if !methodAllowed {
 			w.WriteHeader(http.StatusNoContent)
-			return true
+			return true, nil
 		}
-	}
-
-	// Origin is allowed
-	if cors.AllowCredentials {
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
 
 	useWildcardOrigin := false
@@ -149,14 +154,48 @@ func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.I
 		}
 	}
 
-	if useWildcardOrigin && !cors.AllowCredentials {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-	} else {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
+	applyCORSHeaders := func(h http.Header) {
+		if cors.AllowCredentials {
+			h.Set("Access-Control-Allow-Credentials", "true")
+		}
+
+		if useWildcardOrigin && !cors.AllowCredentials {
+			h.Set("Access-Control-Allow-Origin", "*")
+		} else {
+			h.Set("Access-Control-Allow-Origin", origin)
+			h.Add("Vary", "Origin")
+		}
+
+		if len(cors.ExposeHeaders) > 0 {
+			var exposeHeaders []string
+			useWildcardExpose := false
+			for _, hd := range cors.ExposeHeaders {
+				if string(hd) == "*" {
+					useWildcardExpose = true
+					continue
+				}
+				exposeHeaders = append(exposeHeaders, string(hd))
+			}
+			if useWildcardExpose && !cors.AllowCredentials {
+				h.Set("Access-Control-Expose-Headers", "*")
+			} else if len(exposeHeaders) > 0 {
+				h.Set("Access-Control-Expose-Headers", strings.Join(exposeHeaders, ", "))
+			}
+		}
 	}
 
 	if isPreflight {
 		// Preflight request
+		if cors.AllowCredentials {
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+
+		if useWildcardOrigin && !cors.AllowCredentials {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+		}
 
 		// Access-Control-Allow-Methods
 		if useWildcardMethod && !cors.AllowCredentials {
@@ -182,39 +221,21 @@ func (p *Proxy) handleCORS(w http.ResponseWriter, r *http.Request, cors *state.I
 		if useWildcardHeader && !cors.AllowCredentials {
 			w.Header().Set("Access-Control-Allow-Headers", "*")
 		} else if useWildcardHeader && cors.AllowCredentials {
-			if h := r.Header.Get("Access-Control-Request-Headers"); h != "" {
-				w.Header().Set("Access-Control-Allow-Headers", h)
+			if reqHeaders := strings.Join(r.Header.Values("Access-Control-Request-Headers"), ", "); reqHeaders != "" {
+				w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
 			}
 		} else if len(headers) > 0 {
 			w.Header().Set("Access-Control-Allow-Headers", strings.Join(headers, ", "))
 		}
 
 		// Access-Control-Max-Age
-		w.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", cors.MaxAge))
+		w.Header().Set("Access-Control-Max-Age", strconv.Itoa(int(cors.MaxAge)))
 
 		w.WriteHeader(http.StatusNoContent)
-		return true
+		return true, nil
 	}
 
-	// Normal request
-	if len(cors.ExposeHeaders) > 0 {
-		var exposeHeaders []string
-		useWildcardExpose := false
-		for _, h := range cors.ExposeHeaders {
-			if string(h) == "*" {
-				useWildcardExpose = true
-				continue
-			}
-			exposeHeaders = append(exposeHeaders, string(h))
-		}
-		if useWildcardExpose && !cors.AllowCredentials {
-			w.Header().Set("Access-Control-Expose-Headers", "*")
-		} else if len(exposeHeaders) > 0 {
-			w.Header().Set("Access-Control-Expose-Headers", strings.Join(exposeHeaders, ", "))
-		}
-	}
-
-	return false
+	return false, applyCORSHeaders
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {
@@ -278,7 +299,7 @@ func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.
 	http.Redirect(w, r, newURL.String(), statusCode)
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend) {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, applyCORS func(http.Header)) {
 	scheme := "http"
 	if state.ValueOf(backend.AppProtocol) == "https" {
 		scheme = "https"
@@ -319,6 +340,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				return d.DialContext(ctx, network, addr)
 			},
 		}
+	}
+
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if applyCORS != nil {
+			applyCORS(resp.Header)
+		}
+		return nil
 	}
 
 	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", target.String(), "appProtocol", state.ValueOf(backend.AppProtocol))
