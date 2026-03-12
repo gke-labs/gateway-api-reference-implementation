@@ -15,6 +15,7 @@
 package state
 
 import (
+	"regexp"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -125,7 +126,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 										Type:  gatewayv1.PathMatchExact,
 										Value: "/my.service/MyMethod",
 									},
-								},
+									Headers: []InternalHeaderMatch{{Type: gatewayv1.HeaderMatchRegularExpression, Name: "Content-Type", MatchRegularExpressionValue: regexp.MustCompile("^application/grpc.*")}}},
 							},
 							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
 						},
@@ -586,7 +587,15 @@ func TestBuildInternalRoutes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.grpcRoutes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
-			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
+			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"), cmp.Comparer(func(x, y *regexp.Regexp) bool {
+				if x == nil && y == nil {
+					return true
+				}
+				if x == nil || y == nil {
+					return false
+				}
+				return x.String() == y.String()
+			}))
 			if diff != "" {
 				t.Errorf("BuildInternalRoutes() mismatch (-want +got):\n%s", diff)
 			}

@@ -49,21 +49,20 @@ func (r *GRPCRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// If the route is not accepted, we still update the state but it won't be used for proxying
-	validationCondition := r.State.UpsertGRPCRoute(route)
-
 	// Update status
 	// For each parentRef, we should add a ParentStatus
 	gateways := r.State.GetGateways()
 	rs := state.GRPCRouteState{GRPCRoute: route}
 
 	var newParents []gatewayv1.RouteParentStatus
-	for _, parentRef := range route.Spec.ParentRefs {
-		acceptedCondition := validationCondition
-		if acceptedCondition.Status == metav1.ConditionTrue {
-			acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways)
+	for _, p := range route.Status.Parents {
+		if string(p.ControllerName) != ControllerName {
+			newParents = append(newParents, p)
 		}
+	}
 
+	for _, parentRef := range route.Spec.ParentRefs {
+		acceptedCondition := rs.ComputeAcceptedCondition(parentRef, gateways)
 		newParents = append(newParents, gatewayv1.RouteParentStatus{
 			ParentRef:      parentRef,
 			ControllerName: ControllerName,

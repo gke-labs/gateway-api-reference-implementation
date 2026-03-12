@@ -16,6 +16,7 @@ package state
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -145,36 +146,16 @@ func (s *State) DeleteHTTPRoute(name types.NamespacedName) {
 	delete(s.httpRoutes, name)
 }
 
-func (s *State) UpsertGRPCRoute(route *gatewayv1.GRPCRoute) metav1.Condition {
+func (s *State) UpsertGRPCRoute(route *gatewayv1.GRPCRoute) {
 	rs := &GRPCRouteState{
 		GRPCRoute: route,
-	}
-
-	status := metav1.ConditionTrue
-	reason := gatewayv1.RouteReasonAccepted
-	message := "Route accepted by reference implementation"
-
-	if err := rs.Validate(); err != nil {
-		status = metav1.ConditionFalse
-		reason = gatewayv1.RouteReasonUnsupportedValue
-		message = fmt.Sprintf("Invalid route: %v", err)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.grpcRoutes[types.NamespacedName{Namespace: route.Namespace, Name: route.Name}] = rs
-
-	return metav1.Condition{
-		Type:               string(gatewayv1.RouteConditionAccepted),
-		Status:             status,
-		ObservedGeneration: route.Generation,
-		LastTransitionTime: metav1.Now(),
-		Reason:             string(reason),
-		Message:            message,
-	}
 }
-
 func (s *State) DeleteGRPCRoute(name types.NamespacedName) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,6 +171,19 @@ func (s *State) GetGRPCRoutes() []*GRPCRouteState {
 	for _, route := range s.grpcRoutes {
 		routes = append(routes, route)
 	}
+
+	sort.Slice(routes, func(i, j int) bool {
+		ti := routes[i].CreationTimestamp.Time
+		tj := routes[j].CreationTimestamp.Time
+		if ti.Equal(tj) {
+			if routes[i].Namespace == routes[j].Namespace {
+				return routes[i].Name < routes[j].Name
+			}
+			return routes[i].Namespace < routes[j].Namespace
+		}
+		return ti.Before(tj)
+	})
+
 	return routes
 }
 

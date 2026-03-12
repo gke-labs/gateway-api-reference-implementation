@@ -395,91 +395,9 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 						}
 					} else if redirect == nil {
 						for _, backendRef := range rule.BackendRefs {
-							kind := ValueOf(backendRef.Kind)
-							if kind == "" {
-								kind = "Service"
+							if resolveBackend(backendRef.BackendRef, route.Namespace, services, backendTLSPolicies, configMaps, &iRule) {
+								break
 							}
-							if kind != "Service" {
-								iRule.Error = &ErrorState{
-									Condition: metav1.Condition{
-										Type:    string(gatewayv1.RouteConditionResolvedRefs),
-										Status:  metav1.ConditionFalse,
-										Reason:  string(gatewayv1.RouteReasonInvalidKind),
-										Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
-									},
-									HTTPStatusCode: http.StatusInternalServerError,
-									HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
-								}
-								continue
-							}
-
-							if backendRef.Port == nil {
-								continue
-							}
-
-							backendSvcNamespace := route.Namespace
-							if backendRef.Namespace != nil {
-								backendSvcNamespace = string(*backendRef.Namespace)
-							}
-
-							backendSvcName := types.NamespacedName{
-								Namespace: backendSvcNamespace,
-								Name:      string(backendRef.Name),
-							}
-							var appProtocol *string
-							if svc, ok := services[backendSvcName]; ok {
-								for _, port := range svc.Spec.Ports {
-									if port.Port == int32(*backendRef.Port) {
-										appProtocol = port.AppProtocol
-										break
-									}
-								}
-							}
-
-							// Check for BackendTLSPolicy
-							var tlsConfig *InternalTLSConfig
-							for _, policy := range backendTLSPolicies {
-								for _, targetRef := range policy.Spec.TargetRefs {
-									if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
-										string(targetRef.Name) == string(backendRef.Name) &&
-										policy.Namespace == backendSvcNamespace {
-										// Found a policy targeting this service
-										https := "https"
-										appProtocol = &https
-
-										var caCerts [][]byte
-										for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-											if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-												cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-												if cm, ok := configMaps[cmName]; ok {
-													if data, ok := cm.Data["ca.crt"]; ok {
-														caCerts = append(caCerts, []byte(data))
-													} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-														caCerts = append(caCerts, data)
-													}
-												}
-											}
-										}
-
-										tlsConfig = &InternalTLSConfig{
-											Hostname: string(policy.Spec.Validation.Hostname),
-											CACerts:  caCerts,
-										}
-										break
-									}
-								}
-							}
-
-							iRule.Backend = &InternalBackend{
-								Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-								Port:        int32(*backendRef.Port),
-								AppProtocol: appProtocol,
-								TLSConfig:   tlsConfig,
-							}
-							iRule.Error = nil
-
-							// For minimal implementation, we just take the first Service backendRef for each rule
-							break
 						}
 					}
 
@@ -523,9 +441,8 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 		}
 
 		// Process GRPCRoutes
-		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
-			for _, route := range grpcRoutes {
-				// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
+		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
+			for _, route := range grpcRoutes { // Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
 				bound := false
 				for i := range route.Spec.ParentRefs {
 					parentRef := &route.Spec.ParentRefs[i]
@@ -577,91 +494,9 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 						}
 					} else {
 						for _, backendRef := range rule.BackendRefs {
-							kind := ValueOf(backendRef.Kind)
-							if kind == "" {
-								kind = "Service"
+							if resolveBackend(backendRef.BackendRef, route.Namespace, services, backendTLSPolicies, configMaps, &iRule) {
+								break
 							}
-							if kind != "Service" {
-								iRule.Error = &ErrorState{
-									Condition: metav1.Condition{
-										Type:    string(gatewayv1.RouteConditionResolvedRefs),
-										Status:  metav1.ConditionFalse,
-										Reason:  string(gatewayv1.RouteReasonInvalidKind),
-										Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
-									},
-									HTTPStatusCode: http.StatusInternalServerError,
-									HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
-								}
-								continue
-							}
-
-							if backendRef.Port == nil {
-								continue
-							}
-
-							backendSvcNamespace := route.Namespace
-							if backendRef.Namespace != nil {
-								backendSvcNamespace = string(*backendRef.Namespace)
-							}
-
-							backendSvcName := types.NamespacedName{
-								Namespace: backendSvcNamespace,
-								Name:      string(backendRef.Name),
-							}
-							var appProtocol *string
-							if svc, ok := services[backendSvcName]; ok {
-								for _, port := range svc.Spec.Ports {
-									if port.Port == int32(*backendRef.Port) {
-										appProtocol = port.AppProtocol
-										break
-									}
-								}
-							}
-
-							// Check for BackendTLSPolicy
-							var tlsConfig *InternalTLSConfig
-							for _, policy := range backendTLSPolicies {
-								for _, targetRef := range policy.Spec.TargetRefs {
-									if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
-										string(targetRef.Name) == string(backendRef.Name) &&
-										policy.Namespace == backendSvcNamespace {
-										// Found a policy targeting this service
-										https := "https"
-										appProtocol = &https
-
-										var caCerts [][]byte
-										for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-											if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-												cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-												if cm, ok := configMaps[cmName]; ok {
-													if data, ok := cm.Data["ca.crt"]; ok {
-														caCerts = append(caCerts, []byte(data))
-													} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-														caCerts = append(caCerts, data)
-													}
-												}
-											}
-										}
-
-										tlsConfig = &InternalTLSConfig{
-											Hostname: string(policy.Spec.Validation.Hostname),
-											CACerts:  caCerts,
-										}
-										break
-									}
-								}
-							}
-
-							iRule.Backend = &InternalBackend{
-								Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-								Port:        int32(*backendRef.Port),
-								AppProtocol: appProtocol,
-								TLSConfig:   tlsConfig,
-							}
-							iRule.Error = nil
-
-							// For minimal implementation, we just take the first Service backendRef for each rule
-							break
 						}
 					}
 
@@ -680,14 +515,14 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							method := ValueOf(match.Method.Method)
 
 							if methodType == gatewayv1.GRPCMethodMatchExact {
-								pathMatchType = gatewayv1.PathMatchExact
 								if service != "" && method != "" {
+									pathMatchType = gatewayv1.PathMatchExact
 									pathValue = fmt.Sprintf("/%s/%s", service, method)
 								} else if service != "" {
+									pathMatchType = gatewayv1.PathMatchPathPrefix
 									pathValue = fmt.Sprintf("/%s/", service)
 								}
 							}
-
 							if pathValue != "" {
 								iMatch.Path = &InternalPathMatch{
 									Type:  pathMatchType,
@@ -713,6 +548,15 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							}
 							iMatch.Headers = append(iMatch.Headers, hm)
 						}
+
+						// GRPCRoutes MUST only match requests with a Content-Type header that begins with application/grpc
+						re := regexp.MustCompile("^application/grpc.*")
+						iMatch.Headers = append(iMatch.Headers, InternalHeaderMatch{
+							Type:                        gatewayv1.HeaderMatchRegularExpression,
+							Name:                        "Content-Type",
+							MatchRegularExpressionValue: re,
+						})
+
 						iRule.Matches = append(iRule.Matches, iMatch)
 					}
 
@@ -724,4 +568,112 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 	}
 
 	return internalRoutes
+}
+
+func resolveBackend(
+	backendRef gatewayv1.BackendRef,
+	routeNamespace string,
+	services map[types.NamespacedName]*corev1.Service,
+	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	iRule *InternalRule,
+) bool {
+	group := ValueOf(backendRef.Group)
+	if group != "" && group != "core" {
+		iRule.Error = &ErrorState{
+			Condition: metav1.Condition{
+				Type:    string(gatewayv1.RouteConditionResolvedRefs),
+				Status:  metav1.ConditionFalse,
+				Reason:  string(gatewayv1.RouteReasonInvalidKind),
+				Message: fmt.Sprintf("Unsupported backend group: %s", group),
+			},
+			HTTPStatusCode: http.StatusInternalServerError,
+			HTTPMessage:    fmt.Sprintf("Unsupported backend group: %s", group),
+		}
+		return false
+	}
+
+	kind := ValueOf(backendRef.Kind)
+	if kind == "" {
+		kind = "Service"
+	}
+	if kind != "Service" {
+		iRule.Error = &ErrorState{
+			Condition: metav1.Condition{
+				Type:    string(gatewayv1.RouteConditionResolvedRefs),
+				Status:  metav1.ConditionFalse,
+				Reason:  string(gatewayv1.RouteReasonInvalidKind),
+				Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
+			},
+			HTTPStatusCode: http.StatusInternalServerError,
+			HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+		}
+		return false
+	}
+
+	if backendRef.Port == nil {
+		return false
+	}
+
+	backendSvcNamespace := routeNamespace
+	if backendRef.Namespace != nil {
+		backendSvcNamespace = string(*backendRef.Namespace)
+	}
+
+	backendSvcName := types.NamespacedName{
+		Namespace: backendSvcNamespace,
+		Name:      string(backendRef.Name),
+	}
+	var appProtocol *string
+	if svc, ok := services[backendSvcName]; ok {
+		for _, port := range svc.Spec.Ports {
+			if port.Port == int32(*backendRef.Port) {
+				appProtocol = port.AppProtocol
+				break
+			}
+		}
+	}
+
+	// Check for BackendTLSPolicy
+	var tlsConfig *InternalTLSConfig
+	for _, policy := range backendTLSPolicies {
+		for _, targetRef := range policy.Spec.TargetRefs {
+			if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+				string(targetRef.Name) == string(backendRef.Name) &&
+				policy.Namespace == backendSvcNamespace {
+				// Found a policy targeting this service
+				https := "https"
+				appProtocol = &https
+
+				var caCerts [][]byte
+				for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+					if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+						cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+						if cm, ok := configMaps[cmName]; ok {
+							if data, ok := cm.Data["ca.crt"]; ok {
+								caCerts = append(caCerts, []byte(data))
+							} else if data, ok := cm.BinaryData["ca.crt"]; ok {
+								caCerts = append(caCerts, data)
+							}
+						}
+					}
+				}
+
+				tlsConfig = &InternalTLSConfig{
+					Hostname: string(policy.Spec.Validation.Hostname),
+					CACerts:  caCerts,
+				}
+				break
+			}
+		}
+	}
+
+	iRule.Backend = &InternalBackend{
+		Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
+		Port:        int32(*backendRef.Port),
+		AppProtocol: appProtocol,
+		TLSConfig:   tlsConfig,
+	}
+	iRule.Error = nil
+	return true
 }

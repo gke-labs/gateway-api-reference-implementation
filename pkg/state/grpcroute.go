@@ -32,6 +32,14 @@ func (s *GRPCRouteState) Validate() error {
 	}
 	for _, rule := range s.Spec.Rules {
 		for _, match := range rule.Matches {
+			if match.Method != nil {
+				if ValueOf(match.Method.Type) == gatewayv1.GRPCMethodMatchRegularExpression {
+					return fmt.Errorf("regular expression method matches are not supported")
+				}
+				if ValueOf(match.Method.Method) != "" && ValueOf(match.Method.Service) == "" {
+					return fmt.Errorf("service must not be empty when method is provided")
+				}
+			}
 			for _, header := range match.Headers {
 				if ValueOf(header.Type) == gatewayv1.GRPCHeaderMatchRegularExpression {
 					if _, err := regexp.Compile(header.Value); err != nil {
@@ -71,10 +79,9 @@ func (s *GRPCRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 		} else {
 			matched := false
 			for _, listener := range gw.Spec.Listeners {
-				if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType && listener.Protocol != "TLS" {
+				if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType && listener.Protocol != gatewayv1.TLSProtocolType {
 					// gRPC can run on HTTP, HTTPS, or TLS (with ALPN)
-					// Gateway API spec says GRPCRoute can be bound to HTTP/HTTPS listeners
-					continue
+					// Gateway API spec says GRPCRoute can be bound to HTTP/HTTPS listeners					continue
 				}
 				if sectionName := ValueOf(parentRef.SectionName); sectionName != "" && sectionName != listener.Name {
 					continue
@@ -111,6 +118,12 @@ func (s *GRPCRouteState) ComputeResolvedRefsCondition() metav1.Condition {
 
 	for _, rule := range s.Spec.Rules {
 		for _, backendRef := range rule.BackendRefs {
+			if backendRef.Group != nil && *backendRef.Group != "" && *backendRef.Group != "core" {
+				resolvedRefsStatus = metav1.ConditionFalse
+				resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
+				resolvedRefsMessage = fmt.Sprintf("Unsupported backend group: %s", *backendRef.Group)
+				goto done
+			}
 			if backendRef.Kind != nil && *backendRef.Kind != "Service" {
 				resolvedRefsStatus = metav1.ConditionFalse
 				resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
@@ -157,5 +170,21 @@ func (s *GRPCRouteState) MatchesGateway(gw *gatewayv1.Gateway, controllerName st
 		}
 	}
 
+	return false
+}
+
+func (s *GRPCRouteState) IsAccepted(controllerName string) bool {
+	if s.GRPCRoute == nil {
+		return false
+	}
+	for _, ps := range s.GRPCRoute.Status.Parents {
+		if string(ps.ControllerName) == controllerName {
+			for _, c := range ps.Conditions {
+				if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
+					return true
+				}
+			}
+		}
+	}
 	return false
 }

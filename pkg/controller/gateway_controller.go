@@ -176,18 +176,40 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Compute listener status
-	routes := r.State.GetHTTPRoutes()
+	httpRoutes := r.State.GetHTTPRoutes()
+	grpcRoutes := r.State.GetGRPCRoutes()
 	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
-		for _, route := range routes {
-			for _, parentRef := range route.Spec.ParentRefs {
-				if string(parentRef.Name) == gw.Name {
-					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
-							attachedRoutes++
-							break
+		var supportedKinds []gatewayv1.RouteGroupKind
+
+		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
+			supportedKinds = append(supportedKinds, gatewayv1.RouteGroupKind{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"})
+			for _, route := range httpRoutes {
+				for _, parentRef := range route.Spec.ParentRefs {
+					if string(parentRef.Name) == gw.Name {
+						if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
+							if route.IsAccepted(ControllerName) {
+								attachedRoutes++
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
+			supportedKinds = append(supportedKinds, gatewayv1.RouteGroupKind{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "GRPCRoute"})
+			for _, route := range grpcRoutes {
+				for _, parentRef := range route.Spec.ParentRefs {
+					if string(parentRef.Name) == gw.Name {
+						if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
+							if route.IsAccepted(ControllerName) {
+								attachedRoutes++
+								break
+							}
 						}
 					}
 				}
@@ -196,9 +218,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
-			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
-			AttachedRoutes: int32(attachedRoutes),
-			Conditions: []metav1.Condition{
+			SupportedKinds: supportedKinds,
+			AttachedRoutes: int32(attachedRoutes), Conditions: []metav1.Condition{
 				{
 					Type:               string(gatewayv1.ListenerConditionProgrammed),
 					Status:             metav1.ConditionTrue,
