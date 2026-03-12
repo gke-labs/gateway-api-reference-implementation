@@ -106,9 +106,19 @@ type InternalRule struct {
 	Matches  []InternalMatch
 	Backend  *InternalBackend
 	Redirect *InternalRedirect
+	CORS     *InternalCORS
 	// Error, if non-nil, indicates that this rule is invalid and should
 	// return an error response if matched.
 	Error *ErrorState
+}
+
+type InternalCORS struct {
+	AllowOrigins     []gatewayv1.CORSOrigin
+	AllowMethods     []gatewayv1.HTTPMethodWithWildcard
+	AllowHeaders     []gatewayv1.HTTPHeaderName
+	ExposeHeaders    []gatewayv1.HTTPHeaderName
+	MaxAge           int32
+	AllowCredentials bool
 }
 
 type InternalBackend struct {
@@ -380,6 +390,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
+				var cors *InternalCORS
 				for _, filter := range rule.Filters {
 					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
 						r := filter.RequestRedirect
@@ -401,12 +412,25 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 								Value: pathValue,
 							}
 						}
-						break
+					}
+					if filter.Type == gatewayv1.HTTPRouteFilterCORS && filter.CORS != nil {
+						cors = &InternalCORS{
+							AllowOrigins:     filter.CORS.AllowOrigins,
+							AllowMethods:     filter.CORS.AllowMethods,
+							AllowHeaders:     filter.CORS.AllowHeaders,
+							ExposeHeaders:    filter.CORS.ExposeHeaders,
+							MaxAge:           filter.CORS.MaxAge,
+							AllowCredentials: ValueOf(filter.CORS.AllowCredentials),
+						}
+						if cors.MaxAge == 0 {
+							cors.MaxAge = 5
+						}
 					}
 				}
 
 				iRule := InternalRule{
 					Redirect: redirect,
+					CORS:     cors,
 				}
 
 				if resolvedRefsCond.Status == metav1.ConditionFalse {
