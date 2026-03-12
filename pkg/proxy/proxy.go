@@ -16,15 +16,18 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"golang.org/x/net/http2"
@@ -34,20 +37,65 @@ import (
 
 // Proxy is a minimal implementation of a Gateway API proxy.
 type Proxy struct {
-	mu     sync.RWMutex
-	routes []state.InternalRoute
+	mu            sync.RWMutex
+	routes        []state.InternalRoute
+	mirrorClients sync.Map
+	mirrorSem     chan struct{}
 }
 
 func NewProxy() *Proxy {
 	return &Proxy{
-		routes: []state.InternalRoute{},
+		routes:    []state.InternalRoute{},
+		mirrorSem: make(chan struct{}, 1000), // semaphore to limit concurrent mirrors
 	}
+}
+
+func (p *Proxy) getMirrorKey(backend *state.InternalBackend) string {
+	scheme := "http"
+	if backend.TLSConfig != nil {
+		scheme = "https"
+	}
+	key := fmt.Sprintf("%s-%s:%d", scheme, backend.Host, backend.Port)
+	if backend.TLSConfig != nil {
+		h := sha256.New()
+		h.Write([]byte(backend.TLSConfig.Hostname))
+		h.Write([]byte{0})
+		for _, cert := range backend.TLSConfig.CACerts {
+			h.Write(cert)
+			h.Write([]byte{0})
+		}
+		key = fmt.Sprintf("%s-%x", key, h.Sum(nil))
+	}
+	return key
 }
 
 func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.routes = routes
+
+	// Calculate active mirror keys
+	activeKeys := make(map[string]struct{})
+	for _, route := range routes {
+		for _, rule := range route.Rules {
+			for _, mirror := range rule.Mirrors {
+				activeKeys[p.getMirrorKey(mirror)] = struct{}{}
+			}
+		}
+	}
+
+	// Evict unused mirror clients to prevent idle connections from leaking permanently
+	p.mirrorClients.Range(func(key, value any) bool {
+		if _, active := activeKeys[key.(string)]; !active {
+			if client, ok := value.(*http.Client); ok && client.Transport != nil {
+				if transport, ok := client.Transport.(*http.Transport); ok {
+					transport.CloseIdleConnections()
+				}
+			}
+			p.mirrorClients.Delete(key)
+		}
+		return true
+	})
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -70,12 +118,153 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if bestRule.Backend != nil {
+			var mirrorReaders []io.Reader
+			var shouldMirror = len(bestRule.Mirrors) > 0
+			if shouldMirror {
+				if r.ContentLength > 1024*1024 {
+					log.Log.V(1).Info("Content-Length too large to mirror, skipping mirror filters", "host", r.Host)
+					shouldMirror = false
+				} else if r.ContentLength > 0 || r.ContentLength == -1 {
+					var writers []io.Writer
+					for i := 0; i < len(bestRule.Mirrors); i++ {
+						pr, pw := io.Pipe()
+						mirrorReaders = append(mirrorReaders, pr)
+						writers = append(writers, pw)
+					}
+					var mw io.Writer
+					if len(writers) == 1 {
+						mw = writers[0]
+					} else {
+						mw = io.MultiWriter(writers...)
+					}
+					r.Body = &teeReadCloser{
+						r: io.TeeReader(r.Body, mw),
+						c: r.Body,
+						w: writers,
+					}
+				}
+			}
+
+			if shouldMirror {
+				for i, mirror := range bestRule.Mirrors {
+					mReq := r.Clone(context.WithoutCancel(r.Context()))
+					removeHopByHopHeaders(mReq.Header)
+					mReq.Header.Del("Host")
+					mReq.Host = ""
+					mReq.Trailer = nil
+
+					if r.ContentLength == 0 {
+						mReq.Body = http.NoBody
+						mReq.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
+					} else {
+						mReq.Body = io.NopCloser(mirrorReaders[i])
+					}
+
+					select {
+					case p.mirrorSem <- struct{}{}:
+						go func(mr *http.Request, mb state.InternalBackend) {
+							defer func() { <-p.mirrorSem }()
+							p.mirror(mr, mb)
+						}(mReq, *mirror)
+					default:
+						log.Log.V(1).Info("Mirror concurrency limit reached, skipping mirror request", "host", r.Host)
+						if r.ContentLength != 0 {
+							go io.Copy(io.Discard, mirrorReaders[i])
+						}
+					}
+				}
+			}
 			p.forward(w, r, *bestRule.Backend)
 			return
 		}
 	}
 
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+}
+
+func (p *Proxy) mirror(req *http.Request, backend state.InternalBackend) {
+	scheme := "http"
+	if state.ValueOf(backend.AppProtocol) == "https" {
+		scheme = "https"
+	}
+
+	target := &url.URL{
+		Scheme: scheme,
+		Host:   fmt.Sprintf("%s:%d", backend.Host, backend.Port),
+		Path:   req.URL.Path,
+	}
+
+	req.URL.Scheme = target.Scheme
+	req.URL.Host = target.Host
+	req.RequestURI = "" // RequestURI must be empty for client requests
+
+	key := fmt.Sprintf("%s-%s:%d", scheme, backend.Host, backend.Port)
+	if backend.TLSConfig != nil {
+		h := sha256.New()
+		h.Write([]byte(backend.TLSConfig.Hostname))
+		for _, cert := range backend.TLSConfig.CACerts {
+			h.Write(cert)
+		}
+		key = fmt.Sprintf("%s-%x", key, h.Sum(nil))
+	}
+
+	clientVal, ok := p.mirrorClients.Load(key)
+	var client *http.Client
+	if ok {
+		client = clientVal.(*http.Client)
+	} else {
+		newClient := &http.Client{
+			Timeout: 10 * time.Second, // Timeout to prevent goroutine leaks
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+
+		transport := &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+
+		if scheme == "https" {
+			tlsConfig := &tls.Config{InsecureSkipVerify: false}
+			if backend.TLSConfig != nil {
+				if backend.TLSConfig.Hostname != "" {
+					tlsConfig.ServerName = backend.TLSConfig.Hostname
+				}
+				if len(backend.TLSConfig.CACerts) > 0 {
+					tlsConfig.RootCAs = x509.NewCertPool()
+					for _, cert := range backend.TLSConfig.CACerts {
+						if ok := tlsConfig.RootCAs.AppendCertsFromPEM(cert); !ok {
+							log.Log.V(1).Info("Failed to parse CA certificate for mirror backend", "host", backend.Host)
+						}
+					}
+				}
+			}
+			transport.TLSClientConfig = tlsConfig
+		}
+		newClient.Transport = transport
+
+		actualClient, _ := p.mirrorClients.LoadOrStore(key, newClient)
+		client = actualClient.(*http.Client)
+	}
+
+	log.Log.V(1).Info("Mirroring request", "host", req.Host, "path", req.URL.Path, "target", target.String())
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Log.Error(err, "Error mirroring request", "target", target.String())
+		return
+	}
+	defer resp.Body.Close()
+	// Drain the response body to allow connection reuse
+	_, _ = io.Copy(io.Discard, resp.Body)
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {
@@ -163,11 +352,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				for _, cert := range backend.TLSConfig.CACerts {
 					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
 				}
-			} else {
-				tlsConfig.InsecureSkipVerify = true
 			}
-		} else {
-			tlsConfig.InsecureSkipVerify = true
 		}
 		proxy.Transport = &http.Transport{
 			TLSClientConfig: tlsConfig,
@@ -184,4 +369,56 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 
 	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", target.String(), "appProtocol", state.ValueOf(backend.AppProtocol))
 	proxy.ServeHTTP(w, r)
+}
+
+var hopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func removeHopByHopHeaders(h http.Header) {
+	for _, f := range h["Connection"] {
+		for _, sf := range strings.Split(f, ",") {
+			if sf = strings.TrimSpace(sf); sf != "" {
+				h.Del(sf)
+			}
+		}
+	}
+	for _, hop := range hopHeaders {
+		h.Del(hop)
+	}
+}
+
+type teeReadCloser struct {
+	r io.Reader
+	c io.Closer
+	w []io.Writer
+}
+
+func (t *teeReadCloser) Read(p []byte) (n int, err error) {
+	n, err = t.r.Read(p)
+	if err != nil {
+		for _, w := range t.w {
+			if pw, ok := w.(*io.PipeWriter); ok {
+				pw.CloseWithError(err)
+			}
+		}
+	}
+	return
+}
+
+func (t *teeReadCloser) Close() error {
+	for _, w := range t.w {
+		if pw, ok := w.(*io.PipeWriter); ok {
+			pw.Close()
+		}
+	}
+	return t.c.Close()
 }

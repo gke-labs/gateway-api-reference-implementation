@@ -33,6 +33,7 @@ type State struct {
 	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
 	services           map[types.NamespacedName]*corev1.Service
 	configMaps         map[types.NamespacedName]*corev1.ConfigMap
+	secrets            map[types.NamespacedName]*corev1.Secret
 }
 
 func NewState() *State {
@@ -42,6 +43,7 @@ func NewState() *State {
 		backendTLSPolicies: make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
 		services:           make(map[types.NamespacedName]*corev1.Service),
 		configMaps:         make(map[types.NamespacedName]*corev1.ConfigMap),
+		secrets:            make(map[types.NamespacedName]*corev1.Secret),
 	}
 }
 
@@ -213,4 +215,26 @@ func (s *State) GetServices() map[types.NamespacedName]*corev1.Service {
 		services[k] = v
 	}
 	return services
+}
+
+func (s *State) UpsertSecret(secret *corev1.Secret) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.secrets[types.NamespacedName{Namespace: secret.Namespace, Name: secret.Name}] = secret
+}
+
+func (s *State) DeleteSecret(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.secrets, name)
+}
+
+func (s *State) GetSecrets() map[types.NamespacedName]*corev1.Secret {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	secrets := make(map[types.NamespacedName]*corev1.Secret)
+	for k, v := range s.secrets {
+		secrets[k] = v
+	}
+	return secrets
 }

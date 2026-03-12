@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -105,6 +106,7 @@ type ErrorState struct {
 type InternalRule struct {
 	Matches  []InternalMatch
 	Backend  *InternalBackend
+	Mirrors  []*InternalBackend
 	Redirect *InternalRedirect
 	// Error, if non-nil, indicates that this rule is invalid and should
 	// return an error response if matched.
@@ -306,7 +308,109 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
+func resolveBackend(
+	backendRef gatewayv1.BackendObjectReference,
+	defaultNamespace string,
+	services map[types.NamespacedName]*corev1.Service,
+	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	secrets map[types.NamespacedName]*corev1.Secret,
+) (*InternalBackend, *ErrorState) {
+	kind := ValueOf(backendRef.Kind)
+	if kind == "" {
+		kind = "Service"
+	}
+	if kind != "Service" {
+		return nil, &ErrorState{
+			Condition: metav1.Condition{
+				Type:    string(gatewayv1.RouteConditionResolvedRefs),
+				Status:  metav1.ConditionFalse,
+				Reason:  string(gatewayv1.RouteReasonInvalidKind),
+				Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
+			},
+			HTTPStatusCode: http.StatusInternalServerError,
+			HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+		}
+	}
+
+	if backendRef.Port == nil {
+		return nil, &ErrorState{
+			Condition: metav1.Condition{
+				Type:    string(gatewayv1.RouteConditionResolvedRefs),
+				Status:  metav1.ConditionFalse,
+				Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+				Message: "Port is required for Service backends",
+			},
+			HTTPStatusCode: http.StatusInternalServerError,
+			HTTPMessage:    "Port is required for Service backends",
+		}
+	}
+
+	backendSvcNamespace := defaultNamespace
+	if backendRef.Namespace != nil {
+		backendSvcNamespace = string(*backendRef.Namespace)
+	}
+
+	backendSvcName := types.NamespacedName{
+		Namespace: backendSvcNamespace,
+		Name:      string(backendRef.Name),
+	}
+	var appProtocol *string
+	if svc, ok := services[backendSvcName]; ok {
+		for _, port := range svc.Spec.Ports {
+			if port.Port == int32(*backendRef.Port) {
+				appProtocol = port.AppProtocol
+				break
+			}
+		}
+	}
+
+	// Check for BackendTLSPolicy
+	var tlsConfig *InternalTLSConfig
+	for _, policy := range backendTLSPolicies {
+		if tlsConfig != nil {
+			break
+		}
+		for _, targetRef := range policy.Spec.TargetRefs {
+			if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+				string(targetRef.Name) == string(backendRef.Name) &&
+				policy.Namespace == backendSvcNamespace {
+				// Found a policy targeting this service
+				https := "https"
+				appProtocol = &https
+
+				var caCerts [][]byte
+				for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+					if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+						cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+						if cm, ok := configMaps[cmName]; ok {
+							if data, ok := cm.Data["ca.crt"]; ok {
+								caCerts = append(caCerts, []byte(data))
+							} else if data, ok := cm.BinaryData["ca.crt"]; ok {
+								caCerts = append(caCerts, data)
+							}
+						}
+					}
+				}
+
+				tlsConfig = &InternalTLSConfig{
+					Hostname: string(policy.Spec.Validation.Hostname),
+					CACerts:  caCerts,
+				}
+				break
+			}
+		}
+	}
+
+	return &InternalBackend{
+		Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
+		Port:        int32(*backendRef.Port),
+		AppProtocol: appProtocol,
+		TLSConfig:   tlsConfig,
+	}, nil
+}
+
+func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, secrets map[types.NamespacedName]*corev1.Secret, controllerName string) []InternalRoute {
 	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
 	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
 		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
@@ -376,12 +480,12 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				Hostnames: effectiveHostnames,
 			}
 
-			resolvedRefsCond := route.ComputeResolvedRefsCondition()
-
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
+				var mirrors []*InternalBackend
 				for _, filter := range rule.Filters {
-					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
+					switch filter.Type {
+					case gatewayv1.HTTPRouteFilterRequestRedirect:
 						r := filter.RequestRedirect
 						redirect = &InternalRedirect{
 							Scheme:     r.Scheme,
@@ -401,110 +505,42 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 								Value: pathValue,
 							}
 						}
-						break
+					case gatewayv1.HTTPRouteFilterRequestMirror:
+						m := filter.RequestMirror
+						if backend, errState := resolveBackend(m.BackendRef, route.Namespace, services, backendTLSPolicies, configMaps, secrets); errState != nil {
+							// For mirrors, if resolution fails, we do not fail the primary request.
+							// The Gateway API spec dictates that invalid mirror requests are dropped,
+							// but the route's ResolvedRefs condition is set to False (handled in ComputeResolvedRefsCondition).
+							log.Log.V(1).Info("Invalid mirror backend reference dropped", "error", errState.HTTPMessage)
+						} else if backend != nil {
+							mirrors = append(mirrors, backend)
+						}
 					}
 				}
 
 				iRule := InternalRule{
 					Redirect: redirect,
+					Mirrors:  mirrors,
 				}
 
-				if resolvedRefsCond.Status == metav1.ConditionFalse {
-					iRule.Error = &ErrorState{
-						Condition:      resolvedRefsCond,
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    resolvedRefsCond.Message,
-					}
-				} else if redirect == nil {
+				if redirect == nil {
+					var ruleErr *ErrorState
 					for _, backendRef := range rule.BackendRefs {
-						kind := ValueOf(backendRef.Kind)
-						if kind == "" {
-							kind = "Service"
-						}
-						if kind != "Service" {
-							iRule.Error = &ErrorState{
-								Condition: metav1.Condition{
-									Type:    string(gatewayv1.RouteConditionResolvedRefs),
-									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonInvalidKind),
-									Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
-								},
-								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
-							}
-							continue
+						backend, errState := resolveBackend(backendRef.BackendObjectReference, route.Namespace, services, backendTLSPolicies, configMaps, secrets)
+						if errState != nil {
+							ruleErr = errState
+							continue // Do not fail immediately, keep looking for valid backends
 						}
 
-						if backendRef.Port == nil {
-							continue
+						if backend != nil && iRule.Backend == nil {
+							iRule.Backend = backend
+							// For minimal implementation, we just take the first valid Service backendRef for each rule
 						}
+					}
 
-						backendSvcNamespace := route.Namespace
-						if backendRef.Namespace != nil {
-							backendSvcNamespace = string(*backendRef.Namespace)
-						}
-
-						backendSvcName := types.NamespacedName{
-							Namespace: backendSvcNamespace,
-							Name:      string(backendRef.Name),
-						}
-						var appProtocol *string
-						if svc, ok := services[backendSvcName]; ok {
-							for _, port := range svc.Spec.Ports {
-								if port.Port == int32(*backendRef.Port) {
-									appProtocol = port.AppProtocol
-									break
-								}
-							}
-						}
-
-						// Check for BackendTLSPolicy
-						var tlsConfig *InternalTLSConfig
-						for _, policy := range backendTLSPolicies {
-							if tlsConfig != nil {
-								break
-							}
-							for _, targetRef := range policy.Spec.TargetRefs {
-								if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
-									string(targetRef.Name) == string(backendRef.Name) &&
-									policy.Namespace == backendSvcNamespace {
-									// Found a policy targeting this service
-									https := "https"
-									appProtocol = &https
-
-									var caCerts [][]byte
-									for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-										if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-											cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-											if cm, ok := configMaps[cmName]; ok {
-												if data, ok := cm.Data["ca.crt"]; ok {
-													caCerts = append(caCerts, []byte(data))
-												} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-													caCerts = append(caCerts, data)
-												}
-											}
-										}
-									}
-
-									tlsConfig = &InternalTLSConfig{
-										Hostname: string(policy.Spec.Validation.Hostname),
-										CACerts:  caCerts,
-									}
-									break
-								}
-							}
-						}
-
-						iRule.Backend = &InternalBackend{
-							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-							Port:        int32(*backendRef.Port),
-							AppProtocol: appProtocol,
-							TLSConfig:   tlsConfig,
-						}
-						iRule.Error = nil
-
-						// For minimal implementation, we just take the first Service backendRef for each rule
-						break
+					if iRule.Backend == nil && ruleErr != nil {
+						// Only fail the rule if no valid backends were found
+						iRule.Error = ruleErr
 					}
 				}
 

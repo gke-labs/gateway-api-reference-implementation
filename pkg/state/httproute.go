@@ -109,11 +109,46 @@ func (s *HTTPRouteState) ComputeResolvedRefsCondition() metav1.Condition {
 
 	for _, rule := range s.Spec.Rules {
 		for _, backendRef := range rule.BackendRefs {
-			if backendRef.Kind != nil && *backendRef.Kind != "Service" {
+			if backendRef.Group != nil && *backendRef.Group != "" && *backendRef.Group != "core" {
+				resolvedRefsStatus = metav1.ConditionFalse
+				resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
+				resolvedRefsMessage = fmt.Sprintf("Unsupported backend group: %s", *backendRef.Group)
+				goto done
+			}
+			if backendRef.Kind != nil && *backendRef.Kind != "" && *backendRef.Kind != "Service" {
 				resolvedRefsStatus = metav1.ConditionFalse
 				resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
 				resolvedRefsMessage = fmt.Sprintf("Unsupported backend kind: %s", *backendRef.Kind)
 				goto done
+			}
+			if backendRef.Port == nil {
+				resolvedRefsStatus = metav1.ConditionFalse
+				resolvedRefsReason = gatewayv1.RouteReasonUnsupportedValue
+				resolvedRefsMessage = "Port is required for Service backends"
+				goto done
+			}
+		}
+		for _, filter := range rule.Filters {
+			if filter.Type == gatewayv1.HTTPRouteFilterRequestMirror {
+				m := filter.RequestMirror
+				if m.BackendRef.Group != nil && *m.BackendRef.Group != "" && *m.BackendRef.Group != "core" {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
+					resolvedRefsMessage = fmt.Sprintf("Unsupported mirror backend group: %s", *m.BackendRef.Group)
+					goto done
+				}
+				if m.BackendRef.Kind != nil && *m.BackendRef.Kind != "" && *m.BackendRef.Kind != "Service" {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
+					resolvedRefsMessage = fmt.Sprintf("Unsupported mirror backend kind: %s", *m.BackendRef.Kind)
+					goto done
+				}
+				if m.BackendRef.Port == nil {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.RouteReasonUnsupportedValue
+					resolvedRefsMessage = "Port is required for mirror Service backends"
+					goto done
+				}
 			}
 		}
 	}
