@@ -152,7 +152,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					mReq.Header.Del("Host")
 					mReq.Host = ""
 					mReq.Trailer = nil
-					
+
 					if r.ContentLength == 0 {
 						mReq.Body = http.NoBody
 						mReq.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
