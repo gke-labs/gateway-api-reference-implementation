@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -198,32 +199,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Name:           listener.Name,
 			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
 			AttachedRoutes: int32(attachedRoutes),
-			Conditions: []metav1.Condition{
-				{
-					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonProgrammed),
-					Message:            "Listener programmed",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionAccepted),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonAccepted),
-					Message:            "Listener accepted",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
-			},
+			Conditions:     r.validateListener(ctx, gw, listener),
 		})
 	}
 
@@ -311,6 +287,83 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	l.Info("Updated Gateway status", "address", ip)
 
 	return ctrl.Result{}, nil
+}
+
+func (r *GatewayReconciler) validateListener(ctx context.Context, gw *gatewayv1.Gateway, listener gatewayv1.Listener) []metav1.Condition {
+	resolvedRefsCond := metav1.Condition{
+		Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gw.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+		Message:            "All references resolved",
+	}
+
+	if listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
+		if listener.TLS != nil {
+			for _, ref := range listener.TLS.CertificateRefs {
+				if (ref.Group != nil && *ref.Group != "" && *ref.Group != "core") ||
+					(ref.Kind != nil && *ref.Kind != "" && *ref.Kind != "Secret") {
+					resolvedRefsCond.Status = metav1.ConditionFalse
+					resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+					resolvedRefsCond.Message = fmt.Sprintf("Unsupported certificate ref %s/%s", state.ValueOf(ref.Group), state.ValueOf(ref.Kind))
+					break
+				}
+
+				secretNamespace := gw.Namespace
+				if ref.Namespace != nil {
+					secretNamespace = string(*ref.Namespace)
+				}
+
+				if secretNamespace != gw.Namespace {
+					resolvedRefsCond.Status = metav1.ConditionFalse
+					resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
+					resolvedRefsCond.Message = fmt.Sprintf("Certificate ref to Secret %s/%s not permitted: cross-namespace references require ReferenceGrant (not implemented)", secretNamespace, ref.Name)
+					break
+				}
+
+				secret := &corev1.Secret{}
+				err := r.Get(ctx, types.NamespacedName{Namespace: secretNamespace, Name: string(ref.Name)}, secret)
+				if err != nil {
+					resolvedRefsCond.Status = metav1.ConditionFalse
+					if apierrors.IsNotFound(err) {
+						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+						resolvedRefsCond.Message = fmt.Sprintf("Secret %s/%s not found", secretNamespace, ref.Name)
+					} else {
+						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonPending)
+						resolvedRefsCond.Message = fmt.Sprintf("Error fetching Secret %s/%s: %v", secretNamespace, ref.Name, err)
+					}
+					break
+				}
+			}
+		}
+	}
+
+	acceptedCond := metav1.Condition{
+		Type:               string(gatewayv1.ListenerConditionAccepted),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gw.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             string(gatewayv1.ListenerReasonAccepted),
+		Message:            "Listener accepted",
+	}
+
+	programmedCond := metav1.Condition{
+		Type:               string(gatewayv1.ListenerConditionProgrammed),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gw.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             string(gatewayv1.ListenerReasonProgrammed),
+		Message:            "Listener programmed",
+	}
+
+	if resolvedRefsCond.Status == metav1.ConditionFalse {
+		programmedCond.Status = metav1.ConditionFalse
+		programmedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
+		programmedCond.Message = "Listener has invalid references"
+	}
+
+	return []metav1.Condition{programmedCond, acceptedCond, resolvedRefsCond}
 }
 
 func (r *GatewayReconciler) updateProxy() {
