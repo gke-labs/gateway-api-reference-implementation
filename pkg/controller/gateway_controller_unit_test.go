@@ -152,9 +152,9 @@ func TestGatewayReconciler_FrontendValidation(t *testing.T) {
 				},
 			},
 			expectedStatus:    metav1.ConditionFalse,
-			expectedReason:    "InvalidCACertificateRef",
+			expectedReason:    string(gatewayv1.ListenerReasonInvalidCACertificateRef),
 			expectedAccepted:  metav1.ConditionFalse,
-			expectedAccReason: "NoValidCACertificate",
+			expectedAccReason: string(gatewayv1.ListenerReasonNoValidCACertificate),
 		},
 		{
 			name: "invalid FrontendValidation - unsupported Kind",
@@ -179,7 +179,7 @@ func TestGatewayReconciler_FrontendValidation(t *testing.T) {
 									CACertificateRefs: []gatewayv1.ObjectReference{
 										{
 											Kind: "Secret",
-											Name: "some-secret",
+											Name: "ca-secret",
 										},
 									},
 								},
@@ -189,9 +189,9 @@ func TestGatewayReconciler_FrontendValidation(t *testing.T) {
 				},
 			},
 			expectedStatus:    metav1.ConditionFalse,
-			expectedReason:    "InvalidCACertificateKind",
+			expectedReason:    string(gatewayv1.ListenerReasonInvalidCACertificateKind),
 			expectedAccepted:  metav1.ConditionFalse,
-			expectedAccReason: "NoValidCACertificate",
+			expectedAccReason: string(gatewayv1.ListenerReasonNoValidCACertificate),
 		},
 	}
 
