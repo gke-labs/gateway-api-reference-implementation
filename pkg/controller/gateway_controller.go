@@ -184,7 +184,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		resolvedRefsCondition, supportedKinds := r.computeResolvedRefsAndSupportedKinds(gw.Generation, listener)
 
 		attachedRoutes := 0
-		if len(supportedKinds) > 0 {
+		supportsHTTPRoute := false
+		for _, sk := range supportedKinds {
+			if (sk.Group == nil || *sk.Group == gatewayv1.GroupName) && sk.Kind == "HTTPRoute" {
+				supportsHTTPRoute = true
+				break
+			}
+		}
+
+		if supportsHTTPRoute {
 			for _, route := range routes {
 				for _, parentRef := range route.Spec.ParentRefs {
 					if string(parentRef.Name) == gw.Name {
@@ -320,11 +328,15 @@ func (r *GatewayReconciler) computeResolvedRefsAndSupportedKinds(generation int6
 		Message:            "All references resolved",
 	}
 
-	var supportedKinds []gatewayv1.RouteGroupKind
+	supportedKinds := []gatewayv1.RouteGroupKind{}
 
 	if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
 		var unsupportedMsgs []string
-		seenKinds := make(map[string]bool)
+		type routeKind struct {
+			group gatewayv1.Group
+			kind  gatewayv1.Kind
+		}
+		seenKinds := make(map[routeKind]bool)
 		seenUnsupportedMsgs := make(map[string]bool)
 
 		for _, k := range listener.AllowedRoutes.Kinds {
@@ -333,18 +345,23 @@ func (r *GatewayReconciler) computeResolvedRefsAndSupportedKinds(generation int6
 				group = *k.Group
 			}
 
-			kindKey := fmt.Sprintf("%s/%s", group, k.Kind)
+			rk := routeKind{group: group, kind: k.Kind}
 
 			if group == gatewayv1.Group(gatewayv1.GroupName) && k.Kind == "HTTPRoute" {
-				if !seenKinds[kindKey] {
+				if !seenKinds[rk] {
 					supportedKinds = append(supportedKinds, gatewayv1.RouteGroupKind{
 						Group: state.Ptr(group),
 						Kind:  k.Kind,
 					})
-					seenKinds[kindKey] = true
+					seenKinds[rk] = true
 				}
 			} else {
-				msg := fmt.Sprintf("Group %q and Kind %q are not supported", group, k.Kind)
+				var msg string
+				if group == "" {
+					msg = fmt.Sprintf("Core API Group and Kind %q are not supported", k.Kind)
+				} else {
+					msg = fmt.Sprintf("Group %q and Kind %q are not supported", group, k.Kind)
+				}
 				if !seenUnsupportedMsgs[msg] {
 					unsupportedMsgs = append(unsupportedMsgs, msg)
 					seenUnsupportedMsgs[msg] = true
@@ -357,18 +374,12 @@ func (r *GatewayReconciler) computeResolvedRefsAndSupportedKinds(generation int6
 			condition.Reason = string(gatewayv1.ListenerReasonInvalidRouteKinds)
 			condition.Message = strings.Join(unsupportedMsgs, ", ")
 		}
-
-		if supportedKinds == nil {
-			supportedKinds = []gatewayv1.RouteGroupKind{}
-		}
 	} else {
 		// TODO: Dynamically default to other route types based on listener protocol in the future (e.g. TCPRoute for TCP)
 		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
 			supportedKinds = []gatewayv1.RouteGroupKind{
 				{Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)), Kind: "HTTPRoute"},
 			}
-		} else {
-			supportedKinds = []gatewayv1.RouteGroupKind{}
 		}
 	}
 
