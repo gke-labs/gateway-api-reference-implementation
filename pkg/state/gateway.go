@@ -470,7 +470,8 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							for _, ancestor := range policy.Status.Ancestors {
 								if string(ancestor.ControllerName) == controllerName &&
 									string(ancestor.AncestorRef.Name) == s.Name &&
-									(ancestor.AncestorRef.Namespace == nil || string(*ancestor.AncestorRef.Namespace) == s.Namespace) {
+									((ancestor.AncestorRef.Namespace == nil && policy.Namespace == s.Namespace) ||
+										(ancestor.AncestorRef.Namespace != nil && string(*ancestor.AncestorRef.Namespace) == s.Namespace)) {
 									for _, cond := range ancestor.Conditions {
 										if cond.Type == string(gatewayv1.PolicyConditionAccepted) && cond.Status == metav1.ConditionTrue {
 											isAccepted = true
