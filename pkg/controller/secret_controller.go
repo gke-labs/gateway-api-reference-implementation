@@ -23,8 +23,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 type SecretReconciler struct {
@@ -60,6 +62,12 @@ func (r *SecretReconciler) updateProxy() {
 
 func (r *SecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&corev1.Secret{}).
+		For(&corev1.Secret{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
+			secret, ok := object.(*corev1.Secret)
+			if !ok {
+				return false
+			}
+			return secret.Type == corev1.SecretTypeTLS
+		}))).
 		Complete(r)
 }

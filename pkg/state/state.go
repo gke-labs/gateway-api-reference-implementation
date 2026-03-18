@@ -35,6 +35,7 @@ type State struct {
 	configMaps         map[types.NamespacedName]*corev1.ConfigMap
 	secrets            map[types.NamespacedName]*corev1.Secret
 	referenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+	referenceGrantList []*gatewayv1beta1.ReferenceGrant
 }
 
 func NewState() *State {
@@ -63,15 +64,20 @@ func (s *State) DeleteSecret(name types.NamespacedName) {
 	delete(s.secrets, name)
 }
 
-func (s *State) GetSecrets() map[types.NamespacedName]*corev1.Secret {
+func (s *State) HasSecret(name types.NamespacedName) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	secrets := make(map[types.NamespacedName]*corev1.Secret)
-	for k, v := range s.secrets {
-		secrets[k] = v
+	_, ok := s.secrets[name]
+	return ok
+}
+
+func (s *State) rebuildReferenceGrantList() {
+	var rgs []*gatewayv1beta1.ReferenceGrant
+	for _, rg := range s.referenceGrants {
+		rgs = append(rgs, rg)
 	}
-	return secrets
+	s.referenceGrantList = rgs
 }
 
 func (s *State) UpsertReferenceGrant(rg *gatewayv1beta1.ReferenceGrant) {
@@ -79,6 +85,7 @@ func (s *State) UpsertReferenceGrant(rg *gatewayv1beta1.ReferenceGrant) {
 	defer s.mu.Unlock()
 
 	s.referenceGrants[types.NamespacedName{Namespace: rg.Namespace, Name: rg.Name}] = rg
+	s.rebuildReferenceGrantList()
 }
 
 func (s *State) DeleteReferenceGrant(name types.NamespacedName) {
@@ -86,17 +93,14 @@ func (s *State) DeleteReferenceGrant(name types.NamespacedName) {
 	defer s.mu.Unlock()
 
 	delete(s.referenceGrants, name)
+	s.rebuildReferenceGrantList()
 }
 
 func (s *State) GetReferenceGrants() []*gatewayv1beta1.ReferenceGrant {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var rgs []*gatewayv1beta1.ReferenceGrant
-	for _, rg := range s.referenceGrants {
-		rgs = append(rgs, rg)
-	}
-	return rgs
+	return s.referenceGrantList
 }
 
 func (s *State) UpsertConfigMap(cm *corev1.ConfigMap) {

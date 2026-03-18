@@ -10,8 +10,11 @@ metadata:
   name: gari-controller
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants"]
+  resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies"]
   verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["referencegrants"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["services", "configmaps", "secrets"]
   verbs: ["get", "list", "watch"]
