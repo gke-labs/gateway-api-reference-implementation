@@ -678,6 +678,23 @@ func TestBuildInternalRoutes(t *testing.T) {
 							Hostname: "new.example.com",
 						},
 					},
+					Status: gatewayv1.PolicyStatus{
+						Ancestors: []gatewayv1.PolicyAncestorStatus{
+							{
+								AncestorRef: gatewayv1.ParentReference{
+									Name: "reference-gateway",
+								},
+								ControllerName: gatewayv1.GatewayController(controllerName),
+								Conditions: []metav1.Condition{
+									{
+										Type:   string(gatewayv1.PolicyConditionAccepted),
+										Status: metav1.ConditionTrue,
+										Reason: string(gatewayv1.PolicyReasonAccepted),
+									},
+								},
+							},
+						},
+					},
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -699,6 +716,23 @@ func TestBuildInternalRoutes(t *testing.T) {
 							Hostname: "old.example.com",
 						},
 					},
+					Status: gatewayv1.PolicyStatus{
+						Ancestors: []gatewayv1.PolicyAncestorStatus{
+							{
+								AncestorRef: gatewayv1.ParentReference{
+									Name: "reference-gateway",
+								},
+								ControllerName: gatewayv1.GatewayController(controllerName),
+								Conditions: []metav1.Condition{
+									{
+										Type:   string(gatewayv1.PolicyConditionAccepted),
+										Status: metav1.ConditionTrue,
+										Reason: string(gatewayv1.PolicyReasonAccepted),
+									},
+								},
+							},
+						},
+					},
 				},
 			},
 			expected: []InternalRoute{
@@ -714,6 +748,125 @@ func TestBuildInternalRoutes(t *testing.T) {
 									Hostname: "old.example.com",
 									CACerts:  nil,
 								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "BackendTLSPolicy ignored if not accepted",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route1",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Hostnames: []gatewayv1.Hostname{"example.com"},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Kind: Ptr(gatewayv1.Kind("Service")),
+													Name: "backend-svc",
+													Port: Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "default", Name: "backend-svc"}: {
+					Spec: corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{
+							{
+								Port: 80,
+							},
+						},
+					},
+				},
+			},
+			backendTLSPolicies: []*gatewayv1.BackendTLSPolicy{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "policy-unaccepted",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.BackendTLSPolicySpec{
+						TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+							{
+								LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+									Group: "",
+									Kind:  "Service",
+									Name:  "backend-svc",
+								},
+							},
+						},
+						Validation: gatewayv1.BackendTLSPolicyValidation{
+							Hostname: "unaccepted.example.com",
+						},
+					},
+					Status: gatewayv1.PolicyStatus{
+						Ancestors: []gatewayv1.PolicyAncestorStatus{
+							{
+								AncestorRef: gatewayv1.ParentReference{
+									Name: "reference-gateway",
+								},
+								ControllerName: gatewayv1.GatewayController(controllerName),
+								Conditions: []metav1.Condition{
+									{
+										Type:   string(gatewayv1.PolicyConditionAccepted),
+										Status: metav1.ConditionFalse,
+										Reason: "Invalid",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"example.com"},
+					Rules: []InternalRule{
+						{
+							Backend: &InternalBackend{
+								Host:        "backend-svc.default.svc.cluster.local",
+								Port:        80,
+								AppProtocol: nil,
+								TLSConfig:   nil,
 							},
 						},
 					},
