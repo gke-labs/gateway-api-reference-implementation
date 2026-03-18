@@ -468,7 +468,11 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							// Check if policy is accepted for this Gateway
 							isAccepted := false
 							for _, ancestor := range policy.Status.Ancestors {
-								if string(ancestor.ControllerName) == controllerName &&
+								group := string(ValueOf(ancestor.AncestorRef.Group))
+								kind := string(ValueOf(ancestor.AncestorRef.Kind))
+								if (group == "" || group == "gateway.networking.k8s.io") &&
+									(kind == "" || kind == "Gateway") &&
+									string(ancestor.ControllerName) == controllerName &&
 									string(ancestor.AncestorRef.Name) == s.Name &&
 									((ancestor.AncestorRef.Namespace == nil && policy.Namespace == s.Namespace) ||
 										(ancestor.AncestorRef.Namespace != nil && string(*ancestor.AncestorRef.Namespace) == s.Namespace)) {
