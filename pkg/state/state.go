@@ -15,6 +15,8 @@
 package state
 
 import (
+	"sort"
+
 	"fmt"
 	"sync"
 
@@ -215,6 +217,12 @@ func (s *State) GetHTTPRoutes() []*HTTPRouteState {
 	for _, route := range s.httpRoutes {
 		routes = append(routes, route)
 	}
+	sort.SliceStable(routes, func(i, j int) bool {
+		if routes[i].CreationTimestamp.Time.Equal(routes[j].CreationTimestamp.Time) {
+			return routes[i].Namespace+"/"+routes[i].Name < routes[j].Namespace+"/"+routes[j].Name
+		}
+		return routes[i].CreationTimestamp.Time.Before(routes[j].CreationTimestamp.Time)
+	})
 	return routes
 }
 
@@ -226,6 +234,12 @@ func (s *State) GetGRPCRoutes() []*GRPCRouteState {
 	for _, route := range s.grpcRoutes {
 		routes = append(routes, route)
 	}
+	sort.SliceStable(routes, func(i, j int) bool {
+		if routes[i].CreationTimestamp.Time.Equal(routes[j].CreationTimestamp.Time) {
+			return routes[i].Namespace+"/"+routes[i].Name < routes[j].Namespace+"/"+routes[j].Name
+		}
+		return routes[i].CreationTimestamp.Time.Before(routes[j].CreationTimestamp.Time)
+	})
 	return routes
 }
 

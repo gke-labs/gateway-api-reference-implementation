@@ -184,9 +184,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		attachedRoutes := 0
 		for _, route := range httpRoutes {
 			for _, parentRef := range route.Spec.ParentRefs {
-				if string(parentRef.Name) == gw.Name {
+				ns := route.Namespace
+				if parentRef.Namespace != nil {
+					ns = string(*parentRef.Namespace)
+				}
+				if string(parentRef.Name) == gw.Name && ns == gw.Namespace {
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
+						if route.MatchesGateway(gw, ControllerName) {
 							attachedRoutes++
 							break
 						}
@@ -196,9 +200,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		for _, route := range grpcRoutes {
 			for _, parentRef := range route.Spec.ParentRefs {
-				if string(parentRef.Name) == gw.Name {
+				ns := route.Namespace
+				if parentRef.Namespace != nil {
+					ns = string(*parentRef.Namespace)
+				}
+				if string(parentRef.Name) == gw.Name && ns == gw.Namespace {
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
+						if route.MatchesGateway(gw, ControllerName) {
 							attachedRoutes++
 							break
 						}
@@ -345,8 +353,14 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					if string(state.ValueOf(parentRef.Kind)) == "" || string(state.ValueOf(parentRef.Kind)) == "Gateway" {
 						requests = append(requests, ctrl.Request{
 							NamespacedName: types.NamespacedName{
-								Namespace: route.Namespace, // Assuming same namespace for now
-								Name:      string(parentRef.Name),
+								Namespace: func() string {
+									if parentRef.Namespace != nil {
+										return string(*parentRef.Namespace)
+									} else {
+										return route.Namespace
+									}
+								}(),
+								Name: string(parentRef.Name),
 							},
 						})
 					}
@@ -363,8 +377,14 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					if string(state.ValueOf(parentRef.Kind)) == "" || string(state.ValueOf(parentRef.Kind)) == "Gateway" {
 						requests = append(requests, ctrl.Request{
 							NamespacedName: types.NamespacedName{
-								Namespace: route.Namespace, // Assuming same namespace for now
-								Name:      string(parentRef.Name),
+								Namespace: func() string {
+									if parentRef.Namespace != nil {
+										return string(*parentRef.Namespace)
+									} else {
+										return route.Namespace
+									}
+								}(),
+								Name: string(parentRef.Name),
 							},
 						})
 					}

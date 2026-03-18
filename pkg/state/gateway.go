@@ -100,6 +100,9 @@ type ErrorState struct {
 	// HTTPMessage is the message to return in the HTTP response body.
 	// This is the "user-facing" error message.
 	HTTPMessage string
+
+	// GRPCStatusCode is the status code to return in the grpc-status header.
+	GRPCStatusCode *int32
 }
 
 type InternalRule struct {
@@ -342,7 +345,11 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 					continue
 				}
 				// Namespace check (optional for now as per current implementation)
-				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
+				ns := string(ValueOf(parentRef.Namespace))
+				if ns == "" {
+					ns = route.Namespace
+				}
+				if ns != s.Namespace {
 					continue
 				}
 
@@ -376,8 +383,6 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 				Hostnames: effectiveHostnames,
 			}
 
-			resolvedRefsCond := route.ComputeResolvedRefsCondition()
-
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
 				for _, filter := range rule.Filters {
@@ -409,13 +414,7 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 					Redirect: redirect,
 				}
 
-				if resolvedRefsCond.Status == metav1.ConditionFalse {
-					iRule.Error = &ErrorState{
-						Condition:      resolvedRefsCond,
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    resolvedRefsCond.Message,
-					}
-				} else if redirect == nil {
+				if redirect == nil {
 					for _, backendRef := range rule.BackendRefs {
 						kind := ValueOf(backendRef.Kind)
 						if kind == "" {
@@ -435,26 +434,48 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							continue
 						}
 
-						if backendRef.Port == nil {
-							continue
-						}
-
 						backendSvcNamespace := route.Namespace
 						if backendRef.Namespace != nil {
 							backendSvcNamespace = string(*backendRef.Namespace)
 						}
-
 						backendSvcName := types.NamespacedName{
 							Namespace: backendSvcNamespace,
 							Name:      string(backendRef.Name),
 						}
+						var targetPort int32
 						var appProtocol *string
 						if svc, ok := services[backendSvcName]; ok {
-							for _, port := range svc.Spec.Ports {
-								if port.Port == int32(*backendRef.Port) {
-									appProtocol = port.AppProtocol
-									break
+							if backendRef.Port == nil {
+								if len(svc.Spec.Ports) == 1 {
+									targetPort = svc.Spec.Ports[0].Port
+									appProtocol = svc.Spec.Ports[0].AppProtocol
+								} else {
+									iRule.Error = &ErrorState{
+										Condition: metav1.Condition{
+											Type:    string(gatewayv1.RouteConditionResolvedRefs),
+											Status:  metav1.ConditionFalse,
+											Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+											Message: "Port required for Service with multiple ports",
+										},
+										HTTPStatusCode: http.StatusInternalServerError,
+										HTTPMessage:    "Port required for Service with multiple ports",
+									}
+									continue
 								}
+							} else {
+								targetPort = int32(*backendRef.Port)
+								for _, port := range svc.Spec.Ports {
+									if port.Port == targetPort {
+										appProtocol = port.AppProtocol
+										break
+									}
+								}
+							}
+						} else {
+							if backendRef.Port != nil {
+								targetPort = int32(*backendRef.Port)
+							} else {
+								targetPort = 80 // fallback
 							}
 						}
 
@@ -497,7 +518,7 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 
 						iRule.Backend = &InternalBackend{
 							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-							Port:        int32(*backendRef.Port),
+							Port:        targetPort,
 							AppProtocol: appProtocol,
 							TLSConfig:   tlsConfig,
 						}
@@ -536,6 +557,17 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							re, err := regexp.Compile(header.Value)
 							if err == nil {
 								hm.MatchRegularExpressionValue = re
+							} else {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+										Message: "Invalid regex",
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    "Invalid regex",
+								}
 							}
 						}
 						iMatch.Headers = append(iMatch.Headers, hm)
@@ -558,7 +590,11 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 					continue
 				}
 				// Namespace check (optional for now as per current implementation)
-				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
+				ns := string(ValueOf(parentRef.Namespace))
+				if ns == "" {
+					ns = route.Namespace
+				}
+				if ns != s.Namespace {
 					continue
 				}
 
@@ -591,18 +627,10 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 				Hostnames: effectiveHostnames,
 			}
 
-			resolvedRefsCond := route.ComputeResolvedRefsCondition()
-
 			for _, rule := range route.Spec.Rules {
 				iRule := InternalRule{}
 
-				if resolvedRefsCond.Status == metav1.ConditionFalse {
-					iRule.Error = &ErrorState{
-						Condition:      resolvedRefsCond,
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    resolvedRefsCond.Message,
-					}
-				} else {
+				{
 					for _, backendRef := range rule.BackendRefs {
 						kind := ValueOf(backendRef.Kind)
 						if kind == "" {
@@ -618,11 +646,8 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 								},
 								HTTPStatusCode: http.StatusInternalServerError,
 								HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+								GRPCStatusCode: Ptr(int32(14)),
 							}
-							continue
-						}
-
-						if backendRef.Port == nil {
 							continue
 						}
 
@@ -630,18 +655,45 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 						if backendRef.Namespace != nil {
 							backendSvcNamespace = string(*backendRef.Namespace)
 						}
-
 						backendSvcName := types.NamespacedName{
 							Namespace: backendSvcNamespace,
 							Name:      string(backendRef.Name),
 						}
+						var targetPort int32
 						var appProtocol *string
 						if svc, ok := services[backendSvcName]; ok {
-							for _, port := range svc.Spec.Ports {
-								if port.Port == int32(*backendRef.Port) {
-									appProtocol = port.AppProtocol
-									break
+							if backendRef.Port == nil {
+								if len(svc.Spec.Ports) == 1 {
+									targetPort = svc.Spec.Ports[0].Port
+									appProtocol = svc.Spec.Ports[0].AppProtocol
+								} else {
+									iRule.Error = &ErrorState{
+										Condition: metav1.Condition{
+											Type:    string(gatewayv1.RouteConditionResolvedRefs),
+											Status:  metav1.ConditionFalse,
+											Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+											Message: "Port required for Service with multiple ports",
+										},
+										HTTPStatusCode: http.StatusInternalServerError,
+										HTTPMessage:    "Port required for Service with multiple ports",
+										GRPCStatusCode: Ptr(int32(14)), // UNAVAILABLE
+									}
+									continue
 								}
+							} else {
+								targetPort = int32(*backendRef.Port)
+								for _, port := range svc.Spec.Ports {
+									if port.Port == targetPort {
+										appProtocol = port.AppProtocol
+										break
+									}
+								}
+							}
+						} else {
+							if backendRef.Port != nil {
+								targetPort = int32(*backendRef.Port)
+							} else {
+								targetPort = 80 // fallback
 							}
 						}
 
@@ -684,7 +736,7 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 
 						iRule.Backend = &InternalBackend{
 							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-							Port:        int32(*backendRef.Port),
+							Port:        targetPort,
 							AppProtocol: appProtocol,
 							TLSConfig:   tlsConfig,
 						}
@@ -695,8 +747,18 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 					}
 				}
 
-				for _, match := range rule.Matches {
+				matches := rule.Matches
+				if len(matches) == 0 {
+					matches = []gatewayv1.GRPCRouteMatch{{}}
+				}
+				for _, match := range matches {
 					iMatch := InternalMatch{}
+					iMatch.Headers = append(iMatch.Headers, InternalHeaderMatch{
+						Type:                        gatewayv1.HeaderMatchRegularExpression,
+						Name:                        "Content-Type",
+						MatchExactValue:             "^application/grpc.*",
+						MatchRegularExpressionValue: regexp.MustCompile("^application/grpc.*"),
+					})
 					if match.Method != nil {
 						method := match.Method
 						methodType := ValueOf(method.Type)
@@ -720,9 +782,17 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 								}
 							}
 						} else if methodType == gatewayv1.GRPCMethodMatchRegularExpression {
-							// For regex, it's more complex, but we can try to approximate it
-							// In a real implementation we would use a different internal match type
-							// For now, let's just use exact path for simplicity if it matches a common pattern
+							iRule.Error = &ErrorState{
+								Condition: metav1.Condition{
+									Type:    string(gatewayv1.RouteConditionResolvedRefs), // actually RouteReasonUnsupportedValue is usually under Accepted, but ResolvedRefs works too for internal proxy err
+									Status:  metav1.ConditionFalse,
+									Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+									Message: "GRPCMethodMatchRegularExpression is not supported",
+								},
+								HTTPStatusCode: http.StatusInternalServerError,
+								HTTPMessage:    "GRPCMethodMatchRegularExpression is not supported",
+								GRPCStatusCode: Ptr(int32(12)), // UNIMPLEMENTED
+							}
 						}
 					}
 
@@ -740,6 +810,18 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							re, err := regexp.Compile(header.Value)
 							if err == nil {
 								hm.MatchRegularExpressionValue = re
+							} else {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+										Message: "Invalid regex",
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    "Invalid regex",
+									GRPCStatusCode: Ptr(int32(3)), // INVALID_ARGUMENT
+								}
 							}
 						}
 						iMatch.Headers = append(iMatch.Headers, hm)

@@ -57,8 +57,11 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 		// Check if Gateway exists and has matching listeners
 		var gw *GatewayState
 		for _, g := range gateways {
-			if g.Name == string(parentRef.Name) {
-				// Note: for now we only check name, but should check namespace too if specified
+			ns := string(ValueOf(parentRef.Namespace))
+			if ns == "" {
+				ns = s.Namespace
+			}
+			if g.Name == string(parentRef.Name) && g.Namespace == ns {
 				gw = g
 				break
 			}
@@ -152,8 +155,11 @@ func (s *HTTPRouteState) MatchesGateway(gw *gatewayv1.Gateway, controllerName st
 
 	for _, ps := range s.HTTPRoute.Status.Parents {
 		if string(ps.ControllerName) == controllerName {
-			if string(ps.ParentRef.Name) == gw.Name {
-				// Note: for now we only check name, but should check namespace too if specified
+			ns := string(ValueOf(ps.ParentRef.Namespace))
+			if ns == "" {
+				ns = s.Namespace
+			}
+			if string(ps.ParentRef.Name) == gw.Name && ns == gw.Namespace {
 				for _, c := range ps.Conditions {
 					if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
 						return true
