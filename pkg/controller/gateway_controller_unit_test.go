@@ -63,13 +63,14 @@ func TestGatewayReconciler_FrontendValidation(t *testing.T) {
 	}
 
 	tests := []struct {
-		name              string
-		gateway           *gatewayv1.Gateway
-		configMaps        []*corev1.ConfigMap
-		expectedReason    string
-		expectedStatus    metav1.ConditionStatus
-		expectedAccepted  metav1.ConditionStatus
-		expectedAccReason string
+		name                     string
+		gateway                  *gatewayv1.Gateway
+		configMaps               []*corev1.ConfigMap
+		expectedReason           string
+		expectedStatus           metav1.ConditionStatus
+		expectedAccepted         metav1.ConditionStatus
+		expectedAccReason        string
+		expectedProgrammedStatus metav1.ConditionStatus
 	}{
 		{
 			name: "valid FrontendValidation",
@@ -114,10 +115,11 @@ func TestGatewayReconciler_FrontendValidation(t *testing.T) {
 					},
 				},
 			},
-			expectedStatus:    metav1.ConditionTrue,
-			expectedReason:    string(gatewayv1.ListenerReasonResolvedRefs),
-			expectedAccepted:  metav1.ConditionTrue,
-			expectedAccReason: string(gatewayv1.ListenerReasonAccepted),
+			expectedStatus:           metav1.ConditionTrue,
+			expectedReason:           string(gatewayv1.ListenerReasonResolvedRefs),
+			expectedAccepted:         metav1.ConditionTrue,
+			expectedAccReason:        string(gatewayv1.ListenerReasonAccepted),
+			expectedProgrammedStatus: metav1.ConditionTrue,
 		},
 		{
 			name: "invalid FrontendValidation - ConfigMap not found",
@@ -151,10 +153,125 @@ func TestGatewayReconciler_FrontendValidation(t *testing.T) {
 					},
 				},
 			},
-			expectedStatus:    metav1.ConditionFalse,
-			expectedReason:    string(gatewayv1.ListenerReasonInvalidCACertificateRef),
-			expectedAccepted:  metav1.ConditionFalse,
-			expectedAccReason: string(gatewayv1.ListenerReasonNoValidCACertificate),
+			expectedStatus:           metav1.ConditionFalse,
+			expectedReason:           string(gatewayv1.ListenerReasonInvalidCACertificateRef),
+			expectedAccepted:         metav1.ConditionFalse,
+			expectedAccReason:        string(gatewayv1.ListenerReasonNoValidCACertificate),
+			expectedProgrammedStatus: metav1.ConditionFalse,
+		},
+		{
+			name: "invalid FrontendValidation - cross namespace RefNotPermitted",
+			gateway: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      gwName,
+					Namespace: namespace,
+				},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: gatewayv1.ObjectName(gcName),
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "https",
+							Protocol: gatewayv1.HTTPSProtocolType,
+							Port:     443,
+						},
+					},
+					TLS: &gatewayv1.GatewayTLSConfig{
+						Frontend: &gatewayv1.FrontendTLSConfig{
+							Default: gatewayv1.TLSConfig{
+								Validation: &gatewayv1.FrontendTLSValidation{
+									CACertificateRefs: []gatewayv1.ObjectReference{
+										{
+											Name:      "my-ca-configmap",
+											Kind:      "ConfigMap",
+											Namespace: state.Ptr(gatewayv1.Namespace("other-namespace")),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			configMaps: []*corev1.ConfigMap{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "my-ca-configmap",
+						Namespace: "other-namespace",
+					},
+					Data: map[string]string{
+						"ca.crt": "dummy-cert",
+					},
+				},
+			},
+			expectedStatus:           metav1.ConditionFalse,
+			expectedReason:           string(gatewayv1.ListenerReasonRefNotPermitted),
+			expectedAccepted:         metav1.ConditionFalse,
+			expectedAccReason:        string(gatewayv1.ListenerReasonNoValidCACertificate),
+			expectedProgrammedStatus: metav1.ConditionFalse,
+		},
+		{
+			name: "valid FrontendValidation - PerPort override",
+			gateway: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      gwName,
+					Namespace: namespace,
+				},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: gatewayv1.ObjectName(gcName),
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "https",
+							Protocol: gatewayv1.HTTPSProtocolType,
+							Port:     8443,
+						},
+					},
+					TLS: &gatewayv1.GatewayTLSConfig{
+						Frontend: &gatewayv1.FrontendTLSConfig{
+							Default: gatewayv1.TLSConfig{
+								Validation: &gatewayv1.FrontendTLSValidation{
+									CACertificateRefs: []gatewayv1.ObjectReference{
+										{
+											Name: "missing-ca-configmap",
+											Kind: "ConfigMap",
+										},
+									},
+								},
+							},
+							PerPort: []gatewayv1.TLSPortConfig{
+								{
+									Port: 8443,
+									TLS: gatewayv1.TLSConfig{
+										Validation: &gatewayv1.FrontendTLSValidation{
+											CACertificateRefs: []gatewayv1.ObjectReference{
+												{
+													Name: "valid-ca-configmap",
+													Kind: "ConfigMap",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			configMaps: []*corev1.ConfigMap{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "valid-ca-configmap",
+						Namespace: namespace,
+					},
+					Data: map[string]string{
+						"ca.crt": "dummy-cert",
+					},
+				},
+			},
+			expectedStatus:           metav1.ConditionTrue,
+			expectedReason:           string(gatewayv1.ListenerReasonResolvedRefs),
+			expectedAccepted:         metav1.ConditionTrue,
+			expectedAccReason:        string(gatewayv1.ListenerReasonAccepted),
+			expectedProgrammedStatus: metav1.ConditionTrue,
 		},
 		{
 			name: "invalid FrontendValidation - unsupported Kind",
@@ -188,10 +305,11 @@ func TestGatewayReconciler_FrontendValidation(t *testing.T) {
 					},
 				},
 			},
-			expectedStatus:    metav1.ConditionFalse,
-			expectedReason:    string(gatewayv1.ListenerReasonInvalidCACertificateKind),
-			expectedAccepted:  metav1.ConditionFalse,
-			expectedAccReason: string(gatewayv1.ListenerReasonNoValidCACertificate),
+			expectedStatus:           metav1.ConditionFalse,
+			expectedReason:           string(gatewayv1.ListenerReasonInvalidCACertificateKind),
+			expectedAccepted:         metav1.ConditionFalse,
+			expectedAccReason:        string(gatewayv1.ListenerReasonNoValidCACertificate),
+			expectedProgrammedStatus: metav1.ConditionFalse,
 		},
 	}
 
@@ -236,13 +354,23 @@ func TestGatewayReconciler_FrontendValidation(t *testing.T) {
 			lStatus := updatedGw.Status.Listeners[0]
 			var resolvedRefsCond *metav1.Condition
 			var acceptedCond *metav1.Condition
+			var programmedCond *metav1.Condition
 			for i := range lStatus.Conditions {
 				c := &lStatus.Conditions[i]
 				if c.Type == string(gatewayv1.ListenerConditionResolvedRefs) {
 					resolvedRefsCond = c
 				}
 				if c.Type == string(gatewayv1.ListenerConditionAccepted) {
+					if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+						programmedCond = c
+					}
 					acceptedCond = c
+					if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+						programmedCond = c
+					}
+				}
+				if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+					programmedCond = c
 				}
 			}
 
@@ -265,6 +393,14 @@ func TestGatewayReconciler_FrontendValidation(t *testing.T) {
 				}
 				if acceptedCond.Reason != tt.expectedAccReason {
 					t.Errorf("expected accepted reason %v, got %v", tt.expectedAccReason, acceptedCond.Reason)
+				}
+			}
+
+			if programmedCond == nil {
+				t.Errorf("Programmed condition not found")
+			} else {
+				if programmedCond.Status != tt.expectedProgrammedStatus {
+					t.Errorf("expected programmed status %v, got %v", tt.expectedProgrammedStatus, programmedCond.Status)
 				}
 			}
 		})

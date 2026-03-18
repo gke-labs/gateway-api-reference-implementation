@@ -232,9 +232,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 
 			if validation != nil {
+				if validation.Mode != "" && validation.Mode != gatewayv1.AllowValidOnly {
+					acceptedCond.Status = metav1.ConditionFalse
+					acceptedCond.Reason = string(gatewayv1.ListenerReasonUnsupportedValue)
+					acceptedCond.Message = fmt.Sprintf("Unsupported FrontendValidation Mode: %s. Only AllowValidOnly is supported.", validation.Mode)
+				}
+
 				allInvalid := true
-				invalidReasons := []string{}
-				invalidMessages := []string{}
+				invalidReasons := make([]string, 0, len(validation.CACertificateRefs))
+				invalidMessages := make([]string, 0, len(validation.CACertificateRefs))
 
 				for _, ref := range validation.CACertificateRefs {
 					valid := true
@@ -250,6 +256,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 						reason = string(gatewayv1.ListenerReasonInvalidCACertificateKind)
 						message = fmt.Sprintf("Unsupported kind: %s", string(ref.Kind))
 					} else if ref.Namespace != nil && string(*ref.Namespace) != gw.Namespace {
+						// TODO: Implement ReferenceGrant validation for CACertificateRefs
 						// Reject cross-namespace references
 						valid = false
 						reason = string(gatewayv1.ListenerReasonRefNotPermitted)
@@ -257,19 +264,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					} else {
 						// Check if ConfigMap exists
 						ns := gw.Namespace
-						if ref.Namespace != nil {
-							ns = string(*ref.Namespace)
-						}
 						cm := &corev1.ConfigMap{}
 						err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: string(ref.Name)}, cm)
 						if err != nil {
-							valid = false
 							if apierrors.IsNotFound(err) {
+								valid = false
 								reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
 								message = fmt.Sprintf("ConfigMap %s not found", string(ref.Name))
 							} else {
-								reason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
-								message = fmt.Sprintf("Error fetching ConfigMap %s: %v", string(ref.Name), err)
+								return ctrl.Result{}, err
 							}
 						} else {
 							if _, ok := cm.Data["ca.crt"]; !ok {
@@ -305,19 +308,26 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		programmedCond := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionProgrammed),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonProgrammed),
+			Message:            "Listener programmed",
+		}
+		if acceptedCond.Status == metav1.ConditionFalse || resolvedRefsCond.Status == metav1.ConditionFalse {
+			programmedCond.Status = metav1.ConditionFalse
+			programmedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
+			programmedCond.Message = "Listener configuration is invalid"
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
 			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
 			AttachedRoutes: int32(attachedRoutes),
 			Conditions: []metav1.Condition{
-				{
-					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonProgrammed),
-					Message:            "Listener programmed",
-				},
+				programmedCond,
 				acceptedCond,
 				resolvedRefsCond,
 			},
@@ -423,46 +433,12 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return nil
 			}
 			var gateways gatewayv1.GatewayList
-			if err := r.List(ctx, &gateways); err != nil {
+			if err := r.List(ctx, &gateways, client.InNamespace(cm.Namespace)); err != nil {
 				return nil
 			}
 			var requests []ctrl.Request
 			for _, gw := range gateways.Items {
-				referenced := false
-				if gw.Spec.TLS != nil && gw.Spec.TLS.Frontend != nil {
-					if gw.Spec.TLS.Frontend.Default.Validation != nil {
-						for _, ref := range gw.Spec.TLS.Frontend.Default.Validation.CACertificateRefs {
-							ns := gw.Namespace
-							if ref.Namespace != nil {
-								ns = string(*ref.Namespace)
-							}
-							if string(ref.Name) == cm.Name && ns == cm.Namespace && string(ref.Kind) == "ConfigMap" {
-								referenced = true
-								break
-							}
-						}
-					}
-					if !referenced && gw.Spec.TLS.Frontend.PerPort != nil {
-						for _, pp := range gw.Spec.TLS.Frontend.PerPort {
-							if pp.TLS.Validation != nil {
-								for _, ref := range pp.TLS.Validation.CACertificateRefs {
-									ns := gw.Namespace
-									if ref.Namespace != nil {
-										ns = string(*ref.Namespace)
-									}
-									if string(ref.Name) == cm.Name && ns == cm.Namespace && string(ref.Kind) == "ConfigMap" {
-										referenced = true
-										break
-									}
-								}
-							}
-							if referenced {
-								break
-							}
-						}
-					}
-				}
-				if referenced {
+				if isConfigMapReferenced(&gw, cm) {
 					requests = append(requests, ctrl.Request{
 						NamespacedName: types.NamespacedName{
 							Namespace: gw.Namespace,
@@ -492,4 +468,38 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return requests
 		})).
 		Complete(r)
+}
+
+func isConfigMapReferenced(gw *gatewayv1.Gateway, cm *corev1.ConfigMap) bool {
+	if gw.Spec.TLS == nil || gw.Spec.TLS.Frontend == nil {
+		return false
+	}
+	if gw.Spec.TLS.Frontend.Default.Validation != nil {
+		for _, ref := range gw.Spec.TLS.Frontend.Default.Validation.CACertificateRefs {
+			if isRefMatchingConfigMap(gw.Namespace, ref, cm) {
+				return true
+			}
+		}
+	}
+	if gw.Spec.TLS.Frontend.PerPort != nil {
+		for _, pp := range gw.Spec.TLS.Frontend.PerPort {
+			if pp.TLS.Validation != nil {
+				for _, ref := range pp.TLS.Validation.CACertificateRefs {
+					if isRefMatchingConfigMap(gw.Namespace, ref, cm) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func isRefMatchingConfigMap(gwNamespace string, ref gatewayv1.ObjectReference, cm *corev1.ConfigMap) bool {
+	ns := gwNamespace
+	if ref.Namespace != nil {
+		ns = string(*ref.Namespace)
+	}
+	// Check name, namespace, kind, and group (must be empty for core API)
+	return string(ref.Name) == cm.Name && ns == cm.Namespace && string(ref.Kind) == "ConfigMap" && string(ref.Group) == ""
 }
