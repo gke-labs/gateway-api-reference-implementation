@@ -17,6 +17,8 @@ package controller
 import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"k8s.io/apimachinery/pkg/types"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 func updateProxy(st *state.State, p *proxy.Proxy) {
@@ -31,4 +33,40 @@ func updateProxy(st *state.State, p *proxy.Proxy) {
 		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, ControllerName)...)
 	}
 	p.UpdateRoutes(proxyRoutes)
+}
+
+func isReferencePermitted(fromNamespace string, to types.NamespacedName, fromGroup, fromKind string, toGroup, toKind string, rgs []*gatewayv1beta1.ReferenceGrant) bool {
+	if fromNamespace == to.Namespace {
+		return true
+	}
+
+	for _, rg := range rgs {
+		if rg.Namespace != to.Namespace {
+			continue
+		}
+
+		// Check if the grant allows fromNamespace
+		fromAllowed := false
+		for _, from := range rg.Spec.From {
+			if string(from.Group) == fromGroup && string(from.Kind) == fromKind && string(from.Namespace) == fromNamespace {
+				fromAllowed = true
+				break
+			}
+		}
+
+		if !fromAllowed {
+			continue
+		}
+
+		// Check if the grant allows toKind
+		for _, toRef := range rg.Spec.To {
+			if string(toRef.Group) == toGroup && string(toRef.Kind) == toKind {
+				if toRef.Name == nil || string(*toRef.Name) == to.Name {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }

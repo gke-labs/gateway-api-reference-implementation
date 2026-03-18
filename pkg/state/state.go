@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type State struct {
@@ -33,6 +34,9 @@ type State struct {
 	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
 	services           map[types.NamespacedName]*corev1.Service
 	configMaps         map[types.NamespacedName]*corev1.ConfigMap
+	secrets            map[types.NamespacedName]*corev1.Secret
+	referenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+	referenceGrantList []*gatewayv1beta1.ReferenceGrant
 }
 
 func NewState() *State {
@@ -42,7 +46,62 @@ func NewState() *State {
 		backendTLSPolicies: make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
 		services:           make(map[types.NamespacedName]*corev1.Service),
 		configMaps:         make(map[types.NamespacedName]*corev1.ConfigMap),
+		secrets:            make(map[types.NamespacedName]*corev1.Secret),
+		referenceGrants:    make(map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant),
 	}
+}
+
+func (s *State) UpsertSecret(secret *corev1.Secret) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.secrets[types.NamespacedName{Namespace: secret.Namespace, Name: secret.Name}] = secret
+}
+
+func (s *State) DeleteSecret(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.secrets, name)
+}
+
+func (s *State) HasSecret(name types.NamespacedName) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	_, ok := s.secrets[name]
+	return ok
+}
+
+func (s *State) rebuildReferenceGrantList() {
+	var rgs []*gatewayv1beta1.ReferenceGrant
+	for _, rg := range s.referenceGrants {
+		rgs = append(rgs, rg)
+	}
+	s.referenceGrantList = rgs
+}
+
+func (s *State) UpsertReferenceGrant(rg *gatewayv1beta1.ReferenceGrant) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.referenceGrants[types.NamespacedName{Namespace: rg.Namespace, Name: rg.Name}] = rg
+	s.rebuildReferenceGrantList()
+}
+
+func (s *State) DeleteReferenceGrant(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.referenceGrants, name)
+	s.rebuildReferenceGrantList()
+}
+
+func (s *State) GetReferenceGrants() []*gatewayv1beta1.ReferenceGrant {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.referenceGrantList
 }
 
 func (s *State) UpsertConfigMap(cm *corev1.ConfigMap) {

@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -25,11 +26,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type GatewayClassReconciler struct {
@@ -177,6 +180,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
+	rgs := r.State.GetReferenceGrants()
 	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
@@ -194,6 +198,67 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		resolvedRefsCondition := metav1.Condition{
+			Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: gw.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+			Message:            "All references resolved",
+		}
+
+		if listener.TLS != nil {
+			for _, ref := range listener.TLS.CertificateRefs {
+				refGroup := string(state.ValueOf(ref.Group))
+				refKind := string(state.ValueOf(ref.Kind))
+				if refKind == "" {
+					refKind = "Secret"
+				}
+
+				if refKind == "Secret" {
+					if refGroup != "" && refGroup != "core" {
+						resolvedRefsCondition.Status = metav1.ConditionFalse
+						resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+						resolvedRefsCondition.Message = fmt.Sprintf("Unsupported group %q for Secret reference", refGroup)
+						break
+					}
+
+					refNamespace := gw.Namespace
+					if ref.Namespace != nil {
+						refNamespace = string(*ref.Namespace)
+					}
+
+					if !isReferencePermitted(gw.Namespace, types.NamespacedName{Namespace: refNamespace, Name: string(ref.Name)}, "gateway.networking.k8s.io", "Gateway", "", "Secret", rgs) {
+						resolvedRefsCondition.Status = metav1.ConditionFalse
+						resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
+						resolvedRefsCondition.Message = fmt.Sprintf("Certificate reference to Secret %s/%s not permitted by ReferenceGrant", refNamespace, ref.Name)
+						break
+					}
+
+					if !r.State.HasSecret(types.NamespacedName{Namespace: refNamespace, Name: string(ref.Name)}) {
+						resolvedRefsCondition.Status = metav1.ConditionFalse
+						resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+						resolvedRefsCondition.Message = fmt.Sprintf("Secret %s/%s not found", refNamespace, ref.Name)
+						break
+					}
+				} else {
+					resolvedRefsCondition.Status = metav1.ConditionFalse
+					resolvedRefsCondition.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+					resolvedRefsCondition.Message = "Unsupported certificate reference kind or group"
+					break
+				}
+			}
+		}
+
+		programmedStatus := metav1.ConditionTrue
+		programmedReason := string(gatewayv1.ListenerReasonProgrammed)
+		programmedMessage := "Listener programmed"
+		if resolvedRefsCondition.Status == metav1.ConditionFalse {
+			programmedStatus = metav1.ConditionFalse
+			programmedReason = string(gatewayv1.ListenerReasonInvalid)
+			programmedMessage = "Listener has invalid certificate references"
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
 			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
@@ -201,11 +266,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Conditions: []metav1.Condition{
 				{
 					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             metav1.ConditionTrue,
+					Status:             programmedStatus,
 					ObservedGeneration: gw.Generation,
 					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonProgrammed),
-					Message:            "Listener programmed",
+					Reason:             programmedReason,
+					Message:            programmedMessage,
 				},
 				{
 					Type:               string(gatewayv1.ListenerConditionAccepted),
@@ -215,18 +280,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					Reason:             string(gatewayv1.ListenerReasonAccepted),
 					Message:            "Listener accepted",
 				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
+				resolvedRefsCondition,
 			},
 		})
 	}
-
 	updated := false
 	if len(gw.Status.Conditions) != len(newConditions) || len(gw.Status.Addresses) != len(newAddresses) || len(gw.Status.Listeners) != len(newListenerStatuses) {
 		updated = true
@@ -292,9 +349,38 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if updated {
-		for i := range newConditions {
-			newConditions[i].LastTransitionTime = metav1.Now()
+		now := metav1.Now()
+		for i, nc := range newConditions {
+			newConditions[i].LastTransitionTime = now
+			for _, oc := range gw.Status.Conditions {
+				if oc.Type == nc.Type && oc.Status == nc.Status {
+					newConditions[i].LastTransitionTime = oc.LastTransitionTime
+					break
+				}
+			}
 		}
+
+		for i, nl := range newListenerStatuses {
+			var oldListener *gatewayv1.ListenerStatus
+			for j := range gw.Status.Listeners {
+				if gw.Status.Listeners[j].Name == nl.Name {
+					oldListener = &gw.Status.Listeners[j]
+					break
+				}
+			}
+			for j, nc := range nl.Conditions {
+				newListenerStatuses[i].Conditions[j].LastTransitionTime = now
+				if oldListener != nil {
+					for _, oc := range oldListener.Conditions {
+						if oc.Type == nc.Type && oc.Status == nc.Status {
+							newListenerStatuses[i].Conditions[j].LastTransitionTime = oc.LastTransitionTime
+							break
+						}
+					}
+				}
+			}
+		}
+
 		gw.Status.Conditions = newConditions
 		gw.Status.Addresses = newAddresses
 		gw.Status.Listeners = newListenerStatuses
@@ -338,5 +424,47 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 			return requests
 		})).
+		Watches(&gatewayv1beta1.ReferenceGrant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// When a ReferenceGrant changes, reconcile all Gateways (simple but effective for reference implementation)
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways); err != nil {
+				log.FromContext(ctx).Error(err, "failed to list gateways on ReferenceGrant change")
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: gw.Namespace,
+						Name:      gw.Name,
+					},
+				})
+			}
+			return requests
+		})).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// When a Secret changes, reconcile all Gateways
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways); err != nil {
+				log.FromContext(ctx).Error(err, "failed to list gateways on Secret change")
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: gw.Namespace,
+						Name:      gw.Name,
+					},
+				})
+			}
+			return requests
+		}), builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
+			secret, ok := object.(*corev1.Secret)
+			if !ok {
+				return false
+			}
+			return secret.Type == corev1.SecretTypeTLS
+		}))).
 		Complete(r)
 }
