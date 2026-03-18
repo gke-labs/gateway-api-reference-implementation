@@ -146,14 +146,18 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		ip = svc.Status.LoadBalancer.Ingress[0].IP
 	}
 
-	// Update status to Programmed and add address
+	// Compute Programmed status and reason
 	programmedStatus := metav1.ConditionTrue
 	programmedReason := gatewayv1.GatewayReasonProgrammed
 	programmedMessage := "Gateway programmed by reference implementation"
+	listenerProgrammedReason := gatewayv1.ListenerReasonProgrammed
+	listenerProgrammedMessage := "Listener programmed"
 	if ip == "" {
 		programmedStatus = metav1.ConditionFalse
-		programmedReason = "NoAddress"
+		programmedReason = gatewayv1.GatewayReasonAddressNotAssigned
 		programmedMessage = "gari-proxy service has no LoadBalancer IP yet"
+		listenerProgrammedReason = gatewayv1.ListenerReasonPending
+		listenerProgrammedMessage = "Listener pending Gateway IP"
 	}
 
 	newConditions := []metav1.Condition{
@@ -211,8 +215,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					Status:             programmedStatus,
 					ObservedGeneration: gw.Generation,
 					LastTransitionTime: metav1.Now(),
-					Reason:             string(programmedReason),
-					Message:            programmedMessage,
+					Reason:             string(listenerProgrammedReason),
+					Message:            listenerProgrammedMessage,
 				},
 				{
 					Type:               string(gatewayv1.ListenerConditionAccepted),
@@ -316,7 +320,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	r.updateProxy()
 
 	if ip == "" {
-		l.Info("gari-proxy service has no LoadBalancer IP yet")
+		l.V(1).Info("gari-proxy service has no LoadBalancer IP yet")
 		return ctrl.Result{Requeue: true}, nil
 	}
 
