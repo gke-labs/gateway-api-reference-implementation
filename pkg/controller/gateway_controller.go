@@ -182,6 +182,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	routes := r.State.GetHTTPRoutes()
 	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
+	var errs []error
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
 		for _, route := range routes {
@@ -207,12 +208,19 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		newConds, err := r.validateListener(ctx, gw, listener, oldConditions)
 		if err != nil {
-			return ctrl.Result{}, err
+			errs = append(errs, err)
+		}
+
+		var supportedKinds []gatewayv1.RouteGroupKind
+		if listener.Protocol == gatewayv1.TLSProtocolType {
+			supportedKinds = []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "TLSRoute"}}
+		} else {
+			supportedKinds = []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}}
 		}
 
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
-			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
+			SupportedKinds: supportedKinds,
 			AttachedRoutes: int32(attachedRoutes),
 			Conditions:     newConds,
 		})
@@ -301,7 +309,18 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	l.Info("Updated Gateway status", "address", ip)
 
+	if len(errs) > 0 {
+		return ctrl.Result{}, fmt.Errorf("transient errors during validation: %v", errs)
+	}
+
 	return ctrl.Result{}, nil
+}
+
+func resolveSecretNamespace(ns *gatewayv1.Namespace, defaultNamespace string) string {
+	if ns != nil {
+		return string(*ns)
+	}
+	return defaultNamespace
 }
 
 func (r *GatewayReconciler) validateListener(ctx context.Context, gw *gatewayv1.Gateway, listener gatewayv1.Listener, oldConditions []metav1.Condition) ([]metav1.Condition, error) {
@@ -329,16 +348,26 @@ func (r *GatewayReconciler) validateListener(ctx context.Context, gw *gatewayv1.
 		Message:            "Listener programmed",
 	}
 
+	var transientErr error
+
 	// Validate protocol
 	if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType && listener.Protocol != gatewayv1.TLSProtocolType {
 		acceptedCond.Status = metav1.ConditionFalse
 		acceptedCond.Reason = string(gatewayv1.ListenerReasonUnsupportedProtocol)
 		acceptedCond.Message = fmt.Sprintf("Unsupported protocol: %s", listener.Protocol)
+	} else if listener.Protocol == gatewayv1.HTTPProtocolType && listener.TLS != nil {
+		acceptedCond.Status = metav1.ConditionFalse
+		acceptedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
+		acceptedCond.Message = "TLS configuration must be nil for HTTP protocol"
 	} else if listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
 		if listener.TLS == nil {
 			resolvedRefsCond.Status = metav1.ConditionFalse
 			resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
 			resolvedRefsCond.Message = "TLS block is required for HTTPS/TLS protocols"
+		} else if listener.TLS.Mode != nil && *listener.TLS.Mode == gatewayv1.TLSModePassthrough && len(listener.TLS.CertificateRefs) > 0 {
+			resolvedRefsCond.Status = metav1.ConditionFalse
+			resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+			resolvedRefsCond.Message = "CertificateRefs MUST NOT be provided for Passthrough TLS mode"
 		} else if (listener.TLS.Mode == nil || *listener.TLS.Mode == gatewayv1.TLSModeTerminate) && len(listener.TLS.CertificateRefs) == 0 {
 			resolvedRefsCond.Status = metav1.ConditionFalse
 			resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
@@ -352,10 +381,7 @@ func (r *GatewayReconciler) validateListener(ctx context.Context, gw *gatewayv1.
 					break
 				}
 
-				secretNamespace := gw.Namespace
-				if ref.Namespace != nil {
-					secretNamespace = string(*ref.Namespace)
-				}
+				secretNamespace := resolveSecretNamespace(ref.Namespace, gw.Namespace)
 
 				if secretNamespace == "" {
 					resolvedRefsCond.Status = metav1.ConditionFalse
@@ -380,7 +406,10 @@ func (r *GatewayReconciler) validateListener(ctx context.Context, gw *gatewayv1.
 						resolvedRefsCond.Message = fmt.Sprintf("Secret %s/%s not found", secretNamespace, ref.Name)
 					} else {
 						// Transient error: Requeue
-						return nil, err
+						resolvedRefsCond.Status = metav1.ConditionFalse
+						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+						resolvedRefsCond.Message = fmt.Sprintf("Error fetching Secret %s/%s", secretNamespace, ref.Name)
+						transientErr = err
 					}
 					break
 				}
@@ -418,7 +447,7 @@ func (r *GatewayReconciler) validateListener(ctx context.Context, gw *gatewayv1.
 	meta.SetStatusCondition(&newConds, acceptedCond)
 	meta.SetStatusCondition(&newConds, resolvedRefsCond)
 
-	return newConds, nil
+	return newConds, transientErr
 }
 
 func (r *GatewayReconciler) updateProxy() {
@@ -447,9 +476,12 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return requests
 		})).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			secret := obj.(*corev1.Secret)
+			secretNamespace := obj.GetNamespace()
+			secretName := obj.GetName()
+
 			var gateways gatewayv1.GatewayList
-			if err := r.List(ctx, &gateways); err != nil {
+			if err := r.List(ctx, &gateways, client.InNamespace(secretNamespace)); err != nil {
+				log.FromContext(ctx).Error(err, "failed to list gateways")
 				return nil
 			}
 			var requests []ctrl.Request
@@ -458,11 +490,8 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				for _, listener := range gw.Spec.Listeners {
 					if listener.TLS != nil {
 						for _, ref := range listener.TLS.CertificateRefs {
-							ns := gw.Namespace
-							if ref.Namespace != nil && *ref.Namespace != "" {
-								ns = string(*ref.Namespace)
-							}
-							if ns == secret.Namespace && string(ref.Name) == secret.Name {
+							ns := resolveSecretNamespace(ref.Namespace, gw.Namespace)
+							if ns == secretNamespace && string(ref.Name) == secretName {
 								requests = append(requests, ctrl.Request{
 									NamespacedName: types.NamespacedName{
 										Namespace: gw.Namespace,
