@@ -146,19 +146,23 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		ip = svc.Status.LoadBalancer.Ingress[0].IP
 	}
 
+	// Update status to Programmed and add address
+	programmedStatus := metav1.ConditionTrue
+	programmedReason := gatewayv1.GatewayReasonProgrammed
+	programmedMessage := "Gateway programmed by reference implementation"
 	if ip == "" {
-		l.Info("gari-proxy service has no LoadBalancer IP yet")
-		return ctrl.Result{Requeue: true}, nil
+		programmedStatus = metav1.ConditionFalse
+		programmedReason = "NoAddress"
+		programmedMessage = "gari-proxy service has no LoadBalancer IP yet"
 	}
 
-	// Update status to Programmed and add address
 	newConditions := []metav1.Condition{
 		{
 			Type:               string(gatewayv1.GatewayConditionProgrammed),
-			Status:             metav1.ConditionTrue,
+			Status:             programmedStatus,
 			ObservedGeneration: gw.Generation,
-			Reason:             string(gatewayv1.GatewayReasonProgrammed),
-			Message:            "Gateway programmed by reference implementation",
+			Reason:             string(programmedReason),
+			Message:            programmedMessage,
 		},
 		{
 			Type:               string(gatewayv1.GatewayConditionAccepted),
@@ -168,11 +172,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Message:            "Gateway accepted by reference implementation",
 		},
 	}
-	newAddresses := []gatewayv1.GatewayStatusAddress{
-		{
-			Type:  state.Ptr(gatewayv1.IPAddressType),
-			Value: ip,
-		},
+	var newAddresses []gatewayv1.GatewayStatusAddress
+	if ip != "" {
+		newAddresses = []gatewayv1.GatewayStatusAddress{
+			{
+				Type:  state.Ptr(gatewayv1.IPAddressType),
+				Value: ip,
+			},
+		}
 	}
 
 	// Compute listener status
@@ -201,11 +208,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Conditions: []metav1.Condition{
 				{
 					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             metav1.ConditionTrue,
+					Status:             programmedStatus,
 					ObservedGeneration: gw.Generation,
 					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonProgrammed),
-					Message:            "Listener programmed",
+					Reason:             string(programmedReason),
+					Message:            programmedMessage,
 				},
 				{
 					Type:               string(gatewayv1.ListenerConditionAccepted),
@@ -307,6 +314,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	r.State.UpsertGateway(gw)
 	_ = gs // keep for now
 	r.updateProxy()
+
+	if ip == "" {
+		l.Info("gari-proxy service has no LoadBalancer IP yet")
+		return ctrl.Result{Requeue: true}, nil
+	}
 
 	l.Info("Updated Gateway status", "address", ip)
 
