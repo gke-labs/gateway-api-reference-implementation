@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -168,6 +169,67 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Message:            "Gateway accepted by reference implementation",
 		},
 	}
+
+	resolvedRefsStatus := metav1.ConditionTrue
+	resolvedRefsReason := gatewayv1.GatewayReasonResolvedRefs
+	resolvedRefsMessage := "All references resolved"
+
+	if gw.Spec.TLS != nil && gw.Spec.TLS.Backend != nil && gw.Spec.TLS.Backend.ClientCertificateRef != nil {
+		ref := gw.Spec.TLS.Backend.ClientCertificateRef
+		group := string(state.ValueOf(ref.Group))
+		kind := string(state.ValueOf(ref.Kind))
+		if kind == "" {
+			kind = "Secret"
+		}
+
+		if group == "" && kind == "Secret" {
+			ns := gw.Namespace
+			if ref.Namespace != nil {
+				ns = string(*ref.Namespace)
+			}
+
+			if ns != gw.Namespace {
+				// In a real implementation we would check for ReferenceGrant.
+				// For reference implementation, we don't support cross-namespace certificate references for Gateway.
+				resolvedRefsStatus = metav1.ConditionFalse
+				resolvedRefsReason = gatewayv1.GatewayReasonRefNotPermitted
+				resolvedRefsMessage = "Cross-namespace references for Gateway ClientCertificateRef are not supported"
+			} else {
+				secret := &corev1.Secret{}
+				if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: string(ref.Name)}, secret); err != nil {
+					if apierrors.IsNotFound(err) {
+						resolvedRefsStatus = metav1.ConditionFalse
+						resolvedRefsReason = gatewayv1.GatewayReasonInvalidClientCertificateRef
+						resolvedRefsMessage = fmt.Sprintf("Secret %s/%s not found", ns, ref.Name)
+					} else {
+						return ctrl.Result{}, err
+					}
+				} else if secret.Type != corev1.SecretTypeTLS && secret.Type != corev1.SecretTypeOpaque {
+					// We support TLS or Opaque secrets for reference implementation
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.GatewayReasonInvalidClientCertificateRef
+					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s has unsupported type: %s", ns, ref.Name, secret.Type)
+				} else {
+					crt, hasCrt := secret.Data["tls.crt"]
+					key, hasKey := secret.Data["tls.key"]
+					if !hasCrt || !hasKey || len(crt) == 0 || len(key) == 0 {
+						resolvedRefsStatus = metav1.ConditionFalse
+						resolvedRefsReason = gatewayv1.GatewayReasonInvalidClientCertificateRef
+						resolvedRefsMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", ns, ref.Name)
+					}
+				}
+			}
+		} else {
+			printGroup := group
+			if printGroup == "" {
+				printGroup = "core"
+			}
+			resolvedRefsStatus = metav1.ConditionFalse
+			resolvedRefsReason = gatewayv1.GatewayReasonInvalidClientCertificateRef
+			resolvedRefsMessage = fmt.Sprintf("Unsupported ClientCertificateRef group/kind: %s/%s", printGroup, kind)
+		}
+	}
+
 	newAddresses := []gatewayv1.GatewayStatusAddress{
 		{
 			Type:  state.Ptr(gatewayv1.IPAddressType),
@@ -226,6 +288,34 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			},
 		})
 	}
+
+	// Check if any listener has unresolved refs
+	listenersResolved := true
+	for _, lStatus := range newListenerStatuses {
+		for _, cond := range lStatus.Conditions {
+			if cond.Type == string(gatewayv1.ListenerConditionResolvedRefs) && cond.Status == metav1.ConditionFalse {
+				listenersResolved = false
+				break
+			}
+		}
+		if !listenersResolved {
+			break
+		}
+	}
+
+	if !listenersResolved {
+		resolvedRefsStatus = metav1.ConditionFalse
+		resolvedRefsReason = gatewayv1.GatewayReasonListenersNotResolved
+		resolvedRefsMessage = "One or more listeners have unresolved references"
+	}
+
+	newConditions = append(newConditions, metav1.Condition{
+		Type:               string(gatewayv1.GatewayConditionResolvedRefs),
+		Status:             resolvedRefsStatus,
+		ObservedGeneration: gw.Generation,
+		Reason:             string(resolvedRefsReason),
+		Message:            resolvedRefsMessage,
+	})
 
 	updated := false
 	if len(gw.Status.Conditions) != len(newConditions) || len(gw.Status.Addresses) != len(newAddresses) || len(gw.Status.Listeners) != len(newListenerStatuses) {
@@ -331,6 +421,33 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 							NamespacedName: types.NamespacedName{
 								Namespace: route.Namespace, // Assuming same namespace for now
 								Name:      string(parentRef.Name),
+							},
+						})
+					}
+				}
+			}
+			return requests
+		})).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			// When a Secret changes, reconcile all Gateways that reference it via ClientCertificateRef
+			secret := obj.(*corev1.Secret)
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				if gw.Spec.TLS != nil && gw.Spec.TLS.Backend != nil && gw.Spec.TLS.Backend.ClientCertificateRef != nil {
+					ref := gw.Spec.TLS.Backend.ClientCertificateRef
+					ns := gw.Namespace
+					if ref.Namespace != nil {
+						ns = string(*ref.Namespace)
+					}
+					if ns == secret.Namespace && string(ref.Name) == secret.Name {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: gw.Namespace,
+								Name:      gw.Name,
 							},
 						})
 					}
