@@ -13,7 +13,10 @@ rules:
   resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: [""]
-  resources: ["services", "configmaps"]
+  # Note: Cluster-wide access to secrets is required to support Gateway TLS references.
+  # This is a broad permission; ideally, cross-namespace ReferenceGrants should be
+  # implemented in the future to restrict access to specific namespaces.
+  resources: ["services", "configmaps", "secrets"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status"]

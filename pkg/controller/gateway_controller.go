@@ -16,11 +16,14 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -179,6 +182,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	routes := r.State.GetHTTPRoutes()
 	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
+	var errs []error
 	for _, listener := range gw.Spec.Listeners {
 		attachedRoutes := 0
 		for _, route := range routes {
@@ -194,36 +198,31 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		var oldConditions []metav1.Condition
+		for _, oldL := range gw.Status.Listeners {
+			if oldL.Name == listener.Name {
+				oldConditions = oldL.Conditions
+				break
+			}
+		}
+
+		newConds, err := r.validateListener(ctx, gw, listener, oldConditions)
+		if err != nil {
+			errs = append(errs, err)
+		}
+
+		var supportedKinds []gatewayv1.RouteGroupKind
+		if listener.Protocol == gatewayv1.TLSProtocolType {
+			supportedKinds = []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "TLSRoute"}}
+		} else {
+			supportedKinds = []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}}
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
-			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
+			SupportedKinds: supportedKinds,
 			AttachedRoutes: int32(attachedRoutes),
-			Conditions: []metav1.Condition{
-				{
-					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonProgrammed),
-					Message:            "Listener programmed",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionAccepted),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonAccepted),
-					Message:            "Listener accepted",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
-			},
+			Conditions:     newConds,
 		})
 	}
 
@@ -310,7 +309,145 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	l.Info("Updated Gateway status", "address", ip)
 
+	if len(errs) > 0 {
+		return ctrl.Result{}, fmt.Errorf("transient errors during validation: %v", errs)
+	}
+
 	return ctrl.Result{}, nil
+}
+
+func resolveSecretNamespace(ns *gatewayv1.Namespace, defaultNamespace string) string {
+	if ns != nil {
+		return string(*ns)
+	}
+	return defaultNamespace
+}
+
+func (r *GatewayReconciler) validateListener(ctx context.Context, gw *gatewayv1.Gateway, listener gatewayv1.Listener, oldConditions []metav1.Condition) ([]metav1.Condition, error) {
+	resolvedRefsCond := metav1.Condition{
+		Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gw.Generation,
+		Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+		Message:            "All references resolved",
+	}
+
+	acceptedCond := metav1.Condition{
+		Type:               string(gatewayv1.ListenerConditionAccepted),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gw.Generation,
+		Reason:             string(gatewayv1.ListenerReasonAccepted),
+		Message:            "Listener accepted",
+	}
+
+	programmedCond := metav1.Condition{
+		Type:               string(gatewayv1.ListenerConditionProgrammed),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gw.Generation,
+		Reason:             string(gatewayv1.ListenerReasonProgrammed),
+		Message:            "Listener programmed",
+	}
+
+	var transientErr error
+
+	// Validate protocol
+	if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType && listener.Protocol != gatewayv1.TLSProtocolType {
+		acceptedCond.Status = metav1.ConditionFalse
+		acceptedCond.Reason = string(gatewayv1.ListenerReasonUnsupportedProtocol)
+		acceptedCond.Message = fmt.Sprintf("Unsupported protocol: %s", listener.Protocol)
+	} else if listener.Protocol == gatewayv1.HTTPProtocolType && listener.TLS != nil {
+		acceptedCond.Status = metav1.ConditionFalse
+		acceptedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
+		acceptedCond.Message = "TLS configuration must be nil for HTTP protocol"
+	} else if listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType {
+		if listener.TLS == nil {
+			resolvedRefsCond.Status = metav1.ConditionFalse
+			resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+			resolvedRefsCond.Message = "TLS block is required for HTTPS/TLS protocols"
+		} else if listener.TLS.Mode != nil && *listener.TLS.Mode == gatewayv1.TLSModePassthrough && len(listener.TLS.CertificateRefs) > 0 {
+			resolvedRefsCond.Status = metav1.ConditionFalse
+			resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+			resolvedRefsCond.Message = "CertificateRefs MUST NOT be provided for Passthrough TLS mode"
+		} else if (listener.TLS.Mode == nil || *listener.TLS.Mode == gatewayv1.TLSModeTerminate) && len(listener.TLS.CertificateRefs) == 0 {
+			resolvedRefsCond.Status = metav1.ConditionFalse
+			resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+			resolvedRefsCond.Message = "CertificateRefs must be provided for TLS termination"
+		} else if len(listener.TLS.CertificateRefs) > 0 {
+			for _, ref := range listener.TLS.CertificateRefs {
+				if (ref.Group != nil && *ref.Group != "") || (ref.Kind != nil && *ref.Kind != "" && *ref.Kind != "Secret") {
+					resolvedRefsCond.Status = metav1.ConditionFalse
+					resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+					resolvedRefsCond.Message = fmt.Sprintf("Unsupported certificate ref %s/%s", state.ValueOf(ref.Group), state.ValueOf(ref.Kind))
+					break
+				}
+
+				secretNamespace := resolveSecretNamespace(ref.Namespace, gw.Namespace)
+
+				if secretNamespace == "" {
+					resolvedRefsCond.Status = metav1.ConditionFalse
+					resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+					resolvedRefsCond.Message = "Certificate ref namespace cannot be empty"
+					break
+				}
+
+				if secretNamespace != gw.Namespace {
+					resolvedRefsCond.Status = metav1.ConditionFalse
+					resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonRefNotPermitted)
+					resolvedRefsCond.Message = fmt.Sprintf("Certificate ref to Secret %s/%s not permitted: cross-namespace references require ReferenceGrant (not implemented)", secretNamespace, ref.Name)
+					break
+				}
+
+				secret := &corev1.Secret{}
+				err := r.Get(ctx, types.NamespacedName{Namespace: secretNamespace, Name: string(ref.Name)}, secret)
+				if err != nil {
+					if apierrors.IsNotFound(err) {
+						resolvedRefsCond.Status = metav1.ConditionFalse
+						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+						resolvedRefsCond.Message = fmt.Sprintf("Secret %s/%s not found", secretNamespace, ref.Name)
+					} else {
+						// Transient error: Requeue
+						resolvedRefsCond.Status = metav1.ConditionFalse
+						resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+						resolvedRefsCond.Message = fmt.Sprintf("Error fetching Secret %s/%s", secretNamespace, ref.Name)
+						transientErr = err
+					}
+					break
+				}
+
+				// Validate Secret content
+				if secret.Type != corev1.SecretTypeTLS {
+					resolvedRefsCond.Status = metav1.ConditionFalse
+					resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+					resolvedRefsCond.Message = fmt.Sprintf("Secret %s/%s is not of type kubernetes.io/tls", secretNamespace, ref.Name)
+					break
+				}
+				if _, err := tls.X509KeyPair(secret.Data["tls.crt"], secret.Data["tls.key"]); err != nil {
+					resolvedRefsCond.Status = metav1.ConditionFalse
+					resolvedRefsCond.Reason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+					resolvedRefsCond.Message = fmt.Sprintf("Secret %s/%s contains malformed certificate data: %v", secretNamespace, ref.Name, err)
+					break
+				}
+			}
+		}
+	}
+
+	if acceptedCond.Status == metav1.ConditionFalse {
+		programmedCond.Status = metav1.ConditionFalse
+		programmedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
+		programmedCond.Message = acceptedCond.Message
+	} else if resolvedRefsCond.Status == metav1.ConditionFalse {
+		programmedCond.Status = metav1.ConditionFalse
+		programmedCond.Reason = string(gatewayv1.ListenerReasonInvalid)
+		programmedCond.Message = fmt.Sprintf("Listener has invalid references: %s", resolvedRefsCond.Message)
+	}
+
+	// Merge with old conditions
+	newConds := append([]metav1.Condition{}, oldConditions...)
+	meta.SetStatusCondition(&newConds, programmedCond)
+	meta.SetStatusCondition(&newConds, acceptedCond)
+	meta.SetStatusCondition(&newConds, resolvedRefsCond)
+
+	return newConds, transientErr
 }
 
 func (r *GatewayReconciler) updateProxy() {
@@ -333,6 +470,41 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 								Name:      string(parentRef.Name),
 							},
 						})
+					}
+				}
+			}
+			return requests
+		})).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			secretNamespace := obj.GetNamespace()
+			secretName := obj.GetName()
+
+			var gateways gatewayv1.GatewayList
+			if err := r.List(ctx, &gateways, client.InNamespace(secretNamespace)); err != nil {
+				log.FromContext(ctx).Error(err, "failed to list gateways")
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range gateways.Items {
+				matched := false
+				for _, listener := range gw.Spec.Listeners {
+					if listener.TLS != nil {
+						for _, ref := range listener.TLS.CertificateRefs {
+							ns := resolveSecretNamespace(ref.Namespace, gw.Namespace)
+							if ns == secretNamespace && string(ref.Name) == secretName {
+								requests = append(requests, ctrl.Request{
+									NamespacedName: types.NamespacedName{
+										Namespace: gw.Namespace,
+										Name:      gw.Name,
+									},
+								})
+								matched = true
+								break
+							}
+						}
+					}
+					if matched {
+						break
 					}
 				}
 			}
