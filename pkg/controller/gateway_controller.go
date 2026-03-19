@@ -142,22 +142,20 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	var ip string
+	var hostname string
 	if len(svc.Status.LoadBalancer.Ingress) > 0 {
 		ip = svc.Status.LoadBalancer.Ingress[0].IP
+		hostname = svc.Status.LoadBalancer.Ingress[0].Hostname
 	}
 
 	// Compute Programmed status and reason
 	programmedStatus := metav1.ConditionTrue
 	programmedReason := gatewayv1.GatewayReasonProgrammed
 	programmedMessage := "Gateway programmed by reference implementation"
-	listenerProgrammedReason := gatewayv1.ListenerReasonProgrammed
-	listenerProgrammedMessage := "Listener programmed"
-	if ip == "" {
+	if ip == "" && hostname == "" {
 		programmedStatus = metav1.ConditionFalse
 		programmedReason = gatewayv1.GatewayReasonAddressNotAssigned
-		programmedMessage = "gari-proxy service has no LoadBalancer IP yet"
-		listenerProgrammedReason = gatewayv1.ListenerReasonPending
-		listenerProgrammedMessage = "Listener pending Gateway IP"
+		programmedMessage = "Waiting for LoadBalancer IP address to be assigned to the Gateway"
 	}
 
 	newConditions := []metav1.Condition{
@@ -176,14 +174,30 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Message:            "Gateway accepted by reference implementation",
 		},
 	}
-	var newAddresses []gatewayv1.GatewayStatusAddress
-	if ip != "" {
-		newAddresses = []gatewayv1.GatewayStatusAddress{
-			{
-				Type:  state.Ptr(gatewayv1.IPAddressType),
-				Value: ip,
-			},
+
+	// Preserve LastTransitionTime for Gateway conditions if Status hasn't changed
+	for i, newCond := range newConditions {
+		newConditions[i].LastTransitionTime = metav1.Now()
+		for _, oldCond := range gw.Status.Conditions {
+			if oldCond.Type == newCond.Type && oldCond.Status == newCond.Status {
+				newConditions[i].LastTransitionTime = oldCond.LastTransitionTime
+				break
+			}
 		}
+	}
+
+	newAddresses := make([]gatewayv1.GatewayStatusAddress, 0)
+	if ip != "" {
+		newAddresses = append(newAddresses, gatewayv1.GatewayStatusAddress{
+			Type:  state.Ptr(gatewayv1.IPAddressType),
+			Value: ip,
+		})
+	}
+	if hostname != "" {
+		newAddresses = append(newAddresses, gatewayv1.GatewayStatusAddress{
+			Type:  state.Ptr(gatewayv1.HostnameAddressType),
+			Value: hostname,
+		})
 	}
 
 	// Compute listener status
@@ -205,36 +219,55 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		conds := []metav1.Condition{
+			{
+				Type:               string(gatewayv1.ListenerConditionProgrammed),
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: gw.Generation,
+				Reason:             string(gatewayv1.ListenerReasonProgrammed),
+				Message:            "Listener programmed",
+			},
+			{
+				Type:               string(gatewayv1.ListenerConditionAccepted),
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: gw.Generation,
+				Reason:             string(gatewayv1.ListenerReasonAccepted),
+				Message:            "Listener accepted",
+			},
+			{
+				Type:               string(gatewayv1.ListenerConditionResolvedRefs),
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: gw.Generation,
+				Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
+				Message:            "All references resolved",
+			},
+		}
+
+		var oldListener *gatewayv1.ListenerStatus
+		for _, ol := range gw.Status.Listeners {
+			if ol.Name == listener.Name {
+				oldListener = &ol
+				break
+			}
+		}
+
+		for i, newCond := range conds {
+			conds[i].LastTransitionTime = metav1.Now()
+			if oldListener != nil {
+				for _, oldCond := range oldListener.Conditions {
+					if oldCond.Type == newCond.Type && oldCond.Status == newCond.Status {
+						conds[i].LastTransitionTime = oldCond.LastTransitionTime
+						break
+					}
+				}
+			}
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
 			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
 			AttachedRoutes: int32(attachedRoutes),
-			Conditions: []metav1.Condition{
-				{
-					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             programmedStatus,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(listenerProgrammedReason),
-					Message:            listenerProgrammedMessage,
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionAccepted),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonAccepted),
-					Message:            "Listener accepted",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: gw.Generation,
-					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
-			},
+			Conditions:     conds,
 		})
 	}
 
@@ -303,9 +336,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if updated {
-		for i := range newConditions {
-			newConditions[i].LastTransitionTime = metav1.Now()
-		}
 		gw.Status.Conditions = newConditions
 		gw.Status.Addresses = newAddresses
 		gw.Status.Listeners = newListenerStatuses
@@ -319,12 +349,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	_ = gs // keep for now
 	r.updateProxy()
 
-	if ip == "" {
-		l.V(1).Info("gari-proxy service has no LoadBalancer IP yet")
-		return ctrl.Result{Requeue: true}, nil
+	if ip == "" && hostname == "" {
+		l.V(1).Info("gari-proxy service has no LoadBalancer address yet")
+	} else if ip != "" {
+		l.Info("Updated Gateway status", "address", ip)
+	} else {
+		l.Info("Updated Gateway status", "hostname", hostname)
 	}
-
-	l.Info("Updated Gateway status", "address", ip)
 
 	return ctrl.Result{}, nil
 }
@@ -353,6 +384,25 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 			}
 			return requests
+		})).
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			svc := obj.(*corev1.Service)
+			if svc.Name == "gari-proxy" && svc.Namespace == "default" {
+				var gwList gatewayv1.GatewayList
+				if err := r.List(ctx, &gwList); err == nil {
+					var requests []ctrl.Request
+					for _, gw := range gwList.Items {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: gw.Namespace,
+								Name:      gw.Name,
+							},
+						})
+					}
+					return requests
+				}
+			}
+			return nil
 		})).
 		Complete(r)
 }
