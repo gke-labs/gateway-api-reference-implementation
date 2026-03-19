@@ -103,6 +103,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteHostnameIntersection,
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
 		tests.HTTPRouteBackendProtocolH2C,
+		tests.GatewaySecretInvalidReferenceGrant,
 		tests.BackendTLSPolicy,
 		tests.BackendTLSPolicyConflictResolution,
 	}

@@ -194,6 +194,31 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		resolvedRefsStatus := metav1.ConditionTrue
+		resolvedRefsReason := gatewayv1.ListenerReasonResolvedRefs
+		resolvedRefsMessage := "All references resolved"
+
+		if listener.TLS != nil && listener.TLS.Mode != nil && *listener.TLS.Mode == gatewayv1.TLSModeTerminate {
+			for _, ref := range listener.TLS.CertificateRefs {
+				group := string(state.ValueOf(ref.Group))
+				kind := string(state.ValueOf(ref.Kind))
+				if kind == "" {
+					kind = "Secret"
+				}
+				namespace := string(state.ValueOf(ref.Namespace))
+				if namespace == "" {
+					namespace = gw.Namespace
+				}
+
+				if !r.State.IsReferencePermitted("gateway.networking.k8s.io", "Gateway", gw.Namespace, group, kind, namespace, string(ref.Name)) {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.ListenerReasonRefNotPermitted
+					resolvedRefsMessage = "Reference to Secret not permitted by ReferenceGrant"
+					break
+				}
+			}
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
 			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
@@ -217,11 +242,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				},
 				{
 					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
+					Status:             resolvedRefsStatus,
 					ObservedGeneration: gw.Generation,
 					LastTransitionTime: metav1.Now(),
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
+					Reason:             string(resolvedRefsReason),
+					Message:            resolvedRefsMessage,
 				},
 			},
 		})

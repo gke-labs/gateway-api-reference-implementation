@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type State struct {
@@ -31,6 +32,7 @@ type State struct {
 	gateways           map[types.NamespacedName]*GatewayState
 	httpRoutes         map[types.NamespacedName]*HTTPRouteState
 	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
+	referenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
 	services           map[types.NamespacedName]*corev1.Service
 	configMaps         map[types.NamespacedName]*corev1.ConfigMap
 }
@@ -40,6 +42,7 @@ func NewState() *State {
 		gateways:           make(map[types.NamespacedName]*GatewayState),
 		httpRoutes:         make(map[types.NamespacedName]*HTTPRouteState),
 		backendTLSPolicies: make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
+		referenceGrants:    make(map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant),
 		services:           make(map[types.NamespacedName]*corev1.Service),
 		configMaps:         make(map[types.NamespacedName]*corev1.ConfigMap),
 	}
@@ -68,6 +71,31 @@ func (s *State) GetConfigMaps() map[types.NamespacedName]*corev1.ConfigMap {
 		cms[k] = v
 	}
 	return cms
+}
+
+func (s *State) UpsertReferenceGrant(rg *gatewayv1beta1.ReferenceGrant) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.referenceGrants[types.NamespacedName{Namespace: rg.Namespace, Name: rg.Name}] = rg
+}
+
+func (s *State) DeleteReferenceGrant(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.referenceGrants, name)
+}
+
+func (s *State) GetReferenceGrants() []*gatewayv1beta1.ReferenceGrant {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var rgs []*gatewayv1beta1.ReferenceGrant
+	for _, rg := range s.referenceGrants {
+		rgs = append(rgs, rg)
+	}
+	return rgs
 }
 
 func (s *State) UpsertService(svc *corev1.Service) {
@@ -213,4 +241,33 @@ func (s *State) GetServices() map[types.NamespacedName]*corev1.Service {
 		services[k] = v
 	}
 	return services
+}
+
+func (s *State) IsReferencePermitted(fromGroup, fromKind, fromNamespace, toGroup, toKind, toNamespace, toName string) bool {
+	if fromNamespace == toNamespace {
+		return true
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, rg := range s.referenceGrants {
+		if rg.Namespace != toNamespace {
+			continue
+		}
+
+		for _, from := range rg.Spec.From {
+			if string(from.Group) == fromGroup && string(from.Kind) == fromKind && string(from.Namespace) == fromNamespace {
+				for _, to := range rg.Spec.To {
+					if string(to.Group) == toGroup && string(to.Kind) == toKind {
+						if to.Name == nil || string(*to.Name) == toName {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return false
 }
