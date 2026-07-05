@@ -22,12 +22,12 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
 # Run generation
-go run github.com/gke-labs/gke-labs-infra/ap@latest generate
+go run github.com/gke-labs/gke-labs-infra/ap@latest generate //...
 
 # Check for changes
 if [[ -n $(git status --porcelain) ]]; then
   echo "Changes detected after running 'ap generate'. Please commit these changes."
-  echo "<hint_for_agent>Run 'go run github.com/gke-labs/gke-labs-infra/ap@latest generate' to fix failures</hint_for_agent>"
+  echo "<hint_for_agent>Run 'go run github.com/gke-labs/gke-labs-infra/ap@latest generate //...' to fix failures</hint_for_agent>"
   git status
   exit 1
 fi
