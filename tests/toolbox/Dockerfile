@@ -17,7 +17,7 @@ WORKDIR /app
 COPY main.go .
 RUN CGO_ENABLED=0 go build -o toolbox main.go
 
-FROM alpine:3.19
+FROM alpine:3.24
 WORKDIR /app
 COPY --from=builder /app/toolbox .
 ENTRYPOINT ["/app/toolbox"]
