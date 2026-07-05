@@ -191,7 +191,7 @@ func (h *Harness) runCmd(name string, args ...string) string {
 
 func (h *Harness) InstallGatewayAPI() {
 	h.t.Log("Installing Gateway API CRDs")
-	h.runCmd("kubectl", "apply", "-f", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.0/standard-install.yaml")
+	h.runCmd("kubectl", "apply", "-f", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.0/standard-install.yaml")
 }
 
 func (h *Harness) DeployController() {
