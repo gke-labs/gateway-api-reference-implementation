@@ -22,4 +22,4 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
 # Run e2e tests
-go run github.com/gke-labs/gke-labs-infra/ap@latest e2e
+go run github.com/gke-labs/gke-labs-infra/ap@latest e2e .
