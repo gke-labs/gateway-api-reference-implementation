@@ -87,6 +87,7 @@ func TestConformance(t *testing.T) {
 			GatewayClassName:           "reference-class",
 			Debug:                      true,
 			CleanupBaseResources:       true,
+			CleanupTestResources:       true,
 			EnableAllSupportedFeatures: true,
 		},
 		ManifestFS: []fs.FS{conformance.Manifests},
@@ -99,7 +100,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteSimpleSameNamespace,
 		tests.HTTPRouteMatching,
 		tests.HTTPRoutePathMatchOrder,
-		// tests.HTTPRouteExactPathMatching, // Fails under v1.6.0
+		tests.HTTPRouteExactPathMatching,
 		// tests.HTTPRouteMethodMatching, // Fails on HTTPRouteMethodMatching/11 with headers under v1.5.0
 		// tests.HTTPRouteHeaderMatching, // Fails under v1.6.0
 		// tests.HTTPRouteHostnameIntersection, // Fails on AttachedRoutes count under v1.5.0
