@@ -197,11 +197,12 @@ func (h *Harness) InstallGatewayAPI() {
 func (h *Harness) DeployController() {
 	h.t.Log("Deploying Controller")
 	gitRoot := h.GetGitRoot()
-	h.DockerBuild("gari-controller:e2e", filepath.Join(gitRoot, "Dockerfile"), gitRoot)
+	h.DockerBuild("gari-controller:e2e", filepath.Join(gitRoot, "images/gari-controller/Dockerfile"), gitRoot)
 	h.KindLoad("gari-controller:e2e")
 
 	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/controller.yaml"))
 	h.runCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
+	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never"}]}}}}`)
 	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "--type=json", "-p", `[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--enable-h2c"}]`)
 	h.runCmd("kubectl", "annotate", "deployment/gari-controller", "restartedAt="+time.Now().Format(time.RFC3339), "--namespace=default", "--overwrite")
 
