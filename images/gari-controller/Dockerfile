@@ -19,7 +19,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o gateway-api-reference-implementation cmd/gateway-api-reference-implementation/main.go
 
-FROM alpine:3.19
+FROM gcr.io/distroless/static-debian12
 WORKDIR /
 COPY --from=builder /app/gateway-api-reference-implementation .
 USER 65532:65532
