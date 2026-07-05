@@ -33,4 +33,4 @@ The project uses the `ap` tool for various tasks. Since `ap` is a custom tool, i
 - `go run github.com/gke-labs/gke-labs-infra/ap@latest e2e`: Run e2e tests.
 - `go run github.com/gke-labs/gke-labs-infra/ap@latest lint`: For deeper static analysis.
 
-**Reminder**: Coding agents MUST run at least `ap generate` before sending PRs, and preferably `ap e2e` as well!
+**Reminder**: Coding agents MUST run at least `ap generate` before sending PRs, and MUST run `ap e2e` locally to verify that all conformance and end-to-end tests pass before submitting changes! Running `ap e2e` locally before pushing is a strict requirement to prevent test regressions in CI.
