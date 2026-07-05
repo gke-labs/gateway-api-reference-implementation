@@ -33,7 +33,7 @@ if [[ "${KUBERNETES_CLUSTER:-}" == "kind" ]]; then
 fi
 
 echo "Installing Gateway API CRDs..."
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.0/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.0/standard-install.yaml
 
 echo "Deploying controller..."
 kubectl apply -f k8s/controller.yaml
