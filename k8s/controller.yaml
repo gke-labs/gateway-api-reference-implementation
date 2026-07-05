@@ -57,8 +57,7 @@ spec:
       serviceAccountName: gari-controller
       containers:
       - name: controller
-        image: gari-controller:e2e
-        imagePullPolicy: Never
+        image: gari-controller:latest
         args: ["--proxy-bind-address", ":8000"]
         ports:
         - containerPort: 8000
