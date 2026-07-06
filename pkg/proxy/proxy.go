@@ -72,6 +72,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if bestRule.Rewrite != nil {
 			p.rewrite(r, *bestRule.Rewrite, bestMatch)
 		}
+		if bestRule.RequestHeaderModifier != nil {
+			p.modifyHeaders(r, *bestRule.RequestHeaderModifier)
+		}
 		if bestRule.Backend != nil {
 			p.forward(w, r, *bestRule.Backend)
 			return
@@ -79,6 +82,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+}
+
+// modifyHeaders modifies the request headers in place before forwarding.
+func (p *Proxy) modifyHeaders(r *http.Request, modifier state.InternalHeaderModifier) {
+	for _, h := range modifier.Remove {
+		r.Header.Del(h)
+	}
+	for _, h := range modifier.Set {
+		r.Header.Set(h.Name, h.Value)
+	}
+	for _, h := range modifier.Add {
+		r.Header.Add(h.Name, h.Value)
+	}
 }
 
 // rewrite modifies the incoming *http.Request in place before it is forwarded to the backend.
