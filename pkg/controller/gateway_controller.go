@@ -208,11 +208,21 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		attachedRoutes := 0
 		for _, route := range routes {
 			for _, parentRef := range route.Spec.ParentRefs {
-				if string(parentRef.Name) == gw.Name {
+				parentNamespace := route.Namespace
+				if ns := state.ValueOf(parentRef.Namespace); ns != "" {
+					parentNamespace = string(ns)
+				}
+				if string(parentRef.Name) == gw.Name && parentNamespace == gw.Namespace {
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
 						if route.IsAccepted(ControllerName) {
-							attachedRoutes++
-							break
+							// Also check if the route actually intersects/matches this listener's hostname
+							routeHostnames := route.GetHostnames()
+							listenerHostname := state.ValueOf(listener.Hostname)
+							effectiveHostnames := state.IntersectHostnames(routeHostnames, string(listenerHostname))
+							if len(effectiveHostnames) > 0 || len(routeHostnames) == 0 {
+								attachedRoutes++
+								break
+							}
 						}
 					}
 				}
