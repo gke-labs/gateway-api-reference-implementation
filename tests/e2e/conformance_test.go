@@ -102,7 +102,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRoutePathMatchOrder,
 		tests.HTTPRouteExactPathMatching,
 		tests.HTTPRouteMethodMatching, // Fails on HTTPRouteMethodMatching/11 with headers under v1.5.0
-		// tests.HTTPRouteHeaderMatching, // Fails under v1.6.0
+		tests.HTTPRouteHeaderMatching, // Fails under v1.6.0
 		// tests.HTTPRouteHostnameIntersection, // Fails on AttachedRoutes count under v1.5.0
 		// tests.HTTPRouteRewriteHost, // Fails on rewrite-host-and-modify-headers under v1.5.0
 		// tests.HTTPRouteRewritePath, // Fails on rewrite-path-and-modify-headers under v1.5.0
