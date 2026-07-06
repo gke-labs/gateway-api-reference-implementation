@@ -286,13 +286,17 @@ func isBetterMatch(current, best *InternalMatch) bool {
 		return currentPathLen > bestPathLen
 	}
 
-	// 3. Most header matches win
+	// 3. Method match wins over no method match
+	if (current.Method != nil) != (best.Method != nil) {
+		return current.Method != nil
+	}
+
+	// 4. Most header matches win
 	if len(current.Headers) != len(best.Headers) {
 		return len(current.Headers) > len(best.Headers)
 	}
 
-	// 4. Method match wins
-	return current.Method != nil && best.Method == nil
+	return false
 }
 
 func getPathMatchType(m *InternalMatch) gatewayv1.PathMatchType {
