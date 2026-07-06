@@ -189,3 +189,45 @@ func TestMatchRouteOrder(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchRoute_MethodVsHeaderPrecedence(t *testing.T) {
+	routes := []InternalRoute{
+		{
+			Hostnames: []string{"example.com"},
+			Rules: []InternalRule{
+				{
+					Matches: []InternalMatch{
+						{
+							Method: Ptr(gatewayv1.HTTPMethod("PATCH")),
+						},
+					},
+					Backend: &InternalBackend{Host: "method-backend"},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							Headers: []InternalHeaderMatch{
+								{
+									Name:            "version",
+									MatchExactValue: "four",
+								},
+							},
+						},
+					},
+					Backend: &InternalBackend{Host: "header-backend"},
+				},
+			},
+		},
+	}
+
+	req, _ := http.NewRequest("PATCH", "http://example.com/", nil)
+	req.Header.Set("version", "four")
+
+	rule, _ := MatchRoute(routes, req)
+	if rule == nil {
+		t.Fatalf("Expected match, got nil")
+	}
+	if rule.Backend.Host != "method-backend" {
+		t.Errorf("Expected method match (method-backend) to take precedence over header match (header-backend), got %s", rule.Backend.Host)
+	}
+}
