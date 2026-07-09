@@ -2,6 +2,8 @@ module github.com/gke-labs/gateway-api-reference-implementation
 
 go 1.26.4
 
+toolchain go1.26.5
+
 require (
 	github.com/google/go-cmp v0.7.0
 	golang.org/x/net v0.56.0
