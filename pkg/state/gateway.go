@@ -103,13 +103,27 @@ type ErrorState struct {
 }
 
 type InternalRule struct {
-	Matches  []InternalMatch
-	Backend  *InternalBackend
-	Redirect *InternalRedirect
-	Rewrite  *InternalRewrite
+	Matches               []InternalMatch
+	Backend               *InternalBackend
+	Redirect              *InternalRedirect
+	Rewrite               *InternalRewrite
+	RequestHeaderModifier *InternalHeaderModifier
 	// Error, if non-nil, indicates that this rule is invalid and should
 	// return an error response if matched.
 	Error *ErrorState
+}
+
+// InternalHeaderModifier represents the request header modification configuration.
+type InternalHeaderModifier struct {
+	Set    []InternalHeader
+	Add    []InternalHeader
+	Remove []string
+}
+
+// InternalHeader represents a custom header key-value pair.
+type InternalHeader struct {
+	Name  string
+	Value string
 }
 
 // InternalRewrite represents the URL rewriting configuration for a route rule.
@@ -401,6 +415,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
 				var rewrite *InternalRewrite
+				var headerModifier *InternalHeaderModifier
 				var filterErr *ErrorState
 				for _, filter := range rule.Filters {
 					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
@@ -462,13 +477,37 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 								Value: pathValue,
 							}
 						}
+					} else if filter.Type == gatewayv1.HTTPRouteFilterRequestHeaderModifier {
+						r := filter.RequestHeaderModifier
+						if r != nil {
+							var setHdrs []InternalHeader
+							for _, h := range r.Set {
+								setHdrs = append(setHdrs, InternalHeader{
+									Name:  string(h.Name),
+									Value: h.Value,
+								})
+							}
+							var addHdrs []InternalHeader
+							for _, h := range r.Add {
+								addHdrs = append(addHdrs, InternalHeader{
+									Name:  string(h.Name),
+									Value: h.Value,
+								})
+							}
+							headerModifier = &InternalHeaderModifier{
+								Set:    setHdrs,
+								Add:    addHdrs,
+								Remove: r.Remove,
+							}
+						}
 					}
 				}
 
 				iRule := InternalRule{
-					Redirect: redirect,
-					Rewrite:  rewrite,
-					Error:    filterErr,
+					Redirect:              redirect,
+					Rewrite:               rewrite,
+					RequestHeaderModifier: headerModifier,
+					Error:                 filterErr,
 				}
 
 				if resolvedRefsCond.Status == metav1.ConditionFalse {
