@@ -17,19 +17,27 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "daily"
+    cooldown:
+      default-days: 2
 
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "daily"
+    cooldown:
+      default-days: 2
 
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "daily"
+    cooldown:
+      default-days: 2
 
   - package-ecosystem: "docker"
     directory: "/tests/toolbox"
     schedule:
-      interval: "weekly"
+      interval: "daily"
+    cooldown:
+      default-days: 2
