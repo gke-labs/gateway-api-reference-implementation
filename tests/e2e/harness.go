@@ -84,11 +84,12 @@ func (h *Harness) InstallMetallb() {
 	h.t.Log("Installing Metallb")
 	h.runCmd("kubectl", "apply", "-f", "https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml")
 	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=available", "deployment/controller", "--timeout=90s")
+	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=ready", "pod", "--selector=app=metallb", "--timeout=90s")
 
 	// Configure Metallb with a range of IPs from the kind network
 	h.runCmd("docker", "network", "inspect", "kind")
 
-	h.KubectlApplyContent(h.MetallbConfigManifest())
+	h.KubectlApplyContentWithRetry(h.MetallbConfigManifest(), 90*time.Second)
 }
 
 // RESTConfig returns the configuration for talking to the test kind cluster started from this harness.
@@ -130,6 +131,30 @@ func (h *Harness) KubectlApplyContent(content string) {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		h.t.Fatalf("kubectl apply failed: %v\nStderr: %s", err, stderr.String())
+	}
+}
+
+func (h *Harness) KubectlApplyContentWithRetry(content string, timeout time.Duration) {
+	h.t.Logf("Applying kubectl content (with retry):\n%s", content)
+	start := time.Now()
+	var lastErr error
+	var lastStderr string
+	for {
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(content)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err == nil {
+			return
+		} else {
+			lastErr = err
+			lastStderr = stderr.String()
+		}
+
+		if time.Since(start) > timeout {
+			h.t.Fatalf("Timeout waiting for kubectl apply to succeed: %v\nStderr: %s", lastErr, lastStderr)
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
 
