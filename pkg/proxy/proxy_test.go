@@ -156,3 +156,66 @@ func TestProxyRewrite(t *testing.T) {
 		})
 	}
 }
+
+func TestProxyModifyHeaders(t *testing.T) {
+	tests := []struct {
+		name           string
+		modifier       state.InternalHeaderModifier
+		initialHeaders map[string][]string
+		expectedHeader map[string][]string
+	}{
+		{
+			name: "add set and remove headers",
+			modifier: state.InternalHeaderModifier{
+				Set: []state.InternalHeader{
+					{Name: "X-Header-Set", Value: "newValue"},
+				},
+				Add: []state.InternalHeader{
+					{Name: "X-Header-Add", Value: "addedValue"},
+				},
+				Remove: []string{"X-Header-Remove"},
+			},
+			initialHeaders: map[string][]string{
+				"X-Header-Set":    {"oldValue"},
+				"X-Header-Add":    {"existingValue"},
+				"X-Header-Remove": {"toRemove"},
+			},
+			expectedHeader: map[string][]string{
+				"X-Header-Set": {"newValue"},
+				"X-Header-Add": {"existingValue", "addedValue"},
+			},
+		},
+	}
+
+	p := NewProxy()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com/foo", nil)
+			for k, values := range tt.initialHeaders {
+				for _, v := range values {
+					req.Header.Add(k, v)
+				}
+			}
+
+			p.modifyHeaders(req, tt.modifier)
+
+			for k, expectedValues := range tt.expectedHeader {
+				actualValues := req.Header[k]
+				if len(actualValues) != len(expectedValues) {
+					t.Fatalf("expected header %s to have values %v, got %v", k, expectedValues, actualValues)
+				}
+				for i, ev := range expectedValues {
+					if actualValues[i] != ev {
+						t.Errorf("expected header %s[%d] to be %q, got %q", k, i, ev, actualValues[i])
+					}
+				}
+			}
+
+			for _, removed := range tt.modifier.Remove {
+				if len(req.Header[removed]) > 0 {
+					t.Errorf("expected header %s to be removed, but still has values %v", removed, req.Header[removed])
+				}
+			}
+		})
+	}
+}
