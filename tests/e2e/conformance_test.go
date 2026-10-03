@@ -99,7 +99,12 @@ func TestConformance(t *testing.T) {
 	selectedTests := []suite.ConformanceTest{
 		// tests.BackendTLSPolicy, // Fails on re-encrypt under v1.5.0
 		// tests.BackendTLSPolicyConflictResolution, // Fails on section name conflict resolution under v1.5.0
+		tests.GatewayClassObservedGenerationBump,
+		tests.GatewayInvalidParametersRef,
+		tests.GatewayInvalidRouteKind,
 		tests.GatewayInvalidTLSConfiguration,
+		tests.GatewayListenerUnsupportedProtocol,
+		tests.GatewayModifyListeners,
 		tests.GatewayObservedGenerationBump,
 		tests.GatewaySecretInvalidReferenceGrant,
 		tests.GatewaySecretMissingReferenceGrant,

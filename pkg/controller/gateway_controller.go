@@ -54,15 +54,36 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
+	acceptedStatus := metav1.ConditionTrue
+	acceptedReason := gatewayv1.GatewayClassReasonAccepted
+	acceptedMessage := "GatewayClass accepted by reference implementation"
+
+	if gc.Spec.ParametersRef != nil {
+		acceptedStatus = metav1.ConditionFalse
+		acceptedReason = gatewayv1.GatewayClassReasonInvalidParameters
+		acceptedMessage = "Invalid parametersRef: parametersRef is not supported"
+	}
+
 	// Update status to Accepted
 	newConditions := []metav1.Condition{
 		{
 			Type:               string(gatewayv1.GatewayClassConditionStatusAccepted),
-			Status:             metav1.ConditionTrue,
+			Status:             acceptedStatus,
 			ObservedGeneration: gc.Generation,
-			Reason:             string(gatewayv1.GatewayClassReasonAccepted),
-			Message:            "GatewayClass accepted by reference implementation",
+			Reason:             string(acceptedReason),
+			Message:            acceptedMessage,
 		},
+	}
+
+	// Preserve LastTransitionTime if status has not changed
+	for i, newCond := range newConditions {
+		newConditions[i].LastTransitionTime = metav1.Now()
+		for _, oldCond := range gc.Status.Conditions {
+			if oldCond.Type == newCond.Type && oldCond.Status == newCond.Status {
+				newConditions[i].LastTransitionTime = oldCond.LastTransitionTime
+				break
+			}
+		}
 	}
 
 	updated := false
@@ -162,107 +183,95 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		hostname = svc.Status.LoadBalancer.Ingress[0].Hostname
 	}
 
-	// Compute Programmed status and reason
-	programmedStatus := metav1.ConditionTrue
-	programmedReason := gatewayv1.GatewayReasonProgrammed
-	programmedMessage := "Gateway programmed by reference implementation"
-	if ip == "" && hostname == "" {
-		programmedStatus = metav1.ConditionFalse
-		programmedReason = gatewayv1.GatewayReasonAddressNotAssigned
-		programmedMessage = "Waiting for LoadBalancer IP address to be assigned to the Gateway"
-	}
-
-	newConditions := []metav1.Condition{
-		{
-			Type:               string(gatewayv1.GatewayConditionProgrammed),
-			Status:             programmedStatus,
-			ObservedGeneration: gw.Generation,
-			Reason:             string(programmedReason),
-			Message:            programmedMessage,
-		},
-		{
-			Type:               string(gatewayv1.GatewayConditionAccepted),
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: gw.Generation,
-			Reason:             string(gatewayv1.GatewayReasonAccepted),
-			Message:            "Gateway accepted by reference implementation",
-		},
-	}
-
-	// Preserve LastTransitionTime for Gateway conditions if Status hasn't changed
-	for i, newCond := range newConditions {
-		newConditions[i].LastTransitionTime = metav1.Now()
-		for _, oldCond := range gw.Status.Conditions {
-			if oldCond.Type == newCond.Type && oldCond.Status == newCond.Status {
-				newConditions[i].LastTransitionTime = oldCond.LastTransitionTime
-				break
-			}
-		}
-	}
-
-	newAddresses := make([]gatewayv1.GatewayStatusAddress, 0)
-	if ip != "" {
-		newAddresses = append(newAddresses, gatewayv1.GatewayStatusAddress{
-			Type:  state.Ptr(gatewayv1.IPAddressType),
-			Value: ip,
-		})
-	}
-	if hostname != "" {
-		newAddresses = append(newAddresses, gatewayv1.GatewayStatusAddress{
-			Type:  state.Ptr(gatewayv1.HostnameAddressType),
-			Value: hostname,
-		})
-	}
-
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
 	secrets := r.State.GetSecrets()
 	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
+	acceptedListenersCount := 0
+
 	for _, listener := range gw.Spec.Listeners {
-		attachedRoutes := 0
-		for _, route := range routes {
-			for _, parentRef := range route.Spec.ParentRefs {
-				parentNamespace := route.Namespace
-				if ns := state.ValueOf(parentRef.Namespace); ns != "" {
-					parentNamespace = string(ns)
-				}
-				if string(parentRef.Name) == gw.Name && parentNamespace == gw.Namespace {
-					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if port := state.ValueOf(parentRef.Port); port == 0 || port == listener.Port {
-							if route.IsAcceptedForParentRef(parentRef, controllerName) {
-								// Also check if the route actually intersects/matches this listener's hostname
-								routeHostnames := route.GetHostnames()
-								listenerHostname := state.ValueOf(listener.Hostname)
-								effectiveHostnames := state.IntersectHostnames(routeHostnames, string(listenerHostname))
-								if len(effectiveHostnames) > 0 || len(routeHostnames) == 0 {
-									attachedRoutes++
-									break
-								}
-							}
-						}
-					}
-				}
-			}
-		}
+		isSupported := isSupportedProtocol(listener.Protocol)
+
+		listenerAcceptedStatus := metav1.ConditionTrue
+		listenerAcceptedReason := gatewayv1.ListenerReasonAccepted
+		listenerAcceptedMessage := "Listener accepted"
+
+		listenerProgrammedStatus := metav1.ConditionTrue
+		listenerProgrammedReason := gatewayv1.ListenerReasonProgrammed
+		listenerProgrammedMessage := "Listener programmed"
 
 		resolvedRefsStatus := metav1.ConditionTrue
 		resolvedRefsReason := gatewayv1.ListenerReasonResolvedRefs
 		resolvedRefsMessage := "All references resolved"
 
-		programmedStatus := metav1.ConditionTrue
-		programmedReason := gatewayv1.ListenerReasonProgrammed
-		programmedMessage := "Listener programmed"
+		var supportedKinds []gatewayv1.RouteGroupKind
+		hasInvalidRouteKind := false
 
-		if (listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType) && listener.TLS != nil {
+		if !isSupported {
+			listenerAcceptedStatus = metav1.ConditionFalse
+			listenerAcceptedReason = gatewayv1.ListenerReasonUnsupportedProtocol
+			listenerAcceptedMessage = fmt.Sprintf("Protocol %q is not supported", listener.Protocol)
+
+			listenerProgrammedStatus = metav1.ConditionFalse
+			listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
+			listenerProgrammedMessage = fmt.Sprintf("Protocol %q is not supported", listener.Protocol)
+
+			supportedKinds = []gatewayv1.RouteGroupKind{}
+			if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
+				for _, k := range listener.AllowedRoutes.Kinds {
+					if !isValidRouteKindForProtocol(listener.Protocol, k.Group, k.Kind) {
+						hasInvalidRouteKind = true
+					}
+				}
+			}
+		} else {
+			if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
+				supportedKinds = []gatewayv1.RouteGroupKind{}
+				for _, k := range listener.AllowedRoutes.Kinds {
+					if isValidRouteKindForProtocol(listener.Protocol, k.Group, k.Kind) {
+						alreadyPresent := false
+						for _, sk := range supportedKinds {
+							if sk.Kind == k.Kind && state.ValueOf(sk.Group) == gatewayv1.GroupName {
+								alreadyPresent = true
+								break
+							}
+						}
+						if !alreadyPresent {
+							supportedKinds = append(supportedKinds, gatewayv1.RouteGroupKind{
+								Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
+								Kind:  k.Kind,
+							})
+						}
+					} else {
+						hasInvalidRouteKind = true
+					}
+				}
+			} else {
+				supportedKinds = defaultSupportedKindsForProtocol(listener.Protocol)
+			}
+		}
+
+		if hasInvalidRouteKind {
+			resolvedRefsStatus = metav1.ConditionFalse
+			resolvedRefsReason = gatewayv1.ListenerReasonInvalidRouteKinds
+			resolvedRefsMessage = "One or more route kinds are not supported"
+
+			listenerProgrammedStatus = metav1.ConditionFalse
+			listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
+			listenerProgrammedMessage = "One or more route kinds are not supported"
+		}
+
+		needsTLSSecretValidation := isSupported && (listener.Protocol == gatewayv1.HTTPSProtocolType || (listener.Protocol == gatewayv1.TLSProtocolType && listener.TLS != nil && (listener.TLS.Mode == nil || *listener.TLS.Mode == gatewayv1.TLSModeTerminate))) && listener.TLS != nil
+		if needsTLSSecretValidation {
 			if len(listener.TLS.CertificateRefs) == 0 {
 				resolvedRefsStatus = metav1.ConditionFalse
 				resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
 				resolvedRefsMessage = "No certificate refs specified"
 
-				programmedStatus = metav1.ConditionFalse
-				programmedReason = gatewayv1.ListenerReasonInvalid
-				programmedMessage = "Invalid TLS configuration: no certificate refs specified"
+				listenerProgrammedStatus = metav1.ConditionFalse
+				listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
+				listenerProgrammedMessage = "Invalid TLS configuration: no certificate refs specified"
 			}
 			for _, ref := range listener.TLS.CertificateRefs {
 				group := state.ValueOf(ref.Group)
@@ -272,9 +281,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
 					resolvedRefsMessage = fmt.Sprintf("Unsupported certificate ref group %q kind %q", group, kind)
 
-					programmedStatus = metav1.ConditionFalse
-					programmedReason = gatewayv1.ListenerReasonInvalid
-					programmedMessage = fmt.Sprintf("Invalid certificate ref group %q kind %q", group, kind)
+					listenerProgrammedStatus = metav1.ConditionFalse
+					listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
+					listenerProgrammedMessage = fmt.Sprintf("Invalid certificate ref group %q kind %q", group, kind)
 					break
 				}
 
@@ -298,9 +307,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 						resolvedRefsReason = gatewayv1.ListenerReasonRefNotPermitted
 						resolvedRefsMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name)
 
-						programmedStatus = metav1.ConditionFalse
-						programmedReason = gatewayv1.ListenerReasonInvalid
-						programmedMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name)
+						listenerProgrammedStatus = metav1.ConditionFalse
+						listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
+						listenerProgrammedMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name)
 						break
 					}
 				}
@@ -311,9 +320,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
 					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name)
 
-					programmedStatus = metav1.ConditionFalse
-					programmedReason = gatewayv1.ListenerReasonInvalid
-					programmedMessage = fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name)
+					listenerProgrammedStatus = metav1.ConditionFalse
+					listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
+					listenerProgrammedMessage = fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name)
 					break
 				}
 
@@ -324,9 +333,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
 					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name)
 
-					programmedStatus = metav1.ConditionFalse
-					programmedReason = gatewayv1.ListenerReasonInvalid
-					programmedMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name)
+					listenerProgrammedStatus = metav1.ConditionFalse
+					listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
+					listenerProgrammedMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name)
 					break
 				}
 
@@ -335,10 +344,51 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
 					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err)
 
-					programmedStatus = metav1.ConditionFalse
-					programmedReason = gatewayv1.ListenerReasonInvalid
-					programmedMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err)
+					listenerProgrammedStatus = metav1.ConditionFalse
+					listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
+					listenerProgrammedMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err)
 					break
+				}
+			}
+		}
+
+		attachedRoutes := 0
+		if isSupported {
+			httpRouteAllowed := false
+			if listener.AllowedRoutes == nil || len(listener.AllowedRoutes.Kinds) == 0 {
+				httpRouteAllowed = (listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType)
+			} else {
+				for _, k := range listener.AllowedRoutes.Kinds {
+					if state.IsHTTPRoute(k.Group, k.Kind) {
+						httpRouteAllowed = true
+						break
+					}
+				}
+			}
+
+			if httpRouteAllowed {
+				for _, route := range routes {
+					for _, parentRef := range route.Spec.ParentRefs {
+						parentNamespace := route.Namespace
+						if ns := state.ValueOf(parentRef.Namespace); ns != "" {
+							parentNamespace = string(ns)
+						}
+						if string(parentRef.Name) == gw.Name && parentNamespace == gw.Namespace {
+							if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
+								if port := state.ValueOf(parentRef.Port); port == 0 || port == listener.Port {
+									if route.IsAcceptedForParentRef(parentRef, controllerName) {
+										routeHostnames := route.GetHostnames()
+										listenerHostname := state.ValueOf(listener.Hostname)
+										effectiveHostnames := state.IntersectHostnames(routeHostnames, string(listenerHostname))
+										if len(effectiveHostnames) > 0 || len(routeHostnames) == 0 {
+											attachedRoutes++
+											break
+										}
+									}
+								}
+							}
+						}
+					}
 				}
 			}
 		}
@@ -346,17 +396,17 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		conds := []metav1.Condition{
 			{
 				Type:               string(gatewayv1.ListenerConditionProgrammed),
-				Status:             programmedStatus,
+				Status:             listenerProgrammedStatus,
 				ObservedGeneration: gw.Generation,
-				Reason:             string(programmedReason),
-				Message:            programmedMessage,
+				Reason:             string(listenerProgrammedReason),
+				Message:            listenerProgrammedMessage,
 			},
 			{
 				Type:               string(gatewayv1.ListenerConditionAccepted),
-				Status:             metav1.ConditionTrue,
+				Status:             listenerAcceptedStatus,
 				ObservedGeneration: gw.Generation,
-				Reason:             string(gatewayv1.ListenerReasonAccepted),
-				Message:            "Listener accepted",
+				Reason:             string(listenerAcceptedReason),
+				Message:            listenerAcceptedMessage,
 			},
 			{
 				Type:               string(gatewayv1.ListenerConditionResolvedRefs),
@@ -387,12 +437,98 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		if listenerAcceptedStatus == metav1.ConditionTrue {
+			acceptedListenersCount++
+		}
+
 		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           listener.Name,
-			SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
+			SupportedKinds: supportedKinds,
 			AttachedRoutes: int32(attachedRoutes),
 			Conditions:     conds,
 		})
+	}
+
+	totalListeners := len(gw.Spec.Listeners)
+
+	gwAcceptedStatus := metav1.ConditionTrue
+	gwAcceptedReason := gatewayv1.GatewayReasonAccepted
+	gwAcceptedMessage := "Gateway accepted by reference implementation"
+
+	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+		gwAcceptedStatus = metav1.ConditionFalse
+		gwAcceptedReason = gatewayv1.GatewayReasonInvalidParameters
+		gwAcceptedMessage = "Invalid infrastructure parametersRef: parametersRef is not supported"
+	} else if totalListeners == 0 {
+		gwAcceptedStatus = metav1.ConditionFalse
+		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
+		gwAcceptedMessage = "No listeners configured on Gateway"
+	} else if acceptedListenersCount == 0 {
+		gwAcceptedStatus = metav1.ConditionFalse
+		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
+		gwAcceptedMessage = "No listeners are accepted"
+	} else if acceptedListenersCount < totalListeners {
+		gwAcceptedStatus = metav1.ConditionTrue
+		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
+		gwAcceptedMessage = "One or more listeners have invalid configuration"
+	}
+
+	gwProgrammedStatus := metav1.ConditionTrue
+	gwProgrammedReason := gatewayv1.GatewayReasonProgrammed
+	gwProgrammedMessage := "Gateway programmed by reference implementation"
+
+	if gwAcceptedStatus == metav1.ConditionFalse {
+		gwProgrammedStatus = metav1.ConditionFalse
+		gwProgrammedReason = gatewayv1.GatewayReasonInvalid
+		gwProgrammedMessage = "Gateway is not accepted"
+	} else if ip == "" && hostname == "" {
+		gwProgrammedStatus = metav1.ConditionFalse
+		gwProgrammedReason = gatewayv1.GatewayReasonAddressNotAssigned
+		gwProgrammedMessage = "Waiting for LoadBalancer IP address to be assigned to the Gateway"
+	}
+
+	newConditions := []metav1.Condition{
+		{
+			Type:               string(gatewayv1.GatewayConditionProgrammed),
+			Status:             gwProgrammedStatus,
+			ObservedGeneration: gw.Generation,
+			Reason:             string(gwProgrammedReason),
+			Message:            gwProgrammedMessage,
+		},
+		{
+			Type:               string(gatewayv1.GatewayConditionAccepted),
+			Status:             gwAcceptedStatus,
+			ObservedGeneration: gw.Generation,
+			Reason:             string(gwAcceptedReason),
+			Message:            gwAcceptedMessage,
+		},
+	}
+
+	// Preserve LastTransitionTime for Gateway conditions if Status hasn't changed
+	for i, newCond := range newConditions {
+		newConditions[i].LastTransitionTime = metav1.Now()
+		for _, oldCond := range gw.Status.Conditions {
+			if oldCond.Type == newCond.Type && oldCond.Status == newCond.Status {
+				newConditions[i].LastTransitionTime = oldCond.LastTransitionTime
+				break
+			}
+		}
+	}
+
+	newAddresses := make([]gatewayv1.GatewayStatusAddress, 0)
+	if gwAcceptedStatus == metav1.ConditionTrue {
+		if ip != "" {
+			newAddresses = append(newAddresses, gatewayv1.GatewayStatusAddress{
+				Type:  state.Ptr(gatewayv1.IPAddressType),
+				Value: ip,
+			})
+		}
+		if hostname != "" {
+			newAddresses = append(newAddresses, gatewayv1.GatewayStatusAddress{
+				Type:  state.Ptr(gatewayv1.HostnameAddressType),
+				Value: hostname,
+			})
+		}
 	}
 
 	updated := false
@@ -430,8 +566,19 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			for i := range newListenerStatuses {
 				if gw.Status.Listeners[i].Name != newListenerStatuses[i].Name ||
 					gw.Status.Listeners[i].AttachedRoutes != newListenerStatuses[i].AttachedRoutes ||
-					len(gw.Status.Listeners[i].Conditions) != len(newListenerStatuses[i].Conditions) {
+					len(gw.Status.Listeners[i].Conditions) != len(newListenerStatuses[i].Conditions) ||
+					len(gw.Status.Listeners[i].SupportedKinds) != len(newListenerStatuses[i].SupportedKinds) {
 					updated = true
+					break
+				}
+				for k := range newListenerStatuses[i].SupportedKinds {
+					if state.ValueOf(gw.Status.Listeners[i].SupportedKinds[k].Group) != state.ValueOf(newListenerStatuses[i].SupportedKinds[k].Group) ||
+						gw.Status.Listeners[i].SupportedKinds[k].Kind != newListenerStatuses[i].SupportedKinds[k].Kind {
+						updated = true
+						break
+					}
+				}
+				if updated {
 					break
 				}
 				// Also check if conditions changed (optional but safer)
@@ -441,7 +588,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 						if gw.Status.Listeners[i].Conditions[k].Type == newListenerStatuses[i].Conditions[j].Type {
 							if gw.Status.Listeners[i].Conditions[k].Status == newListenerStatuses[i].Conditions[j].Status &&
 								gw.Status.Listeners[i].Conditions[k].ObservedGeneration == newListenerStatuses[i].Conditions[j].ObservedGeneration &&
-								gw.Status.Listeners[i].Conditions[k].Reason == newListenerStatuses[i].Conditions[j].Reason {
+								gw.Status.Listeners[i].Conditions[k].Reason == newListenerStatuses[i].Conditions[j].Reason &&
+								gw.Status.Listeners[i].Conditions[k].Message == newListenerStatuses[i].Conditions[j].Message {
 								matched = true
 							}
 							break
@@ -626,4 +774,63 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return nil
 		})).
 		Complete(r)
+}
+
+func isSupportedProtocol(protocol gatewayv1.ProtocolType) bool {
+	switch protocol {
+	case gatewayv1.HTTPProtocolType,
+		gatewayv1.HTTPSProtocolType,
+		gatewayv1.TLSProtocolType,
+		gatewayv1.TCPProtocolType,
+		gatewayv1.UDPProtocolType:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidRouteKindForProtocol(protocol gatewayv1.ProtocolType, group *gatewayv1.Group, kind gatewayv1.Kind) bool {
+	grp := state.ValueOf(group)
+	if grp != "" && grp != gatewayv1.GroupName {
+		return false
+	}
+	switch protocol {
+	case gatewayv1.HTTPProtocolType, gatewayv1.HTTPSProtocolType:
+		return kind == "HTTPRoute" || kind == "GRPCRoute"
+	case gatewayv1.TLSProtocolType:
+		return kind == "TLSRoute"
+	case gatewayv1.TCPProtocolType:
+		return kind == "TCPRoute"
+	case gatewayv1.UDPProtocolType:
+		return kind == "UDPRoute"
+	default:
+		return false
+	}
+}
+
+func defaultSupportedKindsForProtocol(protocol gatewayv1.ProtocolType) []gatewayv1.RouteGroupKind {
+	switch protocol {
+	case gatewayv1.HTTPProtocolType, gatewayv1.HTTPSProtocolType:
+		return []gatewayv1.RouteGroupKind{{
+			Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
+			Kind:  gatewayv1.Kind("HTTPRoute"),
+		}}
+	case gatewayv1.TLSProtocolType:
+		return []gatewayv1.RouteGroupKind{{
+			Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
+			Kind:  gatewayv1.Kind("TLSRoute"),
+		}}
+	case gatewayv1.TCPProtocolType:
+		return []gatewayv1.RouteGroupKind{{
+			Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
+			Kind:  gatewayv1.Kind("TCPRoute"),
+		}}
+	case gatewayv1.UDPProtocolType:
+		return []gatewayv1.RouteGroupKind{{
+			Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
+			Kind:  gatewayv1.Kind("UDPRoute"),
+		}}
+	default:
+		return []gatewayv1.RouteGroupKind{}
+	}
 }

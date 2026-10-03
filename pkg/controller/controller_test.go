@@ -454,6 +454,422 @@ func TestGatewayReconciler_TLSReferenceGrant(t *testing.T) {
 	}
 }
 
+func TestGatewayClassReconciler_ParametersRefAndGeneration(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gcInvalidParams := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "invalid-params-gc",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+			ParametersRef: &gatewayv1.ParametersReference{
+				Group: "example.com",
+				Kind:  "Config",
+				Name:  "some-config",
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gcInvalidParams).
+		WithStatusSubresource(gcInvalidParams).
+		Build()
+
+	r := &GatewayClassReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+
+	// Reconcile -> Accepted should be False / InvalidParameters
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "invalid-params-gc"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var res gatewayv1.GatewayClass
+	if err := client.Get(ctx, types.NamespacedName{Name: "invalid-params-gc"}, &res); err != nil {
+		t.Fatalf("failed to get GatewayClass: %v", err)
+	}
+	cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusAccepted))
+	if cond == nil {
+		t.Fatalf("expected Accepted condition on GatewayClass, got none")
+	}
+	if cond.Status != metav1.ConditionFalse || cond.Reason != string(gatewayv1.GatewayClassReasonInvalidParameters) {
+		t.Errorf("expected Accepted=False/InvalidParameters, got Status=%s, Reason=%s", cond.Status, cond.Reason)
+	}
+	if cond.ObservedGeneration != 1 {
+		t.Errorf("expected ObservedGeneration=1, got %d", cond.ObservedGeneration)
+	}
+
+	// Update spec to remove ParametersRef and increment generation
+	res.Spec.ParametersRef = nil
+	res.Generation = 2
+	if err := client.Update(ctx, &res); err != nil {
+		t.Fatalf("failed to update GatewayClass: %v", err)
+	}
+
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "invalid-params-gc"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := client.Get(ctx, types.NamespacedName{Name: "invalid-params-gc"}, &res); err != nil {
+		t.Fatalf("failed to get GatewayClass: %v", err)
+	}
+	cond = findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusAccepted))
+	if cond == nil {
+		t.Fatalf("expected Accepted condition on GatewayClass, got none")
+	}
+	if cond.Status != metav1.ConditionTrue || cond.Reason != string(gatewayv1.GatewayClassReasonAccepted) {
+		t.Errorf("expected Accepted=True/Accepted, got Status=%s, Reason=%s", cond.Status, cond.Reason)
+	}
+	if cond.ObservedGeneration != 2 {
+		t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
+	}
+}
+
+func TestGatewayReconciler_InvalidParametersRef(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-gw",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "invalid.io",
+					Kind:  "InvalidParameters",
+					Name:  "invalid",
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		Proxy:          p,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var res gatewayv1.Gateway
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-gw"}, &res); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	acceptedCond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil {
+		t.Fatalf("expected Accepted condition on Gateway, got none")
+	}
+	if acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+		t.Errorf("expected Accepted=False/InvalidParameters, got Status=%s, Reason=%s", acceptedCond.Status, acceptedCond.Reason)
+	}
+
+	progCond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil {
+		t.Fatalf("expected Programmed condition on Gateway, got none")
+	}
+	if progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonInvalid) {
+		t.Errorf("expected Programmed=False/Invalid, got Status=%s, Reason=%s", progCond.Status, progCond.Reason)
+	}
+}
+
+func TestGatewayReconciler_UnsupportedProtocol(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	// 1. Gateway with only unsupported protocol
+	gwOnlyUnsupported := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gw-unsupported",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "invalid",
+					Port:     1111,
+					Protocol: "INVALID",
+				},
+			},
+		},
+	}
+
+	// 2. Gateway with mixed supported and unsupported protocols
+	gwMixed := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gw-mixed",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+				{
+					Name:     "invalid",
+					Port:     1111,
+					Protocol: "INVALID",
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gwOnlyUnsupported, gwMixed).
+		WithStatusSubresource(gwOnlyUnsupported, gwMixed).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		Proxy:          p,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+
+	// Reconcile gw-unsupported -> Gateway Accepted=False / ListenersNotValid
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-unsupported"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var res1 gatewayv1.Gateway
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "gw-unsupported"}, &res1); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	gwCond1 := findCondition(res1.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if gwCond1 == nil || gwCond1.Status != metav1.ConditionFalse || gwCond1.Reason != string(gatewayv1.GatewayReasonListenersNotValid) {
+		t.Errorf("expected Gateway Accepted=False/ListenersNotValid, got %+v", gwCond1)
+	}
+	if len(res1.Status.Listeners) != 1 {
+		t.Fatalf("expected 1 listener status, got %d", len(res1.Status.Listeners))
+	}
+	if len(res1.Status.Listeners[0].SupportedKinds) != 0 {
+		t.Errorf("expected empty SupportedKinds, got %+v", res1.Status.Listeners[0].SupportedKinds)
+	}
+	lCond1 := findCondition(res1.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionAccepted))
+	if lCond1 == nil || lCond1.Status != metav1.ConditionFalse || lCond1.Reason != string(gatewayv1.ListenerReasonUnsupportedProtocol) {
+		t.Errorf("expected Listener Accepted=False/UnsupportedProtocol, got %+v", lCond1)
+	}
+
+	// Reconcile gw-mixed -> Gateway Accepted=True / ListenersNotValid
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-mixed"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var res2 gatewayv1.Gateway
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "gw-mixed"}, &res2); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	gwCond2 := findCondition(res2.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if gwCond2 == nil || gwCond2.Status != metav1.ConditionTrue || gwCond2.Reason != string(gatewayv1.GatewayReasonListenersNotValid) {
+		t.Errorf("expected Gateway Accepted=True/ListenersNotValid, got %+v", gwCond2)
+	}
+	if len(res2.Status.Listeners) != 2 {
+		t.Fatalf("expected 2 listener statuses, got %d", len(res2.Status.Listeners))
+	}
+	lHttp := res2.Status.Listeners[0]
+	lHttpCond := findCondition(lHttp.Conditions, string(gatewayv1.ListenerConditionAccepted))
+	if lHttpCond == nil || lHttpCond.Status != metav1.ConditionTrue || lHttpCond.Reason != string(gatewayv1.ListenerReasonAccepted) {
+		t.Errorf("expected HTTP Listener Accepted=True/Accepted, got %+v", lHttpCond)
+	}
+	if len(lHttp.SupportedKinds) != 1 || lHttp.SupportedKinds[0].Kind != "HTTPRoute" {
+		t.Errorf("expected SupportedKinds=[HTTPRoute], got %+v", lHttp.SupportedKinds)
+	}
+
+	lInvalid := res2.Status.Listeners[1]
+	lInvalidCond := findCondition(lInvalid.Conditions, string(gatewayv1.ListenerConditionAccepted))
+	if lInvalidCond == nil || lInvalidCond.Status != metav1.ConditionFalse || lInvalidCond.Reason != string(gatewayv1.ListenerReasonUnsupportedProtocol) {
+		t.Errorf("expected Invalid Listener Accepted=False/UnsupportedProtocol, got %+v", lInvalidCond)
+	}
+	if len(lInvalid.SupportedKinds) != 0 {
+		t.Errorf("expected empty SupportedKinds on invalid listener, got %+v", lInvalid.SupportedKinds)
+	}
+}
+
+func TestGatewayReconciler_InvalidRouteKind(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	// 1. Gateway with only invalid route kind
+	gwOnlyInvalid := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gw-only-invalid",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Kinds: []gatewayv1.RouteGroupKind{
+							{Kind: "InvalidRoute"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// 2. Gateway with both valid and invalid route kinds
+	gwSupportedAndInvalid := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gw-supported-and-invalid",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Kinds: []gatewayv1.RouteGroupKind{
+							{Kind: "InvalidRoute"},
+							{Kind: "HTTPRoute"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gwOnlyInvalid, gwSupportedAndInvalid).
+		WithStatusSubresource(gwOnlyInvalid, gwSupportedAndInvalid).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		Proxy:          p,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+
+	// Reconcile gw-only-invalid
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-only-invalid"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var res1 gatewayv1.Gateway
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "gw-only-invalid"}, &res1); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	if len(res1.Status.Listeners) != 1 {
+		t.Fatalf("expected 1 listener, got %d", len(res1.Status.Listeners))
+	}
+	if len(res1.Status.Listeners[0].SupportedKinds) != 0 {
+		t.Errorf("expected empty SupportedKinds, got %+v", res1.Status.Listeners[0].SupportedKinds)
+	}
+	cond1 := findCondition(res1.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if cond1 == nil || cond1.Status != metav1.ConditionFalse || cond1.Reason != string(gatewayv1.ListenerReasonInvalidRouteKinds) {
+		t.Errorf("expected ResolvedRefs=False/InvalidRouteKinds, got %+v", cond1)
+	}
+
+	// Reconcile gw-supported-and-invalid
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-supported-and-invalid"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var res2 gatewayv1.Gateway
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "gw-supported-and-invalid"}, &res2); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	if len(res2.Status.Listeners) != 1 {
+		t.Fatalf("expected 1 listener, got %d", len(res2.Status.Listeners))
+	}
+	if len(res2.Status.Listeners[0].SupportedKinds) != 1 || res2.Status.Listeners[0].SupportedKinds[0].Kind != "HTTPRoute" {
+		t.Errorf("expected SupportedKinds=[HTTPRoute], got %+v", res2.Status.Listeners[0].SupportedKinds)
+	}
+	cond2 := findCondition(res2.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if cond2 == nil || cond2.Status != metav1.ConditionFalse || cond2.Reason != string(gatewayv1.ListenerReasonInvalidRouteKinds) {
+		t.Errorf("expected ResolvedRefs=False/InvalidRouteKinds, got %+v", cond2)
+	}
+}
+
 func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
 	for i := range conditions {
 		if conditions[i].Type == condType {
