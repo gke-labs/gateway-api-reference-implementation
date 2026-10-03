@@ -271,11 +271,19 @@ type ErrorState struct {
 	HTTPMessage string
 }
 
+// InternalMirror represents a mirror destination for a route rule.
+type InternalMirror struct {
+	Backend     InternalBackend
+	Numerator   int32
+	Denominator int32
+}
+
 // InternalRule is the internal representation of an HTTPRouteRule.
 type InternalRule struct {
 	Name     *gatewayv1.SectionName
 	Matches  []InternalMatch
 	Backends []InternalBackend
+	Mirrors  []InternalMirror
 	Redirect *InternalRedirect
 	Rewrite  *InternalRewrite
 	Timeouts *InternalTimeouts

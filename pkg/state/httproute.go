@@ -274,6 +274,34 @@ func CompileHTTPRoute(
 			case gatewayv1.HTTPRouteFilterCORS:
 				iRule.CORS = filter.CORS
 
+			case gatewayv1.HTTPRouteFilterRequestMirror:
+				if filter.RequestMirror != nil {
+					mirror, validationErr, refErr := compileRequestMirrorFilter(
+						filter.RequestMirror,
+						route,
+						services,
+						sortedTLSPolicies,
+						configMaps,
+						refValidator,
+					)
+					if validationErr != nil {
+						if validationCondition.Status == metav1.ConditionTrue {
+							validationCondition = validationErr.Condition
+						}
+						if iRule.Error == nil {
+							iRule.Error = validationErr
+						}
+					}
+					if refErr != nil {
+						if resolvedRefsCondition.Status == metav1.ConditionTrue {
+							resolvedRefsCondition = refErr.Condition
+						}
+					}
+					if mirror != nil {
+						iRule.Mirrors = append(iRule.Mirrors, *mirror)
+					}
+				}
+
 			default:
 				msg := fmt.Sprintf("unsupported filter type: %s", filter.Type)
 				errCond := NewCondition(
@@ -418,156 +446,22 @@ func CompileHTTPRoute(
 		// 3. Process backend refs
 		if iRule.Error == nil && iRule.Redirect == nil {
 			for _, backendRef := range rule.BackendRefs {
-				group := ValueOf(backendRef.Group)
-				kind := ValueOf(backendRef.Kind)
-				if kind == "" {
-					kind = "Service"
-				}
-
-				if (group != "" && group != "core") || kind != "Service" {
-					var msg string
-					if group != "" && group != "core" {
-						msg = fmt.Sprintf("Unsupported backend: %s/%s", group, kind)
-					} else {
-						msg = fmt.Sprintf("Unsupported backend kind: %s", kind)
-					}
-					errCond := NewCondition(
-						string(gatewayv1.RouteConditionResolvedRefs),
-						metav1.ConditionFalse,
-						string(gatewayv1.RouteReasonInvalidKind),
-						msg,
-						route.Generation,
-					)
+				backend, refErr := resolveBackendTarget(
+					backendRef.BackendObjectReference,
+					route,
+					services,
+					sortedTLSPolicies,
+					configMaps,
+					refValidator,
+				)
+				if refErr != nil {
 					if resolvedRefsCondition.Status == metav1.ConditionTrue {
-						resolvedRefsCondition = errCond
+						resolvedRefsCondition = refErr.Condition
 					}
 					if iRule.Error == nil {
-						iRule.Error = &ErrorState{
-							Condition:      errCond,
-							HTTPStatusCode: http.StatusInternalServerError,
-							HTTPMessage:    msg,
-						}
+						iRule.Error = refErr
 					}
 					break
-				}
-
-				backendSvcNamespace := route.Namespace
-				if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
-					backendSvcNamespace = string(*backendRef.Namespace)
-				}
-
-				// Cross-namespace ReferenceGrant check
-				if backendSvcNamespace != route.Namespace {
-					from := Reference{
-						GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
-						Namespace: route.Namespace,
-					}
-					to := Reference{
-						GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
-						Namespace: backendSvcNamespace,
-						Name:      string(backendRef.Name),
-					}
-					if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
-						msg := fmt.Sprintf("Cross-namespace reference to service %s/%s is not permitted by any ReferenceGrant", backendSvcNamespace, string(backendRef.Name))
-						errCond := NewCondition(
-							string(gatewayv1.RouteConditionResolvedRefs),
-							metav1.ConditionFalse,
-							string(gatewayv1.RouteReasonRefNotPermitted),
-							msg,
-							route.Generation,
-						)
-						if resolvedRefsCondition.Status == metav1.ConditionTrue {
-							resolvedRefsCondition = errCond
-						}
-						if iRule.Error == nil {
-							iRule.Error = &ErrorState{
-								Condition:      errCond,
-								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    msg,
-							}
-						}
-						break
-					}
-				}
-
-				// Service resolution
-				port := int32(80)
-				if backendRef.Port != nil {
-					port = int32(*backendRef.Port)
-				}
-
-				svcKey := types.NamespacedName{
-					Namespace: backendSvcNamespace,
-					Name:      string(backendRef.Name),
-				}
-
-				var appProtocol *string
-				if services != nil {
-					svc, ok := services[svcKey]
-					if !ok || svc == nil {
-						msg := fmt.Sprintf("Backend service %s/%s not found", backendSvcNamespace, string(backendRef.Name))
-						errCond := NewCondition(
-							string(gatewayv1.RouteConditionResolvedRefs),
-							metav1.ConditionFalse,
-							string(gatewayv1.RouteReasonBackendNotFound),
-							msg,
-							route.Generation,
-						)
-						if resolvedRefsCondition.Status == metav1.ConditionTrue {
-							resolvedRefsCondition = errCond
-						}
-						if iRule.Error == nil {
-							iRule.Error = &ErrorState{
-								Condition:      errCond,
-								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    msg,
-							}
-						}
-						break
-					}
-
-					for _, p := range svc.Spec.Ports {
-						if p.Port == port {
-							appProtocol = p.AppProtocol
-							break
-						}
-					}
-				}
-
-				// BackendTLSPolicy resolution
-				var tlsConfig *InternalTLSConfig
-				for _, policy := range sortedTLSPolicies {
-					if tlsConfig != nil {
-						break
-					}
-					for _, targetRef := range policy.Spec.TargetRefs {
-						if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
-							string(targetRef.Name) == string(backendRef.Name) &&
-							policy.Namespace == backendSvcNamespace {
-							https := "https"
-							appProtocol = &https
-
-							var caCerts [][]byte
-							for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-								if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-									cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-									if cm, ok := configMaps[cmName]; ok {
-										if data, ok := cm.Data["ca.crt"]; ok {
-											caCerts = append(caCerts, []byte(data))
-										} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-											caCerts = append(caCerts, data)
-										}
-									}
-								}
-							}
-
-							tlsConfig = &InternalTLSConfig{
-								Hostname: string(policy.Spec.Validation.Hostname),
-								CACerts:  caCerts,
-							}
-							break
-						}
-					}
 				}
 
 				// Backend filters
@@ -614,21 +508,17 @@ func CompileHTTPRoute(
 					weight = *backendRef.Weight
 				}
 
-				iRule.Backends = append(iRule.Backends, InternalBackend{
-					Host:                   fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-					Port:                   port,
-					AppProtocol:            appProtocol,
-					TLSConfig:              tlsConfig,
-					Weight:                 weight,
-					RequestHeaderModifier:  backendReqHeaderModifier,
-					ResponseHeaderModifier: backendRespHeaderModifier,
-					CORS:                   backendCORS,
-				})
+				backend.Weight = weight
+				backend.RequestHeaderModifier = backendReqHeaderModifier
+				backend.ResponseHeaderModifier = backendRespHeaderModifier
+				backend.CORS = backendCORS
+				iRule.Backends = append(iRule.Backends, *backend)
 			}
 		}
 
 		if iRule.Error != nil {
 			iRule.Backends = nil
+			iRule.Mirrors = nil
 		}
 
 		compiledRules = append(compiledRules, iRule)
@@ -883,4 +773,244 @@ func (s *HTTPRouteState) MatchesGateway(gw *gatewayv1.Gateway, controllerName st
 	}
 
 	return false
+}
+
+// resolveBackendTarget resolves a BackendObjectReference to an InternalBackend,
+// performing kind/group checks, cross-namespace ReferenceGrant validation, Service resolution,
+// and BackendTLSPolicy matching.
+func resolveBackendTarget(
+	backendRef gatewayv1.BackendObjectReference,
+	route *gatewayv1.HTTPRoute,
+	services map[types.NamespacedName]*corev1.Service,
+	sortedTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	refValidator ReferenceGrantValidator,
+) (*InternalBackend, *ErrorState) {
+	group := ValueOf(backendRef.Group)
+	kind := ValueOf(backendRef.Kind)
+	if kind == "" {
+		kind = "Service"
+	}
+
+	if (group != "" && group != "core") || kind != "Service" {
+		var msg string
+		if group != "" && group != "core" {
+			msg = fmt.Sprintf("Unsupported backend: %s/%s", group, kind)
+		} else {
+			msg = fmt.Sprintf("Unsupported backend kind: %s", kind)
+		}
+		errCond := NewCondition(
+			string(gatewayv1.RouteConditionResolvedRefs),
+			metav1.ConditionFalse,
+			string(gatewayv1.RouteReasonInvalidKind),
+			msg,
+			route.Generation,
+		)
+		return nil, &ErrorState{
+			Condition:      errCond,
+			HTTPStatusCode: http.StatusInternalServerError,
+			HTTPMessage:    msg,
+		}
+	}
+
+	svcNamespace := route.Namespace
+	if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
+		svcNamespace = string(*backendRef.Namespace)
+	}
+
+	// Cross-namespace ReferenceGrant check
+	if svcNamespace != route.Namespace {
+		from := Reference{
+			GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+			Namespace: route.Namespace,
+		}
+		to := Reference{
+			GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
+			Namespace: svcNamespace,
+			Name:      string(backendRef.Name),
+		}
+		if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
+			msg := fmt.Sprintf("Cross-namespace reference to service %s/%s is not permitted by any ReferenceGrant", svcNamespace, string(backendRef.Name))
+			errCond := NewCondition(
+				string(gatewayv1.RouteConditionResolvedRefs),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonRefNotPermitted),
+				msg,
+				route.Generation,
+			)
+			return nil, &ErrorState{
+				Condition:      errCond,
+				HTTPStatusCode: http.StatusInternalServerError,
+				HTTPMessage:    msg,
+			}
+		}
+	}
+
+	// Service resolution
+	port := int32(80)
+	if backendRef.Port != nil {
+		port = int32(*backendRef.Port)
+	}
+
+	svcKey := types.NamespacedName{
+		Namespace: svcNamespace,
+		Name:      string(backendRef.Name),
+	}
+
+	var appProtocol *string
+	if services != nil {
+		svc, ok := services[svcKey]
+		if !ok || svc == nil {
+			msg := fmt.Sprintf("Backend service %s/%s not found", svcNamespace, string(backendRef.Name))
+			errCond := NewCondition(
+				string(gatewayv1.RouteConditionResolvedRefs),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonBackendNotFound),
+				msg,
+				route.Generation,
+			)
+			return nil, &ErrorState{
+				Condition:      errCond,
+				HTTPStatusCode: http.StatusInternalServerError,
+				HTTPMessage:    msg,
+			}
+		}
+
+		for _, p := range svc.Spec.Ports {
+			if p.Port == port {
+				appProtocol = p.AppProtocol
+				break
+			}
+		}
+	}
+
+	// BackendTLSPolicy resolution
+	var tlsConfig *InternalTLSConfig
+	for _, policy := range sortedTLSPolicies {
+		if tlsConfig != nil {
+			break
+		}
+		for _, targetRef := range policy.Spec.TargetRefs {
+			if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+				string(targetRef.Name) == string(backendRef.Name) &&
+				policy.Namespace == svcNamespace {
+				https := "https"
+				appProtocol = &https
+
+				var caCerts [][]byte
+				for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+					if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+						cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+						if cm, ok := configMaps[cmName]; ok {
+							if data, ok := cm.Data["ca.crt"]; ok {
+								caCerts = append(caCerts, []byte(data))
+							} else if data, ok := cm.BinaryData["ca.crt"]; ok {
+								caCerts = append(caCerts, data)
+							}
+						}
+					}
+				}
+
+				tlsConfig = &InternalTLSConfig{
+					Hostname: string(policy.Spec.Validation.Hostname),
+					CACerts:  caCerts,
+				}
+				break
+			}
+		}
+	}
+
+	return &InternalBackend{
+		Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, svcNamespace),
+		Port:        port,
+		AppProtocol: appProtocol,
+		TLSConfig:   tlsConfig,
+	}, nil
+}
+
+// compileRequestMirrorFilter validates the filter settings and resolves the mirror backend target.
+func compileRequestMirrorFilter(
+	m *gatewayv1.HTTPRequestMirrorFilter,
+	route *gatewayv1.HTTPRoute,
+	services map[types.NamespacedName]*corev1.Service,
+	sortedTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	refValidator ReferenceGrantValidator,
+) (*InternalMirror, *ErrorState, *ErrorState) {
+	numerator := int32(100)
+	denominator := int32(100)
+
+	if m.Percent != nil && m.Fraction != nil {
+		msg := "cannot specify both percent and fraction for request mirror filter"
+		errCond := NewCondition(
+			string(gatewayv1.RouteConditionAccepted),
+			metav1.ConditionFalse,
+			string(gatewayv1.RouteReasonUnsupportedValue),
+			msg,
+			route.Generation,
+		)
+		return nil, &ErrorState{
+			Condition:      errCond,
+			HTTPStatusCode: http.StatusInternalServerError,
+			HTTPMessage:    msg,
+		}, nil
+	} else if m.Percent != nil {
+		if *m.Percent < 0 || *m.Percent > 100 {
+			msg := fmt.Sprintf("invalid percent %d for request mirror filter: must be between 0 and 100", *m.Percent)
+			errCond := NewCondition(
+				string(gatewayv1.RouteConditionAccepted),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonUnsupportedValue),
+				msg,
+				route.Generation,
+			)
+			return nil, &ErrorState{
+				Condition:      errCond,
+				HTTPStatusCode: http.StatusInternalServerError,
+				HTTPMessage:    msg,
+			}, nil
+		}
+		numerator = *m.Percent
+		denominator = 100
+	} else if m.Fraction != nil {
+		denom := int32(100)
+		if m.Fraction.Denominator != nil {
+			denom = *m.Fraction.Denominator
+		}
+		if m.Fraction.Numerator < 0 || denom < 1 || m.Fraction.Numerator > denom {
+			msg := fmt.Sprintf("invalid fraction %d/%d for request mirror filter", m.Fraction.Numerator, denom)
+			errCond := NewCondition(
+				string(gatewayv1.RouteConditionAccepted),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonUnsupportedValue),
+				msg,
+				route.Generation,
+			)
+			return nil, &ErrorState{
+				Condition:      errCond,
+				HTTPStatusCode: http.StatusInternalServerError,
+				HTTPMessage:    msg,
+			}, nil
+		}
+		numerator = m.Fraction.Numerator
+		denominator = denom
+	}
+
+	backend, refErr := resolveBackendTarget(
+		m.BackendRef,
+		route,
+		services,
+		sortedTLSPolicies,
+		configMaps,
+		refValidator,
+	)
+	if refErr != nil {
+		return nil, nil, refErr
+	}
+
+	return &InternalMirror{
+		Backend:     *backend,
+		Numerator:   numerator,
+		Denominator: denominator,
+	}, nil, nil
 }
