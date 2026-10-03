@@ -42,7 +42,7 @@ docker run -d \
   -v /etc/snigateway:/etc/snigateway:ro \
   snigateway-frontend:latest \
   --listen :8443 \
-  --ca-cert /etc/snigateway/ca.crt \
+  --client-ca /etc/snigateway/ca.crt=* \
   --server-cert /etc/snigateway/server.crt \
   --server-key /etc/snigateway/server.key
 ```
@@ -58,7 +58,7 @@ docker run -d \
   -v /etc/snigateway:/etc/snigateway:ro \
   snigateway-frontend:latest \
   --listen :443 \
-  --ca-cert /etc/snigateway/ca.crt \
+  --client-ca /etc/snigateway/ca.crt=* \
   --server-cert /etc/snigateway/server.crt \
   --server-key /etc/snigateway/server.key
 ```

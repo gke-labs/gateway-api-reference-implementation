@@ -18,7 +18,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -41,12 +43,14 @@ type ServerConfig struct {
 	ServerTLSConfig  *tls.Config
 	ConnectTimeout   time.Duration
 	ReadSNITimeout   time.Duration
+	Authorizer       Authorizer
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
 type Server struct {
-	config ServerConfig
-	table  *RegistrationTable
+	config     ServerConfig
+	authorizer Authorizer
+	table      *RegistrationTable
 
 	mu      sync.RWMutex
 	clients map[string]chan *api.ConnectionEvent // clientID -> active event stream channel
@@ -79,8 +83,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, errors.New("ServerTLSConfig is required")
 	}
 
+	auth := cfg.Authorizer
+	if auth == nil {
+		auth = &AllowAllAuthorizer{}
+	}
+
 	s := &Server{
 		config:           cfg,
+		authorizer:       auth,
 		table:            NewRegistrationTable(),
 		clients:          make(map[string]chan *api.ConnectionEvent),
 		pending:          make(map[string]chan net.Conn),
@@ -282,15 +292,32 @@ func spliceConnections(c1, c2 net.Conn) {
 	wg.Wait()
 }
 
-func extractClientID(r *http.Request) (string, error) {
+func extractClientIdentity(r *http.Request) (ClientIdentity, error) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-		return "", errors.New("client certificate required")
+		return ClientIdentity{}, errors.New("client certificate required")
 	}
-	cn := r.TLS.PeerCertificates[0].Subject.CommonName
+	peerCert := r.TLS.PeerCertificates[0]
+	cn := peerCert.Subject.CommonName
 	if cn == "" {
 		cn = "unknown-client"
 	}
-	return cn, nil
+
+	var rootCert *x509.Certificate
+	if len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
+		chain := r.TLS.VerifiedChains[0]
+		rootCert = chain[len(chain)-1]
+	} else {
+		rootCert = peerCert
+	}
+
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(rootCert.Raw))
+	id := fmt.Sprintf("%s/%s", fingerprint, cn)
+
+	return ClientIdentity{
+		ID:            id,
+		CAFingerprint: fingerprint,
+		CommonName:    cn,
+	}, nil
 }
 
 func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
@@ -299,7 +326,7 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientID, err := extractClientID(r)
+	clientIdentity, err := extractClientIdentity(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -311,12 +338,17 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.table.Register(clientID, req.Hostnames)
+	if err := s.authorizer.Authorize(r.Context(), clientIdentity, req.Hostnames); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
+	s.table.Register(clientIdentity.ID, req.Hostnames)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(api.RegistrationResponse{
 		Status:    "registered",
-		Hostnames: s.table.GetRegisteredHostnames(clientID),
+		Hostnames: s.table.GetRegisteredHostnames(clientIdentity.ID),
 	})
 }
 
@@ -326,7 +358,7 @@ func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	clientID, err := extractClientID(r)
+	clientIdentity, err := extractClientIdentity(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -341,16 +373,16 @@ func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request)
 	eventCh := make(chan *api.ConnectionEvent, 64)
 
 	s.mu.Lock()
-	s.clients[clientID] = eventCh
+	s.clients[clientIdentity.ID] = eventCh
 	s.mu.Unlock()
 
 	defer func() {
 		s.mu.Lock()
-		if s.clients[clientID] == eventCh {
-			delete(s.clients, clientID)
+		if s.clients[clientIdentity.ID] == eventCh {
+			delete(s.clients, clientIdentity.ID)
 		}
 		s.mu.Unlock()
-		s.table.Unregister(clientID)
+		s.table.Unregister(clientIdentity.ID)
 	}()
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
@@ -383,7 +415,7 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_, err := extractClientID(r)
+	_, err := extractClientIdentity(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return

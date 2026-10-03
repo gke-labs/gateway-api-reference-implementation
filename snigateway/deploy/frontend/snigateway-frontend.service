@@ -25,7 +25,7 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ExecStart=/usr/local/bin/snigateway-frontend \
   --listen :443 \
-  --ca-cert /etc/snigateway/ca.crt \
+  --client-ca /etc/snigateway/ca.crt=* \
   --server-cert /etc/snigateway/server.crt \
   --server-key /etc/snigateway/server.key
 Restart=always

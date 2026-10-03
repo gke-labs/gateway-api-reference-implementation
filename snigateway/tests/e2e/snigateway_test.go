@@ -186,4 +186,43 @@ func TestSNIGateway(t *testing.T) {
 			t.Errorf("Expected presented cert to be Gateway listener cert for echo2.snigateway.test, got: %s", logs)
 		}
 	})
+
+	// Assertion 4: Hostname outside client CA allowlist cannot be registered and is not routed
+	t.Run("Hostname outside client CA allowlist is rejected and not routed", func(t *testing.T) {
+		disallowedCertPEM, disallowedKeyPEM, err := GenerateTestCertificate("disallowed.example.com", "disallowed.example.com")
+		if err != nil {
+			t.Fatalf("Failed to generate disallowed test cert: %v", err)
+		}
+		h.CreateTLSSecret("disallowed-tls-cert", "default", disallowedCertPEM, disallowedKeyPEM)
+		t.Cleanup(func() {
+			h.runCmd("kubectl", "delete", "secret", "disallowed-tls-cert", "--namespace=default", "--ignore-not-found")
+		})
+
+		h.KubectlApplyContent(h.SNIGatewayManifest("disallowed.example.com", "disallowed-tls-cert"))
+		h.KubectlApplyContent(h.SNIHTTPRouteManifest("disallowed-route", "snigateway-test", "disallowed.example.com", "backend", 8080))
+		t.Cleanup(func() {
+			h.runCmd("kubectl", "delete", "httproute", "disallowed-route", "--namespace=default", "--ignore-not-found")
+		})
+
+		// Wait for controller reconciliation attempt
+		time.Sleep(5 * time.Second)
+
+		clientPod := "sni-client-disallowed"
+		h.DeletePod(clientPod)
+		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
+			"client",
+			"--connect-to=" + frontendAddr,
+			"--sni=disallowed.example.com",
+			"--insecure",
+			"--expect-fail",
+			"https://disallowed.example.com/",
+		}))
+		h.WaitForPodSuccess(clientPod, 1*time.Minute)
+		logs := h.GetPodLogs(clientPod)
+		t.Logf("Disallowed client logs: %s", logs)
+
+		if !strings.Contains(logs, "Connection rejected as expected") {
+			t.Errorf("Expected connection to disallowed hostname to be rejected, got logs: %s", logs)
+		}
+	})
 }

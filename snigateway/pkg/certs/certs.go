@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -218,21 +219,53 @@ func GenerateAndWriteCertificates(dir string, serverName string, clientCN string
 	return nil
 }
 
+// ParseCertificatesFromPEM parses all X.509 certificates from PEM encoded bytes.
+func ParseCertificatesFromPEM(pemBytes []byte) ([]*x509.Certificate, error) {
+	var certificates []*x509.Certificate
+	rest := pemBytes
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type == "CERTIFICATE" {
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				return nil, err
+			}
+			certificates = append(certificates, cert)
+		}
+	}
+	if len(certificates) == 0 {
+		return nil, errors.New("no CERTIFICATE blocks found in PEM")
+	}
+	return certificates, nil
+}
+
 // NewServerTLSConfig creates a *tls.Config for the frontend server requiring mTLS.
 func NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCertPEM) {
+		return nil, fmt.Errorf("failed to parse CA cert PEM")
+	}
+	return NewServerTLSConfigWithCertPool(caPool, serverCertPEM, serverKeyPEM)
+}
+
+// NewServerTLSConfigWithCertPool creates a *tls.Config for the frontend server requiring mTLS with the given client CA pool.
+func NewServerTLSConfigWithCertPool(clientCAPool *x509.CertPool, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
 	serverCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("parsing server cert/key: %w", err)
 	}
 
-	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caCertPEM) {
-		return nil, fmt.Errorf("failed to parse CA cert PEM")
+	if clientCAPool == nil {
+		clientCAPool = x509.NewCertPool()
 	}
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
-		ClientCAs:    caPool,
+		ClientCAs:    clientCAPool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		MinVersion:   tls.VersionTLS12,
 		NextProtos:   []string{"http/1.1"},

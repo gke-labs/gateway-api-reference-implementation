@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
@@ -60,7 +62,9 @@ func run(ctx context.Context, args []string) error {
 
 	var listenAddrs stringSliceFlag
 	fs.Var(&listenAddrs, "listen", "Address to listen on (can be specified multiple times, default :443)")
-	caCertPath := fs.String("ca-cert", "ca.crt", "Path to CA certificate PEM file")
+	var clientCAs stringSliceFlag
+	fs.Var(&clientCAs, "client-ca", "Client CA allowlist entry in format <path-to-ca.crt>=<hostname-pattern>[,<hostname-pattern>...] (can be specified multiple times)")
+	caCertPath := fs.String("ca-cert", "ca.crt", "Path to CA certificate PEM file (used when no --client-ca flags are specified)")
 	serverCertPath := fs.String("server-cert", "server.crt", "Path to server certificate PEM file")
 	serverKeyPath := fs.String("server-key", "server.key", "Path to server private key PEM file")
 	internalHostname := fs.String("internal-hostname", api.DefaultInternalHostname, "Internal SNI hostname for mTLS management API")
@@ -74,9 +78,70 @@ func run(ctx context.Context, args []string) error {
 		listenAddrs = []string{":443"}
 	}
 
-	caCertPEM, err := os.ReadFile(*caCertPath)
-	if err != nil {
-		return fmt.Errorf("reading CA cert from %s: %w", *caCertPath, err)
+	clientCAPool := x509.NewCertPool()
+	var authorizer frontend.Authorizer
+
+	if len(clientCAs) > 0 {
+		allowedPatterns := make(map[string][]string)
+		for _, entry := range clientCAs {
+			caPath, patternsStr, ok := strings.Cut(entry, "=")
+			if !ok || caPath == "" || patternsStr == "" {
+				return fmt.Errorf("invalid --client-ca format %q, expected <path-to-ca.crt>=<hostname-pattern>[,<hostname-pattern>...]", entry)
+			}
+
+			caCertPEM, err := os.ReadFile(caPath)
+			if err != nil {
+				return fmt.Errorf("reading client CA cert from %s: %w", caPath, err)
+			}
+
+			parsedCerts, err := certs.ParseCertificatesFromPEM(caCertPEM)
+			if err != nil {
+				return fmt.Errorf("parsing client CA cert from %s: %w", caPath, err)
+			}
+
+			if !clientCAPool.AppendCertsFromPEM(caCertPEM) {
+				return fmt.Errorf("failed to append client CA cert from %s to cert pool", caPath)
+			}
+
+			var patterns []string
+			for _, p := range strings.Split(patternsStr, ",") {
+				p = strings.Trim(strings.TrimSpace(p), "'\"")
+				if p != "" {
+					patterns = append(patterns, p)
+				}
+			}
+			if len(patterns) == 0 {
+				return fmt.Errorf("no patterns specified in --client-ca %q", entry)
+			}
+
+			for _, cert := range parsedCerts {
+				fp := fmt.Sprintf("%x", sha256.Sum256(cert.Raw))
+				allowedPatterns[fp] = append(allowedPatterns[fp], patterns...)
+			}
+		}
+		authorizer = frontend.NewCAAuthorizer(allowedPatterns)
+	} else {
+		log.Printf("WARNING: No --client-ca flags specified. Registrations are unrestricted for CA %s", *caCertPath)
+		caCertPEM, err := os.ReadFile(*caCertPath)
+		if err != nil {
+			return fmt.Errorf("reading CA cert from %s: %w", *caCertPath, err)
+		}
+
+		parsedCerts, err := certs.ParseCertificatesFromPEM(caCertPEM)
+		if err != nil {
+			return fmt.Errorf("parsing CA cert from %s: %w", *caCertPath, err)
+		}
+
+		if !clientCAPool.AppendCertsFromPEM(caCertPEM) {
+			return fmt.Errorf("failed to append CA cert from %s to cert pool", *caCertPath)
+		}
+
+		allowedPatterns := make(map[string][]string)
+		for _, cert := range parsedCerts {
+			fp := fmt.Sprintf("%x", sha256.Sum256(cert.Raw))
+			allowedPatterns[fp] = []string{"*"}
+		}
+		authorizer = frontend.NewCAAuthorizer(allowedPatterns)
 	}
 
 	serverCertPEM, err := os.ReadFile(*serverCertPath)
@@ -89,7 +154,7 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("reading server key from %s: %w", *serverKeyPath, err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	serverTLS, err := certs.NewServerTLSConfigWithCertPool(clientCAPool, serverCertPEM, serverKeyPEM)
 	if err != nil {
 		return fmt.Errorf("creating server TLS config: %w", err)
 	}
@@ -99,6 +164,7 @@ func run(ctx context.Context, args []string) error {
 		InternalHostname: *internalHostname,
 		ServerTLSConfig:  serverTLS,
 		ConnectTimeout:   *connectTimeout,
+		Authorizer:       authorizer,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing frontend server: %w", err)

@@ -401,7 +401,7 @@ spec:
         image: snigateway-frontend:e2e
         imagePullPolicy: Never
         args:
-        - "--ca-cert=/etc/snigateway-frontend/certs/ca.crt"
+        - "--client-ca=/etc/snigateway-frontend/certs/ca.crt=*.snigateway.test"
         - "--server-cert=/etc/snigateway-frontend/certs/server.crt"
         - "--server-key=/etc/snigateway-frontend/certs/server.key"
         - "--listen=:443"

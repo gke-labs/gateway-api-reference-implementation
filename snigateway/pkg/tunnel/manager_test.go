@@ -16,7 +16,9 @@ package tunnel
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -103,6 +105,13 @@ func TestManager_EndToEnd(t *testing.T) {
 		_ = mgr.Run(ctx)
 	}()
 
+	parsedCerts, err := certs.ParseCertificatesFromPEM(caCertPEM)
+	if err != nil {
+		t.Fatalf("parsing ca cert PEM: %v", err)
+	}
+	caFP := fmt.Sprintf("%x", sha256.Sum256(parsedCerts[0].Raw))
+	clientID := fmt.Sprintf("%s/mgr-client", caFP)
+
 	// 1. Update hostnames on manager
 	mgr.UpdateHostnames([]string{"app1.example.com", "*.wildcard.org"})
 
@@ -110,7 +119,7 @@ func TestManager_EndToEnd(t *testing.T) {
 	var regHosts []string
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		regHosts = srv.RegistrationTable().GetRegisteredHostnames("mgr-client")
+		regHosts = srv.RegistrationTable().GetRegisteredHostnames(clientID)
 		slices.Sort(regHosts)
 		if slices.Equal(regHosts, []string{"*.wildcard.org", "app1.example.com"}) {
 			break
@@ -175,7 +184,7 @@ func TestManager_EndToEnd(t *testing.T) {
 
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		regHosts = srv.RegistrationTable().GetRegisteredHostnames("mgr-client")
+		regHosts = srv.RegistrationTable().GetRegisteredHostnames(clientID)
 		if slices.Equal(regHosts, []string{"app2.example.com"}) {
 			break
 		}

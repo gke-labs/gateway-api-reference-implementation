@@ -19,6 +19,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -27,6 +28,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -293,6 +295,142 @@ func TestRejectionWithoutValidClientCertificate(t *testing.T) {
 		_, err = client.Get("https://snigateway.internal/v1/connections")
 		if err == nil {
 			t.Fatal("expected request with untrusted client cert to fail, got nil err")
+		}
+	})
+}
+
+func TestCAAllowlistAuthorization(t *testing.T) {
+	// Generate two separate sets of client/CA credentials
+	certsA, err := certs.GenerateAll("snigateway.internal", "team-a-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certsA: %v", err)
+	}
+	certsB, err := certs.GenerateAll("snigateway.internal", "team-b-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certsB: %v", err)
+	}
+
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(certsA.CA.CertPEM)
+	caPool.AppendCertsFromPEM(certsB.CA.CertPEM)
+
+	parsedCAA, err := certs.ParseCertificatesFromPEM(certsA.CA.CertPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatesFromPEM certsA: %v", err)
+	}
+	parsedCAB, err := certs.ParseCertificatesFromPEM(certsB.CA.CertPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatesFromPEM certsB: %v", err)
+	}
+
+	fpA := fmt.Sprintf("%x", sha256.Sum256(parsedCAA[0].Raw))
+	fpB := fmt.Sprintf("%x", sha256.Sum256(parsedCAB[0].Raw))
+
+	authorizer := NewCAAuthorizer(map[string][]string{
+		fpA: {"*.a.example.com", "a.example.org"},
+		fpB: {"*.b.example.com"},
+	})
+
+	serverTLS, err := certs.NewServerTLSConfigWithCertPool(caPool, certsA.Server.CertPEM, certsA.Server.KeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfigWithCertPool failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	serverAddr := ln.Addr().String()
+
+	srv, err := NewServer(ServerConfig{
+		ServerTLSConfig:  serverTLS,
+		InternalHostname: "snigateway.internal",
+		ConnectTimeout:   5 * time.Second,
+		ReadSNITimeout:   2 * time.Second,
+		Authorizer:       authorizer,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	clientTLSA, err := certs.NewClientTLSConfig(certsA.CA.CertPEM, certsA.Client.CertPEM, certsA.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig A failed: %v", err)
+	}
+	clientA := client.NewClient(serverAddr, clientTLSA)
+
+	clientTLSB, err := certs.NewClientTLSConfig(certsA.CA.CertPEM, certsB.Client.CertPEM, certsB.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig B failed: %v", err)
+	}
+	clientB := client.NewClient(serverAddr, clientTLSB)
+
+	ctx := t.Context()
+
+	// 1. Team A attempts to register disallowed hostnames -> rejected with 403 Forbidden
+	t.Run("Team A rejected for hostnames outside allowlist", func(t *testing.T) {
+		_, err := clientA.Register(ctx, []string{"app.b.example.com"})
+		if err == nil {
+			t.Fatal("expected registration of app.b.example.com by Team A to fail")
+		}
+		if !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "disallowed hostnames: app.b.example.com") {
+			t.Fatalf("unexpected error response: %v", err)
+		}
+	})
+
+	// 2. Team A attempts to register partially allowed hostnames -> rejected completely (not partially registered)
+	t.Run("Team A rejected for mixed allowed and disallowed hostnames", func(t *testing.T) {
+		_, err := clientA.Register(ctx, []string{"app.a.example.com", "other.example.com"})
+		if err == nil {
+			t.Fatal("expected registration of mixed hostnames by Team A to fail")
+		}
+		if !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "disallowed hostnames: other.example.com") {
+			t.Fatalf("unexpected error response: %v", err)
+		}
+
+		// Verify app.a.example.com was NOT partially registered
+		clientID := fmt.Sprintf("%s/team-a-client", fpA)
+		hosts := srv.RegistrationTable().GetRegisteredHostnames(clientID)
+		if len(hosts) != 0 {
+			t.Fatalf("expected 0 registered hostnames for Team A, got %v", hosts)
+		}
+	})
+
+	// 3. Team A registers allowed hostnames -> succeeds
+	t.Run("Team A succeeds for allowed hostnames", func(t *testing.T) {
+		resp, err := clientA.Register(ctx, []string{"app.a.example.com", "a.example.org"})
+		if err != nil {
+			t.Fatalf("unexpected registration failure for Team A: %v", err)
+		}
+		if len(resp.Hostnames) != 2 {
+			t.Fatalf("expected 2 registered hostnames, got %v", resp.Hostnames)
+		}
+	})
+
+	// 4. Team B registers allowed hostnames -> succeeds
+	t.Run("Team B succeeds for allowed hostnames", func(t *testing.T) {
+		resp, err := clientB.Register(ctx, []string{"service.b.example.com"})
+		if err != nil {
+			t.Fatalf("unexpected registration failure for Team B: %v", err)
+		}
+		if len(resp.Hostnames) != 1 {
+			t.Fatalf("expected 1 registered hostname, got %v", resp.Hostnames)
+		}
+	})
+
+	// 5. Team B attempts to register Team A's hostname -> rejected with 403 Forbidden
+	t.Run("Team B cannot hijack Team A hostname", func(t *testing.T) {
+		_, err := clientB.Register(ctx, []string{"app.a.example.com"})
+		if err == nil {
+			t.Fatal("expected registration of app.a.example.com by Team B to fail")
+		}
+		if !strings.Contains(err.Error(), "403") {
+			t.Fatalf("unexpected error response: %v", err)
 		}
 	})
 }
