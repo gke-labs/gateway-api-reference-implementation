@@ -15,6 +15,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -28,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"golang.org/x/net/http2"
@@ -299,6 +301,39 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, backend.Error.HTTPMessage, backend.Error.HTTPStatusCode)
 				return
 			}
+
+			// Read request body if there are mirrors so it can be sent to both main backend and mirrors.
+			// TODO: Support streaming/spooling for request bodies exceeding the memory limit.
+			var bodyBytes []byte
+			if len(bestRule.Mirrors) > 0 && r.Body != nil && r.Body != http.NoBody {
+				const maxMirrorBodySize = 8 * 1024 * 1024 // 8MB limit to avoid OOM
+				limitedReader := io.LimitReader(r.Body, maxMirrorBodySize)
+				var readErr error
+				bodyBytes, readErr = io.ReadAll(limitedReader)
+				r.Body.Close()
+				if readErr != nil {
+					log.Log.Error(readErr, "Failed to read request body for mirroring", "path", r.URL.Path)
+					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+					return
+				}
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			}
+
+			// Process mirrors
+			for _, m := range bestRule.Mirrors {
+				shouldMirror := false
+				if m.Numerator >= m.Denominator && m.Denominator > 0 {
+					shouldMirror = true
+				} else if m.Numerator > 0 && m.Denominator > 0 {
+					if rand.Int32N(m.Denominator) < m.Numerator {
+						shouldMirror = true
+					}
+				}
+				if shouldMirror {
+					p.mirror(r, bodyBytes, m.Backend, bestRule.Timeouts)
+				}
+			}
+
 			if backend.RequestHeaderModifier != nil {
 				p.modifyHeaders(r, *backend.RequestHeaderModifier)
 			}
@@ -509,6 +544,77 @@ func removeHopByHopHeaders(h http.Header) {
 	}
 }
 
+func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backend state.InternalBackend, body io.Reader) (*http.Request, *url.URL, error) {
+	scheme := "http"
+	if state.ValueOf(backend.AppProtocol) == "https" {
+		scheme = "https"
+	}
+
+	targetURL := &url.URL{
+		Scheme:   scheme,
+		Host:     fmt.Sprintf("%s:%d", backend.Host, backend.Port),
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
+	}
+
+	req, err := http.NewRequestWithContext(ctx, r.Method, targetURL.String(), body)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	req.Header = r.Header.Clone()
+	removeHopByHopHeaders(req.Header)
+
+	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
+			clientIP = prior + ", " + clientIP
+		}
+		req.Header.Set("X-Forwarded-For", clientIP)
+	} else if r.RemoteAddr != "" {
+		if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
+			req.Header.Set("X-Forwarded-For", prior+", "+r.RemoteAddr)
+		} else {
+			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
+		}
+	}
+
+	req.Host = r.Host
+	return req, targetURL, nil
+}
+
+func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper {
+	if state.ValueOf(backend.AppProtocol) == "https" {
+		tlsConfig := &tls.Config{InsecureSkipVerify: false}
+		if backend.TLSConfig != nil {
+			if backend.TLSConfig.Hostname != "" {
+				tlsConfig.ServerName = backend.TLSConfig.Hostname
+			}
+			if len(backend.TLSConfig.CACerts) > 0 {
+				tlsConfig.RootCAs = x509.NewCertPool()
+				for _, cert := range backend.TLSConfig.CACerts {
+					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
+				}
+			} else {
+				tlsConfig.InsecureSkipVerify = true
+			}
+		} else {
+			tlsConfig.InsecureSkipVerify = true
+		}
+		return &http.Transport{
+			TLSClientConfig: tlsConfig,
+		}
+	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
+		return &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		}
+	}
+	return http.DefaultTransport
+}
+
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter, timeouts *state.InternalTimeouts) {
 	reqCtx := r.Context()
 	if timeouts != nil && timeouts.Request != nil && *timeouts.Request > 0 {
@@ -524,19 +630,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		defer cancel()
 	}
 
-	scheme := "http"
-	if state.ValueOf(backend.AppProtocol) == "https" {
-		scheme = "https"
-	}
-
-	targetURL := &url.URL{
-		Scheme:   scheme,
-		Host:     fmt.Sprintf("%s:%d", backend.Host, backend.Port),
-		Path:     r.URL.Path,
-		RawQuery: r.URL.RawQuery,
-	}
-
-	outReq, err := http.NewRequestWithContext(backendCtx, r.Method, targetURL.String(), r.Body)
+	outReq, targetURL, err := p.buildBackendRequest(backendCtx, r, backend, r.Body)
 	if err != nil {
 		effectiveCORS := respCORS
 		if backend.CORS != nil {
@@ -555,56 +649,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		return
 	}
 
-	outReq.Header = r.Header.Clone()
-	removeHopByHopHeaders(outReq.Header)
-
-	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
-			clientIP = prior + ", " + clientIP
-		}
-		outReq.Header.Set("X-Forwarded-For", clientIP)
-	} else if r.RemoteAddr != "" {
-		if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
-			outReq.Header.Set("X-Forwarded-For", prior+", "+r.RemoteAddr)
-		} else {
-			outReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
-		}
-	}
-
-	outReq.Host = r.Host
-
-	var transport http.RoundTripper
-	if scheme == "https" {
-		tlsConfig := &tls.Config{InsecureSkipVerify: false}
-		if backend.TLSConfig != nil {
-			if backend.TLSConfig.Hostname != "" {
-				tlsConfig.ServerName = backend.TLSConfig.Hostname
-			}
-			if len(backend.TLSConfig.CACerts) > 0 {
-				tlsConfig.RootCAs = x509.NewCertPool()
-				for _, cert := range backend.TLSConfig.CACerts {
-					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
-				}
-			} else {
-				tlsConfig.InsecureSkipVerify = true
-			}
-		} else {
-			tlsConfig.InsecureSkipVerify = true
-		}
-		transport = &http.Transport{
-			TLSClientConfig: tlsConfig,
-		}
-	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
-		transport = &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, network, addr)
-			},
-		}
-	} else {
-		transport = http.DefaultTransport
-	}
+	transport := p.buildTransport(backend)
 
 	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", targetURL.String(), "appProtocol", state.ValueOf(backend.AppProtocol))
 
@@ -888,4 +933,38 @@ func pickBackend(backends []state.InternalBackend) (state.InternalBackend, error
 	}
 
 	return backends[len(backends)-1], nil
+}
+
+func (p *Proxy) mirror(r *http.Request, bodyBytes []byte, backend state.InternalBackend, timeouts *state.InternalTimeouts) {
+	go func() {
+		timeout := 30 * time.Second
+		if timeouts != nil && timeouts.BackendRequest != nil && *timeouts.BackendRequest > 0 {
+			timeout = *timeouts.BackendRequest
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		var body io.Reader
+		if len(bodyBytes) > 0 {
+			body = bytes.NewReader(bodyBytes)
+		}
+
+		mirrorReq, targetURL, err := p.buildBackendRequest(ctx, r, backend, body)
+		if err != nil {
+			log.Log.Error(err, "Failed to create mirror request")
+			return
+		}
+
+		transport := p.buildTransport(backend)
+		log.Log.Info("Mirroring request", "host", mirrorReq.Host, "path", mirrorReq.URL.Path, "target", targetURL.String())
+
+		resp, err := transport.RoundTrip(mirrorReq)
+		if err != nil {
+			log.Log.Error(err, "Failed to send mirrored request", "target", targetURL.String())
+			return
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+	}()
 }

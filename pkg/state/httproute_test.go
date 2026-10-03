@@ -746,6 +746,7 @@ func TestHTTPRouteValidate_Filters(t *testing.T) {
 									{Type: gatewayv1.HTTPRouteFilterRequestRedirect},
 									{Type: gatewayv1.HTTPRouteFilterURLRewrite},
 									{Type: gatewayv1.HTTPRouteFilterCORS},
+									{Type: gatewayv1.HTTPRouteFilterRequestMirror},
 								},
 								BackendRefs: []gatewayv1.HTTPBackendRef{
 									{
@@ -1420,6 +1421,309 @@ func TestHTTPRouteValidate_Timeouts(t *testing.T) {
 			err := tt.route.Validate()
 			if (err != nil) != tt.expectError {
 				t.Errorf("Validate() err = %v, expectError = %v", err, tt.expectError)
+			}
+		})
+	}
+}
+
+func TestCompileHTTPRoute_RequestMirror(t *testing.T) {
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend-svc"}: {
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Port: 8080},
+				},
+			},
+		},
+		{Namespace: "default", Name: "mirror-svc"}: {
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Port: 8080},
+				},
+			},
+		},
+		{Namespace: "other-ns", Name: "mirror-svc-2"}: {
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Port: 9090},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name                 string
+		route                *gatewayv1.HTTPRoute
+		refValidator         ReferenceGrantValidator
+		expectedAccepted     metav1.ConditionStatus
+		expectedAcceptedReas string
+		expectedResolvedRefs metav1.ConditionStatus
+		expectedResolvedReas string
+		expectedMirrorCount  int
+		expectedNumerator    int32
+		expectedDenominator  int32
+	}{
+		{
+			name: "valid request mirror with default 100%",
+			route: &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mirror-route"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Filters: []gatewayv1.HTTPRouteFilter{
+								{
+									Type: gatewayv1.HTTPRouteFilterRequestMirror,
+									RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Name: "mirror-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+									},
+								},
+							},
+							BackendRefs: []gatewayv1.HTTPBackendRef{
+								{
+									BackendRef: gatewayv1.BackendRef{
+										BackendObjectReference: gatewayv1.BackendObjectReference{
+											Name: "backend-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedAccepted:     metav1.ConditionTrue,
+			expectedAcceptedReas: string(gatewayv1.RouteReasonAccepted),
+			expectedResolvedRefs: metav1.ConditionTrue,
+			expectedResolvedReas: string(gatewayv1.RouteReasonResolvedRefs),
+			expectedMirrorCount:  1,
+			expectedNumerator:    100,
+			expectedDenominator:  100,
+		},
+		{
+			name: "valid request mirror with percent",
+			route: &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mirror-route"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Filters: []gatewayv1.HTTPRouteFilter{
+								{
+									Type: gatewayv1.HTTPRouteFilterRequestMirror,
+									RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Name: "mirror-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+										Percent: Ptr(int32(20)),
+									},
+								},
+							},
+							BackendRefs: []gatewayv1.HTTPBackendRef{
+								{
+									BackendRef: gatewayv1.BackendRef{
+										BackendObjectReference: gatewayv1.BackendObjectReference{
+											Name: "backend-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedAccepted:     metav1.ConditionTrue,
+			expectedAcceptedReas: string(gatewayv1.RouteReasonAccepted),
+			expectedResolvedRefs: metav1.ConditionTrue,
+			expectedResolvedReas: string(gatewayv1.RouteReasonResolvedRefs),
+			expectedMirrorCount:  1,
+			expectedNumerator:    20,
+			expectedDenominator:  100,
+		},
+		{
+			name: "valid request mirror with fraction",
+			route: &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mirror-route"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Filters: []gatewayv1.HTTPRouteFilter{
+								{
+									Type: gatewayv1.HTTPRouteFilterRequestMirror,
+									RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Name: "mirror-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+										Fraction: &gatewayv1.Fraction{
+											Numerator:   25,
+											Denominator: Ptr(int32(50)),
+										},
+									},
+								},
+							},
+							BackendRefs: []gatewayv1.HTTPBackendRef{
+								{
+									BackendRef: gatewayv1.BackendRef{
+										BackendObjectReference: gatewayv1.BackendObjectReference{
+											Name: "backend-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedAccepted:     metav1.ConditionTrue,
+			expectedAcceptedReas: string(gatewayv1.RouteReasonAccepted),
+			expectedResolvedRefs: metav1.ConditionTrue,
+			expectedResolvedReas: string(gatewayv1.RouteReasonResolvedRefs),
+			expectedMirrorCount:  1,
+			expectedNumerator:    25,
+			expectedDenominator:  50,
+		},
+		{
+			name: "invalid request mirror with both percent and fraction",
+			route: &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mirror-route"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Filters: []gatewayv1.HTTPRouteFilter{
+								{
+									Type: gatewayv1.HTTPRouteFilterRequestMirror,
+									RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Name: "mirror-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+										Percent: Ptr(int32(20)),
+										Fraction: &gatewayv1.Fraction{
+											Numerator: 25,
+										},
+									},
+								},
+							},
+							BackendRefs: []gatewayv1.HTTPBackendRef{
+								{
+									BackendRef: gatewayv1.BackendRef{
+										BackendObjectReference: gatewayv1.BackendObjectReference{
+											Name: "backend-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedAccepted:     metav1.ConditionFalse,
+			expectedAcceptedReas: string(gatewayv1.RouteReasonUnsupportedValue),
+			expectedResolvedRefs: metav1.ConditionTrue,
+			expectedResolvedReas: string(gatewayv1.RouteReasonResolvedRefs),
+			expectedMirrorCount:  0,
+		},
+		{
+			name: "invalid request mirror percent > 100",
+			route: &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mirror-route"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Filters: []gatewayv1.HTTPRouteFilter{
+								{
+									Type: gatewayv1.HTTPRouteFilterRequestMirror,
+									RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Name: "mirror-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+										Percent: Ptr(int32(101)),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedAccepted:     metav1.ConditionFalse,
+			expectedAcceptedReas: string(gatewayv1.RouteReasonUnsupportedValue),
+			expectedResolvedRefs: metav1.ConditionTrue,
+			expectedResolvedReas: string(gatewayv1.RouteReasonResolvedRefs),
+			expectedMirrorCount:  0,
+		},
+		{
+			name: "invalid request mirror backend not found",
+			route: &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mirror-route"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Filters: []gatewayv1.HTTPRouteFilter{
+								{
+									Type: gatewayv1.HTTPRouteFilterRequestMirror,
+									RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+										BackendRef: gatewayv1.BackendObjectReference{
+											Name: "nonexistent-mirror-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+									},
+								},
+							},
+							BackendRefs: []gatewayv1.HTTPBackendRef{
+								{
+									BackendRef: gatewayv1.BackendRef{
+										BackendObjectReference: gatewayv1.BackendObjectReference{
+											Name: "backend-svc",
+											Port: Ptr(gatewayv1.PortNumber(8080)),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedAccepted:     metav1.ConditionTrue,
+			expectedAcceptedReas: string(gatewayv1.RouteReasonAccepted),
+			expectedResolvedRefs: metav1.ConditionFalse,
+			expectedResolvedReas: string(gatewayv1.RouteReasonBackendNotFound),
+			expectedMirrorCount:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiled := CompileHTTPRoute(tt.route, services, nil, nil, tt.refValidator)
+			if compiled.ValidationCondition.Status != tt.expectedAccepted {
+				t.Errorf("ValidationCondition.Status = %v, want %v", compiled.ValidationCondition.Status, tt.expectedAccepted)
+			}
+			if compiled.ValidationCondition.Reason != tt.expectedAcceptedReas {
+				t.Errorf("ValidationCondition.Reason = %v, want %v", compiled.ValidationCondition.Reason, tt.expectedAcceptedReas)
+			}
+			if compiled.ResolvedRefsCondition.Status != tt.expectedResolvedRefs {
+				t.Errorf("ResolvedRefsCondition.Status = %v, want %v", compiled.ResolvedRefsCondition.Status, tt.expectedResolvedRefs)
+			}
+			if compiled.ResolvedRefsCondition.Reason != tt.expectedResolvedReas {
+				t.Errorf("ResolvedRefsCondition.Reason = %v, want %v", compiled.ResolvedRefsCondition.Reason, tt.expectedResolvedReas)
+			}
+			if len(compiled.Rules) > 0 {
+				if len(compiled.Rules[0].Mirrors) != tt.expectedMirrorCount {
+					t.Errorf("Mirrors count = %v, want %v", len(compiled.Rules[0].Mirrors), tt.expectedMirrorCount)
+				}
+				if tt.expectedMirrorCount > 0 {
+					m := compiled.Rules[0].Mirrors[0]
+					if m.Numerator != tt.expectedNumerator || m.Denominator != tt.expectedDenominator {
+						t.Errorf("Mirror fraction = %d/%d, want %d/%d", m.Numerator, m.Denominator, tt.expectedNumerator, tt.expectedDenominator)
+					}
+				}
 			}
 		})
 	}
