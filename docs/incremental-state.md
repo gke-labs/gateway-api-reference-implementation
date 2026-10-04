@@ -126,6 +126,10 @@ This design borrows directly from several well-known systems.
   cutoff*. In those terms, this design uses verifying traces with early
   cutoff and dynamic dependencies.
 
+- **Envoy's xDS.** The versioned push and ACK/NACK model for multiple
+  data-plane replicas (see
+  [below](#multiple-data-plane-replicas)) follows Envoy's xDS protocol.
+
 Credit for the ideas goes to these projects and their authors. Mistakes in
 applying them to Kubernetes are ours.
 
@@ -305,6 +309,80 @@ the consistency that the conformance tests check. Recomputation can be
 batched with a small delay, so a burst of watch events, such as at startup,
 results in one recompute.
 
+## Multiple data-plane replicas
+
+So far we have assumed one GARI process that both computes state and serves
+traffic. Once there is more than one data-plane router, for availability or
+for capacity, this design gives a natural split between the controller and
+the data plane.
+
+- **The controller computes; routers apply.** All dependency tracking,
+  validation and status computation stay in the controller. Routers receive
+  compiled configuration and apply it. They don't need informers, the
+  `State`, or any Gateway API logic.
+- **Versioned push, with ACK/NACK.** The controller pushes the proxy
+  configuration output with its revision. Each router applies it and
+  reports back either "applied revision R" (ACK) or "rejected revision R,
+  because ..." (NACK). This is the model of Envoy's
+  [xDS protocol](https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol),
+  where each config carries a `version_info` and proxies ACK or NACK it;
+  we credit xDS for it here. The incremental model maps naturally onto
+  incremental (delta) xDS, because each query output already has its own
+  version.
+
+### Gating status on the data plane
+
+Gateway API separates "the configuration is valid" from "the data plane has
+it":
+
+- **`Accepted` and `ResolvedRefs`** describe validity. The controller can
+  decide these immediately; errors are detected in the controller and don't
+  need a round trip to the data plane.
+- **`Programmed`** (on Gateways and their listeners) describes the data
+  plane. It should become `True` only once every serving router has applied
+  the configuration.
+
+The revisions make this check simple. A Gateway is programmed once every
+serving router has ACKed a revision at or after the `changedAt` of that
+Gateway's compiled configuration. Early cutoff matters here too: a change
+that doesn't affect a Gateway's compiled configuration leaves its
+`changedAt` alone, so its status doesn't flip back to "not yet programmed"
+while routers catch up on unrelated changes.
+
+Some failures can only be detected by a router, such as a port already in
+use or a certificate the TLS stack refuses to load. A NACK carries the
+reason, which becomes `Programmed=False` with a useful message.
+
+### Which routers count
+
+"Every serving router" needs a careful definition, or one bad pod can block
+status for everyone.
+
+- **New routers** report Ready (and so join the Service endpoints) only
+  after applying the current configuration. Until then they get no traffic,
+  so they don't need to be waited on.
+- **Unresponsive routers** are removed from the set after a timeout, and
+  should be restarted, so a wedged pod can't hold `Programmed` back forever.
+- **During rollouts** routers briefly run different revisions. That's
+  acceptable, as long as status only claims what every serving router has
+  applied.
+
+### Scope and acceleration
+
+The unit of push can be a per-Gateway query (`ProxyConfig(gateway)`), so
+that routers dedicated to a Gateway receive only that Gateway's
+configuration and certificates. That fits the separation of provisioning
+from the data plane, where each Gateway gets its own router Deployment. It
+also keeps pushes small and limits where private keys are sent.
+
+In single-process mode the router is in-process and ACKs immediately,
+through the same interface.
+
+This connects to [accelerated operations](accelerated-operations.md). If
+the push protocol is a clean "versioned configuration plus ACK/NACK" stream,
+an accelerated data plane is just another subscriber. It ACKs what it can
+program, and GARI serves the rest.
+
 ## Plan
 
 We will build this in three steps. Each step has no behaviour change of its
@@ -324,6 +402,11 @@ own and is checked against the conformance suite.
 3. **Memoization with dependency tracking.** Add the `Reader`, memo entries,
    validation and early cutoff behind the same interfaces. The outputs of
    step 2's full recompute become the oracle for check mode.
+
+Later, once there is more than one router, a fourth step adds the versioned
+push with ACK/NACK and gates `Programmed` on it, as described in
+[Multiple data-plane replicas](#multiple-data-plane-replicas). It builds on
+step 2, not step 3.
 
 If step 2 turns out to be fast enough, step 3 can wait until there is a
 reason to do it. The architectural win does not depend on it.
