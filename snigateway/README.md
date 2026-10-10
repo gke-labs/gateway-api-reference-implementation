@@ -6,15 +6,16 @@
 
 The `snigateway` architecture consists of two main components:
 1. **`snigateway-frontend`**: Runs on a publicly accessible frontend node (e.g. edge node, VPS, or public VM):
-   - Listens on one or more TLS ports (e.g. `:443`).
+   - Listens on TCP and UDP ports (e.g. `:443`).
    - Peeks at the TLS ClientHello of incoming connections to determine the requested SNI hostname without consuming stream bytes.
-   - If the SNI hostname is `snigateway.internal`, it serves the mTLS management API (authenticated via trusted CAs).
-   - Manages session-scoped hostname registrations and maintains a warm pool of pre-dialed reverse tunnel connections.
+   - If the SNI hostname is `snigateway.internal`, it serves the mTLS management API and QUIC reverse tunnel listeners (`snigateway-tunnel/1` ALPN).
+   - Manages session-scoped hostname registrations and routes across both QUIC streams and pooled TCP connections.
    - Sends PROXY protocol v2 headers (with `PP2_TYPE_AUTHORITY` SNI TLV) on activated connections, carrying real client source/dest IPs.
    - Implements replay-until-first-byte health checking and failover across healthy backend replicas.
 2. **`snigateway` (Controller)**: Runs inside a Kubernetes cluster (e.g. home lab, edge site, private network):
    - Embeds GARI (`pkg/gari`) in-process.
-   - Establishes an outbound session and maintains a warm pool of idle pre-dialed mTLS reverse tunnel connections (`--tunnel-pool-size`, default 4).
+   - Connects to frontend via QUIC (default in `--tunnel-transport=auto` and `quic`) or pre-dialed TCP pool (`--tunnel-transport=tcp` with `--tunnel-pool-size`).
+   - Automatically falls back from QUIC to TCP pool if UDP is blocked/unreachable, and probes to recover back to QUIC gracefully.
    - Uses GARI's `OnGatewaysUpdate` hook to dynamically register SNI hostnames for its HTTPS/TLS listeners.
    - Feeds reverse-tunnelled connections to GARI's HTTPS proxy server via a custom tunnel `net.Listener`, parsing PROXY v2 headers to expose real client IPs.
 
@@ -86,10 +87,12 @@ Because the container runs as a non-root user (`65532:65532`), binding to privil
 ```bash
 docker run -d \
   --name snigateway-frontend \
-  -p 443:8443 \
+  -p 443:8443/tcp \
+  -p 443:8443/udp \
   -v $(pwd)/certs:/certs:ro \
   snigateway-frontend:latest \
   --listen :8443 \
+  --tunnel-listen-udp :8443 \
   --client-ca /certs/ca.crt=* \
   --server-cert /certs/server.crt \
   --server-key /certs/server.key

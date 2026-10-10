@@ -62,6 +62,8 @@ func run(ctx context.Context, args []string) error {
 
 	var listenAddrs stringSliceFlag
 	fs.Var(&listenAddrs, "listen", "Address to listen on (can be specified multiple times, default :443)")
+	var tunnelListenUDP stringSliceFlag
+	fs.Var(&tunnelListenUDP, "tunnel-listen-udp", "UDP address to listen on for QUIC tunnels (can be specified multiple times, defaults to match --listen)")
 	var clientCAs stringSliceFlag
 	fs.Var(&clientCAs, "client-ca", "Client CA allowlist entry in format <path-to-ca.crt>=<hostname-pattern>[,<hostname-pattern>...] (can be specified multiple times)")
 	caCertPath := fs.String("ca-cert", "ca.crt", "Path to CA certificate PEM file (used when no --client-ca flags are specified)")
@@ -76,6 +78,9 @@ func run(ctx context.Context, args []string) error {
 
 	if len(listenAddrs) == 0 {
 		listenAddrs = []string{":443"}
+	}
+	if len(tunnelListenUDP) == 0 {
+		tunnelListenUDP = listenAddrs
 	}
 
 	clientCAPool := x509.NewCertPool()
@@ -161,6 +166,7 @@ func run(ctx context.Context, args []string) error {
 
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ListenAddrs:      listenAddrs,
+		UDPListenAddrs:   tunnelListenUDP,
 		InternalHostname: *internalHostname,
 		ServerTLSConfig:  serverTLS,
 		ConnectTimeout:   *connectTimeout,

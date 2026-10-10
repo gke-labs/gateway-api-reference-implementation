@@ -151,6 +151,13 @@ func TestSNIGateway(t *testing.T) {
 		} else if !strings.Contains(logs, clientPodIP) {
 			t.Errorf("Expected X-Forwarded-For to contain client pod IP %s, got logs: %s", clientPodIP, logs)
 		}
+
+		// Verify default auto deployment established QUIC session (UDP works in kind, so auto requires QUIC)
+		ctrlLogs := h.WaitForControllerLog("Established QUIC session", 30*time.Second)
+		t.Logf("Controller logs for default auto mode: %s", ctrlLogs)
+		if strings.Contains(ctrlLogs, "falling back to TCP pool transport") || strings.Contains(ctrlLogs, "Established TCP fallback session") {
+			t.Errorf("Auto mode unexpectedly fell back to TCP in default deployment, logs: %s", ctrlLogs)
+		}
 	})
 
 	// Assertion 2: Unregistered SNI hostname is rejected (connection closed)
@@ -285,6 +292,146 @@ func TestSNIGateway(t *testing.T) {
 			if !strings.Contains(logs, "\"hostname\":\"echo.snigateway.test\"") && !strings.Contains(logs, "\"host\": \"echo.snigateway.test\"") {
 				t.Errorf("Request %d: Expected hostname echo.snigateway.test in response body, got: %s", i, logs)
 			}
+		}
+	})
+
+	// Assertion 6: Deploy controller with explicit --tunnel-transport=tcp and verify connections succeed
+	t.Run("Controller with --tunnel-transport=tcp succeeds", func(t *testing.T) {
+		t.Cleanup(func() { dumpLogsIfFailed(t) })
+
+		h.DeploySNIGatewayController(infraCerts, frontendAddr, 1, "tcp")
+
+		ctrlLogs := h.WaitForControllerLog("Established TCP pool session", 30*time.Second)
+		t.Logf("Controller logs for TCP mode: %s", ctrlLogs)
+
+		clientPod := "sni-client-tcp-mode"
+		h.DeletePod(clientPod)
+		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
+			"client",
+			"--connect-to=" + frontendAddr,
+			"--sni=echo.snigateway.test",
+			"--insecure",
+			"https://echo.snigateway.test/",
+		}))
+		h.WaitForPodSuccess(clientPod, 1*time.Minute)
+		logs := h.GetPodLogs(clientPod)
+		t.Logf("TCP mode client logs: %s", logs)
+
+		if !strings.Contains(logs, "Status: 200 OK") {
+			t.Errorf("Expected 200 OK for TCP mode, got: %s", logs)
+		}
+	})
+
+	// Assertion 7: Deploy controller with explicit --tunnel-transport=quic and verify connections succeed
+	t.Run("Controller with --tunnel-transport=quic succeeds", func(t *testing.T) {
+		t.Cleanup(func() { dumpLogsIfFailed(t) })
+
+		h.DeploySNIGatewayController(infraCerts, frontendAddr, 1, "quic")
+		ctrlLogsQUIC := h.WaitForControllerLog("Established QUIC session", 30*time.Second)
+		t.Logf("Controller logs for QUIC mode: %s", ctrlLogsQUIC)
+
+		clientPod := "sni-client-quic-mode"
+		h.DeletePod(clientPod)
+		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
+			"client",
+			"--connect-to=" + frontendAddr,
+			"--sni=echo.snigateway.test",
+			"--insecure",
+			"https://echo.snigateway.test/",
+		}))
+		h.WaitForPodSuccess(clientPod, 1*time.Minute)
+		logs := h.GetPodLogs(clientPod)
+		t.Logf("QUIC mode client logs: %s", logs)
+
+		if !strings.Contains(logs, "Status: 200 OK") {
+			t.Errorf("Expected 200 OK for QUIC mode, got: %s", logs)
+		}
+	})
+
+	// Assertion 8: Auto fallback when frontend UDP port is unreachable, with probe recovery when UDP restored
+	t.Run("Auto fallback to TCP pool when UDP is unreachable and recovery to QUIC", func(t *testing.T) {
+		fallbackNS := "snigateway-frontend-tcp-only"
+		t.Cleanup(func() {
+			if t.Failed() {
+				t.Log("Dumping fallbackNS snigateway-frontend and controller logs on failure:")
+				h.DumpDeploymentLogs(fallbackNS, "snigateway-frontend")
+				h.DumpDeploymentLogs("default", "snigateway-controller")
+			}
+		})
+		h.DeploySNIGatewayFrontendTCPOnly(fallbackNS, infraCerts)
+		t.Cleanup(func() {
+			h.runCmd("kubectl", "delete", "namespace", fallbackNS, "--ignore-not-found")
+		})
+
+		fallbackAddr := fmt.Sprintf("snigateway-frontend.%s.svc.cluster.local:443", fallbackNS)
+		h.DeploySNIGatewayController(infraCerts, fallbackAddr, 1, "auto", "--quic-probe-interval=2s")
+
+		ctrlLogsFB := h.WaitForControllerLog("Established TCP fallback session", 30*time.Second)
+		t.Logf("Controller logs during TCP fallback: %s", ctrlLogsFB)
+		if !strings.Contains(ctrlLogsFB, "falling back to TCP pool transport") {
+			t.Errorf("Expected controller logs to show 'falling back to TCP pool transport', got: %s", ctrlLogsFB)
+		}
+
+		clientPod := "sni-client-fallback"
+		h.DeletePod(clientPod)
+		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
+			"client",
+			"--connect-to=" + fallbackAddr,
+			"--sni=echo.snigateway.test",
+			"--insecure",
+			"https://echo.snigateway.test/",
+		}))
+		h.WaitForPodSuccess(clientPod, 1*time.Minute)
+		logs := h.GetPodLogs(clientPod)
+		t.Logf("Auto fallback client logs: %s", logs)
+
+		if !strings.Contains(logs, "Status: 200 OK") {
+			t.Errorf("Expected 200 OK for auto fallback mode, got: %s", logs)
+		}
+
+		// Now upgrade the frontend service to expose UDP port 443 as well (simulating UDP unblocking)
+		h.DeploySNIGatewayFrontend(fallbackNS, infraCerts)
+
+		// Wait for background probe to detect UDP and switch to QUIC:
+		// Require "QUIC probe succeeded" followed by a QUIC session being established, and nothing re-establishing TCP fallback after it.
+		var ctrlLogsAfterRecovery string
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			logs := h.GetControllerLogs()
+			probeIdx := strings.LastIndex(logs, "QUIC probe succeeded")
+			quicIdx := strings.LastIndex(logs, "Established QUIC session")
+			if probeIdx != -1 && quicIdx > probeIdx {
+				ctrlLogsAfterRecovery = logs
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if ctrlLogsAfterRecovery == "" {
+			t.Fatalf("Timed out waiting for 'QUIC probe succeeded' followed by 'Established QUIC session'; current logs:\n%s", h.GetControllerLogs())
+		}
+		t.Logf("Controller logs after probe recovery: %s", ctrlLogsAfterRecovery)
+
+		quicIdx := strings.LastIndex(ctrlLogsAfterRecovery, "Established QUIC session")
+		afterQUIC := ctrlLogsAfterRecovery[quicIdx:]
+		if strings.Contains(afterQUIC, "Established TCP fallback session") || strings.Contains(afterQUIC, "falling back to TCP pool transport") {
+			t.Errorf("Expected nothing re-establishing TCP fallback after QUIC recovery, but found TCP fallback in logs after QUIC session:\n%s", afterQUIC)
+		}
+
+		clientPodRecovered := "sni-client-recovered"
+		h.DeletePod(clientPodRecovered)
+		h.KubectlApplyContent(h.SNIClientPodManifest(clientPodRecovered, []string{
+			"client",
+			"--connect-to=" + fallbackAddr,
+			"--sni=echo.snigateway.test",
+			"--insecure",
+			"https://echo.snigateway.test/",
+		}))
+		h.WaitForPodSuccess(clientPodRecovered, 1*time.Minute)
+		recLogs := h.GetPodLogs(clientPodRecovered)
+		t.Logf("Recovered QUIC client logs: %s", recLogs)
+
+		if !strings.Contains(recLogs, "Status: 200 OK") {
+			t.Errorf("Expected 200 OK after probe recovery to QUIC, got: %s", recLogs)
 		}
 	})
 }

@@ -23,6 +23,9 @@ const (
 
 	// HeaderSessionID is the HTTP header used to identify the backend session.
 	HeaderSessionID = "X-Session-ID"
+
+	// TunnelALPN is the ALPN identifier used for QUIC reverse tunnels.
+	TunnelALPN = "snigateway-tunnel/1"
 )
 
 // SessionResponse is returned upon establishing a backend session.

@@ -61,6 +61,7 @@ spec:
         args:
         - "--controller-name=github.com/gke-labs/gateway-api-reference-implementation/snigateway"
         - "--frontend=snigateway-frontend.example.com:443"
+        - "--tunnel-transport=auto"
         - "--ca-cert=/etc/snigateway/certs/ca.crt"
         - "--client-cert=/etc/snigateway/certs/client.crt"
         - "--client-key=/etc/snigateway/certs/client.key"

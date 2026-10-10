@@ -7,7 +7,7 @@ This guide explains how to deploy `snigateway-frontend` on a standalone Linux VM
 - A Linux VM with a public IPv4 or IPv6 address.
 - Root or `sudo` access on the VM.
 - Go toolchain (if building from source) or Docker (if running as a container).
-- Firewall permissions allowing inbound TCP traffic on port 443.
+- Firewall permissions allowing inbound TCP and UDP traffic on port 443.
 
 ---
 
@@ -32,16 +32,18 @@ chmod 755 /usr/local/bin/snigateway-frontend
 
 #### Option B: Run via Docker Container
 
-If using Docker, you can run the `snigateway-frontend` container image. Note that the container runs as a non-root user (`65532:65532`). To bind to port 443 on the host, use either `--network host` with capability `NET_BIND_SERVICE`, or port mapping `-p 443:8443` with `--listen :8443`:
+If using Docker, you can run the `snigateway-frontend` container image. Note that the container runs as a non-root user (`65532:65532`). To bind to port 443 on the host, use either `--network host` with capability `NET_BIND_SERVICE`, or port mapping `-p 443:8443/tcp -p 443:8443/udp` with `--listen :8443 --tunnel-listen-udp :8443`:
 
 ```bash
 docker run -d \
   --name snigateway-frontend \
   --restart always \
-  -p 443:8443 \
+  -p 443:8443/tcp \
+  -p 443:8443/udp \
   -v /etc/snigateway:/etc/snigateway:ro \
   snigateway-frontend:latest \
   --listen :8443 \
+  --tunnel-listen-udp :8443 \
   --client-ca /etc/snigateway/ca.crt=* \
   --server-cert /etc/snigateway/server.crt \
   --server-key /etc/snigateway/server.key

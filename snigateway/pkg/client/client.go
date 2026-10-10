@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
+	"github.com/quic-go/quic-go"
 )
 
 // Client is a client for communicating with the snigateway frontend mTLS API and reverse tunnels.
@@ -243,4 +244,14 @@ type bufferedClientConn struct {
 
 func (c *bufferedClientConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
+}
+
+// DialQUIC dials an mTLS QUIC connection to the frontend server.
+func (c *Client) DialQUIC(ctx context.Context) (*quic.Conn, error) {
+	quicTLS := c.tlsConfig.Clone()
+	if c.internalHostname != "" {
+		quicTLS.ServerName = c.internalHostname
+	}
+	quicTLS.NextProtos = []string{api.TunnelALPN}
+	return quic.DialAddr(ctx, c.serverAddr, quicTLS, api.DefaultQUICConfig())
 }

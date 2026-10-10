@@ -77,6 +77,11 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	}
 	frontendAddr := frontendListener.Addr().String()
 
+	frontendUDP, err := net.ListenPacket("udp", frontendAddr)
+	if err != nil {
+		t.Fatalf("net.ListenPacket failed: %v", err)
+	}
+
 	frontendServer, err := frontend.NewServer(frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
@@ -89,7 +94,7 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	defer frontendServer.Close()
 
 	go func() {
-		_ = frontendServer.Serve(frontendListener)
+		_ = frontendServer.ServeAll([]net.Listener{frontendListener}, []net.PacketConn{frontendUDP})
 	}()
 
 	// 3. Start tunnel Manager with client connecting to frontend

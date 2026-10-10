@@ -20,6 +20,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
+	"github.com/quic-go/quic-go"
 )
 
 func TestPoolTransport_ConcurrentWaitersBurstNoLostWakeups(t *testing.T) {
@@ -122,6 +126,128 @@ func TestPoolTransport_ConcurrentWaitersBurstNoLostWakeups(t *testing.T) {
 
 		if durations[i] >= 1500*time.Millisecond {
 			t.Errorf("waiter %d took %v, indicating a lost wakeup and wait for per-attempt timeout", i, durations[i])
+		}
+	}
+}
+
+func TestCompositeTransport_ConcurrentBurstMixedSessionsNoLostWakeups(t *testing.T) {
+	pool := NewPoolTransport()
+	quicTr := NewQUICTransport()
+	comp := NewCompositeTransport(pool, quicTr)
+	defer comp.Close()
+
+	// Setup fake QUIC server/client
+	generated, err := certs.GenerateAll("snigateway.internal", "test-client")
+	if err != nil {
+		t.Fatalf("GenerateAll: %v", err)
+	}
+
+	serverTLS, _ := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS.NextProtos = []string{api.TunnelALPN}
+	clientTLS, _ := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	clientTLS.NextProtos = []string{api.TunnelALPN}
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer pc.Close()
+
+	ql, err := quic.Listen(pc, serverTLS, api.DefaultQUICConfig())
+	if err != nil {
+		t.Fatalf("quic.Listen: %v", err)
+	}
+	defer ql.Close()
+
+	go func() {
+		for {
+			conn, err := ql.Accept(t.Context())
+			if err != nil {
+				return
+			}
+			go func(c *quic.Conn) {
+				for {
+					s, err := c.AcceptStream(t.Context())
+					if err != nil {
+						return
+					}
+					// Accept streams from frontend
+					_ = s
+				}
+			}(conn)
+		}
+	}()
+
+	qClientConn, err := quic.DialAddr(t.Context(), pc.LocalAddr().String(), clientTLS, api.DefaultQUICConfig())
+	if err != nil {
+		t.Fatalf("DialAddr: %v", err)
+	}
+	defer qClientConn.CloseWithError(0, "done")
+
+	sessPool := "sess-pool"
+	sessQUIC := "sess-quic"
+
+	pool.RegisterSession(sessPool)
+	quicTr.RegisterSession(sessQUIC, qClientConn)
+
+	const waitersCount = 10
+	var wg sync.WaitGroup
+	wg.Add(waitersCount)
+
+	results := make([]net.Conn, waitersCount)
+	errs := make([]error, waitersCount)
+	durations := make([]time.Duration, waitersCount)
+	assignedSessions := make([]string, waitersCount)
+
+	startWait := make(chan struct{})
+
+	for i := 0; i < waitersCount; i++ {
+		idx := i
+		go func() {
+			defer wg.Done()
+			<-startWait
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			conn, sid, err := comp.GetConnForSessions(ctx, []string{sessPool, sessQUIC})
+			durations[idx] = time.Since(start)
+			results[idx] = conn
+			assignedSessions[idx] = sid
+			errs[idx] = err
+		}()
+	}
+
+	close(startWait)
+	time.Sleep(20 * time.Millisecond)
+
+	// Add 5 pooled TCP connections for sessPool
+	var mockConns []net.Conn
+	defer func() {
+		for _, c := range mockConns {
+			_ = c.Close()
+		}
+	}()
+
+	for i := 0; i < 5; i++ {
+		c1, c2 := net.Pipe()
+		mockConns = append(mockConns, c1, c2)
+		if err := pool.AddConn(sessPool, c1); err != nil {
+			t.Fatalf("AddConn failed: %v", err)
+		}
+	}
+
+	wg.Wait()
+
+	for i := 0; i < waitersCount; i++ {
+		if errs[i] != nil {
+			t.Fatalf("waiter %d failed: %v", i, errs[i])
+		}
+		if results[i] == nil {
+			t.Fatalf("waiter %d got nil conn", i)
+		}
+		if durations[i] >= 1500*time.Millisecond {
+			t.Errorf("waiter %d took %v, indicating lost wakeup", i, durations[i])
 		}
 	}
 }

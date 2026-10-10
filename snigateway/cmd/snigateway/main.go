@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
@@ -38,18 +39,21 @@ var setupLog = ctrl.Log.WithName("setup")
 
 func main() {
 	var (
-		frontendAddr     string
-		caCertPath       string
-		clientCertPath   string
-		clientKeyPath    string
-		internalHostname string
-		controllerName   string
-		metricsAddr      string
-		healthProbeAddr  string
-		proxyAddr        string
-		tunnelPoolSize   int
-		leaderElection   bool
-		leaderElectionID string
+		frontendAddr      string
+		caCertPath        string
+		clientCertPath    string
+		clientKeyPath     string
+		internalHostname  string
+		controllerName    string
+		metricsAddr       string
+		healthProbeAddr   string
+		proxyAddr         string
+		tunnelTransport   string
+		tunnelPoolSize    int
+		quicDialTimeout   time.Duration
+		quicProbeInterval time.Duration
+		leaderElection    bool
+		leaderElectionID  string
 	)
 
 	flag.StringVar(&frontendAddr, "frontend", "127.0.0.1:443", "Address of the snigateway-frontend server (<ip-or-host>:<port>).")
@@ -58,7 +62,10 @@ func main() {
 	flag.StringVar(&clientKeyPath, "client-key", "", "Path to the client private key PEM file for mTLS authentication.")
 	flag.StringVar(&internalHostname, "internal-hostname", "snigateway.internal", "TLS ServerName for the snigateway-frontend mTLS management API.")
 	flag.StringVar(&controllerName, "controller-name", DefaultControllerName, "The GatewayClass controller name managed by this instance.")
-	flag.IntVar(&tunnelPoolSize, "tunnel-pool-size", tunnel.DefaultPoolSize, "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend.")
+	flag.StringVar(&tunnelTransport, "tunnel-transport", tunnel.TransportModeAuto, "Tunnel transport to use (auto, quic, tcp).")
+	flag.IntVar(&tunnelPoolSize, "tunnel-pool-size", tunnel.DefaultPoolSize, "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend when using TCP pool transport.")
+	flag.DurationVar(&quicDialTimeout, "quic-dial-timeout", 3*time.Second, "Timeout for dialing QUIC connections.")
+	flag.DurationVar(&quicProbeInterval, "quic-probe-interval", 30*time.Second, "Interval for probing QUIC availability when in TCP fallback.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&healthProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&proxyAddr, "proxy-bind-address", "", "Optional HTTP proxy bind address. Disabled by default.")
@@ -109,7 +116,12 @@ func main() {
 	}
 
 	snigatewayClient := client.NewClient(frontendAddr, clientTLS, client.WithInternalHostname(internalHostname))
-	tunnelMgr := tunnel.NewManager(snigatewayClient, tunnel.WithPoolSize(tunnelPoolSize))
+	tunnelMgr := tunnel.NewManager(snigatewayClient,
+		tunnel.WithTransport(tunnelTransport),
+		tunnel.WithPoolSize(tunnelPoolSize),
+		tunnel.WithQUICDialTimeout(quicDialTimeout),
+		tunnel.WithQUICProbeInterval(quicProbeInterval),
+	)
 
 	gariOpts := gari.DefaultOptions()
 	gariOpts.ControllerName = controllerName

@@ -15,7 +15,7 @@
 FROM golang:1.27.2 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
-COPY snigateway/go.mod snigateway/go.work ./snigateway/
+COPY snigateway/go.mod snigateway/go.sum snigateway/go.work ./snigateway/
 RUN go mod download
 COPY . .
 WORKDIR /app/snigateway

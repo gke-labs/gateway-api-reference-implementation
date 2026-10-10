@@ -16,6 +16,7 @@ package frontend
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -34,18 +35,20 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
+	"github.com/quic-go/quic-go"
 )
 
 // ServerConfig holds configuration options for the frontend server.
 type ServerConfig struct {
-	ListenAddrs       []string
-	InternalHostname  string
-	ServerTLSConfig   *tls.Config
-	ConnectTimeout    time.Duration
-	PerAttemptTimeout time.Duration
-	ReadSNITimeout    time.Duration
-	Authorizer        Authorizer
-	Transport         *PoolTransport
+	ListenAddrs        []string
+	UDPListenAddrs     []string
+	InternalHostname   string
+	ServerTLSConfig    *tls.Config
+	ConnectTimeout     time.Duration
+	PerAttemptTimeout  time.Duration
+	ReadSNITimeout     time.Duration
+	Authorizer         Authorizer
+	CompositeTransport *CompositeTransport
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -53,15 +56,19 @@ type Server struct {
 	config     ServerConfig
 	authorizer Authorizer
 	table      *RegistrationTable
+	transport  Transport
 	pool       *PoolTransport
+	quic       *QUICTransport
 
 	internalListener *chanListener
 	httpServer       *http.Server
 
-	listenersMu sync.Mutex
-	listeners   []net.Listener
-	closed      bool
-	shutdownCh  chan struct{}
+	listenersMu   sync.Mutex
+	listeners     []net.Listener
+	udpListeners  []net.PacketConn
+	quicListeners []*quic.Listener
+	closed        bool
+	shutdownCh    chan struct{}
 }
 
 // NewServer creates a new frontend Server with the given configuration.
@@ -90,16 +97,18 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		auth = &AllowAllAuthorizer{}
 	}
 
-	pool := cfg.Transport
-	if pool == nil {
-		pool = NewPoolTransport()
+	comp := cfg.CompositeTransport
+	if comp == nil {
+		comp = NewCompositeTransport(NewPoolTransport(), NewQUICTransport())
 	}
 
 	s := &Server{
 		config:           cfg,
 		authorizer:       auth,
 		table:            NewRegistrationTable(),
-		pool:             pool,
+		transport:        comp,
+		pool:             comp.Pool(),
+		quic:             comp.QUIC(),
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
 	}
@@ -124,11 +133,21 @@ func (s *Server) RegistrationTable() *RegistrationTable {
 }
 
 // Transport returns the server's data-plane transport.
-func (s *Server) Transport() *PoolTransport {
+func (s *Server) Transport() Transport {
+	return s.transport
+}
+
+// PoolTransport returns the server's TCP pool transport.
+func (s *Server) PoolTransport() *PoolTransport {
 	return s.pool
 }
 
-// ListenAndServe starts listening on all configured addresses and serves traffic.
+// QUICTransport returns the server's QUIC transport.
+func (s *Server) QUICTransport() *QUICTransport {
+	return s.quic
+}
+
+// ListenAndServe starts listening on all configured TCP and UDP addresses and serves traffic.
 func (s *Server) ListenAndServe() error {
 	var listeners []net.Listener
 	for _, addr := range s.config.ListenAddrs {
@@ -142,24 +161,54 @@ func (s *Server) ListenAndServe() error {
 		listeners = append(listeners, ln)
 	}
 
-	return s.Serve(listeners...)
+	var udpConns []net.PacketConn
+	udpAddrs := s.config.UDPListenAddrs
+	if len(udpAddrs) == 0 {
+		udpAddrs = s.config.ListenAddrs
+	}
+	for _, addr := range udpAddrs {
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			for _, l := range listeners {
+				_ = l.Close()
+			}
+			for _, p := range udpConns {
+				_ = p.Close()
+			}
+			return fmt.Errorf("listening UDP on %s: %w", addr, err)
+		}
+		udpConns = append(udpConns, pc)
+	}
+
+	return s.ServeAll(listeners, udpConns)
 }
 
-// Serve serves traffic on the given pre-created listeners.
+// Serve serves TCP traffic on the given pre-created listeners.
 func (s *Server) Serve(listeners ...net.Listener) error {
+	return s.ServeAll(listeners, nil)
+}
+
+// ServeUDP serves QUIC reverse-tunnel traffic on the given pre-created UDP packet connections.
+func (s *Server) ServeUDP(udpConns ...net.PacketConn) error {
+	return s.ServeAll(nil, udpConns)
+}
+
+// ServeAll serves both TCP client traffic and QUIC reverse tunnel connections.
+func (s *Server) ServeAll(listeners []net.Listener, udpConns []net.PacketConn) error {
 	s.listenersMu.Lock()
 	s.listeners = listeners
+	s.udpListeners = udpConns
 	s.listenersMu.Unlock()
 
 	// Start internal mTLS HTTP server
-	errCh := make(chan error, len(listeners)+1)
+	errCh := make(chan error, len(listeners)+len(udpConns)+1)
 	go func() {
 		if err := s.httpServer.Serve(s.internalListener); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			errCh <- fmt.Errorf("internal HTTP server: %w", err)
 		}
 	}()
 
-	// Accept connections on each listener
+	// Accept connections on each TCP listener
 	for _, ln := range listeners {
 		go func(l net.Listener) {
 			for {
@@ -176,6 +225,38 @@ func (s *Server) Serve(listeners ...net.Listener) error {
 				go s.handleConnection(conn)
 			}
 		}(ln)
+	}
+
+	// Start QUIC listeners on each UDP packet connection
+	for _, pc := range udpConns {
+		quicTLS := s.config.ServerTLSConfig.Clone()
+		quicTLS.NextProtos = []string{api.TunnelALPN}
+		ql, err := quic.Listen(pc, quicTLS, api.DefaultQUICConfig())
+		if err != nil {
+			return fmt.Errorf("creating QUIC listener on %s: %w", pc.LocalAddr(), err)
+		}
+		s.listenersMu.Lock()
+		s.quicListeners = append(s.quicListeners, ql)
+		s.listenersMu.Unlock()
+
+		go func(l *quic.Listener) {
+			for {
+				qConn, err := l.Accept(context.Background())
+				if err != nil {
+					select {
+					case <-s.shutdownCh:
+						return
+					default:
+						if errors.Is(err, quic.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+							return
+						}
+						log.Printf("Frontend: error accepting QUIC connection: %v", err)
+						continue
+					}
+				}
+				go s.handleQUICConnection(qConn)
+			}
+		}(ql)
 	}
 
 	select {
@@ -198,10 +279,16 @@ func (s *Server) Close() error {
 	for _, ln := range s.listeners {
 		_ = ln.Close()
 	}
+	for _, ql := range s.quicListeners {
+		_ = ql.Close()
+	}
+	for _, pc := range s.udpListeners {
+		_ = pc.Close()
+	}
 	s.listenersMu.Unlock()
 
 	_ = s.internalListener.Close()
-	_ = s.pool.Close()
+	_ = s.transport.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
@@ -277,11 +364,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
-		tunnelConn, _, err := s.pool.GetConnForSessions(ctx, sessions)
+		tunnelConn, _, err := s.transport.GetConnForSessions(ctx, sessions)
 		cancel()
 
 		if err != nil {
-			// Pool timeout on this attempt, continue until total deadline
+			// Pool/stream timeout on this attempt, continue until total deadline
 			continue
 		}
 
@@ -346,19 +433,19 @@ func spliceConnections(c1, c2 net.Conn) {
 	wg.Wait()
 }
 
-func extractClientIdentity(r *http.Request) (ClientIdentity, error) {
-	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+func extractIdentityFromTLSState(tlsState tls.ConnectionState) (ClientIdentity, error) {
+	if len(tlsState.PeerCertificates) == 0 {
 		return ClientIdentity{}, errors.New("client certificate required")
 	}
-	peerCert := r.TLS.PeerCertificates[0]
+	peerCert := tlsState.PeerCertificates[0]
 	cn := peerCert.Subject.CommonName
 	if cn == "" {
 		cn = "unknown-client"
 	}
 
 	var rootCert *x509.Certificate
-	if len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
-		chain := r.TLS.VerifiedChains[0]
+	if len(tlsState.VerifiedChains) > 0 && len(tlsState.VerifiedChains[0]) > 0 {
+		chain := tlsState.VerifiedChains[0]
 		rootCert = chain[len(chain)-1]
 	} else {
 		rootCert = peerCert
@@ -372,6 +459,103 @@ func extractClientIdentity(r *http.Request) (ClientIdentity, error) {
 		CAFingerprint: fingerprint,
 		CommonName:    cn,
 	}, nil
+}
+
+func extractClientIdentity(r *http.Request) (ClientIdentity, error) {
+	if r.TLS == nil {
+		return ClientIdentity{}, errors.New("TLS connection required")
+	}
+	return extractIdentityFromTLSState(*r.TLS)
+}
+
+func (s *Server) handleQUICConnection(qConn *quic.Conn) {
+	clientIdentity, err := extractIdentityFromTLSState(qConn.ConnectionState().TLS)
+	if err != nil {
+		log.Printf("Frontend: rejecting QUIC connection: %v", err)
+		_ = qConn.CloseWithError(1, "unauthorized")
+		return
+	}
+
+	// 1. Enforce handshake deadline for accepting control stream and reading init message
+	handshakeCtx, handshakeCancel := context.WithTimeout(context.Background(), api.QUICHandshakeTimeout)
+	ctrlStream, err := qConn.AcceptStream(handshakeCtx)
+	if err != nil {
+		handshakeCancel()
+		log.Printf("Frontend: error accepting QUIC control stream (timeout or closed): %v", err)
+		_ = qConn.CloseWithError(1, "control stream error")
+		return
+	}
+
+	reader := bufio.NewReader(ctrlStream)
+	// Read initial control stream ping/init line (bounded by MaxControlLineBytes)
+	_ = ctrlStream.SetReadDeadline(time.Now().Add(api.QUICHandshakeTimeout))
+	if _, err := api.ReadControlLine(reader); err != nil {
+		handshakeCancel()
+		log.Printf("Frontend: error reading initial line from QUIC control stream: %v", err)
+		_ = qConn.CloseWithError(1, "control stream handshake failed")
+		return
+	}
+	_ = ctrlStream.SetDeadline(time.Time{})
+	handshakeCancel()
+
+	sessionID := generateConnID()
+	s.table.RegisterSession(sessionID, clientIdentity)
+	s.quic.RegisterSession(sessionID, qConn)
+	log.Printf("Frontend: created QUIC session %s for client %q", sessionID, clientIdentity.ID)
+
+	defer func() {
+		s.table.Unregister(sessionID)
+		s.quic.UnregisterSession(sessionID)
+		_ = qConn.CloseWithError(0, "session closed")
+		log.Printf("Frontend: QUIC session %s closed and unregistered for client %q", sessionID, clientIdentity.ID)
+	}()
+
+	// Send initial SessionResponse
+	sessResp := api.SessionResponse{
+		SessionID: sessionID,
+		Status:    "connected",
+	}
+	respBytes, err := json.Marshal(sessResp)
+	if err != nil {
+		return
+	}
+	if _, err := ctrlStream.Write(append(respBytes, '\n')); err != nil {
+		return
+	}
+
+	// Read and process RegistrationRequests from control stream
+	for {
+		line, err := api.ReadControlLine(reader)
+		if err != nil {
+			return
+		}
+		var regReq api.RegistrationRequest
+		if err := json.Unmarshal(bytes.TrimSpace(line), &regReq); err != nil {
+			log.Printf("Frontend: failed to decode QUIC registration request from %s: %v", sessionID, err)
+			continue
+		}
+
+		if err := s.authorizer.Authorize(context.Background(), clientIdentity, regReq.Hostnames); err != nil {
+			log.Printf("Frontend: authorization failed for QUIC session %s (%s) registering %v: %v", sessionID, clientIdentity.ID, regReq.Hostnames, err)
+			errResp, _ := json.Marshal(api.RegistrationResponse{
+				Status: fmt.Sprintf("error: %v", err),
+			})
+			_, _ = ctrlStream.Write(append(errResp, '\n'))
+			continue
+		}
+
+		s.table.Register(sessionID, regReq.Hostnames)
+		registered := s.table.GetRegisteredHostnames(sessionID)
+		log.Printf("Frontend: QUIC session %s (client %q) registered hostnames: %v", sessionID, clientIdentity.ID, registered)
+
+		okResp, _ := json.Marshal(api.RegistrationResponse{
+			Status:    "registered",
+			Hostnames: registered,
+		})
+		if _, err := ctrlStream.Write(append(okResp, '\n')); err != nil {
+			return
+		}
+	}
 }
 
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -574,6 +758,12 @@ func (l *chanListener) SendConn(c net.Conn) error {
 	select {
 	case <-l.closeCh:
 		return net.ErrClosed
+	default:
+	}
+
+	select {
+	case <-l.closeCh:
+		return net.ErrClosed
 	case l.connCh <- c:
 		return nil
 	}
@@ -583,17 +773,30 @@ func (l *chanListener) Accept() (net.Conn, error) {
 	select {
 	case <-l.closeCh:
 		return nil, net.ErrClosed
-	case conn, ok := <-l.connCh:
-		if !ok {
+	case conn := <-l.connCh:
+		select {
+		case <-l.closeCh:
+			_ = conn.Close()
 			return nil, net.ErrClosed
+		default:
+			return conn, nil
 		}
-		return conn, nil
 	}
 }
 
 func (l *chanListener) Close() error {
 	l.once.Do(func() {
 		close(l.closeCh)
+
+		// Drain and close any queued connections after closing closeCh.
+		for {
+			select {
+			case c := <-l.connCh:
+				_ = c.Close()
+			default:
+				return
+			}
+		}
 	})
 	return nil
 }

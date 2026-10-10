@@ -20,25 +20,39 @@ certificates. It only needs to:
 ## How it works
 
 ```
-client ──TLS──► front-end node (snigateway-frontend) ══warm pooled tunnels (PROXY v2)══► GARI in cluster ──► backends
-                 reads SNI only                                                           terminates TLS,
-                 manages sessions, pool & failover                                        does all routing
+client ──TLS──► front-end node (snigateway-frontend) ══QUIC tunnel stream (or TCP pool) (PROXY v2)══► GARI in cluster ──► backends
+                 reads SNI only                                                                         terminates TLS,
+                 manages sessions, transports & failover                                                does all routing
 ```
 
 1. **Announce.** GARI looks at the Gateway listeners it serves (HTTPS/TLS
    listeners with hostnames, and attached routes) and works out the set of
    SNI hostnames the cluster wants to receive.
-2. **Backend Sessions & Registration.** The in-cluster controller connects to `snigateway-frontend` at `snigateway.internal` using mTLS (authenticated via a trusted CA). It establishes a long-lived control session (`GET /v1/session`) and registers its hostnames (`PUT /v1/registration` with `X-Session-ID`). Registrations are scoped to sessions rather than client certificate identities, allowing multiple replicas to serve the same hostnames without overwriting each other.
-3. **Warm Pre-Dialed Tunnel Pool.** Each backend maintains a warm pool of $N$ idle pre-dialed mTLS reverse tunnel connections (`POST /v1/tunnel` with `Upgrade: snigateway-tunnel` and `X-Session-ID`). Because connections are pre-dialed, there is no dial-back handshake overhead on the hot path.
-4. **Route by SNI & Activation with PROXY Protocol v2.** When a client connects to the front-end node on `:443`, the SNI proxy peeks at the TLS ClientHello without consuming stream bytes and looks up matching sessions in the registration table (exact matches win over wildcards). The frontend takes an idle pooled connection for a matching session, writes a PROXY protocol v2 header carrying the real client IP, destination IP, and `PP2_TYPE_AUTHORITY` SNI TLV, writes the peeked ClientHello bytes, and waits for the backend's first response byte.
+2. **Backend Sessions & Registration.** The in-cluster controller connects to `snigateway-frontend` at `snigateway.internal` using mTLS (authenticated via a trusted CA).
+   - Over **QUIC** (default in `auto` and `quic` modes), the backend opens a QUIC connection with ALPN `snigateway-tunnel/1`. The first stream is the control stream, carrying the session protocol (`SessionResponse` and `RegistrationRequest`). Registrations are scoped to sessions and automatically cleaned up when the QUIC connection ends.
+   - Over **TCP** (`tcp` mode or fallback), the backend establishes an HTTP mTLS session (`GET /v1/session`) and registers hostnames (`PUT /v1/registration`).
+3. **Tunnel Transports: QUIC & TCP Pool.**
+   - **QUIC Stream Multiplexing:** Client connections are tunnelled over lightweight, 0-RTT bidirectional QUIC streams multiplexed inside the single mTLS QUIC connection. There is no head-of-line blocking between streams, no pre-dialed pool to manage, and connections survive backend IP address changes via QUIC connection migration.
+   - **Warm Pre-Dialed TCP Pool:** When using TCP transport, each backend maintains a warm pool of $N$ idle pre-dialed mTLS reverse tunnel connections (`POST /v1/tunnel` with `Upgrade: snigateway-tunnel`).
+   - **Auto Fallback & Probing:** In `auto` mode (default), the backend tries QUIC first. If UDP is blocked or unreachable, it falls back to the TCP pool, periodically probes QUIC in the background (default 30s), and automatically switches back to QUIC when available without dropping existing connections.
+4. **Route by SNI & Activation with PROXY Protocol v2.** When a client connects to the front-end node on `:443`, the SNI proxy peeks at the TLS ClientHello without consuming stream bytes and looks up matching sessions in the registration table (exact matches win over wildcards). The frontend establishes a tunnel connection to a matching session (opening a QUIC stream or popping a pooled TCP connection), writes a PROXY protocol v2 header carrying the real client IP, destination IP, and `PP2_TYPE_AUTHORITY` SNI TLV, writes the peeked ClientHello bytes, and waits for the backend's first response byte.
 5. **Health Checking & Failover.** The PROXY header write and response check provide zero-overhead health checking:
-   - **Replay until first byte:** If a pooled connection is closed or unresponsive, the frontend drops it and replays the PROXY header and buffered ClientHello to another pooled connection (on the same or another healthy replica).
+   - **Replay until first byte:** If a stream or pooled connection fails or is unresponsive, the frontend drops it and replays the PROXY header and buffered ClientHello to another session (on the same or another healthy replica).
    - **Load balancing:** Connections are distributed across active sessions registered for the hostname.
-   - **Pool Refill:** As soon as an idle connection receives the PROXY header, the backend signals its pool worker to immediately dial a replacement, keeping $N$ warm connections available.
 6. **Terminate in the cluster.** GARI terminates TLS using the certificates
    from the Gateway listener, and then applies normal Gateway API routing. The backend tunnel listener exposes real client IP addresses via `RemoteAddr()`, ensuring correct `X-Forwarded-For` header population.
 
 As the Gateway configuration changes, GARI updates its announcements.
+
+## Transport Tuning
+
+The QUIC transport is tuned for high-bandwidth, high-latency links and rapid NAT traversal:
+- **Keepalive period:** 15s (`DefaultQUICKeepAlivePeriod`) to prevent UDP NAT state expiration.
+- **Max idle timeout:** 30s (`DefaultQUICMaxIdleTimeout`).
+- **Stream receive window:** 2 MB initial / 8 MB max.
+- **Connection receive window:** 4 MB initial / 16 MB max.
+- **Concurrent streams:** Up to 10,000 concurrent streams (`DefaultQUICMaxIncomingStreams`).
+- **GSO (Generic Segmentation Offload):** Enabled automatically on platforms that support UDP GSO.
 
 ## Encryption & Security
 

@@ -16,6 +16,7 @@ package frontend
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -24,20 +25,25 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
+	"github.com/quic-go/quic-go"
 )
 
 // generateTestBackendCert creates a self-signed cert for the fake backend application served over reverse tunnel.
@@ -839,5 +845,499 @@ func TestFailover_UnresponsiveBackend(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "failover-success!" {
 		t.Fatalf("expected response 'failover-success!', got %q", string(body))
+	}
+}
+
+func setupTestServerWithUDPAndClient(t *testing.T) (*Server, string, *certs.GeneratedCerts, func()) {
+	t.Helper()
+
+	generated, err := certs.GenerateAll("snigateway.internal", "test-cluster-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certs failed: %v", err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+
+	serverAddr := ln.Addr().String()
+
+	pc, err := net.ListenPacket("udp", serverAddr)
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+
+	srv, err := NewServer(ServerConfig{
+		ServerTLSConfig:   serverTLS,
+		InternalHostname:  "snigateway.internal",
+		ConnectTimeout:    5 * time.Second,
+		PerAttemptTimeout: 500 * time.Millisecond,
+		ReadSNITimeout:    2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	go func() {
+		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+	}()
+
+	cleanup := func() {
+		_ = srv.Close()
+	}
+
+	return srv, serverAddr, generated, cleanup
+}
+
+func TestQUIC_SessionEstablishmentAndRegistration(t *testing.T) {
+	srv, serverAddr, generated, cleanup := setupTestServerWithUDPAndClient(t)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	qConn, err := c.DialQUIC(ctx)
+	if err != nil {
+		t.Fatalf("DialQUIC failed: %v", err)
+	}
+	defer qConn.CloseWithError(0, "test done")
+
+	ctrlStream, err := qConn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("OpenStreamSync failed: %v", err)
+	}
+	defer ctrlStream.Close()
+
+	if _, err := ctrlStream.Write([]byte("{\"type\":\"session\"}\n")); err != nil {
+		t.Fatalf("writing handshake failed: %v", err)
+	}
+
+	reader := bufio.NewReader(ctrlStream)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("reading SessionResponse failed: %v", err)
+	}
+
+	var sessResp api.SessionResponse
+	if err := json.Unmarshal(bytes.TrimSpace(line), &sessResp); err != nil {
+		t.Fatalf("unmarshal SessionResponse failed: %v", err)
+	}
+	if sessResp.SessionID == "" {
+		t.Fatalf("expected non-empty SessionID")
+	}
+
+	parsedCACerts, err := certs.ParseCertificatesFromPEM(generated.CA.CertPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatesFromPEM failed: %v", err)
+	}
+	caFP := fmt.Sprintf("%x", sha256.Sum256(parsedCACerts[0].Raw))
+	clientID := fmt.Sprintf("%s/test-cluster-client", caFP)
+
+	// Send registration request
+	regReq := api.RegistrationRequest{
+		Hostnames: []string{"quic1.example.com", "quic2.example.com"},
+	}
+	reqBytes, _ := json.Marshal(regReq)
+	if _, err := ctrlStream.Write(append(reqBytes, '\n')); err != nil {
+		t.Fatalf("writing RegistrationRequest failed: %v", err)
+	}
+
+	respLine, err := reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("reading RegistrationResponse failed: %v", err)
+	}
+
+	var regResp api.RegistrationResponse
+	if err := json.Unmarshal(bytes.TrimSpace(respLine), &regResp); err != nil {
+		t.Fatalf("unmarshal RegistrationResponse failed: %v", err)
+	}
+
+	registered := srv.RegistrationTable().GetRegisteredHostnamesForClient(clientID)
+	if len(registered) != 2 {
+		t.Fatalf("expected 2 registered hostnames, got %v", registered)
+	}
+}
+
+func TestQUIC_StreamPerConnectionAndProxyHeader(t *testing.T) {
+	_, serverAddr, generated, cleanup := setupTestServerWithUDPAndClient(t)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	backendCert, err := generateTestBackendCert("stream.example.com")
+	if err != nil {
+		t.Fatalf("generateTestBackendCert failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	qConn, err := c.DialQUIC(ctx)
+	if err != nil {
+		t.Fatalf("DialQUIC failed: %v", err)
+	}
+	defer qConn.CloseWithError(0, "test done")
+
+	ctrlStream, err := qConn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("OpenStreamSync failed: %v", err)
+	}
+	defer ctrlStream.Close()
+
+	if _, err := ctrlStream.Write([]byte("{\"type\":\"session\"}\n")); err != nil {
+		t.Fatalf("writing handshake failed: %v", err)
+	}
+
+	reader := bufio.NewReader(ctrlStream)
+	_, err = reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("reading SessionResponse failed: %v", err)
+	}
+
+	// Register hostname
+	regReq := api.RegistrationRequest{
+		Hostnames: []string{"stream.example.com"},
+	}
+	reqBytes, _ := json.Marshal(regReq)
+	_, _ = ctrlStream.Write(append(reqBytes, '\n'))
+	_, _ = reader.ReadBytes('\n')
+
+	var streamCount atomic.Int32
+	var authorityReceived atomic.Value
+
+	// Backend accepts streams from frontend
+	go func() {
+		for {
+			stream, err := qConn.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			streamCount.Add(1)
+
+			go func(s *quic.Stream) {
+				streamConn := api.NewQUICStreamConn(s, qConn)
+				bufReader := bufio.NewReader(streamConn)
+				hdr, err := proxyproto.Decode(bufReader)
+				if err != nil {
+					_ = streamConn.Close()
+					return
+				}
+				authorityReceived.Store(hdr.Authority)
+
+				var remaining []byte
+				if bufReader.Buffered() > 0 {
+					remaining = make([]byte, bufReader.Buffered())
+					_, _ = io.ReadFull(bufReader, remaining)
+				}
+
+				proxyConn := proxyproto.NewConn(streamConn, hdr.SrcAddr, hdr.DstAddr, remaining)
+				tlsConn := tls.Server(proxyConn, &tls.Config{Certificates: []tls.Certificate{backendCert}})
+				defer tlsConn.Close()
+
+				buf := make([]byte, 1024)
+				_, _ = tlsConn.Read(buf)
+				_, _ = tlsConn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 13\r\n\r\nhello-stream!"))
+			}(stream)
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "stream.example.com",
+				InsecureSkipVerify: true,
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tls.Dial("tcp", serverAddr, &tls.Config{
+					ServerName:         "stream.example.com",
+					InsecureSkipVerify: true,
+				})
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	// Send 3 requests
+	for i := 0; i < 3; i++ {
+		resp, err := httpClient.Get("https://stream.example.com/test")
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(body) != "hello-stream!" {
+			t.Fatalf("expected 'hello-stream!', got %q", string(body))
+		}
+	}
+
+	if streamCount.Load() != 3 {
+		t.Fatalf("expected 3 separate streams opened, got %d", streamCount.Load())
+	}
+	if auth, ok := authorityReceived.Load().(string); !ok || auth != "stream.example.com" {
+		t.Fatalf("expected PROXY v2 authority 'stream.example.com', got %v", auth)
+	}
+}
+
+func TestQUIC_SessionTeardownRemovesRegistrations(t *testing.T) {
+	srv, serverAddr, generated, cleanup := setupTestServerWithUDPAndClient(t)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	qConn, err := c.DialQUIC(ctx)
+	if err != nil {
+		t.Fatalf("DialQUIC failed: %v", err)
+	}
+
+	ctrlStream, err := qConn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("OpenStreamSync failed: %v", err)
+	}
+
+	if _, err := ctrlStream.Write([]byte("{\"type\":\"session\"}\n")); err != nil {
+		t.Fatalf("writing handshake failed: %v", err)
+	}
+
+	reader := bufio.NewReader(ctrlStream)
+	line, _ := reader.ReadBytes('\n')
+	var sessResp api.SessionResponse
+	_ = json.Unmarshal(bytes.TrimSpace(line), &sessResp)
+
+	// Register hostname
+	regReq := api.RegistrationRequest{
+		Hostnames: []string{"teardown.example.com"},
+	}
+	reqBytes, _ := json.Marshal(regReq)
+	_, _ = ctrlStream.Write(append(reqBytes, '\n'))
+	_, _ = reader.ReadBytes('\n')
+
+	parsedCACerts, err := certs.ParseCertificatesFromPEM(generated.CA.CertPEM)
+	if err != nil {
+		t.Fatalf("ParseCertificatesFromPEM failed: %v", err)
+	}
+	caFP := fmt.Sprintf("%x", sha256.Sum256(parsedCACerts[0].Raw))
+	clientID := fmt.Sprintf("%s/test-cluster-client", caFP)
+
+	registered := srv.RegistrationTable().GetRegisteredHostnamesForClient(clientID)
+	if len(registered) != 1 || registered[0] != "teardown.example.com" {
+		t.Fatalf("expected teardown.example.com registered, got %v", registered)
+	}
+
+	// Close QUIC connection
+	_ = qConn.CloseWithError(0, "client teardown")
+
+	// Wait for registrations to be removed
+	deadline := time.Now().Add(2 * time.Second)
+	var removed bool
+	for time.Now().Before(deadline) {
+		reg := srv.RegistrationTable().GetRegisteredHostnamesForClient(clientID)
+		if len(reg) == 0 {
+			removed = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !removed {
+		t.Fatalf("expected registrations to be removed on QUIC session teardown")
+	}
+}
+
+func TestQUIC_FailoverFromDeadStream(t *testing.T) {
+	_, serverAddr, generated, cleanup := setupTestServerWithUDPAndClient(t)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	backendCert, err := generateTestBackendCert("quic-failover.example.com")
+	if err != nil {
+		t.Fatalf("generateTestBackendCert failed: %v", err)
+	}
+
+	c1 := client.NewClient(serverAddr, clientTLS)
+	c2 := client.NewClient(serverAddr, clientTLS)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Session 1 (flaky backend: resets first stream immediately before sending byte)
+	qConn1, err := c1.DialQUIC(ctx)
+	if err != nil {
+		t.Fatalf("DialQUIC 1 failed: %v", err)
+	}
+	defer qConn1.CloseWithError(0, "done")
+
+	ctrl1, _ := qConn1.OpenStreamSync(ctx)
+	_, _ = ctrl1.Write([]byte("{\"type\":\"session\"}\n"))
+	r1 := bufio.NewReader(ctrl1)
+	_, _ = r1.ReadBytes('\n')
+	req1, _ := json.Marshal(api.RegistrationRequest{Hostnames: []string{"quic-failover.example.com"}})
+	_, _ = ctrl1.Write(append(req1, '\n'))
+	_, _ = r1.ReadBytes('\n')
+
+	// Flaky backend immediately resets incoming stream
+	go func() {
+		for {
+			s, err := qConn1.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			s.CancelRead(42)
+			_ = s.Close()
+		}
+	}()
+
+	// Session 2 (healthy backend)
+	qConn2, err := c2.DialQUIC(ctx)
+	if err != nil {
+		t.Fatalf("DialQUIC 2 failed: %v", err)
+	}
+	defer qConn2.CloseWithError(0, "done")
+
+	ctrl2, _ := qConn2.OpenStreamSync(ctx)
+	_, _ = ctrl2.Write([]byte("{\"type\":\"session\"}\n"))
+	r2 := bufio.NewReader(ctrl2)
+	_, _ = r2.ReadBytes('\n')
+	req2, _ := json.Marshal(api.RegistrationRequest{Hostnames: []string{"quic-failover.example.com"}})
+	_, _ = ctrl2.Write(append(req2, '\n'))
+	_, _ = r2.ReadBytes('\n')
+
+	// Healthy backend handles stream
+	go func() {
+		for {
+			s, err := qConn2.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			go func(stream *quic.Stream) {
+				streamConn := api.NewQUICStreamConn(stream, qConn2)
+				bufReader := bufio.NewReader(streamConn)
+				hdr, err := proxyproto.Decode(bufReader)
+				if err != nil {
+					_ = streamConn.Close()
+					return
+				}
+				var remaining []byte
+				if bufReader.Buffered() > 0 {
+					remaining = make([]byte, bufReader.Buffered())
+					_, _ = io.ReadFull(bufReader, remaining)
+				}
+				proxyConn := proxyproto.NewConn(streamConn, hdr.SrcAddr, hdr.DstAddr, remaining)
+				tlsConn := tls.Server(proxyConn, &tls.Config{Certificates: []tls.Certificate{backendCert}})
+				defer tlsConn.Close()
+
+				buf := make([]byte, 1024)
+				_, _ = tlsConn.Read(buf)
+				_, _ = tlsConn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 17\r\n\r\nquic-failover-ok!"))
+			}(s)
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "quic-failover.example.com",
+				InsecureSkipVerify: true,
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tls.Dial("tcp", serverAddr, &tls.Config{
+					ServerName:         "quic-failover.example.com",
+					InsecureSkipVerify: true,
+				})
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := httpClient.Get("https://quic-failover.example.com/test")
+	if err != nil {
+		t.Fatalf("expected QUIC failover to succeed, got: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "quic-failover-ok!" {
+		t.Fatalf("expected response 'quic-failover-ok!', got %q", string(body))
+	}
+}
+
+func TestChanListener_ConcurrentSendAndClose(t *testing.T) {
+	lis := newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+
+	const numSenders = 10
+	var wg sync.WaitGroup
+	wg.Add(numSenders)
+
+	for i := 0; i < numSenders; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				c1, c2 := net.Pipe()
+				err := lis.SendConn(c1)
+				if err != nil {
+					_ = c1.Close()
+					_ = c2.Close()
+					return
+				}
+				_ = c2.Close()
+			}
+		}()
+	}
+
+	// Concurrently accept connections
+	go func() {
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	_ = lis.Close()
+
+	wg.Wait()
+
+	// Subsequent SendConn should return net.ErrClosed
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	if err := lis.SendConn(c1); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected net.ErrClosed from SendConn after Close, got: %v", err)
+	}
+
+	// Accept should return net.ErrClosed
+	if _, err := lis.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected net.ErrClosed from Accept after Close, got: %v", err)
 	}
 }
