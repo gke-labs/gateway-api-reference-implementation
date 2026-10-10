@@ -68,6 +68,10 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		st.SetGatewayFilter(opts.GatewayFilter)
 		st.SetSynced(false)
 
+		if publisher, ok := opts.AddressProvider.(state.DataplanePublisher); ok {
+			st.SetDataplanePublisher(publisher)
+		}
+
 		if err := registerInformerHandlers(context.Background(), mgr, st); err != nil {
 			return fmt.Errorf("error registering informer event handlers: %w", err)
 		}
@@ -329,11 +333,17 @@ func registerInformerHandlers(ctx context.Context, mgr ctrl.Manager, st *state.S
 			obj: &corev1.Secret{},
 			add: func(obj any) {
 				if s, ok := obj.(*corev1.Secret); ok {
+					if isDataplaneConfigSecret(s) {
+						return
+					}
 					st.UpsertSecret(s)
 				}
 			},
 			update: func(oldObj, newObj any) {
 				if s, ok := newObj.(*corev1.Secret); ok {
+					if isDataplaneConfigSecret(s) {
+						return
+					}
 					st.UpsertSecret(s)
 				}
 			},
@@ -342,6 +352,9 @@ func registerInformerHandlers(ctx context.Context, mgr ctrl.Manager, st *state.S
 					obj = tombstone.Obj
 				}
 				if s, ok := obj.(*corev1.Secret); ok {
+					if isDataplaneConfigSecret(s) {
+						return
+					}
 					st.DeleteSecret(types.NamespacedName{Namespace: s.Namespace, Name: s.Name})
 				}
 			},
@@ -428,4 +441,12 @@ func registerInformerHandlers(ctx context.Context, mgr ctrl.Manager, st *state.S
 	}
 
 	return nil
+}
+
+func isDataplaneConfigSecret(s *corev1.Secret) bool {
+	if s == nil || s.Labels == nil {
+		return false
+	}
+	return s.Labels[state.LabelManagedBy] == state.ManagedByValue &&
+		s.Labels[state.LabelAppName] == state.AppNameValue
 }

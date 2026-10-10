@@ -272,6 +272,7 @@ type Outputs struct {
 	DefaultCert              *tls.Certificate
 	ResolvedGateways         []*gatewayv1.Gateway
 	CompiledGateways         map[types.NamespacedName]*CompiledGateway
+	DataplaneConfigs         map[types.NamespacedName]*DataplaneConfig
 }
 
 func isSupportedProtocol(protocol gatewayv1.ProtocolType) bool {
@@ -1527,6 +1528,14 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 	outputs.DefaultCert = defaultCert
 	outputs.ResolvedGateways = compiled.ResolvedGateways()
 	outputs.CompiledGateways = compiled.Gateways
+
+	outputs.DataplaneConfigs = make(map[types.NamespacedName]*DataplaneConfig)
+	for gwKey, cg := range compiled.Gateways {
+		dpConfig, err := BuildGatewayDataplaneConfig(cg, inputs.Secrets, inputs.RefValidator)
+		if err == nil && dpConfig != nil {
+			outputs.DataplaneConfigs[gwKey] = dpConfig
+		}
+	}
 
 	return outputs
 }

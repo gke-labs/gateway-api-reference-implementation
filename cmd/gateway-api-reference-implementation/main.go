@@ -23,7 +23,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"k8s.io/klog/v2/textlogger"
 	ctrl "sigs.k8s.io/controller-runtime"
-	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 var setupLog = ctrl.Log.WithName("setup")
@@ -70,13 +69,13 @@ func main() {
 			setupLog.Error(fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode"), "invalid configuration")
 			os.Exit(1)
 		}
+		opts.DataplaneMode = true
+		opts.DataplaneGatewayNamespace = gatewayNamespace
+		opts.DataplaneGatewayName = gatewayName
 		opts.DisableStatusUpdates = true
 		opts.LeaderElection = false
 		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr // enable HTTP/3 on the HTTPS port for dataplane
 		opts.AddressProvider = nil
-		opts.GatewayFilter = func(gw *gatewayv1.Gateway) bool {
-			return gw.Namespace == gatewayNamespace && gw.Name == gatewayName
-		}
 	} else {
 		opts.ProxyAddr = ""
 		opts.ProxyHTTPSAddr = ""

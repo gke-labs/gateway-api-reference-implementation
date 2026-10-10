@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/quic-go/quic-go"
@@ -33,12 +34,17 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sync/errgroup"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -152,6 +158,17 @@ type Options struct {
 	// Manager is an optional controller-runtime manager. If provided, New will
 	// register reconcilers with it instead of creating a new manager.
 	Manager ctrl.Manager
+
+	// DataplaneMode runs in data-plane mode serving a single Gateway.
+	// In this mode, the instance watches only its per-Gateway configuration Secret
+	// and applies updates directly to the proxy, without running state computation.
+	DataplaneMode bool
+
+	// DataplaneGatewayNamespace is the namespace of the Gateway in DataplaneMode.
+	DataplaneGatewayNamespace string
+
+	// DataplaneGatewayName is the name of the Gateway in DataplaneMode.
+	DataplaneGatewayName string
 }
 
 // DefaultOptions returns standard default options for GARI.
@@ -175,6 +192,11 @@ func (o *Options) complete() error {
 	}
 	if o.LeaderElectionID == "" {
 		o.LeaderElectionID = "gateway-api-reference-implementation"
+	}
+	if o.DataplaneMode {
+		o.LeaderElection = false
+		o.DisableStatusUpdates = true
+		o.AddressProvider = nil
 	}
 	return nil
 }
@@ -230,18 +252,41 @@ func New(opts Options) (*Server, error) {
 		}
 
 		var err error
-		mgr, err = ctrl.NewManager(cfg, ctrl.Options{
-			Scheme: opts.Scheme,
-			Metrics: metricsserver.Options{
-				BindAddress: opts.MetricsAddr,
-			},
-			WebhookServer: webhook.NewServer(webhook.Options{
-				Port: 9443,
-			}),
-			HealthProbeBindAddress: opts.HealthProbeBindAddress,
-			LeaderElection:         opts.LeaderElection,
-			LeaderElectionID:       opts.LeaderElectionID,
-		})
+		if opts.DataplaneMode {
+			secretName := singlepod.ResourceNameForGateway(opts.DataplaneGatewayName)
+			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
+				Scheme: opts.Scheme,
+				Metrics: metricsserver.Options{
+					BindAddress: opts.MetricsAddr,
+				},
+				HealthProbeBindAddress: opts.HealthProbeBindAddress,
+				LeaderElection:         false,
+				Cache: cache.Options{
+					ByObject: map[client.Object]cache.ByObject{
+						&corev1.Secret{}: {
+							Namespaces: map[string]cache.Config{
+								opts.DataplaneGatewayNamespace: {
+									FieldSelector: fields.OneTermEqualSelector("metadata.name", secretName),
+								},
+							},
+						},
+					},
+				},
+			})
+		} else {
+			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
+				Scheme: opts.Scheme,
+				Metrics: metricsserver.Options{
+					BindAddress: opts.MetricsAddr,
+				},
+				WebhookServer: webhook.NewServer(webhook.Options{
+					Port: 9443,
+				}),
+				HealthProbeBindAddress: opts.HealthProbeBindAddress,
+				LeaderElection:         opts.LeaderElection,
+				LeaderElectionID:       opts.LeaderElectionID,
+			})
+		}
 		if err != nil {
 			return nil, fmt.Errorf("unable to start manager: %w", err)
 		}
@@ -269,6 +314,32 @@ func NewWithManager(mgr ctrl.Manager, opts Options) (*Server, error) {
 
 // SetupWithManager registers all GARI reconcilers with the given Manager.
 func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
+	if s.opts.DataplaneMode {
+		if err := mgr.AddReadyzCheck("readyz", healthz.Checker(func(req *http.Request) error {
+			if !s.proxySynced.Load() {
+				return errors.New("proxy configuration not yet applied")
+			}
+			return nil
+		})); err != nil {
+			return fmt.Errorf("failed to register readyz check: %w", err)
+		}
+
+		secretName := singlepod.ResourceNameForGateway(s.opts.DataplaneGatewayName)
+		reconciler := &dataplaneSecretReconciler{
+			Client:           mgr.GetClient(),
+			proxy:            s.proxy,
+			proxySynced:      &s.proxySynced,
+			gatewayNamespace: s.opts.DataplaneGatewayNamespace,
+			secretName:       secretName,
+		}
+		if err := ctrl.NewControllerManagedBy(mgr).
+			For(&corev1.Secret{}).
+			Complete(reconciler); err != nil {
+			return fmt.Errorf("failed to create dataplane secret controller: %w", err)
+		}
+		return nil
+	}
+
 	userHook := s.opts.OnGatewaysUpdate
 	wrappedHook := func(gateways []*gatewayv1.Gateway) {
 		s.proxySynced.Store(true)
@@ -293,6 +364,49 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		GatewayFilter:        s.opts.GatewayFilter,
 		DisableStatusUpdates: s.opts.DisableStatusUpdates,
 	})
+}
+
+type dataplaneSecretReconciler struct {
+	client.Client
+	proxy            *proxy.Proxy
+	proxySynced      *atomic.Bool
+	gatewayNamespace string
+	secretName       string
+}
+
+func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	if req.Namespace != r.gatewayNamespace || req.Name != r.secretName {
+		return ctrl.Result{}, nil
+	}
+
+	var sec corev1.Secret
+	if err := r.Get(ctx, req.NamespacedName, &sec); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	data, ok := sec.Data[singlepod.DataplaneSecretDataKey]
+	if !ok || len(data) == 0 {
+		return ctrl.Result{}, nil
+	}
+
+	cfg, err := state.UnmarshalDataplaneConfig(data)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
+	}
+
+	certsMap, defaultCert, err := cfg.ExtractCertificates()
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to extract certificates: %w", err)
+	}
+
+	r.proxy.UpdateConfig(cfg.Listeners, cfg.Routes)
+	r.proxy.UpdateCertificates(certsMap, defaultCert)
+	r.proxySynced.Store(true)
+
+	return ctrl.Result{}, nil
 }
 
 func (s *Server) initDefaultCertificate() error {

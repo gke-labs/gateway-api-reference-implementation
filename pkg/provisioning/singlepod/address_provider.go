@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -36,7 +37,7 @@ import (
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
-	"k8s.io/client-go/util/retry"
+	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -54,25 +55,22 @@ const (
 	FieldManager = "gari-provisioner"
 
 	// LabelGatewayName is the label identifying the Gateway name on provisioned resources.
-	LabelGatewayName = "gateway.networking.k8s.io/gateway-name"
+	LabelGatewayName = state.LabelGatewayName
 
 	// LabelManagedBy is the label indicating the resource is managed by the singlepod provisioner.
-	LabelManagedBy = "app.kubernetes.io/managed-by"
+	LabelManagedBy = state.LabelManagedBy
 
 	// ManagedByValue is the value of LabelManagedBy.
-	ManagedByValue = "gari-singlepod"
+	ManagedByValue = state.ManagedByValue
 
 	// LabelAppName is the label identifying the data-plane component.
-	LabelAppName = "app.kubernetes.io/name"
+	LabelAppName = state.LabelAppName
 
 	// AppNameValue is the value for LabelAppName on data-plane components.
-	AppNameValue = "gari-dataplane"
+	AppNameValue = state.AppNameValue
 
-	// DataplaneClusterRoleName is the name of the ClusterRole for per-Gateway data-plane instances.
-	DataplaneClusterRoleName = "gari-dataplane"
-
-	// DataplaneClusterRoleBindingName is the name of the shared ClusterRoleBinding for data-plane service accounts.
-	DataplaneClusterRoleBindingName = "gari-dataplane"
+	// DataplaneSecretDataKey is the key in the per-Gateway Secret holding the serialized DataplaneConfig.
+	DataplaneSecretDataKey = "config.json"
 )
 
 // ResourceNameForGateway computes the resource name for a Gateway within its namespace.
@@ -172,98 +170,7 @@ func buildLabelsAndAnnotations(gw *gatewayv1.Gateway) (map[string]string, map[st
 	return labels, annotations
 }
 
-// ensureClusterRoleBindingSubject ensures that the given ServiceAccount is listed as a subject in the shared gari-dataplane ClusterRoleBinding.
-func (p *AddressProvider) ensureClusterRoleBindingSubject(ctx context.Context, saNamespace, saName string) error {
-	if p.client == nil {
-		return nil
-	}
-
-	reader := p.apiReader
-	if reader == nil {
-		reader = p.client
-	}
-
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var crb rbacv1.ClusterRoleBinding
-		if err := reader.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &crb); err != nil {
-			return err
-		}
-
-		subjectExists := false
-		for _, s := range crb.Subjects {
-			if s.Kind == "ServiceAccount" && s.Namespace == saNamespace && s.Name == saName {
-				subjectExists = true
-				break
-			}
-		}
-
-		if subjectExists {
-			return nil
-		}
-
-		crb.Subjects = append(crb.Subjects, rbacv1.Subject{
-			Kind:      "ServiceAccount",
-			Namespace: saNamespace,
-			Name:      saName,
-		})
-
-		sortSubjects(crb.Subjects)
-
-		return p.client.Update(ctx, &crb)
-	})
-}
-
-// removeClusterRoleBindingSubject removes the given ServiceAccount from the shared gari-dataplane ClusterRoleBinding.
-func (p *AddressProvider) removeClusterRoleBindingSubject(ctx context.Context, saNamespace, saName string) error {
-	if p.client == nil {
-		return nil
-	}
-
-	reader := p.apiReader
-	if reader == nil {
-		reader = p.client
-	}
-
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var crb rbacv1.ClusterRoleBinding
-		if err := reader.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &crb); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
-			return err
-		}
-
-		var newSubjects []rbacv1.Subject
-		found := false
-		for _, s := range crb.Subjects {
-			if s.Kind == "ServiceAccount" && s.Namespace == saNamespace && s.Name == saName {
-				found = true
-				continue
-			}
-			newSubjects = append(newSubjects, s)
-		}
-
-		if !found {
-			return nil
-		}
-
-		crb.Subjects = newSubjects
-		sortSubjects(crb.Subjects)
-
-		return p.client.Update(ctx, &crb)
-	})
-}
-
-func sortSubjects(subjects []rbacv1.Subject) {
-	sort.Slice(subjects, func(i, j int) bool {
-		if subjects[i].Namespace != subjects[j].Namespace {
-			return subjects[i].Namespace < subjects[j].Namespace
-		}
-		return subjects[i].Name < subjects[j].Name
-	})
-}
-
-// GatewayAddresses reconciles the per-Gateway ServiceAccount, ClusterRoleBinding subject, Deployment, and LoadBalancer Service,
+// GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
 // and returns the Service's LoadBalancer ingress addresses and whether the Deployment is ready.
 func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
 	if p.client == nil {
@@ -306,9 +213,79 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		return nil, false, fmt.Errorf("failed to apply ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
-	// 2. Ensure ServiceAccount is in shared gari-dataplane ClusterRoleBinding
-	if err := p.ensureClusterRoleBindingSubject(ctx, gwNamespace, name); err != nil {
-		return nil, false, fmt.Errorf("failed to add subject to ClusterRoleBinding %s: %w", DataplaneClusterRoleBindingName, err)
+	// 2. Reconcile per-Gateway Role in Gateway namespace
+	var existingRole rbacv1.Role
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRole)
+	if err == nil {
+		if !isOwnedByGateway(&existingRole, gw) {
+			return nil, false, &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing Role %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, false, err
+	}
+
+	roleApply := rbacv1ac.Role(name, gwNamespace).
+		WithOwnerReferences(ownerRef).
+		WithLabels(labels).
+		WithRules(rbacv1ac.PolicyRule().
+			WithAPIGroups("").
+			WithResources("secrets").
+			WithResourceNames(name).
+			WithVerbs("get", "list", "watch"),
+		)
+	if len(annotations) > 0 {
+		roleApply.WithAnnotations(annotations)
+	}
+	if err := p.client.Apply(ctx, roleApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return nil, false, fmt.Errorf("failed to apply Role for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+	}
+
+	// 2b. Reconcile per-Gateway RoleBinding in Gateway namespace
+	var existingRB rbacv1.RoleBinding
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRB)
+	if err == nil {
+		if !isOwnedByGateway(&existingRB, gw) {
+			return nil, false, &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing RoleBinding %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, false, err
+	}
+
+	rbApply := rbacv1ac.RoleBinding(name, gwNamespace).
+		WithOwnerReferences(ownerRef).
+		WithLabels(labels).
+		WithRoleRef(rbacv1ac.RoleRef().
+			WithAPIGroup(rbacv1.GroupName).
+			WithKind("Role").
+			WithName(name),
+		).
+		WithSubjects(rbacv1ac.Subject().
+			WithKind("ServiceAccount").
+			WithName(name).
+			WithNamespace(gwNamespace),
+		)
+	if len(annotations) > 0 {
+		rbApply.WithAnnotations(annotations)
+	}
+	if err := p.client.Apply(ctx, rbApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return nil, false, fmt.Errorf("failed to apply RoleBinding for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+	}
+
+	// 2c. Verify ownership of existing Secret in Gateway namespace
+	var existingSecret corev1.Secret
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSecret)
+	if err == nil {
+		if !isOwnedByGateway(&existingSecret, gw) {
+			return nil, false, &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing Secret %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, false, err
 	}
 
 	// 3. Reconcile per-Gateway Deployment in Gateway namespace
@@ -537,71 +514,13 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	return addresses, deployReady, nil
 }
 
-// OnGatewayDeleted cleans up the ClusterRoleBinding subject for the deleted Gateway.
+// OnGatewayDeleted cleans up any resources for the deleted Gateway.
 func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.NamespacedName) error {
-	if p.client == nil {
-		return nil
-	}
-
-	name := ResourceNameForGateway(gwKey.Name)
-	if err := p.removeClusterRoleBindingSubject(ctx, gwKey.Namespace, name); err != nil {
-		return fmt.Errorf("failed to remove subject from ClusterRoleBinding %s: %w", DataplaneClusterRoleBindingName, err)
-	}
-
 	return nil
 }
 
-// SweepOrphans garbage-collects stale ClusterRoleBinding subjects across all namespaces whose corresponding Gateway no longer exists.
+// SweepOrphans garbage-collects stale resources across all namespaces whose corresponding Gateway no longer exists.
 func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
-	if p.client == nil {
-		return nil
-	}
-
-	// Sweep subjects in shared gari-dataplane ClusterRoleBinding
-	reader := p.apiReader
-	if reader == nil {
-		reader = p.client
-	}
-	var crb rbacv1.ClusterRoleBinding
-	if err := reader.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &crb); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("failed to get ClusterRoleBinding %s during orphan sweep: %w", DataplaneClusterRoleBindingName, err)
-	}
-
-	var validSubjects []rbacv1.Subject
-	changed := false
-	for _, s := range crb.Subjects {
-		if s.Kind != "ServiceAccount" {
-			validSubjects = append(validSubjects, s)
-			continue
-		}
-		// Check if ServiceAccount still exists and has managed label
-		var sa corev1.ServiceAccount
-		err := reader.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.Name}, &sa)
-		if apierrors.IsNotFound(err) || (sa.Labels != nil && sa.Labels[LabelManagedBy] == ManagedByValue && sa.Labels[LabelGatewayName] != "") {
-			if apierrors.IsNotFound(err) {
-				changed = true
-				continue
-			}
-			gwName := sa.Labels[LabelGatewayName]
-			var gw gatewayv1.Gateway
-			if gwErr := p.client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: gwName}, &gw); apierrors.IsNotFound(gwErr) || (gwErr == nil && gw.DeletionTimestamp != nil) {
-				changed = true
-				continue
-			}
-		}
-		validSubjects = append(validSubjects, s)
-	}
-	if changed {
-		crb.Subjects = validSubjects
-		sortSubjects(crb.Subjects)
-		if updErr := p.client.Update(ctx, &crb); updErr != nil && !apierrors.IsNotFound(updErr) {
-			return fmt.Errorf("failed to update ClusterRoleBinding %s during orphan sweep: %w", DataplaneClusterRoleBindingName, updErr)
-		}
-	}
-
 	return nil
 }
 
@@ -653,8 +572,46 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 	return nil
 }
 
+// PublishDataplaneConfig writes the Gateway's compiled data-plane config to its per-Gateway Secret.
+func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
+	if p.client == nil || gw == nil || config == nil {
+		return nil
+	}
+
+	name := ResourceNameForGateway(gw.Name)
+	labels, annotations := buildLabelsAndAnnotations(gw)
+	ownerRef := metav1ac.OwnerReference().
+		WithAPIVersion(gatewayv1.GroupVersion.String()).
+		WithKind("Gateway").
+		WithName(gw.Name).
+		WithUID(gw.UID).
+		WithController(true).
+		WithBlockOwnerDeletion(true)
+
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal dataplane config: %w", err)
+	}
+
+	secretApply := corev1ac.Secret(name, gw.Namespace).
+		WithOwnerReferences(ownerRef).
+		WithLabels(labels).
+		WithData(map[string][]byte{
+			DataplaneSecretDataKey: configJSON,
+		})
+	if len(annotations) > 0 {
+		secretApply.WithAnnotations(annotations)
+	}
+
+	if err := p.client.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return fmt.Errorf("failed to apply config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+	}
+	return nil
+}
+
 var (
 	_ controller.AddressProvider      = (*AddressProvider)(nil)
 	_ controller.GatewayDeleteHandler = (*AddressProvider)(nil)
 	_ controller.AddressWatcher       = (*AddressProvider)(nil)
+	_ state.DataplanePublisher        = (*AddressProvider)(nil)
 )

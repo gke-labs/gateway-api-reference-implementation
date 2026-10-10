@@ -15,8 +15,10 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"reflect"
 	"sort"
 	"sync"
@@ -126,6 +128,9 @@ type State struct {
 	onGatewaysUpdate func([]*gatewayv1.Gateway)
 	gatewayFilter    func(gw *gatewayv1.Gateway) bool
 
+	dataplanePublisher DataplanePublisher
+	lastWrittenConfigs map[types.NamespacedName][]byte
+
 	previousOutputs *Outputs
 
 	gatewaySource          *EventSource
@@ -167,6 +172,7 @@ func NewState() *State {
 		listenerSetSource:      NewEventSource(),
 		backendTLSPolicySource: NewEventSource(),
 		gatewayClassSource:     NewEventSource(),
+		lastWrittenConfigs:     make(map[types.NamespacedName][]byte),
 		notifyCh:               make(chan struct{}, 1),
 		synced:                 true,
 		running:                false,
@@ -195,6 +201,21 @@ func (s *State) SetGatewayFilter(fn func(gw *gatewayv1.Gateway) bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gatewayFilter = fn
+}
+
+func (s *State) SetDataplanePublisher(p DataplanePublisher) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dataplanePublisher = p
+}
+
+func (s *State) GetDataplaneConfig(key types.NamespacedName) *DataplaneConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.previousOutputs != nil && s.previousOutputs.DataplaneConfigs != nil {
+		return s.previousOutputs.DataplaneConfigs[key]
+	}
+	return nil
 }
 
 func (s *State) AddRegistration(reg toolscache.ResourceEventHandlerRegistration) {
@@ -347,6 +368,7 @@ func (s *State) Recompute() *Outputs {
 
 	p := s.proxy
 	onGatewaysUpdate := s.onGatewaysUpdate
+	dpPublisher := s.dataplanePublisher
 
 	s.previousOutputs = outputs
 	s.mu.Unlock()
@@ -361,7 +383,65 @@ func (s *State) Recompute() *Outputs {
 		onGatewaysUpdate(outputs.ResolvedGateways)
 	}
 
+	if dpPublisher != nil {
+		s.publishDataplaneConfigs(outputs, dpPublisher)
+	}
+
 	return outputs
+}
+
+// publishDataplaneConfigs iterates through compiled data-plane configs and pushes updates to the publisher.
+// TODO(#637): Publishing is currently synchronous inside Recompute; consider making it asynchronous
+// or streaming (e.g. xDS-like) if cluster size or write latency becomes an issue.
+func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePublisher) {
+	if outputs == nil || publisher == nil {
+		return
+	}
+
+	for gwKey, dpConfig := range outputs.DataplaneConfigs {
+		cg := outputs.CompiledGateways[gwKey]
+		if cg == nil || cg.Gateway == nil {
+			continue
+		}
+		if s.gatewayFilter != nil && !s.gatewayFilter(cg.Gateway) {
+			continue
+		}
+
+		data, err := json.Marshal(dpConfig)
+		if err != nil {
+			klog.Errorf("failed to marshal dataplane config for %s: %v", gwKey, err)
+			continue
+		}
+
+		if len(data) > 1024*1024 {
+			klog.Errorf("dataplane config size for %s (%d bytes) exceeds 1MiB secret limit", gwKey, len(data))
+		}
+
+		s.mu.Lock()
+		lastData := s.lastWrittenConfigs[gwKey]
+		s.mu.Unlock()
+
+		if bytes.Equal(data, lastData) {
+			continue
+		}
+
+		if err := publisher.PublishDataplaneConfig(context.Background(), cg.Gateway, dpConfig); err != nil {
+			klog.Errorf("failed to publish dataplane config for %s: %v", gwKey, err)
+			continue
+		}
+
+		s.mu.Lock()
+		s.lastWrittenConfigs[gwKey] = data
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	for gwKey := range s.lastWrittenConfigs {
+		if _, ok := outputs.DataplaneConfigs[gwKey]; !ok {
+			delete(s.lastWrittenConfigs, gwKey)
+		}
+	}
+	s.mu.Unlock()
 }
 
 func (s *State) snapshotInputsLocked() ModelInputs {

@@ -15,8 +15,10 @@
 package e2e
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -143,7 +145,7 @@ spec:
 		t.Errorf("Expected second Gateway to get distinct address, got same: %s", secondGwAddr)
 	}
 
-	// Verify Service, Deployment, and ServiceAccount were created for second-gateway
+	// Verify Service, Deployment, ServiceAccount, Role, RoleBinding, and Secret were created for second-gateway
 	secondResName := singlepod.ResourceNameForGateway("second-gateway")
 	out := h.runCmd("kubectl", "get", "svc", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(out) != secondResName {
@@ -157,10 +159,42 @@ spec:
 	if strings.TrimSpace(saOut) != secondResName {
 		t.Errorf("Expected ServiceAccount %s to exist, got: %s", secondResName, saOut)
 	}
+	roleOut := h.runCmd("kubectl", "get", "role", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(roleOut) != secondResName {
+		t.Errorf("Expected Role %s to exist, got: %s", secondResName, roleOut)
+	}
+	rbOut := h.runCmd("kubectl", "get", "rolebinding", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(rbOut) != secondResName {
+		t.Errorf("Expected RoleBinding %s to exist, got: %s", secondResName, rbOut)
+	}
+	secOut := h.runCmd("kubectl", "get", "secret", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(secOut) != secondResName {
+		t.Errorf("Expected Secret %s to exist, got: %s", secondResName, secOut)
+	}
 
-	// Delete second-gateway and verify Service, Deployment, and ServiceAccount are cleaned up
+	// Verify gari-dataplane ClusterRole does not exist
+	crCheck := runCmdAllowError(h, "kubectl", "get", "clusterrole", "gari-dataplane")
+	if !strings.Contains(crCheck, "NotFound") && !strings.Contains(crCheck, "not found") {
+		t.Errorf("Expected ClusterRole gari-dataplane to not exist, got: %s", crCheck)
+	}
+
+	// Delete second-gateway and verify Service, Deployment, ServiceAccount, Role, RoleBinding, and Secret are cleaned up
 	h.runCmd("kubectl", "delete", "gateway", "second-gateway", "--namespace=default")
 	h.WaitForResourceDeletion("svc", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("serviceaccount", secondResName, "default", 30*time.Second)
+	h.WaitForResourceDeletion("role", secondResName, "default", 30*time.Second)
+	h.WaitForResourceDeletion("rolebinding", secondResName, "default", 30*time.Second)
+	h.WaitForResourceDeletion("secret", secondResName, "default", 30*time.Second)
+}
+
+func runCmdAllowError(h *Harness, name string, args ...string) string {
+	cmd := exec.Command(name, args...)
+	var combined bytes.Buffer
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
+	if err := cmd.Run(); err != nil {
+		h.t.Logf("Command %s %v returned error (allowed): %v", name, args, err)
+	}
+	return combined.String()
 }

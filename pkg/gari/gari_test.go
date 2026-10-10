@@ -1086,3 +1086,161 @@ func TestHTTP3_CustomQUICConfig(t *testing.T) {
 		t.Errorf("timed out waiting for proxy shutdown")
 	}
 }
+
+func TestDataplaneSecretReconciler(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend ok"))
+	}))
+	defer backend.Close()
+
+	backendHost, backendPortStr, err := net.SplitHostPort(backend.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to split backend addr: %v", err)
+	}
+	var backendPort int
+	_, _ = fmt.Sscanf(backendPortStr, "%d", &backendPort)
+
+	p := proxy.NewProxy()
+
+	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
+	route := state.InternalRoute{
+		Hostnames: []string{"example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/ok"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: backendHost, Port: int32(backendPort), Weight: 1},
+				},
+			},
+		},
+	}
+
+	dpConfig := &state.DataplaneConfig{
+		GatewayName: gwKey,
+		Listeners: []state.InternalListener{
+			{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route}},
+		},
+		Routes: []state.InternalRoute{route},
+	}
+	configBytes, err := dpConfig.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      "test-gw-gari",
+		},
+		Data: map[string][]byte{
+			"config.json": configBytes,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      "test-gw",
+		},
+		proxy: p,
+	}
+
+	reconciler := &dataplaneSecretReconciler{
+		Client:           cl,
+		proxy:            p,
+		proxySynced:      &server.proxySynced,
+		gatewayNamespace: "test-ns",
+		secretName:       "test-gw-gari",
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: "test-ns",
+			Name:      "test-gw-gari",
+		},
+	}
+
+	// Reconcile secret
+	res, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res.Requeue {
+		t.Errorf("expected no requeue")
+	}
+
+	if !server.proxySynced.Load() {
+		t.Errorf("expected proxySynced to be true after reconcile")
+	}
+
+	// Verify request routing against the proxy
+	reqHTTP, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/ok", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, reqHTTP)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK from proxy, got %d", rec.Code)
+	}
+	if rec.Body.String() != "backend ok" {
+		t.Errorf("expected 'backend ok' body, got %q", rec.Body.String())
+	}
+}
+
+func TestDataplaneSecretReconciler_MissingSecretLeavesProxyNotSynced(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	p := proxy.NewProxy()
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      "test-gw",
+		},
+		proxy: p,
+	}
+
+	reconciler := &dataplaneSecretReconciler{
+		Client:           cl,
+		proxy:            p,
+		proxySynced:      &server.proxySynced,
+		gatewayNamespace: "test-ns",
+		secretName:       "test-gw-gari",
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: "test-ns",
+			Name:      "test-gw-gari",
+		},
+	}
+
+	res, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile returned error for missing secret: %v", err)
+	}
+	if res.Requeue {
+		t.Errorf("expected no requeue for missing secret")
+	}
+
+	if server.proxySynced.Load() {
+		t.Errorf("expected proxySynced to be false when Secret is missing")
+	}
+}

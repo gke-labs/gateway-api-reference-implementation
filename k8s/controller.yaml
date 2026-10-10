@@ -15,22 +15,18 @@ rules:
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["tlsroutes", "grpcroutes"]
   verbs: ["get", "list", "watch"]
+# Write access on secrets, roles, and rolebindings is required to provision per-Gateway data-plane RBAC and config Secrets.
 - apiGroups: [""]
-  resources: ["services", "serviceaccounts"]
+  resources: ["services", "serviceaccounts", "secrets"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["rbac.authorization.k8s.io"]
-  resources: ["clusterrolebindings"]
-  resourceNames: ["gari-dataplane"]
-  verbs: ["get", "update", "patch"]
-- apiGroups: ["rbac.authorization.k8s.io"]
-  resources: ["clusterroles"]
-  resourceNames: ["gari-dataplane"]
-  verbs: ["bind"]
+  resources: ["roles", "rolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
-  resources: ["configmaps", "secrets", "namespaces", "endpoints"]
+  resources: ["configmaps", "namespaces", "endpoints"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["discovery.k8s.io"]
   resources: ["endpointslices"]
@@ -38,25 +34,6 @@ rules:
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status", "tlsroutes/status", "grpcroutes/status"]
   verbs: ["update", "patch"]
----
-# Security notice: each per-Gateway data-plane pod currently runs state computation
-# for its Gateway and therefore reads cluster resources. In a future update (see #637),
-# configuration will be computed centrally and pushed as a per-Gateway secret so data-plane
-# pods only need read access to their own namespace.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: gari-dataplane
-rules:
-- apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants", "listenersets", "tlsroutes", "grpcroutes"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: [""]
-  resources: ["services", "configmaps", "secrets", "namespaces", "endpoints"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["discovery.k8s.io"]
-  resources: ["endpointslices"]
-  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -70,16 +47,6 @@ subjects:
 - kind: ServiceAccount
   name: gari-controller
   namespace: default
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: gari-dataplane
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: gari-dataplane
-subjects: []
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
