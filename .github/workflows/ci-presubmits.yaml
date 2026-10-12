@@ -83,7 +83,7 @@ jobs:
           path: /tmp/artifacts
           if-no-files-found: ignore
   ap-lint:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, test-runner]
     env:
       ARTIFACTS: /tmp/artifacts
     steps:
@@ -110,7 +110,7 @@ jobs:
           path: /tmp/artifacts
           if-no-files-found: ignore
   ap-test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, test-runner]
     env:
       ARTIFACTS: /tmp/artifacts
     steps:
