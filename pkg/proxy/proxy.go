@@ -1395,7 +1395,8 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 
 	if backend.TLSConfig == nil {
 		return &tls.Config{
-			InsecureSkipVerify: true,
+			ServerName:         backend.Host,
+			InsecureSkipVerify: false,
 			ClientSessionCache: sessionCache,
 		}
 	}
@@ -1561,7 +1562,8 @@ func backendTransportKey(backend state.InternalBackend) string {
 			b.WriteString(hex.EncodeToString(h[:]))
 		}
 	} else {
-		b.WriteString("insecure")
+		b.WriteString("system-roots|host:")
+		b.WriteString(backend.Host)
 	}
 	return b.String()
 }

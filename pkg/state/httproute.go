@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -533,6 +534,14 @@ func CompileHTTPRoute(
 		}
 
 		compiledRules = append(compiledRules, iRule)
+	}
+
+	if noPolicyHosts := noPolicyTLSBackendHosts(compiledRules); len(noPolicyHosts) > 0 && resolvedRefsCondition.Status == metav1.ConditionTrue {
+		if len(noPolicyHosts) == 1 {
+			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName %s (backend Service specifies appProtocol: https without a BackendTLSPolicy)", noPolicyHosts[0])
+		} else {
+			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName for %s (backend Services specify appProtocol: https without a BackendTLSPolicy)", strings.Join(noPolicyHosts, ", "))
+		}
 	}
 
 	return &InternalHTTPRoute{

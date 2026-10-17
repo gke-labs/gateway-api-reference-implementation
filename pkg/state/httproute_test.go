@@ -1867,3 +1867,191 @@ func TestCompileHTTPRoute_RequestMirror(t *testing.T) {
 		})
 	}
 }
+
+func TestCompileHTTPRoute_BackendTLSWithoutPolicy_ResolvedRefsMessage(t *testing.T) {
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "tls-backend-route",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "https-svc",
+									Port: Ptr(gatewayv1.PortNumber(8443)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "https-svc"}: {
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Port: 8443, AppProtocol: Ptr("https")},
+				},
+			},
+		},
+	}
+
+	t.Run("no policy surfaces verification mode and why on ResolvedRefs", func(t *testing.T) {
+		compiled := CompileHTTPRoute(route, services, nil, nil, nil)
+		if compiled == nil {
+			t.Fatalf("expected non-nil InternalHTTPRoute")
+		}
+		if compiled.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Errorf("expected Accepted=True, got %v", compiled.ValidationCondition.Status)
+		}
+		if compiled.ResolvedRefsCondition.Status != metav1.ConditionTrue {
+			t.Fatalf("expected ResolvedRefs=True, got %v", compiled.ResolvedRefsCondition.Status)
+		}
+		if compiled.ResolvedRefsCondition.Reason != string(gatewayv1.RouteReasonResolvedRefs) {
+			t.Errorf("expected reason %s, got %s", gatewayv1.RouteReasonResolvedRefs, compiled.ResolvedRefsCondition.Reason)
+		}
+		expectedMsg := "Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName https-svc.default.svc.cluster.local (backend Service specifies appProtocol: https without a BackendTLSPolicy)"
+		if compiled.ResolvedRefsCondition.Message != expectedMsg {
+			t.Errorf("expected message %q, got %q", expectedMsg, compiled.ResolvedRefsCondition.Message)
+		}
+	})
+
+	t.Run("with policy preserves standard All references resolved message", func(t *testing.T) {
+		policies := []*gatewayv1.BackendTLSPolicy{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "https-svc-policy",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.BackendTLSPolicySpec{
+					TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+						{
+							LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+								Group: "",
+								Kind:  "Service",
+								Name:  "https-svc",
+							},
+						},
+					},
+					Validation: gatewayv1.BackendTLSPolicyValidation{
+						Hostname: "https-svc.default.svc.cluster.local",
+					},
+				},
+			},
+		}
+
+		compiled := CompileHTTPRoute(route, services, policies, nil, nil)
+		if compiled == nil {
+			t.Fatalf("expected non-nil InternalHTTPRoute")
+		}
+		if compiled.ResolvedRefsCondition.Status != metav1.ConditionTrue {
+			t.Fatalf("expected ResolvedRefs=True, got %v", compiled.ResolvedRefsCondition.Status)
+		}
+		if compiled.ResolvedRefsCondition.Message != "All references resolved" {
+			t.Errorf("expected message 'All references resolved', got %q", compiled.ResolvedRefsCondition.Message)
+		}
+	})
+
+	t.Run("multiple backends without policy list all hosts", func(t *testing.T) {
+		multiRoute := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "multi-backend-route",
+				Namespace:  "default",
+				Generation: 1,
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "svc-1",
+										Port: Ptr(gatewayv1.PortNumber(443)),
+									},
+								},
+							},
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "svc-2",
+										Port: Ptr(gatewayv1.PortNumber(8443)),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		multiServices := map[types.NamespacedName]*corev1.Service{
+			{Namespace: "default", Name: "svc-1"}: {
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{
+						{Port: 443, AppProtocol: Ptr("https")},
+					},
+				},
+			},
+			{Namespace: "default", Name: "svc-2"}: {
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{
+						{Port: 8443, AppProtocol: Ptr("https")},
+					},
+				},
+			},
+		}
+
+		compiled := CompileHTTPRoute(multiRoute, multiServices, nil, nil, nil)
+		if compiled == nil {
+			t.Fatalf("expected non-nil InternalHTTPRoute")
+		}
+		expectedMsg := "Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName for svc-1.default.svc.cluster.local, svc-2.default.svc.cluster.local (backend Services specify appProtocol: https without a BackendTLSPolicy)"
+		if compiled.ResolvedRefsCondition.Message != expectedMsg {
+			t.Errorf("expected message %q, got %q", expectedMsg, compiled.ResolvedRefsCondition.Message)
+		}
+	})
+
+	t.Run("mirror backend without policy is surfaced", func(t *testing.T) {
+		mirrorRoute := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "mirror-route",
+				Namespace:  "default",
+				Generation: 1,
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Filters: []gatewayv1.HTTPRouteFilter{
+							{
+								Type: gatewayv1.HTTPRouteFilterRequestMirror,
+								RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+									BackendRef: gatewayv1.BackendObjectReference{
+										Name: "https-svc",
+										Port: Ptr(gatewayv1.PortNumber(8443)),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileHTTPRoute(mirrorRoute, services, nil, nil, nil)
+		if compiled == nil {
+			t.Fatalf("expected non-nil InternalHTTPRoute")
+		}
+		expectedMsg := "Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName https-svc.default.svc.cluster.local (backend Service specifies appProtocol: https without a BackendTLSPolicy)"
+		if compiled.ResolvedRefsCondition.Message != expectedMsg {
+			t.Errorf("expected message %q, got %q", expectedMsg, compiled.ResolvedRefsCondition.Message)
+		}
+	})
+}

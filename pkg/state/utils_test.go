@@ -158,3 +158,37 @@ func TestIntersectHostnames(t *testing.T) {
 		})
 	}
 }
+
+func TestNoPolicyTLSBackendHosts(t *testing.T) {
+	httpsProto := "https"
+	httpProto := "http"
+
+	rules := []InternalRule{
+		{
+			// Rule with error should be skipped
+			Error: &ErrorState{HTTPMessage: "some error"},
+			Backends: []InternalBackend{
+				{Host: "err.example.com", AppProtocol: &httpsProto},
+			},
+		},
+		{
+			// Rule with backend without policy and backend with policy
+			Backends: []InternalBackend{
+				{Host: "svc1.example.com", AppProtocol: &httpsProto, TLSConfig: nil},
+				{Host: "svc2.example.com", AppProtocol: &httpsProto, TLSConfig: &InternalTLSConfig{Hostname: "svc2.example.com"}},
+				{Host: "svc3.example.com", AppProtocol: &httpProto, TLSConfig: nil},
+				{Host: "svc1.example.com", AppProtocol: &httpsProto, TLSConfig: nil}, // duplicate
+			},
+			Mirrors: []InternalMirror{
+				{Backend: InternalBackend{Host: "mirror1.example.com", AppProtocol: &httpsProto, TLSConfig: nil}},
+				{Backend: InternalBackend{Host: "svc1.example.com", AppProtocol: &httpsProto, TLSConfig: nil}}, // duplicate across backends & mirrors
+			},
+		},
+	}
+
+	got := noPolicyTLSBackendHosts(rules)
+	want := []string{"svc1.example.com", "mirror1.example.com"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("noPolicyTLSBackendHosts() = %v, want %v", got, want)
+	}
+}

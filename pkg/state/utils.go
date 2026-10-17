@@ -154,3 +154,32 @@ func ExtractCACertFromConfigMap(cm *corev1.ConfigMap) ([]byte, error) {
 	}
 	return data, nil
 }
+
+// noPolicyTLSBackendHosts inspects compiled rules for backends and mirrors reached over TLS
+// (appProtocol: https) without a BackendTLSPolicy, returning their deduplicated hosts.
+func noPolicyTLSBackendHosts(rules []InternalRule) []string {
+	var hosts []string
+	seen := make(map[string]bool)
+	for _, rule := range rules {
+		if rule.Error != nil {
+			continue
+		}
+		for _, b := range rule.Backends {
+			if b.AppProtocol != nil && strings.EqualFold(*b.AppProtocol, "https") && b.TLSConfig == nil {
+				if !seen[b.Host] {
+					seen[b.Host] = true
+					hosts = append(hosts, b.Host)
+				}
+			}
+		}
+		for _, m := range rule.Mirrors {
+			if m.Backend.AppProtocol != nil && strings.EqualFold(*m.Backend.AppProtocol, "https") && m.Backend.TLSConfig == nil {
+				if !seen[m.Backend.Host] {
+					seen[m.Backend.Host] = true
+					hosts = append(hosts, m.Backend.Host)
+				}
+			}
+		}
+	}
+	return hosts
+}

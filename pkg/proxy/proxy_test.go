@@ -2209,6 +2209,129 @@ func TestProxy_BuildTransport_BackendTLSPolicy(t *testing.T) {
 	if httpTrInvalid.TLSClientConfig.ServerName != "backend.example.com" {
 		t.Errorf("expected ServerName 'backend.example.com', got %q", httpTrInvalid.TLSClientConfig.ServerName)
 	}
+
+	// 3. No BackendTLSPolicy (TLSConfig == nil) -> RootCAs == nil, !InsecureSkipVerify, ServerName == backend.Host
+	noPolicyBackend := state.InternalBackend{
+		Host:        "backend-svc.default.svc.cluster.local",
+		Port:        443,
+		AppProtocol: &httpsProto,
+		TLSConfig:   nil,
+	}
+	trNoPolicy := p.buildTransport(noPolicyBackend)
+	httpTrNoPolicy, ok := trNoPolicy.(*http.Transport)
+	if !ok || httpTrNoPolicy.TLSClientConfig == nil {
+		t.Fatalf("expected *http.Transport with non-nil TLSClientConfig")
+	}
+	if httpTrNoPolicy.TLSClientConfig.InsecureSkipVerify {
+		t.Errorf("expected InsecureSkipVerify=false for backend without policy, got true")
+	}
+	if httpTrNoPolicy.TLSClientConfig.RootCAs != nil {
+		t.Errorf("expected RootCAs == nil for backend without policy, got %v", httpTrNoPolicy.TLSClientConfig.RootCAs)
+	}
+	if httpTrNoPolicy.TLSClientConfig.ServerName != "backend-svc.default.svc.cluster.local" {
+		t.Errorf("expected ServerName 'backend-svc.default.svc.cluster.local', got %q", httpTrNoPolicy.TLSClientConfig.ServerName)
+	}
+}
+
+func TestBackendTLS_WithoutPolicy_Verification(t *testing.T) {
+	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{"backend.local", "127.0.0.1"}, nil)
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok-from-backend"))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("failed to parse server URL: %v", err)
+	}
+	host := u.Hostname()
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("failed to parse server port: %v", err)
+	}
+	httpsProto := "https"
+
+	p := NewProxy()
+
+	// 1. Backend with appProtocol: https, certificate from unknown CA, and NO policy
+	// TLS handshake must fail verification against system roots and return 502 Bad Gateway.
+	noPolicyBackend := state.InternalBackend{
+		Host:        host,
+		Port:        int32(port),
+		AppProtocol: &httpsProto,
+		Weight:      1,
+		TLSConfig:   nil,
+	}
+	routeNoPolicy := state.InternalRoute{
+		Hostnames: []string{"test.example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+				},
+				Backends: []state.InternalBackend{noPolicyBackend},
+			},
+		},
+	}
+	p.UpdateRoutes([]state.InternalRoute{routeNoPolicy})
+
+	reqNoPolicy := httptest.NewRequest("GET", "http://test.example.com/", nil)
+	wNoPolicy := httptest.NewRecorder()
+	p.ServeHTTP(wNoPolicy, reqNoPolicy)
+	if wNoPolicy.Code != http.StatusBadGateway {
+		t.Errorf("expected 502 Bad Gateway for untrusted backend cert without policy, got %d", wNoPolicy.Code)
+	}
+
+	// Also directly verify via RoundTrip that TLS handshake error is returned
+	tr := p.buildTransport(noPolicyBackend)
+	reqDirect, err := http.NewRequest("GET", fmt.Sprintf("https://%s:%d/", host, port), nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	_, err = tr.RoundTrip(reqDirect)
+	if err == nil {
+		t.Errorf("expected RoundTrip to fail certificate verification with unknown CA and no policy, but got nil error")
+	}
+
+	// 2. With BackendTLSPolicy naming the CA -> succeeds as today
+	withPolicyBackend := state.InternalBackend{
+		Host:        host,
+		Port:        int32(port),
+		AppProtocol: &httpsProto,
+		Weight:      1,
+		TLSConfig: &state.InternalTLSConfig{
+			Hostname: "backend.local",
+			CACerts:  [][]byte{serverCAPEM},
+		},
+	}
+	routeWithPolicy := state.InternalRoute{
+		Hostnames: []string{"test.example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+				},
+				Backends: []state.InternalBackend{withPolicyBackend},
+			},
+		},
+	}
+	p.UpdateRoutes([]state.InternalRoute{routeWithPolicy})
+
+	reqWithPolicy := httptest.NewRequest("GET", "http://test.example.com/", nil)
+	wWithPolicy := httptest.NewRecorder()
+	p.ServeHTTP(wWithPolicy, reqWithPolicy)
+	if wWithPolicy.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for backend with BackendTLSPolicy naming CA, got %d", wWithPolicy.Code)
+	}
+	if wWithPolicy.Body.String() != "ok-from-backend" {
+		t.Errorf("expected body %q, got %q", "ok-from-backend", wWithPolicy.Body.String())
+	}
 }
 
 func generateTestCAAndCert(t testing.TB, dnsNames []string, uris []*url.URL) ([]byte, tls.Certificate) {
@@ -3098,7 +3221,7 @@ func TestProxy_GRPCRoute_HeaderModifiers(t *testing.T) {
 }
 
 func TestProxy_BackendConnectionReuse(t *testing.T) {
-	_, serverCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
+	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
 
 	var handshakes atomic.Int64
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3137,6 +3260,10 @@ func TestProxy_BackendConnectionReuse(t *testing.T) {
 						Port:        int32(port),
 						AppProtocol: &httpsProto,
 						Weight:      1,
+						TLSConfig: &state.InternalTLSConfig{
+							Hostname: "backend.local",
+							CACerts:  [][]byte{serverCAPEM},
+						},
 					},
 				},
 			},
@@ -3389,7 +3516,7 @@ func TestTLSSessionResumption_TLSRouteReencryptBackend(t *testing.T) {
 }
 
 func BenchmarkProxy_TLSBackend_Handshakes(b *testing.B) {
-	_, serverCert := generateTestCAAndCert(b, []string{"bench.backend.local"}, nil)
+	serverCAPEM, serverCert := generateTestCAAndCert(b, []string{"bench.backend.local"}, nil)
 	var handshakes atomic.Int64
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -3424,6 +3551,10 @@ func BenchmarkProxy_TLSBackend_Handshakes(b *testing.B) {
 						Port:        int32(port),
 						AppProtocol: &httpsProto,
 						Weight:      1,
+						TLSConfig: &state.InternalTLSConfig{
+							Hostname: "bench.backend.local",
+							CACerts:  [][]byte{serverCAPEM},
+						},
 					},
 				},
 			},

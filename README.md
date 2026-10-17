@@ -46,6 +46,10 @@ When HTTP/3 is enabled, HTTPS (TCP) responses automatically include an `Alt-Svc:
   - `X-Forwarded-For`:
     - `append` mode (default): Appends the immediate client IP to any existing `X-Forwarded-For` header. In edge deployments facing untrusted clients, only the rightmost entry added by GARI is trustworthy; earlier entries may have been forged unless GARI is behind an upstream trusted proxy.
     - `replace` mode (`--forwarded-for-mode=replace`): Drops any client-supplied `X-Forwarded-For` header and sets `X-Forwarded-For` solely to the immediate client IP. This ensures backends only receive verified client IPs when GARI is the edge proxy (first hop).
+- **Backend TLS Verification**:
+  When reaching a backend over TLS:
+  - **With a `BackendTLSPolicy`**: The backend TLS certificate is validated against the configured `caCertificateRefs` (or system roots when `wellKnownCACertificates: System`), validating `hostname` and any configured `subjectAltNames`.
+  - **Without a `BackendTLSPolicy` (`appProtocol: https`)**: GARI verifies backend certificates against system trust roots by default, setting `ServerName` to the backend Service's cluster DNS name (`<service>.<namespace>.svc.cluster.local`). In-cluster backends using self-signed certificates will fail verification until a `BackendTLSPolicy` names their CA. The route's `ResolvedRefs` condition status message informs the user that system trust roots are being used.
 - **All-in-One Mode Limitation**: In all-in-one mode where multiple Gateways share a single controller and proxy process, two Gateways cannot share the same port and hostname for HTTP, HTTPS, or TLS listeners. Hostnames are first-come-first-served across Gateways (by creation timestamp precedence): the first Gateway wins, and any subsequent Gateway listener requesting the same port and hostname reports `Programmed=False` with reason `HostnameConflict` (or `PortUnavailable` for hostname-less listeners). Per-Gateway data plane mode (`singlepod`) is the recommended and conformance path.
 
 ### TCP Support (TCPRoute)
