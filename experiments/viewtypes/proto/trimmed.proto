@@ -1,0 +1,79 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto2";
+
+package viewtypes.proto;
+
+option go_package = "github.com/gke-labs/gateway-api-reference-implementation/experiments/viewtypes/proto;proto";
+
+// Time represents a timestamp in seconds and nanoseconds.
+// Matches field numbers from k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto.
+message Time {
+  optional int64 seconds = 1;
+  optional int32 nanos = 2;
+}
+
+// ObjectMeta contains trimmed object metadata, declaring only fields read by GARI.
+// Matches field numbers from k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto.
+// Fields like managedFields (17) are omitted and dropped during decoding.
+message ObjectMeta {
+  optional string name = 1;
+  optional string generateName = 2;
+  optional string namespace = 3;
+  optional string uid = 5;
+  optional string resourceVersion = 6;
+  optional int64 generation = 7;
+  optional Time creationTimestamp = 8;
+  map<string, string> labels = 11;
+  map<string, string> annotations = 12;
+}
+
+// ListMeta contains trimmed metadata for list responses.
+// Matches field numbers from k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto.
+message ListMeta {
+  optional string resourceVersion = 2;
+}
+
+// ConfigMap holds trimmed configuration data.
+// Matches field numbers from k8s.io/api/core/v1/generated.proto.
+message ConfigMap {
+  optional ObjectMeta metadata = 1;
+  map<string, string> data = 2;
+  map<string, bytes> binaryData = 3;
+  optional bool immutable = 4;
+}
+
+// ConfigMapList is a list of ConfigMaps.
+// Matches field numbers from k8s.io/api/core/v1/generated.proto.
+message ConfigMapList {
+  optional ListMeta metadata = 1;
+  repeated ConfigMap items = 2;
+}
+
+// Secret holds trimmed secret data.
+// Matches field numbers from k8s.io/api/core/v1/generated.proto.
+message Secret {
+  optional ObjectMeta metadata = 1;
+  map<string, bytes> data = 2;
+  optional string type = 3;
+  optional bool immutable = 5;
+}
+
+// SecretList is a list of Secrets.
+// Matches field numbers from k8s.io/api/core/v1/generated.proto.
+message SecretList {
+  optional ListMeta metadata = 1;
+  repeated Secret items = 2;
+}
