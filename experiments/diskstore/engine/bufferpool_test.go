@@ -16,6 +16,8 @@ package engine
 
 import (
 	"bytes"
+	"fmt"
+	"path/filepath"
 	"testing"
 )
 
@@ -275,3 +277,82 @@ func TestBufferPool_InFlightWriteNotPromoted(t *testing.T) {
 	}
 	bp.mu.Unlock()
 }
+
+func TestBufferPool_BatchedEviction(t *testing.T) {
+	dir := t.TempDir()
+	fs := NewOSFS()
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("evict-batch-test"))
+
+	wal, err := OpenWAL(fs, filepath.Join(dir, "wal"), dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	rawHeap, err := fs.Create(filepath.Join(dir, "heap.db"))
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer rawHeap.Close()
+
+	countingHeap := &countingFileWrapper{File: rawHeap}
+	buddy := NewBuddyAllocator(512)
+
+	// Buffer pool of 32 frames
+	bp := NewBufferPool(countingHeap, wal, buddy, dbID, BufferPoolOptions{NumFrames: 32})
+	defer bp.Close()
+
+	// Fill pool with 32 dirty pages
+	for i := 1; i <= 32; i++ {
+		lsn := uint64(i * 10)
+		_ = wal.Append(Record{Type: RecordTypePut, LSN: lsn, Key: fmt.Sprintf("k%d", i), Payload: []byte("val")})
+		h, err := bp.AllocateNewPage(uint64(i), 1, lsn)
+		if err != nil {
+			t.Fatalf("AllocateNewPage %d failed: %v", i, err)
+		}
+		copy(h.Block(0)[BlockHeaderSize:], []byte(fmt.Sprintf("page-%d-data", i)))
+		h.Unpin()
+	}
+
+	// Reset write count before triggering eviction
+	countingHeap.writeCalls.Store(0)
+
+	// Allocate page 33: requires evicting pages because pool has 0 free frames.
+	// acquireFramesLocked will batch-flush candidate dirty pages in ONE write call.
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 330, Key: "k33", Payload: []byte("val")})
+	h33, err := bp.AllocateNewPage(33, 1, 330)
+	if err != nil {
+		t.Fatalf("AllocateNewPage 33 failed: %v", err)
+	}
+	h33.Unpin()
+
+	writes := countingHeap.writeCalls.Load()
+	if writes != 1 {
+		t.Fatalf("expected exactly 1 batched write call during eviction, got %d", writes)
+	}
+
+	// Verify page 1 (which was evicted) can be reloaded and matches data
+	// First sync heap to establish durable locations
+	bp.SnapshotFlushedForSync()
+	_ = countingHeap.Sync()
+	_ = bp.PromoteFlushedToDurable()
+
+	bp.mu.Lock()
+	loc1 := bp.pageTable[1].DurableLoc
+	bp.mu.Unlock()
+
+	h1Reloaded, err := bp.PinPageWithLocation(1, loc1, 1)
+	if err != nil {
+		t.Fatalf("PinPageWithLocation 1 failed: %v", err)
+	}
+	defer h1Reloaded.Unpin()
+
+	expectedData := []byte("page-1-data")
+	actualData := h1Reloaded.Block(0)[BlockHeaderSize : BlockHeaderSize+len(expectedData)]
+	if !bytes.Equal(actualData, expectedData) {
+		t.Fatalf("reloaded page 1 data mismatch: got %q, want %q", string(actualData), string(expectedData))
+	}
+}
+
