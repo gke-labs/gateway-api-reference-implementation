@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -45,6 +46,14 @@ const (
 
 	// WALBlockSize is 4 KiB block alignment for direct I/O WAL writes.
 	WALBlockSize = 4096
+
+	// DefaultWALBufferSize is 1 MiB.
+	DefaultWALBufferSize = 1024 * 1024
+)
+
+var (
+	// ErrRecordTooLarge is returned when a record exceeds the WAL buffer capacity.
+	ErrRecordTooLarge = errors.New("record exceeds WAL buffer size")
 )
 
 // MonotonicTime represents an opaque monotonic timestamp in nanoseconds.
@@ -77,14 +86,6 @@ func (realClock) Now() MonotonicTime {
 	return MonotonicTime(time.Since(processStart)) + 1
 }
 
-type pendingWALBlock struct {
-	file      File
-	offset    int64
-	block     []byte
-	maxLSN    uint64
-	createdAt MonotonicTime
-}
-
 // WAL manages appending, syncing, and segment lifecycle of the write-ahead log.
 type WAL struct {
 	fs   FS
@@ -92,15 +93,16 @@ type WAL struct {
 	dbID [16]byte
 	mu   sync.Mutex
 
+	bufSize int       // buffer capacity (e.g. 1 MiB), multiple of WALBlockSize
+	bufs    [2][]byte // two aligned buffers for contiguous double-buffering
+
 	activeFile     File
 	activePath     string
 	activeStartLSN uint64
-	activeSize     int64 // Total bytes written/committed to current segment file
 
-	tailBlock         []byte // Aligned 4 KiB buffer for current block
-	tailOffset        int    // Current offset within tailBlock (0..4096)
-	blockOffset       int64  // Physical file offset where tailBlock starts
-	tailBlockOpenTime MonotonicTime
+	appendOff  int64 // physical file offset in active segment where next record appends
+	flushedOff int64 // physical file offset in active segment up to which data has been written to disk
+	tailOffset int   // current offset within 4 KiB block (0..4095) for inspection
 
 	nextLSN         uint64 // Next monotonic LSN to allocate under mu
 	lastAppendedLSN uint64 // Highest LSN successfully written to buffer
@@ -109,17 +111,14 @@ type WAL struct {
 	maxSegSize      int64
 	createdLSNs     map[uint64]bool // Asserts never reuse/recycle segment file names
 
-	queueCond      *sync.Cond
-	syncCond       *sync.Cond
-	queue          []pendingWALBlock
-	maxQueueBlocks int
-
 	writing   bool
 	writeCond *sync.Cond
+	syncCond  *sync.Cond
 
 	clock              Clock
 	tickInterval       time.Duration
 	oldestUnsyncedTime MonotonicTime
+	tailBlockOpenTime  MonotonicTime
 
 	wakeCh        chan struct{}
 	bgStop        chan struct{}
@@ -136,6 +135,7 @@ type WALOptions struct {
 	OnFailure      func(error)
 	Clock          Clock
 	TickInterval   time.Duration
+	BufferSize     int
 }
 
 // OpenWAL opens or creates a WAL in the given directory.
@@ -148,12 +148,22 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	}
 
 	maxSegSize := int64(DefaultMaxSegmentSize)
+	bufSize := DefaultWALBufferSize
 	var onFailure func(error)
 	var clock Clock = realClock{}
 	var tickInterval time.Duration
 	if len(opts) > 0 {
 		if opts[0].MaxSegmentSize > 0 {
 			maxSegSize = opts[0].MaxSegmentSize
+		}
+		if opts[0].BufferSize > 0 {
+			bufSize = opts[0].BufferSize
+			if bufSize < WALBlockSize {
+				bufSize = WALBlockSize
+			}
+			if rem := bufSize % WALBlockSize; rem != 0 {
+				bufSize += WALBlockSize - rem
+			}
 		}
 		onFailure = opts[0].OnFailure
 		if opts[0].Clock != nil {
@@ -168,12 +178,12 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		fs:              fs,
 		dir:             dir,
 		dbID:            dbID,
+		bufSize:         bufSize,
+		bufs:            [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
 		maxSegSize:      maxSegSize,
 		createdLSNs:     make(map[uint64]bool),
-		tailBlock:       AllocateAlignedBlock(WALBlockSize),
 		nextLSN:         initialLSN + 1,
 		lastAppendedLSN: initialLSN,
-		maxQueueBlocks:  1024,
 		clock:           clock,
 		tickInterval:    tickInterval,
 		wakeCh:          make(chan struct{}, 1),
@@ -181,7 +191,6 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		bgDone:          make(chan struct{}),
 		onFailure:       onFailure,
 	}
-	w.queueCond = sync.NewCond(&w.mu)
 	w.syncCond = sync.NewCond(&w.mu)
 	w.writeCond = sync.NewCond(&w.mu)
 
@@ -278,11 +287,64 @@ func (w *WAL) setStickyErrLocked(err error) {
 			w.onFailure(err)
 		}
 		w.syncCond.Broadcast()
-		w.queueCond.Broadcast()
-		if w.writeCond != nil {
-			w.writeCond.Broadcast()
-		}
+		w.writeCond.Broadcast()
 	}
+}
+
+func (w *WAL) writeBytesToBuffer(off int64, p []byte) {
+	for len(p) > 0 {
+		bufIdx := (off / int64(w.bufSize)) % 2
+		startInBuf := int(off % int64(w.bufSize))
+		toCopy := w.bufSize - startInBuf
+		if toCopy > len(p) {
+			toCopy = len(p)
+		}
+		copy(w.bufs[bufIdx][startInBuf:startInBuf+toCopy], p[:toCopy])
+		p = p[toCopy:]
+		off += int64(toCopy)
+	}
+}
+
+func (w *WAL) zeroRangeInBuffer(start, end int64) {
+	curr := start
+	for curr < end {
+		chunk := curr / int64(w.bufSize)
+		bufIdx := chunk % 2
+		startInBuf := int(curr % int64(w.bufSize))
+		chunkEnd := (chunk + 1) * int64(w.bufSize)
+		if chunkEnd > end {
+			chunkEnd = end
+		}
+		lenToZero := int(chunkEnd - curr)
+		clearBytes(w.bufs[bufIdx][startInBuf : startInBuf+lenToZero])
+		curr = chunkEnd
+	}
+}
+
+type writeSlice struct {
+	offset int64
+	data   []byte
+}
+
+func (w *WAL) collectWriteSlices(endOff int64) []writeSlice {
+	var slices []writeSlice
+	currOff := w.flushedOff
+	for currOff < endOff {
+		chunk := currOff / int64(w.bufSize)
+		bufIdx := chunk % 2
+		startInBuf := int(currOff % int64(w.bufSize))
+		chunkEnd := (chunk + 1) * int64(w.bufSize)
+		if chunkEnd > endOff {
+			chunkEnd = endOff
+		}
+		lenToWrite := int(chunkEnd - currOff)
+		slices = append(slices, writeSlice{
+			offset: currOff,
+			data:   w.bufs[bufIdx][startInBuf : startInBuf+lenToWrite],
+		})
+		currOff = chunkEnd
+	}
+	return slices
 }
 
 // flushQueueAndSync flushes queued blocks and syncs without holding w.mu during I/O.
@@ -297,11 +359,6 @@ func (w *WAL) flushQueueAndSync(isStop bool) {
 	timeoutSync := !w.oldestUnsyncedTime.IsZero() && now.Sub(w.oldestUnsyncedTime) >= 5*time.Second
 	doSync := isStop || w.syncRequested || timeoutSync
 
-	if !doSync && len(w.queue) == 0 {
-		w.mu.Unlock()
-		return
-	}
-
 	for w.writing {
 		w.writeCond.Wait()
 		if w.stickyErr != nil {
@@ -310,57 +367,47 @@ func (w *WAL) flushQueueAndSync(isStop bool) {
 		}
 	}
 
-	blocks := w.queue
-	w.queue = nil
-	w.queueCond.Broadcast()
-
-	if doSync && w.activeFile != nil {
-		if w.tailOffset > 0 {
-			for i := w.tailOffset; i < WALBlockSize; i++ {
-				w.tailBlock[i] = 0
-			}
-			blocks = append(blocks, pendingWALBlock{
-				file:      w.activeFile,
-				offset:    w.blockOffset,
-				block:     w.tailBlock,
-				maxLSN:    w.lastAppendedLSN,
-				createdAt: w.tailBlockOpenTime,
-			})
-			w.blockOffset += WALBlockSize
-			w.activeSize = w.blockOffset
-			w.tailOffset = 0
-			w.tailBlockOpenTime = 0
-			w.tailBlock = AllocateAlignedBlock(WALBlockSize)
-		}
-	}
-
-	if len(blocks) == 0 && !doSync {
+	if w.activeFile == nil {
 		w.mu.Unlock()
 		return
 	}
 
-	var syncFile File
+	if !doSync && (w.appendOff/int64(WALBlockSize)) == (w.flushedOff/int64(WALBlockSize)) {
+		w.mu.Unlock()
+		return
+	}
+
+	if doSync && w.appendOff%int64(WALBlockSize) != 0 {
+		paddedEnd := ((w.appendOff / int64(WALBlockSize)) + 1) * int64(WALBlockSize)
+		w.zeroRangeInBuffer(w.appendOff, paddedEnd)
+		w.appendOff = paddedEnd
+		w.tailOffset = 0
+		w.tailBlockOpenTime = 0
+	}
+
+	var endOff int64
+	var targetLSN uint64
 	if doSync {
-		syncFile = w.activeFile
+		endOff = w.appendOff
+		targetLSN = w.lastAppendedLSN
+	} else {
+		endOff = (w.appendOff / int64(WALBlockSize)) * int64(WALBlockSize)
 	}
 
-	var batchMaxLSN uint64
-	for _, b := range blocks {
-		if b.maxLSN > batchMaxLSN {
-			batchMaxLSN = b.maxLSN
-		}
-	}
-	if doSync && batchMaxLSN < w.lastAppendedLSN && len(blocks) == 0 {
-		batchMaxLSN = w.lastAppendedLSN
+	if endOff <= w.flushedOff && !doSync {
+		w.mu.Unlock()
+		return
 	}
 
+	slices := w.collectWriteSlices(endOff)
+	syncFile := w.activeFile
 	w.writing = true
 	w.mu.Unlock()
 
 	var writeErr error
-	for _, p := range blocks {
-		if _, err := p.file.WriteAt(p.block, p.offset); err != nil {
-			writeErr = fmt.Errorf("failed to write WAL block at offset %d: %w", p.offset, err)
+	for _, ws := range slices {
+		if _, err := syncFile.WriteAt(ws.data, ws.offset); err != nil {
+			writeErr = fmt.Errorf("failed to write WAL block at offset %d: %w", ws.offset, err)
 			break
 		}
 	}
@@ -383,21 +430,18 @@ func (w *WAL) flushQueueAndSync(isStop bool) {
 		return
 	}
 
+	if endOff > w.flushedOff {
+		w.flushedOff = endOff
+	}
+
 	if doSync {
-		if batchMaxLSN > w.fsyncedLSN.Load() {
-			w.fsyncedLSN.Store(batchMaxLSN)
+		if targetLSN > w.fsyncedLSN.Load() {
+			w.fsyncedLSN.Store(targetLSN)
 		}
-		if w.fsyncedLSN.Load() >= w.lastAppendedLSN && len(w.queue) == 0 && w.tailOffset == 0 {
+		if w.fsyncedLSN.Load() >= w.lastAppendedLSN && w.appendOff == w.flushedOff {
 			w.syncRequested = false
 			w.oldestUnsyncedTime = 0
-		} else {
-			if len(w.queue) > 0 {
-				w.oldestUnsyncedTime = w.queue[0].createdAt
-			} else if w.tailOffset > 0 {
-				w.oldestUnsyncedTime = w.tailBlockOpenTime
-			} else {
-				w.oldestUnsyncedTime = 0
-			}
+			w.tailBlockOpenTime = 0
 		}
 		w.syncCond.Broadcast()
 	}
@@ -409,47 +453,53 @@ func (w *WAL) flushQueueAndSyncDirectLocked(doSync bool) error {
 	if w.stickyErr != nil {
 		return w.stickyErr
 	}
+	if w.activeFile == nil {
+		return nil
+	}
 
-	for len(w.queue) > 0 {
-		p := w.queue[0]
-		w.queue = w.queue[1:]
-		w.queueCond.Signal()
+	if doSync && w.appendOff%int64(WALBlockSize) != 0 {
+		paddedEnd := ((w.appendOff / int64(WALBlockSize)) + 1) * int64(WALBlockSize)
+		w.zeroRangeInBuffer(w.appendOff, paddedEnd)
+		w.appendOff = paddedEnd
+		w.tailOffset = 0
+		w.tailBlockOpenTime = 0
+	}
 
-		if _, err := p.file.WriteAt(p.block, p.offset); err != nil {
-			w.setStickyErrLocked(fmt.Errorf("failed to write WAL block at offset %d: %w", p.offset, err))
+	var endOff int64
+	var targetLSN uint64
+	if doSync {
+		endOff = w.appendOff
+		targetLSN = w.lastAppendedLSN
+	} else {
+		endOff = (w.appendOff / int64(WALBlockSize)) * int64(WALBlockSize)
+	}
+
+	slices := w.collectWriteSlices(endOff)
+	for _, ws := range slices {
+		if _, err := w.activeFile.WriteAt(ws.data, ws.offset); err != nil {
+			w.setStickyErrLocked(fmt.Errorf("failed to write WAL block at offset %d: %w", ws.offset, err))
 			return w.stickyErr
 		}
 	}
 
-	if doSync && w.activeFile != nil {
-		targetLSN := w.lastAppendedLSN
-		if w.tailOffset > 0 {
-			for i := w.tailOffset; i < WALBlockSize; i++ {
-				w.tailBlock[i] = 0
-			}
-			if _, err := w.activeFile.WriteAt(w.tailBlock, w.blockOffset); err != nil {
-				w.setStickyErrLocked(fmt.Errorf("failed to write padded WAL block on sync: %w", err))
-				return w.stickyErr
-			}
-			w.blockOffset += WALBlockSize
-			w.activeSize = w.blockOffset
-			w.tailOffset = 0
-			w.tailBlockOpenTime = 0
-			w.tailBlock = AllocateAlignedBlock(WALBlockSize)
-		}
+	if endOff > w.flushedOff {
+		w.flushedOff = endOff
+	}
 
+	if doSync {
 		if err := w.activeFile.Sync(); err != nil {
 			w.setStickyErrLocked(fmt.Errorf("failed to fsync WAL segment: %w", err))
 			return w.stickyErr
 		}
-
 		if targetLSN > w.fsyncedLSN.Load() {
 			w.fsyncedLSN.Store(targetLSN)
 		}
 		w.oldestUnsyncedTime = 0
+		w.tailBlockOpenTime = 0
 		w.syncRequested = false
 		w.syncCond.Broadcast()
 	}
+	w.writeCond.Broadcast()
 	return nil
 }
 
@@ -460,7 +510,7 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 		return fmt.Errorf("invariant violation: segment file name for LSN %d already used", startLSN)
 	}
 
-	// Flush any queued blocks and sync existing active segment before rolling
+	// Flush and sync existing active segment before rolling
 	if w.activeFile != nil {
 		for w.writing {
 			w.writeCond.Wait()
@@ -471,6 +521,10 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 		if err := w.flushQueueAndSyncDirectLocked(true); err != nil {
 			return err
 		}
+		if err := w.activeFile.Close(); err != nil {
+			return fmt.Errorf("failed to close superseded active segment: %w", err)
+		}
+		w.activeFile = nil
 	}
 
 	name := segmentFileName(startLSN)
@@ -489,42 +543,29 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 		}
 	}
 
-	// Prepare segment header in tail block
-	clearBytes(w.tailBlock)
-	binary.BigEndian.PutUint32(w.tailBlock[0:4], WALMagic)
-	binary.BigEndian.PutUint32(w.tailBlock[4:8], WALVersion)
-	// bytes 8..16 reserved zero padding
-	copy(w.tailBlock[16:32], w.dbID[:])
-
-	// Write initial header block
-	if _, err := f.WriteAt(w.tailBlock, 0); err != nil {
-		return errors.Join(fmt.Errorf("failed to write segment header: %w", err), f.Close())
-	}
-
-	// Fsync the segment file
-	if err := f.Sync(); err != nil {
-		return errors.Join(fmt.Errorf("failed to sync new segment file: %w", err), f.Close())
-	}
-
 	// Fsync the directory after creating a segment
 	if err := w.fs.SyncDir(w.dir); err != nil {
-		return errors.Join(fmt.Errorf("failed to fsync directory after segment creation: %w", err), f.Close())
-	}
-
-	if w.activeFile != nil {
-		closeErr := w.activeFile.Close()
-		if closeErr != nil {
-			return fmt.Errorf("failed to close superseded active segment: %w", closeErr)
-		}
+		_ = f.Close()
+		return fmt.Errorf("failed to fsync directory after segment creation: %w", err)
 	}
 
 	w.activeFile = f
 	w.activePath = path
 	w.activeStartLSN = startLSN
-	w.blockOffset = 0
+	w.flushedOff = 0
+	w.appendOff = SegmentHeaderSize
 	w.tailOffset = SegmentHeaderSize
-	w.activeSize = int64(SegmentHeaderSize)
+	w.oldestUnsyncedTime = 0
+	w.tailBlockOpenTime = 0
 	w.createdLSNs[startLSN] = true
+
+	// Write segment header into buffer 0 at offset 0..32
+	clearBytes(w.bufs[0][:SegmentHeaderSize])
+	binary.BigEndian.PutUint32(w.bufs[0][0:4], WALMagic)
+	binary.BigEndian.PutUint32(w.bufs[0][4:8], WALVersion)
+	// bytes 8..16 zeroed
+	copy(w.bufs[0][16:32], w.dbID[:])
+
 	return nil
 }
 
@@ -584,70 +625,194 @@ func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 		w.maxLSN.Store(r.LSN)
 	}
 
-	encoded := EncodeRecord(*r)
-
-	// Block if queue is full (bounded buffer)
-	for len(w.queue) >= w.maxQueueBlocks {
-		if w.stickyErr != nil {
-			return 0, w.stickyErr
-		}
-		w.queueCond.Wait()
-	}
+	keyLen := len(r.Key)
+	payloadLen := len(r.Payload)
+	tokenLen := len(r.Token)
+	recLen := RecordHeaderSize + keyLen + payloadLen + tokenLen
 
 	now := w.clock.Now()
 	if w.oldestUnsyncedTime.IsZero() {
 		w.oldestUnsyncedTime = now
 	}
 
-	// If no active file or file exceeds max size, roll to a new segment
-	if w.activeFile == nil || w.blockOffset+int64(w.tailOffset)+int64(len(encoded)) > w.maxSegSize {
-		if err := w.createSegmentLocked(r.LSN); err != nil {
-			return 0, err
+	for {
+		if w.stickyErr != nil {
+			return 0, w.stickyErr
 		}
-	}
-
-	if w.tailOffset == 0 && w.tailBlockOpenTime.IsZero() {
-		w.tailBlockOpenTime = now
-	}
-
-	written := 0
-	for written < len(encoded) {
-		space := WALBlockSize - w.tailOffset
-		toCopy := len(encoded) - written
-		if toCopy > space {
-			toCopy = space
+		if w.closed {
+			return 0, errors.New("wal is closed")
 		}
-		copy(w.tailBlock[w.tailOffset:w.tailOffset+toCopy], encoded[written:written+toCopy])
-		w.tailOffset += toCopy
-		written += toCopy
 
-		if w.tailOffset == WALBlockSize {
-			// Enqueue full 4 KiB block for background direct I/O writing
-			w.queue = append(w.queue, pendingWALBlock{
-				file:      w.activeFile,
-				offset:    w.blockOffset,
-				block:     w.tailBlock,
-				maxLSN:    r.LSN,
-				createdAt: w.tailBlockOpenTime,
-			})
-			w.blockOffset += WALBlockSize
-			w.activeSize = w.blockOffset
-			w.tailOffset = 0
-			w.tailBlockOpenTime = 0
-			w.tailBlock = AllocateAlignedBlock(WALBlockSize)
-
-			select {
-			case w.wakeCh <- struct{}{}:
-			default:
+		// If no active file or record exceeds segment size, roll segment
+		if w.activeFile == nil || w.appendOff+int64(recLen) > w.maxSegSize {
+			if err := w.createSegmentLocked(r.LSN); err != nil {
+				return 0, err
 			}
 		}
+
+		if recLen > w.bufSize {
+			if w.writing {
+				w.writeCond.Wait()
+				continue
+			}
+			break
+		}
+
+		startChunk := w.appendOff / int64(w.bufSize)
+		endChunk := (w.appendOff + int64(recLen) - 1) / int64(w.bufSize)
+
+		needWait := false
+		for chunk := startChunk; chunk <= endChunk; chunk++ {
+			if chunk >= 2 {
+				requiredFlushedOff := (chunk - 1) * int64(w.bufSize)
+				if w.flushedOff < requiredFlushedOff {
+					needWait = true
+					break
+				}
+			}
+		}
+
+		if !needWait {
+			break
+		}
+
+		select {
+		case w.wakeCh <- struct{}{}:
+		default:
+		}
+		w.writeCond.Wait()
 	}
 
-	if w.tailOffset > 0 && w.tailBlockOpenTime.IsZero() {
+	if w.tailBlockOpenTime.IsZero() {
 		w.tailBlockOpenTime = now
 	}
 
+	// Format record header into 36-byte stack buffer
+	var hdr [RecordHeaderSize]byte
+	hdr[0] = RecordMagic
+	hdr[1] = RecordFormatVersion
+	hdr[2] = byte(r.Type)
+	hdr[3] = 0 // reserved
+	binary.BigEndian.PutUint64(hdr[4:12], r.LSN)
+	binary.BigEndian.PutUint64(hdr[12:20], r.RedoStartLSN)
+	binary.BigEndian.PutUint32(hdr[20:24], uint32(keyLen))
+	binary.BigEndian.PutUint32(hdr[24:28], uint32(payloadLen))
+	binary.BigEndian.PutUint32(hdr[28:32], uint32(tokenLen))
+	// bytes 32..36 are zero for CRC calculation
+
+	if recLen > w.bufSize {
+		// Record exceeds buffer capacity: compute CRC incrementally and stream through double buffers
+		h := crc32.Update(0, castagnoliTable, hdr[:])
+		if keyLen > 0 {
+			h = crc32.Update(h, castagnoliTable, []byte(r.Key))
+		}
+		if payloadLen > 0 {
+			h = crc32.Update(h, castagnoliTable, r.Payload)
+		}
+		if tokenLen > 0 {
+			h = crc32.Update(h, castagnoliTable, []byte(r.Token))
+		}
+		binary.BigEndian.PutUint32(hdr[32:36], h)
+
+		for w.writing {
+			w.writeCond.Wait()
+			if w.stickyErr != nil {
+				return 0, w.stickyErr
+			}
+		}
+		if err := w.flushQueueAndSyncDirectLocked(false); err != nil {
+			return 0, err
+		}
+
+		appendPiece := func(p []byte) error {
+			for len(p) > 0 {
+				bufIdx := (w.appendOff / int64(w.bufSize)) % 2
+				startInBuf := int(w.appendOff % int64(w.bufSize))
+				toCopy := w.bufSize - startInBuf
+				if toCopy > len(p) {
+					toCopy = len(p)
+				}
+				copy(w.bufs[bufIdx][startInBuf:startInBuf+toCopy], p[:toCopy])
+				p = p[toCopy:]
+				w.appendOff += int64(toCopy)
+
+				if w.appendOff%int64(w.bufSize) == 0 {
+					chunkStart := w.appendOff - int64(w.bufSize)
+					slice := w.bufs[bufIdx]
+					if _, err := w.activeFile.WriteAt(slice, chunkStart); err != nil {
+						w.setStickyErrLocked(fmt.Errorf("failed to write WAL chunk at %d: %w", chunkStart, err))
+						return w.stickyErr
+					}
+					w.flushedOff = w.appendOff
+				}
+			}
+			return nil
+		}
+
+		if err := appendPiece(hdr[:]); err != nil {
+			return 0, err
+		}
+		if keyLen > 0 {
+			if err := appendPiece([]byte(r.Key)); err != nil {
+				return 0, err
+			}
+		}
+		if payloadLen > 0 {
+			if err := appendPiece(r.Payload); err != nil {
+				return 0, err
+			}
+		}
+		if tokenLen > 0 {
+			if err := appendPiece([]byte(r.Token)); err != nil {
+				return 0, err
+			}
+		}
+	} else {
+		recStartOff := w.appendOff
+		startChunk := recStartOff / int64(w.bufSize)
+		endChunk := (recStartOff + int64(recLen) - 1) / int64(w.bufSize)
+
+		if startChunk == endChunk {
+			bufIdx := startChunk % 2
+			startInBuf := int(recStartOff % int64(w.bufSize))
+			dest := w.bufs[bufIdx][startInBuf : startInBuf+recLen]
+			copy(dest[0:36], hdr[:])
+			copy(dest[36:36+keyLen], r.Key)
+			copy(dest[36+keyLen:36+keyLen+payloadLen], r.Payload)
+			copy(dest[36+keyLen+payloadLen:recLen], r.Token)
+			crc := crc32.Checksum(dest, castagnoliTable)
+			binary.BigEndian.PutUint32(dest[32:36], crc)
+		} else {
+			w.writeBytesToBuffer(recStartOff, hdr[:])
+			if keyLen > 0 {
+				w.writeBytesToBuffer(recStartOff+36, []byte(r.Key))
+			}
+			if payloadLen > 0 {
+				w.writeBytesToBuffer(recStartOff+36+int64(keyLen), r.Payload)
+			}
+			if tokenLen > 0 {
+				w.writeBytesToBuffer(recStartOff+36+int64(keyLen)+int64(payloadLen), []byte(r.Token))
+			}
+			buf1 := w.bufs[startChunk%2][recStartOff%int64(w.bufSize) : w.bufSize]
+			len2 := recLen - len(buf1)
+			buf2 := w.bufs[endChunk%2][0 : len2]
+			crc := crc32.Update(0, castagnoliTable, buf1)
+			crc = crc32.Update(crc, castagnoliTable, buf2)
+			var crcBuf [4]byte
+			binary.BigEndian.PutUint32(crcBuf[:], crc)
+			w.writeBytesToBuffer(recStartOff+32, crcBuf[:])
+		}
+
+		w.appendOff += int64(recLen)
+	}
+	w.tailOffset = int(w.appendOff % int64(WALBlockSize))
 	w.lastAppendedLSN = r.LSN
+
+	select {
+	case w.wakeCh <- struct{}{}:
+	default:
+	}
+
 	return r.LSN, nil
 }
 
@@ -672,7 +837,7 @@ func (w *WAL) SyncThrough(lsn uint64) error {
 		if w.fsyncedLSN.Load() >= lsn {
 			return nil
 		}
-		if w.fsyncedLSN.Load() >= w.lastAppendedLSN {
+		if w.fsyncedLSN.Load() >= w.lastAppendedLSN && w.appendOff == w.flushedOff {
 			// All appended WAL records are already fsynced
 			return nil
 		}
@@ -731,8 +896,8 @@ func (w *WAL) Close() error {
 		return nil
 	}
 	w.closed = true
-	w.queueCond.Broadcast()
 	w.syncCond.Broadcast()
+	w.writeCond.Broadcast()
 	close(w.bgStop)
 	w.mu.Unlock()
 
