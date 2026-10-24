@@ -591,3 +591,38 @@ func TestEngine_TokenPerBucket(t *testing.T) {
 		t.Fatalf("Secret recovered wrong RV: got %q, want %q", store2.Token("Secret"), "secret-rv-600")
 	}
 }
+
+func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
+	const numFrames = 256
+	const objectCount = 2000
+	payload := make([]byte, 2048)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+
+	b.SetBytes(int64(objectCount * len(payload)))
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		b.StopTimer()
+		dir := b.TempDir()
+		store, err := Open(WithDir(dir), WithNumFrames(numFrames))
+		if err != nil {
+			b.Fatalf("Open failed: %v", err)
+		}
+		b.StartTimer()
+
+		for i := 0; i < objectCount; i++ {
+			key := fmt.Sprintf("bench-key-%05d", i)
+			token := fmt.Sprintf("%d", i)
+			if err := store.Put("bench-bucket", key, payload, token); err != nil {
+				b.Fatalf("Put failed at %d: %v", i, err)
+			}
+		}
+
+		b.StopTimer()
+		_ = store.Close()
+		b.StartTimer()
+	}
+}
+

@@ -178,17 +178,7 @@ func (b *BuddyAllocator) allocateLocked(order int) (uint64, error) {
 	return block, nil
 }
 
-// Free releases previously allocated blocks starting at block and merges buddies.
-func (b *BuddyAllocator) Free(block uint64) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	order, exists := b.allocated[block]
-	if !exists {
-		return fmt.Errorf("block %d not allocated", block)
-	}
-	delete(b.allocated, block)
-
+func (b *BuddyAllocator) insertAndCoalesceFreeLocked(order int, block uint64) {
 	currBlock := block
 	currOrder := order
 	for currOrder < MaxOrder {
@@ -206,7 +196,150 @@ func (b *BuddyAllocator) Free(block uint64) error {
 	}
 
 	b.insertFree(currOrder, currBlock)
+}
+
+func (b *BuddyAllocator) returnFreeRangeLocked(start, count uint64) {
+	curr := start
+	end := start + count
+	for curr < end {
+		order := 0
+		for order < MaxOrder {
+			nextOrder := order + 1
+			blockSize := uint64(1 << nextOrder)
+			if curr+blockSize <= end && curr%blockSize == 0 {
+				order = nextOrder
+			} else {
+				break
+			}
+		}
+		b.insertAndCoalesceFreeLocked(order, curr)
+		curr += uint64(1 << order)
+	}
+}
+
+// Free releases previously allocated blocks starting at block and merges buddies.
+func (b *BuddyAllocator) Free(block uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	order, exists := b.allocated[block]
+	if !exists {
+		return fmt.Errorf("block %d not allocated", block)
+	}
+	delete(b.allocated, block)
+
+	b.insertAndCoalesceFreeLocked(order, block)
 	return nil
+}
+
+// AllocateBatch reserves a contiguous extent of physical blocks for a batch of pages,
+// recording each individual page allocation in the allocator.
+func (b *BuddyAllocator) AllocateBatch(orders []int) ([]uint64, error) {
+	if len(orders) == 0 {
+		return nil, nil
+	}
+	for _, o := range orders {
+		if o < MinOrder || o > MaxOrder {
+			return nil, fmt.Errorf("invalid order %d in batch", o)
+		}
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.allocateBatchLocked(orders)
+}
+
+func (b *BuddyAllocator) allocateBatchLocked(orders []int) ([]uint64, error) {
+	totalBlocks := 0
+	maxOrder := 0
+	for _, o := range orders {
+		totalBlocks += 1 << o
+		if o > maxOrder {
+			maxOrder = o
+		}
+	}
+
+	minOrder := 0
+	for (1 << minOrder) < totalBlocks && minOrder <= MaxOrder {
+		minOrder++
+	}
+
+	var startBlock uint64
+	extentFound := false
+
+	if minOrder <= MaxOrder {
+		targetOrder := -1
+		var lowestBlock uint64 = ^uint64(0)
+		for o := minOrder; o <= MaxOrder; o++ {
+			if len(b.freeLists[o]) > 0 {
+				blk := b.freeLists[o][0]
+				if blk < lowestBlock {
+					lowestBlock = blk
+					targetOrder = o
+				}
+			}
+		}
+
+		if targetOrder != -1 {
+			startBlock = b.freeLists[targetOrder][0]
+			b.removeFree(targetOrder, startBlock)
+			extentSize := uint64(1 << targetOrder)
+			if rem := extentSize - uint64(totalBlocks); rem > 0 {
+				b.returnFreeRangeLocked(startBlock+uint64(totalBlocks), rem)
+			}
+			extentFound = true
+		}
+	}
+
+	if !extentFound {
+		chunks := (totalBlocks + DefaultGrowBlocks - 1) / DefaultGrowBlocks
+		list := b.freeLists[MaxOrder]
+		var foundIdx int = -1
+		for i := 0; i+chunks <= len(list); i++ {
+			base := list[i]
+			consec := true
+			for j := 1; j < chunks; j++ {
+				if list[i+j] != base+uint64(j*DefaultGrowBlocks) {
+					consec = false
+					break
+				}
+			}
+			if consec {
+				foundIdx = i
+				startBlock = base
+				break
+			}
+		}
+
+		if foundIdx != -1 {
+			b.freeLists[MaxOrder] = append(list[:foundIdx], list[foundIdx+chunks:]...)
+			extentSize := uint64(chunks * DefaultGrowBlocks)
+			if rem := extentSize - uint64(totalBlocks); rem > 0 {
+				b.returnFreeRangeLocked(startBlock+uint64(totalBlocks), rem)
+			}
+			extentFound = true
+		} else {
+			growBlocks := uint64(chunks * DefaultGrowBlocks)
+			startBlock = b.totalBlocks
+			b.growLocked(growBlocks)
+			for blk := startBlock; blk < startBlock+growBlocks; blk += uint64(DefaultGrowBlocks) {
+				b.removeFree(MaxOrder, blk)
+			}
+			if rem := growBlocks - uint64(totalBlocks); rem > 0 {
+				b.returnFreeRangeLocked(startBlock+uint64(totalBlocks), rem)
+			}
+		}
+	}
+
+	locs := make([]uint64, len(orders))
+	curr := startBlock
+	for i, o := range orders {
+		locs[i] = curr
+		b.allocated[curr] = o
+		curr += uint64(1 << o)
+	}
+	return locs, nil
 }
 
 // MarkAllocated marks specific blocks as allocated during crash recovery.
