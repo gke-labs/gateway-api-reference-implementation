@@ -51,6 +51,17 @@ func NewHarness(t *testing.T, clusterName string) *Harness {
 
 func (h *Harness) Setup() {
 	h.t.Logf("Setting up harness for cluster %s", h.clusterName)
+
+	gitRoot := h.GetGitRoot()
+	buildBin := filepath.Join(gitRoot, ".build/bin")
+	if _, err := os.Stat(buildBin); err != nil {
+		if !os.IsNotExist(err) {
+			h.t.Logf("checking .build/bin: %v", err)
+		}
+	} else {
+		h.t.Setenv("PATH", buildBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+
 	// Check if kind is installed
 	if _, err := exec.LookPath("kind"); err != nil {
 		h.t.Fatalf("kind not found: %v", err)
@@ -124,7 +135,7 @@ func (h *Harness) GetGitRoot() string {
 
 func (h *Harness) DockerBuild(tag, dockerfile, context string) {
 	h.t.Logf("Building docker image %s", tag)
-	h.runCmd("docker", "build", "-t", tag, "-f", dockerfile, context)
+	h.runCmd("docker", "buildx", "build", "-t", tag, "-f", dockerfile, context)
 }
 
 func (h *Harness) KindLoad(tag string) {

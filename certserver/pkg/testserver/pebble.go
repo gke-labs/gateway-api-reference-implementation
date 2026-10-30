@@ -15,6 +15,8 @@
 package testserver
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -41,6 +43,8 @@ type ServerConfig struct {
 	ValidityPeriod   uint64
 	ChallengeStore   challenge.Store
 	ChallengeHandler http.Handler
+	ChallengePort    int
+	ResolvedIP       string
 }
 
 // Server encapsulates an in-process Pebble ACME test environment.
@@ -49,13 +53,25 @@ type Server struct {
 	HTTPClient      *http.Client
 	ChallengeStore  challenge.Store
 	ChallengeServer *httptest.Server
+	ServerCert      *x509.Certificate
+	ServerCertPEM   []byte
+	RootCert        *x509.Certificate
+	RootCertPEM     []byte
 	dnsServer       *dns.Server
 	dnsListener     net.Listener
 	pebbleServer    *httptest.Server
+	dnsHandler      *mockDNSHandler
 
 	// mu guards closed state to prevent concurrent or duplicate server shutdown.
 	mu     sync.Mutex
 	closed bool
+}
+
+// SetResolvedIP dynamically updates the IP address returned by mock DNS for TypeA queries.
+func (s *Server) SetResolvedIP(ip string) {
+	if s.dnsHandler != nil {
+		s.dnsHandler.setIP(ip)
+	}
 }
 
 // StartPebble creates and starts an in-process Pebble server without external network dependencies.
@@ -87,14 +103,19 @@ func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 		t.Fatalf("failed to convert challenge port: %v", err)
 	}
 
-	// 2. Start mock DNS server that resolves all names to 127.0.0.1 via TCP (which Pebble VA uses)
+	chalPort := challengePort
+	if cfg.ChallengePort > 0 {
+		chalPort = cfg.ChallengePort
+	}
+
+	// 2. Start mock DNS server that resolves all names to configured IP (default 127.0.0.1) via TCP (which Pebble VA uses)
 	dnsListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		challengeSrv.Close()
 		t.Fatalf("failed to start TCP listener for mock DNS: %v", err)
 	}
 
-	dnsHandler := &mockDNSHandler{}
+	dnsHandler := &mockDNSHandler{ip: cfg.ResolvedIP}
 	dnsSrv := &dns.Server{
 		Listener: dnsListener,
 		Handler:  dnsHandler,
@@ -131,20 +152,39 @@ func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 	}
 
 	pebbleCA := ca.New(logger, memDB, "", "ecdsa", 0, 1, profiles)
-	pebbleVA := va.New(logger, challengePort, 0, false, dnsAddr, memDB)
+	pebbleVA := va.New(logger, chalPort, 0, false, dnsAddr, memDB)
 	pebbleWFE := wfe.New(logger, memDB, pebbleVA, pebbleCA, []string{"pebble.letsencrypt.org"}, false, eabRequired, 0, 0)
 
 	pebbleSrv := httptest.NewTLSServer(pebbleWFE.Handler())
 	dirURL := fmt.Sprintf("%s%s", pebbleSrv.URL, wfe.DirectoryPath)
+
+	serverCert := pebbleSrv.Certificate()
+	var serverPEM []byte
+	if serverCert != nil {
+		serverPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCert.Raw})
+	}
+
+	rootCert := pebbleCA.GetRootCert(0)
+	var rootX509 *x509.Certificate
+	var rootPEM []byte
+	if rootCert != nil {
+		rootX509 = rootCert.Cert
+		rootPEM = rootCert.PEM()
+	}
 
 	srv := &Server{
 		DirectoryURL:    dirURL,
 		HTTPClient:      pebbleSrv.Client(),
 		ChallengeStore:  challengeStore,
 		ChallengeServer: challengeSrv,
+		ServerCert:      serverCert,
+		ServerCertPEM:   serverPEM,
+		RootCert:        rootX509,
+		RootCertPEM:     rootPEM,
 		dnsServer:       dnsSrv,
 		dnsListener:     dnsListener,
 		pebbleServer:    pebbleSrv,
+		dnsHandler:      dnsHandler,
 	}
 
 	t.Cleanup(func() {
@@ -181,17 +221,37 @@ func (s *Server) Close() {
 	}
 }
 
-type mockDNSHandler struct{}
+type mockDNSHandler struct {
+	// mu guards ip to allow concurrent updates and reads during testing.
+	mu sync.RWMutex
+	ip string
+}
+
+func (h *mockDNSHandler) setIP(ip string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ip = ip
+}
+
+func (h *mockDNSHandler) getIP() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.ip != "" {
+		return h.ip
+	}
+	return "127.0.0.1"
+}
 
 func (h *mockDNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	m := new(dns.Msg)
 	m.SetReply(r)
 	m.Authoritative = true
+	targetIP := h.getIP()
 
 	for _, q := range r.Question {
 		switch q.Qtype {
 		case dns.TypeA:
-			rr, err := dns.NewRR(fmt.Sprintf("%s 60 IN A 127.0.0.1", q.Name))
+			rr, err := dns.NewRR(fmt.Sprintf("%s 60 IN A %s", q.Name, targetIP))
 			if err != nil {
 				continue
 			}

@@ -54,11 +54,30 @@ if [[ ! -x "${DOCKER_BIN}" ]]; then
 fi
 ln -sf "../src/docker/${DOCKER_VERSION}/bin/docker" "${REPO_ROOT}/.build/bin/docker"
 
+# Install docker-buildx plugin
+BUILDX_VERSION="v0.21.1"
+BUILDX_SHA256="7f355525bfaf411302570b705118181b720f18071f4be3f0eaac7b2297d826e2"
+BUILDX_BIN="${REPO_ROOT}/.build/src/docker-buildx/${BUILDX_VERSION}/bin/docker-buildx"
+if [[ ! -x "${BUILDX_BIN}" ]]; then
+    echo "Installing docker-buildx ${BUILDX_VERSION}..."
+    mkdir -p "$(dirname "${BUILDX_BIN}")"
+    curl -sLo "${BUILDX_BIN}" "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
+    echo "${BUILDX_SHA256}  ${BUILDX_BIN}" | sha256sum -c -
+    chmod +x "${BUILDX_BIN}"
+fi
+ln -sf "../src/docker-buildx/${BUILDX_VERSION}/bin/docker-buildx" "${REPO_ROOT}/.build/bin/docker-buildx"
+mkdir -p "${HOME}/.docker/cli-plugins"
+ln -sf "${REPO_ROOT}/.build/bin/docker-buildx" "${HOME}/.docker/cli-plugins/docker-buildx"
+
 export PATH="${REPO_ROOT}/.build/bin:${PATH}"
+export DOCKER_BUILDKIT=1
 export RUN_E2E=1
 
 echo "Running basic E2E tests..."
 go test -v ./tests/e2e/... -run TestGatewayAPI
+
+echo "Running certserver E2E tests..."
+(cd certserver && go test -v ./tests/e2e/... -run TestCertserver)
 
 echo "Running SNIGateway E2E tests..."
 (cd snigateway && go test -v ./tests/e2e/... -run TestSNIGateway)
