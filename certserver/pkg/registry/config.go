@@ -63,10 +63,36 @@ type ServerConfig struct {
 	Clusters []ClusterConfig `json:"clusters"`
 }
 
+// ValidateClusterID validates that clusterID is a safe name complying with DNS-1123 label format:
+// 1-63 lowercase alphanumeric characters or '-', starting and ending with an alphanumeric character.
+func ValidateClusterID(clusterID string) error {
+	id := strings.TrimSpace(clusterID)
+	if id == "" {
+		return errors.New("clusterID is required")
+	}
+	if len(id) > 63 {
+		return fmt.Errorf("clusterID %q exceeds maximum length of 63 characters", id)
+	}
+	for i := 0; i < len(id); i++ {
+		ch := id[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') {
+			continue
+		}
+		if ch == '-' {
+			if i == 0 || i == len(id)-1 {
+				return fmt.Errorf("clusterID %q cannot start or end with a hyphen", id)
+			}
+			continue
+		}
+		return fmt.Errorf("clusterID %q is invalid: must be a DNS-1123 label (lowercase alphanumeric characters or '-', starting and ending with an alphanumeric character)", id)
+	}
+	return nil
+}
+
 // Validate validates the cluster configuration entry.
 func (c *ClusterConfig) Validate() error {
-	if strings.TrimSpace(c.ClusterID) == "" {
-		return errors.New("clusterID is required")
+	if err := ValidateClusterID(c.ClusterID); err != nil {
+		return err
 	}
 	if strings.TrimSpace(c.IssuerURL) == "" {
 		return fmt.Errorf("cluster %q: issuerURL is required", c.ClusterID)

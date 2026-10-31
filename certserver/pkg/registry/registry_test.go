@@ -25,6 +25,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -777,5 +779,330 @@ func TestIsAuthorizedForwarder(t *testing.T) {
 	if !IsAuthorizedForwarder(reg, bindingStore, "cluster-d", "default/gw-special", "default/dp-d",
 		CallerIdentity{ClusterID: "cluster-d", Namespace: "default", ServiceAccount: "dp-d"}) {
 		t.Errorf("expected authorized for same gateway")
+	}
+}
+
+func TestRegistry_DirectoryRegistration(t *testing.T) {
+	tempDir := t.TempDir()
+	regDir := filepath.Join(tempDir, "clusters")
+	if err := os.MkdirAll(regDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	var auditBuf bytes.Buffer
+	auditLogger := NewAuditLogger(&auditBuf)
+
+	// Static cluster setup
+	staticKey := generateRSAKey(t)
+	staticJWKS := buildJWKS(map[string]*rsa.PublicKey{"static-key-1": &staticKey.PublicKey})
+	staticJWKSFile := filepath.Join(tempDir, "static-jwks.json")
+	if err := os.WriteFile(staticJWKSFile, staticJWKS, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	staticCluster := ClusterConfig{
+		ClusterID:                "static-1",
+		IssuerURL:                "https://issuer.static.example.com",
+		JWKSFile:                 staticJWKSFile,
+		ControllerServiceAccount: "system:serviceaccount:default:static-controller",
+	}
+
+	reg, err := NewRegistry([]ClusterConfig{staticCluster},
+		WithRegistrationDir(regDir),
+		WithPollInterval(25*time.Millisecond),
+		WithAuditLogger(auditLogger),
+	)
+	if err != nil {
+		t.Fatalf("NewRegistry failed: %v", err)
+	}
+	defer func() {
+		if err := reg.Close(); err != nil {
+			t.Errorf("reg.Close: %v", err)
+		}
+	}()
+
+	ctx := t.Context()
+
+	// 1. Static cluster token verifies
+	staticToken := signJWT(t,
+		map[string]any{"alg": "RS256", "kid": "static-key-1"},
+		map[string]any{
+			"iss": "https://issuer.static.example.com",
+			"sub": "system:serviceaccount:default:static-controller",
+			"aud": []string{CertServerAudience},
+			"exp": time.Now().Add(time.Hour).Unix(),
+		},
+		staticKey,
+	)
+	if _, _, err := reg.VerifyToken(ctx, staticToken, "static-1"); err != nil {
+		t.Fatalf("failed to verify static cluster token: %v", err)
+	}
+
+	// Dynamic cluster setup
+	clusterID := "dynamic-1"
+	clusterDir := filepath.Join(regDir, clusterID)
+	issuerURL := "https://issuer.dynamic.example.com"
+
+	key1 := generateRSAKey(t)
+	jwksData1 := buildJWKS(map[string]*rsa.PublicKey{"key-1": &key1.PublicKey})
+
+	token1 := signJWT(t,
+		map[string]any{"alg": "RS256", "kid": "key-1"},
+		map[string]any{
+			"iss": issuerURL,
+			"sub": "system:serviceaccount:default:my-controller",
+			"aud": []string{CertServerAudience},
+			"exp": time.Now().Add(time.Hour).Unix(),
+		},
+		key1,
+	)
+
+	// Before registration, verifying token for dynamic-1 fails
+	if _, _, err := reg.VerifyToken(ctx, token1, clusterID); err == nil {
+		t.Fatal("expected token verification to fail for unregistered cluster")
+	}
+
+	// 2. Register new cluster while running (no restart)
+	if err := os.MkdirAll(clusterDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	clusterCfg := ClusterConfig{
+		ClusterID:                clusterID,
+		IssuerURL:                issuerURL,
+		ControllerServiceAccount: "system:serviceaccount:default:my-controller",
+		AllowedHostnames:         []string{"*.example.com"},
+	}
+	cfgBytes, _ := json.MarshalIndent(clusterCfg, "", "  ")
+
+	// Write files atomically using temp file + rename
+	tmpJWKS := filepath.Join(clusterDir, ".jwks.json.tmp")
+	if err := os.WriteFile(tmpJWKS, jwksData1, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmpJWKS, filepath.Join(clusterDir, "jwks.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	tmpCluster := filepath.Join(clusterDir, ".cluster.json.tmp")
+	if err := os.WriteFile(tmpCluster, cfgBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmpCluster, filepath.Join(clusterDir, "cluster.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for background reload
+	deadline := time.Now().Add(2 * time.Second)
+	var verifiedID CallerIdentity
+	for time.Now().Before(deadline) {
+		id, _, err := reg.VerifyToken(ctx, token1, clusterID)
+		if err == nil {
+			verifiedID = id
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if verifiedID.ClusterID != clusterID {
+		t.Fatalf("dynamic cluster token did not verify after directory creation: expected %s, got %s", clusterID, verifiedID.ClusterID)
+	}
+
+	// Verify audit log recorded RegisterCluster
+	if !strings.Contains(auditBuf.String(), `"RegisterCluster"`) || !strings.Contains(auditBuf.String(), `"allowed"`) {
+		t.Errorf("expected audit log to record allowed RegisterCluster, got:\n%s", auditBuf.String())
+	}
+
+	// 3. Key rotation: replace JWKS with key-1 + key-2
+	key2 := generateRSAKey(t)
+	jwksData2 := buildJWKS(map[string]*rsa.PublicKey{
+		"key-1": &key1.PublicKey,
+		"key-2": &key2.PublicKey,
+	})
+
+	token2 := signJWT(t,
+		map[string]any{"alg": "RS256", "kid": "key-2"},
+		map[string]any{
+			"iss": issuerURL,
+			"sub": "system:serviceaccount:default:my-controller",
+			"aud": []string{CertServerAudience},
+			"exp": time.Now().Add(time.Hour).Unix(),
+		},
+		key2,
+	)
+
+	tmpJWKS2 := filepath.Join(clusterDir, ".jwks.json.tmp2")
+	if err := os.WriteFile(tmpJWKS2, jwksData2, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmpJWKS2, filepath.Join(clusterDir, "jwks.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for background reload of key rotation
+	deadline = time.Now().Add(2 * time.Second)
+	key2Verified := false
+	for time.Now().Before(deadline) {
+		if _, _, err := reg.VerifyToken(ctx, token2, clusterID); err == nil {
+			key2Verified = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !key2Verified {
+		t.Fatal("token signed with rotated key-2 did not verify")
+	}
+
+	// Old key-1 token should still verify
+	if _, _, err := reg.VerifyToken(ctx, token1, clusterID); err != nil {
+		t.Fatalf("token signed with key-1 failed after rotation: %v", err)
+	}
+
+	// 4. Invalid upload is rejected, previous registration stays active
+	auditBuf.Reset()
+	// Write invalid jwks.json (e.g. empty keys list)
+	invalidJWKSTmp := filepath.Join(clusterDir, ".jwks.json.tmp_invalid")
+	if err := os.WriteFile(invalidJWKSTmp, []byte(`{"keys":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(invalidJWKSTmp, filepath.Join(clusterDir, "jwks.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger sync
+	if err := reg.SyncRegistrationDir(ctx); err != nil {
+		t.Fatalf("SyncRegistrationDir failed: %v", err)
+	}
+
+	// Verification of key-1 and key-2 STILL works!
+	if _, _, err := reg.VerifyToken(ctx, token1, clusterID); err != nil {
+		t.Fatalf("key-1 token failed after invalid JWKS upload: %v", err)
+	}
+	if _, _, err := reg.VerifyToken(ctx, token2, clusterID); err != nil {
+		t.Fatalf("key-2 token failed after invalid JWKS upload: %v", err)
+	}
+
+	// Verify audit log has refusal
+	if !strings.Contains(auditBuf.String(), `"refused"`) {
+		t.Errorf("expected audit log refusal for invalid JWKS upload, got:\n%s", auditBuf.String())
+	}
+
+	// Restore valid JWKS
+	if err := os.WriteFile(filepath.Join(clusterDir, "jwks.json"), jwksData2, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write invalid cluster.json (non-HTTPS issuer)
+	auditBuf.Reset()
+	invalidCluster := clusterCfg
+	invalidCluster.IssuerURL = "http://insecure.example.com"
+	invalidClusterBytes, _ := json.Marshal(invalidCluster)
+	if err := os.WriteFile(filepath.Join(clusterDir, "cluster.json"), invalidClusterBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = reg.SyncRegistrationDir(ctx)
+
+	// Verification STILL works!
+	if _, _, err := reg.VerifyToken(ctx, token2, clusterID); err != nil {
+		t.Fatalf("token failed after invalid cluster config upload: %v", err)
+	}
+	if !strings.Contains(auditBuf.String(), `"refused"`) {
+		t.Errorf("expected audit log refusal for non-HTTPS cluster config, got:\n%s", auditBuf.String())
+	}
+
+	// Repeated scan with same failed bytes should skip and NOT log/audit duplicate entries
+	auditLenBefore := auditBuf.Len()
+	_ = reg.SyncRegistrationDir(ctx)
+	if auditBuf.Len() != auditLenBefore {
+		t.Errorf("expected no duplicate audit log for unchanged failed cluster config, got new log:\n%s", auditBuf.String()[auditLenBefore:])
+	}
+
+	// Restore valid cluster config
+	if err := os.WriteFile(filepath.Join(clusterDir, "cluster.json"), cfgBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. Invalid cluster ID directory name (e.g. invalid characters) is rejected
+	invalidDir := filepath.Join(regDir, "bad_name_with_underscores")
+	if err := os.MkdirAll(invalidDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(invalidDir, "cluster.json"), cfgBytes, 0600)
+	_ = os.WriteFile(filepath.Join(invalidDir, "jwks.json"), jwksData1, 0600)
+
+	auditBuf.Reset()
+	_ = reg.SyncRegistrationDir(ctx)
+	if !strings.Contains(auditBuf.String(), `"refused"`) || !strings.Contains(auditBuf.String(), "invalid cluster directory name") {
+		t.Errorf("expected refusal for invalid cluster directory name, got:\n%s", auditBuf.String())
+	}
+	// Repeated scan with same invalid directory name should skip and NOT log/audit duplicate entries
+	auditLenBeforeInvalid := auditBuf.Len()
+	_ = reg.SyncRegistrationDir(ctx)
+	if auditBuf.Len() != auditLenBeforeInvalid {
+		t.Errorf("expected no duplicate audit log for unchanged invalid directory name, got new log:\n%s", auditBuf.String()[auditLenBeforeInvalid:])
+	}
+	_ = os.RemoveAll(invalidDir)
+
+	// 6. Duplicate cluster ID against static config is rejected
+	dupDir := filepath.Join(regDir, "static-1")
+	if err := os.MkdirAll(dupDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(dupDir, "cluster.json"), []byte(`{"clusterID":"static-1","issuerURL":"https://dup.example.com"}`), 0600)
+	_ = os.WriteFile(filepath.Join(dupDir, "jwks.json"), jwksData1, 0600)
+
+	auditBuf.Reset()
+	_ = reg.SyncRegistrationDir(ctx)
+
+	// Static cluster remains active
+	if _, _, err := reg.VerifyToken(ctx, staticToken, "static-1"); err != nil {
+		t.Fatalf("static cluster failed after duplicate attempt: %v", err)
+	}
+	if !strings.Contains(auditBuf.String(), `"AlreadyExists"`) {
+		t.Errorf("expected audit log AlreadyExists for duplicate static cluster ID, got:\n%s", auditBuf.String())
+	}
+	_ = os.RemoveAll(dupDir)
+
+	// 7. Partial writes / temp files are ignored and never loaded
+	partialDir := filepath.Join(regDir, "partial-cluster")
+	if err := os.MkdirAll(partialDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Only temp files
+	_ = os.WriteFile(filepath.Join(partialDir, ".cluster.json.tmp"), cfgBytes, 0600)
+	_ = os.WriteFile(filepath.Join(partialDir, ".jwks.json.tmp"), jwksData1, 0600)
+
+	_ = reg.SyncRegistrationDir(ctx)
+	if _, ok := reg.GetCluster("partial-cluster"); ok {
+		t.Fatal("expected partial-cluster with only temp files to not be loaded")
+	}
+	_ = os.RemoveAll(partialDir)
+
+	// 7. Removing directory unregisters the cluster
+	auditBuf.Reset()
+	if err := os.RemoveAll(clusterDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for background reload to notice removal
+	deadline = time.Now().Add(2 * time.Second)
+	unregistered := false
+	for time.Now().Before(deadline) {
+		if _, _, err := reg.VerifyToken(ctx, token2, clusterID); err != nil {
+			unregistered = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !unregistered {
+		t.Fatal("cluster remained registered after directory removal")
+	}
+
+	if _, ok := reg.GetCluster(clusterID); ok {
+		t.Fatal("expected GetCluster to return false after directory removal")
+	}
+
+	// Verify audit log has UnregisterCluster
+	if !strings.Contains(auditBuf.String(), `"UnregisterCluster"`) {
+		t.Errorf("expected audit log to record UnregisterCluster, got:\n%s", auditBuf.String())
 	}
 }

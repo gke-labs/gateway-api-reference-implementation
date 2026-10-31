@@ -148,7 +148,7 @@ certserver authenticates all requests using Kubernetes projected service-account
 
 certserver authorizes requests using three distinct controls:
 
-1. **Per-Cluster Server Policy:** certserver maintains a local configuration file that defines policies for each known cluster:
+1. **Per-Cluster Server Policy:** certserver maintains a local configuration (via static configuration file and/or dynamic registration directory) that defines policies for each known cluster:
    - `allowedHostnames`: An optional list of hostname patterns that the cluster may request.
    - `deniedHostnames`: An optional list of hostname patterns that the cluster cannot request.
    - `sharedFrontEndGroup`: An optional group name for clusters that share public IP addresses or load balancers.
@@ -158,6 +158,18 @@ certserver authorizes requests using three distinct controls:
    - The service account of the data plane that serves the Gateway.
    - The Gateway's external addresses (`status.addresses`).
 3. **In-Path Challenge Validation:** certserver verifies that public DNS directs HTTP-01 challenge traffic through the attested data plane before it marks an order complete.
+
+### Cluster Registration and Live Directory Reload
+
+To avoid requiring clusters to expose their OIDC discovery documents or JWKS publicly to the internet, and to enable adding or rotating clusters without restarting `certserver`, certserver supports dynamic cluster registration via a dedicated directory (`--cluster-dir`):
+
+- **Directory Layout**: Each cluster occupies a subdirectory `<dir>/<cluster-id>/` containing `cluster.json` (cluster ID, issuer URL, hostname policies, controller identity, groups) and `jwks.json` (trusted JSON Web Key Set). The directory is owned by the certserver user with permissions `0700` and files `0600`.
+- **Subcommand over SSH**: Operators upload cluster configuration and JWKS via the `certserver register-cluster` subcommand over SSH, piping raw JWKS from `kubectl get --raw /openid/v1/jwks`.
+- **Atomic Writes**: `register-cluster` writes files atomically (temporary file, `fsync`, and atomic rename) so partially written files are never read or loaded.
+- **Reload Without Restart**: certserver watches or periodically scans the directory. It validates that `cluster.json` parses, the issuer uses HTTPS, and `jwks.json` has at least one usable public key before swapping it into memory. If validation fails, the previous registration remains active.
+- **Dynamic Unregistration**: Removing a cluster's directory unregisters the cluster on the next scan.
+- **Safe Key Rotation**: During Kubernetes ServiceAccount signing key rotation, both old and new keys are published simultaneously. Uploading the combined JWKS updates the cluster live with zero downtime.
+- **Configuration Merge**: Static config (`--cluster-config-file`) and directory entries merge, and duplicate cluster IDs are rejected. All registration lifecycle changes are recorded in certserver's structured audit log.
 
 ### Local Pre-Validation and DNS Checks
 

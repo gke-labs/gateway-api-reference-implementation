@@ -58,6 +58,7 @@ type IssuerConfig struct {
 	IssuerURL string // HTTPS URL for OIDC discovery
 	JWKSURL   string // Direct JWKS URI (optional, bypasses OIDC discovery)
 	JWKSFile  string // Path to static JWKS file (alternative to public OIDC discovery)
+	JWKSBytes []byte // In-memory validated JWKS document (takes precedence over file/network)
 }
 
 // jwkEntry represents a single JSON Web Key in a JWKS.
@@ -89,6 +90,7 @@ type issuerState struct {
 	issuerURL   string
 	jwksFile    string
 	jwksURI     string
+	jwksBytes   []byte
 	keys        map[string]crypto.PublicKey // kid -> public key
 	keysLoaded  bool
 	lastRefresh time.Time
@@ -219,6 +221,76 @@ func (c *JWKSCache) Close() error {
 	return nil
 }
 
+// AddOrUpdateIssuer registers or updates an issuer in the cache, immediately loading/refreshing its keys.
+// If key loading fails, an existing issuer keeps its previous keys and the error is returned.
+func (c *JWKSCache) AddOrUpdateIssuer(ctx context.Context, cfg IssuerConfig) error {
+	if cfg.IssuerURL == "" && cfg.JWKSFile == "" && len(cfg.JWKSBytes) == 0 {
+		return errors.New("issuer config must specify IssuerURL, JWKSFile, or JWKSBytes")
+	}
+
+	normIss := NormalizeIssuer(cfg.IssuerURL)
+	if cfg.JWKSFile == "" && len(cfg.JWKSBytes) == 0 {
+		if !strings.HasPrefix(cfg.IssuerURL, "https://") {
+			return fmt.Errorf("issuer URL must use HTTPS: %q", cfg.IssuerURL)
+		}
+	}
+	if cfg.JWKSURL != "" && !strings.HasPrefix(cfg.JWKSURL, "https://") {
+		return fmt.Errorf("JWKS URL must use HTTPS: %q", cfg.JWKSURL)
+	}
+
+	c.issuersMu.Lock()
+	state, exists := c.issuers[normIss]
+	if !exists {
+		state = &issuerState{
+			issuerURL: cfg.IssuerURL,
+			jwksFile:  cfg.JWKSFile,
+			jwksURI:   cfg.JWKSURL,
+			jwksBytes: cfg.JWKSBytes,
+			keys:      make(map[string]crypto.PublicKey),
+		}
+	}
+	c.issuersMu.Unlock()
+
+	state.refreshMu.Lock()
+	defer state.refreshMu.Unlock()
+
+	oldURL := state.issuerURL
+	oldFile := state.jwksFile
+	oldURI := state.jwksURI
+	oldBytes := state.jwksBytes
+
+	state.issuerURL = cfg.IssuerURL
+	state.jwksFile = cfg.JWKSFile
+	state.jwksURI = cfg.JWKSURL
+	state.jwksBytes = cfg.JWKSBytes
+
+	if err := c.refreshIssuerLocked(ctx, state); err != nil {
+		if exists {
+			state.issuerURL = oldURL
+			state.jwksFile = oldFile
+			state.jwksURI = oldURI
+			state.jwksBytes = oldBytes
+		}
+		return fmt.Errorf("loading keys for issuer %s: %w", cfg.IssuerURL, err)
+	}
+
+	if !exists {
+		c.issuersMu.Lock()
+		c.issuers[normIss] = state
+		c.issuersMu.Unlock()
+	}
+
+	return nil
+}
+
+// RemoveIssuer removes an issuer from the cache.
+func (c *JWKSCache) RemoveIssuer(issuerURL string) {
+	normIss := NormalizeIssuer(issuerURL)
+	c.issuersMu.Lock()
+	delete(c.issuers, normIss)
+	c.issuersMu.Unlock()
+}
+
 func (c *JWKSCache) runPeriodicRefresh() {
 	ticker := time.NewTicker(c.refreshInterval)
 	defer ticker.Stop()
@@ -329,7 +401,9 @@ func (c *JWKSCache) refreshIssuerLocked(ctx context.Context, s *issuerState) err
 	var jwksBytes []byte
 	var err error
 
-	if s.jwksFile != "" {
+	if len(s.jwksBytes) > 0 {
+		jwksBytes = s.jwksBytes
+	} else if s.jwksFile != "" {
 		jwksBytes, err = c.readJWKSFile(s.jwksFile)
 	} else {
 		jwksBytes, err = c.fetchJWKSHTTP(ctx, s)
@@ -343,7 +417,7 @@ func (c *JWKSCache) refreshIssuerLocked(ctx context.Context, s *issuerState) err
 		return err
 	}
 
-	parsedKeys, err := parseJWKS(jwksBytes)
+	parsedKeys, err := ParseJWKS(jwksBytes)
 	if err != nil {
 		s.mu.Lock()
 		s.lastError = err
@@ -459,7 +533,9 @@ func (c *JWKSCache) fetchJWKSHTTP(ctx context.Context, s *issuerState) ([]byte, 
 	return jwksBytes, nil
 }
 
-func parseJWKS(data []byte) (map[string]crypto.PublicKey, error) {
+// ParseJWKS parses a JWKS document into a map of key ID to crypto.PublicKey.
+// It supports RSA and EC (P-256) public keys.
+func ParseJWKS(data []byte) (map[string]crypto.PublicKey, error) {
 	var doc jwksDocument
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, err

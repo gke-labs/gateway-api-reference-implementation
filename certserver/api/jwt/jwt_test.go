@@ -526,3 +526,176 @@ func TestJWKSCache_ResponseCapAndHTTPS(t *testing.T) {
 		}
 	})
 }
+
+func TestParseJWKS(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("Valid RSA and EC keys", func(t *testing.T) {
+		doc := jwksDocument{
+			Keys: []jwkEntry{
+				exportRSAJWK(&rsaKey.PublicKey, "rsa-key-1"),
+				exportECJWK(&ecKey.PublicKey, "ec-key-1"),
+			},
+		}
+		data, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys, err := ParseJWKS(data)
+		if err != nil {
+			t.Fatalf("unexpected error parsing valid JWKS: %v", err)
+		}
+		if len(keys) != 2 {
+			t.Fatalf("expected 2 keys, got %d", len(keys))
+		}
+		if _, ok := keys["rsa-key-1"].(*rsa.PublicKey); !ok {
+			t.Errorf("expected *rsa.PublicKey for rsa-key-1, got %T", keys["rsa-key-1"])
+		}
+		if _, ok := keys["ec-key-1"].(*ecdsa.PublicKey); !ok {
+			t.Errorf("expected *ecdsa.PublicKey for ec-key-1, got %T", keys["ec-key-1"])
+		}
+	})
+
+	t.Run("Invalid JSON", func(t *testing.T) {
+		_, err := ParseJWKS([]byte(`{not json`))
+		if err == nil {
+			t.Fatal("expected error parsing invalid JSON, got nil")
+		}
+	})
+
+	t.Run("Empty keys list", func(t *testing.T) {
+		keys, err := ParseJWKS([]byte(`{"keys":[]}`))
+		if err != nil {
+			t.Fatalf("unexpected error parsing empty keys: %v", err)
+		}
+		if len(keys) != 0 {
+			t.Fatalf("expected 0 keys, got %d", len(keys))
+		}
+	})
+}
+
+func TestJWKSCache_DynamicIssuers(t *testing.T) {
+	tempDir := t.TempDir()
+	jwksPath1 := filepath.Join(tempDir, "jwks1.json")
+	jwksPath2 := filepath.Join(tempDir, "jwks2.json")
+
+	rsaKey1, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaKey2, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doc1 := jwksDocument{Keys: []jwkEntry{exportRSAJWK(&rsaKey1.PublicKey, "key-1")}}
+	docBytes1, _ := json.Marshal(doc1)
+	if err := os.WriteFile(jwksPath1, docBytes1, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	doc2 := jwksDocument{Keys: []jwkEntry{
+		exportRSAJWK(&rsaKey1.PublicKey, "key-1"),
+		exportRSAJWK(&rsaKey2.PublicKey, "key-2"),
+	}}
+	docBytes2, _ := json.Marshal(doc2)
+	if err := os.WriteFile(jwksPath2, docBytes2, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cache, err := NewJWKSCache(nil)
+	if err != nil {
+		t.Fatalf("NewJWKSCache failed: %v", err)
+	}
+	defer cache.Close()
+
+	ctx := t.Context()
+	issuerURL := "https://dynamic-issuer.example.com"
+
+	// Key lookup before registration should fail
+	if _, err := cache.GetKey(ctx, issuerURL, "key-1"); err == nil {
+		t.Fatal("expected error before issuer is registered")
+	}
+
+	// 1. Add new issuer dynamically
+	err = cache.AddOrUpdateIssuer(ctx, IssuerConfig{
+		IssuerURL: issuerURL,
+		JWKSFile:  jwksPath1,
+	})
+	if err != nil {
+		t.Fatalf("AddOrUpdateIssuer failed: %v", err)
+	}
+
+	// Key 1 should resolve
+	k, err := cache.GetKey(ctx, issuerURL, "key-1")
+	if err != nil {
+		t.Fatalf("GetKey for key-1 failed: %v", err)
+	}
+	if k == nil {
+		t.Fatal("expected non-nil key")
+	}
+
+	// Key 2 should not exist yet
+	if _, err := cache.GetKey(ctx, issuerURL, "key-2"); err == nil {
+		t.Fatal("expected key-2 to not exist yet")
+	}
+
+	// 2. Update issuer with rotation (pointing to jwksPath2 with key-1 and key-2)
+	err = cache.AddOrUpdateIssuer(ctx, IssuerConfig{
+		IssuerURL: issuerURL,
+		JWKSFile:  jwksPath2,
+	})
+	if err != nil {
+		t.Fatalf("AddOrUpdateIssuer rotation failed: %v", err)
+	}
+
+	// Both key-1 and key-2 should resolve
+	if _, err := cache.GetKey(ctx, issuerURL, "key-1"); err != nil {
+		t.Fatalf("GetKey for key-1 after rotation failed: %v", err)
+	}
+	if _, err := cache.GetKey(ctx, issuerURL, "key-2"); err != nil {
+		t.Fatalf("GetKey for key-2 after rotation failed: %v", err)
+	}
+
+	// 3. Failed update keeps previous keys
+	err = cache.AddOrUpdateIssuer(ctx, IssuerConfig{
+		IssuerURL: issuerURL,
+		JWKSFile:  filepath.Join(tempDir, "nonexistent.json"),
+	})
+	if err == nil {
+		t.Fatal("expected error on nonexistent JWKS file")
+	}
+
+	// Previous keys still resolve
+	if _, err := cache.GetKey(ctx, issuerURL, "key-1"); err != nil {
+		t.Fatalf("GetKey for key-1 after failed update failed: %v", err)
+	}
+	if _, err := cache.GetKey(ctx, issuerURL, "key-2"); err != nil {
+		t.Fatalf("GetKey for key-2 after failed update failed: %v", err)
+	}
+
+	// 4. Update issuer using in-memory JWKSBytes directly
+	err = cache.AddOrUpdateIssuer(ctx, IssuerConfig{
+		IssuerURL: issuerURL,
+		JWKSBytes: docBytes2,
+	})
+	if err != nil {
+		t.Fatalf("AddOrUpdateIssuer with JWKSBytes failed: %v", err)
+	}
+	if _, err := cache.GetKey(ctx, issuerURL, "key-2"); err != nil {
+		t.Fatalf("GetKey for key-2 failed after in-memory JWKSBytes update: %v", err)
+	}
+
+	// 5. Remove issuer
+	cache.RemoveIssuer(issuerURL)
+	if _, err := cache.GetKey(ctx, issuerURL, "key-1"); err == nil {
+		t.Fatal("expected error after RemoveIssuer")
+	}
+}
