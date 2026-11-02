@@ -24,6 +24,10 @@ updates:
   - package-ecosystem: "gomod"
     directories:
       - "/"
+      - "/certserver"
+      - "/certserver/api"
+      - "/gcpgateway"
+      - "/localgateway"
       - "/snigateway"
     schedule:
       interval: "daily"
