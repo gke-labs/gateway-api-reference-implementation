@@ -25,6 +25,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"regexp"
@@ -172,7 +173,7 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 
 	routes := []InternalRoute{
 		{
-			Hostnames: []string{"example.com"},
+			Hostnames: routeHostnamesFromStrings("example.com"),
 			Rules: []InternalRule{
 				{
 					Matches: []InternalMatch{
@@ -336,6 +337,33 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 	testTLSHandshake(t, restoredClientCert, "client.example.com")
 }
 
+func TestInternalRoute_MarshalRoundTrip_PreservesOriginalHostname(t *testing.T) {
+	route := InternalRoute{
+		Hostnames: []RouteHostname{
+			NewRouteHostname("abc.example.com", "*.example.com"),
+		},
+		Rules: []InternalRule{{Backends: []InternalBackend{{Host: "backend-2", Port: 8080}}}},
+	}
+	data, err := json.Marshal(route)
+	if err != nil {
+		t.Fatalf("failed to marshal route: %v", err)
+	}
+
+	var roundTripped InternalRoute
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("failed to unmarshal route: %v", err)
+	}
+	if len(roundTripped.Hostnames) != 1 {
+		t.Fatalf("expected 1 hostname, got %d", len(roundTripped.Hostnames))
+	}
+	if roundTripped.Hostnames[0].Hostname != "abc.example.com" {
+		t.Errorf("expected effective hostname 'abc.example.com', got %q", roundTripped.Hostnames[0].Hostname)
+	}
+	if roundTripped.Hostnames[0].OriginalHostname != "*.example.com" {
+		t.Errorf("expected original hostname '*.example.com', got %q", roundTripped.Hostnames[0].OriginalHostname)
+	}
+}
+
 func testTLSHandshake(t *testing.T, cert *tls.Certificate, serverName string) {
 	t.Helper()
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
@@ -479,7 +507,7 @@ func TestInProcessDataplanePublisher_MultipleGatewaysClientCertIsolation(t *test
 	}
 
 	routeA := InternalRoute{
-		Hostnames: []string{"a.example.com"},
+		Hostnames: routeHostnamesFromStrings("a.example.com"),
 		Rules: []InternalRule{
 			{
 				Backends: []InternalBackend{
@@ -495,7 +523,7 @@ func TestInProcessDataplanePublisher_MultipleGatewaysClientCertIsolation(t *test
 		},
 	}
 	routeB := InternalRoute{
-		Hostnames: []string{"b.example.com"},
+		Hostnames: routeHostnamesFromStrings("b.example.com"),
 		Rules: []InternalRule{
 			{
 				Backends: []InternalBackend{
@@ -836,7 +864,7 @@ func TestApplyDataplaneConfig_MissingBackendClientCertID(t *testing.T) {
 		GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
 		Routes: []InternalRoute{
 			{
-				Hostnames: []string{"initial.example.com"},
+				Hostnames: routeHostnamesFromStrings("initial.example.com"),
 				Rules: []InternalRule{
 					{
 						Backends: []InternalBackend{
@@ -854,7 +882,7 @@ func TestApplyDataplaneConfig_MissingBackendClientCertID(t *testing.T) {
 	if err := ApplyDataplaneConfig(updater, initialData); err != nil {
 		t.Fatalf("failed to apply initial config: %v", err)
 	}
-	if len(updater.routes) != 1 || updater.routes[0].Hostnames[0] != "initial.example.com" {
+	if len(updater.routes) != 1 || updater.routes[0].Hostnames[0].Hostname != "initial.example.com" {
 		t.Fatalf("expected initial config in updater")
 	}
 
@@ -871,7 +899,7 @@ func TestApplyDataplaneConfig_MissingBackendClientCertID(t *testing.T) {
 			GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
 			Routes: []InternalRoute{
 				{
-					Hostnames: []string{"secure.example.com"},
+					Hostnames: routeHostnamesFromStrings("secure.example.com"),
 					Rules: []InternalRule{
 						{
 							Backends: []InternalBackend{
@@ -901,7 +929,7 @@ func TestApplyDataplaneConfig_MissingBackendClientCertID(t *testing.T) {
 		}
 
 		// Verify previously applied config stays in effect
-		if len(updater.routes) != 1 || updater.routes[0].Hostnames[0] != "initial.example.com" {
+		if len(updater.routes) != 1 || updater.routes[0].Hostnames[0].Hostname != "initial.example.com" {
 			t.Fatalf("expected previously applied config to stay in effect, got routes: %+v", updater.routes)
 		}
 		if updater.routes[0].Rules[0].Backends[0].Host != "initial-backend" {
@@ -917,7 +945,7 @@ func TestApplyDataplaneConfig_MissingBackendClientCertID(t *testing.T) {
 		if err := ApplyDataplaneConfig(updater, validData); err != nil {
 			t.Fatalf("expected ApplyDataplaneConfig to succeed with certificate present: %v", err)
 		}
-		if len(updater.routes) != 1 || updater.routes[0].Hostnames[0] != "secure.example.com" {
+		if len(updater.routes) != 1 || updater.routes[0].Hostnames[0].Hostname != "secure.example.com" {
 			t.Fatalf("expected updated config to be applied, got routes: %+v", updater.routes)
 		}
 		appliedBackend := updater.routes[0].Rules[0].Backends[0]
@@ -971,7 +999,7 @@ func TestApplyDataplaneConfig_MissingBackendClientCertID(t *testing.T) {
 			GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
 			Routes: []InternalRoute{
 				{
-					Hostnames: []string{"mirror.example.com"},
+					Hostnames: routeHostnamesFromStrings("mirror.example.com"),
 					Rules: []InternalRule{
 						{
 							Backends: []InternalBackend{

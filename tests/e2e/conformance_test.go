@@ -142,10 +142,6 @@ var skippedTests = map[string]struct{}{
 	"BackendTLSPolicyTLSRouteTerminate": {},
 	// fails: Gateway with maximum length name (253 chars) does not become Programmed
 	"GatewayNameMaximumLength": {},
-	// fails: GRPCRoute exact hostname does not take precedence over older wildcard route
-	"GRPCRouteMultipleRoutesAttachmentSameHostnameIntersection": {},
-	// fails: HTTPRoute exact/more specific hostname does not take precedence over older wildcard route
-	"HTTPRouteMultipleRoutesAttachmentSameHostnameIntersection": {},
 }
 
 func validateSkippedTests(skipped map[string]struct{}, suiteTests []suite.ConformanceTest) error {

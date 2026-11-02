@@ -796,7 +796,7 @@ func TestHTTP3_Enabled_AltSvcAndQUICRouting(t *testing.T) {
 			Port:     443,
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"example.com"},
+					Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 					Rules: []state.InternalRule{
 						{
 							Matches: []state.InternalMatch{
@@ -826,7 +826,7 @@ func TestHTTP3_Enabled_AltSvcAndQUICRouting(t *testing.T) {
 			Port:     443,
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"*.other.com"},
+					Hostnames: []state.RouteHostname{state.NewRouteHostname("*.other.com", "*.other.com")},
 					Rules: []state.InternalRule{
 						{
 							Matches: []state.InternalMatch{
@@ -1005,7 +1005,7 @@ func TestHTTP3_TCPCrossProtocolResumption(t *testing.T) {
 			Port:     443,
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"example.com"},
+					Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 					Rules: []state.InternalRule{
 						{
 							Matches: []state.InternalMatch{
@@ -1305,7 +1305,7 @@ func TestHTTP3_StripBackendAltSvc(t *testing.T) {
 			Port:     443,
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"example.com"},
+					Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 					Rules: []state.InternalRule{
 						{
 							Matches: []state.InternalMatch{
@@ -1453,7 +1453,7 @@ func TestHTTP3_Disabled_StripBackendAltSvc(t *testing.T) {
 			Port:     443,
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"example.com"},
+					Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 					Rules: []state.InternalRule{
 						{
 							Matches: []state.InternalMatch{
@@ -1621,7 +1621,7 @@ func TestDataplaneSecretReconciler(t *testing.T) {
 
 	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
 	route := state.InternalRoute{
-		Hostnames: []string{"example.com"},
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{
@@ -1793,7 +1793,7 @@ func TestInProcessDataplanePublisher_RoutesAndCertificates(t *testing.T) {
 		},
 	}
 	route := state.InternalRoute{
-		Hostnames: []string{"example.com"},
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{
@@ -2334,7 +2334,7 @@ func TestDataplane_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t 
 
 	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
 	route := state.InternalRoute{
-		Hostnames: []string{"example.com"},
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{
@@ -2490,7 +2490,7 @@ func TestDataplane_HTTPS_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerSt
 
 	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
 	route := state.InternalRoute{
-		Hostnames: []string{"example.com"},
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{
@@ -2661,7 +2661,7 @@ func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testin
 
 	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
 	route := state.InternalRoute{
-		Hostnames: []string{"example.com"},
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{

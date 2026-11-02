@@ -40,6 +40,7 @@ var SupportedFeatures = []features.FeatureName{
 	features.SupportGatewayHTTPSListenerDetectMisdirectedRequests,
 	features.SupportGatewayInfrastructure,
 	features.SupportGatewayPort8080,
+	features.SupportGatewayRouteHostnameIntersectionPrecedence,
 	features.SupportGatewayStaticAddresses,
 	features.SupportHTTPRoute,
 	features.SupportHTTPRoute303RedirectStatusCode,

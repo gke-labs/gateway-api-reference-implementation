@@ -27,6 +27,14 @@ import (
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
+func routeHostnamesFromStrings(hostnames ...string) []RouteHostname {
+	out := make([]RouteHostname, len(hostnames))
+	for i, h := range hostnames {
+		out[i] = RouteHostname{Hostname: h, OriginalHostname: h}
+	}
+	return out
+}
+
 func TestBuildInternalRoutes(t *testing.T) {
 	controllerName := "test-controller"
 	tests := []struct {
@@ -124,7 +132,9 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"example.com"},
+					Hostnames: []RouteHostname{
+						NewRouteHostname("example.com", "example.com"),
+					},
 					Rules: []InternalRule{
 						{
 							Backends: []InternalBackend{
@@ -220,7 +230,9 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"example.com"},
+					Hostnames: []RouteHostname{
+						NewRouteHostname("example.com", "example.com"),
+					},
 					Rules: []InternalRule{
 						{
 							Backends: []InternalBackend{{Host: "backend-svc.default.svc.cluster.local", Port: 80, Weight: 1}},
@@ -309,7 +321,9 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"foo.example.com"},
+					Hostnames: []RouteHostname{
+						NewRouteHostname("foo.example.com", "foo.example.com"),
+					},
 					Rules: []InternalRule{
 						{
 							Backends: []InternalBackend{{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080, Weight: 1}},
@@ -404,7 +418,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Matches: []InternalMatch{
@@ -504,7 +518,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Matches: []InternalMatch{
@@ -595,7 +609,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Matches: []InternalMatch{
@@ -698,7 +712,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Matches: []InternalMatch{
@@ -796,7 +810,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Error: &ErrorState{
@@ -887,7 +901,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Error: &ErrorState{
@@ -1033,7 +1047,9 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"example.com"},
+					Hostnames: []RouteHostname{
+						NewRouteHostname("example.com", "example.com"),
+					},
 					Rules: []InternalRule{
 						{
 							Backends: []InternalBackend{
@@ -1143,7 +1159,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Rewrite: &InternalRewrite{
@@ -1256,7 +1272,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Rewrite: &InternalRewrite{
@@ -1370,7 +1386,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
@@ -1521,7 +1537,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Backends: []InternalBackend{
@@ -1654,7 +1670,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Backends: []InternalBackend{
@@ -1839,7 +1855,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Error: &ErrorState{
@@ -1936,7 +1952,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Error: &ErrorState{
@@ -2056,7 +2072,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Backends: []InternalBackend{{Host: "web-backend.other-ns.svc.cluster.local", Port: 80, Weight: 1}},
@@ -2194,7 +2210,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 			expected: []InternalRoute{
 				{
-					Hostnames: []string{"*"},
+					Hostnames: []RouteHostname{NewRouteHostname("*", "")},
 					Rules: []InternalRule{
 						{
 							Matches: []InternalMatch{
@@ -2268,7 +2284,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 func TestMatchRoute_Method(t *testing.T) {
 	routes := []InternalRoute{
 		{
-			Hostnames: []string{"example.com"},
+			Hostnames: routeHostnamesFromStrings("example.com"),
 			Rules: []InternalRule{
 				{
 					Matches: []InternalMatch{

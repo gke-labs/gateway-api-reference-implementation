@@ -194,7 +194,7 @@ func TestMatchRouteOrder(t *testing.T) {
 func TestMatchRoute_MethodVsHeaderPrecedence(t *testing.T) {
 	routes := []InternalRoute{
 		{
-			Hostnames: []string{"example.com"},
+			Hostnames: routeHostnamesFromStrings("example.com"),
 			Rules: []InternalRule{
 				{
 					Matches: []InternalMatch{
@@ -236,7 +236,7 @@ func TestMatchRoute_MethodVsHeaderPrecedence(t *testing.T) {
 func TestMatchRoute_HeaderMatching(t *testing.T) {
 	routes := []InternalRoute{
 		{
-			Hostnames: []string{"example.com"},
+			Hostnames: routeHostnamesFromStrings("example.com"),
 			Rules: []InternalRule{
 				{
 					Matches: []InternalMatch{
@@ -293,7 +293,7 @@ func TestMatchRoute_HeaderMatching(t *testing.T) {
 func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 	routes := []InternalRoute{
 		{
-			Hostnames: []string{"*.bar.com"},
+			Hostnames: routeHostnamesFromStrings("*.bar.com"),
 			Rules: []InternalRule{
 				{
 					Backends: []InternalBackend{{Host: "wildcard-bar-backend"}},
@@ -301,7 +301,7 @@ func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 			},
 		},
 		{
-			Hostnames: []string{"foo.bar.com"},
+			Hostnames: routeHostnamesFromStrings("foo.bar.com"),
 			Rules: []InternalRule{
 				{
 					Backends: []InternalBackend{{Host: "exact-foo-bar-backend"}},
@@ -309,7 +309,7 @@ func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 			},
 		},
 		{
-			Hostnames: []string{"*.foo.bar.com"},
+			Hostnames: routeHostnamesFromStrings("*.foo.bar.com"),
 			Rules: []InternalRule{
 				{
 					Backends: []InternalBackend{{Host: "longer-wildcard-backend"}},
@@ -317,7 +317,7 @@ func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 			},
 		},
 		{
-			Hostnames: []string{"*"},
+			Hostnames: routeHostnamesFromStrings("*"),
 			Rules: []InternalRule{
 				{
 					Backends: []InternalBackend{{Host: "catch-all-backend"}},
@@ -380,7 +380,7 @@ func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 func TestMatchRoute_HostnamePrecedenceOverPath(t *testing.T) {
 	routes := []InternalRoute{
 		{
-			Hostnames: []string{"*.bar.com"},
+			Hostnames: routeHostnamesFromStrings("*.bar.com"),
 			Rules: []InternalRule{
 				{
 					Matches: []InternalMatch{
@@ -396,7 +396,7 @@ func TestMatchRoute_HostnamePrecedenceOverPath(t *testing.T) {
 			},
 		},
 		{
-			Hostnames: []string{"foo.bar.com"},
+			Hostnames: routeHostnamesFromStrings("foo.bar.com"),
 			Rules: []InternalRule{
 				{
 					Matches: []InternalMatch{
@@ -420,6 +420,43 @@ func TestMatchRoute_HostnamePrecedenceOverPath(t *testing.T) {
 	}
 	if len(rule.Backends) == 0 || rule.Backends[0].Host != "exact-host-prefix-path-backend" {
 		t.Errorf("Expected exact hostname match (exact-host-prefix-path-backend) to take precedence over wildcard host match with exact path, got %v", rule.Backends)
+	}
+}
+
+func TestMatchRoute_OriginalHostnamesPrecedence(t *testing.T) {
+	// Both routes attached to the same listener (abc.example.com), so their effective Hostnames are identical.
+	// Route 1 was created first (so appears first in slice), but had a wildcard original hostname.
+	// Route 2 had an exact original hostname.
+	routes := []InternalRoute{
+		{
+			Hostnames: []RouteHostname{
+				NewRouteHostname("abc.example.com", "*.example.com"),
+			},
+			Rules: []InternalRule{
+				{
+					Backends: []InternalBackend{{Host: "older-wildcard-backend"}},
+				},
+			},
+		},
+		{
+			Hostnames: []RouteHostname{
+				NewRouteHostname("abc.example.com", "abc.example.com"),
+			},
+			Rules: []InternalRule{
+				{
+					Backends: []InternalBackend{{Host: "newer-exact-backend"}},
+				},
+			},
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "http://abc.example.com/", nil)
+	rule, _ := MatchRoute(routes, req)
+	if rule == nil {
+		t.Fatalf("Expected match, got nil")
+	}
+	if len(rule.Backends) == 0 || rule.Backends[0].Host != "newer-exact-backend" {
+		t.Errorf("Expected exact original hostname (newer-exact-backend) to take precedence over wildcard (older-wildcard-backend), got %v", rule.Backends)
 	}
 }
 
@@ -780,7 +817,7 @@ func TestMatchRoute_MatchingAcrossRoutes(t *testing.T) {
 	//   rule 2: Header version: two -> v2
 	routes := []InternalRoute{
 		{
-			Hostnames: []string{"example.com", "example.net"},
+			Hostnames: routeHostnamesFromStrings("example.com", "example.net"),
 			Rules: []InternalRule{
 				{
 					Matches: []InternalMatch{
@@ -801,7 +838,7 @@ func TestMatchRoute_MatchingAcrossRoutes(t *testing.T) {
 			},
 		},
 		{
-			Hostnames: []string{"example.com"},
+			Hostnames: routeHostnamesFromStrings("example.com"),
 			Rules: []InternalRule{
 				{
 					Matches: []InternalMatch{

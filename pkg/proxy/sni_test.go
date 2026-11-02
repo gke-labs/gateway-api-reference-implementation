@@ -82,7 +82,7 @@ func TestSNIListener_PassthroughAndHTTPSAndFailClosed(t *testing.T) {
 	passthroughMode := gatewayv1.TLSModePassthrough
 	httpsRoutes := []state.InternalRoute{
 		{
-			Hostnames: []string{"https.example.com"},
+			Hostnames: testRouteHostnames("https.example.com"),
 			Rules: []state.InternalRule{
 				{
 					Matches: []state.InternalMatch{
@@ -652,7 +652,7 @@ func BenchmarkSNIListener_HTTPSOnly(b *testing.B) {
 
 	httpsRoutes := []state.InternalRoute{
 		{
-			Hostnames: []string{"https.example.com"},
+			Hostnames: testRouteHostnames("https.example.com"),
 			Rules: []state.InternalRule{
 				{
 					Backends: []state.InternalBackend{
@@ -1217,7 +1217,7 @@ func TestTLSSessionResumption_HTTPSListener(t *testing.T) {
 
 	routes := []state.InternalRoute{
 		{
-			Hostnames: []string{"https.example.com"},
+			Hostnames: testRouteHostnames("https.example.com"),
 			Rules: []state.InternalRule{
 				{
 					Matches: []state.InternalMatch{
@@ -1310,7 +1310,7 @@ func TestTLSSessionResumption_HTTPSListener_ConcurrentWithReadLock(t *testing.T)
 
 	routes := []state.InternalRoute{
 		{
-			Hostnames: []string{"https.example.com"},
+			Hostnames: testRouteHostnames("https.example.com"),
 			Rules: []state.InternalRule{
 				{
 					Matches: []state.InternalMatch{
