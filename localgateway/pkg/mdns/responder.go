@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/miekg/dns"
+	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
@@ -68,7 +68,7 @@ type RecordSet struct {
 }
 
 // ConflictHandler is a callback invoked when a conflicting mDNS response or higher-priority probe is detected.
-type ConflictHandler func(fqdn string, conflictingRR dns.RR)
+type ConflictHandler func(fqdn string, conflictingRR dnsmessage.Resource)
 
 // ResponderOptions configures an mDNS Responder.
 type ResponderOptions struct {
@@ -91,24 +91,24 @@ type ResponderOptions struct {
 	// IPv6Conn is an optional pre-bound PacketConn (useful for testing).
 	IPv6Conn net.PacketConn
 
-	// MulticastTap is an optional callback receiving every multicast DNS message sent.
+	// MulticastTap is an optional callback receiving every multicast DNS packet sent.
 	// Useful for testing without opening secondary multicast listener sockets.
-	MulticastTap func(msg *dns.Msg)
+	MulticastTap func(raw []byte)
 }
 
-// Responder is a pure-Go mDNS responder built on github.com/miekg/dns.
+// Responder is a pure-Go mDNS responder built on golang.org/x/net/dns/dnsmessage.
 // It listens on UDP port 5353, answers A/AAAA queries for published single-label .local names,
 // sends probes, detects conflicts, rate-limits multicast responses, and sends goodbye packets.
 type Responder struct {
 	port          int
 	interfaceName string
-	multicastTap  func(msg *dns.Msg)
+	multicastTap  func(raw []byte)
 
 	mu              sync.RWMutex
 	records         map[string]*RecordSet // keyed by lowercase FQDN
 	conflictHandler ConflictHandler
-	activeProbes    map[string][]dns.RR  // keyed by lowercase FQDN -> proposed records
-	lastMulticast   map[string]time.Time // key: "name/type" -> last multicast send time (RFC 6762 §6.2)
+	activeProbes    map[string][]dnsmessage.Resource // keyed by lowercase FQDN -> proposed records
+	lastMulticast   map[string]time.Time             // key: "name/type" -> last multicast send time (RFC 6762 §6.2)
 	lastReadErrLog  time.Time
 
 	raw4 net.PacketConn
@@ -138,7 +138,7 @@ func NewResponder(opts ResponderOptions) (*Responder, error) {
 		interfaceName: opts.InterfaceName,
 		multicastTap:  opts.MulticastTap,
 		records:       make(map[string]*RecordSet),
-		activeProbes:  make(map[string][]dns.RR),
+		activeProbes:  make(map[string][]dnsmessage.Resource),
 		lastMulticast: make(map[string]time.Time),
 		stopCh:        make(chan struct{}),
 	}
@@ -321,7 +321,7 @@ func (r *Responder) SetRecord(rs *RecordSet) {
 	if rs == nil || rs.FQDN == "" {
 		return
 	}
-	fqdn := strings.ToLower(dns.Fqdn(rs.FQDN))
+	fqdn := strings.ToLower(toFQDN(rs.FQDN))
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.records[fqdn] = &RecordSet{
@@ -334,7 +334,7 @@ func (r *Responder) SetRecord(rs *RecordSet) {
 
 // RemoveRecord removes a published RecordSet by hostname.
 func (r *Responder) RemoveRecord(hostname string) *RecordSet {
-	fqdn := strings.ToLower(dns.Fqdn(hostname))
+	fqdn := strings.ToLower(toFQDN(hostname))
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	old := r.records[fqdn]
@@ -344,7 +344,7 @@ func (r *Responder) RemoveRecord(hostname string) *RecordSet {
 
 // GetRecord returns a published RecordSet by hostname.
 func (r *Responder) GetRecord(hostname string) (*RecordSet, bool) {
-	fqdn := strings.ToLower(dns.Fqdn(hostname))
+	fqdn := strings.ToLower(toFQDN(hostname))
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rec, ok := r.records[fqdn]
@@ -367,8 +367,8 @@ func (r *Responder) SetConflictHandler(h ConflictHandler) {
 }
 
 // RegisterProbe registers an active probe for simultaneous conflict detection.
-func (r *Responder) RegisterProbe(fqdn string, proposedRecords []dns.RR) {
-	name := strings.ToLower(dns.Fqdn(fqdn))
+func (r *Responder) RegisterProbe(fqdn string, proposedRecords []dnsmessage.Resource) {
+	name := strings.ToLower(toFQDN(fqdn))
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.activeProbes[name] = proposedRecords
@@ -376,7 +376,7 @@ func (r *Responder) RegisterProbe(fqdn string, proposedRecords []dns.RR) {
 
 // UnregisterProbe unregisters an active probe.
 func (r *Responder) UnregisterProbe(fqdn string) {
-	name := strings.ToLower(dns.Fqdn(fqdn))
+	name := strings.ToLower(toFQDN(fqdn))
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.activeProbes, name)
@@ -403,12 +403,7 @@ func (r *Responder) readLoop(p net.PacketConn, isIPv6 bool) {
 			continue
 		}
 
-		msg := new(dns.Msg)
-		if err := msg.Unpack(buf[:n]); err != nil {
-			continue
-		}
-
-		r.handlePacket(msg, from, isIPv6)
+		r.handlePacket(buf[:n], from, isIPv6)
 	}
 }
 
@@ -421,21 +416,59 @@ func (r *Responder) logReadError(err error) {
 	}
 }
 
-// handlePacket dispatches an incoming DNS message.
-func (r *Responder) handlePacket(msg *dns.Msg, from net.Addr, isIPv6 bool) {
-	if msg.Response {
-		r.handleResponse(msg)
+// handlePacket parses and dispatches an incoming DNS message.
+func (r *Responder) handlePacket(data []byte, from net.Addr, isIPv6 bool) {
+	var p dnsmessage.Parser
+	hdr, err := p.Start(data)
+	if err != nil {
+		return
+	}
+
+	if hdr.Response {
+		r.handleResponse(&p, hdr)
 	} else {
-		r.handleQuery(msg, from, isIPv6)
+		r.handleQuery(&p, hdr, from, isIPv6)
 	}
 }
 
 // handleResponse inspects answers and authority records for conflicts with active probes
 // and already published records per RFC 6762 §9.
-func (r *Responder) handleResponse(msg *dns.Msg) {
+func (r *Responder) handleResponse(p *dnsmessage.Parser, _ dnsmessage.Header) {
+	if err := p.SkipAllQuestions(); err != nil {
+		return
+	}
+
+	var answers []dnsmessage.Resource
+	for {
+		ans, err := p.Answer()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return
+		}
+		answers = append(answers, ans)
+	}
+
+	var authorities []dnsmessage.Resource
+	for {
+		auth, err := p.Authority()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return
+		}
+		authorities = append(authorities, auth)
+	}
+
+	if err := p.SkipAllAdditionals(); err != nil {
+		return
+	}
+
 	r.mu.Lock()
 	handler := r.conflictHandler
-	probes := make(map[string][]dns.RR, len(r.activeProbes))
+	probes := make(map[string][]dnsmessage.Resource, len(r.activeProbes))
 	for k, v := range r.activeProbes {
 		probes[k] = v
 	}
@@ -447,8 +480,8 @@ func (r *Responder) handleResponse(msg *dns.Msg) {
 
 	// Record multicast response time for multicast rate limiting (RFC 6762 §6.2)
 	now := time.Now()
-	for _, rr := range msg.Answer {
-		key := fmt.Sprintf("%s/%d", strings.ToLower(dns.Fqdn(rr.Header().Name)), rr.Header().Rrtype)
+	for _, rr := range answers {
+		key := fmt.Sprintf("%s/%d", strings.ToLower(rr.Header.Name.String()), rr.Header.Type)
 		r.lastMulticast[key] = now
 	}
 	r.mu.Unlock()
@@ -457,8 +490,8 @@ func (r *Responder) handleResponse(msg *dns.Msg) {
 		return
 	}
 
-	for _, rr := range append(msg.Answer, msg.Ns...) {
-		name := strings.ToLower(dns.Fqdn(rr.Header().Name))
+	for _, rr := range append(answers, authorities...) {
+		name := strings.ToLower(rr.Header.Name.String())
 
 		// 1. Conflict with an active probe
 		if proposed, probing := probes[name]; probing {
@@ -470,7 +503,11 @@ func (r *Responder) handleResponse(msg *dns.Msg) {
 
 		// 2. Conflict with an already published record (RFC 6762 §9)
 		if pubRec, isPub := published[name]; isPub {
-			proposed := buildRecords(pubRec.FQDN, append(append([]net.IP(nil), pubRec.A...), pubRec.AAAA...), pubRec.TTL)
+			proposed, err := buildRecords(pubRec.FQDN, append(append([]net.IP(nil), pubRec.A...), pubRec.AAAA...), pubRec.TTL)
+			if err != nil {
+				klog.Warningf("failed to build records for %s: %v", pubRec.FQDN, err)
+				continue
+			}
 			if isConflictingRecord(rr, proposed) {
 				handler(name, rr)
 			}
@@ -482,25 +519,65 @@ func (r *Responder) handleResponse(msg *dns.Msg) {
 //  1. Answers queries matching published records, respecting multicast rate limiting (RFC 6762 §6.2),
 //     known-answer suppression (§7.1), and legacy unicast formatting (§6.7).
 //  2. Checks simultaneous probe queries against active probes (RFC 6762 §8.2).
-func (r *Responder) handleQuery(msg *dns.Msg, from net.Addr, isIPv6 bool) {
+func (r *Responder) handleQuery(p *dnsmessage.Parser, queryHeader dnsmessage.Header, from net.Addr, isIPv6 bool) {
+	var questions []dnsmessage.Question
+	for {
+		q, err := p.Question()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return
+		}
+		questions = append(questions, q)
+	}
+
+	var knownAnswers []dnsmessage.Resource
+	for {
+		ans, err := p.Answer()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return
+		}
+		knownAnswers = append(knownAnswers, ans)
+	}
+
+	var authorities []dnsmessage.Resource
+	for {
+		auth, err := p.Authority()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return
+		}
+		authorities = append(authorities, auth)
+	}
+
+	if err := p.SkipAllAdditionals(); err != nil {
+		return
+	}
+
 	r.mu.RLock()
 	handler := r.conflictHandler
-	probes := make(map[string][]dns.RR, len(r.activeProbes))
+	probes := make(map[string][]dnsmessage.Resource, len(r.activeProbes))
 	for k, v := range r.activeProbes {
 		probes[k] = v
 	}
 	r.mu.RUnlock()
 
 	// 1. Simultaneous probe conflict check (RFC 6762 §8.2)
-	if handler != nil && len(probes) > 0 && len(msg.Ns) > 0 {
-		for _, q := range msg.Question {
-			qname := strings.ToLower(dns.Fqdn(q.Name))
+	if handler != nil && len(probes) > 0 && len(authorities) > 0 {
+		for _, q := range questions {
+			qname := strings.ToLower(q.Name.String())
 			proposed, probing := probes[qname]
 			if !probing {
 				continue
 			}
-			for _, nsRR := range msg.Ns {
-				if strings.ToLower(dns.Fqdn(nsRR.Header().Name)) == qname {
+			for _, nsRR := range authorities {
+				if strings.ToLower(nsRR.Header.Name.String()) == qname {
 					if isLexicographicallyGreater(nsRR, proposed) {
 						handler(qname, nsRR)
 					}
@@ -514,19 +591,19 @@ func (r *Responder) handleQuery(msg *dns.Msg, from net.Addr, isIPv6 bool) {
 	isLegacyUnicast := isUDP && udpFrom.Port != r.port
 
 	unicastRequested := isLegacyUnicast
-	for _, q := range msg.Question {
-		if q.Qclass&CacheFlushBit != 0 {
+	for _, q := range questions {
+		if uint16(q.Class)&CacheFlushBit != 0 {
 			unicastRequested = true
 		}
 	}
 
 	// 2. Construct answer for published records
-	var answers []dns.RR
+	var answers []dnsmessage.Resource
 	now := time.Now()
 
 	r.mu.Lock()
-	for _, q := range msg.Question {
-		qname := strings.ToLower(dns.Fqdn(q.Name))
+	for _, q := range questions {
+		qname := strings.ToLower(q.Name.String())
 		rec, found := r.records[qname]
 		if !found {
 			continue
@@ -534,7 +611,7 @@ func (r *Responder) handleQuery(msg *dns.Msg, from net.Addr, isIPv6 bool) {
 
 		// RFC 6762 §6.7: Legacy unicast answers must use TTL <= 10s and standard ClassINET (no cache-flush bit).
 		// RFC 6762 §10.2: Standard mDNS answers set CacheFlushBit and normal TTL.
-		var rrClass uint16 = dns.ClassINET
+		var rrClass uint16 = uint16(dnsmessage.ClassINET)
 		ttl := rec.TTL
 		if ttl == 0 {
 			ttl = DefaultTTL
@@ -547,26 +624,34 @@ func (r *Responder) handleQuery(msg *dns.Msg, from net.Addr, isIPv6 bool) {
 			rrClass |= CacheFlushBit
 		}
 
+		recName, err := dnsmessage.NewName(toFQDN(rec.FQDN))
+		if err != nil {
+			klog.Warningf("failed to construct DNS name for %q: %v", rec.FQDN, err)
+			continue
+		}
+
 		// A records
-		if q.Qtype == dns.TypeA || q.Qtype == dns.TypeANY {
-			key := fmt.Sprintf("%s/%d", qname, dns.TypeA)
+		if q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeALL {
+			key := fmt.Sprintf("%s/%d", qname, dnsmessage.TypeA)
 			// Multicast rate limiting: at most once per second per record (RFC 6762 §6.2)
 			allowed := unicastRequested || now.Sub(r.lastMulticast[key]) >= time.Second
 
 			if allowed {
 				for _, ip4 := range rec.A {
 					if ip4.To4() != nil {
-						rr := &dns.A{
-							Hdr: dns.RR_Header{
-								Name:   rec.FQDN,
-								Rrtype: dns.TypeA,
-								Class:  rrClass,
-								Ttl:    ttl,
+						var a [4]byte
+						copy(a[:], ip4.To4())
+						rr := dnsmessage.Resource{
+							Header: dnsmessage.ResourceHeader{
+								Name:  recName,
+								Type:  dnsmessage.TypeA,
+								Class: dnsmessage.Class(rrClass),
+								TTL:   ttl,
 							},
-							A: ip4.To4(),
+							Body: &dnsmessage.AResource{A: a},
 						}
 						// Known-answer suppression (RFC 6762 §7.1): suppress if querier already has it with >= half TTL
-						if !isKnownAnswer(rr, msg.Answer) {
+						if !isKnownAnswer(rr, knownAnswers) {
 							answers = append(answers, rr)
 							if !unicastRequested {
 								r.lastMulticast[key] = now
@@ -578,23 +663,25 @@ func (r *Responder) handleQuery(msg *dns.Msg, from net.Addr, isIPv6 bool) {
 		}
 
 		// AAAA records
-		if q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY {
-			key := fmt.Sprintf("%s/%d", qname, dns.TypeAAAA)
+		if q.Type == dnsmessage.TypeAAAA || q.Type == dnsmessage.TypeALL {
+			key := fmt.Sprintf("%s/%d", qname, dnsmessage.TypeAAAA)
 			allowed := unicastRequested || now.Sub(r.lastMulticast[key]) >= time.Second
 
 			if allowed {
 				for _, ip6 := range rec.AAAA {
 					if ip6.To4() == nil && ip6.To16() != nil {
-						rr := &dns.AAAA{
-							Hdr: dns.RR_Header{
-								Name:   rec.FQDN,
-								Rrtype: dns.TypeAAAA,
-								Class:  rrClass,
-								Ttl:    ttl,
+						var aaaa [16]byte
+						copy(aaaa[:], ip6.To16())
+						rr := dnsmessage.Resource{
+							Header: dnsmessage.ResourceHeader{
+								Name:  recName,
+								Type:  dnsmessage.TypeAAAA,
+								Class: dnsmessage.Class(rrClass),
+								TTL:   ttl,
 							},
-							AAAA: ip6.To16(),
+							Body: &dnsmessage.AAAAResource{AAAA: aaaa},
 						}
-						if !isKnownAnswer(rr, msg.Answer) {
+						if !isKnownAnswer(rr, knownAnswers) {
 							answers = append(answers, rr)
 							if !unicastRequested {
 								r.lastMulticast[key] = now
@@ -611,25 +698,57 @@ func (r *Responder) handleQuery(msg *dns.Msg, from net.Addr, isIPv6 bool) {
 		return
 	}
 
-	resp := new(dns.Msg)
-	resp.SetReply(msg)
-	resp.Response = true
-	resp.Authoritative = true
-	resp.RecursionAvailable = false
-	resp.Answer = answers
+	respHdr := dnsmessage.Header{
+		ID:               queryHeader.ID,
+		Response:         true,
+		OpCode:           queryHeader.OpCode,
+		Authoritative:    true,
+		RecursionDesired: queryHeader.RecursionDesired,
+		CheckingDisabled: queryHeader.CheckingDisabled,
+	}
+	b := dnsmessage.NewBuilder(nil, respHdr)
+	b.EnableCompression()
+
+	if len(questions) > 0 {
+		if err := b.StartQuestions(); err != nil {
+			klog.Warningf("failed to start questions in response: %v", err)
+			return
+		}
+		if err := b.Question(questions[0]); err != nil {
+			klog.Warningf("failed to add question to response: %v", err)
+			return
+		}
+	}
+
+	if err := b.StartAnswers(); err != nil {
+		klog.Warningf("failed to start answers in response: %v", err)
+		return
+	}
+	for _, ans := range answers {
+		if err := appendResource(&b, ans); err != nil {
+			klog.Warningf("failed to add answer to response: %v", err)
+			return
+		}
+	}
+
+	data, err := b.Finish()
+	if err != nil {
+		klog.Warningf("failed to finish building response: %v", err)
+		return
+	}
 
 	if unicastRequested {
-		r.sendUnicast(resp, from, isIPv6)
+		r.sendUnicast(data, from, isIPv6)
 	} else {
-		r.sendMulticast(resp, isIPv6)
+		r.sendMulticast(data, isIPv6)
 	}
 }
 
 // isKnownAnswer determines whether the querier's Answer section contains an identical answer with >= half TTL (RFC 6762 §7.1).
-func isKnownAnswer(ourRR dns.RR, knownAnswers []dns.RR) bool {
+func isKnownAnswer(ourRR dnsmessage.Resource, knownAnswers []dnsmessage.Resource) bool {
 	for _, ka := range knownAnswers {
 		if recordsEqual(ourRR, ka) {
-			if ka.Header().Ttl >= ourRR.Header().Ttl/2 {
+			if ka.Header.TTL >= ourRR.Header.TTL/2 {
 				return true
 			}
 		}
@@ -638,9 +757,9 @@ func isKnownAnswer(ourRR dns.RR, knownAnswers []dns.RR) bool {
 }
 
 // isConflictingRecord determines whether a received record conflicts with our proposed records.
-func isConflictingRecord(received dns.RR, proposed []dns.RR) bool {
+func isConflictingRecord(received dnsmessage.Resource, proposed []dnsmessage.Resource) bool {
 	// A TTL of 0 is a goodbye, not an active conflict.
-	if received.Header().Ttl == 0 {
+	if received.Header.TTL == 0 {
 		return false
 	}
 
@@ -651,15 +770,15 @@ func isConflictingRecord(received dns.RR, proposed []dns.RR) bool {
 		}
 	}
 
-	switch received.(type) {
-	case *dns.A, *dns.AAAA:
+	switch received.Body.(type) {
+	case *dnsmessage.AResource, *dnsmessage.AAAAResource:
 		return true // different address published for same name
 	}
 	return false
 }
 
 // isLexicographicallyGreater determines whether opponent's authority record is greater than ours (RFC 6762 §8.2).
-func isLexicographicallyGreater(oppRR dns.RR, ourRRs []dns.RR) bool {
+func isLexicographicallyGreater(oppRR dnsmessage.Resource, ourRRs []dnsmessage.Resource) bool {
 	// If opponent record is identical to any of our proposed records, it is not a conflict (RFC 6762 §8.2).
 	for _, ourRR := range ourRRs {
 		if recordsEqual(oppRR, ourRR) {
@@ -667,15 +786,15 @@ func isLexicographicallyGreater(oppRR dns.RR, ourRRs []dns.RR) bool {
 		}
 	}
 
-	oppData, err := packRR(oppRR)
+	oppData, err := packResource(oppRR)
 	if err != nil {
 		return false
 	}
 
 	// Compare against our proposed record of the same RR type
 	for _, ourRR := range ourRRs {
-		if ourRR.Header().Rrtype == oppRR.Header().Rrtype {
-			ourData, err := packRR(ourRR)
+		if ourRR.Header.Type == oppRR.Header.Type {
+			ourData, err := packResource(ourRR)
 			if err != nil {
 				continue
 			}
@@ -685,7 +804,7 @@ func isLexicographicallyGreater(oppRR dns.RR, ourRRs []dns.RR) bool {
 
 	// If no same-type record found, compare against all
 	for _, ourRR := range ourRRs {
-		ourData, err := packRR(ourRR)
+		ourData, err := packResource(ourRR)
 		if err != nil {
 			continue
 		}
@@ -696,85 +815,158 @@ func isLexicographicallyGreater(oppRR dns.RR, ourRRs []dns.RR) bool {
 	return false
 }
 
-func recordsEqual(a, b dns.RR) bool {
-	if a.Header().Rrtype != b.Header().Rrtype {
+func recordsEqual(a, b dnsmessage.Resource) bool {
+	if a.Header.Type != b.Header.Type {
 		return false
 	}
-	switch ra := a.(type) {
-	case *dns.A:
-		if rb, ok := b.(*dns.A); ok {
-			return ra.A.Equal(rb.A)
+	switch bodyA := a.Body.(type) {
+	case *dnsmessage.AResource:
+		if bodyB, ok := b.Body.(*dnsmessage.AResource); ok {
+			return bodyA.A == bodyB.A
 		}
-	case *dns.AAAA:
-		if rb, ok := b.(*dns.AAAA); ok {
-			return ra.AAAA.Equal(rb.AAAA)
+	case *dnsmessage.AAAAResource:
+		if bodyB, ok := b.Body.(*dnsmessage.AAAAResource); ok {
+			return bodyA.AAAA == bodyB.AAAA
 		}
 	}
 	return false
 }
 
-func packRR(rr dns.RR) ([]byte, error) {
-	msg := new(dns.Msg)
-	msg.Answer = []dns.RR{rr}
-	return msg.Pack()
+func packResource(r dnsmessage.Resource) ([]byte, error) {
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{})
+	if err := b.StartAnswers(); err != nil {
+		return nil, err
+	}
+	if err := appendResource(&b, r); err != nil {
+		return nil, err
+	}
+	return b.Finish()
+}
+
+func appendResource(b *dnsmessage.Builder, r dnsmessage.Resource) error {
+	switch body := r.Body.(type) {
+	case *dnsmessage.AResource:
+		return b.AResource(r.Header, *body)
+	case *dnsmessage.AAAAResource:
+		return b.AAAAResource(r.Header, *body)
+	case *dnsmessage.CNAMEResource:
+		return b.CNAMEResource(r.Header, *body)
+	case *dnsmessage.PTRResource:
+		return b.PTRResource(r.Header, *body)
+	case *dnsmessage.TXTResource:
+		return b.TXTResource(r.Header, *body)
+	case *dnsmessage.SRVResource:
+		return b.SRVResource(r.Header, *body)
+	case *dnsmessage.UnknownResource:
+		return b.UnknownResource(r.Header, *body)
+	default:
+		return fmt.Errorf("unsupported resource body: %T", r.Body)
+	}
 }
 
 // SendProbe broadcasts an mDNS probe query for the given FQDN with proposed authority records (RFC 6762 §8.1).
-func (r *Responder) SendProbe(fqdn string, proposedRecords []dns.RR) error {
-	name := strings.ToLower(dns.Fqdn(fqdn))
-	m := new(dns.Msg)
-	m.Response = false
-	m.Opcode = dns.OpcodeQuery
-	m.Question = []dns.Question{
-		{
-			Name:   name,
-			Qtype:  dns.TypeANY,
-			Qclass: dns.ClassINET | CacheFlushBit, // QU bit requests unicast response
-		},
+func (r *Responder) SendProbe(fqdn string, proposedRecords []dnsmessage.Resource) error {
+	name, err := dnsmessage.NewName(toFQDN(fqdn))
+	if err != nil {
+		return fmt.Errorf("invalid fqdn %q: %w", fqdn, err)
 	}
-	m.Ns = proposedRecords
-	return r.BroadcastMulticast(m)
+
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		Response: false,
+		OpCode:   0,
+	})
+	b.EnableCompression()
+
+	if err := b.StartQuestions(); err != nil {
+		return fmt.Errorf("starting questions: %w", err)
+	}
+	if err := b.Question(dnsmessage.Question{
+		Name:  name,
+		Type:  dnsmessage.TypeALL,
+		Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | CacheFlushBit), // QU bit requests unicast response
+	}); err != nil {
+		return fmt.Errorf("adding probe question: %w", err)
+	}
+
+	if err := b.StartAuthorities(); err != nil {
+		return fmt.Errorf("starting authorities: %w", err)
+	}
+	for _, rec := range proposedRecords {
+		if err := appendResource(&b, rec); err != nil {
+			return fmt.Errorf("adding probe authority record: %w", err)
+		}
+	}
+
+	data, err := b.Finish()
+	if err != nil {
+		return fmt.Errorf("finishing probe message: %w", err)
+	}
+
+	return r.BroadcastMulticast(data)
 }
 
 // SendAnnouncement broadcasts an mDNS announcement response for the given records (RFC 6762 §8.3).
-func (r *Responder) SendAnnouncement(records []dns.RR) error {
+func (r *Responder) SendAnnouncement(records []dnsmessage.Resource) error {
 	if len(records) == 0 {
 		return nil
 	}
-	m := new(dns.Msg)
-	m.Response = true
-	m.Authoritative = true
-	m.Answer = records
-	return r.BroadcastMulticast(m)
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		Response:      true,
+		Authoritative: true,
+	})
+	b.EnableCompression()
+
+	if err := b.StartAnswers(); err != nil {
+		return fmt.Errorf("starting answers: %w", err)
+	}
+	for _, rec := range records {
+		if err := appendResource(&b, rec); err != nil {
+			return fmt.Errorf("adding announcement record: %w", err)
+		}
+	}
+
+	data, err := b.Finish()
+	if err != nil {
+		return fmt.Errorf("finishing announcement message: %w", err)
+	}
+
+	return r.BroadcastMulticast(data)
 }
 
 // SendGoodbye broadcasts a goodbye packet (TTL=0) for the given records (RFC 6762 §10.1).
-func (r *Responder) SendGoodbye(records []dns.RR) error {
+func (r *Responder) SendGoodbye(records []dnsmessage.Resource) error {
 	if len(records) == 0 {
 		return nil
 	}
-	goodbyes := make([]dns.RR, len(records))
-	for i, rr := range records {
-		cloned := dns.Copy(rr)
-		cloned.Header().Ttl = 0
-		goodbyes[i] = cloned
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		Response:      true,
+		Authoritative: true,
+	})
+	b.EnableCompression()
+
+	if err := b.StartAnswers(); err != nil {
+		return fmt.Errorf("starting answers: %w", err)
 	}
-	m := new(dns.Msg)
-	m.Response = true
-	m.Authoritative = true
-	m.Answer = goodbyes
-	return r.BroadcastMulticast(m)
+	for _, rec := range records {
+		goodbyeRec := rec
+		goodbyeRec.Header.TTL = 0
+		if err := appendResource(&b, goodbyeRec); err != nil {
+			return fmt.Errorf("adding goodbye record: %w", err)
+		}
+	}
+
+	data, err := b.Finish()
+	if err != nil {
+		return fmt.Errorf("finishing goodbye message: %w", err)
+	}
+
+	return r.BroadcastMulticast(data)
 }
 
 // BroadcastMulticast sends a DNS message to both IPv4 and IPv6 multicast groups.
-func (r *Responder) BroadcastMulticast(msg *dns.Msg) error {
+func (r *Responder) BroadcastMulticast(data []byte) error {
 	if r.multicastTap != nil {
-		r.multicastTap(msg)
-	}
-
-	data, err := msg.Pack()
-	if err != nil {
-		return fmt.Errorf("packing dns message: %w", err)
+		r.multicastTap(data)
 	}
 
 	var errs []error
@@ -793,15 +985,11 @@ func (r *Responder) BroadcastMulticast(msg *dns.Msg) error {
 	return errors.Join(errs...)
 }
 
-func (r *Responder) sendMulticast(msg *dns.Msg, isIPv6 bool) {
+func (r *Responder) sendMulticast(data []byte, isIPv6 bool) {
 	if r.multicastTap != nil {
-		r.multicastTap(msg)
+		r.multicastTap(data)
 	}
 
-	data, err := msg.Pack()
-	if err != nil {
-		return
-	}
 	if isIPv6 && r.raw6 != nil {
 		dst6 := &net.UDPAddr{IP: net.ParseIP(IPv6MulticastGroup), Port: r.port}
 		if _, err := r.raw6.WriteTo(data, dst6); err != nil {
@@ -815,11 +1003,7 @@ func (r *Responder) sendMulticast(msg *dns.Msg, isIPv6 bool) {
 	}
 }
 
-func (r *Responder) sendUnicast(msg *dns.Msg, to net.Addr, isIPv6 bool) {
-	data, err := msg.Pack()
-	if err != nil {
-		return
-	}
+func (r *Responder) sendUnicast(data []byte, to net.Addr, isIPv6 bool) {
 	if isIPv6 && r.raw6 != nil {
 		if _, err := r.raw6.WriteTo(data, to); err != nil {
 			klog.Warningf("failed to send IPv6 unicast response to %v: %v", to, err)
@@ -851,4 +1035,11 @@ func (r *Responder) Close() error {
 		err = errors.Join(errs...)
 	})
 	return err
+}
+
+func toFQDN(name string) string {
+	if strings.HasSuffix(name, ".") {
+		return name
+	}
+	return name + "."
 }
