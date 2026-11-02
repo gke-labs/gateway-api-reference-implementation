@@ -622,15 +622,25 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to parse compiled bundle version %q: %v", gatewayconsts.BundleVersion, err)
 	}
+	previousMinorVersion := fmt.Sprintf("v%d.%d.0", compiledV.Major(), compiledV.Minor()-1)
 	differentPatchVersion := fmt.Sprintf("v%d.%d.%d", compiledV.Major(), compiledV.Minor(), compiledV.Patch()+1)
-	mismatchedVersion := fmt.Sprintf("v%d.%d.0", compiledV.Major(), compiledV.Minor()-1)
-	supportedRange := fmt.Sprintf("v%d.%d.x", compiledV.Major(), compiledV.Minor())
+	mismatchedVersion := fmt.Sprintf("v%d.%d.0", compiledV.Major(), compiledV.Minor()-2)
+	supportedRange := fmt.Sprintf("v%d.%d.x and v%d.%d.x", compiledV.Major(), compiledV.Minor()-1, compiledV.Major(), compiledV.Minor())
 
 	crdWithMatchingVersion := &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: GatewayCRDName,
 			Annotations: map[string]string{
 				gatewayconsts.BundleVersionAnnotation: gatewayconsts.BundleVersion,
+			},
+		},
+	}
+
+	crdWithPreviousMinorVersion := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: GatewayCRDName,
+			Annotations: map[string]string{
+				gatewayconsts.BundleVersionAnnotation: previousMinorVersion,
 			},
 		},
 	}
@@ -668,6 +678,48 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 
 		ctx := t.Context()
 		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: gatewayconsts.BundleVersion})
+
+		r := &GatewayClassReconciler{
+			Client:         client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+			CRDView:        crdView,
+		}
+
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+
+		var res gatewayv1.GatewayClass
+		if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &res); err != nil {
+			t.Fatalf("failed to get GatewayClass: %v", err)
+		}
+
+		cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond == nil {
+			t.Fatalf("expected SupportedVersion condition, got nil")
+		}
+		if cond.Status != metav1.ConditionTrue {
+			t.Errorf("expected Status=True, got %s", cond.Status)
+		}
+		if cond.Reason != string(gatewayv1.GatewayClassReasonSupportedVersion) {
+			t.Errorf("expected Reason=SupportedVersion, got %s", cond.Reason)
+		}
+		if cond.ObservedGeneration != 1 {
+			t.Errorf("expected ObservedGeneration=1, got %d", cond.ObservedGeneration)
+		}
+	})
+
+	t.Run("previous minor CRD annotation yields SupportedVersion=True", func(t *testing.T) {
+		client := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc.DeepCopy(), crdWithPreviousMinorVersion).
+			WithStatusSubresource(gc.DeepCopy()).
+			Build()
+
+		ctx := t.Context()
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: previousMinorVersion})
 
 		r := &GatewayClassReconciler{
 			Client:         client,
