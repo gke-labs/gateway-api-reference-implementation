@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -302,12 +303,20 @@ type mockManager struct {
 	scheme    *runtime.Scheme
 	mapper    meta.RESTMapper
 	cache     cache.Cache
+	config    *rest.Config
 	runnables []manager.Runnable
 }
 
 func (m *mockManager) Add(r manager.Runnable) error {
 	m.runnables = append(m.runnables, r)
 	return nil
+}
+
+func (m *mockManager) GetConfig() *rest.Config {
+	if m.config != nil {
+		return m.config
+	}
+	return &rest.Config{Host: "http://localhost:8080"}
 }
 func (m *mockManager) GetCache() cache.Cache          { return m.cache }
 func (m *mockManager) GetScheme() *runtime.Scheme     { return m.scheme }

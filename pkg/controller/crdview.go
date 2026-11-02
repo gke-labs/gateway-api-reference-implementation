@@ -25,8 +25,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/metadata/metadatainformer"
 	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,6 +52,20 @@ const (
 	ListenerSetCRDName      = "listenersets.gateway.networking.k8s.io"
 	ReferenceGrantCRDName   = "referencegrants.gateway.networking.k8s.io"
 )
+
+// GatewayAPICRDNames contains all CustomResourceDefinition names for Gateway API resources.
+var GatewayAPICRDNames = []string{
+	GatewayClassCRDName,
+	GatewayCRDName,
+	HTTPRouteCRDName,
+	TLSRouteCRDName,
+	GRPCRouteCRDName,
+	TCPRouteCRDName,
+	UDPRouteCRDName,
+	BackendTLSPolicyCRDName,
+	ListenerSetCRDName,
+	ReferenceGrantCRDName,
+}
 
 // CustomResourceDefinitionGVK is the GroupVersionKind for CustomResourceDefinitions.
 var CustomResourceDefinitionGVK = schema.GroupVersionKind{
@@ -235,11 +252,14 @@ type crdRecord struct {
 // CRDView manages the Gateway API CRD view: tracking served kinds, bundle version,
 // and reacting to CRD changes at runtime.
 type CRDView struct {
+	// mu guards crds, snapshot, onBundleVersionChanged, and informers.
 	mu                     sync.RWMutex
 	crds                   map[string]crdRecord
 	snapshot               CRDSnapshot
 	onBundleVersionChanged func(newVersion string)
-	crdChanges             atomic.Uint64
+	informers              []toolscache.SharedIndexInformer
+
+	crdChanges atomic.Uint64
 }
 
 // NewCRDView initializes a new CRDView using the RESTMapper as the single source of truth
@@ -321,28 +341,106 @@ func (v *CRDView) Snapshot() CRDSnapshot {
 	return v.snapshot
 }
 
-// RegisterWithManager registers the metadata-only CRD informer handler with mgr.
+// RegisterWithManager registers field-selected metadata informers for each named
+// Gateway API CRD with mgr.
 func (v *CRDView) RegisterWithManager(mgr ctrl.Manager) error {
-	if mgr == nil || mgr.GetCache() == nil {
+	if mgr == nil {
+		return fmt.Errorf("manager is required")
+	}
+
+	v.mu.Lock()
+	alreadyRegistered := len(v.informers) > 0
+	v.mu.Unlock()
+
+	if alreadyRegistered {
 		return nil
 	}
-	crdMeta := &metav1.PartialObjectMetadata{}
-	crdMeta.SetGroupVersionKind(CustomResourceDefinitionGVK)
-	informer, err := mgr.GetCache().GetInformer(context.Background(), crdMeta)
-	if err != nil {
-		return fmt.Errorf("failed to get informer for CustomResourceDefinition metadata: %w", err)
+
+	cfg := mgr.GetConfig()
+	if cfg == nil {
+		return fmt.Errorf("manager rest.Config is required for CRD informers")
 	}
-	_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerDetailedFuncs{
-		AddFunc: func(obj any, isInInitialList bool) {
-			v.HandleAdd(obj, isInInitialList)
-		},
-		UpdateFunc: v.HandleUpdate,
-		DeleteFunc: v.HandleDelete,
-	})
+
+	metaClient, err := metadata.NewForConfig(cfg)
 	if err != nil {
-		return fmt.Errorf("failed to add event handler for CustomResourceDefinition metadata: %w", err)
+		return fmt.Errorf("failed to create metadata client for CRD informers: %w", err)
+	}
+
+	crdGVR := schema.GroupVersionResource{
+		Group:    CustomResourceDefinitionGVK.Group,
+		Version:  CustomResourceDefinitionGVK.Version,
+		Resource: "customresourcedefinitions",
+	}
+
+	var informers []toolscache.SharedIndexInformer
+	for _, crdName := range GatewayAPICRDNames {
+		name := crdName
+		tweak := func(opts *metav1.ListOptions) {
+			opts.FieldSelector = fields.OneTermEqualSelector("metadata.name", name).String()
+		}
+		genInformer := metadatainformer.NewFilteredMetadataInformer(
+			metaClient,
+			crdGVR,
+			metav1.NamespaceAll,
+			0,
+			toolscache.Indexers{},
+			tweak,
+		)
+		inf := genInformer.Informer()
+		if err := inf.SetTransform(toolscache.TransformFunc(CRDMetadataTransform)); err != nil {
+			return fmt.Errorf("failed to set transform for %s CRD informer: %w", name, err)
+		}
+		_, err := inf.AddEventHandler(toolscache.ResourceEventHandlerDetailedFuncs{
+			AddFunc: func(obj any, isInInitialList bool) {
+				v.HandleAdd(obj, isInInitialList)
+			},
+			UpdateFunc: v.HandleUpdate,
+			DeleteFunc: v.HandleDelete,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to add event handler for %s CRD informer: %w", name, err)
+		}
+		informers = append(informers, inf)
+	}
+
+	v.mu.Lock()
+	v.informers = informers
+	v.mu.Unlock()
+
+	if err := mgr.Add(v); err != nil {
+		return fmt.Errorf("failed to add CRDView to manager: %w", err)
 	}
 	return nil
+}
+
+// Start runs all registered CRD informers until ctx is cancelled.
+func (v *CRDView) Start(ctx context.Context) error {
+	v.mu.RLock()
+	informers := make([]toolscache.SharedIndexInformer, len(v.informers))
+	copy(informers, v.informers)
+	v.mu.RUnlock()
+
+	if len(informers) == 0 {
+		<-ctx.Done()
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	for _, inf := range informers {
+		wg.Add(1)
+		go func(inf toolscache.SharedIndexInformer) {
+			defer wg.Done()
+			inf.RunWithContext(ctx)
+		}(inf)
+	}
+	wg.Wait()
+	return nil
+}
+
+// NeedLeaderElection implements manager.LeaderElectionRunnable.
+// CRD informers do not require leader election and should run immediately.
+func (v *CRDView) NeedLeaderElection() bool {
+	return false
 }
 
 // HandleAdd processes CRD creation events.

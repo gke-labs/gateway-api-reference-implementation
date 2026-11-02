@@ -21,7 +21,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	appsv1 "k8s.io/api/apps/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -80,5 +82,55 @@ func TestControllerManifest_DefaultDeploymentOptIn(t *testing.T) {
 
 	if !foundDeploy {
 		t.Fatalf("gari-controller Deployment not found in %s", manifestPath)
+	}
+}
+
+func TestControllerManifest_RBACCustomResourceDefinitions(t *testing.T) {
+	manifestPath := filepath.Join("..", "..", "k8s", "controller.yaml")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", manifestPath, err)
+	}
+
+	docs := strings.Split(string(data), "\n---")
+	var foundClusterRole bool
+	var foundCRDRule bool
+
+	for _, doc := range docs {
+		var role rbacv1.ClusterRole
+		if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
+			continue
+		}
+		if role.Kind != "ClusterRole" || role.Name != "gari-controller" {
+			continue
+		}
+		foundClusterRole = true
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.APIGroups, "apiextensions.k8s.io") && slices.Contains(rule.Resources, "customresourcedefinitions") {
+				foundCRDRule = true
+				gotNames := slices.Clone(rule.ResourceNames)
+				slices.Sort(gotNames)
+				sortedExpected := slices.Clone(controller.GatewayAPICRDNames)
+				slices.Sort(sortedExpected)
+				if !slices.Equal(gotNames, sortedExpected) {
+					t.Errorf("customresourcedefinitions rule must restrict resourceNames to named Gateway API CRDs; got %v, want %v", rule.ResourceNames, controller.GatewayAPICRDNames)
+				}
+				for _, verb := range []string{"get", "list", "watch"} {
+					if !slices.Contains(rule.Verbs, verb) {
+						t.Errorf("customresourcedefinitions rule missing required verb %q; got %v", verb, rule.Verbs)
+					}
+				}
+				if len(rule.Verbs) != 3 {
+					t.Errorf("expected exactly [get, list, watch] verbs; got %v", rule.Verbs)
+				}
+			}
+		}
+	}
+
+	if !foundClusterRole {
+		t.Fatalf("gari-controller ClusterRole not found in %s", manifestPath)
+	}
+	if !foundCRDRule {
+		t.Fatalf("customresourcedefinitions rule not found in gari-controller ClusterRole")
 	}
 }
