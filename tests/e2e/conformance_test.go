@@ -155,11 +155,6 @@ var skippedTests = map[string]struct{}{
 	// Suite claims TLSRouteModeTerminate and TLSRouteModeMixed.
 	"TLSRouteListenerTerminateNotSupported":        {},
 	"TLSRouteListenerMixedTerminationNotSupported": {},
-
-	// fails: BackendTLSPolicy Accepted condition not set when targeted by GRPCRoute
-	"BackendTLSPolicyGRPCRoute": {},
-	// fails: BackendTLSPolicy Accepted condition not set when targeted by TLSRoute in terminate mode
-	"BackendTLSPolicyTLSRouteTerminate": {},
 }
 
 // previousMinorSkippedTests contains additional tests to skip when running against the previous minor's CRDs,

@@ -274,8 +274,8 @@ func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 		}
 
 		if selected.Protocol == gatewayv1.TLSProtocolType && (selected.TLSMode == nil || *selected.TLSMode == gatewayv1.TLSModeTerminate) {
-			backend, ok := selected.SelectTLSBackend(sniHostname)
-			if !ok || backend == "" {
+			backend, ok := selected.SelectTLSBackendObject(sniHostname)
+			if !ok || backend.Target == "" {
 				return
 			}
 			handedOff = true
@@ -301,7 +301,7 @@ func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 	handOffToHTTPS()
 }
 
-func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, backend string) {
+func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname string, backend state.InternalTLSBackend) {
 	select {
 	case <-l.done:
 		closeConn(clientConn)
@@ -330,8 +330,23 @@ func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, ba
 		return
 	}
 
+	if backend.Error != nil {
+		closeConn(tlsConn)
+		return
+	}
+
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	backendConn, err := dialer.Dial("tcp", backend)
+	var backendConn net.Conn
+	var err error
+	if backend.TLSConfig != nil {
+		tlsConfig := l.p.buildBackendTLSConfig(state.InternalBackend{
+			Host:      backend.Target,
+			TLSConfig: backend.TLSConfig,
+		})
+		backendConn, err = tls.DialWithDialer(dialer, "tcp", backend.Target, tlsConfig)
+	} else {
+		backendConn, err = dialer.Dial("tcp", backend.Target)
+	}
 	if err != nil {
 		closeConn(tlsConn)
 		return

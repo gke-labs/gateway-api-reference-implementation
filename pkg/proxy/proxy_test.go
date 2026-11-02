@@ -2514,7 +2514,7 @@ func TestProxy_BuildTransport_BackendTLSPolicy(t *testing.T) {
 			WellKnownCACertificates: &systemWellKnown,
 		},
 	}
-	trSystem := p.buildTransport(systemBackend)
+	trSystem := p.buildTransport(systemBackend, false)
 	httpTrSystem, ok := trSystem.(*http.Transport)
 	if !ok || httpTrSystem.TLSClientConfig == nil {
 		t.Fatalf("expected *http.Transport with non-nil TLSClientConfig")
@@ -2539,7 +2539,7 @@ func TestProxy_BuildTransport_BackendTLSPolicy(t *testing.T) {
 			CACerts:  nil,
 		},
 	}
-	trInvalid := p.buildTransport(invalidBackend)
+	trInvalid := p.buildTransport(invalidBackend, false)
 	httpTrInvalid, ok := trInvalid.(*http.Transport)
 	if !ok || httpTrInvalid.TLSClientConfig == nil {
 		t.Fatalf("expected *http.Transport with non-nil TLSClientConfig")
@@ -2563,7 +2563,7 @@ func TestProxy_BuildTransport_BackendTLSPolicy(t *testing.T) {
 		AppProtocol: &httpsProto,
 		TLSConfig:   nil,
 	}
-	trNoPolicy := p.buildTransport(noPolicyBackend)
+	trNoPolicy := p.buildTransport(noPolicyBackend, false)
 	httpTrNoPolicy, ok := trNoPolicy.(*http.Transport)
 	if !ok || httpTrNoPolicy.TLSClientConfig == nil {
 		t.Fatalf("expected *http.Transport with non-nil TLSClientConfig")
@@ -2635,7 +2635,7 @@ func TestBackendTLS_WithoutPolicy_Verification(t *testing.T) {
 	}
 
 	// Also directly verify via RoundTrip that TLS handshake error is returned
-	tr := p.buildTransport(noPolicyBackend)
+	tr := p.buildTransport(noPolicyBackend, false)
 	reqDirect, err := http.NewRequest("GET", fmt.Sprintf("https://%s:%d/", host, port), nil)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
@@ -2838,7 +2838,7 @@ func TestBackendTLSPolicy_SubjectAltNamesVerification(t *testing.T) {
 					SubjectAltNames: tc.sans,
 				},
 			}
-			tr := p.buildTransport(backend)
+			tr := p.buildTransport(backend, false)
 			client := &http.Client{Transport: tr}
 			req, _ := http.NewRequest("GET", fmt.Sprintf("https://%s:%d/", host, port), nil)
 			resp, err := client.Do(req)
@@ -3111,7 +3111,7 @@ func TestBackendTLSPolicy_ClientCertificateAuth(t *testing.T) {
 				ClientCert: &clientTLSCert,
 			},
 		}
-		tr := p.buildTransport(backend)
+		tr := p.buildTransport(backend, false)
 		client := &http.Client{Transport: tr}
 		req, _ := http.NewRequest("GET", fmt.Sprintf("https://%s:%d/", host, port), nil)
 		resp, err := client.Do(req)
@@ -3140,7 +3140,7 @@ func TestBackendTLSPolicy_ClientCertificateAuth(t *testing.T) {
 				ClientCert: nil,
 			},
 		}
-		tr := p.buildTransport(backend)
+		tr := p.buildTransport(backend, false)
 		client := &http.Client{Transport: tr}
 		req, _ := http.NewRequest("GET", fmt.Sprintf("https://%s:%d/", host, port), nil)
 		resp, err := client.Do(req)
@@ -3878,6 +3878,101 @@ func TestProxy_GRPCRoute_HeaderModifiers(t *testing.T) {
 	}
 }
 
+func TestProxy_GRPCRoute_BackendTLSPolicy(t *testing.T) {
+	backendCAPEM, backendCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
+
+	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/grpc")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("grpc-reply"))
+		w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+		w.Header().Set(http.TrailerPrefix+"Grpc-Message", "ok")
+	})
+
+	backendTLS := &tls.Config{
+		Certificates: []tls.Certificate{backendCert},
+		NextProtos:   []string{"h2"},
+	}
+	backendLn, err := tls.Listen("tcp", "127.0.0.1:0", backendTLS)
+	if err != nil {
+		t.Fatalf("failed to listen for backend: %v", err)
+	}
+	defer backendLn.Close()
+	backendSrv := &http.Server{
+		Handler: backendHandler,
+	}
+	_ = http2.ConfigureServer(backendSrv, &http2.Server{})
+	go backendSrv.Serve(backendLn)
+	defer backendSrv.Close()
+
+	backendHost, backendPortStr, _ := net.SplitHostPort(backendLn.Addr().String())
+	backendPort, _ := strconv.Atoi(backendPortStr)
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Hostnames: testRouteHostnames("example.com"),
+			Rules: []state.InternalRule{
+				{
+					Backends: []state.InternalBackend{
+						{
+							Host:        backendHost,
+							Port:        int32(backendPort),
+							AppProtocol: state.Ptr("https"),
+							Weight:      1,
+							TLSConfig: &state.InternalTLSConfig{
+								Hostname: "backend.local",
+								CACerts:  [][]byte{backendCAPEM},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	proxyH2cHandler := h2c.NewHandler(p, &http2.Server{})
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for proxy: %v", err)
+	}
+	defer proxyLn.Close()
+	proxySrv := &http.Server{Handler: proxyH2cHandler}
+	go proxySrv.Serve(proxyLn)
+	defer proxySrv.Close()
+
+	client := &http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		},
+	}
+
+	req, err := http.NewRequest("POST", "http://"+proxyLn.Addr().String()+"/my.service/Echo", bytes.NewReader([]byte("ping")))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Host = "example.com"
+	req.Header.Set("Content-Type", "application/grpc")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "grpc-reply" {
+		t.Errorf("expected body 'grpc-reply', got %q", string(body))
+	}
+	if resp.Header.Get("Grpc-Status") != "0" && resp.Trailer.Get("Grpc-Status") != "0" {
+		t.Errorf("expected Grpc-Status trailer '0', got header %q trailer %q", resp.Header.Get("Grpc-Status"), resp.Trailer.Get("Grpc-Status"))
+	}
+}
+
 func TestProxy_BackendConnectionReuse(t *testing.T) {
 	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
 
@@ -3970,13 +4065,13 @@ func TestProxy_BackendTransportCachingAndEviction(t *testing.T) {
 	}
 
 	p := NewProxy()
-	tr1 := p.buildTransport(b1)
-	tr2 := p.buildTransport(b1)
+	tr1 := p.buildTransport(b1, false)
+	tr2 := p.buildTransport(b1, false)
 	if tr1 != tr2 {
 		t.Fatalf("expected buildTransport to return cached transport for same backend")
 	}
 
-	trB2 := p.buildTransport(b2)
+	trB2 := p.buildTransport(b2, false)
 	if tr1 == trB2 {
 		t.Fatalf("expected different transports for different backends")
 	}
@@ -3991,8 +4086,8 @@ func TestProxy_BackendTransportCachingAndEviction(t *testing.T) {
 
 	// b2 should have been evicted
 	p.transportsMu.Lock()
-	_, b1Cached := p.transports[backendTransportKey(b1)]
-	_, b2Cached := p.transports[backendTransportKey(b2)]
+	_, b1Cached := p.transports[backendTransportKey(b1, false)]
+	_, b2Cached := p.transports[backendTransportKey(b2, false)]
 	p.transportsMu.Unlock()
 
 	if !b1Cached {
@@ -4066,7 +4161,7 @@ func TestTLSSessionResumption_HTTPToTLSBackend(t *testing.T) {
 
 	// Close idle connections to force transport to dial a new connection on next request
 	p.transportsMu.Lock()
-	tr := p.transports[backendTransportKey(b)]
+	tr := p.transports[backendTransportKey(b, false)]
 	tr.(*http.Transport).CloseIdleConnections()
 	p.transportsMu.Unlock()
 

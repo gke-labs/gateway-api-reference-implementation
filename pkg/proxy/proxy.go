@@ -1381,6 +1381,9 @@ var hopByHopHeaders = []string{
 
 func removeHopByHopHeaders(h http.Header) {
 	for _, k := range hopByHopHeaders {
+		if k == "Te" && strings.EqualFold(h.Get("Te"), "trailers") {
+			continue
+		}
 		h.Del(k)
 	}
 	if c := h.Get("Connection"); c != "" {
@@ -1665,7 +1668,7 @@ func verifySubjectAltNames(cert *x509.Certificate, sans []gatewayv1.SubjectAltNa
 	return fmt.Errorf("certificate does not match configured SubjectAltNames")
 }
 
-func backendTransportKey(backend state.InternalBackend) string {
+func backendTransportKey(backend state.InternalBackend, isH2 bool) string {
 	appProto := strings.ToLower(state.ValueOf(backend.AppProtocol))
 	if !strings.EqualFold(appProto, "https") && appProto != "kubernetes.io/h2c" {
 		return "default"
@@ -1676,7 +1679,11 @@ func backendTransportKey(backend state.InternalBackend) string {
 	}
 
 	var b strings.Builder
-	b.WriteString("https|")
+	if isH2 {
+		b.WriteString("https-h2|")
+	} else {
+		b.WriteString("https|")
+	}
 	b.WriteString(target)
 	b.WriteString("|")
 	if backend.TLSConfig != nil {
@@ -1732,22 +1739,26 @@ func (p *Proxy) evictUnusedTransports(activeRoutes []state.InternalRoute) {
 	for _, route := range activeRoutes {
 		for _, rule := range route.Rules {
 			for _, b := range rule.Backends {
-				key := backendTransportKey(b)
-				if !activeKeys[key] {
-					activeKeys[key] = true
-					if strings.HasPrefix(key, "https|") {
+				k1 := backendTransportKey(b, false)
+				k2 := backendTransportKey(b, true)
+				if !activeKeys[k1] {
+					activeKeys[k1] = true
+					if strings.HasPrefix(k1, "https|") {
 						distinctTLSCount++
 					}
 				}
+				activeKeys[k2] = true
 			}
 			for _, m := range rule.Mirrors {
-				key := backendTransportKey(m.Backend)
-				if !activeKeys[key] {
-					activeKeys[key] = true
-					if strings.HasPrefix(key, "https|") {
+				k1 := backendTransportKey(m.Backend, false)
+				k2 := backendTransportKey(m.Backend, true)
+				if !activeKeys[k1] {
+					activeKeys[k1] = true
+					if strings.HasPrefix(k1, "https|") {
 						distinctTLSCount++
 					}
 				}
+				activeKeys[k2] = true
 			}
 		}
 	}
@@ -1772,8 +1783,8 @@ func (p *Proxy) evictUnusedTransports(activeRoutes []state.InternalRoute) {
 	}
 }
 
-func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper {
-	key := backendTransportKey(backend)
+func (p *Proxy) buildTransport(backend state.InternalBackend, isH2 bool) http.RoundTripper {
+	key := backendTransportKey(backend, isH2)
 	if key == "default" {
 		return http.DefaultTransport
 	}
@@ -1789,8 +1800,36 @@ func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper 
 
 	var tr http.RoundTripper
 	if strings.EqualFold(state.ValueOf(backend.AppProtocol), "https") {
-		tr = &http.Transport{
-			TLSClientConfig: p.buildBackendTLSConfig(backend),
+		if isH2 {
+			tlsConfig := p.buildBackendTLSConfig(backend).Clone()
+			tlsConfig.NextProtos = []string{"h2"}
+			tr = &http2.Transport{
+				TLSClientConfig: tlsConfig,
+				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+					dialer := &tls.Dialer{
+						NetDialer: &net.Dialer{Timeout: 5 * time.Second},
+						Config:    cfg,
+					}
+					cn, err := dialer.DialContext(ctx, network, addr)
+					if err != nil {
+						return nil, err
+					}
+					if tlsCn, ok := cn.(*tls.Conn); ok {
+						cs := tlsCn.ConnectionState()
+						if proto := cs.NegotiatedProtocol; proto != http2.NextProtoTLS {
+							if closeErr := cn.Close(); closeErr != nil {
+								klog.Errorf("failed to close connection after ALPN mismatch: %v", closeErr)
+							}
+							return nil, fmt.Errorf("http2: unexpected ALPN protocol %q; want %q", proto, http2.NextProtoTLS)
+						}
+					}
+					return cn, nil
+				},
+			}
+		} else {
+			tr = &http.Transport{
+				TLSClientConfig: p.buildBackendTLSConfig(backend),
+			}
 		}
 	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
 		tr = &http2.Transport{
@@ -2066,7 +2105,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		}
 	}
 
-	transport := p.buildTransport(backend)
+	isGRPC := strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
+	transport := p.buildTransport(backend, isGRPC)
 
 	maxRetries := 0
 	if retry != nil && retry.Attempts != nil && *retry.Attempts > 0 {
@@ -2480,7 +2520,8 @@ func (p *Proxy) mirror(r *http.Request, bodyBytes []byte, backend state.Internal
 			return
 		}
 
-		transport := p.buildTransport(backend)
+		isGRPC := strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
+		transport := p.buildTransport(backend, isGRPC)
 		log.Log.Info("Mirroring request", "host", mirrorReq.Host, "path", mirrorReq.URL.Path, "target", targetURL.String())
 
 		resp, err := transport.RoundTrip(mirrorReq)

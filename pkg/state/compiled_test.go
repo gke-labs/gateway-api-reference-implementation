@@ -3719,6 +3719,433 @@ func TestBackendTLSPolicy_CompiledInternalTLSConfig_CarriesSubjectAltNames(t *te
 	}
 }
 
+func TestComputeOutputs_BackendTLSPolicy_GRPCRoute_AncestorStatus(t *testing.T) {
+	certPEM, _ := generateTestCertPEM(t, "example.com")
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "valid-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
+		},
+	}
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "grpc-service"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "grpc-service"},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Name: "btls", Port: 443},
+				},
+			},
+		},
+	}
+
+	gwCertPEM, gwKeyPEM := generateTestCertPEM(t, "grpc.example.com")
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "gw-cert"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-cert"},
+			Type:       corev1.SecretTypeTLS,
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       gwCertPEM,
+				corev1.TLSPrivateKeyKey: gwKeyPEM,
+			},
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "gw-cert"},
+						},
+					},
+				},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	port443 := gatewayv1.PortNumber(443)
+	grpcRoute := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "grpc-route", Namespace: "default"},
+		Spec: gatewayv1.GRPCRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+			},
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					BackendRefs: []gatewayv1.GRPCBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "grpc-service",
+									Port: &port443,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	btlsSection := gatewayv1.SectionName("btls")
+	policy := &gatewayv1.BackendTLSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "grpc-policy", Namespace: "default", Generation: 1},
+		Spec: gatewayv1.BackendTLSPolicySpec{
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+						Group: "",
+						Kind:  "Service",
+						Name:  "grpc-service",
+					},
+					SectionName: &btlsSection,
+				},
+			},
+			Validation: gatewayv1.BackendTLSPolicyValidation{
+				Hostname: "grpc.backend.local",
+				CACertificateRefs: []gatewayv1.LocalObjectReference{
+					{Group: "", Kind: "ConfigMap", Name: "valid-ca"},
+				},
+			},
+		},
+	}
+
+	outputs := ComputeOutputs(ModelInputs{
+		Gateways:           []*gatewayv1.Gateway{gw},
+		GatewayClasses:     []*gatewayv1.GatewayClass{gc},
+		GRPCRoutes:         []*gatewayv1.GRPCRoute{grpcRoute},
+		BackendTLSPolicies: []*gatewayv1.BackendTLSPolicy{policy},
+		ConfigMaps:         configMaps,
+		Services:           services,
+		Secrets:            secrets,
+		ControllerName:     "test-controller",
+	})
+
+	policyStatus, ok := outputs.BackendTLSPolicyStatuses[types.NamespacedName{Namespace: "default", Name: "grpc-policy"}]
+	if !ok {
+		t.Fatalf("expected policy status for grpc-policy")
+	}
+	if len(policyStatus.Ancestors) != 1 {
+		t.Fatalf("expected 1 ancestor in policy status for GRPCRoute backend, got %d", len(policyStatus.Ancestors))
+	}
+	if string(policyStatus.Ancestors[0].AncestorRef.Name) != "gw" {
+		t.Errorf("expected ancestor gw, got %s", policyStatus.Ancestors[0].AncestorRef.Name)
+	}
+	var acceptedCond, refsCond *metav1.Condition
+	for i := range policyStatus.Ancestors[0].Conditions {
+		c := &policyStatus.Ancestors[0].Conditions[i]
+		if c.Type == string(gatewayv1.PolicyConditionAccepted) {
+			acceptedCond = c
+		} else if c.Type == string(gatewayv1.BackendTLSPolicyConditionResolvedRefs) {
+			refsCond = c
+		}
+	}
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Accepted=True, got %v", acceptedCond)
+	}
+	if refsCond == nil || refsCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected ResolvedRefs=True, got %v", refsCond)
+	}
+
+	if len(outputs.ProxyListeners) != 1 || len(outputs.ProxyListeners[0].Routes) != 1 {
+		t.Fatalf("expected 1 proxy listener and 1 route")
+	}
+	b := outputs.ProxyListeners[0].Routes[0].Rules[0].Backends[0]
+	if b.TLSConfig == nil {
+		t.Fatalf("expected GRPCRoute backend to have TLSConfig")
+	}
+	if b.TLSConfig.Hostname != "grpc.backend.local" {
+		t.Errorf("expected Hostname 'grpc.backend.local', got %q", b.TLSConfig.Hostname)
+	}
+	if len(b.TLSConfig.CACerts) != 1 {
+		t.Errorf("expected 1 CACert, got %d", len(b.TLSConfig.CACerts))
+	}
+}
+
+func TestComputeOutputs_BackendTLSPolicy_TLSRouteTerminate_AncestorStatus(t *testing.T) {
+	certPEM, _ := generateTestCertPEM(t, "example.com")
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "valid-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
+		},
+	}
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "tls-backend"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "tls-backend"},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Name: "btls", Port: 8443},
+				},
+			},
+		},
+	}
+
+	gwCertPEM, gwKeyPEM := generateTestCertPEM(t, "tls.example.com")
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "gw-tls-cert"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-tls-cert"},
+			Type:       corev1.SecretTypeTLS,
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       gwCertPEM,
+				corev1.TLSPrivateKeyKey: gwKeyPEM,
+			},
+		},
+	}
+
+	terminateMode := gatewayv1.TLSModeTerminate
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "tls-terminate",
+					Port:     8443,
+					Protocol: gatewayv1.TLSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						Mode: &terminateMode,
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "gw-tls-cert"},
+						},
+					},
+				},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	port8443 := gatewayv1.PortNumber(8443)
+	tlsRoute := &gatewayv1.TLSRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "tls-route", Namespace: "default"},
+		Spec: gatewayv1.TLSRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+			},
+			Rules: []gatewayv1.TLSRouteRule{
+				{
+					BackendRefs: []gatewayv1.BackendRef{
+						{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Name: "tls-backend",
+								Port: &port8443,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	btlsSection := gatewayv1.SectionName("btls")
+	policy := &gatewayv1.BackendTLSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "tls-policy", Namespace: "default", Generation: 1},
+		Spec: gatewayv1.BackendTLSPolicySpec{
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+						Group: "",
+						Kind:  "Service",
+						Name:  "tls-backend",
+					},
+					SectionName: &btlsSection,
+				},
+			},
+			Validation: gatewayv1.BackendTLSPolicyValidation{
+				Hostname: "abc.example.com",
+				CACertificateRefs: []gatewayv1.LocalObjectReference{
+					{Group: "", Kind: "ConfigMap", Name: "valid-ca"},
+				},
+			},
+		},
+	}
+
+	outputs := ComputeOutputs(ModelInputs{
+		Gateways:           []*gatewayv1.Gateway{gw},
+		GatewayClasses:     []*gatewayv1.GatewayClass{gc},
+		TLSRoutes:          []*gatewayv1.TLSRoute{tlsRoute},
+		BackendTLSPolicies: []*gatewayv1.BackendTLSPolicy{policy},
+		ConfigMaps:         configMaps,
+		Services:           services,
+		Secrets:            secrets,
+		ControllerName:     "test-controller",
+	})
+
+	policyStatus, ok := outputs.BackendTLSPolicyStatuses[types.NamespacedName{Namespace: "default", Name: "tls-policy"}]
+	if !ok {
+		t.Fatalf("expected policy status for tls-policy")
+	}
+	if len(policyStatus.Ancestors) != 1 {
+		t.Fatalf("expected 1 ancestor in policy status for TLSRoute terminate backend, got %d", len(policyStatus.Ancestors))
+	}
+	if string(policyStatus.Ancestors[0].AncestorRef.Name) != "gw" {
+		t.Errorf("expected ancestor gw, got %s", policyStatus.Ancestors[0].AncestorRef.Name)
+	}
+	var acceptedCond, refsCond *metav1.Condition
+	for i := range policyStatus.Ancestors[0].Conditions {
+		c := &policyStatus.Ancestors[0].Conditions[i]
+		if c.Type == string(gatewayv1.PolicyConditionAccepted) {
+			acceptedCond = c
+		} else if c.Type == string(gatewayv1.BackendTLSPolicyConditionResolvedRefs) {
+			refsCond = c
+		}
+	}
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Accepted=True, got %v", acceptedCond)
+	}
+	if refsCond == nil || refsCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected ResolvedRefs=True, got %v", refsCond)
+	}
+
+	// Verify compiled TLSBackends carries TLSConfig
+	if len(outputs.ProxyListeners) != 1 {
+		t.Fatalf("expected 1 proxy listener, got %d", len(outputs.ProxyListeners))
+	}
+	pLis := outputs.ProxyListeners[0]
+	backends := pLis.TLSBackends["*"]
+	if len(backends) == 0 {
+		backends = pLis.TLSBackends[""]
+	}
+	if len(backends) == 0 {
+		for _, b := range pLis.TLSBackends {
+			if len(b) > 0 {
+				backends = b
+				break
+			}
+		}
+	}
+	if len(backends) != 1 {
+		t.Fatalf("expected 1 backend in TLSBackends, got %d", len(backends))
+	}
+	if backends[0].TLSConfig == nil {
+		t.Fatalf("expected TLSRoute backend to have TLSConfig")
+	}
+	if backends[0].TLSConfig.Hostname != "abc.example.com" {
+		t.Errorf("expected Hostname 'abc.example.com', got %q", backends[0].TLSConfig.Hostname)
+	}
+	if len(backends[0].TLSConfig.CACerts) != 1 {
+		t.Errorf("expected 1 CACert, got %d", len(backends[0].TLSConfig.CACerts))
+	}
+}
+
+func TestComputeOutputs_BackendTLSPolicy_TLSRoutePassthrough_NoAncestorStatus(t *testing.T) {
+	certPEM, _ := generateTestCertPEM(t, "example.com")
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "valid-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
+		},
+	}
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "tls-backend"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "tls-backend"},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Name: "btls", Port: 8443},
+				},
+			},
+		},
+	}
+
+	passthroughMode := gatewayv1.TLSModePassthrough
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "tls-passthrough",
+					Port:     8443,
+					Protocol: gatewayv1.TLSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						Mode: &passthroughMode,
+					},
+				},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	port8443 := gatewayv1.PortNumber(8443)
+	tlsRoute := &gatewayv1.TLSRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "tls-route", Namespace: "default"},
+		Spec: gatewayv1.TLSRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+			},
+			Rules: []gatewayv1.TLSRouteRule{
+				{
+					BackendRefs: []gatewayv1.BackendRef{
+						{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Name: "tls-backend",
+								Port: &port8443,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	btlsSection := gatewayv1.SectionName("btls")
+	policy := &gatewayv1.BackendTLSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "tls-policy", Namespace: "default", Generation: 1},
+		Spec: gatewayv1.BackendTLSPolicySpec{
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+						Group: "",
+						Kind:  "Service",
+						Name:  "tls-backend",
+					},
+					SectionName: &btlsSection,
+				},
+			},
+			Validation: gatewayv1.BackendTLSPolicyValidation{
+				Hostname: "abc.example.com",
+				CACertificateRefs: []gatewayv1.LocalObjectReference{
+					{Group: "", Kind: "ConfigMap", Name: "valid-ca"},
+				},
+			},
+		},
+	}
+
+	outputs := ComputeOutputs(ModelInputs{
+		Gateways:           []*gatewayv1.Gateway{gw},
+		GatewayClasses:     []*gatewayv1.GatewayClass{gc},
+		TLSRoutes:          []*gatewayv1.TLSRoute{tlsRoute},
+		BackendTLSPolicies: []*gatewayv1.BackendTLSPolicy{policy},
+		ConfigMaps:         configMaps,
+		Services:           services,
+		ControllerName:     "test-controller",
+	})
+
+	policyStatus, ok := outputs.BackendTLSPolicyStatuses[types.NamespacedName{Namespace: "default", Name: "tls-policy"}]
+	if !ok {
+		t.Fatalf("expected policy status entry for tls-policy")
+	}
+	if len(policyStatus.Ancestors) != 0 {
+		t.Errorf("expected 0 ancestors for TLSRoute with Passthrough listener, got %d", len(policyStatus.Ancestors))
+	}
+}
+
 func TestGatewayBackendClientCertificate_ResolvedRefs(t *testing.T) {
 	certPEM, keyPEM := generateTestCertPEM(t, "client.example.com")
 	gc := &gatewayv1.GatewayClass{

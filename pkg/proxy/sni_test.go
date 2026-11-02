@@ -1515,3 +1515,106 @@ func TestTLSSessionResumption_TLSRouteTerminate(t *testing.T) {
 	}
 	conn2.Close()
 }
+
+func TestTLSRouteTerminate_BackendTLSPolicy_Reencrypt(t *testing.T) {
+	frontendCAPEM, frontendCert := generateTestCAAndCert(t, []string{"tls.example.com"}, nil)
+	backendCAPEM, backendCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
+
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"tls.example.com": &frontendCert,
+	}, &frontendCert)
+
+	backendTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{backendCert},
+	}
+	backendLis, err := tls.Listen("tcp", "127.0.0.1:0", backendTLSConfig)
+	if err != nil {
+		t.Fatalf("failed to listen on backend: %v", err)
+	}
+	defer backendLis.Close()
+
+	go func() {
+		for {
+			c, err := backendLis.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 1024)
+				n, _ := conn.Read(buf)
+				if n > 0 {
+					_, _ = conn.Write([]byte("reencrypt-echo: " + string(buf[:n])))
+				}
+			}(c)
+		}
+	}()
+
+	terminateMode := gatewayv1.TLSModeTerminate
+	p.UpdateConfig([]state.InternalListener{
+		{
+			Name:     "tls-terminate-listener",
+			Protocol: gatewayv1.TLSProtocolType,
+			Port:     8443,
+			Hostname: "tls.example.com",
+			TLSMode:  &terminateMode,
+			TLSBackends: map[string][]state.InternalTLSBackend{
+				"tls.example.com": {
+					{
+						Target: backendLis.Addr().String(),
+						Weight: 1,
+						TLSConfig: &state.InternalTLSConfig{
+							Hostname: "backend.local",
+							CACerts:  [][]byte{backendCAPEM},
+						},
+					},
+				},
+			},
+		},
+	}, nil)
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	go func() {
+		for {
+			c, err := sniLis.Accept()
+			if err != nil {
+				return
+			}
+			_ = c
+		}
+	}()
+
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(frontendCAPEM)
+
+	clientTLS := &tls.Config{
+		ServerName: "tls.example.com",
+		RootCAs:    caPool,
+	}
+
+	addr := rawLis.Addr().String()
+
+	conn, err := tls.Dial("tcp", addr, clientTLS)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("hello reencrypt\n")); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil || !strings.Contains(string(buf[:n]), "reencrypt-echo: hello reencrypt") {
+		t.Fatalf("read failed: %v, resp: %s", err, string(buf[:n]))
+	}
+}
