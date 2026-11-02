@@ -729,3 +729,136 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 		t.Fatalf("deleted key1 resurrected after crash recovery! val=%q", string(val))
 	}
 }
+
+func TestRegression_OversizeNoResurrectionAcrossCheckpointTruncation(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_oversize_no_resurrect"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// 1. Put an oversize object (> 512 blocks, 2.1 MB)
+	ovrsVal := make([]byte, 2100*1024)
+	copy(ovrsVal, "oversize-to-delete")
+	if err := store.Put("ConfigMap", "largeKey", ovrsVal, "1"); err != nil {
+		t.Fatalf("Put oversize failed: %v", err)
+	}
+
+	// 2. Put a few small keys, then Checkpoint(). The oversize Put record is now truncated.
+	for i := 2; i <= 5; i++ {
+		if err := store.Put("ConfigMap", fmt.Sprintf("k%d", i), []byte("v"), fmt.Sprintf("%d", i)); err != nil {
+			t.Fatalf("Put pad failed: %v", err)
+		}
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	// Save a copy of the oversize file data on disk before Delete
+	qKey := qualifyKey("ConfigMap", "largeKey")
+	ovrsPath := filepath.Join(dir, "oversize", oversizeFileName(qKey))
+	fO, err := memFS.OpenFile(ovrsPath, os.O_RDONLY, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile oversize failed: %v", err)
+	}
+	sz, err := fO.Size()
+	if err != nil {
+		t.Fatalf("Size failed: %v", err)
+	}
+	ovrsData := make([]byte, sz)
+	if _, err := fO.ReadAt(ovrsData, 0); err != nil {
+		t.Fatalf("ReadAt oversize failed: %v", err)
+	}
+	if err := fO.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 3. Delete the key, which appends RecordTypeDelete to WAL
+	if err := store.Delete("ConfigMap", "largeKey", "6"); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	// Fsync WAL so Delete record is durable
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 4. Restore the oversize file. This simulates a crash after the delete record
+	// is durable but before removeOversizeFile runs.
+	fR, err := memFS.OpenFile(ovrsPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile restore failed: %v", err)
+	}
+	if _, err := fR.WriteAt(ovrsData, 0); err != nil {
+		t.Fatalf("WriteAt restore failed: %v", err)
+	}
+	if err := fR.Close(); err != nil {
+		t.Fatalf("Close restore failed: %v", err)
+	}
+
+	// 5. Reopen. Deleted key must NOT resurrect!
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	val, exists, err := store2.Get("ConfigMap", "largeKey")
+	if err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	if exists {
+		t.Fatalf("deleted oversize key resurrected after recovery! val len=%d", len(val))
+	}
+}
+
+func TestRegression_OversizeRedoRecreate(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_oversize_redo_recreate"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	payload := make([]byte, 2100*1024)
+	copy(payload, "recreated-from-wal-payload")
+	if err := store.Put("ConfigMap", "largeKey", payload, "1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Delete the oversize file from disk to simulate missing file
+	qKey := qualifyKey("ConfigMap", "largeKey")
+	ovrsPath := filepath.Join(dir, "oversize", oversizeFileName(qKey))
+	if err := memFS.Remove(ovrsPath); err != nil {
+		t.Fatalf("Remove failed: %v", err)
+	}
+
+	// Reopen store: WAL redo must recreate the oversize file from the WAL payload
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	val, exists, err := store2.Get("ConfigMap", "largeKey")
+	if err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected largeKey to exist after redo recreation")
+	}
+	if string(val[:len("recreated-from-wal-payload")]) != "recreated-from-wal-payload" {
+		t.Fatalf("content mismatch: got %q", string(val[:30]))
+	}
+}

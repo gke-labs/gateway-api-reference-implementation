@@ -678,16 +678,20 @@ func decodeOversizeFile(data []byte) (string, uint64, []byte, error) {
 	return key, lsn, payload, nil
 }
 
-func (s *Engine) writeOversizeFile(qKey string, lsn uint64, payload []byte) error {
+func writeOversizeFileWithTemp(fs FS, storeDir string, qKey string, lsn uint64, payload []byte) error {
+	dir := filepath.Join(storeDir, "oversize")
+	if err := fs.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create oversize dir: %w", err)
+	}
+
 	encoded := encodeOversizeFile(qKey, lsn, payload)
-	finalPath := s.oversizeFilePath(qKey)
-	dir := filepath.Join(s.dir, "oversize")
+	finalPath := filepath.Join(dir, oversizeFileName(qKey))
 
 	// Atomic write via temp file
 	tmpName := fmt.Sprintf(".tmp-%x-%d", sha256.Sum256([]byte(qKey)), lsn)
 	tmpPath := filepath.Join(dir, tmpName)
 
-	f, err := s.fs.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := fs.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create temp oversize file: %w", err)
 	}
@@ -696,7 +700,7 @@ func (s *Engine) writeOversizeFile(qKey string, lsn uint64, payload []byte) erro
 		if cErr := f.Close(); cErr != nil {
 			err = errors.Join(err, cErr)
 		}
-		if rErr := s.fs.Remove(tmpPath); rErr != nil {
+		if rErr := fs.Remove(tmpPath); rErr != nil {
 			err = errors.Join(err, rErr)
 		}
 		return fmt.Errorf("failed to write temp oversize file: %w", err)
@@ -706,39 +710,39 @@ func (s *Engine) writeOversizeFile(qKey string, lsn uint64, payload []byte) erro
 		if cErr := f.Close(); cErr != nil {
 			err = errors.Join(err, cErr)
 		}
-		if rErr := s.fs.Remove(tmpPath); rErr != nil {
+		if rErr := fs.Remove(tmpPath); rErr != nil {
 			err = errors.Join(err, rErr)
 		}
 		return fmt.Errorf("failed to sync temp oversize file: %w", err)
 	}
 
 	if err := f.Close(); err != nil {
-		if rErr := s.fs.Remove(tmpPath); rErr != nil {
+		if rErr := fs.Remove(tmpPath); rErr != nil {
 			err = errors.Join(err, rErr)
 		}
 		return fmt.Errorf("failed to close temp oversize file: %w", err)
 	}
 
-	// Write-ahead rule: fsync WAL through record LSN before publishing oversize file
-	if err := s.wal.SyncThrough(lsn); err != nil {
-		if rErr := s.fs.Remove(tmpPath); rErr != nil {
-			err = errors.Join(err, rErr)
-		}
-		return fmt.Errorf("failed to fsync WAL before publishing oversize file: %w", err)
-	}
-
-	if err := s.fs.Rename(tmpPath, finalPath); err != nil {
-		if rErr := s.fs.Remove(tmpPath); rErr != nil {
+	if err := fs.Rename(tmpPath, finalPath); err != nil {
+		if rErr := fs.Remove(tmpPath); rErr != nil {
 			err = errors.Join(err, rErr)
 		}
 		return fmt.Errorf("failed to rename temp oversize file to final: %w", err)
 	}
 
-	if err := s.fs.SyncDir(dir); err != nil {
+	if err := fs.SyncDir(dir); err != nil {
 		return fmt.Errorf("failed to sync oversize dir: %w", err)
 	}
 
 	return nil
+}
+
+func (s *Engine) writeOversizeFile(qKey string, lsn uint64, payload []byte) error {
+	// Write-ahead rule: fsync WAL through record LSN before publishing oversize file
+	if err := s.wal.SyncThrough(lsn); err != nil {
+		return fmt.Errorf("failed to fsync WAL before publishing oversize file: %w", err)
+	}
+	return writeOversizeFileWithTemp(s.fs, s.dir, qKey, lsn, payload)
 }
 
 func (s *Engine) loadOversizeObjects() error {

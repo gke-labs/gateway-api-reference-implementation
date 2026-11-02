@@ -454,9 +454,47 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	}
 
 	removeOversizeFileForRedo := func(qKey string) error {
-		oversizePath := filepath.Join(filepath.Dir(walDir), "oversize", oversizeFileName(qKey))
+		oversizeDir := filepath.Join(filepath.Dir(walDir), "oversize")
+		oversizePath := filepath.Join(oversizeDir, oversizeFileName(qKey))
 		if err := fs.Remove(oversizePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("failed to remove oversize file %s during redo: %w", oversizePath, err)
+		}
+		return nil
+	}
+
+	removeOversizeFileIfOlder := func(qKey string, recordLSN uint64) error {
+		oversizeDir := filepath.Join(filepath.Dir(walDir), "oversize")
+		oversizePath := filepath.Join(oversizeDir, oversizeFileName(qKey))
+		f, err := fs.OpenFile(oversizePath, os.O_RDONLY, 0644)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || os.IsNotExist(err) || strings.Contains(err.Error(), "does not exist") {
+				return nil
+			}
+			return fmt.Errorf("failed to open oversize file %s during redo: %w", oversizePath, err)
+		}
+		size, sErr := f.Size()
+		if sErr != nil {
+			_ = f.Close()
+			return sErr
+		}
+		data := make([]byte, size)
+		_, rErr := f.ReadAt(data, 0)
+		_ = f.Close()
+		if rErr != nil && !errors.Is(rErr, io.EOF) {
+			return rErr
+		}
+		_, fileLSN, _, dErr := decodeOversizeFile(data)
+		if dErr != nil {
+			_ = fs.Remove(oversizePath)
+			return nil
+		}
+		if fileLSN < recordLSN {
+			if err := fs.Remove(oversizePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("failed to remove obsolete oversize file %s during redo: %w", oversizePath, err)
+			}
+			if err := fs.SyncDir(oversizeDir); err != nil {
+				return fmt.Errorf("failed to sync oversize dir: %w", err)
+			}
 		}
 		return nil
 	}
@@ -537,11 +575,19 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 						LSN:         rec.LSN,
 						IsOversize:  true,
 					}
+					storeDir := filepath.Dir(walDir)
+					if err := writeOversizeFileWithTemp(fs, storeDir, rec.Key, rec.LSN, rec.Payload); err != nil {
+						return nil, fmt.Errorf("failed to restore oversize file during redo: %w", err)
+					}
 					continue
 				}
 
 				if inIndex && existing.IsOversize {
 					if err := removeOversizeFileForRedo(rec.Key); err != nil {
+						return nil, err
+					}
+				} else {
+					if err := removeOversizeFileIfOlder(rec.Key, rec.LSN); err != nil {
 						return nil, err
 					}
 				}
@@ -711,6 +757,9 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 						return nil, err
 					}
 					delete(keyIndex, rec.Key)
+				}
+				if err := removeOversizeFileIfOlder(rec.Key, rec.LSN); err != nil {
+					return nil, err
 				}
 			}
 		}
