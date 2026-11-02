@@ -891,6 +891,343 @@ func TestProxy_BackendResponseHeaderModifier(t *testing.T) {
 	}
 }
 
+func TestProxy_BackendURLRewrite(t *testing.T) {
+	type receivedReq struct {
+		path          string
+		host          string
+		forwardedHost string
+	}
+
+	var mu sync.Mutex
+	var s1Req, s2Req *receivedReq
+
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		s1Req = &receivedReq{
+			path:          r.URL.Path,
+			host:          r.Host,
+			forwardedHost: r.Header.Get("X-Forwarded-Host"),
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s1.Close()
+
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		s2Req = &receivedReq{
+			path:          r.URL.Path,
+			host:          r.Host,
+			forwardedHost: r.Header.Get("X-Forwarded-Host"),
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s2.Close()
+
+	u1, _ := url.Parse(s1.URL)
+	port1, _ := strconv.Atoi(u1.Port())
+	u2, _ := url.Parse(s2.URL)
+	port2, _ := strconv.Atoi(u2.Port())
+
+	t.Run("backend-level rewrite applies to its own backend only", func(t *testing.T) {
+		p := NewProxy()
+		// Route with two backends: backend 1 has URLRewrite, backend 2 does not.
+		p.UpdateRoutes([]state.InternalRoute{
+			{
+				Rules: []state.InternalRule{
+					{
+						Matches: []state.InternalMatch{
+							{
+								Path: &state.InternalPathMatch{
+									Type:  gatewayv1.PathMatchPathPrefix,
+									Value: "/api",
+								},
+							},
+						},
+						Backends: []state.InternalBackend{
+							{
+								Host:   u1.Hostname(),
+								Port:   int32(port1),
+								Weight: 1,
+								Rewrite: &state.InternalRewrite{
+									Hostname: state.Ptr(gatewayv1.PreciseHostname("b1.example.internal")),
+									Path: &state.InternalPathRewrite{
+										Type:  gatewayv1.FullPathHTTPPathModifier,
+										Value: "/rewritten-b1",
+									},
+								},
+							},
+							{
+								Host:   u2.Hostname(),
+								Port:   int32(port2),
+								Weight: 0,
+							},
+						},
+					},
+				},
+			},
+		})
+
+		mu.Lock()
+		s1Req, s2Req = nil, nil
+		mu.Unlock()
+
+		// Request routed to backend 1 (weight 1 vs weight 0)
+		req1 := httptest.NewRequest("GET", "http://original.example.com/api/test", nil)
+		req1.Host = "original.example.com"
+		w1 := httptest.NewRecorder()
+		p.ServeHTTP(w1, req1)
+
+		if w1.Result().StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code for req1: %d", w1.Result().StatusCode)
+		}
+
+		mu.Lock()
+		gotS1 := s1Req
+		gotS2 := s2Req
+		mu.Unlock()
+
+		if gotS1 == nil {
+			t.Fatalf("expected backend 1 to receive request")
+		}
+		if gotS2 != nil {
+			t.Fatalf("expected backend 2 NOT to receive request")
+		}
+		if gotS1.path != "/rewritten-b1" {
+			t.Errorf("backend 1: expected path '/rewritten-b1', got %q", gotS1.path)
+		}
+		if gotS1.host != "b1.example.internal" {
+			t.Errorf("backend 1: expected host 'b1.example.internal', got %q", gotS1.host)
+		}
+		if gotS1.forwardedHost != "original.example.com" {
+			t.Errorf("backend 1: expected X-Forwarded-Host 'original.example.com', got %q", gotS1.forwardedHost)
+		}
+
+		// Now update weights so backend 2 (no rewrite) is chosen
+		p.UpdateRoutes([]state.InternalRoute{
+			{
+				Rules: []state.InternalRule{
+					{
+						Matches: []state.InternalMatch{
+							{
+								Path: &state.InternalPathMatch{
+									Type:  gatewayv1.PathMatchPathPrefix,
+									Value: "/api",
+								},
+							},
+						},
+						Backends: []state.InternalBackend{
+							{
+								Host:   u1.Hostname(),
+								Port:   int32(port1),
+								Weight: 0,
+								Rewrite: &state.InternalRewrite{
+									Hostname: state.Ptr(gatewayv1.PreciseHostname("b1.example.internal")),
+									Path: &state.InternalPathRewrite{
+										Type:  gatewayv1.FullPathHTTPPathModifier,
+										Value: "/rewritten-b1",
+									},
+								},
+							},
+							{
+								Host:   u2.Hostname(),
+								Port:   int32(port2),
+								Weight: 1,
+							},
+						},
+					},
+				},
+			},
+		})
+
+		mu.Lock()
+		s1Req, s2Req = nil, nil
+		mu.Unlock()
+
+		req2 := httptest.NewRequest("GET", "http://original.example.com/api/test", nil)
+		req2.Host = "original.example.com"
+		w2 := httptest.NewRecorder()
+		p.ServeHTTP(w2, req2)
+
+		if w2.Result().StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code for req2: %d", w2.Result().StatusCode)
+		}
+
+		mu.Lock()
+		gotS1 = s1Req
+		gotS2 = s2Req
+		mu.Unlock()
+
+		if gotS2 == nil {
+			t.Fatalf("expected backend 2 to receive request")
+		}
+		if gotS1 != nil {
+			t.Fatalf("expected backend 1 NOT to receive request")
+		}
+		if gotS2.path != "/api/test" {
+			t.Errorf("backend 2: expected original path '/api/test', got %q", gotS2.path)
+		}
+		if gotS2.host != "original.example.com" {
+			t.Errorf("backend 2: expected original host 'original.example.com', got %q", gotS2.host)
+		}
+		if gotS2.forwardedHost != "" {
+			t.Errorf("backend 2: expected no X-Forwarded-Host, got %q", gotS2.forwardedHost)
+		}
+	})
+
+	t.Run("backend-level ReplacePrefixMatch rewrite", func(t *testing.T) {
+		p := NewProxy()
+		p.UpdateRoutes([]state.InternalRoute{
+			{
+				Rules: []state.InternalRule{
+					{
+						Matches: []state.InternalMatch{
+							{
+								Path: &state.InternalPathMatch{
+									Type:  gatewayv1.PathMatchPathPrefix,
+									Value: "/prefix",
+								},
+							},
+						},
+						Backends: []state.InternalBackend{
+							{
+								Host:   u1.Hostname(),
+								Port:   int32(port1),
+								Weight: 1,
+								Rewrite: &state.InternalRewrite{
+									Path: &state.InternalPathRewrite{
+										Type:  gatewayv1.PrefixMatchHTTPPathModifier,
+										Value: "/rewritten-prefix",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+
+		mu.Lock()
+		s1Req = nil
+		mu.Unlock()
+
+		req := httptest.NewRequest("GET", "http://example.com/prefix/original", nil)
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		if w.Result().StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code: %d", w.Result().StatusCode)
+		}
+
+		mu.Lock()
+		got := s1Req
+		mu.Unlock()
+
+		if got == nil {
+			t.Fatalf("expected backend to receive request")
+		}
+		if got.path != "/rewritten-prefix/original" {
+			t.Errorf("expected path '/rewritten-prefix/original', got %q", got.path)
+		}
+	})
+
+	t.Run("mirror backend does not receive backend-level rewrite", func(t *testing.T) {
+		p := NewProxy()
+		mirrorDone := make(chan struct{})
+		var mirrorReceivedPath, mirrorReceivedHost string
+
+		mirrorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			mirrorReceivedPath = r.URL.Path
+			mirrorReceivedHost = r.Host
+			mu.Unlock()
+			close(mirrorDone)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer mirrorServer.Close()
+
+		uMirror, _ := url.Parse(mirrorServer.URL)
+		portMirror, _ := strconv.Atoi(uMirror.Port())
+
+		p.UpdateRoutes([]state.InternalRoute{
+			{
+				Rules: []state.InternalRule{
+					{
+						Backends: []state.InternalBackend{
+							{
+								Host:   u1.Hostname(),
+								Port:   int32(port1),
+								Weight: 1,
+								Rewrite: &state.InternalRewrite{
+									Hostname: state.Ptr(gatewayv1.PreciseHostname("primary.example.internal")),
+									Path: &state.InternalPathRewrite{
+										Type:  gatewayv1.FullPathHTTPPathModifier,
+										Value: "/primary-rewritten",
+									},
+								},
+							},
+						},
+						Mirrors: []state.InternalMirror{
+							{
+								Backend: state.InternalBackend{
+									Host: uMirror.Hostname(),
+									Port: int32(portMirror),
+								},
+								Numerator:   100,
+								Denominator: 100,
+							},
+						},
+					},
+				},
+			},
+		})
+
+		mu.Lock()
+		s1Req = nil
+		mu.Unlock()
+
+		req := httptest.NewRequest("GET", "http://client.example.com/original-path", nil)
+		req.Host = "client.example.com"
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		if w.Result().StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code: %d", w.Result().StatusCode)
+		}
+
+		select {
+		case <-mirrorDone:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for mirror request")
+		}
+
+		mu.Lock()
+		primaryGot := s1Req
+		mirrorPath := mirrorReceivedPath
+		mirrorHost := mirrorReceivedHost
+		mu.Unlock()
+
+		if primaryGot == nil {
+			t.Fatalf("expected primary backend to receive request")
+		}
+		if primaryGot.path != "/primary-rewritten" {
+			t.Errorf("primary: expected path '/primary-rewritten', got %q", primaryGot.path)
+		}
+		if primaryGot.host != "primary.example.internal" {
+			t.Errorf("primary: expected host 'primary.example.internal', got %q", primaryGot.host)
+		}
+
+		// Mirror should receive the unrewritten original path and original host
+		if mirrorPath != "/original-path" {
+			t.Errorf("mirror: expected original path '/original-path', got %q", mirrorPath)
+		}
+		if mirrorHost != "client.example.com" {
+			t.Errorf("mirror: expected original host 'client.example.com', got %q", mirrorHost)
+		}
+	})
+}
+
 func TestProxy_HTTPSListenerDetectMisdirectedRequests(t *testing.T) {
 	// Setup mock backends
 	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

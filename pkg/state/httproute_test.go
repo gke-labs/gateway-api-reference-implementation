@@ -755,6 +755,7 @@ func TestHTTPRouteValidate_Filters(t *testing.T) {
 											{Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier},
 											{Type: gatewayv1.HTTPRouteFilterResponseHeaderModifier},
 											{Type: gatewayv1.HTTPRouteFilterCORS},
+											{Type: gatewayv1.HTTPRouteFilterURLRewrite},
 										},
 									},
 								},
@@ -1867,6 +1868,161 @@ func TestCompileHTTPRoute_RequestMirror(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCompileHTTPRoute_BackendURLRewrite(t *testing.T) {
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend-svc"}: {
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{{Port: 8080}},
+			},
+		},
+	}
+
+	t.Run("compiles valid backend URLRewrite filters", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "backend-rewrite-route",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: Ptr(gatewayv1.PortNumber(8080)),
+									},
+								},
+								Filters: []gatewayv1.HTTPRouteFilter{
+									{
+										Type: gatewayv1.HTTPRouteFilterURLRewrite,
+										URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+											Hostname: Ptr(gatewayv1.PreciseHostname("backend.example.internal")),
+											Path: &gatewayv1.HTTPPathModifier{
+												Type:            gatewayv1.FullPathHTTPPathModifier,
+												ReplaceFullPath: Ptr("/new-full-path"),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: Ptr(gatewayv1.PortNumber(8080)),
+									},
+								},
+								Filters: []gatewayv1.HTTPRouteFilter{
+									{
+										Type: gatewayv1.HTTPRouteFilterURLRewrite,
+										URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+											Path: &gatewayv1.HTTPPathModifier{
+												Type:               gatewayv1.PrefixMatchHTTPPathModifier,
+												ReplacePrefixMatch: Ptr("/new-prefix"),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileHTTPRoute(route, services, nil, nil, nil)
+		if compiled == nil {
+			t.Fatalf("expected non-nil InternalHTTPRoute")
+		}
+		if compiled.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Fatalf("expected ValidationCondition True, got %v: %s", compiled.ValidationCondition.Status, compiled.ValidationCondition.Message)
+		}
+		if len(compiled.Rules) != 2 {
+			t.Fatalf("expected 2 rules, got %d", len(compiled.Rules))
+		}
+
+		// Rule 0: FullPath rewrite and Hostname rewrite
+		b0 := compiled.Rules[0].Backends
+		if len(b0) != 1 || b0[0].Rewrite == nil {
+			t.Fatalf("expected 1 backend with Rewrite on rule 0, got %+v", b0)
+		}
+		if ValueOf(b0[0].Rewrite.Hostname) != "backend.example.internal" {
+			t.Errorf("expected hostname backend.example.internal, got %v", ValueOf(b0[0].Rewrite.Hostname))
+		}
+		if b0[0].Rewrite.Path == nil || b0[0].Rewrite.Path.Type != gatewayv1.FullPathHTTPPathModifier || b0[0].Rewrite.Path.Value != "/new-full-path" {
+			t.Errorf("expected FullPath /new-full-path, got %+v", b0[0].Rewrite.Path)
+		}
+
+		// Rule 1: PrefixMatch rewrite
+		b1 := compiled.Rules[1].Backends
+		if len(b1) != 1 || b1[0].Rewrite == nil {
+			t.Fatalf("expected 1 backend with Rewrite on rule 1, got %+v", b1)
+		}
+		if b1[0].Rewrite.Hostname != nil {
+			t.Errorf("expected nil hostname, got %v", b1[0].Rewrite.Hostname)
+		}
+		if b1[0].Rewrite.Path == nil || b1[0].Rewrite.Path.Type != gatewayv1.PrefixMatchHTTPPathModifier || b1[0].Rewrite.Path.Value != "/new-prefix" {
+			t.Errorf("expected PrefixMatch /new-prefix, got %+v", b1[0].Rewrite.Path)
+		}
+	})
+
+	t.Run("rejects backend URLRewrite with unsupported path modifier type", func(t *testing.T) {
+		unsupportedType := gatewayv1.HTTPPathModifierType("UnsupportedModifier")
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "invalid-backend-rewrite-route",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: Ptr(gatewayv1.PortNumber(8080)),
+									},
+								},
+								Filters: []gatewayv1.HTTPRouteFilter{
+									{
+										Type: gatewayv1.HTTPRouteFilterURLRewrite,
+										URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+											Path: &gatewayv1.HTTPPathModifier{
+												Type: unsupportedType,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileHTTPRoute(route, services, nil, nil, nil)
+		if compiled == nil {
+			t.Fatalf("expected non-nil InternalHTTPRoute")
+		}
+		if compiled.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", compiled.ValidationCondition.Status)
+		}
+		if compiled.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason %s, got %s", gatewayv1.RouteReasonUnsupportedValue, compiled.ValidationCondition.Reason)
+		}
+		if len(compiled.Rules) != 1 || compiled.Rules[0].Error == nil {
+			t.Fatalf("expected rule with ErrorState, got %+v", compiled.Rules)
+		}
+	})
 }
 
 func TestCompileHTTPRoute_BackendTLSWithoutPolicy_ResolvedRefsMessage(t *testing.T) {

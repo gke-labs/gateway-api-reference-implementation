@@ -153,8 +153,6 @@ var skippedTests = map[string]struct{}{
 	"GatewayPreserveForeignConditions": {},
 	// fails: GRPCRoute exact hostname does not take precedence over older wildcard route
 	"GRPCRouteMultipleRoutesAttachmentSameHostnameIntersection": {},
-	// fails: URLRewrite not supported as a backend filter
-	"HTTPRouteBackendURLRewrite": {},
 	// fails: HTTPRoute exact/more specific hostname does not take precedence over older wildcard route
 	"HTTPRouteMultipleRoutesAttachmentSameHostnameIntersection": {},
 

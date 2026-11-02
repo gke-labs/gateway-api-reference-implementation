@@ -1144,6 +1144,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
+			if backend.Rewrite != nil {
+				r = p.rewrite(r, *backend.Rewrite, bestMatch)
+			}
 			if backend.RequestHeaderModifier != nil {
 				p.modifyHeaders(r, *backend.RequestHeaderModifier)
 			}

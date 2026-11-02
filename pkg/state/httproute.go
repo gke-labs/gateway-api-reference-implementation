@@ -229,47 +229,26 @@ func CompileHTTPRoute(
 				}
 
 			case gatewayv1.HTTPRouteFilterURLRewrite:
-				rw := filter.URLRewrite
-				if rw == nil {
-					continue
-				}
-				iRw := &InternalRewrite{
-					Hostname: rw.Hostname,
-				}
-				if rw.Path != nil {
-					switch rw.Path.Type {
-					case gatewayv1.FullPathHTTPPathModifier:
-						iRw.Path = &InternalPathRewrite{
-							Type:  gatewayv1.FullPathHTTPPathModifier,
-							Value: ValueOf(rw.Path.ReplaceFullPath),
-						}
-					case gatewayv1.PrefixMatchHTTPPathModifier:
-						iRw.Path = &InternalPathRewrite{
-							Type:  gatewayv1.PrefixMatchHTTPPathModifier,
-							Value: ValueOf(rw.Path.ReplacePrefixMatch),
-						}
-					default:
-						msg := fmt.Sprintf("Unsupported rewrite path modifier type: %s", rw.Path.Type)
-						errCond := NewCondition(
-							string(gatewayv1.RouteConditionAccepted),
-							metav1.ConditionFalse,
-							string(gatewayv1.RouteReasonUnsupportedValue),
-							msg,
-							route.Generation,
-						)
-						if validationCondition.Status == metav1.ConditionTrue {
-							validationCondition = errCond
-						}
-						if iRule.Error == nil {
-							iRule.Error = &ErrorState{
-								Condition:      errCond,
-								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    msg,
-							}
+				iRw, err := compileURLRewriteFilter(filter.URLRewrite)
+				if err != nil {
+					errCond := NewCondition(
+						string(gatewayv1.RouteConditionAccepted),
+						metav1.ConditionFalse,
+						string(gatewayv1.RouteReasonUnsupportedValue),
+						err.Error(),
+						route.Generation,
+					)
+					if validationCondition.Status == metav1.ConditionTrue {
+						validationCondition = errCond
+					}
+					if iRule.Error == nil {
+						iRule.Error = &ErrorState{
+							Condition:      errCond,
+							HTTPStatusCode: http.StatusInternalServerError,
+							HTTPMessage:    err.Error(),
 						}
 					}
-				}
-				if iRule.Error == nil {
+				} else if iRule.Error == nil && iRw != nil {
 					iRule.Rewrite = iRw
 				}
 
@@ -480,6 +459,7 @@ func CompileHTTPRoute(
 				var backendReqHeaderModifier *gatewayv1.HTTPHeaderFilter
 				var backendRespHeaderModifier *gatewayv1.HTTPHeaderFilter
 				var backendCORS *gatewayv1.HTTPCORSFilter
+				var backendRewrite *InternalRewrite
 				var backendFilterErr error
 				for _, filter := range backendRef.Filters {
 					switch filter.Type {
@@ -489,8 +469,13 @@ func CompileHTTPRoute(
 						backendRespHeaderModifier = filter.ResponseHeaderModifier
 					case gatewayv1.HTTPRouteFilterCORS:
 						backendCORS = filter.CORS
+					case gatewayv1.HTTPRouteFilterURLRewrite:
+						backendRewrite, backendFilterErr = compileURLRewriteFilter(filter.URLRewrite)
 					default:
 						backendFilterErr = fmt.Errorf("Unsupported backend filter type: %s", filter.Type)
+					}
+					if backendFilterErr != nil {
+						break
 					}
 				}
 
@@ -524,6 +509,7 @@ func CompileHTTPRoute(
 				backend.RequestHeaderModifier = backendReqHeaderModifier
 				backend.ResponseHeaderModifier = backendRespHeaderModifier
 				backend.CORS = backendCORS
+				backend.Rewrite = backendRewrite
 				iRule.Backends = append(iRule.Backends, *backend)
 			}
 		}
@@ -956,6 +942,33 @@ func validateBackendTLSPolicy(
 		caCerts = append(caCerts, data)
 	}
 	return caCerts, true
+}
+
+// compileURLRewriteFilter compiles an HTTPURLRewriteFilter into an InternalRewrite.
+func compileURLRewriteFilter(rw *gatewayv1.HTTPURLRewriteFilter) (*InternalRewrite, error) {
+	if rw == nil {
+		return nil, nil
+	}
+	iRw := &InternalRewrite{
+		Hostname: rw.Hostname,
+	}
+	if rw.Path != nil {
+		switch rw.Path.Type {
+		case gatewayv1.FullPathHTTPPathModifier:
+			iRw.Path = &InternalPathRewrite{
+				Type:  gatewayv1.FullPathHTTPPathModifier,
+				Value: ValueOf(rw.Path.ReplaceFullPath),
+			}
+		case gatewayv1.PrefixMatchHTTPPathModifier:
+			iRw.Path = &InternalPathRewrite{
+				Type:  gatewayv1.PrefixMatchHTTPPathModifier,
+				Value: ValueOf(rw.Path.ReplacePrefixMatch),
+			}
+		default:
+			return nil, fmt.Errorf("Unsupported rewrite path modifier type: %s", rw.Path.Type)
+		}
+	}
+	return iRw, nil
 }
 
 // compileRequestMirrorFilter validates the filter settings and resolves the mirror backend target.
