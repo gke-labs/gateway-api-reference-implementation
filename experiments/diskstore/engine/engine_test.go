@@ -1682,3 +1682,36 @@ func TestRegression_MetaFileReadErrorNoWipe(t *testing.T) {
 		t.Fatalf("database was wiped on meta.db read error! val=%q, exists=%v, err=%v", string(val), exists, err)
 	}
 }
+
+type syncDirTrackingFS struct {
+	FS
+	syncDirDirs []string
+}
+
+func (s *syncDirTrackingFS) SyncDir(dirname string) error {
+	s.syncDirDirs = append(s.syncDirDirs, dirname)
+	return s.FS.SyncDir(dirname)
+}
+
+func TestRegression_SyncDirOnStoreInit(t *testing.T) {
+	memFS := NewMemFS()
+	tracker := &syncDirTrackingFS{FS: memFS}
+	dir := "test_syncdir_init"
+
+	store, err := Open(WithFS(tracker), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	foundHeapDirSync := false
+	for _, d := range tracker.syncDirDirs {
+		if d == dir {
+			foundHeapDirSync = true
+			break
+		}
+	}
+	if !foundHeapDirSync {
+		t.Fatalf("expected store directory %q to be synced during initialization, got %v", dir, tracker.syncDirDirs)
+	}
+}
