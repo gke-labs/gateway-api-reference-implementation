@@ -919,3 +919,116 @@ func TestRegression_OversizeRedoRecreate(t *testing.T) {
 		t.Fatalf("content mismatch: got %q", string(val[:30]))
 	}
 }
+
+type reuseRuleTrackingFile struct {
+	File
+	syncCount            int
+	initialDurableBlocks map[uint64]bool
+	reusedBeforeSync     bool
+}
+
+func (f *reuseRuleTrackingFile) WriteAt(p []byte, off int64) (int, error) {
+	blockIdx := uint64(off / BlockSize)
+	if f.syncCount < 2 && f.initialDurableBlocks[blockIdx] {
+		f.reusedBeforeSync = true
+	}
+	return f.File.WriteAt(p, off)
+}
+
+func (f *reuseRuleTrackingFile) Sync() error {
+	f.syncCount++
+	return f.File.Sync()
+}
+
+func TestRegression_RecoveryStep6ReuseRule(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("reuse-rule-test1"))
+
+	wal, err := OpenWAL(memFS, "wal", dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	rawHeapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
+	buddy := NewBuddyAllocator(512)
+	bp := NewBlockPool(rawHeapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
+
+	// 1. Create page 1 with 1 block (allocates block 0 in buddy) and make durable
+	rec0 := Record{Type: RecordTypePut, Key: "ConfigMap k1", Payload: []byte("val1-initial")}
+	lsn0, err := wal.AppendRecord(&rec0)
+	if err != nil {
+		t.Fatalf("AppendRecord rec0 failed: %v", err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("wal.Sync failed: %v", err)
+	}
+
+	h1, err := bp.AllocateNewPage(1, 1, lsn0)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	slotted := NewSlottedPage(1, lsn0)
+	if _, err := slotted.Put("ConfigMap k1", []byte("val1-initial"), lsn0); err != nil {
+		t.Fatalf("slotted.Put failed: %v", err)
+	}
+	copy(h1.Block(0), slotted.buf)
+	FinalizeBlockCRC(h1.Block(0))
+	bp.MarkDirty(1, lsn0)
+	h1.Unpin()
+
+	cp := NewCheckpointer(bp, rawHeapFile, wal, nil)
+	if _, err := cp.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	initialBlock := h1.Desc.DurableLoc
+	t.Logf("initialBlock=%d", initialBlock)
+
+	// 2. Append WAL records: page 1 modified, plus multiple new pages
+	recP1 := Record{Type: RecordTypePut, Key: "ConfigMap k1", Payload: []byte("val1-updated")}
+	if _, err := wal.AppendRecord(&recP1); err != nil {
+		t.Fatalf("AppendRecord recP1 failed: %v", err)
+	}
+	for i := 2; i <= 8; i++ {
+		r := Record{Type: RecordTypePut, Key: fmt.Sprintf("ConfigMap k%d", i), Payload: []byte("val-new")}
+		if _, err := wal.AppendRecord(&r); err != nil {
+			t.Fatalf("AppendRecord r%d failed: %v", i, err)
+		}
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("wal.Sync failed: %v", err)
+	}
+
+	if err := bp.Close(); err != nil {
+		t.Fatalf("bp.Close failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("wal.Close failed: %v", err)
+	}
+	if err := rawHeapFile.Close(); err != nil {
+		t.Fatalf("rawHeapFile.Close failed: %v", err)
+	}
+
+	// 3. Open heap file with tracker to verify no durable block is overwritten before sync
+	openedHeap, err := memFS.OpenFile("heap.db", os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db failed: %v", err)
+	}
+	trackingHeap := &reuseRuleTrackingFile{
+		File: openedHeap,
+		initialDurableBlocks: map[uint64]bool{
+			initialBlock: true,
+		},
+	}
+
+	_, err = Recover(memFS, trackingHeap, "wal", dbID)
+	if err != nil {
+		t.Fatalf("Recover failed: %v", err)
+	}
+	if trackingHeap.reusedBeforeSync {
+		t.Fatalf("Reuse Rule violation: superseded physical block %d was reused/overwritten before heapFile.Sync()", initialBlock)
+	}
+}
