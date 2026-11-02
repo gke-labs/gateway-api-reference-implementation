@@ -997,16 +997,8 @@ func (it *WALIterator) Next() (Record, error) {
 		}
 
 		// Check for zero-padded block or torn header
-		isZeroPadding := true
-		for _, b := range hdr[:n] {
-			if b != 0 {
-				isZeroPadding = false
-				break
-			}
-		}
-
-		if isZeroPadding {
-			// Check if we can skip zero padding to the next 4 KiB block boundary within this segment
+		if n > 0 && hdr[0] == 0 {
+			// Skip zero padding to next 4 KiB block boundary within this segment
 			nextBlock := ((it.currOffset / WALBlockSize) + 1) * WALBlockSize
 			size, sizeErr := it.currFile.Size()
 			if sizeErr == nil && nextBlock < size {

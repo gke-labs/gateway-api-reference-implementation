@@ -959,3 +959,68 @@ func TestRegression_AbandonedWALSegmentOnOpen(t *testing.T) {
 		t.Fatalf("expected record LSN 2, got %d", lsn)
 	}
 }
+
+func TestRegression_WALZeroPaddingRecovery(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("wal-zeropad-test"))
+
+	walDir := "wal"
+	wal, err := OpenWAL(memFS, walDir, dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+
+	// Write record 1 such that the remaining space in block 0 is < 36 bytes (RecordHeaderSize)
+	// SegmentHeaderSize = 32 bytes
+	// Total record length = 4076 - 32 = 4044 bytes, leaving 20 bytes of padding to 4096.
+	key := "ConfigMap k1"
+	token := "tok1"
+	payloadLen := 4044 - RecordHeaderSize - len(key) - len(token)
+	rec1 := Record{Type: RecordTypePut, Key: key, Token: token, Payload: make([]byte, payloadLen)}
+	lsn1, err := wal.AppendRecord(&rec1)
+	if err != nil {
+		t.Fatalf("AppendRecord 1 failed: %v", err)
+	}
+
+	// Sync forces zero-padding of the remaining 20 bytes in block 0 to 4096
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Write record 2 (starts at block boundary, offset 4096)
+	rec2 := Record{Type: RecordTypePut, Key: "ConfigMap k2", Token: "tok2", Payload: []byte("val2")}
+	lsn2, err := wal.AppendRecord(&rec2)
+	if err != nil {
+		t.Fatalf("AppendRecord 2 failed: %v", err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("Sync 2 failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Replay WAL using iterator
+	it, err := NewWALIterator(memFS, walDir, dbID, 1)
+	if err != nil {
+		t.Fatalf("NewWALIterator failed: %v", err)
+	}
+	defer it.Close()
+
+	r1, err := it.Next()
+	if err != nil {
+		t.Fatalf("Next 1 failed: %v", err)
+	}
+	if r1.LSN != lsn1 {
+		t.Fatalf("expected record 1 LSN %d, got %d", lsn1, r1.LSN)
+	}
+
+	r2, err := it.Next()
+	if err != nil {
+		t.Fatalf("Next 2 failed (dropped across block zero-padding): %v", err)
+	}
+	if r2.LSN != lsn2 {
+		t.Fatalf("expected record 2 LSN %d, got %d", lsn2, r2.LSN)
+	}
+}
