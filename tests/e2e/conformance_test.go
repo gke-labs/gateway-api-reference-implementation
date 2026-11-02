@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"testing"
@@ -118,140 +119,88 @@ func TestConformance(t *testing.T) {
 		t.Fatalf("error creating conformance test suite: %v", err)
 	}
 
-	selectedTests := []suite.ConformanceTest{
-		tests.BackendTLSPolicy,
-		tests.BackendTLSPolicyConflictResolution,
-		tests.BackendTLSPolicyInvalidCACertificateRef,
-		tests.BackendTLSPolicyInvalidKind,
-		tests.BackendTLSPolicyObservedGenerationBump,
-		tests.BackendTLSPolicySANValidation,
-		tests.GatewayClassObservedGenerationBump,
-		tests.GatewayFrontendClientCertificateValidation,
-		tests.GatewayFrontendClientCertificateValidationInsecureFallback,
-		tests.GatewayFrontendInvalidDefaultClientCertificateValidation,
-		tests.GatewayHTTPListenerIsolation,
-		tests.GatewayInfrastructureMetadata,
-		tests.GatewayInvalidFrontendClientCertificateValidation,
-		tests.GatewayInvalidParametersRef,
-		tests.GatewayInvalidRouteKind,
-		tests.GatewayInvalidTLSBackendConfiguration,
-		tests.GatewayInvalidTLSConfiguration,
-		tests.GatewayListenerUnsupportedProtocol,
-		tests.GatewayModifyListeners,
-		tests.GatewayObservedGenerationBump,
-		tests.GatewayOptionalAddressValue,
-		tests.GatewaySecretInvalidReferenceGrant,
-		tests.GatewaySecretMissingReferenceGrant,
-		tests.GatewaySecretReferenceGrantAllInNamespace,
-		tests.GatewaySecretReferenceGrantSpecific,
-		tests.GatewayStaticAddresses,
-		tests.GatewayTLSBackendClientCertificate,
-		tests.GatewayWithAttachedRoutes,
-		tests.GatewayWithAttachedRoutesWithPort8080,
-		tests.GRPCExactMethodMatching,
-		tests.GRPCRouteHeaderMatching,
-		tests.GRPCRouteListenerHostnameMatching,
-		tests.GRPCRouteNamedRule,
-		tests.GRPCRouteWeight,
-		tests.HTTPRoute303Redirect,
-		tests.HTTPRoute307Redirect,
-		tests.HTTPRoute308Redirect,
-		tests.HTTPRouteBackendProtocolH2C,
-		tests.HTTPRouteBackendProtocolWebSocket,
-		tests.HTTPRouteBackendRequestHeaderModifier,
-		tests.HTTPRouteCORS,
-		tests.HTTPRouteCrossNamespace,
-		tests.HTTPRouteDisallowedKind,
-		tests.HTTPRouteExactPathMatching,
-		tests.HTTPRouteHeaderMatching,
-		tests.HTTPRouteHostnameIntersection,
-		tests.HTTPRouteHTTPSListener,
-		tests.HTTPRouteHTTPSListenerDetectMisdirectedRequests,
-		tests.HTTPRouteInvalidBackendRefUnknownKind,
-		tests.HTTPRouteInvalidCrossNamespaceBackendRef,
-		tests.HTTPRouteInvalidCrossNamespaceParentRef,
-		tests.HTTPRouteInvalidNonExistentBackendRef,
-		tests.HTTPRouteInvalidParentRefNotMatchingListenerPort,
-		tests.HTTPRouteInvalidParentRefNotMatchingSectionName,
-		tests.HTTPRouteInvalidParentRefSectionNameNotMatchingPort,
-		tests.HTTPRouteInvalidReferenceGrant,
-		tests.HTTPRouteListenerHostnameMatching,
-		tests.HTTPRouteListenerPortMatching,
-		tests.HTTPRouteMatching,
-		tests.HTTPRouteMatchingAcrossRoutes,
-		tests.HTTPRouteMethodMatching,
-		tests.HTTPRouteMultipleGateways,
-		tests.HTTPRouteNamedRule,
-		tests.HTTPRouteNoBackendRefs,
-		tests.HTTPRouteObservedGenerationBump,
-		tests.HTTPRoutePartiallyInvalidViaInvalidReferenceGrant,
-		tests.HTTPRoutePathMatchOrder,
-		tests.HTTPRouteQueryParamMatching,
-		tests.HTTPRouteRedirectHostAndStatus,
-		tests.HTTPRouteRedirectPath,
-		tests.HTTPRouteRedirectPort,
-		tests.HTTPRouteRedirectPortAndScheme,
-		tests.HTTPRouteRedirectScheme,
-		tests.HTTPRouteReferenceGrant,
-		tests.HTTPRouteRequestHeaderModifier,
-		tests.HTTPRouteRequestHeaderModifierBackendWeights,
-		tests.HTTPRouteRequestMirror,
-		tests.HTTPRouteRequestMultipleMirrors,
-		tests.HTTPRouteRequestPercentageMirror,
-		tests.HTTPRouteResponseHeaderModifier,
-		tests.HTTPRouteRetry,
-		tests.HTTPRouteRewriteHost,
-		tests.HTTPRouteRewritePath,
-		tests.HTTPRouteServiceTypes,
-		tests.HTTPRouteSimpleSameNamespace,
-		tests.HTTPRouteTimeoutBackendRequest,
-		tests.HTTPRouteTimeoutRequest,
-		tests.HTTPRouteWeight,
-		tests.ListenerSetAllowedNamespaceNone,
-		tests.ListenerSetAllowedNamespaceSame,
-		tests.ListenerSetAllowedNamespaceSelector,
-		tests.ListenerSetAllowedRoutesNamespaces,
-		tests.ListenerSetAllowedRoutesSupportedKinds,
-		tests.ListenerSetDefaultNotAllowed,
-		tests.ListenerSetDualParentRefIndependence,
-		tests.ListenerSetGatewayParentSectionNameNotFound,
-		tests.ListenerSetHostnameConflict,
-		tests.ListenerSetHTTPRouting,
-		tests.ListenerSetProtocolConflict,
-		tests.ListenerSetReferenceGrant,
-		tests.ListenerSetRouteStatusScopedToParentRef,
-		tests.TLSRouteHostnameIntersection,
-		tests.TLSRouteInvalidBackendRefNonexistent,
-		tests.TLSRouteInvalidBackendRefUnknownKind,
-		tests.TLSRouteInvalidNoMatchingListener,
-		tests.TLSRouteInvalidNoMatchingListenerHostname,
-		tests.TLSRouteInvalidReferenceGrant,
-		// TLSRouteListenerTerminateNotSupported and TLSRouteListenerMixedTerminationNotSupported are omitted: suite claims TLSRouteModeTerminate and TLSRouteModeMixed.
-		tests.TLSRouteListenerPassthroughSupportedKinds,
-		tests.TLSRouteListenerTerminateSupportedKinds,
-		tests.TLSRouteMixedTerminationSameNamespace,
-		tests.TLSRouteSimpleSameNamespace,
-		tests.TLSRouteTerminateSimpleSameNamespace,
-		tests.TCPRouteInvalidBackendRefNonexistent,
-		tests.TCPRouteInvalidCrossNamespaceBackendRef,
-		tests.TCPRouteInvalidNonTCPListener,
-		tests.TCPRouteParentRefAttachAll,
-		tests.TCPRouteParentRefPortAndSectionName,
-		tests.TCPRouteMultipleRoutesAttachment,
-		tests.TCPRouteReferenceGrant,
-		tests.TCPRouteWeightedRouting,
-		tests.UDPRouteInvalidBackendRefNonexistent,
-		tests.UDPRouteInvalidCrossNamespaceBackendRef,
-		tests.UDPRouteNotAllowedByListeners,
-		tests.UDPRouteTest,
-		tests.UDPRouteMultipleRoutesAttachment,
-		tests.UDPRouteParentRefAttachAllListeners,
-		tests.UDPRouteParentRefPortAndSectionName,
-		tests.UDPRouteReferenceGrant,
-		tests.UDPRouteWeightedRouting,
+	if err := validateSkippedTests(skippedTests, tests.ConformanceTests); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	var selectedTests []suite.ConformanceTest
+	for _, tc := range tests.ConformanceTests {
+		if _, skip := skippedTests[tc.ShortName]; skip {
+			continue
+		}
+		selectedTests = append(selectedTests, tc)
 	}
 
 	cSuite.Setup(t, selectedTests)
 
 	cSuite.Run(t, selectedTests)
+}
+
+// skippedTests contains the ShortName of tests in tests.ConformanceTests to skip,
+// along with the reason or tracking issue for skipping each test.
+var skippedTests = map[string]struct{}{
+	// Suite claims TLSRouteModeTerminate and TLSRouteModeMixed.
+	"TLSRouteListenerTerminateNotSupported":        {},
+	"TLSRouteListenerMixedTerminationNotSupported": {},
+
+	// fails: BackendTLSPolicy Accepted condition not set when targeted by GRPCRoute
+	"BackendTLSPolicyGRPCRoute": {},
+	// fails: BackendTLSPolicy Accepted condition not set when targeted by TLSRoute in terminate mode
+	"BackendTLSPolicyTLSRouteTerminate": {},
+	// fails: Gateway with maximum length name (253 chars) does not become Programmed
+	"GatewayNameMaximumLength": {},
+	// fails: controller removes foreign conditions from Gateway status
+	"GatewayPreserveForeignConditions": {},
+	// fails: GRPCRoute exact hostname does not take precedence over older wildcard route
+	"GRPCRouteMultipleRoutesAttachmentSameHostnameIntersection": {},
+	// fails: URLRewrite not supported as a backend filter
+	"HTTPRouteBackendURLRewrite": {},
+	// fails: HTTPRoute exact/more specific hostname does not take precedence over older wildcard route
+	"HTTPRouteMultipleRoutesAttachmentSameHostnameIntersection": {},
+
+	// Not applicable: this implementation is not a service mesh (EnableAllSupportedFeatures enables mesh features).
+	"MeshConsumerRoute":                         {},
+	"MeshFrontend":                              {},
+	"MeshFrontendHostname":                      {},
+	"MeshGRPCRouteRequestHeaderModifier":        {},
+	"MeshGRPCRouteWeight":                       {},
+	"MeshHTTPRoute303Redirect":                  {},
+	"MeshHTTPRoute307Redirect":                  {},
+	"MeshHTTPRoute308Redirect":                  {},
+	"MeshHTTPRouteBackendRequestHeaderModifier": {},
+	"MeshHTTPRouteQueryParamMatching":           {},
+	"MeshHTTPRouteRedirectHostAndStatus":        {},
+	"MeshHTTPRouteRedirectPath":                 {},
+	"MeshHTTPRouteRedirectPort":                 {},
+	"MeshHTTPRouteRequestHeaderModifier":        {},
+	"MeshHTTPRouteRewritePath":                  {},
+	"MeshHTTPRouteSchemeRedirect":               {},
+	"MeshHTTPRouteWeight":                       {},
+	"MeshPorts":                                 {},
+}
+
+func validateSkippedTests(skipped map[string]struct{}, suiteTests []suite.ConformanceTest) error {
+	known := make(map[string]bool, len(suiteTests))
+	for _, tc := range suiteTests {
+		known[tc.ShortName] = true
+	}
+	for name := range skipped {
+		if !known[name] {
+			return fmt.Errorf("skipped test %q does not exist in conformance suite", name)
+		}
+	}
+	return nil
+}
+
+func TestSkippedTestsExist(t *testing.T) {
+	if err := validateSkippedTests(skippedTests, tests.ConformanceTests); err != nil {
+		t.Fatal(err)
+	}
+
+	testSkip := map[string]struct{}{
+		"NonExistentTest": {},
+	}
+	if err := validateSkippedTests(testSkip, tests.ConformanceTests); err == nil {
+		t.Fatal("expected error for non-existent test in skip set, got nil")
+	}
 }
