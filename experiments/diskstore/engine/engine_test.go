@@ -1518,3 +1518,53 @@ func TestGet_PinPageFailurePreservesCause(t *testing.T) {
 		t.Fatalf("expected error to contain cause %q, got: %v", ErrPageNotFound.Error(), err)
 	}
 }
+
+func TestRegression_SlottedReuseFromMultiBlock(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_slotted_multiblock_reuse"
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Write a multi-block object (6 KB -> 2 blocks)
+	mbData := make([]byte, 6*1024)
+	if err := store.Put("ConfigMap", "mbKey", mbData, "1"); err != nil {
+		t.Fatalf("Put multi-block failed: %v", err)
+	}
+
+	// 2. Delete the multi-block object so its logical page is freed to emptyPages
+	if err := store.Delete("ConfigMap", "mbKey"); err != nil {
+		t.Fatalf("Delete multi-block failed: %v", err)
+	}
+
+	// 3. Put a small slotted object (< 1 block) which pops the emptied logical page
+	if err := store.Put("ConfigMap", "slottedKey", []byte("small-value"), "2"); err != nil {
+		t.Fatalf("Put slotted failed: %v", err)
+	}
+
+	// 4. Verify slottedKey exists and reads correctly
+	val, exists, err := store.Get("ConfigMap", "slottedKey")
+	if err != nil || !exists || string(val) != "small-value" {
+		t.Fatalf("Get slotted failed: val=%q, exists=%v, err=%v", string(val), exists, err)
+	}
+
+	// 5. Verify descriptor NumBlocks == 1 in block pool
+	store.bp.mu.Lock()
+	entry, inIndex := store.keyIndex[qualifyKey("ConfigMap", "slottedKey")]
+	if !inIndex {
+		store.bp.mu.Unlock()
+		t.Fatalf("slottedKey not found in keyIndex")
+	}
+	desc := store.bp.pageTable[entry.LogicalPage]
+	if desc == nil || desc.NumBlocks != 1 {
+		numBlocks := -1
+		if desc != nil {
+			numBlocks = desc.NumBlocks
+		}
+		store.bp.mu.Unlock()
+		t.Fatalf("expected descriptor NumBlocks == 1 for slotted page, got %d", numBlocks)
+	}
+	store.bp.mu.Unlock()
+}

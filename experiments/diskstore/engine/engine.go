@@ -1078,7 +1078,10 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 		}
 
 		handle, err := s.bp.PinPage(targetPage)
-		if err != nil {
+		if err != nil || handle.Desc.NumBlocks != 1 {
+			if err == nil {
+				handle.Unpin()
+			}
 			handle, err = s.bp.AllocateNewPage(targetPage, 1, lsn)
 			if err != nil {
 				s.setFailed(err)
