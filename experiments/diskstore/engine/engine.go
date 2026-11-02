@@ -793,9 +793,20 @@ func (s *Engine) loadOversizeObjects() error {
 			return fmt.Errorf("corrupt oversize file %s: %w", name, err)
 		}
 
-		// Item 2: Loading must respect LSNs
+		// Do not load oversize files from future uncommitted writes beyond recovered WAL LSN
+		if s.wal != nil && lsn > s.wal.MaxLSN() {
+			if rErr := s.fs.Remove(filePath); rErr != nil && !os.IsNotExist(rErr) {
+				return fmt.Errorf("failed to remove uncommitted oversize file %s: %w", filePath, rErr)
+			}
+			continue
+		}
+
+		// Check if key exists in recovered keyIndex and was superseded by a newer version
 		if existing, ok := s.keyIndex[qKey]; ok {
-			if !existing.IsOversize || existing.LSN > lsn {
+			if existing.LSN > lsn {
+				if rErr := s.fs.Remove(filePath); rErr != nil && !os.IsNotExist(rErr) {
+					return fmt.Errorf("failed to remove stale oversize file %s: %w", filePath, rErr)
+				}
 				continue
 			}
 		}

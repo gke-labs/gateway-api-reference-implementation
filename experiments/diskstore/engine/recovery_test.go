@@ -730,6 +730,63 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	}
 }
 
+func TestRegression_OversizeUncommittedDiscard(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_oversize_uncommitted"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	payload1 := make([]byte, 2100*1024)
+	copy(payload1, "valid-oversize-v1")
+	if err := store.Put("ConfigMap", "largeKey", payload1, "1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Close cleanly: WAL max LSN is 1
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Create an uncommitted oversize file with LSN 999 directly in oversize dir
+	oversizeDir := filepath.Join(dir, "oversize")
+	qKey := qualifyKey("ConfigMap", "largeKey")
+	uncommittedFile := filepath.Join(oversizeDir, oversizeFileName(qKey))
+	uncommittedPayload := make([]byte, 2100*1024)
+	copy(uncommittedPayload, "uncommitted-future-data")
+	encoded := encodeOversizeFile(qKey, 999, uncommittedPayload)
+	f, err := memFS.OpenFile(uncommittedFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if _, err := f.WriteAt(encoded, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Reopen store. Recovery must discard the uncommitted oversize file whose LSN exceeds WAL max LSN.
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	val, exists, err := store2.Get("ConfigMap", "largeKey")
+	if err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected largeKey to exist at LSN 1")
+	}
+	if string(val[:len("valid-oversize-v1")]) != "valid-oversize-v1" {
+		t.Fatalf("uncommitted future oversize file loaded instead of durable state: got %q", string(val[:30]))
+	}
+}
+
 func TestRegression_OversizeNoResurrectionAcrossCheckpointTruncation(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_no_resurrect"
