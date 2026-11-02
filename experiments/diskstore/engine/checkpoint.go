@@ -15,24 +15,30 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 )
 
+// TokenProvider returns the current bucket progress tokens.
+type TokenProvider func() map[string]string
+
 // Checkpointer coordinates non-blocking checkpoints between the block pool, heap file, and WAL.
 type Checkpointer struct {
-	bp       *BlockPool
-	heapFile File
-	wal      *WAL
-	mu       sync.Mutex
+	bp            *BlockPool
+	heapFile      File
+	wal           *WAL
+	tokenProvider TokenProvider
+	mu            sync.Mutex
 }
 
 // NewCheckpointer creates a new Checkpointer.
-func NewCheckpointer(bp *BlockPool, heapFile File, wal *WAL) *Checkpointer {
+func NewCheckpointer(bp *BlockPool, heapFile File, wal *WAL, tokenProvider TokenProvider) *Checkpointer {
 	return &Checkpointer{
-		bp:       bp,
-		heapFile: heapFile,
-		wal:      wal,
+		bp:            bp,
+		heapFile:      heapFile,
+		wal:           wal,
+		tokenProvider: tokenProvider,
 	}
 }
 
@@ -83,9 +89,22 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 	}
 
 	// 6. Append checkpoint record to WAL, assigning LSN under WAL lock
+	var tokenPayload []byte
+	if c.tokenProvider != nil {
+		tokens := c.tokenProvider()
+		if len(tokens) > 0 {
+			var mErr error
+			tokenPayload, mErr = json.Marshal(tokens)
+			if mErr != nil {
+				return 0, fmt.Errorf("checkpoint failed to marshal tokens: %w", mErr)
+			}
+		}
+	}
+
 	chkRec := Record{
 		Type:         RecordTypeCheckpoint,
 		RedoStartLSN: redoStartLSN,
+		Payload:      tokenPayload,
 	}
 	chkLSN, err := c.wal.AppendRecord(&chkRec)
 	if err != nil {

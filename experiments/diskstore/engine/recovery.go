@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,17 @@ import (
 	"sort"
 	"strings"
 )
+
+func decodeCheckpointTokens(payload []byte) (map[string]string, error) {
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	var chkTokens map[string]string
+	if err := json.Unmarshal(payload, &chkTokens); err != nil {
+		return nil, fmt.Errorf("corrupt checkpoint token payload: %w", err)
+	}
+	return chkTokens, nil
+}
 
 // KeyIndexEntry maps an object key to its location in a logical page.
 type KeyIndexEntry struct {
@@ -327,6 +339,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	var lastToken string
 	var maxWAL_LSN uint64
 	lastTokenByBucket := make(map[string]string)
+	tokensSetByRecords := make(map[string]bool)
 
 	walScanIt, err := NewWALIterator(fs, walDir, dbID, 1)
 	if err == nil {
@@ -346,13 +359,26 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 				bucket, _ := unqualifyKey(rec.Key)
 				if bucket != "" {
 					lastTokenByBucket[bucket] = rec.Token
+					tokensSetByRecords[bucket] = true
 				}
 			}
 			if rec.Type == RecordTypeToken {
 				continue
 			}
-			if rec.Type == RecordTypeCheckpoint && rec.RedoStartLSN > 0 {
-				redoStartLSN = rec.RedoStartLSN
+			if rec.Type == RecordTypeCheckpoint {
+				if rec.RedoStartLSN > 0 {
+					redoStartLSN = rec.RedoStartLSN
+				}
+				chkTokens, err := decodeCheckpointTokens(rec.Payload)
+				if err != nil {
+					return nil, err
+				}
+				for b, tok := range chkTokens {
+					if !tokensSetByRecords[b] {
+						lastTokenByBucket[b] = tok
+					}
+				}
+				continue
 			}
 		}
 		if closeErr := walScanIt.Close(); closeErr != nil {
@@ -463,9 +489,22 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 				bucket, _ := unqualifyKey(rec.Key)
 				if bucket != "" {
 					lastTokenByBucket[bucket] = rec.Token
+					tokensSetByRecords[bucket] = true
 				}
 			}
 			if rec.Type == RecordTypeToken {
+				continue
+			}
+			if rec.Type == RecordTypeCheckpoint {
+				chkTokens, err := decodeCheckpointTokens(rec.Payload)
+				if err != nil {
+					return nil, err
+				}
+				for b, tok := range chkTokens {
+					if !tokensSetByRecords[b] {
+						lastTokenByBucket[b] = tok
+					}
+				}
 				continue
 			}
 

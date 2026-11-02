@@ -138,7 +138,7 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	heapFile, _ := faultFS.Create("heap.db")
 	buddy := NewBuddyAllocator(512)
 	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
-	cp := NewCheckpointer(bp, heapFile, wal)
+	cp := NewCheckpointer(bp, heapFile, wal, nil)
 
 	// Add key-1, checkpoint, then delete key-1 and checkpoint again
 	_ = wal.Append(Record{Type: RecordTypePut, LSN: 1, Key: "key-1", Payload: []byte("val-1"), Token: "1"})

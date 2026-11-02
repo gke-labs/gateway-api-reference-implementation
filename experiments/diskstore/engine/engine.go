@@ -540,7 +540,7 @@ func Open(opts ...Option) (*Engine, error) {
 			Cipher:        options.Cipher,
 			OnFailure:     s.setFailed,
 		})
-		s.cp = NewCheckpointer(s.bp, heapFile, wal)
+		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.Tokens)
 	} else {
 		// Existing store: perform crash recovery scan and WAL redo replay
 		recoveryRes, err := Recover(options.FS, heapFile, walDir, dbID)
@@ -578,7 +578,7 @@ func Open(opts ...Option) (*Engine, error) {
 			OnFailure:     s.setFailed,
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
-		s.cp = NewCheckpointer(s.bp, heapFile, wal)
+		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.Tokens)
 
 		// Item 17: Load persisted oversize objects
 		if err := s.loadOversizeObjects(); err != nil {

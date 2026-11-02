@@ -16,8 +16,10 @@ package engine
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -46,7 +48,7 @@ func TestCheckpointer_BasicCheckpoint(t *testing.T) {
 	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 	defer bp.Close()
 
-	checkpointer := NewCheckpointer(bp, heapFile, wal)
+	checkpointer := NewCheckpointer(bp, heapFile, wal, nil)
 
 	// Write 5 records to WAL and dirty 2 pages
 	for i := uint64(1); i <= 5; i++ {
@@ -175,7 +177,7 @@ func runCountingCheckpointTest(t *testing.T, numPages int, expectedWrites int64)
 	bp := NewBlockPool(countingHeap, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: numPages + 10})
 	defer bp.Close()
 
-	checkpointer := NewCheckpointer(bp, countingHeap, wal)
+	checkpointer := NewCheckpointer(bp, countingHeap, wal, nil)
 
 	// Dirty N pages and write WAL records
 	for i := 1; i <= numPages; i++ {
@@ -228,5 +230,175 @@ func runCountingCheckpointTest(t *testing.T, numPages int, expectedWrites int64)
 			t.Fatalf("page %d content mismatch: got %q, want %q", i, string(actualData), string(expectedData))
 		}
 		h.Unpin()
+	}
+}
+
+func TestRegression_TokenLossAcrossCheckpoint(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_token_loss"
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("tok-test-db-0001"))
+	walDir := filepath.Join(dir, "wal")
+
+	// 1. Open WAL with tiny max segment size (200 bytes) so segments roll frequently
+	wal, err := OpenWAL(memFS, walDir, dbID, 0, WALOptions{MaxSegmentSize: 200})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	heapFile, err := memFS.Create(filepath.Join(dir, "heap.db"))
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
+	buddy := NewBuddyAllocator(512)
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
+
+	tokens := map[string]string{
+		"ConfigMap": "tok-cm-1",
+		"Gateway":   "tok-gw-1",
+	}
+	cp := NewCheckpointer(bp, heapFile, wal, func() map[string]string { return tokens })
+
+	// Write Put with token in segment 1
+	rec1 := Record{Type: RecordTypePut, Key: qualifyKey("ConfigMap", "cm1"), Token: "tok-cm-1", Payload: []byte("v1")}
+	if _, err := wal.AppendRecord(&rec1); err != nil {
+		t.Fatalf("AppendRecord failed: %v", err)
+	}
+
+	// Write more records to roll into subsequent segments
+	for i := 0; i < 5; i++ {
+		r := Record{Type: RecordTypePut, Key: qualifyKey("ConfigMap", fmt.Sprintf("cm-pad-%d", i)), Payload: bytes.Repeat([]byte("p"), 100)}
+		if _, err := wal.AppendRecord(&r); err != nil {
+			t.Fatalf("AppendRecord failed: %v", err)
+		}
+	}
+
+	// Checkpoint flushes and truncates older segments strictly before redoStartLSN
+	if _, err := cp.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	// Verify segment 1 was truncated
+	entries, err := memFS.ReadDir(walDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() == "00000000000000000001.wal" {
+			t.Fatalf("expected segment 1 to be truncated")
+		}
+	}
+
+	if err := bp.Close(); err != nil {
+		t.Fatalf("bp.Close failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("wal.Close failed: %v", err)
+	}
+	if err := heapFile.Close(); err != nil {
+		t.Fatalf("heapFile.Close failed: %v", err)
+	}
+
+	// Recover and verify tokens
+	heapOpen, err := memFS.Open(filepath.Join(dir, "heap.db"))
+	if err != nil {
+		t.Fatalf("Open heap.db failed: %v", err)
+	}
+	defer heapOpen.Close()
+	res, err := Recover(memFS, heapOpen, walDir, dbID)
+	if err != nil {
+		t.Fatalf("Recover failed: %v", err)
+	}
+	if res.LastTokenByBucket["ConfigMap"] != "tok-cm-1" {
+		t.Fatalf("expected token 'tok-cm-1', got %q", res.LastTokenByBucket["ConfigMap"])
+	}
+	if res.LastTokenByBucket["Gateway"] != "tok-gw-1" {
+		t.Fatalf("expected token 'tok-gw-1', got %q", res.LastTokenByBucket["Gateway"])
+	}
+}
+
+func TestRegression_CheckpointTokenInterleaving(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("tok-interleave-1"))
+	walDir := "wal"
+
+	wal, err := OpenWAL(memFS, walDir, dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	heapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	// Append a RecordTypePut with newer token "tok-newer" at LSN 1
+	rec1 := Record{Type: RecordTypePut, Key: qualifyKey("ConfigMap", "cm1"), Token: "tok-newer", Payload: []byte("v1")}
+	if _, err := wal.AppendRecord(&rec1); err != nil {
+		t.Fatalf("AppendRecord failed: %v", err)
+	}
+
+	// Append a Checkpoint record carrying an older baseline token "tok-older" at LSN 2
+	olderTokens := map[string]string{"ConfigMap": "tok-older"}
+	olderPayload, err := json.Marshal(olderTokens)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	chkRec := Record{Type: RecordTypeCheckpoint, RedoStartLSN: 1, Payload: olderPayload}
+	if _, err := wal.AppendRecord(&chkRec); err != nil {
+		t.Fatalf("AppendRecord failed: %v", err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Recovery must treat checkpoint tokens as baseline: do not overwrite newer token from record
+	res, err := Recover(memFS, heapFile, walDir, dbID)
+	if err != nil {
+		t.Fatalf("Recover failed: %v", err)
+	}
+	if res.LastTokenByBucket["ConfigMap"] != "tok-newer" {
+		t.Fatalf("expected newer token 'tok-newer', got %q", res.LastTokenByBucket["ConfigMap"])
+	}
+}
+
+func TestRegression_CorruptCheckpointPayload(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("tok-corrupt-0001"))
+	walDir := "wal"
+
+	wal, err := OpenWAL(memFS, walDir, dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	heapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	chkRec := Record{Type: RecordTypeCheckpoint, RedoStartLSN: 1, Payload: []byte("{not-valid-json")}
+	if _, err := wal.AppendRecord(&chkRec); err != nil {
+		t.Fatalf("AppendRecord failed: %v", err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Recovery must fail with an error when checkpoint payload is corrupt
+	_, err = Recover(memFS, heapFile, walDir, dbID)
+	if err == nil {
+		t.Fatalf("expected recovery to fail on corrupt checkpoint payload")
+	}
+	if !strings.Contains(err.Error(), "corrupt checkpoint token payload") {
+		t.Fatalf("unexpected error message: %v", err)
 	}
 }
