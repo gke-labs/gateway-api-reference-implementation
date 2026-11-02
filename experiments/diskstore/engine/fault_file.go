@@ -19,11 +19,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -32,11 +34,20 @@ var (
 
 	// ErrWriteAheadRuleViolation is returned when a heap write violates the write-ahead rule.
 	ErrWriteAheadRuleViolation = errors.New("write-ahead rule violation: page written before WAL fsynced through page LSN")
+
+	// ErrCrashed is returned when an I/O operation is attempted after or during a simulated crash point.
+	ErrCrashed = errors.New("simulated crash during I/O operation")
+
+	// ErrInjectedFault is returned when an I/O fault is explicitly injected.
+	ErrInjectedFault = errors.New("injected I/O error")
 )
 
 const (
 	// DefaultBlockSize is 4 KiB.
 	DefaultBlockSize = 4096
+
+	// SectorSize is 512 bytes (standard disk sector granularity for torn writes).
+	SectorSize = 512
 
 	// BlockMagicValue is "GARIDSTR" in big endian uint64.
 	BlockMagicValue uint64 = 0x4741524944535452
@@ -47,6 +58,16 @@ type DurablePageRange struct {
 	StartBlock uint64
 	NumBlocks  uint32
 	LSN        uint64
+}
+
+// PowerLossOptions configures power loss simulation parameters.
+type PowerLossOptions struct {
+	DropUnsynced         bool
+	RandomSubset         bool
+	TearFraction         float64
+	LostMetadata         bool
+	TruncateUnsyncedSize bool
+	Rand                 *rand.Rand
 }
 
 // FaultFS wraps an FS to intercept writes, assert storage invariants, and simulate crashes.
@@ -60,8 +81,31 @@ type FaultFS struct {
 	assertReuseRule      bool
 	assertWriteAheadRule bool
 
-	writeErr error
-	syncErr  error
+	readErr          error
+	readErrSticky    bool
+	writeErr         error
+	writeErrSticky   bool
+	syncErr          error
+	syncErrSticky    bool
+	dirSyncErr       error
+	dirSyncErrSticky bool
+	skipSync         bool
+
+	shortReadLimit  int
+	shortWriteLimit int
+
+	staleBlocks map[string]map[uint64][]byte // path -> blockIdx -> stale block data
+
+	// Lost metadata tracking: directory operations not yet confirmed by SyncDir
+	pendingFileCreations map[string]bool   // path -> true
+	pendingFileRemovals  map[string][]byte // path -> prior durable content
+	pendingRenames       map[string]string // newPath -> oldPath
+
+	// Operation counting for crash point enumeration
+	totalIOOps      atomic.Int64
+	crashAfterOps   atomic.Int64
+	onCrashAfterOps func()
+	crashed         atomic.Bool
 
 	beforeWriteAt func(path string, p []byte, off int64)
 	beforeSync    func(path string)
@@ -74,7 +118,51 @@ func NewFaultFS(underlying FS) *FaultFS {
 		files:                make(map[string]*FaultFile),
 		assertReuseRule:      true,
 		assertWriteAheadRule: true,
+		pendingFileCreations: make(map[string]bool),
+		pendingFileRemovals:  make(map[string][]byte),
+		pendingRenames:       make(map[string]string),
 	}
+}
+
+// checkCrash checks if the operation count has reached the crash threshold.
+func (f *FaultFS) checkCrash() error {
+	ops := f.totalIOOps.Add(1)
+	threshold := f.crashAfterOps.Load()
+	if threshold > 0 && ops >= threshold {
+		if f.crashed.CompareAndSwap(false, true) {
+			f.mu.RLock()
+			cb := f.onCrashAfterOps
+			f.mu.RUnlock()
+			if cb != nil {
+				cb()
+			}
+		}
+		return ErrCrashed
+	}
+	if f.crashed.Load() {
+		return ErrCrashed
+	}
+	return nil
+}
+
+// TotalIOOps returns the total number of intercepted I/O operations.
+func (f *FaultFS) TotalIOOps() int64 {
+	return f.totalIOOps.Load()
+}
+
+// ResetCrash resets the crash state and operation counter.
+func (f *FaultFS) ResetCrash() {
+	f.totalIOOps.Store(0)
+	f.crashAfterOps.Store(0)
+	f.crashed.Store(false)
+}
+
+// SetCrashAfterOps sets a target I/O operation count at which to simulate a crash.
+func (f *FaultFS) SetCrashAfterOps(count int64, fn func()) {
+	f.crashAfterOps.Store(count)
+	f.mu.Lock()
+	f.onCrashAfterOps = fn
+	f.mu.Unlock()
 }
 
 // SetMaxFsyncedLSN sets the highest LSN that has been fsynced in the WAL.
@@ -106,18 +194,184 @@ func (f *FaultFS) SetAssertWriteAheadRule(enabled bool) {
 	f.assertWriteAheadRule = enabled
 }
 
-// SetWriteError sets an error to be returned on subsequent writes.
+// SetWriteError sets an error to be returned on subsequent writes (sticky).
 func (f *FaultFS) SetWriteError(err error) {
+	f.SetWriteErrorSticky(err, true)
+}
+
+// SetWriteErrorSticky sets an error to be returned on writes with sticky flag.
+func (f *FaultFS) SetWriteErrorSticky(err error, sticky bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.writeErr = err
+	f.writeErrSticky = sticky
 }
 
-// SetSyncError sets an error to be returned on subsequent syncs.
+// SetReadError sets an error to be returned on subsequent reads (sticky).
+func (f *FaultFS) SetReadError(err error) {
+	f.SetReadErrorSticky(err, true)
+}
+
+// SetReadErrorSticky sets an error to be returned on reads with sticky flag.
+func (f *FaultFS) SetReadErrorSticky(err error, sticky bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readErr = err
+	f.readErrSticky = sticky
+}
+
+// SetSyncError sets an error to be returned on subsequent syncs (sticky).
 func (f *FaultFS) SetSyncError(err error) {
+	f.SetSyncErrorSticky(err, true)
+}
+
+// SetSyncErrorSticky sets an error to be returned on syncs with sticky flag.
+func (f *FaultFS) SetSyncErrorSticky(err error, sticky bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.syncErr = err
+	f.syncErrSticky = sticky
+}
+
+// SetDirSyncError sets an error to be returned on subsequent directory syncs.
+func (f *FaultFS) SetDirSyncError(err error, sticky bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dirSyncErr = err
+	f.dirSyncErrSticky = sticky
+}
+
+// SetSkipSync enables or disables skipping fsync commitments to durable state.
+func (f *FaultFS) SetSkipSync(skip bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.skipSync = skip
+}
+
+// SetShortRead limits the maximum number of bytes returned by ReadAt.
+func (f *FaultFS) SetShortRead(maxBytes int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.shortReadLimit = maxBytes
+}
+
+// SetShortWrite limits the maximum number of bytes written by WriteAt.
+func (f *FaultFS) SetShortWrite(maxBytes int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.shortWriteLimit = maxBytes
+}
+
+// SetStaleBlock configures a stale page block to be returned on reads for a specific path and block index.
+func (f *FaultFS) SetStaleBlock(path string, blockIdx uint64, staleData []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cleaned := cleanPath(path)
+	if f.staleBlocks == nil {
+		f.staleBlocks = make(map[string]map[uint64][]byte)
+	}
+	if f.staleBlocks[cleaned] == nil {
+		f.staleBlocks[cleaned] = make(map[uint64][]byte)
+	}
+	f.staleBlocks[cleaned][blockIdx] = bytes.Clone(staleData)
+}
+
+// ClearStaleBlocks clears all registered stale blocks.
+func (f *FaultFS) ClearStaleBlocks() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.staleBlocks = nil
+}
+
+// CorruptBlock introduces a bit flip in the block at blockIdx for the specified file.
+func (f *FaultFS) CorruptBlock(path string, blockIdx uint64, byteOffset int, mask byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cleaned := cleanPath(path)
+	ff, exists := f.files[cleaned]
+	if !exists {
+		return fmt.Errorf("file not found: %s", cleaned)
+	}
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
+	off := int(blockIdx*DefaultBlockSize) + byteOffset
+	if off >= len(ff.pendingData) {
+		return fmt.Errorf("offset %d out of range (size %d)", off, len(ff.pendingData))
+	}
+	ff.pendingData[off] ^= mask
+	if off < len(ff.durableData) {
+		ff.durableData[off] ^= mask
+	}
+	_, err := ff.underlying.WriteAt(ff.pendingData[off:off+1], int64(off))
+	if err != nil {
+		uFile, oErr := f.underlying.OpenFile(cleaned, os.O_RDWR, 0644)
+		if oErr != nil {
+			return errors.Join(err, oErr)
+		}
+		_, err = uFile.WriteAt(ff.pendingData[off:off+1], int64(off))
+		sErr := uFile.Sync()
+		cErr := uFile.Close()
+		return errors.Join(err, sErr, cErr)
+	}
+	return ff.underlying.Sync()
+}
+
+// CorruptWALRecord introduces a bit flip in the WAL record with recordLSN in the given WAL file.
+func (f *FaultFS) CorruptWALRecord(path string, recordLSN uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cleaned := cleanPath(path)
+	ff, exists := f.files[cleaned]
+	if !exists {
+		return fmt.Errorf("file not found: %s", cleaned)
+	}
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
+
+	data := ff.pendingData
+	if len(data) < SegmentHeaderSize {
+		return errors.New("WAL file too short for header")
+	}
+	offset := SegmentHeaderSize
+	for offset+RecordHeaderSize <= len(data) {
+		if data[offset] == 0 {
+			nextBlock := ((offset / DefaultBlockSize) + 1) * DefaultBlockSize
+			if nextBlock <= offset || nextBlock >= len(data) {
+				break
+			}
+			offset = nextBlock
+			continue
+		}
+		r, err := DecodeRecord(bytes.NewReader(data[offset:]))
+		if err != nil {
+			break
+		}
+		recLen := RecordHeaderSize + len(r.Key) + len(r.Payload) + len(r.Token)
+		if r.LSN == recordLSN {
+			corruptOff := offset + RecordHeaderSize
+			if len(r.Payload) > 0 {
+				corruptOff = offset + RecordHeaderSize + len(r.Key)
+			}
+			data[corruptOff] ^= 0xff
+			if corruptOff < len(ff.durableData) {
+				ff.durableData[corruptOff] ^= 0xff
+			}
+			_, wErr := ff.underlying.WriteAt(data[corruptOff:corruptOff+1], int64(corruptOff))
+			if wErr != nil {
+				uFile, oErr := f.underlying.OpenFile(cleaned, os.O_RDWR, 0644)
+				if oErr != nil {
+					return errors.Join(wErr, oErr)
+				}
+				_, wErr = uFile.WriteAt(data[corruptOff:corruptOff+1], int64(corruptOff))
+				sErr := uFile.Sync()
+				cErr := uFile.Close()
+				return errors.Join(wErr, sErr, cErr)
+			}
+			return ff.underlying.Sync()
+		}
+		offset += recLen
+	}
+	return fmt.Errorf("record with LSN %d not found in %s", recordLSN, cleaned)
 }
 
 // SetBeforeWriteAt sets a callback invoked before WriteAt execution.
@@ -135,6 +389,10 @@ func (f *FaultFS) SetBeforeSync(fn func(path string)) {
 }
 
 func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	if err := f.checkCrash(); err != nil {
+		return nil, err
+	}
+
 	cleaned := cleanPath(name)
 	file, err := f.underlying.OpenFile(cleaned, flag, perm)
 	if err != nil {
@@ -143,6 +401,13 @@ func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if flag&os.O_CREATE != 0 {
+		if _, exists := f.files[cleaned]; !exists {
+			f.pendingFileCreations[cleaned] = true
+		}
+	}
+
 	ff, exists := f.files[cleaned]
 	if !exists {
 		var nErr error
@@ -167,17 +432,32 @@ func (f *FaultFS) Open(name string) (File, error) {
 }
 
 func (f *FaultFS) Remove(name string) error {
+	if err := f.checkCrash(); err != nil {
+		return err
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	delete(f.files, cleanPath(name))
+	cleaned := cleanPath(name)
+	if ff, exists := f.files[cleaned]; exists {
+		ff.mu.RLock()
+		f.pendingFileRemovals[cleaned] = bytes.Clone(ff.durableData)
+		ff.mu.RUnlock()
+	}
+	delete(f.files, cleaned)
 	return f.underlying.Remove(name)
 }
 
 func (f *FaultFS) Rename(oldpath, newpath string) error {
+	if err := f.checkCrash(); err != nil {
+		return err
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	oldClean := cleanPath(oldpath)
 	newClean := cleanPath(newpath)
+	f.pendingRenames[newClean] = oldClean
 	if ff, exists := f.files[oldClean]; exists {
 		f.files[newClean] = ff
 		delete(f.files, oldClean)
@@ -186,30 +466,153 @@ func (f *FaultFS) Rename(oldpath, newpath string) error {
 }
 
 func (f *FaultFS) MkdirAll(path string, perm os.FileMode) error {
+	if err := f.checkCrash(); err != nil {
+		return err
+	}
 	return f.underlying.MkdirAll(path, perm)
 }
 
 func (f *FaultFS) ReadDir(dirname string) ([]os.DirEntry, error) {
+	if err := f.checkCrash(); err != nil {
+		return nil, err
+	}
 	return f.underlying.ReadDir(dirname)
 }
 
 func (f *FaultFS) SyncDir(dirname string) error {
+	if err := f.checkCrash(); err != nil {
+		return err
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.dirSyncErr != nil {
+		err := f.dirSyncErr
+		if !f.dirSyncErrSticky {
+			f.dirSyncErr = nil
+		}
+		return err
+	}
+
+	cleanedDir := cleanPath(dirname)
+	// Commit pending directory metadata changes for this directory
+	for path := range f.pendingFileCreations {
+		if cleanPath(filepath.Dir(path)) == cleanedDir {
+			delete(f.pendingFileCreations, path)
+		}
+	}
+	for path := range f.pendingFileRemovals {
+		if cleanPath(filepath.Dir(path)) == cleanedDir {
+			delete(f.pendingFileRemovals, path)
+		}
+	}
+	for newPath := range f.pendingRenames {
+		if cleanPath(filepath.Dir(newPath)) == cleanedDir {
+			delete(f.pendingRenames, newPath)
+		}
+	}
+
 	return f.underlying.SyncDir(dirname)
+}
+
+// SetCrashed marks the filesystem as crashed or not crashed.
+// When crashed is true, all subsequent I/O operations return ErrCrashed.
+func (f *FaultFS) SetCrashed(crashed bool) {
+	f.crashed.Store(crashed)
+}
+
+// PowerLoss simulates a power outage or hardware reset.
+// Pending writes in the device's volatile write cache may be dropped, reordered, or torn.
+// Non-fsynced directory metadata changes are lost if LostMetadata is true.
+func (f *FaultFS) PowerLoss(opts PowerLossOptions) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if opts.Rand == nil {
+		opts.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+
+	if opts.LostMetadata {
+		// Revert non-fsynced file creations
+		for path := range f.pendingFileCreations {
+			if rErr := f.underlying.Remove(path); rErr != nil && !os.IsNotExist(rErr) {
+				return rErr
+			}
+			delete(f.files, path)
+		}
+		f.pendingFileCreations = make(map[string]bool)
+
+		// Revert non-fsynced file removals
+		for path, durableContent := range f.pendingFileRemovals {
+			file, err := f.underlying.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+			if err != nil {
+				return err
+			}
+			if _, wErr := file.WriteAt(durableContent, 0); wErr != nil {
+				cErr := file.Close()
+				return errors.Join(wErr, cErr)
+			}
+			if sErr := file.Sync(); sErr != nil {
+				cErr := file.Close()
+				return errors.Join(sErr, cErr)
+			}
+			if cErr := file.Close(); cErr != nil {
+				return cErr
+			}
+		}
+		f.pendingFileRemovals = make(map[string][]byte)
+
+		// Revert non-fsynced renames
+		for newPath, oldPath := range f.pendingRenames {
+			if rErr := f.underlying.Rename(newPath, oldPath); rErr != nil && !os.IsNotExist(rErr) {
+				return rErr
+			}
+			if ff, exists := f.files[newPath]; exists {
+				f.files[oldPath] = ff
+				delete(f.files, newPath)
+			}
+		}
+		f.pendingRenames = make(map[string]string)
+	}
+
+	var errs []error
+	for _, ff := range f.files {
+		ff.mu.Lock()
+		if err := ff.powerLossLocked(opts); err != nil {
+			errs = append(errs, err)
+		}
+		ff.mu.Unlock()
+	}
+	return errors.Join(errs...)
+}
+
+// ProcessCrash simulates a process death where OS buffer cache survives and is flushed to disk.
+func (f *FaultFS) ProcessCrash() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var errs []error
+	for _, ff := range f.files {
+		ff.mu.Lock()
+		truncErr := ff.underlying.Truncate(int64(len(ff.pendingData)))
+		_, writeErr := ff.underlying.WriteAt(ff.pendingData, 0)
+		syncErr := ff.underlying.Sync()
+		ff.mu.Unlock()
+		if err := errors.Join(truncErr, writeErr, syncErr); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Crash simulates a crash across all files in this filesystem.
 // If dropUnsynced is true, all un-fsynced writes are discarded.
 // If tearFraction > 0, randomly tears un-fsynced blocks.
 func (f *FaultFS) Crash(dropUnsynced bool, tearFraction float64) error {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	var errs []error
-	for _, ff := range f.files {
-		if err := ff.Crash(dropUnsynced, tearFraction); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
+	return f.PowerLoss(PowerLossOptions{
+		DropUnsynced: dropUnsynced,
+		TearFraction: tearFraction,
+	})
 }
 
 // FaultFile intercepts reads, writes, and syncs on a specific file.
@@ -219,9 +622,10 @@ type FaultFile struct {
 	underlying File
 	mu         sync.RWMutex
 
-	durableData   []byte
-	pendingData   []byte
-	pendingBlocks map[uint64]bool
+	durableData    []byte
+	pendingData    []byte
+	pendingBlocks  map[uint64]bool
+	pendingSectors map[uint64]bool
 
 	// Map of logicalPage -> newest durable range (heap files only)
 	durablePages map[uint64]DurablePageRange
@@ -248,15 +652,16 @@ func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error)
 	}
 
 	ff := &FaultFile{
-		fs:            fs,
-		name:          name,
-		underlying:    underlying,
-		durableData:   bytes.Clone(initial),
-		pendingData:   bytes.Clone(initial),
-		pendingBlocks: make(map[uint64]bool),
-		durablePages:  make(map[uint64]DurablePageRange),
-		isHeapFile:    isHeap,
-		isWALFile:     isWAL,
+		fs:             fs,
+		name:           name,
+		underlying:     underlying,
+		durableData:    bytes.Clone(initial),
+		pendingData:    bytes.Clone(initial),
+		pendingBlocks:  make(map[uint64]bool),
+		pendingSectors: make(map[uint64]bool),
+		durablePages:   make(map[uint64]DurablePageRange),
+		isHeapFile:     isHeap,
+		isWALFile:      isWAL,
 	}
 
 	if isHeap && len(initial) > 0 {
@@ -266,26 +671,72 @@ func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error)
 }
 
 func (f *FaultFile) ReadAt(p []byte, off int64) (int, error) {
+	if err := f.fs.checkCrash(); err != nil {
+		return 0, err
+	}
+
+	f.fs.mu.Lock()
+	readErr := f.fs.readErr
+	if readErr != nil && !f.fs.readErrSticky {
+		f.fs.readErr = nil
+	}
+	shortRead := f.fs.shortReadLimit
+	staleMap := f.fs.staleBlocks[f.name]
+	f.fs.mu.Unlock()
+
+	if readErr != nil {
+		return 0, readErr
+	}
+
+	if shortRead > 0 && len(p) > shortRead {
+		p = p[:shortRead]
+	}
+
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+
 	if off < 0 {
 		return 0, errors.New("negative offset")
 	}
+
+	// Check for injected stale block read
+	if staleMap != nil {
+		bIdx := uint64(off / DefaultBlockSize)
+		if staleData, ok := staleMap[bIdx]; ok && len(staleData) > 0 {
+			blockOff := int(off % DefaultBlockSize)
+			if blockOff < len(staleData) {
+				n := copy(p, staleData[blockOff:])
+				return n, nil
+			}
+		}
+	}
+
 	if off >= int64(len(f.pendingData)) {
-		return 0, os.ErrNotExist
+		return 0, io.EOF
 	}
 	n := copy(p, f.pendingData[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
 	return n, nil
 }
 
 func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
-	f.fs.mu.RLock()
+	if err := f.fs.checkCrash(); err != nil {
+		return 0, err
+	}
+
+	f.fs.mu.Lock()
 	writeErr := f.fs.writeErr
+	if writeErr != nil && !f.fs.writeErrSticky {
+		f.fs.writeErr = nil
+	}
 	assertReuse := f.fs.assertReuseRule
 	assertWAL := f.fs.assertWriteAheadRule
 	maxFsyncedLSN := f.fs.MaxFsyncedLSN()
 	beforeWriteAt := f.fs.beforeWriteAt
-	f.fs.mu.RUnlock()
+	shortWrite := f.fs.shortWriteLimit
+	f.fs.mu.Unlock()
 
 	if beforeWriteAt != nil {
 		beforeWriteAt(f.name, p, off)
@@ -293,6 +744,10 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 
 	if writeErr != nil {
 		return 0, writeErr
+	}
+
+	if shortWrite > 0 && len(p) > shortWrite {
+		p = p[:shortWrite]
 	}
 
 	f.mu.Lock()
@@ -345,6 +800,13 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 		}
 	}
 
+	// Track pending 512-byte sectors
+	startSec := uint64(off / SectorSize)
+	endSec := uint64((off + int64(len(p)) + SectorSize - 1) / SectorSize)
+	for s := startSec; s < endSec; s++ {
+		f.pendingSectors[s] = true
+	}
+
 	reqLen := int(off) + len(p)
 	if reqLen > len(f.pendingData) {
 		expanded := make([]byte, reqLen)
@@ -363,10 +825,17 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (f *FaultFile) Sync() error {
-	f.fs.mu.RLock()
+	if err := f.fs.checkCrash(); err != nil {
+		return err
+	}
+
+	f.fs.mu.Lock()
 	syncErr := f.fs.syncErr
+	if syncErr != nil && !f.fs.syncErrSticky {
+		f.fs.syncErr = nil
+	}
 	beforeSync := f.fs.beforeSync
-	f.fs.mu.RUnlock()
+	f.fs.mu.Unlock()
 
 	if beforeSync != nil {
 		beforeSync(f.name)
@@ -376,12 +845,21 @@ func (f *FaultFile) Sync() error {
 		return syncErr
 	}
 
+	f.fs.mu.RLock()
+	skipSync := f.fs.skipSync
+	f.fs.mu.RUnlock()
+
+	if skipSync {
+		return nil
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	// Commit pending writes to durable state
 	f.durableData = bytes.Clone(f.pendingData)
 	f.pendingBlocks = make(map[uint64]bool)
+	f.pendingSectors = make(map[uint64]bool)
 
 	// Update durable pages index if heap file
 	if f.isHeapFile {
@@ -461,7 +939,6 @@ func (f *FaultFile) updateMaxFsyncedWAL_LSNLocked() {
 	var maxLSN uint64
 	for offset+RecordHeaderSize <= len(f.durableData) {
 		if f.durableData[offset] == 0 {
-			// Zero padding in block: skip to next 4 KiB block boundary
 			nextBlock := ((offset / DefaultBlockSize) + 1) * DefaultBlockSize
 			if nextBlock <= offset || nextBlock >= len(f.durableData) {
 				break
@@ -488,46 +965,87 @@ func (f *FaultFile) updateMaxFsyncedWAL_LSNLocked() {
 	}
 }
 
-// Crash simulates a crash on this file.
-func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if dropUnsynced {
-		// Discard pending writes; revert to durable data
-		f.pendingData = bytes.Clone(f.durableData)
-		f.pendingBlocks = make(map[uint64]bool)
-		truncErr := f.underlying.Truncate(int64(len(f.durableData)))
-		_, writeErr := f.underlying.WriteAt(f.durableData, 0)
-		syncErr := f.underlying.Sync()
-		return errors.Join(truncErr, writeErr, syncErr)
+// powerLossLocked executes power loss simulation on this file while f.mu is held.
+func (f *FaultFile) powerLossLocked(opts PowerLossOptions) error {
+	if opts.TruncateUnsyncedSize && len(f.pendingData) > len(f.durableData) {
+		f.pendingData = f.pendingData[:len(f.durableData)]
 	}
 
-	if tearFraction > 0 && len(f.pendingBlocks) > 0 {
-		// Partially write or tear random pending blocks
-		for bIdx := range f.pendingBlocks {
-			r := rand.Float64()
-			if r < tearFraction {
-				// Tear block: corrupt random bytes or write only half block
-				start := int(bIdx) * DefaultBlockSize
-				if start+DefaultBlockSize <= len(f.pendingData) {
-					// Corrupt last 128 bytes of block
-					for k := 0; k < 128; k++ {
-						f.pendingData[start+DefaultBlockSize-1-k] ^= 0xff
+	if opts.DropUnsynced {
+		f.pendingData = bytes.Clone(f.durableData)
+		f.pendingBlocks = make(map[uint64]bool)
+		f.pendingSectors = make(map[uint64]bool)
+	} else if opts.RandomSubset && len(f.pendingSectors) > 0 {
+		// Reorder/subset: randomly revert some pending 512-byte sectors to durable
+		for sIdx := range f.pendingSectors {
+			if opts.Rand != nil && opts.Rand.Float64() < 0.5 {
+				secStart := int(sIdx * SectorSize)
+				secEnd := secStart + SectorSize
+				if secStart < len(f.durableData) {
+					dEnd := secEnd
+					if dEnd > len(f.durableData) {
+						dEnd = len(f.durableData)
+					}
+					copy(f.pendingData[secStart:dEnd], f.durableData[secStart:dEnd])
+				} else if secStart < len(f.pendingData) {
+					pEnd := secEnd
+					if pEnd > len(f.pendingData) {
+						pEnd = len(f.pendingData)
+					}
+					clear(f.pendingData[secStart:pEnd])
+				}
+			}
+		}
+	}
+
+	if opts.TearFraction > 0 && len(f.pendingSectors) > 0 {
+		// Randomly tear 512-byte sectors
+		for sIdx := range f.pendingSectors {
+			if opts.Rand != nil && opts.Rand.Float64() < opts.TearFraction {
+				secStart := int(sIdx * SectorSize)
+				if secStart+SectorSize <= len(f.pendingData) {
+					// Corrupt last 64 bytes of the sector
+					for k := 0; k < 64; k++ {
+						f.pendingData[secStart+SectorSize-1-k] ^= 0xff
 					}
 				}
 			}
 		}
 	}
 
-	// Write current crashed image to underlying and sync
+	// Write crashed image to underlying and sync
 	truncErr := f.underlying.Truncate(int64(len(f.pendingData)))
 	_, writeErr := f.underlying.WriteAt(f.pendingData, 0)
 	syncErr := f.underlying.Sync()
+
+	f.pendingBlocks = make(map[uint64]bool)
+	f.pendingSectors = make(map[uint64]bool)
+
+	if f.isHeapFile {
+		f.rebuildDurablePagesLocked()
+	}
+	if f.isWALFile {
+		f.updateMaxFsyncedWAL_LSNLocked()
+	}
+
 	return errors.Join(truncErr, writeErr, syncErr)
 }
 
+// Crash simulates a crash on this file.
+func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.powerLossLocked(PowerLossOptions{
+		DropUnsynced: dropUnsynced,
+		TearFraction: tearFraction,
+	})
+}
+
 func (f *FaultFile) Truncate(size int64) error {
+	if err := f.fs.checkCrash(); err != nil {
+		return err
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if size < 0 {
@@ -548,6 +1066,10 @@ func (f *FaultFile) Close() error {
 }
 
 func (f *FaultFile) Size() (int64, error) {
+	if err := f.fs.checkCrash(); err != nil {
+		return 0, err
+	}
+
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return int64(len(f.pendingData)), nil

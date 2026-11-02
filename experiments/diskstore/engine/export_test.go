@@ -18,3 +18,42 @@ package engine
 func (s *Engine) SimulateFailure(err error) {
 	s.setFailed(err)
 }
+
+// InjectFrameLeak drops a free block from the pool to simulate a frame leak.
+func (s *Engine) InjectFrameLeak() {
+	s.bp.mu.Lock()
+	defer s.bp.mu.Unlock()
+	if len(s.bp.freePoolBlocks) > 0 {
+		s.bp.freePoolBlocks = s.bp.freePoolBlocks[1:]
+	}
+}
+
+// InjectBuddyOverlap adds an overlapping allocation to the buddy allocator.
+func (s *Engine) InjectBuddyOverlap() {
+	s.buddy.mu.Lock()
+	defer s.buddy.mu.Unlock()
+	// Find any allocated block and add an overlapping block
+	for start := range s.buddy.allocated {
+		s.buddy.allocated[start+1] = 0
+		break
+	}
+}
+
+// InjectBuddyLeak adds an unreferenced allocated block to simulate an allocator block leak.
+func (s *Engine) InjectBuddyLeak() {
+	s.buddy.mu.Lock()
+	defer s.buddy.mu.Unlock()
+	s.buddy.allocated[999999] = 0
+}
+
+// InjectCorruptIndex points an index entry to a non-existent logical page.
+func (s *Engine) InjectCorruptIndex(qKey string) {
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	s.keyIndex[qKey] = KeyIndexEntry{
+		LogicalPage: 888888,
+		Slot:        0,
+		LSN:         1,
+		NumBlocks:   1,
+	}
+}
