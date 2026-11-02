@@ -3433,10 +3433,10 @@ func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName
 	}
 }
 
-// MergeGatewayStatus merges desired GatewayStatus into current, preserving LastTransitionTime.
+// MergeGatewayStatus merges desired GatewayStatus into current, preserving LastTransitionTime and foreign conditions.
 func MergeGatewayStatus(current *gatewayv1.GatewayStatus, desired gatewayv1.GatewayStatus) bool {
 	updated := false
-	if SetConditions(&current.Conditions, desired.Conditions) {
+	if MergeConditions(&current.Conditions, desired.Conditions, GatewayOwnedConditionTypes) {
 		updated = true
 	}
 	if !reflectAddressesEqual(current.Addresses, desired.Addresses) {
@@ -3452,37 +3452,20 @@ func MergeGatewayStatus(current *gatewayv1.GatewayStatus, desired gatewayv1.Gate
 
 	var newListeners []gatewayv1.ListenerStatus
 	for _, dl := range desired.Listeners {
+		var entryConditions []metav1.Condition
+		for _, ol := range current.Listeners {
+			if ol.Name == dl.Name {
+				entryConditions = slices.Clone(ol.Conditions)
+				break
+			}
+		}
+		MergeConditions(&entryConditions, dl.Conditions, ListenerOwnedConditionTypes)
+
 		entry := gatewayv1.ListenerStatus{
 			Name:           dl.Name,
 			SupportedKinds: dl.SupportedKinds,
 			AttachedRoutes: dl.AttachedRoutes,
-			Conditions:     make([]metav1.Condition, len(dl.Conditions)),
-		}
-		copy(entry.Conditions, dl.Conditions)
-
-		var matchedOld *gatewayv1.ListenerStatus
-		for _, ol := range current.Listeners {
-			if ol.Name == dl.Name {
-				matchedOld = &ol
-				break
-			}
-		}
-		if matchedOld != nil {
-			for k, dc := range entry.Conditions {
-				for _, oc := range matchedOld.Conditions {
-					if oc.Type == dc.Type {
-						if oc.Status == dc.Status {
-							entry.Conditions[k].LastTransitionTime = oc.LastTransitionTime
-						}
-						break
-					}
-				}
-			}
-		}
-		for k := range entry.Conditions {
-			if entry.Conditions[k].LastTransitionTime.IsZero() {
-				entry.Conditions[k].LastTransitionTime = metav1.Now()
-			}
+			Conditions:     entryConditions,
 		}
 		newListeners = append(newListeners, entry)
 	}

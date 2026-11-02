@@ -4002,3 +4002,161 @@ func TestGatewayClassReconciler_SupportedFeatures(t *testing.T) {
 			rv, resSecond.ResourceVersion)
 	}
 }
+
+func TestGatewayReconciler_PreservesForeignConditions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gwClass)
+
+	t0 := metav1.NewTime(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	foreignGwCond := metav1.Condition{
+		Type:               "conformance.gateway.networking.k8s.io/StaleCondition",
+		Status:             metav1.ConditionTrue,
+		Reason:             "Seeded",
+		Message:            "Foreign condition seeded by another controller",
+		ObservedGeneration: 1,
+		LastTransitionTime: t0,
+	}
+	foreignListenerCond := metav1.Condition{
+		Type:               "conformance.gateway.networking.k8s.io/StaleCondition",
+		Status:             metav1.ConditionTrue,
+		Reason:             "SeededListener",
+		Message:            "Foreign listener condition seeded by another controller",
+		ObservedGeneration: 1,
+		LastTransitionTime: t0,
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-gw",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+		Status: gatewayv1.GatewayStatus{
+			Conditions: []metav1.Condition{foreignGwCond},
+			Listeners: []gatewayv1.ListenerStatus{
+				{
+					Name:       "http",
+					Conditions: []metav1.Condition{foreignListenerCond},
+				},
+			},
+		},
+	}
+
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	// Reconcile Gateway: controller updates status
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get reconciled gateway: %v", err)
+	}
+
+	// 1. Foreign condition on Gateway must survive
+	storedGw := findCondition(reconciledGW.Status.Conditions, "conformance.gateway.networking.k8s.io/StaleCondition")
+	if storedGw == nil {
+		t.Fatalf("expected foreign Gateway condition to survive status update, got none")
+	}
+	if storedGw.Type != foreignGwCond.Type ||
+		storedGw.Status != foreignGwCond.Status ||
+		storedGw.Reason != foreignGwCond.Reason ||
+		storedGw.Message != foreignGwCond.Message ||
+		storedGw.ObservedGeneration != foreignGwCond.ObservedGeneration ||
+		!storedGw.LastTransitionTime.Equal(&foreignGwCond.LastTransitionTime) {
+		t.Errorf("foreign Gateway condition was modified: got %+v, want %+v", *storedGw, foreignGwCond)
+	}
+
+	// 2. Owned conditions on Gateway must be present
+	acceptedCond := findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Gateway Accepted=True, got %+v", acceptedCond)
+	}
+	progCond := findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil {
+		t.Errorf("expected Gateway Programmed condition, got none")
+	}
+
+	// 3. Foreign condition on Listener must survive
+	if len(reconciledGW.Status.Listeners) != 1 {
+		t.Fatalf("expected 1 listener in status, got %d", len(reconciledGW.Status.Listeners))
+	}
+	storedListener := findCondition(reconciledGW.Status.Listeners[0].Conditions, "conformance.gateway.networking.k8s.io/StaleCondition")
+	if storedListener == nil {
+		t.Fatalf("expected foreign Listener condition to survive status update, got none")
+	}
+	if storedListener.Type != foreignListenerCond.Type ||
+		storedListener.Status != foreignListenerCond.Status ||
+		storedListener.Reason != foreignListenerCond.Reason ||
+		storedListener.Message != foreignListenerCond.Message ||
+		storedListener.ObservedGeneration != foreignListenerCond.ObservedGeneration ||
+		!storedListener.LastTransitionTime.Equal(&foreignListenerCond.LastTransitionTime) {
+		t.Errorf("foreign Listener condition was modified: got %+v, want %+v", *storedListener, foreignListenerCond)
+	}
+
+	// 4. Owned conditions on Listener must be present
+	listenerProg := findCondition(reconciledGW.Status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if listenerProg == nil || listenerProg.Status != metav1.ConditionTrue {
+		t.Errorf("expected Listener Programmed=True, got %+v", listenerProg)
+	}
+
+	// 5. Subsequent reconcile without changes must be a no-op (no error, unchanged status)
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error on second reconcile: %v", err)
+	}
+
+	var secondReconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &secondReconciledGW); err != nil {
+		t.Fatalf("failed to get reconciled gateway: %v", err)
+	}
+	storedGw2 := findCondition(secondReconciledGW.Status.Conditions, "conformance.gateway.networking.k8s.io/StaleCondition")
+	if storedGw2 == nil ||
+		storedGw2.Type != foreignGwCond.Type ||
+		storedGw2.Status != foreignGwCond.Status ||
+		storedGw2.Reason != foreignGwCond.Reason ||
+		storedGw2.Message != foreignGwCond.Message ||
+		storedGw2.ObservedGeneration != foreignGwCond.ObservedGeneration ||
+		!storedGw2.LastTransitionTime.Equal(&foreignGwCond.LastTransitionTime) {
+		t.Errorf("foreign Gateway condition was modified on second reconcile: got %+v, want %+v", storedGw2, foreignGwCond)
+	}
+}
