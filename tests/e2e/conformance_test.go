@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -34,6 +36,14 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
+
+// exemptFeatures returns features not supported by this implementation.
+// GARI doesn't implement mesh (GAMMA).
+func exemptFeatures() []features.FeatureName {
+	exempt := append([]features.FeatureName{features.SupportMesh}, features.SetsToNamesSet(features.MeshExtendedFeatures).UnsortedList()...)
+	slices.Sort(exempt)
+	return exempt
+}
 
 func TestConformance(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
@@ -93,6 +103,7 @@ func TestConformance(t *testing.T) {
 			CleanupBaseResources:       true,
 			CleanupTestResources:       true,
 			EnableAllSupportedFeatures: true,
+			ExemptFeatures:             exemptFeatures(),
 			SupportedFeatures: []features.FeatureName{
 				features.SupportGatewayBackendClientCertificate,
 				features.SupportGatewayFrontendClientCertificateValidation,
@@ -157,26 +168,6 @@ var skippedTests = map[string]struct{}{
 	"HTTPRouteBackendURLRewrite": {},
 	// fails: HTTPRoute exact/more specific hostname does not take precedence over older wildcard route
 	"HTTPRouteMultipleRoutesAttachmentSameHostnameIntersection": {},
-
-	// Not applicable: this implementation is not a service mesh (EnableAllSupportedFeatures enables mesh features).
-	"MeshConsumerRoute":                         {},
-	"MeshFrontend":                              {},
-	"MeshFrontendHostname":                      {},
-	"MeshGRPCRouteRequestHeaderModifier":        {},
-	"MeshGRPCRouteWeight":                       {},
-	"MeshHTTPRoute303Redirect":                  {},
-	"MeshHTTPRoute307Redirect":                  {},
-	"MeshHTTPRoute308Redirect":                  {},
-	"MeshHTTPRouteBackendRequestHeaderModifier": {},
-	"MeshHTTPRouteQueryParamMatching":           {},
-	"MeshHTTPRouteRedirectHostAndStatus":        {},
-	"MeshHTTPRouteRedirectPath":                 {},
-	"MeshHTTPRouteRedirectPort":                 {},
-	"MeshHTTPRouteRequestHeaderModifier":        {},
-	"MeshHTTPRouteRewritePath":                  {},
-	"MeshHTTPRouteSchemeRedirect":               {},
-	"MeshHTTPRouteWeight":                       {},
-	"MeshPorts":                                 {},
 }
 
 func validateSkippedTests(skipped map[string]struct{}, suiteTests []suite.ConformanceTest) error {
@@ -202,5 +193,13 @@ func TestSkippedTestsExist(t *testing.T) {
 	}
 	if err := validateSkippedTests(testSkip, tests.ConformanceTests); err == nil {
 		t.Fatal("expected error for non-existent test in skip set, got nil")
+	}
+}
+
+func TestMeshFeaturesExempt(t *testing.T) {
+	for name := range skippedTests {
+		if strings.HasPrefix(name, "Mesh") {
+			t.Errorf("skippedTests contains Mesh test %q; mesh tests should be exempt via features", name)
+		}
 	}
 }
