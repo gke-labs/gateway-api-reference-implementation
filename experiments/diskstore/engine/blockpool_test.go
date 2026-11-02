@@ -759,3 +759,58 @@ func TestRegression_BlockPoolFlushPanicSafety(t *testing.T) {
 
 	_ = bp.FlushAllDirty()
 }
+
+func TestRegression_BlockPoolInFlightWait(t *testing.T) {
+	memFS := NewMemFS()
+	rawHeapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
+	defer rawHeapFile.Close()
+
+	buddy := NewBuddyAllocator(512)
+	var dbID [16]byte
+	bp := NewBlockPool(rawHeapFile, nil, buddy, dbID, BlockPoolOptions{
+		NumPoolBlocks: 2,
+	})
+	defer bp.Close()
+
+	// Fill pool with 2 dirty pages
+	h1, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage 1 failed: %v", err)
+	}
+	bp.MarkDirty(1, 10)
+	h1.Unpin()
+
+	h2, err := bp.AllocateNewPage(2, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage 2 failed: %v", err)
+	}
+	bp.MarkDirty(2, 10)
+	h2.Unpin()
+
+	// Mark both pages as InFlight simulating an active flush
+	bp.mu.Lock()
+	bp.pageTable[1].InFlight = true
+	bp.pageTable[2].InFlight = true
+	bp.mu.Unlock()
+
+	// In a goroutine, after 50ms, clear InFlight and signal cond
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		bp.mu.Lock()
+		bp.pageTable[1].InFlight = false
+		bp.pageTable[2].InFlight = false
+		bp.cond.Broadcast()
+		bp.mu.Unlock()
+	}()
+
+	// Allocate a new page. Without the fix, this fails immediately with ErrBlockPoolFull.
+	// With the fix, it waits on bp.cond and succeeds.
+	h3, err := bp.AllocateNewPage(3, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	defer h3.Unpin()
+}

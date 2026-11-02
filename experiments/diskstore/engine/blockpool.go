@@ -513,12 +513,22 @@ func (bp *BlockPool) acquirePoolBlocksLocked(count int) ([]int, error) {
 		}
 
 		var candidates []*PageDesc
+		hasInFlight := false
 		for _, desc := range bp.pageTable {
-			if len(desc.PoolBlocks) > 0 && desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
-				candidates = append(candidates, desc)
+			if len(desc.PoolBlocks) > 0 {
+				if desc.InFlight {
+					hasInFlight = true
+				}
+				if desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
+					candidates = append(candidates, desc)
+				}
 			}
 		}
 		if len(candidates) == 0 {
+			if hasInFlight {
+				bp.cond.Wait()
+				continue
+			}
 			return nil, ErrBlockPoolFull
 		}
 
