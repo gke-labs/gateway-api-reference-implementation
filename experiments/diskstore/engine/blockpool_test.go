@@ -715,3 +715,47 @@ func TestBlockPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
 		t.Fatalf("timed out waiting for AllocateNewPage after unpin")
 	}
 }
+
+type panickingDirectIO struct {
+	DirectIO
+}
+
+func (p *panickingDirectIO) Write(f File, off int64, b []byte) error {
+	panic("injected panic in direct I/O write")
+}
+
+func TestRegression_BlockPoolFlushPanicSafety(t *testing.T) {
+	memFS := NewMemFS()
+	rawHeapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
+	defer rawHeapFile.Close()
+
+	buddy := NewBuddyAllocator(512)
+	var dbID [16]byte
+	bp := NewBlockPool(rawHeapFile, nil, buddy, dbID, BlockPoolOptions{
+		NumPoolBlocks: 16,
+	})
+	bp.directIO = &panickingDirectIO{}
+	defer bp.Close()
+
+	h, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	bp.MarkDirty(1, 10)
+	h.Unpin()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected panic from panickingDirectIO")
+		}
+		if rStr := fmt.Sprint(r); rStr != "injected panic in direct I/O write" {
+			t.Fatalf("unexpected panic value: %v", r)
+		}
+	}()
+
+	_ = bp.FlushAllDirty()
+}
