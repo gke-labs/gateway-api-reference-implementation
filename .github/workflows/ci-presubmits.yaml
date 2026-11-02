@@ -163,3 +163,30 @@ jobs:
           name: artifacts-ap-verify-generate
           path: /tmp/artifacts
           if-no-files-found: ignore
+  conformance-previous-minor:
+    runs-on: ubuntu-latest
+    env:
+      ARTIFACTS: /tmp/artifacts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # ratchet:actions/setup-go@v7.0.0
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run conformance-previous-minor
+        run: ./dev/ci/presubmits/conformance-previous-minor
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # ratchet:actions/upload-artifact@v7.0.2
+        with:
+          name: artifacts-conformance-previous-minor
+          path: /tmp/artifacts
+          if-no-files-found: ignore

@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
+
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 )
 
@@ -40,7 +42,7 @@ func TestGatewayAPI(t *testing.T) {
 	h.Setup()
 
 	// 1. Install Gateway API CRDs
-	h.InstallGatewayAPI()
+	h.InstallGatewayAPI(gatewayconsts.BundleVersion)
 
 	// 2. Deploy Controller
 	h.DeployController()

@@ -222,6 +222,34 @@ func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Dur
 	}
 }
 
+func (h *Harness) WaitForGatewayClassSupportedVersion(name string, timeout time.Duration) {
+	h.t.Logf("Waiting for GatewayClass %s to have SupportedVersion=True", name)
+	start := time.Now()
+	var lastErr error
+	for {
+		if time.Since(start) > timeout {
+			out := h.runCmd("kubectl", "get", "gatewayclass", name, "-o", `jsonpath=status={.status.conditions[?(@.type=="SupportedVersion")].status} reason={.status.conditions[?(@.type=="SupportedVersion")].reason} message={.status.conditions[?(@.type=="SupportedVersion")].message}`)
+			if lastErr != nil {
+				h.t.Fatalf("Timeout waiting for GatewayClass %s SupportedVersion=True (last error: %v): %s", name, lastErr, out)
+			}
+			h.t.Fatalf("Timeout waiting for GatewayClass %s SupportedVersion=True: %s", name, out)
+		}
+
+		cmd := exec.Command("kubectl", "get", "gatewayclass", name, "-o", `jsonpath={.status.conditions[?(@.type=="SupportedVersion")].status} {.status.conditions[?(@.type=="SupportedVersion")].reason}`)
+		out, err := cmd.Output()
+		if err != nil {
+			lastErr = err
+			h.t.Logf("waiting for GatewayClass %s SupportedVersion condition: %v", name, err)
+		} else {
+			fields := strings.Fields(strings.TrimSpace(string(out)))
+			if len(fields) >= 2 && fields[0] == "True" && fields[1] == "SupportedVersion" {
+				return
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
 func (h *Harness) WaitForResourceDeletion(kind, name, namespace string, timeout time.Duration) {
 	h.t.Logf("Waiting for %s %s/%s to be deleted", kind, namespace, name)
 	start := time.Now()
@@ -294,9 +322,12 @@ func (h *Harness) runCmd(name string, args ...string) string {
 	return stdout.String()
 }
 
-func (h *Harness) InstallGatewayAPI() {
-	h.t.Log("Installing Gateway API CRDs")
-	h.runCmd("kubectl", "apply", "--server-side", "--force-conflicts", "-f", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/experimental-install.yaml")
+// PreviousMinorCRDVersion is the previous minor Gateway API release bundle version supported by the controller.
+const PreviousMinorCRDVersion = "v1.6.3"
+
+func (h *Harness) InstallGatewayAPI(version string) {
+	h.t.Logf("Installing Gateway API CRDs (%s)", version)
+	h.runCmd("kubectl", "apply", "--server-side", "--force-conflicts", "-f", fmt.Sprintf("https://github.com/kubernetes-sigs/gateway-api/releases/download/%s/experimental-install.yaml", version))
 }
 
 func (h *Harness) DeployController() {
