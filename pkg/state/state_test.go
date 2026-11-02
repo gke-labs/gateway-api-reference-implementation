@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 )
 
 type testQueue struct {
@@ -1333,7 +1334,7 @@ func TestState_GatewayCRDBundleVersionEnqueuesGatewayClass(t *testing.T) {
 	}
 
 	// Setting bundle version and recomputing adds SupportedVersion to outputs and enqueues GatewayClass
-	bundleVersion := "v1.6.3"
+	bundleVersion := gatewayconsts.BundleVersion
 	st.SetGatewayCRDBundleVersion(&bundleVersion)
 	st.Recompute()
 

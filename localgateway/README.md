@@ -32,7 +32,7 @@ It is purpose-built to serve single-label `.local` hostnames (such as `grafana.l
 - A standard Kubernetes cluster (kubeadm, kind, etc.).
 - Standard Gateway API CRDs installed:
   ```bash
-  kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
+  kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
   ```
 
 ### 2. Deploy localgateway

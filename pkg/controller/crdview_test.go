@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/version"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -119,7 +120,7 @@ func TestCRDSnapshot_Comparable(t *testing.T) {
 			Gateway:      true,
 			HTTPRoute:    true,
 		},
-		BundleVersion: "v1.6.3",
+		BundleVersion: gatewayconsts.BundleVersion,
 	}
 
 	s2 := CRDSnapshot{
@@ -128,7 +129,7 @@ func TestCRDSnapshot_Comparable(t *testing.T) {
 			Gateway:      true,
 			HTTPRoute:    true,
 		},
-		BundleVersion: "v1.6.3",
+		BundleVersion: gatewayconsts.BundleVersion,
 	}
 
 	s3 := CRDSnapshot{
@@ -138,7 +139,7 @@ func TestCRDSnapshot_Comparable(t *testing.T) {
 			HTTPRoute:    true,
 			TLSRoute:     true,
 		},
-		BundleVersion: "v1.6.3",
+		BundleVersion: gatewayconsts.BundleVersion,
 	}
 
 	s4 := CRDSnapshot{
@@ -147,7 +148,7 @@ func TestCRDSnapshot_Comparable(t *testing.T) {
 			Gateway:      true,
 			HTTPRoute:    true,
 		},
-		BundleVersion: "v1.6.4",
+		BundleVersion: gatewayconsts.BundleVersion + "-different",
 	}
 
 	if s1 != s2 {
@@ -167,7 +168,14 @@ func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersion(t *testing.T) {
 	ctx := t.Context()
 	scheme := newTestSchemeWithApiextensions()
 
-	initCRDs := requiredGatewayAPICRDs("v1.6.0")
+	parsedV, err := version.ParseSemantic(gatewayconsts.BundleVersion)
+	if err != nil {
+		t.Fatalf("failed to parse bundle version %q: %v", gatewayconsts.BundleVersion, err)
+	}
+	initialBV := fmt.Sprintf("v%d.%d.%d", parsedV.Major(), parsedV.Minor(), parsedV.Patch()+1)
+	upgradedBV := fmt.Sprintf("v%d.%d.%d", parsedV.Major(), parsedV.Minor(), parsedV.Patch()+2)
+
+	initCRDs := requiredGatewayAPICRDs(initialBV)
 	var initObjs []runtime.Object
 	for _, c := range initCRDs {
 		initObjs = append(initObjs, c)
@@ -201,14 +209,14 @@ func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersion(t *testing.T) {
 		t.Fatalf("unexpected NewCRDView error: %v", err)
 	}
 
-	if crdView.Snapshot().BundleVersion != "v1.6.0" {
-		t.Fatalf("expected initial bundle version v1.6.0, got %q", crdView.Snapshot().BundleVersion)
+	if crdView.Snapshot().BundleVersion != initialBV {
+		t.Fatalf("expected initial bundle version %s, got %q", initialBV, crdView.Snapshot().BundleVersion)
 	}
 
 	st := state.NewState()
 	st.SetControllerName("test-controller")
-	initBV := crdView.Snapshot().BundleVersion
-	st.SetGatewayCRDBundleVersion(&initBV)
+	initBVVal := crdView.Snapshot().BundleVersion
+	st.SetGatewayCRDBundleVersion(&initBVVal)
 	st.UpsertGatewayClass(gc)
 	st.Recompute()
 
@@ -239,19 +247,20 @@ func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersion(t *testing.T) {
 	if cond == nil {
 		t.Fatalf("expected SupportedVersion condition, got nil")
 	}
-	if !strings.Contains(cond.Message, `"v1.6.0" is supported`) {
-		t.Errorf("expected initial message to contain v1.6.0 is supported, got: %s", cond.Message)
+	expectedInitialMsg := fmt.Sprintf("%q is supported", initialBV)
+	if !strings.Contains(cond.Message, expectedInitialMsg) {
+		t.Errorf("expected initial message to contain %s, got: %s", expectedInitialMsg, cond.Message)
 	}
 
-	// Upgrade bundle version annotation from v1.6.0 to v1.6.3
-	oldGatewayCRD := makeTestCRD(GatewayCRDName, "v1.6.0")
-	newGatewayCRD := makeTestCRD(GatewayCRDName, "v1.6.3")
+	// Upgrade bundle version annotation
+	oldGatewayCRD := makeTestCRD(GatewayCRDName, initialBV)
+	newGatewayCRD := makeTestCRD(GatewayCRDName, upgradedBV)
 	newGatewayCRD.ResourceVersion = "2"
 
 	crdView.HandleUpdate(oldGatewayCRD, newGatewayCRD)
 
-	if crdView.Snapshot().BundleVersion != "v1.6.3" {
-		t.Errorf("expected snapshot bundle version to be v1.6.3, got %q", crdView.Snapshot().BundleVersion)
+	if crdView.Snapshot().BundleVersion != upgradedBV {
+		t.Errorf("expected snapshot bundle version to be %s, got %q", upgradedBV, crdView.Snapshot().BundleVersion)
 	}
 
 	// State was updated via callback; recompute outputs
@@ -270,8 +279,9 @@ func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersion(t *testing.T) {
 	if cond == nil {
 		t.Fatalf("expected SupportedVersion condition, got nil")
 	}
-	if !strings.Contains(cond.Message, `"v1.6.3" is supported`) {
-		t.Errorf("expected updated message to contain v1.6.3 is supported, got: %s", cond.Message)
+	expectedUpgradedMsg := fmt.Sprintf("%q is supported", upgradedBV)
+	if !strings.Contains(cond.Message, expectedUpgradedMsg) {
+		t.Errorf("expected updated message to contain %s, got: %s", expectedUpgradedMsg, cond.Message)
 	}
 }
 
@@ -284,7 +294,7 @@ func TestCRDView_InitialSyncReplayDoesNotLogOrIncrementCounter(t *testing.T) {
 			Gateway:      true,
 			HTTPRoute:    true,
 		},
-		BundleVersion: "v1.6.3",
+		BundleVersion: gatewayconsts.BundleVersion,
 	}
 	crdView := NewCRDViewFromSnapshot(snapshot)
 
@@ -294,7 +304,7 @@ func TestCRDView_InitialSyncReplayDoesNotLogOrIncrementCounter(t *testing.T) {
 
 	// Replay initial-sync Add events for all already-served CRDs
 	crdView.HandleAdd(makeTestCRD(GatewayClassCRDName, ""), true)
-	crdView.HandleAdd(makeTestCRD(GatewayCRDName, "v1.6.3"), true)
+	crdView.HandleAdd(makeTestCRD(GatewayCRDName, gatewayconsts.BundleVersion), true)
 	crdView.HandleAdd(makeTestCRD(HTTPRouteCRDName, ""), true)
 
 	if crdView.CRDChangeCount() != 0 {
@@ -323,7 +333,7 @@ func TestCRDView_InitialListAddForUnservedKindDoesNotLogOrCount(t *testing.T) {
 			HTTPRoute:    true,
 			TLSRoute:     false, // Unserved kind (e.g. older cluster bundle only serves v1alpha2)
 		},
-		BundleVersion: "v1.6.0",
+		BundleVersion: gatewayconsts.BundleVersion,
 	}
 	crdView := NewCRDViewFromSnapshot(snapshot)
 
@@ -332,7 +342,7 @@ func TestCRDView_InitialListAddForUnservedKindDoesNotLogOrCount(t *testing.T) {
 	}
 
 	// CRD exists on cluster, but comes from initial list (isInInitialList = true)
-	tlsCRD := makeTestCRD(TLSRouteCRDName, "v1.6.0")
+	tlsCRD := makeTestCRD(TLSRouteCRDName, gatewayconsts.BundleVersion)
 	tlsCRD.ResourceVersion = "42"
 	crdView.HandleAdd(tlsCRD, true)
 
@@ -353,7 +363,7 @@ func TestCRDView_InitialListAddForUnservedKindDoesNotLogOrCount(t *testing.T) {
 	}
 
 	// Now deliver a runtime add (isInInitialList = false) for a different unserved kind -> should count!
-	grpcCRD := makeTestCRD(GRPCRouteCRDName, "v1.6.0")
+	grpcCRD := makeTestCRD(GRPCRouteCRDName, gatewayconsts.BundleVersion)
 	crdView.HandleAdd(grpcCRD, false)
 	if crdView.CRDChangeCount() != 1 {
 		t.Errorf("expected change count 1 after runtime add of unserved kind, got %d", crdView.CRDChangeCount())
@@ -421,7 +431,7 @@ func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
 			Gateway:      true,
 			HTTPRoute:    true,
 		},
-		BundleVersion: "v1.6.3",
+		BundleVersion: gatewayconsts.BundleVersion,
 	}
 	crdView := NewCRDViewFromSnapshot(snapshot)
 
@@ -430,7 +440,7 @@ func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
 	}
 
 	// Add an unserved optional CRD at runtime -> meaningful change!
-	tlsCRD := makeTestCRD(TLSRouteCRDName, "v1.6.3")
+	tlsCRD := makeTestCRD(TLSRouteCRDName, gatewayconsts.BundleVersion)
 	tlsCRD.ResourceVersion = "1"
 	crdView.HandleAdd(tlsCRD, false)
 
@@ -445,7 +455,7 @@ func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
 	}
 
 	// Update unserved CRD without bundle version change -> not a change to served kinds
-	tlsCRDUpdated := makeTestCRD(TLSRouteCRDName, "v1.6.3")
+	tlsCRDUpdated := makeTestCRD(TLSRouteCRDName, gatewayconsts.BundleVersion)
 	tlsCRDUpdated.ResourceVersion = "2"
 	crdView.HandleUpdate(tlsCRD, tlsCRDUpdated)
 
@@ -461,9 +471,9 @@ func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
 	}
 
 	// Bundle version change on Gateway CRD -> meaningful change!
-	gatewayUpdated := makeTestCRD(GatewayCRDName, "v1.6.4")
+	gatewayUpdated := makeTestCRD(GatewayCRDName, gatewayconsts.BundleVersion+"-different")
 	gatewayUpdated.ResourceVersion = "2"
-	crdView.HandleUpdate(makeTestCRD(GatewayCRDName, "v1.6.3"), gatewayUpdated)
+	crdView.HandleUpdate(makeTestCRD(GatewayCRDName, gatewayconsts.BundleVersion), gatewayUpdated)
 	if crdView.CRDChangeCount() != 3 {
 		t.Errorf("expected change count 3 after bundle version change, got %d", crdView.CRDChangeCount())
 	}
@@ -497,7 +507,7 @@ func TestCRDMetadataTransform_DropsManagedFieldsAndAnnotations(t *testing.T) {
 			Annotations: map[string]string{
 				"kubectl.kubernetes.io/last-applied-configuration": `{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition"}`,
 				"kubectl.kubernetes.io/client-side-filter":         "true",
-				gatewayconsts.BundleVersionAnnotation:              "v1.6.3",
+				gatewayconsts.BundleVersionAnnotation:              gatewayconsts.BundleVersion,
 				"custom.company.org/team":                          "networking",
 			},
 		},
@@ -518,8 +528,8 @@ func TestCRDMetadataTransform_DropsManagedFieldsAndAnnotations(t *testing.T) {
 	if _, hasCustom := metaObj.Annotations["custom.company.org/team"]; hasCustom {
 		t.Errorf("expected custom annotation to be dropped")
 	}
-	if bv, ok := metaObj.Annotations[gatewayconsts.BundleVersionAnnotation]; !ok || bv != "v1.6.3" {
-		t.Errorf("expected bundle version annotation v1.6.3, got %q", bv)
+	if bv, ok := metaObj.Annotations[gatewayconsts.BundleVersionAnnotation]; !ok || bv != gatewayconsts.BundleVersion {
+		t.Errorf("expected bundle version annotation %s, got %q", gatewayconsts.BundleVersion, bv)
 	}
 }
 
@@ -542,7 +552,7 @@ func TestCRDInformer_CacheTransformInspectStore(t *testing.T) {
 			},
 			Annotations: map[string]string{
 				"kubectl.kubernetes.io/last-applied-configuration": `{"apiVersion":"apiextensions.k8s.io/v1"}`,
-				gatewayconsts.BundleVersionAnnotation:              "v1.6.3",
+				gatewayconsts.BundleVersionAnnotation:              gatewayconsts.BundleVersion,
 			},
 		},
 	}
@@ -586,8 +596,8 @@ func TestCRDInformer_CacheTransformInspectStore(t *testing.T) {
 	if _, exists := storedObj.Annotations["kubectl.kubernetes.io/last-applied-configuration"]; exists {
 		t.Errorf("expected informer cache to not contain last-applied-configuration")
 	}
-	if bv := storedObj.Annotations[gatewayconsts.BundleVersionAnnotation]; bv != "v1.6.3" {
-		t.Errorf("expected informer cache to retain bundle version v1.6.3, got %q", bv)
+	if bv := storedObj.Annotations[gatewayconsts.BundleVersionAnnotation]; bv != gatewayconsts.BundleVersion {
+		t.Errorf("expected informer cache to retain bundle version %s, got %q", gatewayconsts.BundleVersion, bv)
 	}
 }
 

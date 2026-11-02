@@ -37,6 +37,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/version"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -615,6 +616,14 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		},
 	}
 
+	compiledV, err := version.ParseSemantic(gatewayconsts.BundleVersion)
+	if err != nil {
+		t.Fatalf("failed to parse compiled bundle version %q: %v", gatewayconsts.BundleVersion, err)
+	}
+	differentPatchVersion := fmt.Sprintf("v%d.%d.%d", compiledV.Major(), compiledV.Minor(), compiledV.Patch()+1)
+	mismatchedVersion := fmt.Sprintf("v%d.%d.0", compiledV.Major(), compiledV.Minor()-1)
+	supportedRange := fmt.Sprintf("v%d.%d.x", compiledV.Major(), compiledV.Minor())
+
 	crdWithMatchingVersion := &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: GatewayCRDName,
@@ -628,7 +637,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: GatewayCRDName,
 			Annotations: map[string]string{
-				gatewayconsts.BundleVersionAnnotation: "v1.6.0",
+				gatewayconsts.BundleVersionAnnotation: differentPatchVersion,
 			},
 		},
 	}
@@ -637,7 +646,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: GatewayCRDName,
 			Annotations: map[string]string{
-				gatewayconsts.BundleVersionAnnotation: "v1.5.0",
+				gatewayconsts.BundleVersionAnnotation: mismatchedVersion,
 			},
 		},
 	}
@@ -698,7 +707,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: "v1.6.0"})
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: differentPatchVersion})
 
 		r := &GatewayClassReconciler{
 			Client:         client,
@@ -740,7 +749,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: "v1.5.0"})
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: mismatchedVersion})
 
 		r := &GatewayClassReconciler{
 			Client:         client,
@@ -772,7 +781,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		if cond.ObservedGeneration != 1 {
 			t.Errorf("expected ObservedGeneration=1, got %d", cond.ObservedGeneration)
 		}
-		expectedMsg := fmt.Sprintf("Gateway API CRD bundle-version \"v1.5.0\" is not supported (controller supports v1.6.x, built against %s)", gatewayconsts.BundleVersion)
+		expectedMsg := fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s, built against %s)", mismatchedVersion, supportedRange, gatewayconsts.BundleVersion)
 		if cond.Message != expectedMsg {
 			t.Errorf("expected message %q, got %q", expectedMsg, cond.Message)
 		}
@@ -891,10 +900,13 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		st := state.NewState()
 		st.SetControllerName("test-controller")
 
+		initialBV := fmt.Sprintf("v%d.%d.%d", compiledV.Major(), compiledV.Minor(), compiledV.Patch()+1)
+		updatedBV := fmt.Sprintf("v%d.%d.%d", compiledV.Major(), compiledV.Minor(), compiledV.Patch()+2)
+
 		// Construct the view with an initial version
 		crdView := NewCRDViewFromSnapshot(CRDSnapshot{
 			ServedKinds:   ServedKinds{GatewayClass: true, Gateway: true, HTTPRoute: true},
-			BundleVersion: "v1.6.0",
+			BundleVersion: initialBV,
 		})
 
 		// Wire the view to State exactly as RegisterReconcilers does in utils.go
@@ -912,19 +924,19 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			st.SetGatewayCRDBundleVersion(newBVPtr)
 		})
 
-		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != "v1.6.0" {
-			t.Fatalf("expected initial State bundle version v1.6.0, got %v", st.GatewayCRDBundleVersion())
+		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != initialBV {
+			t.Fatalf("expected initial State bundle version %s, got %v", initialBV, st.GatewayCRDBundleVersion())
 		}
 
 		// Deliver a CRD update with a new bundle-version annotation
-		oldCRD := makeTestCRD(GatewayCRDName, "v1.6.0")
-		newCRD := makeTestCRD(GatewayCRDName, "v1.6.3")
+		oldCRD := makeTestCRD(GatewayCRDName, initialBV)
+		newCRD := makeTestCRD(GatewayCRDName, updatedBV)
 		newCRD.ResourceVersion = "2"
 		crdView.HandleUpdate(oldCRD, newCRD)
 
 		// Assert on State
-		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != "v1.6.3" {
-			t.Errorf("expected State bundle version v1.6.3 after update, got %v", st.GatewayCRDBundleVersion())
+		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != updatedBV {
+			t.Errorf("expected State bundle version %s after update, got %v", updatedBV, st.GatewayCRDBundleVersion())
 		}
 
 		// Deliver a CRD deletion clearing bundle-version
