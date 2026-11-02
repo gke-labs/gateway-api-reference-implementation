@@ -1568,3 +1568,49 @@ func TestRegression_SlottedReuseFromMultiBlock(t *testing.T) {
 	}
 	store.bp.mu.Unlock()
 }
+
+type renameHookFS struct {
+	FS
+	beforeRename func(oldpath, newpath string)
+}
+
+func (h *renameHookFS) Rename(oldpath, newpath string) error {
+	if h.beforeRename != nil {
+		h.beforeRename(oldpath, newpath)
+	}
+	return h.FS.Rename(oldpath, newpath)
+}
+
+func TestRegression_OversizeWriteAheadRule(t *testing.T) {
+	memFS := NewMemFS()
+	renamed := false
+	var store *Engine
+
+	hookedFS := &renameHookFS{
+		FS: memFS,
+		beforeRename: func(oldpath, newpath string) {
+			if strings.Contains(newpath, "oversize") && !strings.Contains(newpath, ".tmp") {
+				renamed = true
+				if store != nil && store.wal.FsyncedLSN() < store.wal.MaxLSN() {
+					t.Fatalf("write-ahead rule violation: oversize file renamed before WAL fsynced (fsynced=%d, max=%d)",
+						store.wal.FsyncedLSN(), store.wal.MaxLSN())
+				}
+			}
+		},
+	}
+
+	var err error
+	store, err = Open(WithFS(hookedFS), WithDir("test_oversize_war"), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	oversizePayload := make([]byte, 2100*1024)
+	if err := store.Put("ConfigMap", "largeKey", oversizePayload, "1"); err != nil {
+		t.Fatalf("Put oversize failed: %v", err)
+	}
+	if !renamed {
+		t.Fatalf("expected oversize file to be renamed")
+	}
+}
