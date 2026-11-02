@@ -920,3 +920,42 @@ func TestWAL_WriteErrorSticky(t *testing.T) {
 		t.Fatalf("expected DurableLSN to remain 0 after failed write, got %d", wal.DurableLSN())
 	}
 }
+
+func TestRegression_AbandonedWALSegmentOnOpen(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("abandoned-seg-01"))
+
+	walDir := "wal"
+	if err := memFS.MkdirAll(walDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	// Simulate an abandoned segment from an uncommitted rotation past recovered LSN
+	// e.g. segment for LSN 2 created on disk before crash, but recovery only recovered to LSN 1.
+	abandonedPath := filepath.Join(walDir, segmentFileName(2))
+	f, err := memFS.OpenFile(abandonedPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// OpenWAL with initialLSN = 1
+	wal, err := OpenWAL(memFS, walDir, dbID, 1, WALOptions{MaxSegmentSize: 100})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	// Append record that causes segment rotation at LSN 2
+	rec := Record{Type: RecordTypePut, Key: "k", Payload: []byte("val")}
+	lsn, err := wal.AppendRecord(&rec)
+	if err != nil {
+		t.Fatalf("AppendRecord failed: %v", err)
+	}
+	if lsn != 2 {
+		t.Fatalf("expected record LSN 2, got %d", lsn)
+	}
+}

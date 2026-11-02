@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -202,8 +203,23 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		return nil, err
 	}
 
+	var removedAbandoned bool
 	for _, seg := range segments {
+		if seg.startLSN > initialLSN {
+			// Abandoned segment from uncommitted rotation past recovered LSN
+			log.Printf("diskstore: removed abandoned WAL segment %s", seg.path)
+			if rErr := w.fs.Remove(seg.path); rErr != nil && !os.IsNotExist(rErr) {
+				return nil, fmt.Errorf("failed to remove abandoned segment %s: %w", seg.path, rErr)
+			}
+			removedAbandoned = true
+			continue
+		}
 		w.createdLSNs[seg.startLSN] = true
+	}
+	if removedAbandoned {
+		if err := w.fs.SyncDir(w.dir); err != nil {
+			return nil, fmt.Errorf("failed to sync WAL dir after removing abandoned segments: %w", err)
+		}
 	}
 
 	w.maxLSN.Store(initialLSN)
