@@ -31,6 +31,7 @@ import (
 	compute "google.golang.org/api/compute/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -50,6 +51,9 @@ func setupScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
 	_ = appsv1.AddToScheme(s)
+	if err := discoveryv1.AddToScheme(s); err != nil {
+		panic(err)
+	}
 	_ = gatewayv1.Install(s)
 	return s
 }
@@ -2375,5 +2379,145 @@ func TestGateway_ControllerRestartWithNoDeletionDetachesNothing(t *testing.T) {
 	eps, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443)
 	if len(eps) != 1 || eps[0].IpAddress != "10.0.1.5" {
 		t.Errorf("expected endpoint to remain attached, got: %+v", eps)
+	}
+}
+
+func setupLongNameTest(t *testing.T, initObjs ...client.Object) (string, *gatewayv1.Gateway, client.Client, *GatewayReconciler, *gcp.FakeComputeClient) {
+	t.Helper()
+	scheme := setupScheme()
+	prefix := "gateway-name-maximum-length-"
+	longGwName := prefix + strings.Repeat("a", 253-len(prefix))
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      longGwName,
+			UID:       types.UID("long-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{
+					Type:  &ipAddrType,
+					Value: "34.120.254.10",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+
+	objs := append([]client.Object{gw}, initObjs...)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(objs...).
+		Build()
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID:      "cluster-1",
+		NegPrefix:      "gcpgw",
+		Project:        "my-project",
+		ControllerName: "gke-labs.io/gcpgateway",
+		Zones:          []string{"us-central1-a"},
+	})
+
+	return longGwName, gw, c, reconciler, fakeGCP
+}
+
+func TestGateway_LongName_PodToGateway(t *testing.T) {
+	longGwName, _, _, reconciler, _ := setupLongNameTest(t)
+
+	// Pod carries the hashed 63-character label value from singlepod.LabelValueForGateway
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-pod",
+			Labels: map[string]string{
+				singlepod.LabelAppName:     singlepod.AppNameValue,
+				singlepod.LabelGatewayName: singlepod.LabelValueForGateway(longGwName),
+			},
+		},
+	}
+
+	reqs := reconciler.podToGateway(t.Context(), pod)
+	if len(reqs) != 1 || reqs[0].NamespacedName != (types.NamespacedName{Namespace: "default", Name: longGwName}) {
+		t.Errorf("podToGateway mapped to %v, want default/%s", reqs, longGwName)
+	}
+}
+
+func TestGateway_LongName_EndpointSliceToGateway(t *testing.T) {
+	longGwName, _, _, reconciler, _ := setupLongNameTest(t)
+
+	// EndpointSlice carries the hashed 63-character label value copied from Service
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-slice",
+			Labels: map[string]string{
+				singlepod.LabelGatewayName: singlepod.LabelValueForGateway(longGwName),
+			},
+		},
+	}
+
+	reqs := reconciler.endpointSliceToGateway(t.Context(), slice)
+	if len(reqs) != 1 || reqs[0].NamespacedName != (types.NamespacedName{Namespace: "default", Name: longGwName}) {
+		t.Errorf("endpointSliceToGateway mapped to %v, want default/%s", reqs, longGwName)
+	}
+}
+
+func TestGateway_LongName_Reconcile(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+	longGwName, gw, c, reconciler, fakeGCP := setupLongNameTest(t, node)
+
+	makeTestPod(t, c, gw, "dp-pod-1", "node-1", "10.0.1.5", []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodConditionType(registrar.LoadBalancerReadyGate), Status: corev1.ConditionFalse},
+	})
+
+	negDesc, err := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: longGwName,
+		Port:        8443,
+	}).Encode()
+	if err != nil {
+		t.Fatalf("failed to encode NEG metadata: %v", err)
+	}
+
+	negName := metadata.ResourceName("gcpgw", "cluster-1", "default", longGwName, "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negName,
+		Zone:        "us-central1-a",
+		Description: negDesc,
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: longGwName}}
+	if _, err := reconciler.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	// Verify that the data plane pod was matched and attached to the NEG
+	eps, err := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negName)
+	if err != nil {
+		t.Fatalf("listing network endpoints: %v", err)
+	}
+	if len(eps) != 1 || eps[0].IpAddress != "10.0.1.5" {
+		t.Fatalf("expected pod attached to NEG, got %+v", eps)
 	}
 }

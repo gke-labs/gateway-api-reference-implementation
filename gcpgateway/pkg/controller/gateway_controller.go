@@ -210,6 +210,34 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// gatewayRequestForLabel lists the Gateways in the namespace and matches
+// singlepod.LabelValueForGateway(gw.Name) against the label value. It does not
+// filter the List with a label selector because Gateways do not carry
+// LabelGatewayName, and the label value may be a hash of a long Gateway name.
+func (r *GatewayReconciler) gatewayRequestForLabel(ctx context.Context, namespace, labelValue string) []reconcile.Request {
+	if labelValue == "" {
+		return nil
+	}
+	var gwList gatewayv1.GatewayList
+	if err := r.Client.List(ctx, &gwList, client.InNamespace(namespace)); err != nil {
+		klog.ErrorS(err, "listing gateways to map label to gateway", "namespace", namespace, "labelValue", labelValue)
+		return nil
+	}
+	for _, gw := range gwList.Items {
+		if singlepod.LabelValueForGateway(gw.Name) == labelValue {
+			return []reconcile.Request{
+				{
+					NamespacedName: types.NamespacedName{
+						Namespace: namespace,
+						Name:      gw.Name,
+					},
+				},
+			}
+		}
+	}
+	return nil
+}
+
 func (r *GatewayReconciler) podToGateway(ctx context.Context, obj client.Object) []reconcile.Request {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok || pod == nil {
@@ -218,18 +246,7 @@ func (r *GatewayReconciler) podToGateway(ctx context.Context, obj client.Object)
 	if pod.Labels[singlepod.LabelAppName] != singlepod.AppNameValue {
 		return nil
 	}
-	gwName := pod.Labels[singlepod.LabelGatewayName]
-	if gwName == "" {
-		return nil
-	}
-	return []reconcile.Request{
-		{
-			NamespacedName: types.NamespacedName{
-				Namespace: pod.Namespace,
-				Name:      gwName,
-			},
-		},
-	}
+	return r.gatewayRequestForLabel(ctx, pod.Namespace, pod.Labels[singlepod.LabelGatewayName])
 }
 
 func (r *GatewayReconciler) endpointSliceToGateway(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -237,38 +254,7 @@ func (r *GatewayReconciler) endpointSliceToGateway(ctx context.Context, obj clie
 	if !ok || slice == nil {
 		return nil
 	}
-	gwName := slice.Labels[singlepod.LabelGatewayName]
-	if gwName != "" {
-		return []reconcile.Request{
-			{
-				NamespacedName: types.NamespacedName{
-					Namespace: slice.Namespace,
-					Name:      gwName,
-				},
-			},
-		}
-	}
-	svcName := slice.Labels["kubernetes.io/service-name"]
-	if svcName != "" {
-		var gwList gatewayv1.GatewayList
-		if err := r.Client.List(ctx, &gwList, client.InNamespace(slice.Namespace)); err != nil {
-			klog.V(4).Infof("endpointSliceToGateway: listing gateways: %v", err)
-			return nil
-		}
-		for _, gw := range gwList.Items {
-			if singlepod.ResourceNameForGateway(gw.Name) == svcName {
-				return []reconcile.Request{
-					{
-						NamespacedName: types.NamespacedName{
-							Namespace: slice.Namespace,
-							Name:      gw.Name,
-						},
-					},
-				}
-			}
-		}
-	}
-	return nil
+	return r.gatewayRequestForLabel(ctx, slice.Namespace, slice.Labels[singlepod.LabelGatewayName])
 }
 
 // Reconcile performs the full reconciliation loop for a Gateway.
@@ -410,7 +396,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 
 	// 5. Poll health status from Google Cloud Load Balancer and update readiness gates
 	var podList corev1.PodList
-	if err := r.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
+	if err := r.List(ctx, &podList, client.InNamespace(gw.Namespace), client.MatchingLabels{
+		singlepod.LabelAppName:     singlepod.AppNameValue,
+		singlepod.LabelGatewayName: singlepod.LabelValueForGateway(gw.Name),
+	}); err != nil {
 		return reconcile.Result{}, fmt.Errorf("listing pods: %w", err)
 	}
 
@@ -424,12 +413,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.Labels[singlepod.LabelAppName] != singlepod.AppNameValue {
-			continue
-		}
-		if pod.Labels[singlepod.LabelGatewayName] != gw.Name {
-			continue
-		}
 		dataplanePodCount++
 
 		if pod.Status.PodIP == "" || pod.Spec.NodeName == "" || !registrar.IsContainersReady(pod) || pod.DeletionTimestamp != nil {

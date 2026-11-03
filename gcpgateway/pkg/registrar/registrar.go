@@ -259,14 +259,14 @@ func (r *Registrar) DetachAll(ctx context.Context, gw *gatewayv1.Gateway) (*Reco
 	}
 
 	var podList corev1.PodList
-	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
+	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace), client.MatchingLabels{
+		singlepod.LabelGatewayName: singlepod.LabelValueForGateway(gw.Name),
+	}); err != nil {
 		return nil, fmt.Errorf("listing pods in namespace %s: %w", gw.Namespace, err)
 	}
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.Labels[singlepod.LabelGatewayName] == gw.Name {
-			r.tracker.Clear(fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
-		}
+		r.tracker.Clear(fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
 	}
 
 	return result, nil
@@ -321,7 +321,10 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 
 	// 4. List data plane pods for this Gateway
 	var podList corev1.PodList
-	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
+	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace), client.MatchingLabels{
+		singlepod.LabelAppName:     singlepod.AppNameValue,
+		singlepod.LabelGatewayName: singlepod.LabelValueForGateway(gw.Name),
+	}); err != nil {
 		return nil, fmt.Errorf("listing pods in namespace %s: %w", gw.Namespace, err)
 	}
 
@@ -331,12 +334,6 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.Labels[singlepod.LabelAppName] != singlepod.AppNameValue {
-			continue
-		}
-		if pod.Labels[singlepod.LabelGatewayName] != gw.Name {
-			continue
-		}
 		if pod.Status.PodIP == "" || pod.Spec.NodeName == "" {
 			continue
 		}
