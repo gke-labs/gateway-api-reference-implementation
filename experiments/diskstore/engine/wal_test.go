@@ -920,3 +920,86 @@ func TestWAL_WriteErrorSticky(t *testing.T) {
 		t.Fatalf("expected DurableLSN to remain 0 after failed write, got %d", wal.DurableLSN())
 	}
 }
+
+func TestRegression_AbandonedWALSegmentOnOpen(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("abandoned-seg-01"))
+
+	walDir := "wal"
+	if err := memFS.MkdirAll(walDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	writeSeg := func() {
+		p := filepath.Join(walDir, segmentFileName(2))
+		f, err := memFS.OpenFile(p, os.O_CREATE|os.O_RDWR, 0644)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+	}
+	countQuarantined := func() int {
+		entries, err := memFS.ReadDir(filepath.Join(walDir, "lost+found"))
+		if err != nil {
+			t.Fatalf("ReadDir lost+found failed: %v", err)
+		}
+		for _, e := range entries {
+			if !strings.HasPrefix(e.Name(), segmentFileName(2)) {
+				t.Fatalf("unexpected quarantined file name %s", e.Name())
+			}
+		}
+		return len(entries)
+	}
+
+	// 1. First crash: abandoned segment for LSN 2 quarantined
+	writeSeg()
+	wal1, err := OpenWAL(memFS, walDir, dbID, 1, WALOptions{MaxSegmentSize: 100})
+	if err != nil {
+		t.Fatalf("First OpenWAL failed: %v", err)
+	}
+	if err := wal1.Close(); err != nil {
+		t.Fatalf("Close wal1 failed: %v", err)
+	}
+	if n := countQuarantined(); n != 1 {
+		t.Fatalf("expected 1 quarantined segment, got %d", n)
+	}
+
+	// 2. Second crash: same-named segment abandoned again; must not overwrite
+	writeSeg()
+	wal2, err := OpenWAL(memFS, walDir, dbID, 1, WALOptions{MaxSegmentSize: 100})
+	if err != nil {
+		t.Fatalf("Second OpenWAL failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := wal2.Close(); err != nil {
+			t.Errorf("wal2.Close failed: %v", err)
+		}
+	})
+	if n := countQuarantined(); n != 2 {
+		t.Fatalf("expected 2 quarantined segments, got %d", n)
+	}
+
+	// Verify abandoned segment was moved out of WAL root
+	abandonedPath := filepath.Join(walDir, segmentFileName(2))
+	if af, err := memFS.Open(abandonedPath); err == nil {
+		if cErr := af.Close(); cErr != nil {
+			t.Errorf("Close failed: %v", cErr)
+		}
+		t.Fatalf("expected abandoned segment %s to be moved, but still exists", abandonedPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected error checking abandoned segment %s: %v", abandonedPath, err)
+	}
+
+	// Append record that causes segment rotation at LSN 2
+	rec := Record{Type: RecordTypePut, Key: "k", Payload: []byte("val")}
+	lsn, err := wal2.AppendRecord(&rec)
+	if err != nil {
+		t.Fatalf("AppendRecord failed: %v", err)
+	}
+	if lsn != 2 {
+		t.Fatalf("expected record LSN 2, got %d", lsn)
+	}
+}
