@@ -56,6 +56,8 @@ as this:
 Small, focused issues lead to small, focused PRs. Big PRs are hard to review because reviewers miss things when moves, refactors and behaviour changes arrive together. Big PRs are also harder to write correctly because each additional idea adds more ways for the pieces to interact, and more to keep in mind across review rounds.
 
 - **One idea, one issue, one PR.** If a PR can be split into two ideas, split it.
+- **A good PR changes at most 200 lines, including tests.** The time to review and understand a PR grows roughly with the square of the lines in the diff, so a 100-line PR costs a quarter as much as a 200-line one, and splitting a 200-line change in two halves the total. If the one idea needs more than 200 lines, say so on the issue before pushing and propose where to cut or how to order the parts.
+- **Issues carry a line budget** for the same reason. Give an issue a budget before assigning it.
 - **When an issue contains more than one idea,** don't deliver it as one large PR. Say so on the issue, propose the split, and deliver the parts as separate PRs, or ask for the issue to be split.
 - **Separate mechanical changes from behaviour changes.** Moves, renames and reformatting go in their own PR, or at least their own commit first, with nothing else changed, so the reviewer can confirm nothing changed.
 - **Stay in scope during review.** Fix what the review asks for. Problems found along the way that are outside the PR's idea become new issues, not extra changes in the same PR.
