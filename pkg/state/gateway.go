@@ -15,6 +15,7 @@ package state
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -358,16 +359,19 @@ type listenerMatchCandidate struct {
 	hostnameLength int
 }
 
-// MatchesWildcard reports whether a hostname matches a wildcard pattern (e.g. *.example.com).
-func MatchesWildcard(pattern, host string) bool {
-	host = hostWithoutPort(host)
-	cleanHost := strings.ToLower(host)
-	cleanPattern := strings.ToLower(pattern)
+// matchesNormalizedWildcard reports whether cleanHost matches cleanPattern.
+// Both cleanPattern and cleanHost must already be lower-cased.
+func matchesNormalizedWildcard(cleanPattern, cleanHost string) bool {
 	if !strings.HasPrefix(cleanPattern, "*.") {
 		return false
 	}
 	suffix := cleanPattern[1:]
 	return len(cleanHost) > len(suffix) && strings.HasSuffix(cleanHost, suffix)
+}
+
+// MatchesWildcard reports whether a hostname matches a wildcard pattern (e.g. *.example.com).
+func MatchesWildcard(pattern, host string) bool {
+	return matchesNormalizedWildcard(strings.ToLower(pattern), strings.ToLower(hostWithoutPort(host)))
 }
 
 // MatchListeners finds all listeners that match a given host with the highest specificity (Exact > Wildcard > CatchAll).
@@ -477,32 +481,48 @@ func isBetterListenerMatch(current, best *listenerMatchCandidate) bool {
 type RouteHostname struct {
 	Hostname         string
 	OriginalHostname string
+
+	// Lower-cased forms of the fields above, set by NewRouteHostname.
+	normalizedHostname         string
+	normalizedOriginalHostname string
 }
 
 // NewRouteHostname constructs a RouteHostname pairing an effective listener hostname
 // with the route's original configured hostname.
 func NewRouteHostname(hostname, originalHostname string) RouteHostname {
 	return RouteHostname{
-		Hostname:         hostname,
-		OriginalHostname: originalHostname,
+		Hostname:                   hostname,
+		OriginalHostname:           originalHostname,
+		normalizedHostname:         strings.ToLower(hostname),
+		normalizedOriginalHostname: strings.ToLower(originalHostname),
 	}
+}
+
+// UnmarshalJSON implements json.Unmarshaler. Because the unexported normalized fields
+// are not part of the JSON, it rebuilds them with NewRouteHostname after decoding.
+func (r *RouteHostname) UnmarshalJSON(data []byte) error {
+	type rawRouteHostname RouteHostname
+	var raw rawRouteHostname
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = NewRouteHostname(raw.Hostname, raw.OriginalHostname)
+	return nil
 }
 
 func (r RouteHostname) matchesHostname(cleanHost string) bool {
-	cleanH := strings.ToLower(r.Hostname)
-	return cleanH == "*" || cleanH == cleanHost || MatchesWildcard(cleanH, cleanHost)
+	return r.normalizedHostname == "*" || r.normalizedHostname == cleanHost || matchesNormalizedWildcard(r.normalizedHostname, cleanHost)
 }
 
 func (r RouteHostname) score(cleanHost string) (int, int) {
-	cleanOrig := strings.ToLower(r.OriginalHostname)
-	if cleanOrig == "*" || cleanOrig == "" {
+	if r.normalizedOriginalHostname == "*" || r.normalizedOriginalHostname == "" {
 		return 0, 0
 	}
-	if cleanOrig == cleanHost {
-		return len(cleanOrig), len(cleanOrig)
+	if r.normalizedOriginalHostname == cleanHost {
+		return len(r.normalizedOriginalHostname), len(r.normalizedOriginalHostname)
 	}
-	if MatchesWildcard(cleanOrig, cleanHost) {
-		return 0, len(cleanOrig)
+	if matchesNormalizedWildcard(r.normalizedOriginalHostname, cleanHost) {
+		return 0, len(r.normalizedOriginalHostname)
 	}
 	return 0, 0
 }

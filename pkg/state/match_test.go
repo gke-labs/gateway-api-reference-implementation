@@ -16,6 +16,7 @@ package state
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"testing"
 
@@ -457,6 +458,44 @@ func TestMatchRoute_OriginalHostnamesPrecedence(t *testing.T) {
 	}
 	if len(rule.Backends) == 0 || rule.Backends[0].Host != "newer-exact-backend" {
 		t.Errorf("Expected exact original hostname (newer-exact-backend) to take precedence over wildcard (older-wildcard-backend), got %v", rule.Backends)
+	}
+}
+
+func TestMatchRoute_MixedCaseRouteHostname(t *testing.T) {
+	routes := []InternalRoute{
+		{
+			Hostnames: []RouteHostname{NewRouteHostname("*.ExAmPlE.CoM", "*.ExAmPlE.CoM")},
+			Rules:     []InternalRule{{Backends: []InternalBackend{{Host: "wildcard-backend"}}}},
+		},
+		{
+			Hostnames: []RouteHostname{NewRouteHostname("FoO.ExAmPlE.CoM", "FoO.ExAmPlE.CoM")},
+			Rules:     []InternalRule{{Backends: []InternalBackend{{Host: "exact-backend"}}}},
+		},
+		{
+			Hostnames: []RouteHostname{NewRouteHostname("abc.example.com", "*.ExAmPlE.CoM")},
+			Rules:     []InternalRule{{Backends: []InternalBackend{{Host: "older-wildcard-backend"}}}},
+		},
+		{
+			Hostnames: []RouteHostname{NewRouteHostname("abc.example.com", "AbC.ExAmPlE.CoM")},
+			Rules:     []InternalRule{{Backends: []InternalBackend{{Host: "newer-exact-backend"}}}},
+		},
+	}
+
+	tests := []struct {
+		host        string
+		wantBackend string
+	}{
+		{"foo.example.com", "exact-backend"},
+		{"bar.example.com", "wildcard-backend"},
+		{"abc.example.com", "newer-exact-backend"},
+	}
+
+	for _, tt := range tests {
+		req := httptest.NewRequest("GET", "http://"+tt.host+"/", nil)
+		rule, _ := MatchRoute(routes, req)
+		if rule == nil || len(rule.Backends) == 0 || rule.Backends[0].Host != tt.wantBackend {
+			t.Errorf("MatchRoute(%q) = %v, want backend %s", tt.host, rule, tt.wantBackend)
+		}
 	}
 }
 

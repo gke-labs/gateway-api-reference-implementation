@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"net/http/httptest"
 	"regexp"
 	"testing"
 	"time"
@@ -361,6 +362,39 @@ func TestInternalRoute_MarshalRoundTrip_PreservesOriginalHostname(t *testing.T) 
 	}
 	if roundTripped.Hostnames[0].OriginalHostname != "*.example.com" {
 		t.Errorf("expected original hostname '*.example.com', got %q", roundTripped.Hostnames[0].OriginalHostname)
+	}
+}
+
+func TestInternalRoute_MarshalRoundTrip_MixedCaseRouteHostnameMatches(t *testing.T) {
+	route := InternalRoute{
+		Hostnames: []RouteHostname{
+			NewRouteHostname("AbC.ExAmPlE.CoM", "*.ExAmPlE.CoM"),
+		},
+		Rules: []InternalRule{{Backends: []InternalBackend{{Host: "backend-1", Port: 8080}}}},
+	}
+	data, err := json.Marshal(route)
+	if err != nil {
+		t.Fatalf("failed to marshal route: %v", err)
+	}
+
+	var roundTripped InternalRoute
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("failed to unmarshal route: %v", err)
+	}
+	if len(roundTripped.Hostnames) != 1 {
+		t.Fatalf("expected 1 hostname, got %d", len(roundTripped.Hostnames))
+	}
+	if roundTripped.Hostnames[0].Hostname != "AbC.ExAmPlE.CoM" {
+		t.Errorf("expected Hostname %q, got %q", "AbC.ExAmPlE.CoM", roundTripped.Hostnames[0].Hostname)
+	}
+	if roundTripped.Hostnames[0].OriginalHostname != "*.ExAmPlE.CoM" {
+		t.Errorf("expected OriginalHostname %q, got %q", "*.ExAmPlE.CoM", roundTripped.Hostnames[0].OriginalHostname)
+	}
+
+	req := httptest.NewRequest("GET", "http://abc.example.com/", nil)
+	rule, _ := MatchRoute([]InternalRoute{roundTripped}, req)
+	if rule == nil || len(rule.Backends) == 0 || rule.Backends[0].Host != "backend-1" {
+		t.Errorf("MatchRoute after unmarshal = %v, want backend-1", rule)
 	}
 }
 
