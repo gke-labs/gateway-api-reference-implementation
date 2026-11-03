@@ -96,6 +96,104 @@ func SetConditions(conditions *[]metav1.Condition, newConditions []metav1.Condit
 	return changed
 }
 
+// GatewayOwnedConditionTypes contains every Gateway condition type that this controller sets.
+// When reconciling status, the controller modifies or removes conditions in this set.
+// The controller leaves all other condition types intact so that conditions written by other controllers survive.
+// Every Gateway condition type produced by the controller must appear in this map.
+var GatewayOwnedConditionTypes = map[string]bool{
+	string(gatewayv1.GatewayConditionAccepted):                       true,
+	string(gatewayv1.GatewayConditionProgrammed):                     true,
+	string(gatewayv1.GatewayConditionResolvedRefs):                   true,
+	string(gatewayv1.GatewayConditionInsecureFrontendValidationMode): true,
+}
+
+// ListenerOwnedConditionTypes contains every Listener condition type that this controller sets.
+// When reconciling status, the controller modifies or removes conditions in this set.
+// The controller leaves all other condition types intact so that conditions written by other controllers survive.
+// Every Listener condition type produced by the controller must appear in this map.
+var ListenerOwnedConditionTypes = map[string]bool{
+	string(gatewayv1.ListenerConditionAccepted):             true,
+	string(gatewayv1.ListenerConditionProgrammed):           true,
+	string(gatewayv1.ListenerConditionResolvedRefs):         true,
+	string(gatewayv1.ListenerConditionConflicted):           true,
+	string(gatewayv1.ListenerConditionOverlappingTLSConfig): true,
+}
+
+// MergeConditions updates existing conditions slice with desired conditions,
+// preserving LastTransitionTime when Status has not changed.
+// It only updates or removes conditions of types that are owned (present in ownedTypes or desired).
+// Any conditions of unowned (foreign) types already present in existing are preserved unmodified.
+// It returns true if any condition was added, modified, or removed.
+func MergeConditions(conditions *[]metav1.Condition, desired []metav1.Condition, ownedTypes map[string]bool) bool {
+	if conditions == nil {
+		return false
+	}
+
+	isOwned := func(condType string) bool {
+		if ownedTypes != nil && ownedTypes[condType] {
+			return true
+		}
+		for _, d := range desired {
+			if d.Type == condType {
+				return true
+			}
+		}
+		return false
+	}
+
+	changed := false
+	desiredMatched := make([]bool, len(desired))
+
+	newConditions := make([]metav1.Condition, 0, len(*conditions)+len(desired))
+	for _, ec := range *conditions {
+		desiredIdx := -1
+		for j, dc := range desired {
+			if !desiredMatched[j] && dc.Type == ec.Type {
+				desiredIdx = j
+				break
+			}
+		}
+
+		if desiredIdx >= 0 {
+			desiredMatched[desiredIdx] = true
+			dc := desired[desiredIdx]
+			if ec.Status == dc.Status {
+				dc.LastTransitionTime = ec.LastTransitionTime
+			} else if dc.LastTransitionTime.IsZero() {
+				dc.LastTransitionTime = metav1.Now()
+			}
+			if ec.Status != dc.Status ||
+				ec.Reason != dc.Reason ||
+				ec.Message != dc.Message ||
+				ec.ObservedGeneration != dc.ObservedGeneration {
+				changed = true
+			}
+			newConditions = append(newConditions, dc)
+		} else {
+			if isOwned(ec.Type) {
+				changed = true
+			} else {
+				newConditions = append(newConditions, ec)
+			}
+		}
+	}
+
+	for j, dc := range desired {
+		if !desiredMatched[j] {
+			if dc.LastTransitionTime.IsZero() {
+				dc.LastTransitionTime = metav1.Now()
+			}
+			newConditions = append(newConditions, dc)
+			changed = true
+		}
+	}
+
+	if changed {
+		*conditions = newConditions
+	}
+	return changed
+}
+
 // RemoveCondition removes a condition of the specified type from conditions.
 // It returns true if a condition was removed.
 func RemoveCondition(conditions *[]metav1.Condition, condType string) bool {

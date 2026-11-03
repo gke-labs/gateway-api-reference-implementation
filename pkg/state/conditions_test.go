@@ -18,7 +18,9 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -101,6 +103,327 @@ func TestSetConditions(t *testing.T) {
 	changed = SetConditions(&conditions, reducedConds)
 	if !changed || len(conditions) != 1 {
 		t.Errorf("expected 1 condition remaining, changed=%v", changed)
+	}
+}
+
+func sameCondition(a, b *metav1.Condition) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Type == b.Type &&
+		a.Status == b.Status &&
+		a.Reason == b.Reason &&
+		a.Message == b.Message &&
+		a.ObservedGeneration == b.ObservedGeneration &&
+		a.LastTransitionTime.Equal(&b.LastTransitionTime)
+}
+
+func TestMergeConditions(t *testing.T) {
+	ownedTypes := map[string]bool{
+		"Accepted":                       true,
+		"Programmed":                     true,
+		"InsecureFrontendValidationMode": true,
+	}
+
+	t0 := metav1.NewTime(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	foreignCond := metav1.Condition{
+		Type:               "conformance.gateway.networking.k8s.io/StaleCondition",
+		Status:             metav1.ConditionTrue,
+		Reason:             "Seeded",
+		Message:            "Foreign condition message",
+		ObservedGeneration: 1,
+		LastTransitionTime: t0,
+	}
+
+	// 1. Initial merge on existing slice containing foreign condition
+	existing := []metav1.Condition{
+		foreignCond,
+		NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1),
+	}
+
+	desired := []metav1.Condition{
+		NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1),
+		NewCondition("Programmed", metav1.ConditionTrue, "Programmed", "Programmed", 1),
+	}
+
+	changed := MergeConditions(&existing, desired, ownedTypes)
+	if !changed {
+		t.Fatalf("expected changed=true when Programmed was added")
+	}
+
+	// Check foreign condition is still present and unchanged
+	foundForeign := FindCondition(existing, "conformance.gateway.networking.k8s.io/StaleCondition")
+	if foundForeign == nil {
+		t.Fatalf("expected foreign condition to be preserved")
+	}
+	if !sameCondition(foundForeign, &foreignCond) {
+		t.Errorf("foreign condition was modified: got %+v, want %+v", *foundForeign, foreignCond)
+	}
+
+	// 2. Idempotent merge with no changes to owned conditions must return false (no-op)
+	changed = MergeConditions(&existing, desired, ownedTypes)
+	if changed {
+		t.Errorf("expected changed=false when desired conditions are unchanged")
+	}
+
+	// 3. Foreign condition survives status change of owned condition
+	desiredUpdated := []metav1.Condition{
+		NewCondition("Accepted", metav1.ConditionFalse, "ListenersNotValid", "Listeners invalid", 2),
+		NewCondition("Programmed", metav1.ConditionTrue, "Programmed", "Programmed", 2),
+	}
+	changed = MergeConditions(&existing, desiredUpdated, ownedTypes)
+	if !changed {
+		t.Fatalf("expected changed=true when Accepted changed")
+	}
+	foundForeign = FindCondition(existing, "conformance.gateway.networking.k8s.io/StaleCondition")
+	if foundForeign == nil || !sameCondition(foundForeign, &foreignCond) {
+		t.Errorf("foreign condition was not preserved after update: %+v", foundForeign)
+	}
+
+	// 4. Stale owned condition is removed, foreign condition is kept
+	existingWithStaleOwned := []metav1.Condition{
+		foreignCond,
+		NewCondition("InsecureFrontendValidationMode", metav1.ConditionTrue, "ConfigChanged", "Fallback", 1),
+		NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1),
+	}
+	desiredWithoutStale := []metav1.Condition{
+		NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1),
+	}
+	changed = MergeConditions(&existingWithStaleOwned, desiredWithoutStale, ownedTypes)
+	if !changed {
+		t.Fatalf("expected changed=true when InsecureFrontendValidationMode was removed")
+	}
+	if FindCondition(existingWithStaleOwned, "InsecureFrontendValidationMode") != nil {
+		t.Errorf("expected InsecureFrontendValidationMode to be removed")
+	}
+	if FindCondition(existingWithStaleOwned, "conformance.gateway.networking.k8s.io/StaleCondition") == nil {
+		t.Errorf("expected foreign condition to be preserved")
+	}
+}
+
+func TestMergeGatewayStatus_PreservesForeignConditions(t *testing.T) {
+	t0 := metav1.NewTime(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	foreignGwCond := metav1.Condition{
+		Type:               "conformance.gateway.networking.k8s.io/StaleCondition",
+		Status:             metav1.ConditionTrue,
+		Reason:             "Seeded",
+		Message:            "Foreign GW",
+		ObservedGeneration: 1,
+		LastTransitionTime: t0,
+	}
+	foreignListenerCond := metav1.Condition{
+		Type:               "conformance.gateway.networking.k8s.io/StaleCondition",
+		Status:             metav1.ConditionTrue,
+		Reason:             "SeededListener",
+		Message:            "Foreign Listener",
+		ObservedGeneration: 1,
+		LastTransitionTime: t0,
+	}
+
+	current := gatewayv1.GatewayStatus{
+		Conditions: []metav1.Condition{
+			foreignGwCond,
+			NewCondition(string(gatewayv1.GatewayConditionAccepted), metav1.ConditionTrue, "Accepted", "Accepted", 1),
+		},
+		Listeners: []gatewayv1.ListenerStatus{
+			{
+				Name: "http",
+				Conditions: []metav1.Condition{
+					foreignListenerCond,
+					NewCondition(string(gatewayv1.ListenerConditionProgrammed), metav1.ConditionTrue, "Programmed", "Programmed", 1),
+				},
+				SupportedKinds: []gatewayv1.RouteGroupKind{{Kind: "HTTPRoute"}},
+			},
+		},
+	}
+
+	desired := gatewayv1.GatewayStatus{
+		Conditions: []metav1.Condition{
+			NewCondition(string(gatewayv1.GatewayConditionAccepted), metav1.ConditionTrue, "Accepted", "Accepted", 1),
+			NewCondition(string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionTrue, "Programmed", "Programmed", 1),
+		},
+		Listeners: []gatewayv1.ListenerStatus{
+			{
+				Name: "http",
+				Conditions: []metav1.Condition{
+					NewCondition(string(gatewayv1.ListenerConditionProgrammed), metav1.ConditionTrue, "Programmed", "Programmed", 1),
+					NewCondition(string(gatewayv1.ListenerConditionAccepted), metav1.ConditionTrue, "Accepted", "Accepted", 1),
+				},
+				SupportedKinds: []gatewayv1.RouteGroupKind{{Kind: "HTTPRoute"}},
+			},
+		},
+	}
+
+	// Merge with additions: Programmed on GW, Accepted on listener
+	changed := MergeGatewayStatus(&current, desired)
+	if !changed {
+		t.Fatalf("expected changed=true on initial merge")
+	}
+
+	// Verify foreign conditions survive
+	storedGw := FindCondition(current.Conditions, "conformance.gateway.networking.k8s.io/StaleCondition")
+	if storedGw == nil || !sameCondition(storedGw, &foreignGwCond) {
+		t.Fatalf("foreign Gateway condition was lost or modified: got %+v, want %+v", storedGw, foreignGwCond)
+	}
+
+	storedListener := FindCondition(current.Listeners[0].Conditions, "conformance.gateway.networking.k8s.io/StaleCondition")
+	if storedListener == nil || !sameCondition(storedListener, &foreignListenerCond) {
+		t.Fatalf("foreign Listener condition was lost or modified: got %+v, want %+v", storedListener, foreignListenerCond)
+	}
+
+	// Merge again without changes -> must be a no-op (return false)
+	changed = MergeGatewayStatus(&current, desired)
+	if changed {
+		t.Errorf("expected changed=false on second merge with identical desired status")
+	}
+}
+
+// TestOwnedConditionTypes_CoversComputedConditions verifies that every condition type
+// produced on a Gateway or its listeners during state compilation is registered in
+// GatewayOwnedConditionTypes or ListenerOwnedConditionTypes.
+func TestOwnedConditionTypes_CoversComputedConditions(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("test-controller")
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gwClass)
+
+	// Case 1: Standard HTTP Gateway.
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-standard"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gw1)
+
+	// Case 2: Gateway with insecure fallback listener (produces InsecureFrontendValidationMode).
+	caPEM, _ := generateTestCertPEM(t, "ca.example.com")
+	caConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ca-config"},
+		Data:       map[string]string{ConfigMapCACertKey: string(caPEM)},
+	}
+	st.UpsertConfigMap(caConfigMap)
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-fallback"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			TLS: &gatewayv1.GatewayTLSConfig{
+				Frontend: &gatewayv1.FrontendTLSConfig{
+					Default: gatewayv1.TLSConfig{
+						Validation: &gatewayv1.FrontendTLSValidation{
+							CACertificateRefs: []gatewayv1.ObjectReference{
+								{Kind: "ConfigMap", Group: "", Name: "ca-config"},
+							},
+							Mode: gatewayv1.AllowInsecureFallback,
+						},
+					},
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+	st.UpsertGateway(gw2)
+
+	// Case 3: Gateway with overlapping TLS listeners (produces OverlappingTLSConfig).
+	certPEM1, keyPEM1 := generateTestCertPEM(t, "*.example.com", "foo.example.com")
+	secret1 := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cert-1"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM1,
+			corev1.TLSPrivateKeyKey: keyPEM1,
+		},
+	}
+	st.UpsertSecret(secret1)
+	certPEM2, keyPEM2 := generateTestCertPEM(t, "foo.example.com")
+	secret2 := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cert-2"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM2,
+			corev1.TLSPrivateKeyKey: keyPEM2,
+		},
+	}
+	st.UpsertSecret(secret2)
+	gw3 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-overlapping"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "tls-wildcard",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "cert-1"},
+						},
+					},
+				},
+				{
+					Name:     "tls-exact",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("foo.example.com")),
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "cert-2"},
+						},
+					},
+				},
+			},
+		},
+	}
+	st.UpsertGateway(gw3)
+
+	// Case 4: Gateway with port conflict (produces Conflicted).
+	gw4 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-conflicted"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "tcp", Port: 8080, Protocol: gatewayv1.TCPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gw4)
+
+	st.Recompute()
+
+	gateways := []*gatewayv1.Gateway{gw1, gw2, gw3, gw4}
+	for _, gw := range gateways {
+		key := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+		status, ok := st.GetDesiredGatewayStatus(key)
+		if !ok {
+			t.Fatalf("expected desired status for gateway %s", key)
+		}
+
+		for _, cond := range status.Conditions {
+			if !GatewayOwnedConditionTypes[cond.Type] {
+				t.Errorf("Gateway %s has condition %q which is missing from GatewayOwnedConditionTypes", key, cond.Type)
+			}
+		}
+
+		for _, lis := range status.Listeners {
+			for _, cond := range lis.Conditions {
+				if !ListenerOwnedConditionTypes[cond.Type] {
+					t.Errorf("Gateway %s listener %s has condition %q which is missing from ListenerOwnedConditionTypes", key, lis.Name, cond.Type)
+				}
+			}
+		}
 	}
 }
 
