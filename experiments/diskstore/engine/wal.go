@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -202,8 +203,41 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		return nil, err
 	}
 
+	var movedAbandoned bool
+	lostDir := filepath.Join(w.dir, "lost+found")
 	for _, seg := range segments {
+		if seg.startLSN > initialLSN {
+			// Abandoned segment from uncommitted rotation past recovered LSN.
+			// Quarantine to lost+found for optional offline recovery/reconstruction.
+			if err := w.fs.MkdirAll(lostDir, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create lost+found dir: %w", err)
+			}
+			dest := uniqueQuarantinePath(lostDir, seg.name)
+			if rErr := w.fs.Rename(seg.path, dest); rErr != nil {
+				if !errors.Is(rErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("failed to move abandoned segment %s to %s: %w", seg.path, dest, rErr)
+				}
+				// Safe to ignore if already gone: the abandoned segment cannot cause an LSN collision.
+			} else {
+				slog.Warn("diskstore: moved abandoned WAL segment", "from", seg.path, "to", dest, "startLSN", seg.startLSN, "recoveredLSN", initialLSN)
+			}
+			movedAbandoned = true
+			continue
+		}
 		w.createdLSNs[seg.startLSN] = true
+	}
+	if movedAbandoned {
+		// A rename across directories changes two directory entries.
+		// Syncing lost+found makes the new entry durable so a crash cannot leave the file
+		// in neither directory and lose offline recovery data.
+		if err := w.fs.SyncDir(lostDir); err != nil {
+			return nil, fmt.Errorf("failed to sync lost+found dir after moving abandoned segments: %w", err)
+		}
+		// Syncing the WAL directory makes the removal durable so the abandoned segment
+		// cannot reappear after a subsequent crash and collide with future rotations.
+		if err := w.fs.SyncDir(w.dir); err != nil {
+			return nil, fmt.Errorf("failed to sync WAL dir after moving abandoned segments: %w", err)
+		}
 	}
 
 	w.maxLSN.Store(initialLSN)
@@ -212,6 +246,10 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	go w.bgWriter()
 
 	return w, nil
+}
+
+func uniqueQuarantinePath(lostDir, segName string) string {
+	return filepath.Join(lostDir, fmt.Sprintf("%s.%d.%d", segName, time.Now().UnixNano(), os.Getpid()))
 }
 
 type segmentMeta struct {
