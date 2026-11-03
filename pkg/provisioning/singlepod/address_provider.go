@@ -69,6 +69,9 @@ const (
 	// AppNameValue is the value for LabelAppName on data-plane components.
 	AppNameValue = state.AppNameValue
 
+	// MaxLabelValueLength is the maximum length of a Kubernetes label value (63 characters).
+	MaxLabelValueLength = 63
+
 	// DataplaneSecretDataKey is the key in the per-Gateway Secret holding the serialized DataplaneConfig.
 	DataplaneSecretDataKey = "config.json"
 
@@ -103,6 +106,18 @@ func ResourceNameForGateway(gwName string) string {
 	h := sha256.Sum256([]byte(gwName))
 	suffix := "-" + hex.EncodeToString(h[:4])
 	return base[:63-len(suffix)] + suffix
+}
+
+// LabelValueForGateway returns a valid Kubernetes label value for the parent Gateway name.
+// Short names are kept unchanged because a Deployment's selector is immutable; hashing every
+// name would change the selector of existing data-plane Deployments and fail on upgrade.
+// If gwName exceeds MaxLabelValueLength, it returns the 63-character derived resource name
+// so that the label value remains valid (<= 63 characters) and matches the selector labels.
+func LabelValueForGateway(gwName string) string {
+	if len(gwName) <= MaxLabelValueLength {
+		return gwName
+	}
+	return ResourceNameForGateway(gwName)
 }
 
 // Option configures an AddressProvider.
@@ -303,7 +318,7 @@ func buildLabelsAndAnnotations(gw *gatewayv1.Gateway) (map[string]string, map[st
 	}
 
 	// GARI-owned labels override user labels
-	labels[LabelGatewayName] = gw.Name
+	labels[LabelGatewayName] = LabelValueForGateway(gw.Name)
 	labels[LabelManagedBy] = ManagedByValue
 	labels[LabelAppName] = AppNameValue
 
@@ -370,6 +385,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	name := ResourceNameForGateway(gw.Name)
+	labelGwName := LabelValueForGateway(gw.Name)
 	gwNamespace := gw.Namespace
 
 	labels, annotations := buildLabelsAndAnnotations(gw)
@@ -726,7 +742,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			WithReplicas(1).
 			WithSelector(metav1ac.LabelSelector().
 				WithMatchLabels(map[string]string{
-					LabelGatewayName: gw.Name,
+					LabelGatewayName: labelGwName,
 					LabelAppName:     AppNameValue,
 				}),
 			).
@@ -819,7 +835,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		svcSpec := corev1ac.ServiceSpec().
 			WithType(params.ServiceType).
 			WithSelector(map[string]string{
-				LabelGatewayName: gw.Name,
+				LabelGatewayName: labelGwName,
 				LabelAppName:     AppNameValue,
 			}).
 			WithPorts(svcPorts...)

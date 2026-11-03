@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
@@ -4200,6 +4201,229 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 		}
 		if challengeTokenPath != tokenPath {
 			t.Errorf("challengeTokenPath = %q, want %q", challengeTokenPath, tokenPath)
+		}
+	})
+}
+
+func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme clientgoscheme: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme gatewayv1: %v", err)
+	}
+	if err := rbacv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme rbacv1: %v", err)
+	}
+
+	// Create a 253-character Gateway name (max allowed by Kubernetes)
+	prefix := "gateway-name-maximum-length-"
+	gwName := prefix + strings.Repeat("a", 253-len(prefix))
+	if len(gwName) != 253 {
+		t.Fatalf("expected gwName length 253, got %d", len(gwName))
+	}
+	gwNamespace := "default"
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gwName,
+			Namespace: gwNamespace,
+			UID:       types.UID("test-uid-max-length"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw).
+		Build()
+
+	p := NewAddressProvider(c)
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+		},
+	}
+
+	// 1. Reconcile Gateway resources
+	_, readiness, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	if err != nil {
+		t.Fatalf("GatewayAddressesWithReadiness failed for max length gateway: %v", err)
+	}
+
+	expectedName := ResourceNameForGateway(gwName)
+	expectedLabelGwName := LabelValueForGateway(gwName)
+
+	if len(expectedName) > 63 {
+		t.Errorf("expected resource name <= 63, got %d (%q)", len(expectedName), expectedName)
+	}
+	if len(expectedLabelGwName) > 63 {
+		t.Errorf("expected label value <= 63, got %d (%q)", len(expectedLabelGwName), expectedLabelGwName)
+	}
+	if errs := validation.IsDNS1035Label(expectedName); len(errs) > 0 {
+		t.Errorf("expectedName is not a valid DNS-1035 label: %v", errs)
+	}
+	if errs := validation.IsValidLabelValue(expectedLabelGwName); len(errs) > 0 {
+		t.Errorf("expectedLabelGwName is not a valid label value: %v", errs)
+	}
+
+	// 2. Verify ServiceAccount exists with valid name
+	var sa corev1.ServiceAccount
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount %s: %v", expectedName, err)
+	}
+	if sa.Labels[LabelGatewayName] != expectedLabelGwName {
+		t.Errorf("ServiceAccount LabelGatewayName = %q, want %q", sa.Labels[LabelGatewayName], expectedLabelGwName)
+	}
+
+	// 3. Verify Role and RoleBinding exist
+	var role rbacv1.Role
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &role); err != nil {
+		t.Fatalf("failed to get Role %s: %v", expectedName, err)
+	}
+	var rb rbacv1.RoleBinding
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &rb); err != nil {
+		t.Fatalf("failed to get RoleBinding %s: %v", expectedName, err)
+	}
+	if rb.RoleRef.Name != expectedName {
+		t.Errorf("RoleBinding roleRef.name = %q, want %q", rb.RoleRef.Name, expectedName)
+	}
+	if len(rb.Subjects) == 0 || rb.Subjects[0].Name != expectedName {
+		t.Errorf("RoleBinding subject name = %v, want %q", rb.Subjects, expectedName)
+	}
+
+	// 4. Verify Deployment exists
+	var deploy appsv1.Deployment
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment %s: %v", expectedName, err)
+	}
+	if deploy.Spec.Template.Spec.ServiceAccountName != expectedName {
+		t.Errorf("Deployment ServiceAccountName = %q, want %q", deploy.Spec.Template.Spec.ServiceAccountName, expectedName)
+	}
+	if deploy.Spec.Selector.MatchLabels[LabelGatewayName] != expectedLabelGwName {
+		t.Errorf("Deployment selector LabelGatewayName = %q, want %q", deploy.Spec.Selector.MatchLabels[LabelGatewayName], expectedLabelGwName)
+	}
+	if deploy.Spec.Template.Labels[LabelGatewayName] != expectedLabelGwName {
+		t.Errorf("Deployment template LabelGatewayName = %q, want %q", deploy.Spec.Template.Labels[LabelGatewayName], expectedLabelGwName)
+	}
+
+	// 5. Verify Service exists
+	var svc corev1.Service
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &svc); err != nil {
+		t.Fatalf("failed to get Service %s: %v", expectedName, err)
+	}
+	if svc.Spec.Selector[LabelGatewayName] != expectedLabelGwName {
+		t.Errorf("Service selector LabelGatewayName = %q, want %q", svc.Spec.Selector[LabelGatewayName], expectedLabelGwName)
+	}
+
+	// 6. Test PublishDataplaneConfig with max-length Gateway
+	dpCfg := &state.DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: gwNamespace, Name: gwName},
+	}
+	if err := p.PublishDataplaneConfig(t.Context(), gw, dpCfg); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed for max length gateway: %v", err)
+	}
+
+	var secret corev1.Secret
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &secret); err != nil {
+		t.Fatalf("failed to get Secret %s: %v", expectedName, err)
+	}
+	if secret.Labels[LabelGatewayName] != expectedLabelGwName {
+		t.Errorf("Secret LabelGatewayName = %q, want %q", secret.Labels[LabelGatewayName], expectedLabelGwName)
+	}
+
+	// 7. Verify readiness becomes Programmed once Deployment is ready and Service has LB ingress
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}}
+	if err := c.Status().Update(t.Context(), &svc); err != nil {
+		t.Fatalf("failed to update Service status: %v", err)
+	}
+	deploy.Status.AvailableReplicas = 1
+	if err := c.Status().Update(t.Context(), &deploy); err != nil {
+		t.Fatalf("failed to update Deployment status: %v", err)
+	}
+
+	finalAddrs, readiness, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	if err != nil {
+		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+	}
+	if !readiness.Ready {
+		t.Errorf("expected readiness.Ready = true, got false (reason=%s message=%s)", readiness.Reason, readiness.Message)
+	}
+	if len(finalAddrs) == 0 || finalAddrs[0].Value != "1.2.3.4" {
+		t.Errorf("expected address 1.2.3.4, got %v", finalAddrs)
+	}
+}
+
+func TestLabelValueForGateway(t *testing.T) {
+	// 1. Length 63: fits within label limit, returned unchanged
+	name63 := strings.Repeat("a", 63)
+	got63 := LabelValueForGateway(name63)
+	if got63 != name63 {
+		t.Errorf("LabelValueForGateway(63) = %q, want %q", got63, name63)
+	}
+	if errs := validation.IsValidLabelValue(got63); len(errs) > 0 {
+		t.Errorf("invalid label value for 63: %v", errs)
+	}
+
+	// 2. Length 64: exceeds 63, returned as 63-character derived resource name
+	name64 := strings.Repeat("a", 64)
+	got64 := LabelValueForGateway(name64)
+	want64 := ResourceNameForGateway(name64)
+	if got64 != want64 {
+		t.Errorf("LabelValueForGateway(64) = %q, want %q", got64, want64)
+	}
+	if len(got64) != 63 {
+		t.Errorf("expected length 63 for 64-char name, got %d", len(got64))
+	}
+	if errs := validation.IsValidLabelValue(got64); len(errs) > 0 {
+		t.Errorf("invalid label value for 64: %v", errs)
+	}
+
+	// 3. Length 253: maximum Kubernetes name length, returned as 63-character derived resource name
+	name253 := strings.Repeat("a", 253)
+	got253 := LabelValueForGateway(name253)
+	want253 := ResourceNameForGateway(name253)
+	if got253 != want253 {
+		t.Errorf("LabelValueForGateway(253) = %q, want %q", got253, want253)
+	}
+	if len(got253) != 63 {
+		t.Errorf("expected length 63 for 253-char name, got %d", len(got253))
+	}
+	if errs := validation.IsValidLabelValue(got253); len(errs) > 0 {
+		t.Errorf("invalid label value for 253: %v", errs)
+	}
+
+	// 4. Two long names sharing a prefix produce different label values
+	t.Run("two long names sharing a prefix produce different label values", func(t *testing.T) {
+		sharedPrefix := strings.Repeat("c", 240)
+		nameA := sharedPrefix + "1234567890abc"
+		nameB := sharedPrefix + "abcdefghijklm"
+		labelA := LabelValueForGateway(nameA)
+		labelB := LabelValueForGateway(nameB)
+
+		if labelA == labelB {
+			t.Errorf("expected distinct label values, got %q == %q", labelA, labelB)
+		}
+		if len(labelA) > 63 || len(labelB) > 63 {
+			t.Errorf("expected label length <= 63, got len(A)=%d, len(B)=%d", len(labelA), len(labelB))
+		}
+		if errs := validation.IsValidLabelValue(labelA); len(errs) > 0 {
+			t.Errorf("invalid label value labelA: %v", errs)
+		}
+		if errs := validation.IsValidLabelValue(labelB); len(errs) > 0 {
+			t.Errorf("invalid label value labelB: %v", errs)
 		}
 	})
 }
