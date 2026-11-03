@@ -16,6 +16,7 @@ package controller
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -26,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -3923,5 +3925,80 @@ func TestSecretsCertificateSource(t *testing.T) {
 	resNotFound, _ := src.ResolveCertificates(gwMissingSecret, &gwMissingSecret.Spec.Listeners[0])
 	if resNotFound.FailedReason == "" {
 		t.Errorf("expected failure for missing secret")
+	}
+}
+
+func TestGatewayClassReconciler_SupportedFeatures(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add clientgo scheme: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add gatewayv1 scheme: %v", err)
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc", Generation: 1},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gc).
+		WithStatusSubresource(gc).
+		Build()
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gc)
+	st.Recompute()
+
+	r := &GatewayClassReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+
+	// 1. Initial reconcile on accepted GatewayClass
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}}); err != nil {
+		t.Fatalf("first reconcile failed: %v", err)
+	}
+
+	var res gatewayv1.GatewayClass
+	if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &res); err != nil {
+		t.Fatalf("failed to get GatewayClass: %v", err)
+	}
+
+	cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusAccepted))
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected Accepted=True condition, got %+v", cond)
+	}
+
+	expectedFeatures := state.GatewayClassSupportedFeatures()
+	if !slices.Equal(res.Status.SupportedFeatures, expectedFeatures) {
+		t.Errorf("SupportedFeatures mismatch: got %+v, want %+v", res.Status.SupportedFeatures, expectedFeatures)
+	}
+	if !slices.IsSortedFunc(res.Status.SupportedFeatures, func(a, b gatewayv1.SupportedFeature) int {
+		return cmp.Compare(a.Name, b.Name)
+	}) {
+		t.Errorf("SupportedFeatures is not sorted ascending: %+v", res.Status.SupportedFeatures)
+	}
+
+	// 2. Second reconcile must not write status again
+	rv := res.ResourceVersion
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}}); err != nil {
+		t.Fatalf("second reconcile failed: %v", err)
+	}
+
+	var resSecond gatewayv1.GatewayClass
+	if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &resSecond); err != nil {
+		t.Fatalf("failed to get GatewayClass on second reconcile: %v", err)
+	}
+	if resSecond.ResourceVersion != rv {
+		t.Errorf("expected ResourceVersion to remain %s on second reconcile, got %s (status write occurred)",
+			rv, resSecond.ResourceVersion)
 	}
 }
