@@ -17,6 +17,7 @@ package state
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -1355,8 +1357,26 @@ func TestState_GatewayCRDBundleVersionEnqueuesGatewayClass(t *testing.T) {
 		t.Errorf("expected SupportedVersion=True/SupportedVersion, got %+v", cond)
 	}
 
-	// Changing to mismatched bundle version updates status and enqueues GatewayClass again
-	mismatched := "v1.5.0"
+	// Setting previous minor bundle version (N-1) keeps SupportedVersion=True
+	compiledV, err := version.ParseSemantic(gatewayconsts.BundleVersion)
+	if err != nil {
+		t.Fatalf("failed to parse compiled bundle version %q: %v", gatewayconsts.BundleVersion, err)
+	}
+	prevMinor := fmt.Sprintf("v%d.%d.0", compiledV.Major(), compiledV.Minor()-1)
+	st.SetGatewayCRDBundleVersion(&prevMinor)
+	st.Recompute()
+
+	status, ok = st.GetDesiredGatewayClassStatus(types.NamespacedName{Name: "test-gc"})
+	if !ok {
+		t.Fatalf("expected desired GatewayClassStatus to be present")
+	}
+	cond = findCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != string(gatewayv1.GatewayClassReasonSupportedVersion) {
+		t.Errorf("expected SupportedVersion=True/SupportedVersion for previous minor, got %+v", cond)
+	}
+
+	// Changing to mismatched bundle version (N-2) updates status and enqueues GatewayClass again
+	mismatched := fmt.Sprintf("v%d.%d.0", compiledV.Major(), compiledV.Minor()-2)
 	st.SetGatewayCRDBundleVersion(&mismatched)
 	st.Recompute()
 

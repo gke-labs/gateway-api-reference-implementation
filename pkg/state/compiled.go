@@ -3341,8 +3341,9 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	return gatewayv1.PolicyStatus{Ancestors: ancestors}
 }
 
-// isSupportedBundleVersion returns true if bundleVersion has the same major and minor
-// version as the compiled-in Gateway API bundle version, is valid semver, and is not a pre-release.
+// isSupportedBundleVersion returns true if bundleVersion has the same major version as the
+// compiled-in Gateway API bundle version, has minor version N or N-1 (where N is the compiled
+// minor version), is valid semver, and is not a pre-release.
 func isSupportedBundleVersion(bundleVersion string) bool {
 	compiledV, err := version.ParseSemantic(gatewayconsts.BundleVersion)
 	if err != nil {
@@ -3355,7 +3356,10 @@ func isSupportedBundleVersion(bundleVersion string) bool {
 	if bundleV.PreRelease() != "" {
 		return false
 	}
-	return bundleV.Major() == compiledV.Major() && bundleV.Minor() == compiledV.Minor()
+	if bundleV.Major() != compiledV.Major() {
+		return false
+	}
+	return bundleV.Minor() == compiledV.Minor() || (compiledV.Minor() > 0 && bundleV.Minor() == compiledV.Minor()-1)
 }
 
 // unsupportedBundleVersionMessage returns the condition message for an unsupported bundle version,
@@ -3366,7 +3370,10 @@ func unsupportedBundleVersionMessage(bundleVersion, compiledVersion string) stri
 	if err != nil {
 		return fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s)", bundleVersion, compiledVersion)
 	}
-	return fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports v%d.%d.x, built against %s)", bundleVersion, compiledV.Major(), compiledV.Minor(), compiledVersion)
+	if compiledV.Minor() == 0 {
+		return fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports v%d.%d.x, built against %s)", bundleVersion, compiledV.Major(), compiledV.Minor(), compiledVersion)
+	}
+	return fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports v%d.%d.x and v%d.%d.x, built against %s)", bundleVersion, compiledV.Major(), compiledV.Minor()-1, compiledV.Major(), compiledV.Minor(), compiledVersion)
 }
 
 // ComputeSupportedVersionCondition computes the SupportedVersion condition for a GatewayClass given a bundle version.

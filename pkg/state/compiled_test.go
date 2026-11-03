@@ -5945,11 +5945,14 @@ func TestComputeSupportedVersionCondition(t *testing.T) {
 
 	sameMinorV0 := fmt.Sprintf("v%d.%d.0", major, minor)
 	sameMinorV9 := fmt.Sprintf("v%d.%d.9", major, minor)
-	olderMinor := fmt.Sprintf("v%d.%d.0", major, minor-1)
+	prevMinorV0 := fmt.Sprintf("v%d.%d.0", major, minor-1)
+	prevMinorV9 := fmt.Sprintf("v%d.%d.9", major, minor-1)
+	twoMinorsOlder := fmt.Sprintf("v%d.%d.0", major, minor-2)
 	newerMinor := fmt.Sprintf("v%d.%d.0", major, minor+1)
 	diffMajor := fmt.Sprintf("v%d.%d.0", major+1, minor)
 	preRelease := fmt.Sprintf("v%d.%d.0-rc1", major, minor)
-	supportedRange := fmt.Sprintf("v%d.%d.x", major, minor)
+	preReleasePrev := fmt.Sprintf("v%d.%d.0-rc1", major, minor-1)
+	supportedRange := fmt.Sprintf("v%d.%d.x and v%d.%d.x", major, minor-1, major, minor)
 
 	tests := []struct {
 		name            string
@@ -5958,6 +5961,20 @@ func TestComputeSupportedVersionCondition(t *testing.T) {
 		expectedReason  gatewayv1.GatewayClassConditionReason
 		expectedMessage string
 	}{
+		{
+			name:            fmt.Sprintf("previous minor version %s", prevMinorV0),
+			bundleVersion:   prevMinorV0,
+			expectedStatus:  metav1.ConditionTrue,
+			expectedReason:  gatewayv1.GatewayClassReasonSupportedVersion,
+			expectedMessage: fmt.Sprintf("Gateway API CRD bundle-version %q is supported", prevMinorV0),
+		},
+		{
+			name:            fmt.Sprintf("previous minor higher patch %s", prevMinorV9),
+			bundleVersion:   prevMinorV9,
+			expectedStatus:  metav1.ConditionTrue,
+			expectedReason:  gatewayv1.GatewayClassReasonSupportedVersion,
+			expectedMessage: fmt.Sprintf("Gateway API CRD bundle-version %q is supported", prevMinorV9),
+		},
 		{
 			name:            fmt.Sprintf("same minor version %s", sameMinorV0),
 			bundleVersion:   sameMinorV0,
@@ -5980,11 +5997,11 @@ func TestComputeSupportedVersionCondition(t *testing.T) {
 			expectedMessage: fmt.Sprintf("Gateway API CRD bundle-version %q is supported", sameMinorV9),
 		},
 		{
-			name:            fmt.Sprintf("older minor %s", olderMinor),
-			bundleVersion:   olderMinor,
+			name:            fmt.Sprintf("two minors older %s", twoMinorsOlder),
+			bundleVersion:   twoMinorsOlder,
 			expectedStatus:  metav1.ConditionFalse,
 			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
-			expectedMessage: fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s, built against %s)", olderMinor, supportedRange, gatewayconsts.BundleVersion),
+			expectedMessage: fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s, built against %s)", twoMinorsOlder, supportedRange, gatewayconsts.BundleVersion),
 		},
 		{
 			name:            fmt.Sprintf("newer minor %s", newerMinor),
@@ -6013,6 +6030,13 @@ func TestComputeSupportedVersionCondition(t *testing.T) {
 			expectedStatus:  metav1.ConditionFalse,
 			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
 			expectedMessage: fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s, built against %s)", preRelease, supportedRange, gatewayconsts.BundleVersion),
+		},
+		{
+			name:            fmt.Sprintf("previous minor pre-release version %s", preReleasePrev),
+			bundleVersion:   preReleasePrev,
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s, built against %s)", preReleasePrev, supportedRange, gatewayconsts.BundleVersion),
 		},
 		{
 			name:            fmt.Sprintf("different major %s", diffMajor),
@@ -6048,7 +6072,15 @@ func TestComputeSupportedVersionCondition(t *testing.T) {
 func TestUnsupportedBundleVersionMessage(t *testing.T) {
 	t.Run("parsed compiled version derives minor range", func(t *testing.T) {
 		msg := unsupportedBundleVersionMessage("v9.9.0", "v1.2.3")
-		expected := `Gateway API CRD bundle-version "v9.9.0" is not supported (controller supports v1.2.x, built against v1.2.3)`
+		expected := `Gateway API CRD bundle-version "v9.9.0" is not supported (controller supports v1.1.x and v1.2.x, built against v1.2.3)`
+		if msg != expected {
+			t.Errorf("expected %q, got %q", expected, msg)
+		}
+	})
+
+	t.Run("parsed compiled version with minor 0", func(t *testing.T) {
+		msg := unsupportedBundleVersionMessage("v9.9.0", "v1.0.0")
+		expected := `Gateway API CRD bundle-version "v9.9.0" is not supported (controller supports v1.0.x, built against v1.0.0)`
 		if msg != expected {
 			t.Errorf("expected %q, got %q", expected, msg)
 		}
@@ -6080,12 +6112,15 @@ func TestGatewayClassStatus_SupportedVersion(t *testing.T) {
 
 	sameMinorV0 := fmt.Sprintf("v%d.%d.0", major, minor)
 	sameMinorV9 := fmt.Sprintf("v%d.%d.9", major, minor)
-	olderMinor := fmt.Sprintf("v%d.%d.0", major, minor-1)
+	prevMinorV0 := fmt.Sprintf("v%d.%d.0", major, minor-1)
+	prevMinorV9 := fmt.Sprintf("v%d.%d.9", major, minor-1)
+	twoMinorsOlder := fmt.Sprintf("v%d.%d.0", major, minor-2)
 	newerMinor := fmt.Sprintf("v%d.%d.0", major, minor+1)
 	preRelease := fmt.Sprintf("v%d.%d.0-rc1", major, minor)
-	supportedRange := fmt.Sprintf("v%d.%d.x", major, minor)
+	preReleasePrev := fmt.Sprintf("v%d.%d.0-rc1", major, minor-1)
+	supportedRange := fmt.Sprintf("v%d.%d.x and v%d.%d.x", major, minor-1, major, minor)
 
-	for _, v := range []string{sameMinorV0, gatewayconsts.BundleVersion, sameMinorV9} {
+	for _, v := range []string{prevMinorV0, prevMinorV9, sameMinorV0, gatewayconsts.BundleVersion, sameMinorV9} {
 		t.Run(fmt.Sprintf("supported version %s yields SupportedVersion=True", v), func(t *testing.T) {
 			ver := v
 			status := ComputeDesiredGatewayClassStatus(gc, "test-controller", &ver)
@@ -6105,7 +6140,7 @@ func TestGatewayClassStatus_SupportedVersion(t *testing.T) {
 		})
 	}
 
-	for _, v := range []string{olderMinor, newerMinor, "garbage", preRelease} {
+	for _, v := range []string{twoMinorsOlder, newerMinor, "garbage", preRelease, preReleasePrev} {
 		t.Run(fmt.Sprintf("unsupported version %s yields SupportedVersion=False", v), func(t *testing.T) {
 			ver := v
 			status := ComputeDesiredGatewayClassStatus(gc, "test-controller", &ver)
