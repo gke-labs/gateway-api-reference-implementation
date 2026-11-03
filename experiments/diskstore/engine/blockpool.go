@@ -680,10 +680,22 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 	}
 
 	// Release pool mutex so concurrent operations can access other pages in memory
+	reacquired := false
+	defer func() {
+		if !reacquired {
+			bp.mu.Lock()
+		}
+	}()
 	bp.mu.Unlock()
 
 	// Acquire flush mutex to copy into the shared aligned staging buffer and issue direct I/O write
+	flushUnlocked := false
 	bp.flushMu.Lock()
+	defer func() {
+		if !flushUnlocked {
+			bp.flushMu.Unlock()
+		}
+	}()
 
 	for i, desc := range chunk {
 		desc.Mu.Lock()
@@ -720,9 +732,11 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 	}
 
 	bp.flushMu.Unlock()
+	flushUnlocked = true
 
 	// Re-acquire pool mutex
 	bp.mu.Lock()
+	reacquired = true
 
 	for _, desc := range chunk {
 		desc.InFlight = false

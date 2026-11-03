@@ -715,3 +715,70 @@ func TestBlockPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
 		t.Fatalf("timed out waiting for AllocateNewPage after unpin")
 	}
 }
+
+type panickingDirectIO struct {
+	DirectIO
+}
+
+func (p *panickingDirectIO) Write(f File, off int64, b []byte) error {
+	panic("injected panic in direct I/O write")
+}
+
+func TestRegression_BlockPoolFlushPanicSafety(t *testing.T) {
+	memFS := NewMemFS()
+	rawHeapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := rawHeapFile.Close(); err != nil {
+			t.Errorf("rawHeapFile.Close failed: %v", err)
+		}
+	})
+
+	buddy := NewBuddyAllocator(512)
+	var dbID [16]byte
+	bp := NewBlockPool(rawHeapFile, nil, buddy, dbID, BlockPoolOptions{
+		NumPoolBlocks: 16,
+	})
+	bp.directIO = &panickingDirectIO{}
+	t.Cleanup(func() {
+		if err := bp.Close(); err != nil {
+			t.Errorf("bp.Close failed: %v", err)
+		}
+	})
+
+	h, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	bp.MarkDirty(1, 10)
+	h.Unpin()
+
+	panicked := false
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("expected panic from panickingDirectIO")
+			}
+			if rStr := fmt.Sprint(r); rStr != "injected panic in direct I/O write" {
+				t.Fatalf("unexpected panic value: %v", r)
+			}
+			panicked = true
+		}()
+
+		// FlushAllDirty is expected to panic during direct I/O write, so its
+		// return value is unreachable.
+		_ = bp.FlushAllDirty()
+	}()
+
+	if !panicked {
+		t.Fatalf("expected FlushAllDirty to panic")
+	}
+
+	if !bp.flushMu.TryLock() {
+		t.Fatalf("expected flushMu to be unlocked after recovered panic")
+	}
+	bp.flushMu.Unlock()
+}
