@@ -837,6 +837,9 @@ func recordsEqual(a, b dnsmessage.Resource) bool {
 	if a.Header.Type != b.Header.Type {
 		return false
 	}
+	if !strings.EqualFold(toFQDN(a.Header.Name.String()), toFQDN(b.Header.Name.String())) {
+		return false
+	}
 	switch bodyA := a.Body.(type) {
 	case *dnsmessage.AResource:
 		if bodyB, ok := b.Body.(*dnsmessage.AResource); ok {
