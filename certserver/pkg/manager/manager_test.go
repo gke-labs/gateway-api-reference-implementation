@@ -54,6 +54,12 @@ func (c *mockClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
+func (c *mockClock) Set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = t
+}
+
 func createTestManager(
 	t *testing.T,
 	pebble *testserver.Server,
@@ -382,8 +388,8 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 	// 2. Simulate CA failure during renewal
 	tripper.fail.Store(true)
 
-	// Advance clock into renewal window (45s of 60s)
-	clock.Advance(45 * time.Second)
+	// Advance clock into renewal window (45s of 60s from cert issuance)
+	clock.Set(cert1.IssuedAt.Add(45 * time.Second))
 
 	// Execute renewal attempt: fails due to simulated CA downtime
 	_ = mgr.CheckRenewals(ctx)
