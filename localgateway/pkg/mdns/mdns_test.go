@@ -915,3 +915,94 @@ func TestMDNSGracefulShutdownSendsGoodbye(t *testing.T) {
 		t.Fatalf("expected goodbye packet with TTL=0 on graceful shutdown, but none was observed")
 	}
 }
+
+type captureConn struct {
+	*net.UDPConn
+	writes [][]byte
+}
+
+func (c *captureConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.writes = append(c.writes, append([]byte(nil), p...))
+	return len(p), nil
+}
+
+func newTestResponder(t *testing.T) (*Responder, *captureConn) {
+	t.Helper()
+
+	rawConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP failed: %v", err)
+	}
+	conn := &captureConn{UDPConn: rawConn}
+
+	resp, err := NewResponder(ResponderOptions{
+		Port:        rawConn.LocalAddr().(*net.UDPAddr).Port,
+		IPv4Conn:    conn,
+		DisableIPv6: true,
+	})
+	if err != nil {
+		t.Fatalf("NewResponder failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := resp.Close(); err != nil {
+			t.Errorf("resp.Close failed: %v", err)
+		}
+	})
+
+	resp.SetRecord(&RecordSet{
+		FQDN: "grafana.local.",
+		A:    []net.IP{net.ParseIP("192.168.1.1").To4()},
+		TTL:  120,
+	})
+
+	return resp, conn
+}
+
+// TestMDNSQueryClassFiltering verifies that handlePacket answers IN and ANY questions
+// (including with the QU bit set) and ignores other classes like CHAOS per RFC 6762 §5.5.
+func TestMDNSQueryClassFiltering(t *testing.T) {
+	tests := []struct {
+		name       string
+		class      dnsmessage.Class
+		wantAnswer bool
+	}{
+		{"CHAOS", dnsmessage.ClassCHAOS, false},
+		{"CHAOS with QU", dnsmessage.Class(uint16(dnsmessage.ClassCHAOS) | QUBit), false},
+		{"IN", dnsmessage.ClassINET, true},
+		{"IN with QU", dnsmessage.Class(uint16(dnsmessage.ClassINET) | QUBit), true},
+		{"ANY", dnsmessage.ClassANY, true},
+		{"ANY with QU", dnsmessage.Class(uint16(dnsmessage.ClassANY) | QUBit), true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, conn := newTestResponder(t)
+			from := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: resp.Port()}
+
+			b := dnsmessage.NewBuilder(nil, dnsmessage.Header{})
+			if err := b.StartQuestions(); err != nil {
+				t.Fatalf("StartQuestions: %v", err)
+			}
+			if err := b.Question(dnsmessage.Question{
+				Name:  dnsmessage.MustNewName("grafana.local."),
+				Type:  dnsmessage.TypeA,
+				Class: tc.class,
+			}); err != nil {
+				t.Fatalf("Question: %v", err)
+			}
+			qData, err := b.Finish()
+			if err != nil {
+				t.Fatalf("Finish: %v", err)
+			}
+
+			resp.handlePacket(qData, from, false)
+
+			if tc.wantAnswer && len(conn.writes) == 0 {
+				t.Fatalf("expected answer for class %v, got none", tc.class)
+			}
+			if !tc.wantAnswer && len(conn.writes) > 0 {
+				t.Fatalf("expected no answer for class %v, got %d", tc.class, len(conn.writes))
+			}
+		})
+	}
+}
