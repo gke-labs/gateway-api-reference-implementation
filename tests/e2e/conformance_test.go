@@ -18,9 +18,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"slices"
-	"strings"
 	"testing"
+	"time"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,18 +31,9 @@ import (
 	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/tests"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
-	"sigs.k8s.io/gateway-api/pkg/features"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
-
-// exemptFeatures returns features not supported by this implementation.
-// GARI doesn't implement mesh (GAMMA).
-func exemptFeatures() []features.FeatureName {
-	exempt := append([]features.FeatureName{features.SupportMesh}, features.SetsToNamesSet(features.MeshExtendedFeatures).UnsortedList()...)
-	slices.Sort(exempt)
-	return exempt
-}
 
 func TestConformance(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
@@ -63,6 +53,7 @@ func TestConformance(t *testing.T) {
 
 	// 2. Deploy Controller
 	h.DeployController()
+	h.WaitForGatewayClassStatus("reference-class", 1*time.Minute)
 
 	// 3. Run Conformance Tests
 	cfg := h.RESTConfig()
@@ -98,19 +89,10 @@ func TestConformance(t *testing.T) {
 		Client:     cl,
 		RestConfig: cfg,
 		ConfigurableOptions: suite.ConfigurableOptions{
-			GatewayClassName:           "reference-class",
-			Debug:                      true,
-			CleanupBaseResources:       true,
-			CleanupTestResources:       true,
-			EnableAllSupportedFeatures: true,
-			ExemptFeatures:             exemptFeatures(),
-			SupportedFeatures: []features.FeatureName{
-				features.SupportGatewayBackendClientCertificate,
-				features.SupportGatewayFrontendClientCertificateValidation,
-				features.SupportGatewayFrontendClientCertificateValidationInsecureFallback,
-				features.SupportTCPRoute,
-				features.SupportUDPRoute,
-			},
+			GatewayClassName:     "reference-class",
+			Debug:                true,
+			CleanupBaseResources: true,
+			CleanupTestResources: true,
 			UsableNetworkAddresses: []gatewayv1.GatewaySpecAddress{
 				{
 					Type:  state.Ptr(gatewayv1.IPAddressType),
@@ -191,13 +173,5 @@ func TestSkippedTestsExist(t *testing.T) {
 	}
 	if err := validateSkippedTests(testSkip, tests.ConformanceTests); err == nil {
 		t.Fatal("expected error for non-existent test in skip set, got nil")
-	}
-}
-
-func TestMeshFeaturesExempt(t *testing.T) {
-	for name := range skippedTests {
-		if strings.HasPrefix(name, "Mesh") {
-			t.Errorf("skippedTests contains Mesh test %q; mesh tests should be exempt via features", name)
-		}
 	}
 }

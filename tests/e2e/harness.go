@@ -177,6 +177,27 @@ func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
 	h.runCmd("kubectl", "wait", "--namespace", "default", "--for=condition=available", "--timeout="+timeout.String(), "deployment/"+name)
 }
 
+func (h *Harness) WaitForGatewayClassStatus(name string, timeout time.Duration) {
+	h.t.Logf("Waiting for GatewayClass %s to have supportedFeatures populated", name)
+	start := time.Now()
+	for {
+		if time.Since(start) > timeout {
+			logs := h.runCmd("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
+			h.t.Logf("Controller logs on timeout:\n%s", logs)
+			h.t.Fatalf("Timeout waiting for GatewayClass %s supportedFeatures", name)
+		}
+
+		out, err := exec.Command("kubectl", "get", "gatewayclass", name, "-o", "jsonpath={.status.supportedFeatures}").Output()
+		if err != nil {
+			h.t.Logf("waiting for gatewayclass %s: %v", name, err)
+		} else if strings.TrimSpace(string(out)) != "" {
+			h.t.Logf("GatewayClass %s has supportedFeatures populated", name)
+			return
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
 func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Duration) string {
 	h.t.Logf("Waiting for Gateway %s/%s to have an address assigned", namespace, name)
 	start := time.Now()
