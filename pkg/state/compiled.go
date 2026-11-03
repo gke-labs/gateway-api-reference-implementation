@@ -3422,8 +3422,14 @@ func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName
 		conds = append(conds, ComputeSupportedVersionCondition(*crdBundleVersion, gc.Generation))
 	}
 
+	var supportedFeatures []gatewayv1.SupportedFeature
+	if acceptedStatus == metav1.ConditionTrue {
+		supportedFeatures = GatewayClassSupportedFeatures()
+	}
+
 	return gatewayv1.GatewayClassStatus{
-		Conditions: conds,
+		Conditions:        conds,
+		SupportedFeatures: supportedFeatures,
 	}
 }
 
@@ -3587,7 +3593,12 @@ func MergeBackendTLSPolicyStatus(current *gatewayv1.PolicyStatus, desired gatewa
 
 // MergeGatewayClassStatus merges desired GatewayClassStatus into current, preserving LastTransitionTime.
 func MergeGatewayClassStatus(current *gatewayv1.GatewayClassStatus, desired gatewayv1.GatewayClassStatus) bool {
-	return SetConditions(&current.Conditions, desired.Conditions)
+	updated := SetConditions(&current.Conditions, desired.Conditions)
+	if !slices.Equal(current.SupportedFeatures, desired.SupportedFeatures) {
+		current.SupportedFeatures = slices.Clone(desired.SupportedFeatures)
+		updated = true
+	}
+	return updated
 }
 
 // GatewayStatusesEqual compares two GatewayStatus objects (ignoring LastTransitionTime).
@@ -3707,7 +3718,10 @@ func PolicyStatusesEqual(a, b gatewayv1.PolicyStatus) bool {
 
 // GatewayClassStatusesEqual compares two GatewayClassStatus objects (ignoring LastTransitionTime).
 func GatewayClassStatusesEqual(a, b gatewayv1.GatewayClassStatus) bool {
-	return ConditionsEqual(a.Conditions, b.Conditions)
+	if !ConditionsEqual(a.Conditions, b.Conditions) {
+		return false
+	}
+	return slices.Equal(a.SupportedFeatures, b.SupportedFeatures)
 }
 
 func reflectAddressesEqual(a, b []gatewayv1.GatewayStatusAddress) bool {
