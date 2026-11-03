@@ -496,6 +496,76 @@ func TestMDNSMulticastAndLegacyUnicastResponse(t *testing.T) {
 	})
 }
 
+// TestMDNSKnownAnswerNameMatching verifies that known-answer suppression compares record names case-insensitively.
+func TestMDNSKnownAnswerNameMatching(t *testing.T) {
+	setup := func(t *testing.T) (*Responder, net.Addr, func() int) {
+		resp, err := NewResponder(ResponderOptions{Ephemeral: true, DisableIPv6: true})
+		if err != nil {
+			t.Fatalf("NewResponder: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := resp.Close(); err != nil {
+				t.Errorf("resp.Close: %v", err)
+			}
+		})
+		resp.SetRecord(&RecordSet{FQDN: "grafana.local.", A: []net.IP{net.IPv4(192, 168, 1, 100)}, TTL: 120})
+
+		var (
+			tapMu sync.Mutex
+			count int
+		)
+		resp.multicastTap = func([]byte) {
+			tapMu.Lock()
+			count++
+			tapMu.Unlock()
+		}
+		return resp, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: resp.Port()}, func() int {
+			tapMu.Lock()
+			defer tapMu.Unlock()
+			return count
+		}
+	}
+
+	buildQueryWithKnownAnswer := func(t *testing.T, kaName string) []byte {
+		b := dnsmessage.NewBuilder(nil, dnsmessage.Header{})
+		b.EnableCompression()
+		if err := b.StartQuestions(); err != nil {
+			t.Fatalf("StartQuestions: %v", err)
+		}
+		if err := b.Question(dnsmessage.Question{Name: dnsmessage.MustNewName("grafana.local."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}); err != nil {
+			t.Fatalf("Question: %v", err)
+		}
+		if err := b.StartAnswers(); err != nil {
+			t.Fatalf("StartAnswers: %v", err)
+		}
+		hdr := dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName(kaName), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 100}
+		if err := b.AResource(hdr, dnsmessage.AResource{A: [4]byte{192, 168, 1, 100}}); err != nil {
+			t.Fatalf("AResource: %v", err)
+		}
+		data, err := b.Finish()
+		if err != nil {
+			t.Fatalf("Finish: %v", err)
+		}
+		return data
+	}
+
+	t.Run("different name does not suppress", func(t *testing.T) {
+		resp, from, count := setup(t)
+		resp.handlePacket(buildQueryWithKnownAnswer(t, "other.local."), from, false)
+		if n := count(); n != 1 {
+			t.Fatalf("expected 1 response (known answer with different name should not suppress), got %d", n)
+		}
+	})
+
+	t.Run("matching name in different case suppresses", func(t *testing.T) {
+		resp, from, count := setup(t)
+		resp.handlePacket(buildQueryWithKnownAnswer(t, "GRAFANA.LOCAL."), from, false)
+		if n := count(); n != 0 {
+			t.Fatalf("expected 0 responses (known answer matching in different case must suppress), got %d", n)
+		}
+	})
+}
+
 // TestMDNSRemoveSendsGoodbye verifies that removing a published name sends a goodbye record (TTL=0).
 func TestMDNSRemoveSendsGoodbye(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
