@@ -395,6 +395,107 @@ func TestMDNSRateLimitAndKnownAnswerSuppression(t *testing.T) {
 	}
 }
 
+// TestMDNSMulticastAndLegacyUnicastResponse verifies that multicast responses set ID 0
+// and omit questions, while legacy unicast responses echo the query ID and question.
+func TestMDNSMulticastAndLegacyUnicastResponse(t *testing.T) {
+	resp, err := NewResponder(ResponderOptions{
+		Ephemeral:   true,
+		DisableIPv6: true,
+	})
+	if err != nil {
+		t.Fatalf("NewResponder failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := resp.Close(); err != nil {
+			t.Errorf("resp.Close failed: %v", err)
+		}
+	})
+
+	resp.SetRecord(&RecordSet{
+		FQDN: "grafana.local.",
+		A:    []net.IP{net.ParseIP("192.168.1.100").To4()},
+		TTL:  120,
+	})
+
+	const queryID = 0x4321
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: queryID})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		t.Fatalf("starting questions: %v", err)
+	}
+	if err := b.Question(dnsmessage.Question{
+		Name:  dnsmessage.MustNewName("grafana.local."),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}); err != nil {
+		t.Fatalf("adding question: %v", err)
+	}
+	qData, err := b.Finish()
+	if err != nil {
+		t.Fatalf("building query: %v", err)
+	}
+
+	t.Run("Multicast", func(t *testing.T) {
+		var multicastData []byte
+		resp.multicastTap = func(raw []byte) { multicastData = raw }
+		resp.handlePacket(qData, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: resp.Port()}, false)
+
+		if len(multicastData) == 0 {
+			t.Fatalf("expected multicast response, got none")
+		}
+		var p dnsmessage.Parser
+		hdr, err := p.Start(multicastData)
+		if err != nil {
+			t.Fatalf("parsing response: %v", err)
+		}
+		if hdr.ID != 0 {
+			t.Errorf("multicast response ID must be 0, got %d", hdr.ID)
+		}
+		if _, err := p.Question(); err != dnsmessage.ErrSectionDone {
+			t.Errorf("multicast response must omit questions, got err %v", err)
+		}
+	})
+
+	t.Run("LegacyUnicast", func(t *testing.T) {
+		legacyConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to create legacy listener: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := legacyConn.Close(); err != nil {
+				t.Errorf("legacyConn.Close failed: %v", err)
+			}
+		})
+
+		resp.handlePacket(qData, legacyConn.LocalAddr(), false)
+
+		buf := make([]byte, 1024)
+		if err := legacyConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatalf("setting read deadline: %v", err)
+		}
+		n, _, err := legacyConn.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("reading legacy unicast response: %v", err)
+		}
+
+		var p dnsmessage.Parser
+		hdr, err := p.Start(buf[:n])
+		if err != nil {
+			t.Fatalf("parsing response: %v", err)
+		}
+		if hdr.ID != queryID {
+			t.Errorf("legacy unicast response ID must match query ID %d, got %d", queryID, hdr.ID)
+		}
+		q, err := p.Question()
+		if err != nil {
+			t.Fatalf("reading question: %v", err)
+		}
+		if q.Name.String() != "grafana.local." || q.Type != dnsmessage.TypeA {
+			t.Errorf("expected echoed question grafana.local. TypeA, got %v", q)
+		}
+	})
+}
+
 // TestMDNSRemoveSendsGoodbye verifies that removing a published name sends a goodbye record (TTL=0).
 func TestMDNSRemoveSendsGoodbye(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
