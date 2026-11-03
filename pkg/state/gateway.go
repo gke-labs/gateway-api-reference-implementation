@@ -655,6 +655,7 @@ type InternalBackend struct {
 	RequestHeaderModifier  *gatewayv1.HTTPHeaderFilter
 	ResponseHeaderModifier *gatewayv1.HTTPHeaderFilter
 	CORS                   *gatewayv1.HTTPCORSFilter
+	Rewrite                *InternalRewrite
 	Error                  *ErrorState
 }
 
