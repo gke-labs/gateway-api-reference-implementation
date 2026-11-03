@@ -50,6 +50,9 @@ const (
 
 	// CacheFlushBit is the most significant bit of the RRClass field (RFC 6762 §10.2).
 	CacheFlushBit = 0x8000
+
+	// QUBit is the unicast-response bit in question classes (RFC 6762 §5.4).
+	QUBit = CacheFlushBit
 )
 
 // RecordSet represents the set of addresses published for an mDNS hostname.
@@ -592,7 +595,7 @@ func (r *Responder) handleQuery(p *dnsmessage.Parser, queryHeader dnsmessage.Hea
 
 	unicastRequested := isLegacyUnicast
 	for _, q := range questions {
-		if uint16(q.Class)&CacheFlushBit != 0 {
+		if uint16(q.Class)&QUBit != 0 {
 			unicastRequested = true
 		}
 	}
@@ -603,6 +606,12 @@ func (r *Responder) handleQuery(p *dnsmessage.Parser, queryHeader dnsmessage.Hea
 
 	r.mu.Lock()
 	for _, q := range questions {
+		// RFC 6762 §5.5: clear the QU bit, then ignore questions for classes we don't hold records in.
+		class := q.Class &^ dnsmessage.Class(QUBit)
+		if class != dnsmessage.ClassINET && class != dnsmessage.ClassANY {
+			continue
+		}
+
 		qname := strings.ToLower(q.Name.String())
 		rec, found := r.records[qname]
 		if !found {
@@ -892,7 +901,7 @@ func (r *Responder) SendProbe(fqdn string, proposedRecords []dnsmessage.Resource
 	if err := b.Question(dnsmessage.Question{
 		Name:  name,
 		Type:  dnsmessage.TypeALL,
-		Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | CacheFlushBit), // QU bit requests unicast response
+		Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | QUBit), // QU bit requests unicast response
 	}); err != nil {
 		return fmt.Errorf("adding probe question: %w", err)
 	}
