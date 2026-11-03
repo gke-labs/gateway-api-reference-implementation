@@ -698,8 +698,15 @@ func (r *Responder) handleQuery(p *dnsmessage.Parser, queryHeader dnsmessage.Hea
 		return
 	}
 
+	// Per RFC 6762 §18.1 and §6.7, multicast responses set the message ID to 0,
+	// while legacy unicast responses copy the query ID.
+	var respID uint16
+	if isLegacyUnicast {
+		respID = queryHeader.ID
+	}
+
 	respHdr := dnsmessage.Header{
-		ID:               queryHeader.ID,
+		ID:               respID,
 		Response:         true,
 		OpCode:           queryHeader.OpCode,
 		Authoritative:    true,
@@ -709,7 +716,9 @@ func (r *Responder) handleQuery(p *dnsmessage.Parser, queryHeader dnsmessage.Hea
 	b := dnsmessage.NewBuilder(nil, respHdr)
 	b.EnableCompression()
 
-	if len(questions) > 0 {
+	// Per RFC 6762 §6 and §6.7, multicast responses omit the question section,
+	// while legacy unicast responses echo the question.
+	if isLegacyUnicast && len(questions) > 0 {
 		if err := b.StartQuestions(); err != nil {
 			klog.Warningf("failed to start questions in response: %v", err)
 			return
