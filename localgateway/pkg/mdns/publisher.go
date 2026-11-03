@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/miekg/dns"
+	"golang.org/x/net/dns/dnsmessage"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -117,8 +117,8 @@ type PublisherOptions struct {
 	// Responder is an optional custom Responder instance (useful for testing).
 	Responder *Responder
 
-	// MulticastTap is an optional callback receiving every multicast DNS message sent.
-	MulticastTap func(msg *dns.Msg)
+	// MulticastTap is an optional callback receiving every multicast DNS packet sent.
+	MulticastTap func(raw []byte)
 }
 
 type listenerKey struct {
@@ -131,7 +131,7 @@ type hostnamePublicationState struct {
 	hostname        string // raw hostname
 	state           HostnameState
 	addresses       []net.IP
-	records         []dns.RR
+	records         []dnsmessage.Resource
 	conflictReason  string
 	conflictMessage string
 	lastConflict    time.Time
@@ -273,7 +273,7 @@ func (p *Publisher) Start(ctx context.Context) error {
 	// Graceful shutdown: send goodbyes for all active published hostnames
 	p.mu.Lock()
 	p.cancel() // cancel all probe routines
-	var allRecords []dns.RR
+	var allRecords []dnsmessage.Resource
 	for _, st := range p.names {
 		if st.state == StatePublished && len(st.records) > 0 {
 			allRecords = append(allRecords, st.records...)
@@ -305,8 +305,8 @@ func isNormalClose(err error) bool {
 
 // onConflict is invoked by the Responder when a conflict is detected on the LAN
 // during active probing or after publishing (RFC 6762 §9).
-func (p *Publisher) onConflict(fqdn string, conflictingRR dns.RR) {
-	name := strings.ToLower(dns.Fqdn(fqdn))
+func (p *Publisher) onConflict(fqdn string, conflictingRR dnsmessage.Resource) {
+	name := strings.ToLower(toFQDN(fqdn))
 
 	p.mu.Lock()
 	st, ok := p.names[name]
@@ -376,7 +376,7 @@ func (p *Publisher) retryConflict(fqdn string) {
 
 	probeCtx, cancel := context.WithCancel(p.ctx)
 	st.cancelProbe = cancel
-	records := append([]dns.RR(nil), st.records...)
+	records := append([]dnsmessage.Resource(nil), st.records...)
 	var gws []types.NamespacedName
 	for lk := range st.listeners {
 		gws = append(gws, lk.gw)
@@ -436,7 +436,7 @@ func (p *Publisher) OnGatewaysUpdate(gateways []*gatewayv1.Gateway) {
 			}
 
 			currentGWListeners[l.Name] = struct{}{}
-			fqdn := strings.ToLower(dns.Fqdn(rawHostname))
+			fqdn := strings.ToLower(toFQDN(rawHostname))
 			currentGWFQDNs[fqdn] = struct{}{}
 			lk := listenerKey{gw: gwKey, listener: l.Name}
 
@@ -535,7 +535,7 @@ func (p *Publisher) StatusHook(ctx context.Context, gw *gatewayv1.Gateway, statu
 		}
 
 		// Read publisher state for this hostname
-		fqdn := strings.ToLower(dns.Fqdn(rawHostname))
+		fqdn := strings.ToLower(toFQDN(rawHostname))
 		pubState, found := p.GetHostnameState(fqdn)
 		if !found {
 			// If not yet picked up by OnGatewaysUpdate, report Probing
@@ -589,7 +589,7 @@ func (p *Publisher) StatusHook(ctx context.Context, gw *gatewayv1.Gateway, statu
 
 // GetHostnameState returns a snapshot of the current publication state for a hostname.
 func (p *Publisher) GetHostnameState(fqdn string) (HostnamePublicationSnapshot, bool) {
-	name := strings.ToLower(dns.Fqdn(fqdn))
+	name := strings.ToLower(toFQDN(fqdn))
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	st, ok := p.names[name]
@@ -615,7 +615,11 @@ func (p *Publisher) syncListener(lk listenerKey, rawHostname, fqdn string, addrs
 	}
 	p.listeners[lk] = fqdn
 
-	records := buildRecords(fqdn, addrs, p.opts.TTL)
+	records, err := buildRecords(fqdn, addrs, p.opts.TTL)
+	if err != nil {
+		klog.Warningf("failed to build records for %s: %v", fqdn, err)
+		return nil
+	}
 
 	st, exists := p.names[fqdn]
 	if !exists {
@@ -699,7 +703,7 @@ func (p *Publisher) untrackListenerLocked(lk listenerKey) {
 }
 
 // runProbe executes RFC 6762 §8.1 probing before claiming an mDNS hostname.
-func (p *Publisher) runProbe(ctx context.Context, fqdn string, proposedRecords []dns.RR, gws []types.NamespacedName) {
+func (p *Publisher) runProbe(ctx context.Context, fqdn string, proposedRecords []dnsmessage.Resource, gws []types.NamespacedName) {
 	p.responder.RegisterProbe(fqdn, proposedRecords)
 	defer p.responder.UnregisterProbe(fqdn)
 
@@ -756,7 +760,7 @@ func (p *Publisher) runProbe(ctx context.Context, fqdn string, proposedRecords [
 		AAAA: aaaa,
 		TTL:  p.opts.TTL,
 	})
-	records := append([]dns.RR(nil), st.records...)
+	records := append([]dnsmessage.Resource(nil), st.records...)
 	p.mu.Unlock()
 
 	// Send initial announcements (RFC 6762 §8.3: at least two announcements)
@@ -778,33 +782,41 @@ func (p *Publisher) runProbe(ctx context.Context, fqdn string, proposedRecords [
 	p.enqueueGateways(gws)
 }
 
-// buildRecords creates A and AAAA dns.RR resource records for the given FQDN and IP addresses.
-func buildRecords(fqdn string, addrs []net.IP, ttl uint32) []dns.RR {
-	var records []dns.RR
+// buildRecords creates A and AAAA dnsmessage.Resource records for the given FQDN and IP addresses.
+func buildRecords(fqdn string, addrs []net.IP, ttl uint32) ([]dnsmessage.Resource, error) {
+	name, err := dnsmessage.NewName(toFQDN(fqdn))
+	if err != nil {
+		return nil, fmt.Errorf("invalid fqdn %q: %w", fqdn, err)
+	}
+	var records []dnsmessage.Resource
 	for _, ip := range addrs {
 		if ip4 := ip.To4(); ip4 != nil {
-			records = append(records, &dns.A{
-				Hdr: dns.RR_Header{
-					Name:   fqdn,
-					Rrtype: dns.TypeA,
-					Class:  dns.ClassINET | CacheFlushBit,
-					Ttl:    ttl,
+			var a [4]byte
+			copy(a[:], ip4)
+			records = append(records, dnsmessage.Resource{
+				Header: dnsmessage.ResourceHeader{
+					Name:  name,
+					Type:  dnsmessage.TypeA,
+					Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | CacheFlushBit),
+					TTL:   ttl,
 				},
-				A: ip4,
+				Body: &dnsmessage.AResource{A: a},
 			})
 		} else if ip6 := ip.To16(); ip6 != nil {
-			records = append(records, &dns.AAAA{
-				Hdr: dns.RR_Header{
-					Name:   fqdn,
-					Rrtype: dns.TypeAAAA,
-					Class:  dns.ClassINET | CacheFlushBit,
-					Ttl:    ttl,
+			var aaaa [16]byte
+			copy(aaaa[:], ip6)
+			records = append(records, dnsmessage.Resource{
+				Header: dnsmessage.ResourceHeader{
+					Name:  name,
+					Type:  dnsmessage.TypeAAAA,
+					Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | CacheFlushBit),
+					TTL:   ttl,
 				},
-				AAAA: ip6,
+				Body: &dnsmessage.AAAAResource{AAAA: aaaa},
 			})
 		}
 	}
-	return records
+	return records, nil
 }
 
 func ipsEqual(a, b []net.IP) bool {

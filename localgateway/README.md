@@ -15,7 +15,7 @@ It is purpose-built to serve single-label `.local` hostnames (such as `grafana.l
 - **HTTP Only:** `localgateway` currently supports HTTP listeners only. HTTPS/TLS listeners are rejected with condition `Accepted=False` (`Reason: UnsupportedProtocol`) and `Programmed=False` (`Reason: Invalid`).
 - **LAN Address Provider:** Populates the node's LAN IPv4 and IPv6 addresses into `Gateway.status.addresses` via `--interface` or Node `InternalIP`.
 - **mDNS Publishing from the Data Plane:**
-  - Built-in pure-Go mDNS responder based on `github.com/miekg/dns`.
+  - Built-in pure-Go mDNS responder based on `golang.org/x/net/dns/dnsmessage`.
   - Automatically publishes served `.local` hostnames on the LAN over mDNS (multicast UDP `224.0.0.251:5353` and `[ff02::fb]:5353`), so devices on the network resolve `grafana.local` to the gateway with no manual DNS configuration.
   - **Port 5353 Ownership:** `localgateway` owns UDP port 5353 on the node. Any host `avahi-daemon` or systemd-resolved mDNS must be stopped or bound elsewhere; `localgateway` will fail clearly at startup if port 5353 is already taken.
   - **RFC 6762 Probing & Conflict Detection:** Probes before claiming a name. If another host on the LAN already responds to the name, `localgateway` stops the claim, reports `Published=False` and `Conflicted=True` with reason `HostnameConflict` on the listener status, and periodically retries.
