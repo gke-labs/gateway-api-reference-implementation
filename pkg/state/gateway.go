@@ -472,59 +472,85 @@ func isBetterListenerMatch(current, best *listenerMatchCandidate) bool {
 	return false
 }
 
+// RouteHostname associates an effective listener hostname with the route's
+// original configured hostname. The original hostname defines precedence.
+type RouteHostname struct {
+	Hostname         string
+	OriginalHostname string
+}
+
+// NewRouteHostname constructs a RouteHostname pairing an effective listener hostname
+// with the route's original configured hostname.
+func NewRouteHostname(hostname, originalHostname string) RouteHostname {
+	return RouteHostname{
+		Hostname:         hostname,
+		OriginalHostname: originalHostname,
+	}
+}
+
+func (r RouteHostname) matchesHostname(cleanHost string) bool {
+	cleanH := strings.ToLower(r.Hostname)
+	return cleanH == "*" || cleanH == cleanHost || MatchesWildcard(cleanH, cleanHost)
+}
+
+func (r RouteHostname) score(cleanHost string) (int, int) {
+	cleanOrig := strings.ToLower(r.OriginalHostname)
+	if cleanOrig == "*" || cleanOrig == "" {
+		return 0, 0
+	}
+	if cleanOrig == cleanHost {
+		return len(cleanOrig), len(cleanOrig)
+	}
+	if MatchesWildcard(cleanOrig, cleanHost) {
+		return 0, len(cleanOrig)
+	}
+	return 0, 0
+}
+
 // InternalRoute represents the computed state for a route, used by the proxy.
 type InternalRoute struct {
-	Hostnames []string
+	Hostnames []RouteHostname
 	Rules     []InternalRule
 }
 
+func (ir *InternalRoute) matchRouteHostnames(host string) (bool, int, int) {
+	if len(ir.Hostnames) == 0 {
+		return true, 0, 0
+	}
+
+	cleanHost := strings.ToLower(hostWithoutPort(host))
+	matched := false
+	maxNonWildcardLen := 0
+	maxHostnameLen := 0
+
+	for _, rh := range ir.Hostnames {
+		if !rh.matchesHostname(cleanHost) {
+			continue
+		}
+		matched = true
+
+		nonWildcardLen, hostnameLen := rh.score(cleanHost)
+		if nonWildcardLen > maxNonWildcardLen {
+			maxNonWildcardLen = nonWildcardLen
+		}
+		if hostnameLen > maxHostnameLen {
+			maxHostnameLen = hostnameLen
+		}
+	}
+
+	return matched, maxNonWildcardLen, maxHostnameLen
+}
+
 func (ir *InternalRoute) MatchHostname(host string) bool {
-	matched, _, _ := ir.MatchHostnameScore(host)
+	matched, _, _ := ir.matchRouteHostnames(host)
 	return matched
 }
 
 // MatchHostnameScore computes whether the host matches any of the route's hostnames,
 // and returns the number of characters in the matching non-wildcard hostname and total matching hostname.
+// Precedence is defined by OriginalHostname.
 func (ir *InternalRoute) MatchHostnameScore(host string) (bool, int, int) {
-	host = hostWithoutPort(host)
-	cleanHost := strings.ToLower(host)
-
-	if len(ir.Hostnames) == 0 {
-		return true, 0, 0
-	}
-
-	matched := false
-	maxNonWildcardLen := 0
-	maxHostnameLen := 0
-
-	for _, h := range ir.Hostnames {
-		cleanH := strings.ToLower(h)
-		if cleanH == "*" {
-			matched = true
-			continue
-		}
-		if cleanH == cleanHost {
-			matched = true
-			if len(cleanH) > maxNonWildcardLen {
-				maxNonWildcardLen = len(cleanH)
-			}
-			if len(cleanH) > maxHostnameLen {
-				maxHostnameLen = len(cleanH)
-			}
-			continue
-		}
-		if strings.HasPrefix(cleanH, "*.") {
-			suffix := cleanH[1:] // .example.com
-			if len(cleanHost) > len(suffix) && strings.HasSuffix(cleanHost, suffix) {
-				matched = true
-				if len(cleanH) > maxHostnameLen {
-					maxHostnameLen = len(cleanH)
-				}
-			}
-		}
-	}
-
-	return matched, maxNonWildcardLen, maxHostnameLen
+	return ir.matchRouteHostnames(host)
 }
 
 // ErrorState represents an error that should be surfaced to the user.

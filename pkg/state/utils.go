@@ -55,21 +55,40 @@ func IsUDPRoute(group *gatewayv1.Group, kind gatewayv1.Kind) bool {
 
 // IntersectHostnames calculates the intersection of route hostnames and a listener hostname.
 func IntersectHostnames(routeHostnames []string, listenerHostname string) []string {
+	rhs := IntersectRouteHostnames(routeHostnames, listenerHostname)
+	if len(rhs) == 0 {
+		return nil
+	}
+	out := make([]string, len(rhs))
+	for i, rh := range rhs {
+		out[i] = rh.Hostname
+	}
+	return out
+}
+
+// IntersectRouteHostnames calculates the intersection of route hostnames and a listener hostname,
+// pairing each effective listener hostname with the route's original configured hostname.
+// The original hostname defines precedence.
+func IntersectRouteHostnames(routeHostnames []string, listenerHostname string) []RouteHostname {
 	if listenerHostname == "" || listenerHostname == "*" {
 		if len(routeHostnames) == 0 {
-			return []string{"*"}
+			return []RouteHostname{{Hostname: "*", OriginalHostname: ""}}
 		}
-		return routeHostnames
+		var result []RouteHostname
+		for _, rh := range routeHostnames {
+			result = append(result, RouteHostname{Hostname: rh, OriginalHostname: rh})
+		}
+		return result
 	}
 
 	if len(routeHostnames) == 0 {
-		return []string{listenerHostname}
+		return []RouteHostname{{Hostname: listenerHostname, OriginalHostname: ""}}
 	}
 
-	var result []string
+	var result []RouteHostname
 	for _, rh := range routeHostnames {
 		if intersection, ok := Intersect(rh, listenerHostname); ok {
-			result = append(result, intersection)
+			result = append(result, RouteHostname{Hostname: intersection, OriginalHostname: rh})
 		}
 	}
 	return result

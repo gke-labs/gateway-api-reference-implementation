@@ -128,7 +128,7 @@ func TestClientCertificateValidation_RealSockets(t *testing.T) {
 	}, &serverCert)
 
 	routeA := state.InternalRoute{
-		Hostnames: []string{"a.example.com"},
+		Hostnames: testRouteHostnames("a.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
@@ -137,7 +137,7 @@ func TestClientCertificateValidation_RealSockets(t *testing.T) {
 		},
 	}
 	routeB := state.InternalRoute{
-		Hostnames: []string{"b.example.com"},
+		Hostnames: testRouteHostnames("b.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
@@ -146,7 +146,7 @@ func TestClientCertificateValidation_RealSockets(t *testing.T) {
 		},
 	}
 	routeC := state.InternalRoute{
-		Hostnames: []string{"c.example.com"},
+		Hostnames: testRouteHostnames("c.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
@@ -155,7 +155,7 @@ func TestClientCertificateValidation_RealSockets(t *testing.T) {
 		},
 	}
 	routeD := state.InternalRoute{
-		Hostnames: []string{"d.example.com"},
+		Hostnames: testRouteHostnames("d.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
@@ -442,7 +442,7 @@ func TestClientCertificateValidation_FailClosedInvalidConfiguration(t *testing.T
 
 	routeFor := func(host string) state.InternalRoute {
 		return state.InternalRoute{
-			Hostnames: []string{host},
+			Hostnames: testRouteHostnames(host),
 			Rules: []state.InternalRule{
 				{
 					Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
@@ -635,7 +635,7 @@ func TestClientCertificateValidation_AllowInsecureFallback(t *testing.T) {
 	}, &serverCert)
 
 	routeFallback := state.InternalRoute{
-		Hostnames: []string{"fallback.example.com"},
+		Hostnames: testRouteHostnames("fallback.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
@@ -644,7 +644,7 @@ func TestClientCertificateValidation_AllowInsecureFallback(t *testing.T) {
 		},
 	}
 	routeValid := state.InternalRoute{
-		Hostnames: []string{"valid.example.com"},
+		Hostnames: testRouteHostnames("valid.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
@@ -828,7 +828,7 @@ func TestTLSSessionResumption_ValidatedListener(t *testing.T) {
 	}, &serverCert)
 
 	route := state.InternalRoute{
-		Hostnames: []string{"validated.example.com"},
+		Hostnames: testRouteHostnames("validated.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{

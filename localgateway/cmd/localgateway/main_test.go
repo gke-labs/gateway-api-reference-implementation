@@ -290,7 +290,7 @@ func TestLocalGateway_E2E_AppLocalCompiledRoute(t *testing.T) {
 			t.Fatalf("expected 1 proxy route, got %d", len(outputs.ProxyRoutes))
 		}
 		pr := outputs.ProxyRoutes[0]
-		if len(pr.Hostnames) != 1 || pr.Hostnames[0] != "app.local" {
+		if len(pr.Hostnames) != 1 || pr.Hostnames[0].Hostname != "app.local" {
 			t.Errorf("expected proxy route hostnames ['app.local'], got %+v", pr.Hostnames)
 		}
 

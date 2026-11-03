@@ -49,6 +49,14 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+func testRouteHostnames(hostnames ...string) []state.RouteHostname {
+	out := make([]state.RouteHostname, len(hostnames))
+	for i, h := range hostnames {
+		out[i] = state.NewRouteHostname(h, h)
+	}
+	return out
+}
+
 func TestProxyRewrite(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -1261,7 +1269,7 @@ func TestProxy_HTTPSListenerDetectMisdirectedRequests(t *testing.T) {
 			Hostname: "",
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"example.org"},
+					Hostnames: testRouteHostnames("example.org"),
 					Rules: []state.InternalRule{
 						{
 							Matches: []state.InternalMatch{
@@ -1281,7 +1289,7 @@ func TestProxy_HTTPSListenerDetectMisdirectedRequests(t *testing.T) {
 			Hostname: "second-example.org",
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"second-example.org"},
+					Hostnames: testRouteHostnames("second-example.org"),
 					Rules: []state.InternalRule{
 						{
 							Matches: []state.InternalMatch{
@@ -1301,7 +1309,7 @@ func TestProxy_HTTPSListenerDetectMisdirectedRequests(t *testing.T) {
 			Hostname: "*.wildcard.org",
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"*.wildcard.org"},
+					Hostnames: testRouteHostnames("*.wildcard.org"),
 					Rules: []state.InternalRule{
 						{
 							Matches: []state.InternalMatch{
@@ -1321,7 +1329,7 @@ func TestProxy_HTTPSListenerDetectMisdirectedRequests(t *testing.T) {
 			Hostname: "fourth-example.wildcard.org",
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"fourth-example.wildcard.org"},
+					Hostnames: testRouteHostnames("fourth-example.wildcard.org"),
 					Rules: []state.InternalRule{
 						{
 							Matches: []state.InternalMatch{
@@ -2108,7 +2116,7 @@ func TestProxy_ListenerPortMatching(t *testing.T) {
 			Port:     80,
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"foo.com"},
+					Hostnames: testRouteHostnames("foo.com"),
 					Rules: []state.InternalRule{
 						{
 							Backends: []state.InternalBackend{{Host: u1.Hostname(), Port: int32(port1), Weight: 1}},
@@ -2124,7 +2132,7 @@ func TestProxy_ListenerPortMatching(t *testing.T) {
 			Port:     8080,
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"foo.com"},
+					Hostnames: testRouteHostnames("foo.com"),
 					Rules: []state.InternalRule{
 						{
 							Backends: []state.InternalBackend{{Host: u2.Hostname(), Port: int32(port2), Weight: 1}},
@@ -2140,7 +2148,7 @@ func TestProxy_ListenerPortMatching(t *testing.T) {
 			Port:     8080,
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"bar.com"},
+					Hostnames: testRouteHostnames("bar.com"),
 					Rules: []state.InternalRule{
 						{
 							Backends: []state.InternalBackend{{Host: u2.Hostname(), Port: int32(port2), Weight: 1}},
@@ -2156,7 +2164,7 @@ func TestProxy_ListenerPortMatching(t *testing.T) {
 			Port:     8090,
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"foo.com"},
+					Hostnames: testRouteHostnames("foo.com"),
 					Rules: []state.InternalRule{
 						{
 							Backends: []state.InternalBackend{{Host: u3.Hostname(), Port: int32(port3), Weight: 1}},
@@ -2607,7 +2615,7 @@ func TestBackendTLS_WithoutPolicy_Verification(t *testing.T) {
 		TLSConfig:   nil,
 	}
 	routeNoPolicy := state.InternalRoute{
-		Hostnames: []string{"test.example.com"},
+		Hostnames: testRouteHostnames("test.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{
@@ -2649,7 +2657,7 @@ func TestBackendTLS_WithoutPolicy_Verification(t *testing.T) {
 		},
 	}
 	routeWithPolicy := state.InternalRoute{
-		Hostnames: []string{"test.example.com"},
+		Hostnames: testRouteHostnames("test.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{
@@ -2880,7 +2888,7 @@ func TestProxy_H2C_GRPC(t *testing.T) {
 	h2cProto := "kubernetes.io/h2c"
 	p.UpdateRoutes([]state.InternalRoute{
 		{
-			Hostnames: []string{"example.com"},
+			Hostnames: testRouteHostnames("example.com"),
 			Rules: []state.InternalRule{
 				{
 					Matches: []state.InternalMatch{
@@ -3256,7 +3264,7 @@ func TestBackendTLSPolicy_MissingClientCertID_FailsClosed(t *testing.T) {
 		GatewayName: types.NamespacedName{Namespace: "default", Name: "test-gw"},
 		Routes: []state.InternalRoute{
 			{
-				Hostnames: []string{"backend.local"},
+				Hostnames: testRouteHostnames("backend.local"),
 				Rules:     []state.InternalRule{rule},
 			},
 		},
@@ -3296,7 +3304,7 @@ func TestBackendTLSPolicy_MissingClientCertID_FailsClosed(t *testing.T) {
 		pDirect := NewProxy()
 		pDirect.UpdateConfig(nil, []state.InternalRoute{
 			{
-				Hostnames: []string{"backend.local"},
+				Hostnames: testRouteHostnames("backend.local"),
 				Rules:     []state.InternalRule{rule},
 			},
 		})
@@ -3495,7 +3503,7 @@ func TestServeHTTP_PortlessHostMatching(t *testing.T) {
 			Hostname: "exact.example.com",
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"exact.example.com"},
+					Hostnames: testRouteHostnames("exact.example.com"),
 					Rules: []state.InternalRule{
 						{
 							Backends: backendRef,
@@ -3514,7 +3522,7 @@ func TestServeHTTP_PortlessHostMatching(t *testing.T) {
 			Hostname: "*.wildcard.example.com",
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"*.wildcard.example.com"},
+					Hostnames: testRouteHostnames("*.wildcard.example.com"),
 					Rules: []state.InternalRule{
 						{
 							Backends: backendRef,
@@ -3533,7 +3541,7 @@ func TestServeHTTP_PortlessHostMatching(t *testing.T) {
 			Hostname: "shared.example.com",
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"shared.example.com"},
+					Hostnames: testRouteHostnames("shared.example.com"),
 					Rules: []state.InternalRule{
 						{
 							Backends: backendRef,
@@ -3552,7 +3560,7 @@ func TestServeHTTP_PortlessHostMatching(t *testing.T) {
 			Hostname: "shared.example.com",
 			Routes: []state.InternalRoute{
 				{
-					Hostnames: []string{"shared.example.com"},
+					Hostnames: testRouteHostnames("shared.example.com"),
 					Rules: []state.InternalRule{
 						{
 							Backends: backendRef,
@@ -3774,7 +3782,7 @@ func TestProxy_GRPCRoute_HeaderModifiers(t *testing.T) {
 	p := NewProxy()
 	p.UpdateRoutes([]state.InternalRoute{
 		{
-			Hostnames: compiled.Hostnames,
+			Hostnames: testRouteHostnames(compiled.Hostnames...),
 			Rules:     compiled.Rules,
 		},
 	})
@@ -3898,7 +3906,7 @@ func TestProxy_BackendConnectionReuse(t *testing.T) {
 
 	p := NewProxy()
 	route := state.InternalRoute{
-		Hostnames: []string{"example.com"},
+		Hostnames: testRouteHostnames("example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{
@@ -4036,7 +4044,7 @@ func TestTLSSessionResumption_HTTPToTLSBackend(t *testing.T) {
 		},
 	}
 	route := state.InternalRoute{
-		Hostnames: []string{"example.com"},
+		Hostnames: testRouteHostnames("example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{
@@ -4189,7 +4197,7 @@ func BenchmarkProxy_TLSBackend_Handshakes(b *testing.B) {
 
 	p := NewProxy()
 	route := state.InternalRoute{
-		Hostnames: []string{"bench.example.com"},
+		Hostnames: testRouteHostnames("bench.example.com"),
 		Rules: []state.InternalRule{
 			{
 				Matches: []state.InternalMatch{

@@ -159,6 +159,49 @@ func TestIntersectHostnames(t *testing.T) {
 	}
 }
 
+func TestIntersectRouteHostnames(t *testing.T) {
+	tests := []struct {
+		name             string
+		routeHostnames   []string
+		listenerHostname string
+		want             []RouteHostname
+	}{
+		{
+			name:             "empty route hostnames, empty listener hostname",
+			routeHostnames:   []string{},
+			listenerHostname: "",
+			want:             []RouteHostname{NewRouteHostname("*", "")},
+		},
+		{
+			name:             "empty route hostnames, exact listener hostname",
+			routeHostnames:   []string{},
+			listenerHostname: "foo.com",
+			want:             []RouteHostname{NewRouteHostname("foo.com", "")},
+		},
+		{
+			name:             "wildcard route hostname matches exact listener hostname",
+			routeHostnames:   []string{"*.foo.com"},
+			listenerHostname: "a.foo.com",
+			want:             []RouteHostname{NewRouteHostname("a.foo.com", "*.foo.com")},
+		},
+		{
+			name:             "wildcard route hostname matches wildcard listener hostname (superset)",
+			routeHostnames:   []string{"*.com"},
+			listenerHostname: "*.foo.com",
+			want:             []RouteHostname{NewRouteHostname("*.foo.com", "*.com")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IntersectRouteHostnames(tt.routeHostnames, tt.listenerHostname)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("IntersectRouteHostnames() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNoPolicyTLSBackendHosts(t *testing.T) {
 	httpsProto := "https"
 	httpProto := "http"

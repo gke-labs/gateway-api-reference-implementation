@@ -405,7 +405,7 @@ func TestSinglePodAddressProvider_NamespacedRolesAndSecrets(t *testing.T) {
 	dpCfg := &state.DataplaneConfig{
 		GatewayName: types.NamespacedName{Namespace: "ns-1", Name: "gw-1"},
 		Routes: []state.InternalRoute{
-			{Hostnames: []string{"test.com"}},
+			{Hostnames: []state.RouteHostname{state.NewRouteHostname("test.com", "test.com")}},
 		},
 	}
 	if err := p.PublishDataplaneConfig(ctx, gw1, dpCfg); err != nil {
@@ -419,7 +419,7 @@ func TestSinglePodAddressProvider_NamespacedRolesAndSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to unmarshal published config: %v", err)
 	}
-	if len(unmarshaled.Routes) != 1 || unmarshaled.Routes[0].Hostnames[0] != "test.com" {
+	if len(unmarshaled.Routes) != 1 || unmarshaled.Routes[0].Hostnames[0].Hostname != "test.com" {
 		t.Errorf("unexpected published config: %+v", unmarshaled)
 	}
 }

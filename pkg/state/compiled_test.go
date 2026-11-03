@@ -6469,3 +6469,313 @@ func TestCompileModel_ValidatorHooks(t *testing.T) {
 		}
 	})
 }
+
+func TestRoute_HostnameIntersectionPrecedence_HTTPRoute(t *testing.T) {
+	now := time.Now()
+	tOlder := metav1.NewTime(now.Add(-10 * time.Minute))
+	tNewer := metav1.NewTime(now.Add(-5 * time.Minute))
+	port8080 := gatewayv1.PortNumber(8080)
+	pathPrefix := gatewayv1.PathMatchPathPrefix
+	headerExact := gatewayv1.HeaderMatchExact
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend-older"}: {
+			ObjectMeta: metav1.ObjectMeta{Name: "backend-older", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+		{Namespace: "default", Name: "backend-newer"}: {
+			ObjectMeta: metav1.ObjectMeta{Name: "backend-newer", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		listenerHostname string
+		olderHostnames   []gatewayv1.Hostname
+		newerHostnames   []gatewayv1.Hostname
+		olderMatches     []gatewayv1.HTTPRouteMatch
+		newerMatches     []gatewayv1.HTTPRouteMatch
+		requestURL       string
+		requestHeaders   map[string]string
+		wantBackend      string
+	}{
+		{
+			name:             "Exact hostname beats older wildcard route attached to same listener",
+			listenerHostname: "abc.example.com",
+			olderHostnames:   []gatewayv1.Hostname{"*.example.com"},
+			newerHostnames:   []gatewayv1.Hostname{"abc.example.com"},
+			requestURL:       "http://abc.example.com/",
+			wantBackend:      "backend-newer.default.svc.cluster.local",
+		},
+		{
+			name:             "More specific wildcard route beats older less specific wildcard route",
+			listenerHostname: "*.example.com",
+			olderHostnames:   []gatewayv1.Hostname{"*.com"},
+			newerHostnames:   []gatewayv1.Hostname{"*.example.com"},
+			requestURL:       "http://abc.example.com/",
+			wantBackend:      "backend-newer.default.svc.cluster.local",
+		},
+		{
+			name:             "Exact hostname route beats older wildcard route even with shorter path",
+			listenerHostname: "abc.example.com",
+			olderHostnames:   []gatewayv1.Hostname{"*.example.com"},
+			newerHostnames:   []gatewayv1.Hostname{"abc.example.com"},
+			olderMatches: []gatewayv1.HTTPRouteMatch{
+				{Path: &gatewayv1.HTTPPathMatch{Type: &pathPrefix, Value: Ptr("/path/prefix")}},
+			},
+			newerMatches: []gatewayv1.HTTPRouteMatch{
+				{Path: &gatewayv1.HTTPPathMatch{Type: &pathPrefix, Value: Ptr("/path")}},
+			},
+			requestURL:  "http://abc.example.com/path/prefix/longer",
+			wantBackend: "backend-newer.default.svc.cluster.local",
+		},
+		{
+			name:             "Unmatched traffic falls back to older wildcard route",
+			listenerHostname: "abc.example.com",
+			olderHostnames:   []gatewayv1.Hostname{"*.example.com"},
+			newerHostnames:   []gatewayv1.Hostname{"abc.example.com"},
+			olderMatches: []gatewayv1.HTTPRouteMatch{
+				{
+					Path:    &gatewayv1.HTTPPathMatch{Type: &pathPrefix, Value: Ptr("/path/prefix")},
+					Headers: []gatewayv1.HTTPHeaderMatch{{Type: &headerExact, Name: "Header-B", Value: "B"}},
+				},
+			},
+			newerMatches: []gatewayv1.HTTPRouteMatch{
+				{
+					Path:    &gatewayv1.HTTPPathMatch{Type: &pathPrefix, Value: Ptr("/path")},
+					Headers: []gatewayv1.HTTPHeaderMatch{{Type: &headerExact, Name: "Header-A", Value: "A"}},
+				},
+			},
+			requestURL:     "http://abc.example.com/path/prefix/longer",
+			requestHeaders: map[string]string{"Header-B": "B"},
+			wantBackend:    "backend-older.default.svc.cluster.local",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "ref-class",
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "http",
+							Port:     80,
+							Protocol: gatewayv1.HTTPProtocolType,
+							Hostname: Ptr(gatewayv1.Hostname(tt.listenerHostname)),
+						},
+					},
+				},
+			}
+
+			olderRoute := &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "route-older",
+					Namespace:         "default",
+					CreationTimestamp: tOlder,
+				},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+					},
+					Hostnames: tt.olderHostnames,
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Matches: tt.olderMatches,
+							BackendRefs: []gatewayv1.HTTPBackendRef{
+								{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend-older", Port: &port8080}}},
+							},
+						},
+					},
+				},
+			}
+
+			newerRoute := &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "route-newer",
+					Namespace:         "default",
+					CreationTimestamp: tNewer,
+				},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+					},
+					Hostnames: tt.newerHostnames,
+					Rules: []gatewayv1.HTTPRouteRule{
+						{
+							Matches: tt.newerMatches,
+							BackendRefs: []gatewayv1.HTTPBackendRef{
+								{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend-newer", Port: &port8080}}},
+							},
+						},
+					},
+				},
+			}
+
+			outputs := ComputeOutputs(ModelInputs{
+				Gateways:       []*gatewayv1.Gateway{gw},
+				GatewayClasses: []*gatewayv1.GatewayClass{gc},
+				HTTPRoutes:     []*gatewayv1.HTTPRoute{olderRoute, newerRoute},
+				Services:       services,
+				ControllerName: "example.net/gateway-controller",
+			})
+
+			req, err := http.NewRequest("GET", tt.requestURL, nil)
+			if err != nil {
+				t.Fatalf("failed to create request: %v", err)
+			}
+			for k, v := range tt.requestHeaders {
+				req.Header.Set(k, v)
+			}
+			listeners, _ := MatchListeners(outputs.ProxyListeners, req.Host)
+			if len(listeners) == 0 {
+				t.Fatalf("expected matching listener for host %q", req.Host)
+			}
+			rule, _ := MatchRoute(listeners[0].Routes, req)
+			if rule == nil || len(rule.Backends) == 0 {
+				t.Fatalf("expected matched rule, got nil")
+			}
+			if rule.Backends[0].Host != tt.wantBackend {
+				t.Errorf("expected backend %q, got %q", tt.wantBackend, rule.Backends[0].Host)
+			}
+		})
+	}
+}
+
+func TestRoute_HostnameIntersectionPrecedence_GRPCRoute(t *testing.T) {
+	now := time.Now()
+	tOlder := metav1.NewTime(now.Add(-10 * time.Minute))
+	tNewer := metav1.NewTime(now.Add(-5 * time.Minute))
+	port8080 := gatewayv1.PortNumber(8080)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "grpc-backend-older"}: {
+			ObjectMeta: metav1.ObjectMeta{Name: "grpc-backend-older", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+		{Namespace: "default", Name: "grpc-backend-newer"}: {
+			ObjectMeta: metav1.ObjectMeta{Name: "grpc-backend-newer", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		listenerHostname string
+		olderHostnames   []gatewayv1.Hostname
+		newerHostnames   []gatewayv1.Hostname
+		wantBackend      string
+	}{
+		{
+			name:             "GRPCRoute exact hostname beats older wildcard route",
+			listenerHostname: "abc.example.com",
+			olderHostnames:   []gatewayv1.Hostname{"*.example.com"},
+			newerHostnames:   []gatewayv1.Hostname{"abc.example.com"},
+			wantBackend:      "grpc-backend-newer.default.svc.cluster.local",
+		},
+		{
+			name:             "GRPCRoute more specific wildcard route beats older less specific wildcard route",
+			listenerHostname: "*.example.com",
+			olderHostnames:   []gatewayv1.Hostname{"*.com"},
+			newerHostnames:   []gatewayv1.Hostname{"*.example.com"},
+			wantBackend:      "grpc-backend-newer.default.svc.cluster.local",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw-grpc", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "ref-class",
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "grpc-listener",
+							Port:     80,
+							Protocol: gatewayv1.HTTPProtocolType,
+							Hostname: Ptr(gatewayv1.Hostname(tt.listenerHostname)),
+						},
+					},
+				},
+			}
+
+			olderRoute := &gatewayv1.GRPCRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "grpcroute-older",
+					Namespace:         "default",
+					CreationTimestamp: tOlder,
+				},
+				Spec: gatewayv1.GRPCRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gw-grpc"}},
+					},
+					Hostnames: tt.olderHostnames,
+					Rules: []gatewayv1.GRPCRouteRule{
+						{
+							BackendRefs: []gatewayv1.GRPCBackendRef{
+								{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "grpc-backend-older", Port: &port8080}}},
+							},
+						},
+					},
+				},
+			}
+
+			newerRoute := &gatewayv1.GRPCRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "grpcroute-newer",
+					Namespace:         "default",
+					CreationTimestamp: tNewer,
+				},
+				Spec: gatewayv1.GRPCRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gw-grpc"}},
+					},
+					Hostnames: tt.newerHostnames,
+					Rules: []gatewayv1.GRPCRouteRule{
+						{
+							BackendRefs: []gatewayv1.GRPCBackendRef{
+								{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "grpc-backend-newer", Port: &port8080}}},
+							},
+						},
+					},
+				},
+			}
+
+			outputs := ComputeOutputs(ModelInputs{
+				Gateways:       []*gatewayv1.Gateway{gw},
+				GatewayClasses: []*gatewayv1.GatewayClass{gc},
+				GRPCRoutes:     []*gatewayv1.GRPCRoute{olderRoute, newerRoute},
+				Services:       services,
+				ControllerName: "example.net/gateway-controller",
+			})
+
+			req, err := http.NewRequest("POST", "http://abc.example.com/echo.EchoService/Echo", nil)
+			if err != nil {
+				t.Fatalf("failed to create request: %v", err)
+			}
+			listeners, _ := MatchListeners(outputs.ProxyListeners, "abc.example.com")
+			if len(listeners) == 0 {
+				t.Fatalf("expected matching listener")
+			}
+			rule, _ := MatchRoute(listeners[0].Routes, req)
+			if rule == nil || len(rule.Backends) == 0 {
+				t.Fatalf("expected matched rule, got nil")
+			}
+			if rule.Backends[0].Host != tt.wantBackend {
+				t.Errorf("expected backend %q, got %q", tt.wantBackend, rule.Backends[0].Host)
+			}
+		})
+	}
+}

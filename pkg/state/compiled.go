@@ -2119,7 +2119,7 @@ type routeBindingConfig struct {
 	validationCond       *metav1.Condition
 	isProtocolCompatible func(el *EffectiveListener) bool
 	isKindAllowed        func(group *gatewayv1.Group, kind gatewayv1.Kind) bool
-	onBind               func(el *EffectiveListener, effectiveHostnames []string)
+	onBind               func(el *EffectiveListener, routeHostnames []RouteHostname)
 }
 
 func bindParentRef(
@@ -2285,15 +2285,15 @@ func bindParentRef(
 
 		hasAllowedListener = true
 
-		effectiveHostnames := IntersectHostnames(cfg.hostnames, string(ValueOf(el.Hostname)))
-		if len(effectiveHostnames) > 0 || len(cfg.hostnames) == 0 {
+		routeHostnames := IntersectRouteHostnames(cfg.hostnames, string(ValueOf(el.Hostname)))
+		if len(routeHostnames) > 0 || len(cfg.hostnames) == 0 {
 			hasMatchingHostname = true
 
 			if !boundListenersForRoute[el] {
 				boundListenersForRoute[el] = true
 				el.AttachedRoutes++
 				if cfg.onBind != nil {
-					cfg.onBind(el, effectiveHostnames)
+					cfg.onBind(el, routeHostnames)
 				}
 			}
 		}
@@ -2357,9 +2357,9 @@ func bindRouteParentRef(
 				return el.Protocol == gatewayv1.HTTPProtocolType || el.Protocol == gatewayv1.HTTPSProtocolType
 			},
 			isKindAllowed: IsHTTPRoute,
-			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
+			onBind: func(el *EffectiveListener, routeHostnames []RouteHostname) {
 				ir := InternalRoute{
-					Hostnames: effectiveHostnames,
+					Hostnames: routeHostnames,
 					Rules:     rs.Internal.Rules,
 				}
 				el.Routes = append(el.Routes, ir)
@@ -2400,11 +2400,12 @@ func bindTLSRouteParentRef(
 				return *el.TLS.Mode == gatewayv1.TLSModePassthrough || *el.TLS.Mode == gatewayv1.TLSModeTerminate
 			},
 			isKindAllowed: IsTLSRoute,
-			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
+			onBind: func(el *EffectiveListener, routeHostnames []RouteHostname) {
 				if el.TLSBackends == nil {
 					el.TLSBackends = make(map[string][]InternalTLSBackend)
 				}
-				for _, eh := range effectiveHostnames {
+				for _, rh := range routeHostnames {
+					eh := rh.Hostname
 					if rs.Internal != nil {
 						for _, rule := range rs.Internal.Rules {
 							if len(rule.Backends) > 0 {
@@ -2444,9 +2445,9 @@ func bindGRPCRouteParentRef(
 				return el.Protocol == gatewayv1.HTTPProtocolType || el.Protocol == gatewayv1.HTTPSProtocolType
 			},
 			isKindAllowed: IsGRPCRoute,
-			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
+			onBind: func(el *EffectiveListener, routeHostnames []RouteHostname) {
 				ir := InternalRoute{
-					Hostnames: effectiveHostnames,
+					Hostnames: routeHostnames,
 					Rules:     rs.Internal.Rules,
 				}
 				el.Routes = append(el.Routes, ir)
@@ -2481,7 +2482,7 @@ func bindTCPRouteParentRef(
 				return el.Protocol == gatewayv1.TCPProtocolType
 			},
 			isKindAllowed: IsTCPRoute,
-			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
+			onBind: func(el *EffectiveListener, _ []RouteHostname) {
 				if rs.Internal != nil {
 					routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 					if el.BoundTCPRoute == nil || *el.BoundTCPRoute == routeKey {
@@ -2524,7 +2525,7 @@ func bindUDPRouteParentRef(
 				return el.Protocol == gatewayv1.UDPProtocolType
 			},
 			isKindAllowed: IsUDPRoute,
-			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
+			onBind: func(el *EffectiveListener, _ []RouteHostname) {
 				if rs.Internal != nil {
 					routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 					if el.BoundUDPRoute == nil || *el.BoundUDPRoute == routeKey {
