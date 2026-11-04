@@ -72,23 +72,23 @@ func IntersectHostnames(routeHostnames []string, listenerHostname string) []stri
 func IntersectRouteHostnames(routeHostnames []string, listenerHostname string) []RouteHostname {
 	if listenerHostname == "" || listenerHostname == "*" {
 		if len(routeHostnames) == 0 {
-			return []RouteHostname{{Hostname: "*", OriginalHostname: ""}}
+			return []RouteHostname{NewRouteHostname("*", "")}
 		}
 		var result []RouteHostname
 		for _, rh := range routeHostnames {
-			result = append(result, RouteHostname{Hostname: rh, OriginalHostname: rh})
+			result = append(result, NewRouteHostname(rh, rh))
 		}
 		return result
 	}
 
 	if len(routeHostnames) == 0 {
-		return []RouteHostname{{Hostname: listenerHostname, OriginalHostname: ""}}
+		return []RouteHostname{NewRouteHostname(listenerHostname, "")}
 	}
 
 	var result []RouteHostname
 	for _, rh := range routeHostnames {
 		if intersection, ok := Intersect(rh, listenerHostname); ok {
-			result = append(result, RouteHostname{Hostname: intersection, OriginalHostname: rh})
+			result = append(result, NewRouteHostname(intersection, rh))
 		}
 	}
 	return result

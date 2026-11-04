@@ -30,7 +30,7 @@ import (
 func routeHostnamesFromStrings(hostnames ...string) []RouteHostname {
 	out := make([]RouteHostname, len(hostnames))
 	for i, h := range hostnames {
-		out[i] = RouteHostname{Hostname: h, OriginalHostname: h}
+		out[i] = NewRouteHostname(h, h)
 	}
 	return out
 }
@@ -2273,7 +2273,10 @@ func TestBuildInternalRoutes(t *testing.T) {
 				ControllerName:     controllerName,
 			})
 			actual := outputs.ProxyRoutes
-			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
+			diff := cmp.Diff(tt.expected, actual,
+				cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"),
+				cmpopts.IgnoreUnexported(RouteHostname{}),
+			)
 			if diff != "" {
 				t.Errorf("ComputeOutputs() mismatch (-want +got):\n%s", diff)
 			}
