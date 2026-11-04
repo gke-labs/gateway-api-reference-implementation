@@ -78,6 +78,32 @@ var SupportedFeatures = []features.FeatureName{
 	features.SupportUDPRoute,
 }
 
+// unsupportedFeatures is the list of Gateway API features not supported by GARI.
+// Every upstream feature in features.AllFeatures must appear in exactly one of
+// SupportedFeatures or unsupportedFeatures.
+var unsupportedFeatures = []features.FeatureName{
+	// ClusterTrustBundle references in BackendTLSPolicy and Gateway frontend TLS validation are not implemented.
+	features.SupportClusterTrustBundle,
+	// Gateway address routability is experimental and not implemented.
+	features.SupportGatewayAddressRoutability,
+	// Cluster Gateway address routability is experimental and not implemented.
+	features.SupportGatewayAddressRoutabilityCluster,
+	// Gateway listener filters are experimental and not implemented.
+	features.SupportGatewayListenerFilters,
+
+	// GARI does not implement service mesh (GAMMA).
+	features.SupportMesh,
+	features.SupportMeshClusterIPMatching,
+	features.SupportMeshConsumerRoute,
+	features.SupportMeshHTTPRouteBackendRequestHeaderModification,
+	features.SupportMeshHTTPRouteNamedRouteRule,
+	features.SupportMeshHTTPRouteQueryParamMatching,
+	features.SupportMeshHTTPRouteRedirectPath,
+	features.SupportMeshHTTPRouteRedirectPort,
+	features.SupportMeshHTTPRouteRewritePath,
+	features.SupportMeshHTTPRouteSchemeRedirect,
+}
+
 // GatewayClassSupportedFeatures returns the sorted slice of SupportedFeature for GatewayClass status.
 func GatewayClassSupportedFeatures() []gatewayv1.SupportedFeature {
 	out := make([]gatewayv1.SupportedFeature, len(SupportedFeatures))
