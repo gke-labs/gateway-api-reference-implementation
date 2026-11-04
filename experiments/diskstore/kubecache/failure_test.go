@@ -41,11 +41,9 @@ func TestAdapterFailure_EngineError(t *testing.T) {
 	defer eng.Close()
 
 	var fatalCount atomic.Int32
-	var fatalErr error
 	fatalCh := make(chan error, 10)
 	onFatal := func(err error) {
 		fatalCount.Add(1)
-		fatalErr = err
 		fatalCh <- err
 	}
 
@@ -82,6 +80,12 @@ func TestAdapterFailure_EngineError(t *testing.T) {
 	// Check onFatal called exactly once
 	if c := fatalCount.Load(); c != 1 {
 		t.Fatalf("expected OnFatal called exactly once, got %d", c)
+	}
+	var fatalErr error
+	select {
+	case fatalErr = <-fatalCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for error on fatalCh")
 	}
 	if fatalErr == nil || !errors.Is(fatalErr, engine.ErrFailed) {
 		t.Fatalf("expected ErrFailed in OnFatal, got %v", fatalErr)
