@@ -773,6 +773,14 @@ func (s *Engine) writeOversizeFile(qKey string, lsn uint64, payload []byte) erro
 		return fmt.Errorf("failed to close temp oversize file: %w", err)
 	}
 
+	// Write-ahead rule: fsync WAL through record LSN before publishing oversize file
+	if err := s.wal.SyncThrough(lsn); err != nil {
+		if rErr := s.fs.Remove(tmpPath); rErr != nil {
+			err = errors.Join(err, rErr)
+		}
+		return fmt.Errorf("failed to fsync WAL before publishing oversize file: %w", err)
+	}
+
 	if err := s.fs.Rename(tmpPath, finalPath); err != nil {
 		if rErr := s.fs.Remove(tmpPath); rErr != nil {
 			err = errors.Join(err, rErr)
