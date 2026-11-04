@@ -681,6 +681,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	}
 
 	// Step 6: Flush any pages modified by redo replay to heapFile and fsync
+	var supersededLocs []uint64
 	for pID := range dirtyLogicalPages {
 		desc := pageDescs[pID]
 		oldLoc := desc.PhysicalBlock
@@ -693,9 +694,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 			return nil, fmt.Errorf("failed to allocate heap block for redone page %d: %w", pID, err)
 		}
 		if oldLoc != NoBlock {
-			if err := buddy.Free(oldLoc); err != nil {
-				return nil, fmt.Errorf("failed to free superseded block %d during redo: %w", oldLoc, err)
-			}
+			supersededLocs = append(supersededLocs, oldLoc)
 		}
 		desc.PhysicalBlock = newLoc
 		desc.DurableLoc = newLoc
@@ -719,6 +718,13 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	if len(dirtyLogicalPages) > 0 {
 		if err := heapFile.Sync(); err != nil {
 			return nil, fmt.Errorf("failed to sync heap file after redo: %w", err)
+		}
+		// Defer freeing superseded blocks until after heapFile.Sync succeeds (reuse rule).
+		// Until the sync, the superseded block holds the only durable copy of the page.
+		for _, loc := range supersededLocs {
+			if err := buddy.Free(loc); err != nil {
+				return nil, fmt.Errorf("failed to free superseded block %d during redo: %w", loc, err)
+			}
 		}
 	}
 
