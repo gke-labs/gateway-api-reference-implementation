@@ -98,21 +98,35 @@ const (
 )
 
 // ResourceNameForGateway computes the resource name for a Gateway within its namespace.
+// The derived name is guaranteed to be a valid DNS-1035 label (at most 63 characters,
+// lowercase alphanumeric and hyphens, starting with an alphabetic character and ending
+// with an alphanumeric character) of the form "gari-<name>-<hash>".
 func ResourceNameForGateway(gwName string) string {
-	base := fmt.Sprintf("%s-gari", gwName)
-	if len(base) <= 63 {
-		return base
-	}
 	h := sha256.Sum256([]byte(gwName))
-	suffix := "-" + hex.EncodeToString(h[:4])
-	return base[:63-len(suffix)] + suffix
+	hash := hex.EncodeToString(h[:4])
+
+	var b strings.Builder
+	for _, r := range strings.ToLower(gwName) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	clean := b.String()
+	// Limit clean name length so "gari-<clean>-<hash>" stays within 63 characters.
+	maxCleanLen := 63 - len("gari-") - len("-") - len(hash)
+	if len(clean) > maxCleanLen {
+		clean = clean[:maxCleanLen]
+	}
+	return fmt.Sprintf("gari-%s-%s", clean, hash)
 }
 
 // LabelValueForGateway returns a valid Kubernetes label value for the parent Gateway name.
-// Short names are kept unchanged because a Deployment's selector is immutable; hashing every
-// name would change the selector of existing data-plane Deployments and fail on upgrade.
-// If gwName exceeds MaxLabelValueLength, it returns the 63-character derived resource name
-// so that the label value remains valid (<= 63 characters) and matches the selector labels.
+// Generated resources carry the standard gateway.networking.k8s.io/gateway-name label,
+// whose value must be the Gateway's name, as checked by Gateway API conformance.
+// Only names that exceed MaxLabelValueLength (63 characters) fall back to the hashed
+// resource name so that the label value remains valid.
 func LabelValueForGateway(gwName string) string {
 	if len(gwName) <= MaxLabelValueLength {
 		return gwName

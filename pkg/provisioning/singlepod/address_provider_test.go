@@ -4427,3 +4427,72 @@ func TestLabelValueForGateway(t *testing.T) {
 		}
 	})
 }
+
+func TestResourceNameForGateway(t *testing.T) {
+	cases := []struct {
+		name, gwName, want, mustDiff string
+	}{
+		{name: "short valid", gwName: "my-gw", want: "gari-my-gw-b6402a44"},
+		{name: "exact 63 base", gwName: strings.Repeat("a", 58)},
+		{name: "valid 63", gwName: strings.Repeat("a", 63), want: "gari-" + strings.Repeat("a", 49) + "-7d3e74a0"},
+		{name: "valid 253", gwName: strings.Repeat("a", 253), want: "gari-" + strings.Repeat("a", 49) + "-32859a3a"},
+		// Collision test pairs: sanitized names and spelled-out hashes must differ
+		{name: "valid pair A", gwName: "my-gateway", want: "gari-my-gateway-6632e849"},
+		{name: "sanitized pair A", gwName: "my.gateway", want: "gari-my-gateway-0f568ee0", mustDiff: "gari-my-gateway-6632e849"},
+		{name: "spelled-out hash pair", gwName: "my-gateway-0f568ee0", mustDiff: "gari-my-gateway-0f568ee0"},
+		{name: "valid pair B", gwName: "g-1gw", want: "gari-g-1gw-02e06d46"},
+		{name: "sanitized pair B", gwName: "1gw", want: "gari-1gw-60bcb19e", mustDiff: "gari-g-1gw-02e06d46"},
+		{name: "multiple dots", gwName: "foo.bar.baz"},
+		{name: "leading dot", gwName: ".leading"},
+		{name: "trailing dot", gwName: "trailing."},
+		{name: "long with dots", gwName: "my.gateway." + strings.Repeat("a", 242)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ResourceNameForGateway(tc.gwName)
+			if tc.want != "" && got != tc.want {
+				t.Errorf("ResourceNameForGateway(%q) = %q, want %q", tc.gwName, got, tc.want)
+			}
+			if tc.mustDiff != "" && got == tc.mustDiff {
+				t.Errorf("expected ResourceNameForGateway(%q) != %q, got %q", tc.gwName, tc.mustDiff, got)
+			}
+			if len(got) > 63 || len(validation.IsDNS1035Label(got)) > 0 {
+				t.Errorf("ResourceNameForGateway(%q) = %q is not a valid DNS-1035 label", tc.gwName, got)
+			}
+		})
+	}
+}
+
+func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("clientgoscheme.AddToScheme: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("gatewayv1.AddToScheme: %v", err)
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "my.gateway", Namespace: "default", UID: "uid-dots"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners:        []gatewayv1.Listener{{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType}},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).Build()
+	p := NewAddressProvider(c)
+	listeners := []*state.EffectiveListener{{Port: 80, Protocol: gatewayv1.HTTPProtocolType}}
+	if _, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, listeners); err != nil {
+		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+	}
+
+	expectedName := ResourceNameForGateway("my.gateway")
+	var svc corev1.Service
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: expectedName}, &svc); err != nil {
+		t.Fatalf("failed to get Service %s: %v", expectedName, err)
+	}
+	if errs := validation.IsDNS1035Label(svc.Name); len(errs) > 0 {
+		t.Errorf("Service name %q is not a valid DNS-1035 label: %v", svc.Name, errs)
+	}
+}

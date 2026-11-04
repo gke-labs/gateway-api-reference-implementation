@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"strings"
@@ -35,6 +36,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 )
 
 func generateTestTLSCert(t *testing.T) (*tls.Certificate, *x509.Certificate) {
@@ -158,7 +160,7 @@ func TestSource_NamespaceQualifiedDataPlaneServiceAccount(t *testing.T) {
 		t.Fatalf("timed out waiting for GetCertificate request")
 	}
 
-	wantDPSA := "traffic-system/web-gateway-gari"
+	wantDPSA := fmt.Sprintf("traffic-system/%s", singlepod.ResourceNameForGateway("web-gateway"))
 	if got := capturedReq.GetDataPlaneServiceAccount(); got != wantDPSA {
 		t.Errorf("GetDataPlaneServiceAccount() = %q, want namespace-qualified %q", got, wantDPSA)
 	}

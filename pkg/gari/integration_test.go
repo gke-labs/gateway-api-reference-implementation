@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -272,4 +273,68 @@ func TestGARI_Integration_SinglePodProvisioning(t *testing.T) {
 	if podList.Items[0].Name != pod.Name {
 		t.Errorf("expected pod name %q, got %q", pod.Name, podList.Items[0].Name)
 	}
+
+	// 9. Verify Gateway with dots (my.gateway) gets a valid Service and becomes Programmed
+	dotGwName := "my.gateway"
+	dotGw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: gwNamespace,
+			Name:      dotGwName,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: gatewayv1.ObjectName(className),
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+	if err := env.Client.Create(ctx, dotGw); err != nil {
+		t.Fatalf("failed to create Gateway %s: %v", dotGwName, err)
+	}
+
+	dotResName := singlepod.ResourceNameForGateway(dotGwName)
+	dotResKey := types.NamespacedName{Namespace: gwNamespace, Name: dotResName}
+	var dotDeploy appsv1.Deployment
+	var dotSvc corev1.Service
+	deadline = time.Now().Add(15 * time.Second)
+	for {
+		if env.Client.Get(ctx, dotResKey, &dotDeploy) == nil && env.Client.Get(ctx, dotResKey, &dotSvc) == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for singlepod resources for %s", dotGwName)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if errs := validation.IsDNS1035Label(dotSvc.Name); len(errs) > 0 {
+		t.Fatalf("Service name %q is not a valid DNS-1035 label: %v", dotSvc.Name, errs)
+	}
+
+	dotDeploy.Status.Replicas, dotDeploy.Status.AvailableReplicas, dotDeploy.Status.ReadyReplicas = 1, 1, 1
+	if err := env.Client.Status().Update(ctx, &dotDeploy); err != nil {
+		t.Fatalf("failed to update Deployment status: %v", err)
+	}
+	dotSvc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "10.0.0.2"}}
+	if err := env.Client.Status().Update(ctx, &dotSvc); err != nil {
+		t.Fatalf("failed to update Service status: %v", err)
+	}
+
+	dotGwKey := types.NamespacedName{Namespace: gwNamespace, Name: dotGwName}
+	var dotGwStatus gatewayv1.Gateway
+	deadline = time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := env.Client.Get(ctx, dotGwKey, &dotGwStatus); err == nil {
+			for _, c := range dotGwStatus.Status.Conditions {
+				if c.Type == string(gatewayv1.GatewayConditionProgrammed) && c.Status == metav1.ConditionTrue {
+					return
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for Gateway %s to become Programmed=True: %+v", dotGwName, dotGwStatus.Status)
 }
