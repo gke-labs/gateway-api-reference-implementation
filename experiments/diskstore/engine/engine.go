@@ -482,9 +482,6 @@ func Open(opts ...Option) (*Engine, error) {
 			return nil, fmt.Errorf("failed to close meta file: %w", err)
 		}
 	}
-	if err := options.FS.SyncDir(dir); err != nil {
-		return nil, fmt.Errorf("failed to sync directory after meta file creation: %w", err)
-	}
 
 	// Open heap file with direct I/O flag
 	openFlags := os.O_RDWR | os.O_CREATE | DirectIOOpenFlag()
@@ -498,6 +495,10 @@ func Open(opts ...Option) (*Engine, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open heap file: %w", err)
 		}
+	}
+	if err := options.FS.SyncDir(dir); err != nil {
+		closeErr := heapFile.Close()
+		return nil, errors.Join(fmt.Errorf("failed to sync directory after meta and heap file creation: %w", err), closeErr)
 	}
 
 	// Apply platform specific flags (e.g. F_NOCACHE on Darwin)

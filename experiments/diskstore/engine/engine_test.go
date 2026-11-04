@@ -1659,3 +1659,50 @@ func TestRegression_MetaFileReadErrorNoWipe(t *testing.T) {
 		t.Fatalf("database was wiped on meta.db read error! val=%q, exists=%v, err=%v", string(val), exists, err)
 	}
 }
+
+type syncDirTrackingFS struct {
+	FS
+	storeDir                        string
+	heapFileCreated                 bool
+	syncedStoreDirAfterHeapCreation bool
+	syncDirDirs                     []string
+}
+
+func (tracker *syncDirTrackingFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	file, err := tracker.FS.OpenFile(name, flag, perm)
+	if err == nil && filepath.Base(name) == "heap.db" && (flag&os.O_CREATE != 0) {
+		tracker.heapFileCreated = true
+	}
+	return file, err
+}
+
+func (tracker *syncDirTrackingFS) SyncDir(dirname string) error {
+	tracker.syncDirDirs = append(tracker.syncDirDirs, dirname)
+	if tracker.heapFileCreated && dirname == tracker.storeDir {
+		tracker.syncedStoreDirAfterHeapCreation = true
+	}
+	return tracker.FS.SyncDir(dirname)
+}
+
+func TestRegression_SyncDirOnStoreInit(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_syncdir_init"
+	tracker := &syncDirTrackingFS{
+		FS:       memFS,
+		storeDir: dir,
+	}
+
+	store, err := Open(WithFS(tracker), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("store.Close failed: %v", closeErr)
+		}
+	}()
+
+	if !tracker.syncedStoreDirAfterHeapCreation {
+		t.Fatalf("expected store directory %q to be synced after heap file creation, sync calls: %v", dir, tracker.syncDirDirs)
+	}
+}
