@@ -160,8 +160,6 @@ var skippedTests = map[string]struct{}{
 	"BackendTLSPolicyGRPCRoute": {},
 	// fails: BackendTLSPolicy Accepted condition not set when targeted by TLSRoute in terminate mode
 	"BackendTLSPolicyTLSRouteTerminate": {},
-	// fails: Gateway with maximum length name (253 chars) does not become Programmed
-	"GatewayNameMaximumLength": {},
 }
 
 // previousMinorSkippedTests contains additional tests to skip when running against the previous minor's CRDs,
