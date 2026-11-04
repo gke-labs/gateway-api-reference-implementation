@@ -1591,6 +1591,7 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 type readErrorHookFS struct {
 	FS
 	failMetaRead bool
+	failMetaOpen bool
 }
 
 type readErrorFile struct {
@@ -1606,6 +1607,9 @@ func (f *readErrorFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (h *readErrorHookFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	if strings.Contains(name, "meta.db") && h.failMetaOpen {
+		return nil, errors.New("simulated open error")
+	}
 	f, err := h.FS.OpenFile(name, flag, perm)
 	if err != nil {
 		return nil, err
@@ -1704,5 +1708,197 @@ func TestRegression_SyncDirOnStoreInit(t *testing.T) {
 
 	if !tracker.syncedStoreDirAfterHeapCreation {
 		t.Fatalf("expected store directory %q to be synced after heap file creation, sync calls: %v", dir, tracker.syncDirDirs)
+	}
+}
+
+func TestOpen_CreateOption(t *testing.T) {
+	// 1. Without WithCreate, Open on non-existent path fails and does not create directory
+	nonExistent := filepath.Join(t.TempDir(), "sub", "not_there")
+	if _, err := Open(WithDir(nonExistent)); err == nil {
+		t.Fatalf("expected Open without WithCreate to fail on non-existent directory")
+	}
+	if _, err := os.Stat(nonExistent); !os.IsNotExist(err) {
+		t.Fatalf("expected non-existent directory to not be created, got err: %v", err)
+	}
+
+	// 2. Without WithCreate, Open on empty directory fails and leaves directory empty
+	emptyDir := t.TempDir()
+	if _, err := Open(WithDir(emptyDir)); err == nil {
+		t.Fatalf("expected Open without WithCreate to fail on empty directory")
+	}
+	entries, err := os.ReadDir(emptyDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected directory to remain empty, found %d entries", len(entries))
+	}
+
+	// 3. Temporary store (empty Dir) implies WithCreate
+	tempStore, err := Open()
+	if err != nil {
+		t.Fatalf("Open temporary store failed: %v", err)
+	}
+	if err := tempStore.Close(); err != nil {
+		t.Fatalf("Close temporary store failed: %v", err)
+	}
+
+	// 4. With WithCreate, Open creates database
+	dir := filepath.Join(t.TempDir(), "create_store")
+	store, err := Open(WithDir(dir), WithCreate())
+	if err != nil {
+		t.Fatalf("Open with WithCreate failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "key1", []byte("val1"), "1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 5. Reopening existing database succeeds without WithCreate
+	store2, err := Open(WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open on existing store failed: %v", err)
+	}
+	val, exists, err := store2.Get("ConfigMap", "key1")
+	if err != nil || !exists || string(val) != "val1" {
+		t.Fatalf("Get on reopened store failed: exists=%v, val=%q, err=%v", exists, string(val), err)
+	}
+	if err := store2.Close(); err != nil {
+		t.Fatalf("Close on reopened store failed: %v", err)
+	}
+}
+
+func TestOpen_EraseOnErrorOption(t *testing.T) {
+	assertFileExists := func(t *testing.T, fs FS, path string) {
+		t.Helper()
+		f, err := fs.OpenFile(path, os.O_RDONLY, 0)
+		if err != nil {
+			t.Fatalf("file %s does not exist: %v", path, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close %s failed: %v", path, err)
+		}
+	}
+
+	cases := []struct {
+		name      string
+		damage    func(t *testing.T, fs *readErrorHookFS, dir string)
+		expectErr string
+		files     []string
+	}{
+		{
+			name: "FailureMarker",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				mf, err := fs.OpenFile(filepath.Join(dir, "FAILED"), os.O_CREATE|os.O_WRONLY, 0644)
+				if err != nil {
+					t.Fatalf("create FAILED marker failed: %v", err)
+				}
+				if err := mf.Close(); err != nil {
+					t.Fatalf("close FAILED marker failed: %v", err)
+				}
+			},
+			expectErr: "failure marker",
+			files:     []string{"FAILED", "meta.db", "heap.db"},
+		},
+		{
+			name: "OrphanedFiles",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				if err := fs.Remove(filepath.Join(dir, "meta.db")); err != nil {
+					t.Fatalf("remove meta.db failed: %v", err)
+				}
+			},
+			expectErr: "orphaned store files",
+			files:     []string{"heap.db"},
+		},
+		{
+			name: "CorruptMeta",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				metaPath := filepath.Join(dir, "meta.db")
+				mf, err := fs.OpenFile(metaPath, os.O_RDWR, 0644)
+				if err != nil {
+					t.Fatalf("open meta.db failed: %v", err)
+				}
+				var badVer [4]byte
+				binary.BigEndian.PutUint32(badVer[:], 999)
+				if _, err := mf.WriteAt(badVer[:], 16); err != nil {
+					t.Fatalf("write bad version failed: %v", err)
+				}
+				if err := mf.Close(); err != nil {
+					t.Fatalf("close meta.db failed: %v", err)
+				}
+			},
+			expectErr: "outdated or corrupt meta file",
+			files:     []string{"meta.db", "heap.db"},
+		},
+		{
+			name: "UnreadableMetaRead",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				fs.failMetaRead = true
+			},
+			expectErr: "simulated read error",
+			files:     []string{"meta.db", "heap.db"},
+		},
+		{
+			name: "UnreadableMetaOpen",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				fs.failMetaOpen = true
+			},
+			expectErr: "simulated open error",
+			files:     []string{"meta.db", "heap.db"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hookFS := &readErrorHookFS{FS: NewMemFS()}
+			dir := "test_erase_" + tc.name
+
+			store, err := Open(WithFS(hookFS), WithDir(dir), WithCreate())
+			if err != nil {
+				t.Fatalf("Open failed: %v", err)
+			}
+			if err := store.Put("ConfigMap", "k1", []byte("val1"), "1"); err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close failed: %v", err)
+			}
+
+			tc.damage(t, hookFS, dir)
+
+			// Without WithEraseOnError, Open must return error and leave files in place
+			_, err = Open(WithFS(hookFS), WithDir(dir))
+			if err == nil {
+				t.Fatalf("expected Open without WithEraseOnError to fail")
+			}
+			if !strings.Contains(err.Error(), tc.expectErr) {
+				t.Fatalf("expected error containing %q, got: %v", tc.expectErr, err)
+			}
+
+			// Verify files were left in place
+			readFailed := hookFS.failMetaRead
+			openFailed := hookFS.failMetaOpen
+			hookFS.failMetaOpen = false
+			hookFS.failMetaRead = false
+			for _, file := range tc.files {
+				assertFileExists(t, hookFS, filepath.Join(dir, file))
+			}
+			hookFS.failMetaRead = readFailed
+			hookFS.failMetaOpen = openFailed
+
+			// With WithEraseOnError, Open must erase and report Wiped()
+			store2, err := Open(WithFS(hookFS), WithDir(dir), WithEraseOnError())
+			if err != nil {
+				t.Fatalf("Open with WithEraseOnError failed: %v", err)
+			}
+			if !store2.Wiped() {
+				t.Fatalf("expected store to report Wiped()")
+			}
+			if err := store2.Close(); err != nil {
+				t.Fatalf("store2.Close failed: %v", err)
+			}
+		})
 	}
 }
