@@ -17,10 +17,12 @@ package engine
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -1516,5 +1518,144 @@ func TestGet_PinPageFailurePreservesCause(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), ErrPageNotFound.Error()) {
 		t.Fatalf("expected error to contain cause %q, got: %v", ErrPageNotFound.Error(), err)
+	}
+}
+
+func TestRegression_OversizePutAfterWipe(t *testing.T) {
+	oversizePayload := make([]byte, 3*1024*1024)
+	copy(oversizePayload, []byte("large-payload-after-wipe"))
+	if _, err := rand.Read(oversizePayload[len("large-payload-after-wipe"):]); err != nil {
+		t.Fatalf("rand.Read failed: %v", err)
+	}
+
+	testWipe := func(t *testing.T, corrupt func(dir string)) {
+		fs := NewOSFS()
+		dir := t.TempDir()
+
+		store, err := Open(WithFS(fs), WithDir(dir))
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		corrupt(dir)
+
+		store2, err := Open(WithFS(fs), WithDir(dir))
+		if err != nil {
+			t.Fatalf("Open after wipe failed: %v", err)
+		}
+		defer func() {
+			if err := store2.Close(); err != nil {
+				t.Errorf("store2.Close failed: %v", err)
+			}
+		}()
+
+		if err := store2.Put("ConfigMap", "largeKey", oversizePayload, "1"); err != nil {
+			t.Fatalf("Put oversize object failed after wipe: %v", err)
+		}
+		val, exists, err := store2.Get("ConfigMap", "largeKey")
+		if err != nil || !exists || !bytes.Equal(val, oversizePayload) {
+			t.Fatalf("Get oversize object mismatch after wipe: exists=%v, err=%v", exists, err)
+		}
+	}
+
+	t.Run("FailureMarker", func(t *testing.T) {
+		testWipe(t, func(dir string) {
+			if err := os.WriteFile(filepath.Join(dir, "FAILED"), []byte("simulated-failure"), 0644); err != nil {
+				t.Fatalf("failed to write FAILED marker: %v", err)
+			}
+		})
+	})
+
+	t.Run("VersionMismatch", func(t *testing.T) {
+		testWipe(t, func(dir string) {
+			buf := make([]byte, metaFileSize)
+			binary.BigEndian.PutUint32(buf[16:20], StoreFormatVersion+99)
+			if err := os.WriteFile(filepath.Join(dir, "meta.db"), buf, 0644); err != nil {
+				t.Fatalf("failed to write incompatible version: %v", err)
+			}
+		})
+	})
+
+	t.Run("OrphanedFiles", func(t *testing.T) {
+		testWipe(t, func(dir string) {
+			if err := os.Remove(filepath.Join(dir, "meta.db")); err != nil {
+				t.Fatalf("failed to remove meta.db: %v", err)
+			}
+		})
+	})
+}
+
+type readErrorHookFS struct {
+	FS
+	failMetaRead bool
+}
+
+type readErrorFile struct {
+	File
+	failRead bool
+}
+
+func (f *readErrorFile) ReadAt(p []byte, off int64) (int, error) {
+	if f.failRead {
+		return 0, errors.New("simulated read error")
+	}
+	return f.File.ReadAt(p, off)
+}
+
+func (h *readErrorHookFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	f, err := h.FS.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	if strings.Contains(name, "meta.db") && h.failMetaRead {
+		return &readErrorFile{File: f, failRead: true}, nil
+	}
+	return f, nil
+}
+
+func TestRegression_MetaFileReadErrorNoWipe(t *testing.T) {
+	memFS := NewMemFS()
+	hookedFS := &readErrorHookFS{FS: memFS}
+	dir := "test_meta_read_err"
+
+	// 1. Initialize store with data
+	store, err := Open(WithFS(hookedFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "importantKey", []byte("val"), "1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 2. Inject read error on meta.db
+	hookedFS.failMetaRead = true
+
+	// 3. Attempt Open: must fail with read error and NOT wipe database
+	_, err = Open(WithFS(hookedFS), WithDir(dir))
+	if err == nil {
+		t.Fatalf("expected Open to fail when meta.db read fails")
+	}
+
+	// 4. Clear read error and reopen: data must still exist!
+	hookedFS.failMetaRead = false
+	store2, err := Open(WithFS(hookedFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open after clearing read error failed: %v", err)
+	}
+	defer func() {
+		if err := store2.Close(); err != nil {
+			t.Errorf("store2.Close failed: %v", err)
+		}
+	}()
+
+	val, exists, err := store2.Get("ConfigMap", "importantKey")
+	if err != nil || !exists || string(val) != "val" {
+		t.Fatalf("database was wiped on meta.db read error! val=%q, exists=%v, err=%v", string(val), exists, err)
 	}
 }
