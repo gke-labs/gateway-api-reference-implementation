@@ -351,15 +351,15 @@ func Open(opts ...Option) (*Engine, error) {
 	// Check for failure marker from a prior failed instance
 	markerPath := filepath.Join(dir, "FAILED")
 	wiped := false
+	needsErase := false
+	eraseReason := ""
 	markerFile, markerErr := options.FS.OpenFile(markerPath, os.O_RDONLY, 0)
 	if markerErr == nil {
 		if cErr := markerFile.Close(); cErr != nil {
 			return nil, fmt.Errorf("failed to close failure marker: %w", cErr)
 		}
-		if err := wipeStoreFiles(options.FS, dir); err != nil {
-			return nil, fmt.Errorf("failed to wipe store files after failure marker: %w", err)
-		}
-		wiped = true
+		needsErase = true
+		eraseReason = "failure marker"
 	} else if !os.IsNotExist(markerErr) && !errors.Is(markerErr, os.ErrNotExist) {
 		return nil, fmt.Errorf("failed to check failure marker: %w", markerErr)
 	}
@@ -369,90 +369,97 @@ func Open(opts ...Option) (*Engine, error) {
 	walDir := filepath.Join(dir, "wal")
 	oversizeDir := filepath.Join(dir, "oversize")
 
-	if err := options.FS.MkdirAll(oversizeDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create oversize directory: %w", err)
-	}
-
 	var dbID [16]byte
 	isNewStore := false
 
-	// Read or generate database ID and verify store format version
-	metaFile, err := options.FS.OpenFile(metaPath, os.O_RDWR, 0644)
-	if err != nil {
-		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
-			// meta.db does not exist. Check if orphaned store files exist (heap.db, wal/, or oversize/)
-			hasOrphaned := false
-			hf, hErr := options.FS.OpenFile(heapPath, os.O_RDONLY, 0)
-			if hErr == nil {
-				if cErr := hf.Close(); cErr != nil {
-					return nil, fmt.Errorf("failed to close heap.db check file: %w", cErr)
-				}
-				hasOrphaned = true
-			} else if !os.IsNotExist(hErr) && !errors.Is(hErr, os.ErrNotExist) {
-				return nil, fmt.Errorf("failed to check heap.db: %w", hErr)
-			}
-
-			wEntries, wErr := options.FS.ReadDir(walDir)
-			if wErr == nil {
-				if len(wEntries) > 0 {
-					hasOrphaned = true
-				}
-			} else if !os.IsNotExist(wErr) && !errors.Is(wErr, os.ErrNotExist) {
-				return nil, fmt.Errorf("failed to check wal directory: %w", wErr)
-			}
-
-			oEntries, oErr := options.FS.ReadDir(oversizeDir)
-			if oErr == nil {
-				if len(oEntries) > 0 {
-					hasOrphaned = true
-				}
-			} else if !os.IsNotExist(oErr) && !errors.Is(oErr, os.ErrNotExist) {
-				return nil, fmt.Errorf("failed to check oversize directory: %w", oErr)
-			}
-			if hasOrphaned {
-				if wipeErr := wipeStoreFiles(options.FS, dir); wipeErr != nil {
-					return nil, fmt.Errorf("failed to wipe orphaned store files: %w", wipeErr)
-				}
-				wiped = true
-			}
-
-			isNewStore = true
-		} else {
-			return nil, err
-		}
+	if needsErase {
+		isNewStore = true
 	} else {
-		// meta.db exists. Read dbID and store format version.
-		metaBuf := make([]byte, metaFileSize)
-		n, rErr := metaFile.ReadAt(metaBuf, 0)
-		if cErr := metaFile.Close(); cErr != nil {
-			return nil, fmt.Errorf("failed to close meta file: %w", cErr)
-		}
+		// Read or generate database ID and verify store format version
+		metaFile, err := options.FS.OpenFile(metaPath, os.O_RDWR, 0644)
+		if err != nil {
+			if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+				// meta.db does not exist. Check if orphaned store files exist (heap.db, wal/, or oversize/)
+				hasOrphaned := false
+				hf, hErr := options.FS.OpenFile(heapPath, os.O_RDONLY, 0)
+				if hErr == nil {
+					if cErr := hf.Close(); cErr != nil {
+						return nil, fmt.Errorf("failed to close heap.db check file: %w", cErr)
+					}
+					hasOrphaned = true
+				} else if !os.IsNotExist(hErr) && !errors.Is(hErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("failed to check heap.db: %w", hErr)
+				}
 
-		validVersion := false
-		if (rErr == nil || errors.Is(rErr, io.EOF)) && n >= metaFileSize {
-			version := binary.BigEndian.Uint32(metaBuf[16:20])
-			if version == StoreFormatVersion {
-				validVersion = true
-				copy(dbID[:], metaBuf[:16])
+				wEntries, wErr := options.FS.ReadDir(walDir)
+				if wErr == nil {
+					if len(wEntries) > 0 {
+						hasOrphaned = true
+					}
+				} else if !os.IsNotExist(wErr) && !errors.Is(wErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("failed to check wal directory: %w", wErr)
+				}
+
+				oEntries, oErr := options.FS.ReadDir(oversizeDir)
+				if oErr == nil {
+					if len(oEntries) > 0 {
+						hasOrphaned = true
+					}
+				} else if !os.IsNotExist(oErr) && !errors.Is(oErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("failed to check oversize directory: %w", oErr)
+				}
+				if hasOrphaned {
+					needsErase = true
+					eraseReason = "orphaned store files"
+				}
+
+				isNewStore = true
+			} else {
+				return nil, err
+			}
+		} else {
+			// meta.db exists. Read dbID and store format version.
+			metaBuf := make([]byte, metaFileSize)
+			n, rErr := metaFile.ReadAt(metaBuf, 0)
+			if cErr := metaFile.Close(); cErr != nil {
+				return nil, fmt.Errorf("failed to close meta file: %w", cErr)
+			}
+			validVersion := false
+			if (rErr == nil || errors.Is(rErr, io.EOF)) && n >= metaFileSize {
+				version := binary.BigEndian.Uint32(metaBuf[16:20])
+				if version == StoreFormatVersion {
+					validVersion = true
+					copy(dbID[:], metaBuf[:16])
+				}
+			}
+
+			if !validVersion {
+				// Missing format version (e.g. 16-byte version 1 meta.db) or version mismatch:
+				// wipe the store and initialize a fresh database.
+				needsErase = true
+				eraseReason = "outdated or corrupt meta file"
+				isNewStore = true
 			}
 		}
+	}
 
-		if !validVersion {
-			// Missing format version (e.g. 16-byte version 1 meta.db) or version mismatch:
-			// wipe the store and initialize a fresh database.
-			if wipeErr := wipeStoreFiles(options.FS, dir); wipeErr != nil {
-				return nil, fmt.Errorf("failed to wipe outdated store: %w", wipeErr)
-			}
-			wiped = true
-			isNewStore = true
+	if needsErase {
+		if wipeErr := wipeStoreFiles(options.FS, dir); wipeErr != nil {
+			return nil, fmt.Errorf("failed to wipe store files after %s: %w", eraseReason, wipeErr)
 		}
+		wiped = true
+		isNewStore = true
+	}
+
+	if err := options.FS.MkdirAll(oversizeDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create oversize directory: %w", err)
 	}
 
 	if isNewStore {
 		if _, randErr := io.ReadFull(rand.Reader, dbID[:]); randErr != nil {
 			return nil, fmt.Errorf("failed to generate DB ID: %w", randErr)
 		}
-		metaFile, err = options.FS.Create(metaPath)
+		metaFile, err := options.FS.Create(metaPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create meta file: %w", err)
 		}
