@@ -1003,3 +1003,77 @@ func TestRegression_AbandonedWALSegmentOnOpen(t *testing.T) {
 		t.Fatalf("expected record LSN 2, got %d", lsn)
 	}
 }
+
+func TestRegression_WALZeroPaddingRecovery(t *testing.T) {
+	memoryFS := NewMemFS()
+	var databaseID [16]byte
+	copy(databaseID[:], []byte("wal-zeropad-test"))
+
+	walDirectory := "wal"
+	wal, err := OpenWAL(memoryFS, walDirectory, databaseID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+
+	// Write record 1 such that the remaining space in block 0 is shorter than
+	// RecordHeaderSize. Aim for 20 bytes of padding to the block boundary.
+	const paddingBytes = 20
+	if paddingBytes >= RecordHeaderSize {
+		t.Fatalf("paddingBytes (%d) must be less than RecordHeaderSize (%d)", paddingBytes, RecordHeaderSize)
+	}
+
+	key := "ConfigMap k1"
+	token := "tok1"
+	totalRecordLength := WALBlockSize - SegmentHeaderSize - paddingBytes
+	payloadLength := totalRecordLength - RecordHeaderSize - len(key) - len(token)
+	record1 := Record{Type: RecordTypePut, Key: key, Token: token, Payload: make([]byte, payloadLength)}
+	firstLSN, err := wal.AppendRecord(&record1)
+	if err != nil {
+		t.Fatalf("AppendRecord 1 failed: %v", err)
+	}
+
+	// Sync forces zero-padding of the remaining bytes in block 0 to WALBlockSize
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Write record 2 (starts at block boundary, offset 4096)
+	record2 := Record{Type: RecordTypePut, Key: "ConfigMap k2", Token: "tok2", Payload: []byte("val2")}
+	secondLSN, err := wal.AppendRecord(&record2)
+	if err != nil {
+		t.Fatalf("AppendRecord 2 failed: %v", err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("Sync 2 failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Replay WAL using iterator
+	iterator, err := NewWALIterator(memoryFS, walDirectory, databaseID, 1)
+	if err != nil {
+		t.Fatalf("NewWALIterator failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := iterator.Close(); err != nil {
+			t.Errorf("iterator.Close failed: %v", err)
+		}
+	})
+
+	firstReadRecord, err := iterator.Next()
+	if err != nil {
+		t.Fatalf("Next 1 failed: %v", err)
+	}
+	if firstReadRecord.LSN != firstLSN {
+		t.Fatalf("expected record 1 LSN %d, got %d", firstLSN, firstReadRecord.LSN)
+	}
+
+	secondReadRecord, err := iterator.Next()
+	if err != nil {
+		t.Fatalf("Next 2 failed (dropped across block zero-padding): %v", err)
+	}
+	if secondReadRecord.LSN != secondLSN {
+		t.Fatalf("expected record 2 LSN %d, got %d", secondLSN, secondReadRecord.LSN)
+	}
+}
