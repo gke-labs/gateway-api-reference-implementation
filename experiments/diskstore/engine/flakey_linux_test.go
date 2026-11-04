@@ -43,7 +43,7 @@ func TestDMFlakey(t *testing.T) {
 	mountPoint := filepath.Join(tmpDir, "mnt")
 	_ = os.MkdirAll(mountPoint, 0755)
 
-	store, err := Open(WithDir(mountPoint))
+	store, err := Open(WithDir(mountPoint), WithCreate())
 	if err != nil {
 		t.Fatalf("Open on flakey mount failed: %v", err)
 	}

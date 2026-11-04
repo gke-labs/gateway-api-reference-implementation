@@ -30,7 +30,7 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 	dir := "test_failure_marker_dir"
 
 	// 1. Initial run: write objects with per-bucket progress tokens
-	eng1, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	eng1, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 
 	// 3. Reopen: engine must detect the failure marker, wipe the store, report the wipe,
 	// generate a new DB ID, and return no tokens.
-	eng2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	eng2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithEraseOnError())
 	if err != nil {
 		t.Fatalf("reopening store after failure failed: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestEngine_FailureMarkerPreservesUnrelatedFiles(t *testing.T) {
 	memFS := engine.NewMemFS()
 	dir := "test_preserve_unrelated"
 
-	eng1, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	eng1, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestEngine_FailureMarkerPreservesUnrelatedFiles(t *testing.T) {
 	_ = eng1.Close()
 
 	// Reopen
-	eng2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	eng2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithEraseOnError())
 	if err != nil {
 		t.Fatalf("Open after failure failed: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestEngine_InterruptedWipe_FailurePartWay(t *testing.T) {
 	dir := "test_interrupted_wipe"
 
 	// 1. Initialize store with data
-	eng1, err := engine.Open(engine.WithFS(faultyFS), engine.WithDir(dir))
+	eng1, err := engine.Open(engine.WithFS(faultyFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestEngine_InterruptedWipe_FailurePartWay(t *testing.T) {
 	faultyFS.failOnSuffix = "heap.db"
 
 	// Open must attempt wipe, fail on heap.db, and return error
-	_, err = engine.Open(engine.WithFS(faultyFS), engine.WithDir(dir))
+	_, err = engine.Open(engine.WithFS(faultyFS), engine.WithDir(dir), engine.WithEraseOnError())
 	if err == nil {
 		t.Fatalf("expected Open to fail when wipe fails")
 	}
@@ -278,7 +278,7 @@ func TestEngine_InterruptedWipe_FailurePartWay(t *testing.T) {
 
 	// 4. Clear the fault and reopen: next Open must complete the wipe and produce a clean store
 	faultyFS.failOnSuffix = ""
-	eng2, err := engine.Open(engine.WithFS(faultyFS), engine.WithDir(dir))
+	eng2, err := engine.Open(engine.WithFS(faultyFS), engine.WithDir(dir), engine.WithEraseOnError())
 	if err != nil {
 		t.Fatalf("reopening store after interrupted wipe failed: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestEngine_OrphanedStoreFilesWithoutMeta_TreatedAsCorrupt(t *testing.T) {
 	dir := "test_orphaned_store"
 
 	// 1. Set up a store, write data, sync
-	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestEngine_OrphanedStoreFilesWithoutMeta_TreatedAsCorrupt(t *testing.T) {
 	}
 
 	// 3. Reopen without meta.db: Open must detect existing heap.db/wal, wipe them, and report Wiped()
-	eng2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	eng2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithEraseOnError())
 	if err != nil {
 		t.Fatalf("Open on orphaned store failed: %v", err)
 	}

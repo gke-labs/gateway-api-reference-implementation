@@ -46,7 +46,7 @@ func makeRandomPayload(size int) []byte {
 // the 10% savings rule are stored raw with CodecNone.
 func TestCompression_RawFallbackAndSavingsRule(t *testing.T) {
 	memFS := NewMemFS()
-	store, err := Open(WithFS(memFS), WithDir("test_compress_raw_fallback"), WithCompressionCodec(CodecZstd))
+	store, err := Open(WithFS(memFS), WithDir("test_compress_raw_fallback"), WithCompressionCodec(CodecZstd), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -221,6 +221,7 @@ func TestCompression_RoundTripAllCodecs(t *testing.T) {
 				WithDir("test_roundtrip_"+tc.name),
 				WithCompressionCodec(tc.codec),
 				WithCipher(cipher),
+				WithCreate(),
 			)
 			if err != nil {
 				t.Fatalf("Open failed: %v", err)
@@ -257,6 +258,7 @@ func TestCompression_PayloadExceedingMaxObjectSize_StoredRawAndReadable(t *testi
 		WithDir("test_max_object_size_fallback"),
 		WithCompressionCodec(CodecZstd),
 		WithMaxObjectSize(customMaxObjSize),
+		WithCreate(),
 	)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
@@ -329,7 +331,7 @@ func TestEngine_OldFormatVersion_WipedOnOpen(t *testing.T) {
 	_ = hf.Close()
 
 	// 2. Open store: Open must detect missing format version, wipe the store, and report Wiped()
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithEraseOnError())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -389,7 +391,7 @@ func TestCompression_PageClassReduction(t *testing.T) {
 
 	// 1. Uncompressed store
 	memFSNone := NewMemFS()
-	storeNone, err := Open(WithFS(memFSNone), WithDir("test_pageclass_none"), WithCompressionCodec(CodecNone))
+	storeNone, err := Open(WithFS(memFSNone), WithDir("test_pageclass_none"), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open none failed: %v", err)
 	}
@@ -402,7 +404,7 @@ func TestCompression_PageClassReduction(t *testing.T) {
 
 	// 2. Compressed store (zstd)
 	memFSZstd := NewMemFS()
-	storeZstd, err := Open(WithFS(memFSZstd), WithDir("test_pageclass_zstd"), WithCompressionCodec(CodecZstd))
+	storeZstd, err := Open(WithFS(memFSZstd), WithDir("test_pageclass_zstd"), WithCompressionCodec(CodecZstd), WithCreate())
 	if err != nil {
 		t.Fatalf("Open zstd failed: %v", err)
 	}
@@ -442,7 +444,7 @@ func TestCompression_RecoveryWALReplay(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_compress_recovery"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -584,7 +586,7 @@ func TestCompression_Rejection_StoreState(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			memFS := NewMemFS()
-			store, err := Open(WithFS(memFS), WithDir("test_reject_"+tc.name))
+			store, err := Open(WithFS(memFS), WithDir("test_reject_"+tc.name), WithCreate())
 			if err != nil {
 				t.Fatalf("Open failed: %v", err)
 			}
@@ -687,7 +689,7 @@ func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
 		t.Run(fmt.Sprintf("Compressible_%dB", size), func(t *testing.T) {
 			memFS := NewMemFS()
 			dir := fmt.Sprintf("test_rt_comp_%d", size)
-			store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd))
+			store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd), WithCreate())
 			if err != nil {
 				t.Fatalf("Open failed: %v", err)
 			}
@@ -734,7 +736,7 @@ func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
 		t.Run(fmt.Sprintf("Incompressible_%dB", size), func(t *testing.T) {
 			memFS := NewMemFS()
 			dir := fmt.Sprintf("test_rt_incomp_%d", size)
-			store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd))
+			store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd), WithCreate())
 			if err != nil {
 				t.Fatalf("Open failed: %v", err)
 			}
@@ -781,7 +783,7 @@ func TestCompression_ReopenUncompressedSmallValues(t *testing.T) {
 	dir := "test_uncompressed_small"
 
 	// 1. Write store with CodecNone (simulating legacy stores or uncompressed writes)
-	store1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open with CodecNone failed: %v", err)
 	}

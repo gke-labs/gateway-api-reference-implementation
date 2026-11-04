@@ -263,7 +263,7 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	model := make(map[string]string)
 
 	// Cycle 1: Open fresh store, put initial keys and a large multi-block object, checkpoint
-	store, err := Open(WithFS(faultFS), WithDir(dir))
+	store, err := Open(WithFS(faultFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Cycle 1 Open failed: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestRegression_Item1_LSNReopenContinuation(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_reopen_lsn_continuation"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestRegression_Item3_RedoAppliesPayload(t *testing.T) {
 	faultFS := NewFaultFS(memFS)
 	dir := "test_redo_applies_payload"
 
-	store, err := Open(WithFS(faultFS), WithDir(dir))
+	store, err := Open(WithFS(faultFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -580,7 +580,7 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	faultFS := NewFaultFS(memFS)
 
 	dir := "test_crash_reuse_emptied_page"
-	store, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}

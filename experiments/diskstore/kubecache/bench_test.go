@@ -622,6 +622,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			engine.WithCipher(cipherDisk),
 			engine.WithNumPoolBlocks(2048), // 8 MiB block pool
 			engine.WithCompressionCodec(codec),
+			engine.WithCreate(),
 		)
 		if err != nil {
 			t.Fatalf("diskstore creation failed: %v", err)

@@ -71,6 +71,8 @@ type Options struct {
 	NumPoolBlocks int
 	AutoDelete    bool
 	Clock         Clock
+	Create        bool
+	EraseOnError  bool
 
 	CompressionCodec CompressionCodec
 	MaxObjectSize    int
@@ -80,6 +82,26 @@ type Options struct {
 
 // Option is a functional option for configuring an Engine.
 type Option func(*Options)
+
+// WithCreate specifies that Open should create a new database when no store files exist.
+// Without it, Open returns an error if there is no existing database.
+// When Dir is empty, Open creates a temporary store, which implies WithCreate.
+func WithCreate() Option {
+	return func(o *Options) {
+		o.Create = true
+	}
+}
+
+// WithEraseOnError enables erasing the store and starting fresh when an unreadable,
+// outdated, or corrupt meta file, orphaned store files, or failure markers are detected.
+// Erasing destroys data, which suits a cache that can rebuild from its source,
+// but not every caller can do that. Without it, Open returns an error describing
+// the issue without modifying existing files.
+func WithEraseOnError() Option {
+	return func(o *Options) {
+		o.EraseOnError = true
+	}
+}
 
 // WithClock sets the Clock used for WAL timing.
 func WithClock(clock Clock) Option {

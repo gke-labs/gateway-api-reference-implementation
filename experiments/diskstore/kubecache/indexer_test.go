@@ -39,7 +39,7 @@ func testOnFatal(t testing.TB) func(error) {
 
 func TestIndexer_CRUD(t *testing.T) {
 	memFS := engine.NewMemFS()
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_crud_store"))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_crud_store"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestIndexer_CRUD(t *testing.T) {
 
 func TestIndexer_SecondaryIndexing(t *testing.T) {
 	memFS := engine.NewMemFS()
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_sec_store"))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_sec_store"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestIndexer_WithEncryption(t *testing.T) {
 		t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
 	}
 
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithCipher(cipher), engine.WithDir("idx_crypto_store"))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithCipher(cipher), engine.WithDir("idx_crypto_store"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestIndexer_WithEncryption(t *testing.T) {
 
 func TestIndexer_ReplaceAndResourceVersion(t *testing.T) {
 	memFS := engine.NewMemFS()
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_rv_store"))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_rv_store"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestRegression_Item20_SecondaryIndexesRebuiltOnReopen(t *testing.T) {
 	memFS := engine.NewMemFS()
 	dir := "test_secondary_rebuild"
 
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -391,7 +391,7 @@ func TestRegression_Item21_ReplaceAsDiff(t *testing.T) {
 	memFS := engine.NewMemFS()
 	dir := "test_replace_as_diff"
 
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -443,7 +443,7 @@ func TestRegression_Round2_Item5_BookmarkNoFakeObject(t *testing.T) {
 	memFS := engine.NewMemFS()
 	dir := "test_bookmark_fake_obj"
 
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestRegression_Round2_Item6_ResourceVersionPerBucket(t *testing.T) {
 	memFS := engine.NewMemFS()
 	dir := "test_rv_per_bucket"
 
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -542,7 +542,7 @@ func TestIndexer_NoGoroutineLeakOnEngineClose(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 
 	memFS := engine.NewMemFS()
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_leak_store"))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_leak_store"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}

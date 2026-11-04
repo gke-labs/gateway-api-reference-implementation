@@ -34,7 +34,7 @@ func TestDiskStore_BasicCRUD(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_store"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestDiskStore_OversizeObject(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_oversize_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_oversize_store"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestDiskStore_FailedStateOnErrors(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_fail_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_fail_store"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_stale_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_stale_store"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_reuse_rule_promote"))
+	store, err := Open(WithFS(faultFS), WithDir("test_reuse_rule_promote"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestRegression_Item15_16_NoOldRecordResurrection(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_no_old_record_resurrection"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestRegression_Item17_OversizeObjectPersistence(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_persistence"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestRegression_Item19_BucketIsolation(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_bucket_isolation"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestRegression_Item20_EngineScanConsistent(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_scan_rebuild"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestRegression_Round2_Item1_OversizeDeleteThenReopen(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_delete_reopen"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestRegression_Round2_Item2_OversizeToSmallUpdateThenReopen(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_to_small_reopen"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestRegression_Round2_Item3_OversizeLongNameAndTornFiles(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_long_name"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -510,7 +510,7 @@ func TestRegression_Round2_Item4_LogicalPageReuseNoLeak(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_page_reuse_no_leak"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithNumPoolBlocks(64))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithNumPoolBlocks(64), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestEngine_SetTokenNoFakeObject(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_token_no_fake_obj"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -572,7 +572,7 @@ func TestEngine_TokenPerBucket(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_rv_per_bucket"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -658,7 +658,7 @@ func TestKeyBoundaries_TableTest(t *testing.T) {
 					memFS := NewMemFS()
 					dir := "test_boundary_store"
 
-					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 					if err != nil {
 						t.Fatalf("Open failed: %v", err)
 					}
@@ -738,7 +738,7 @@ func TestSlottedPage_KeyOver64BytesNearBoundary(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_slotted_boundary"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -780,7 +780,7 @@ func TestMultiBlockPage_KeyOver64BytesNearBoundary(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_multiblock_boundary"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -822,7 +822,7 @@ func TestMultiBlockPage_RecordSizesBetweenSlottedAndBlockLimitRoundTrip(t *testi
 	memFS := NewMemFS()
 	dir := "test_multiblock_transition_store"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1126,7 +1126,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 					memFS := NewMemFS()
 					dir := fmt.Sprintf("test_transition_%s_%s", tc.name, m.name)
 
-					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(tc.codec))
+					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(tc.codec), WithCreate())
 					if err != nil {
 						t.Fatalf("Open failed: %v", err)
 					}
@@ -1229,7 +1229,7 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_mb_redo_idempotent"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1333,7 +1333,7 @@ func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
 		dir := b.TempDir()
-		store, err := Open(WithDir(dir), WithNumPoolBlocks(numPoolBlocks))
+		store, err := Open(WithDir(dir), WithNumPoolBlocks(numPoolBlocks), WithCreate())
 		if err != nil {
 			b.Fatalf("Open failed: %v", err)
 		}
@@ -1361,7 +1361,7 @@ func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
 // keys that writers rewrite continuously with checkpoints running complete with no read errors.
 func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 	memFS := NewMemFS()
-	store, err := Open(WithFS(memFS), WithDir("stress_store"), WithNumPoolBlocks(64))
+	store, err := Open(WithFS(memFS), WithDir("stress_store"), WithNumPoolBlocks(64), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1450,7 +1450,7 @@ func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 // returns exists=false and does not cause a fatal corruption error.
 func TestGet_MissingOversizeObjectReturnsNotFound(t *testing.T) {
 	memFS := NewMemFS()
-	store, err := Open(WithFS(memFS), WithDir("missing_oversize_test"))
+	store, err := Open(WithFS(memFS), WithDir("missing_oversize_test"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1487,7 +1487,7 @@ func TestGet_MissingOversizeObjectReturnsNotFound(t *testing.T) {
 // the engine failure error includes the cause.
 func TestGet_PinPageFailurePreservesCause(t *testing.T) {
 	memFS := NewMemFS()
-	store, err := Open(WithFS(memFS), WithDir("pin_fail_test"))
+	store, err := Open(WithFS(memFS), WithDir("pin_fail_test"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1532,7 +1532,7 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 		fs := NewOSFS()
 		dir := t.TempDir()
 
-		store, err := Open(WithFS(fs), WithDir(dir))
+		store, err := Open(WithFS(fs), WithDir(dir), WithCreate())
 		if err != nil {
 			t.Fatalf("Open failed: %v", err)
 		}
@@ -1542,7 +1542,7 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 
 		corrupt(dir)
 
-		store2, err := Open(WithFS(fs), WithDir(dir))
+		store2, err := Open(WithFS(fs), WithDir(dir), WithEraseOnError())
 		if err != nil {
 			t.Fatalf("Open after wipe failed: %v", err)
 		}
@@ -1622,7 +1622,7 @@ func TestRegression_MetaFileReadErrorNoWipe(t *testing.T) {
 	dir := "test_meta_read_err"
 
 	// 1. Initialize store with data
-	store, err := Open(WithFS(hookedFS), WithDir(dir))
+	store, err := Open(WithFS(hookedFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1692,7 +1692,7 @@ func TestRegression_SyncDirOnStoreInit(t *testing.T) {
 		storeDir: dir,
 	}
 
-	store, err := Open(WithFS(tracker), WithDir(dir))
+	store, err := Open(WithFS(tracker), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
