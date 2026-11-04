@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2416,6 +2417,7 @@ func setupLongNameTest(t *testing.T, initObjs ...client.Object) (string, *gatewa
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithIndex(&gatewayv1.Gateway{}, GatewayLabelValueIndex, GatewayLabelValueIndexer).
 		WithObjects(objs...).
 		Build()
 
@@ -2435,6 +2437,80 @@ func setupLongNameTest(t *testing.T, initObjs ...client.Object) (string, *gatewa
 	})
 
 	return longGwName, gw, c, reconciler, fakeGCP
+}
+
+func TestGateway_LabelValueIndex_MapFunctions(t *testing.T) {
+	scheme := setupScheme()
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "short-gw"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&gatewayv1.Gateway{}, GatewayLabelValueIndex, GatewayLabelValueIndexer).
+		WithObjects(gw).
+		Build()
+
+	rec := &GatewayReconciler{Client: c}
+	labelVal := singlepod.LabelValueForGateway("short-gw")
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Labels: map[string]string{
+				singlepod.LabelAppName:     singlepod.AppNameValue,
+				singlepod.LabelGatewayName: labelVal,
+			},
+		},
+	}
+	if reqs := rec.podToGateway(t.Context(), pod); len(reqs) != 1 || reqs[0].Name != "short-gw" {
+		t.Errorf("podToGateway = %v, want default/short-gw", reqs)
+	}
+
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Labels:    map[string]string{singlepod.LabelGatewayName: labelVal},
+		},
+	}
+	if reqs := rec.endpointSliceToGateway(t.Context(), slice); len(reqs) != 1 || reqs[0].Name != "short-gw" {
+		t.Errorf("endpointSliceToGateway = %v, want default/short-gw", reqs)
+	}
+}
+
+func TestGateway_LabelValueIndex_MultipleMatches(t *testing.T) {
+	scheme := setupScheme()
+	gw1 := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-one"}}
+	gw2 := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-two"}}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&gatewayv1.Gateway{}, GatewayLabelValueIndex, func(client.Object) []string {
+			return []string{"collision-label"}
+		}).
+		WithObjects(gw1, gw2).
+		Build()
+
+	rec := &GatewayReconciler{Client: c}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Labels: map[string]string{
+				singlepod.LabelAppName:     singlepod.AppNameValue,
+				singlepod.LabelGatewayName: "collision-label",
+			},
+		},
+	}
+
+	reqs := rec.podToGateway(t.Context(), pod)
+	var names []string
+	for _, req := range reqs {
+		names = append(names, req.Name)
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"gw-one", "gw-two"}) {
+		t.Errorf("podToGateway = %v, want [gw-one gw-two]", names)
+	}
 }
 
 func TestGateway_LongName_PodToGateway(t *testing.T) {

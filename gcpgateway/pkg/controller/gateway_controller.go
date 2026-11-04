@@ -41,6 +41,9 @@ import (
 )
 
 const (
+	// GatewayLabelValueIndex is the field index name used to map singlepod label values to Gateways.
+	GatewayLabelValueIndex = "gcpgateway.gke-labs.io/gateway-label-value"
+
 	// FinalizerCleanup is added to Gateways managed by gcpgateway to ensure data-plane
 	// endpoints and resources are cleanly detached and cleaned up before the Gateway is deleted.
 	FinalizerCleanup = "gcpgateway.gke-labs.io/cleanup"
@@ -199,9 +202,22 @@ func NewGatewayReconciler(c client.Client, scheme *runtime.Scheme, gcpClient gcp
 	}
 }
 
+// GatewayLabelValueIndexer indexes a Gateway by singlepod.LabelValueForGateway.
+func GatewayLabelValueIndexer(rawObj client.Object) []string {
+	gw, ok := rawObj.(*gatewayv1.Gateway)
+	if !ok || gw == nil || gw.Name == "" {
+		return nil
+	}
+	return []string{singlepod.LabelValueForGateway(gw.Name)}
+}
+
 // SetupWithManager registers GatewayReconciler with the controller-runtime Manager,
 // watching Gateways, data-plane Pods, and EndpointSlices.
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.Gateway{}, GatewayLabelValueIndex, GatewayLabelValueIndexer); err != nil {
+		return fmt.Errorf("registering field index %s: %w", GatewayLabelValueIndex, err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("gcpgateway").
 		For(&gatewayv1.Gateway{}).
@@ -210,32 +226,39 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// gatewayRequestForLabel lists the Gateways in the namespace and matches
-// singlepod.LabelValueForGateway(gw.Name) against the label value. It does not
-// filter the List with a label selector because Gateways do not carry
-// LabelGatewayName, and the label value may be a hash of a long Gateway name.
+// gatewayRequestForLabel finds Gateways in the namespace matching the label value
+// using the GatewayLabelValueIndex field index. If multiple Gateways match
+// (which can only occur due to a hash collision between long Gateway names),
+// a warning is logged and all matching Gateways are enqueued.
 func (r *GatewayReconciler) gatewayRequestForLabel(ctx context.Context, namespace, labelValue string) []reconcile.Request {
 	if labelValue == "" {
 		return nil
 	}
 	var gwList gatewayv1.GatewayList
-	if err := r.Client.List(ctx, &gwList, client.InNamespace(namespace)); err != nil {
+	if err := r.Client.List(ctx, &gwList, client.InNamespace(namespace), client.MatchingFields{GatewayLabelValueIndex: labelValue}); err != nil {
 		klog.ErrorS(err, "listing gateways to map label to gateway", "namespace", namespace, "labelValue", labelValue)
 		return nil
 	}
-	for _, gw := range gwList.Items {
-		if singlepod.LabelValueForGateway(gw.Name) == labelValue {
-			return []reconcile.Request{
-				{
-					NamespacedName: types.NamespacedName{
-						Namespace: namespace,
-						Name:      gw.Name,
-					},
-				},
-			}
+	if len(gwList.Items) == 0 {
+		return nil
+	}
+	if len(gwList.Items) > 1 {
+		names := make([]string, len(gwList.Items))
+		for i, gw := range gwList.Items {
+			names[i] = gw.Name
+		}
+		klog.Warningf("Multiple Gateways matched label value %q in namespace %q: %v; enqueuing all matches (possible hash collision)", labelValue, namespace, names)
+	}
+	reqs := make([]reconcile.Request, len(gwList.Items))
+	for i, gw := range gwList.Items {
+		reqs[i] = reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      gw.Name,
+			},
 		}
 	}
-	return nil
+	return reqs
 }
 
 func (r *GatewayReconciler) podToGateway(ctx context.Context, obj client.Object) []reconcile.Request {
