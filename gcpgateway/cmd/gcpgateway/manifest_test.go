@@ -37,6 +37,19 @@ func TestControllerManifest_RBACCustomResourceDefinitions(t *testing.T) {
 	var foundClusterRole bool
 	var foundCRDRule bool
 
+	expectedCRDNames := []string{
+		"gatewayclasses.gateway.networking.k8s.io",
+		"gateways.gateway.networking.k8s.io",
+		"httproutes.gateway.networking.k8s.io",
+		"tlsroutes.gateway.networking.k8s.io",
+		"grpcroutes.gateway.networking.k8s.io",
+		"tcproutes.gateway.networking.k8s.io",
+		"udproutes.gateway.networking.k8s.io",
+		"backendtlspolicies.gateway.networking.k8s.io",
+		"listenersets.gateway.networking.k8s.io",
+		"referencegrants.gateway.networking.k8s.io",
+	}
+
 	for _, doc := range docs {
 		var role rbacv1.ClusterRole
 		if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
@@ -49,8 +62,12 @@ func TestControllerManifest_RBACCustomResourceDefinitions(t *testing.T) {
 		for _, rule := range role.Rules {
 			if slices.Contains(rule.APIGroups, "apiextensions.k8s.io") && slices.Contains(rule.Resources, "customresourcedefinitions") {
 				foundCRDRule = true
-				if len(rule.ResourceNames) != 0 {
-					t.Errorf("customresourcedefinitions rule must not restrict resourceNames (got %v), because controller-runtime informers cannot be scoped by resourceNames", rule.ResourceNames)
+				gotNames := slices.Clone(rule.ResourceNames)
+				slices.Sort(gotNames)
+				sortedExpected := slices.Clone(expectedCRDNames)
+				slices.Sort(sortedExpected)
+				if !slices.Equal(gotNames, sortedExpected) {
+					t.Errorf("customresourcedefinitions rule must restrict resourceNames to named Gateway API CRDs; got %v, want %v", rule.ResourceNames, expectedCRDNames)
 				}
 				for _, verb := range []string{"get", "list", "watch"} {
 					if !slices.Contains(rule.Verbs, verb) {

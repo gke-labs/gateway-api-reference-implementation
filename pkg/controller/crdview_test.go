@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/version"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
@@ -37,6 +38,8 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 )
 
 func makeTestCRD(name string, bundleVersion string) *metav1.PartialObjectMetadata {
@@ -603,18 +606,19 @@ func TestCRDInformer_CacheTransformInspectStore(t *testing.T) {
 
 // Acceptance criteria: The cache holds no CRD specs (metadata only), if the watch approach is chosen.
 func TestCRDView_RegistersMetadataOnlyInformer(t *testing.T) {
-	scheme := newTestSchemeWithApiextensions()
+	env := testenv.Start(t)
 
-	var capturedObj any
+	var cacheCalled bool
 	fakeCache := &informerCaptureCache{
-		scheme: scheme,
+		scheme: env.Scheme,
 		onGetInformer: func(obj any) {
-			capturedObj = obj
+			cacheCalled = true
 		},
 	}
 
 	mgr := &mockManager{
-		scheme: scheme,
+		scheme: env.Scheme,
+		config: env.Config,
 		cache:  fakeCache,
 	}
 
@@ -623,18 +627,39 @@ func TestCRDView_RegistersMetadataOnlyInformer(t *testing.T) {
 		t.Fatalf("unexpected RegisterWithManager error: %v", err)
 	}
 
-	if capturedObj == nil {
-		t.Fatalf("expected GetInformer to be called with CRD object, got nil")
+	// Controller-runtime manager cache must NOT be used for CRDs (cluster-wide list is forbidden).
+	if cacheCalled {
+		t.Errorf("expected controller-runtime cache not to be called for CRD informers")
 	}
 
-	metaObj, ok := capturedObj.(*metav1.PartialObjectMetadata)
-	if !ok {
-		t.Fatalf("expected GetInformer to be called with *metav1.PartialObjectMetadata, got %T (CRD specs must not be cached)", capturedObj)
+	// CRDView must be registered as a Runnable with the manager.
+	if len(mgr.runnables) != 1 {
+		t.Fatalf("expected 1 runnable registered with manager, got %d", len(mgr.runnables))
+	}
+	if mgr.runnables[0] != crdView {
+		t.Errorf("expected CRDView to be registered as runnable with manager")
+	}
+	if crdView.NeedLeaderElection() {
+		t.Errorf("expected NeedLeaderElection to be false so informers run immediately")
+	}
+}
+
+type nilConfigManager struct {
+	ctrl.Manager
+}
+
+func (m *nilConfigManager) GetConfig() *rest.Config {
+	return nil
+}
+
+func TestCRDView_RegisterWithManager_NilConfigReturnsError(t *testing.T) {
+	crdView := NewCRDViewFromSnapshot(CRDSnapshot{})
+	if err := crdView.RegisterWithManager(nil); err == nil {
+		t.Errorf("expected error when mgr is nil, got nil")
 	}
 
-	gvk := metaObj.GetObjectKind().GroupVersionKind()
-	if gvk != CustomResourceDefinitionGVK {
-		t.Errorf("expected GVK %v, got %v", CustomResourceDefinitionGVK, gvk)
+	if err := crdView.RegisterWithManager(&nilConfigManager{}); err == nil {
+		t.Errorf("expected error when mgr.GetConfig() is nil, got nil")
 	}
 }
 
