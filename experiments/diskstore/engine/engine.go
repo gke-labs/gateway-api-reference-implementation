@@ -424,8 +424,12 @@ func Open(opts ...Option) (*Engine, error) {
 			if cErr := metaFile.Close(); cErr != nil {
 				return nil, fmt.Errorf("failed to close meta file: %w", cErr)
 			}
+			if rErr != nil && !errors.Is(rErr, io.EOF) {
+				return nil, fmt.Errorf("failed to read meta file: %w", rErr)
+			}
+
 			validVersion := false
-			if (rErr == nil || errors.Is(rErr, io.EOF)) && n >= metaFileSize {
+			if n >= metaFileSize {
 				version := binary.BigEndian.Uint32(metaBuf[16:20])
 				if version == StoreFormatVersion {
 					validVersion = true

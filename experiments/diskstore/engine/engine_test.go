@@ -1587,3 +1587,75 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 		})
 	})
 }
+
+type readErrorHookFS struct {
+	FS
+	failMetaRead bool
+}
+
+type readErrorFile struct {
+	File
+	failRead bool
+}
+
+func (f *readErrorFile) ReadAt(p []byte, off int64) (int, error) {
+	if f.failRead {
+		return 0, errors.New("simulated read error")
+	}
+	return f.File.ReadAt(p, off)
+}
+
+func (h *readErrorHookFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	f, err := h.FS.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	if strings.Contains(name, "meta.db") && h.failMetaRead {
+		return &readErrorFile{File: f, failRead: true}, nil
+	}
+	return f, nil
+}
+
+func TestRegression_MetaFileReadErrorNoWipe(t *testing.T) {
+	memFS := NewMemFS()
+	hookedFS := &readErrorHookFS{FS: memFS}
+	dir := "test_meta_read_err"
+
+	// 1. Initialize store with data
+	store, err := Open(WithFS(hookedFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "importantKey", []byte("val"), "1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 2. Inject read error on meta.db
+	hookedFS.failMetaRead = true
+
+	// 3. Attempt Open: must fail with read error and NOT wipe database
+	_, err = Open(WithFS(hookedFS), WithDir(dir))
+	if err == nil {
+		t.Fatalf("expected Open to fail when meta.db read fails")
+	}
+
+	// 4. Clear read error and reopen: data must still exist!
+	hookedFS.failMetaRead = false
+	store2, err := Open(WithFS(hookedFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open after clearing read error failed: %v", err)
+	}
+	defer func() {
+		if err := store2.Close(); err != nil {
+			t.Errorf("store2.Close failed: %v", err)
+		}
+	}()
+
+	val, exists, err := store2.Get("ConfigMap", "importantKey")
+	if err != nil || !exists || string(val) != "val" {
+		t.Fatalf("database was wiped on meta.db read error! val=%q, exists=%v, err=%v", string(val), exists, err)
+	}
+}
