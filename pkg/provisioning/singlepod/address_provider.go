@@ -39,6 +39,7 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -910,6 +911,10 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			}, nil
 		}
 
+		if err := p.deleteOldResources(ctx, gw, name); err != nil {
+			return nil, state.GatewayReadiness{}, fmt.Errorf("failed to clean up obsolete resources for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		}
+
 		return addresses, state.GatewayReadiness{
 			Ready:   true,
 			Reason:  string(gatewayv1.GatewayReasonProgrammed),
@@ -1001,11 +1006,65 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}, nil
 	}
 
+	if err := p.deleteOldResources(ctx, gw, name); err != nil {
+		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to clean up obsolete resources for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+	}
+
 	return addresses, state.GatewayReadiness{
 		Ready:   true,
 		Reason:  string(gatewayv1.GatewayReasonProgrammed),
 		Message: "Gateway programmed by reference implementation",
 	}, nil
+}
+
+// deleteOldResources finds and deletes resources in the Gateway's namespace that were
+// provisioned for this Gateway but do not have the current derived name.
+// Old resources are deleted only after the new Deployment is ready and the Service
+// has an assigned address, so that the old data plane continues serving traffic during
+// naming scheme upgrades without causing downtime.
+func (p *AddressProvider) deleteOldResources(ctx context.Context, gw *gatewayv1.Gateway, currentName string) error {
+	if gw == nil || gw.UID == "" {
+		return nil
+	}
+
+	lists := []struct {
+		kind string
+		list client.ObjectList
+	}{
+		{kind: "Deployment", list: &appsv1.DeploymentList{}},
+		{kind: "Service", list: &corev1.ServiceList{}},
+		{kind: "Secret", list: &corev1.SecretList{}},
+		{kind: "RoleBinding", list: &rbacv1.RoleBindingList{}},
+		{kind: "Role", list: &rbacv1.RoleList{}},
+		{kind: "ServiceAccount", list: &corev1.ServiceAccountList{}},
+	}
+
+	for _, item := range lists {
+		if err := p.client.List(ctx, item.list, client.InNamespace(gw.Namespace), client.MatchingLabels{LabelAppName: AppNameValue}); err != nil {
+			return fmt.Errorf("listing %s for cleanup: %w", item.kind, err)
+		}
+		objs, err := meta.ExtractList(item.list)
+		if err != nil {
+			return fmt.Errorf("extracting %s list: %w", item.kind, err)
+		}
+		for _, o := range objs {
+			obj, ok := o.(client.Object)
+			if !ok || obj.GetName() == currentName {
+				continue
+			}
+			if !isOwnedByGateway(obj, gw) {
+				continue
+			}
+			if err := p.client.Delete(ctx, obj); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return fmt.Errorf("failed to delete obsolete %s %s/%s: %w", item.kind, obj.GetNamespace(), obj.GetName(), err)
+				}
+				continue
+			}
+			klog.InfoS("deleted obsolete provisioned resource", "kind", item.kind, "name", obj.GetName(), "reason", "name does not match current derived name")
+		}
+	}
+	return nil
 }
 
 // GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
