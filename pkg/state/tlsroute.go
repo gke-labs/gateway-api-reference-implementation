@@ -20,7 +20,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -138,90 +137,21 @@ func CompileTLSRoute(
 		}
 
 		for _, backendRef := range rule.BackendRefs {
-			group := ValueOf(backendRef.Group)
-			kind := ValueOf(backendRef.Kind)
-			if kind == "" {
-				kind = "Service"
-			}
-
-			if (group != "" && group != "core") || kind != "Service" {
-				var msg string
-				if group != "" && group != "core" {
-					msg = fmt.Sprintf("Unsupported backend: %s/%s", group, kind)
-				} else {
-					msg = fmt.Sprintf("Unsupported backend kind: %s", kind)
+			backend, resolutionErr := resolveBackendTarget(
+				backendRef.BackendObjectReference,
+				"TLSRoute",
+				route.Namespace,
+				route.Generation,
+				services,
+				nil,
+				nil,
+				refValidator,
+			)
+			if resolutionErr != nil {
+				if resolvedRefsCondition.Status == metav1.ConditionTrue {
+					resolvedRefsCondition = resolutionErr.Condition
 				}
-				resolvedRefsCondition = NewCondition(
-					string(gatewayv1.RouteConditionResolvedRefs),
-					metav1.ConditionFalse,
-					string(gatewayv1.RouteReasonInvalidKind),
-					msg,
-					route.Generation,
-				)
 				continue
-			}
-
-			svcNamespace := route.Namespace
-			if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
-				svcNamespace = string(*backendRef.Namespace)
-			}
-
-			// Cross-namespace ReferenceGrant check
-			if svcNamespace != route.Namespace {
-				from := Reference{
-					GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"},
-					Namespace: route.Namespace,
-				}
-				to := Reference{
-					GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
-					Namespace: svcNamespace,
-					Name:      string(backendRef.Name),
-				}
-				if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
-					msg := fmt.Sprintf("Cross-namespace reference to service %s/%s is not permitted by any ReferenceGrant", svcNamespace, string(backendRef.Name))
-					resolvedRefsCondition = NewCondition(
-						string(gatewayv1.RouteConditionResolvedRefs),
-						metav1.ConditionFalse,
-						string(gatewayv1.RouteReasonRefNotPermitted),
-						msg,
-						route.Generation,
-					)
-					continue
-				}
-			}
-
-			port := int32(443)
-			if backendRef.Port != nil {
-				port = int32(*backendRef.Port)
-			}
-
-			svcKey := types.NamespacedName{
-				Namespace: svcNamespace,
-				Name:      string(backendRef.Name),
-			}
-
-			if services != nil {
-				svc, ok := services[svcKey]
-				if !ok || svc == nil {
-					msg := fmt.Sprintf("Backend service %s/%s not found", svcNamespace, string(backendRef.Name))
-					resolvedRefsCondition = NewCondition(
-						string(gatewayv1.RouteConditionResolvedRefs),
-						metav1.ConditionFalse,
-						string(gatewayv1.RouteReasonBackendNotFound),
-						msg,
-						route.Generation,
-					)
-					continue
-				}
-
-				for _, p := range svc.Spec.Ports {
-					if p.Port == port {
-						if svc.Spec.ClusterIP == corev1.ClusterIPNone && p.TargetPort.IntValue() > 0 {
-							port = int32(p.TargetPort.IntValue())
-						}
-						break
-					}
-				}
 			}
 
 			weight := int32(1)
@@ -232,7 +162,7 @@ func CompileTLSRoute(
 				}
 			}
 
-			target := fmt.Sprintf("%s.%s.svc.cluster.local:%d", backendRef.Name, svcNamespace, port)
+			target := fmt.Sprintf("%s:%d", backend.Host, backend.Port)
 			iRule.Backends = append(iRule.Backends, InternalTLSBackend{
 				Target: target,
 				Weight: weight,

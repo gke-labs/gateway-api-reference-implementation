@@ -780,6 +780,73 @@ func TestTLSRoute_UnresolvableBackendRef(t *testing.T) {
 			t.Errorf("expected ResolvedRefs reason InvalidKind, got %s", resolvedRefsCond.Reason)
 		}
 	})
+
+	t.Run("first failing backend sets ResolvedRefs reason", func(t *testing.T) {
+		unknownGroup := gatewayv1.Group("unknownkind.example.com")
+		unknownKind := gatewayv1.Kind("NonExistent")
+		route := &gatewayv1.TLSRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-multiple-failures", Namespace: "default"},
+			Spec: gatewayv1.TLSRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+				},
+				Hostnames: []gatewayv1.Hostname{"example.com"},
+				Rules: []gatewayv1.TLSRouteRule{
+					{
+						BackendRefs: []gatewayv1.BackendRef{
+							{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &unknownGroup,
+									Kind:  &unknownKind,
+									Name:  "tls-backend",
+									Port:  &port443,
+								},
+							},
+							{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "nonexistent",
+									Port: &port443,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			TLSRoutes:      []*gatewayv1.TLSRoute{route},
+			Services:       map[types.NamespacedName]*corev1.Service{},
+			ControllerName: "example.net/gateway-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		routeStatus, ok := outputs.TLSRouteStatuses[types.NamespacedName{Namespace: "default", Name: "route-multiple-failures"}]
+		if !ok {
+			t.Fatalf("expected status for route")
+		}
+		if len(routeStatus.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(routeStatus.Parents))
+		}
+		var resolvedRefsCond *metav1.Condition
+		for _, c := range routeStatus.Parents[0].Conditions {
+			if c.Type == string(gatewayv1.RouteConditionResolvedRefs) {
+				resolvedRefsCond = &c
+				break
+			}
+		}
+		if resolvedRefsCond == nil {
+			t.Fatal("expected ResolvedRefs condition on parent status")
+		}
+		if resolvedRefsCond.Status != metav1.ConditionFalse {
+			t.Errorf("expected ResolvedRefs status False, got %s", resolvedRefsCond.Status)
+		}
+		if resolvedRefsCond.Reason != string(gatewayv1.RouteReasonInvalidKind) {
+			t.Errorf("expected ResolvedRefs reason InvalidKind, got %s", resolvedRefsCond.Reason)
+		}
+	})
 }
 
 func TestTLSRoute_InvalidNoMatchingListener(t *testing.T) {
