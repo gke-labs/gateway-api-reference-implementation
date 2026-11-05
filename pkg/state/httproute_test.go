@@ -1338,6 +1338,79 @@ func TestCompileHTTPRoute(t *testing.T) {
 			t.Errorf("expected Reason UnsupportedValue, got %s", internalDup.ValidationCondition.Reason)
 		}
 	})
+
+	t.Run("clamps negative backend weights to 0", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "neg-weight-route", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "svc-neg",
+										Port: Ptr(gatewayv1.PortNumber(8080)),
+									},
+									Weight: Ptr(int32(-5)),
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		services := map[types.NamespacedName]*corev1.Service{
+			{Namespace: "default", Name: "svc-neg"}: {
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{{Port: 8080}},
+				},
+			},
+		}
+		compiled := CompileHTTPRoute(route, services, nil, nil, nil)
+		if len(compiled.Rules) != 1 || len(compiled.Rules[0].Backends) != 1 {
+			t.Fatalf("expected 1 backend, got %+v", compiled.Rules)
+		}
+		if compiled.Rules[0].Backends[0].Weight != 0 {
+			t.Errorf("expected negative weight to be clamped to 0, got %d", compiled.Rules[0].Backends[0].Weight)
+		}
+	})
+
+	t.Run("skips repeated header names in matches case-insensitively", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "dup-headers-route", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								Headers: []gatewayv1.HTTPHeaderMatch{
+									{Name: "X-Header", Value: "first"},
+									{Name: "x-header", Value: "second"},
+									{Name: "Other-Header", Value: "val"},
+									{Name: "OTHER-HEADER", Value: "ignored"},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		compiled := CompileHTTPRoute(route, nil, nil, nil, nil)
+		if len(compiled.Rules) != 1 || len(compiled.Rules[0].Matches) != 1 {
+			t.Fatalf("expected 1 rule with 1 match, got %+v", compiled.Rules)
+		}
+		headers := compiled.Rules[0].Matches[0].Headers
+		if len(headers) != 2 {
+			t.Fatalf("expected 2 deduplicated headers, got %d: %+v", len(headers), headers)
+		}
+		if headers[0].Name != "X-Header" || headers[0].MatchExactValue != "first" {
+			t.Errorf("expected first header X-Header=first, got %+v", headers[0])
+		}
+		if headers[1].Name != "Other-Header" || headers[1].MatchExactValue != "val" {
+			t.Errorf("expected second header Other-Header=val, got %+v", headers[1])
+		}
+	})
 }
 
 func TestHTTPRouteValidate_Timeouts(t *testing.T) {

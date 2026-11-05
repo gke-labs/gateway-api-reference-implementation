@@ -17,7 +17,6 @@ package state
 import (
 	"errors"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strings"
 
@@ -139,23 +138,7 @@ func CompileGRPCRoute(
 		if rule.Name != nil {
 			if seenRuleNames[*rule.Name] {
 				msg := fmt.Sprintf("duplicate rule name: %s", *rule.Name)
-				errCond := NewCondition(
-					string(gatewayv1.RouteConditionAccepted),
-					metav1.ConditionFalse,
-					string(gatewayv1.RouteReasonUnsupportedValue),
-					msg,
-					route.Generation,
-				)
-				if validationCondition.Status == metav1.ConditionTrue {
-					validationCondition = errCond
-				}
-				if iRule.Error == nil {
-					iRule.Error = &ErrorState{
-						Condition:      errCond,
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    msg,
-					}
-				}
+				recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
 			}
 			seenRuleNames[*rule.Name] = true
 		}
@@ -201,23 +184,7 @@ func CompileGRPCRoute(
 
 			default:
 				msg := fmt.Sprintf("unsupported filter type: %s", filter.Type)
-				errCond := NewCondition(
-					string(gatewayv1.RouteConditionAccepted),
-					metav1.ConditionFalse,
-					string(gatewayv1.RouteReasonUnsupportedValue),
-					msg,
-					route.Generation,
-				)
-				if validationCondition.Status == metav1.ConditionTrue {
-					validationCondition = errCond
-				}
-				if iRule.Error == nil {
-					iRule.Error = &ErrorState{
-						Condition:      errCond,
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    msg,
-					}
-				}
+				recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
 			}
 		}
 
@@ -261,23 +228,7 @@ func CompileGRPCRoute(
 					re, err := regexp.Compile(header.Value)
 					if err != nil {
 						msg := fmt.Sprintf("invalid regular expression in header match: %v", err)
-						errCond := NewCondition(
-							string(gatewayv1.RouteConditionAccepted),
-							metav1.ConditionFalse,
-							string(gatewayv1.RouteReasonUnsupportedValue),
-							msg,
-							route.Generation,
-						)
-						if validationCondition.Status == metav1.ConditionTrue {
-							validationCondition = errCond
-						}
-						if iRule.Error == nil {
-							iRule.Error = &ErrorState{
-								Condition:      errCond,
-								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    msg,
-							}
-						}
+						recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
 					} else {
 						hm.MatchRegularExpressionValue = re
 					}
@@ -323,38 +274,17 @@ func CompileGRPCRoute(
 					default:
 						backendFilterErr = fmt.Errorf("Unsupported backend filter type: %s", filter.Type)
 					}
+					if backendFilterErr != nil {
+						break
+					}
 				}
 
 				if backendFilterErr != nil {
-					errCond := NewCondition(
-						string(gatewayv1.RouteConditionAccepted),
-						metav1.ConditionFalse,
-						string(gatewayv1.RouteReasonUnsupportedValue),
-						backendFilterErr.Error(),
-						route.Generation,
-					)
-					if validationCondition.Status == metav1.ConditionTrue {
-						validationCondition = errCond
-					}
-					if iRule.Error == nil {
-						iRule.Error = &ErrorState{
-							Condition:      errCond,
-							HTTPStatusCode: http.StatusInternalServerError,
-							HTTPMessage:    backendFilterErr.Error(),
-						}
-					}
+					recordRuleValidationError(&validationCondition, &iRule, backendFilterErr.Error(), route.Generation)
 					break
 				}
 
-				weight := int32(1)
-				if backendRef.Weight != nil {
-					weight = *backendRef.Weight
-					if weight < 0 {
-						weight = 0
-					}
-				}
-
-				backend.Weight = weight
+				backend.Weight = resolveBackendWeight(backendRef.Weight)
 				backend.RequestHeaderModifier = backendReqHeaderModifier
 				backend.ResponseHeaderModifier = backendRespHeaderModifier
 				iRule.Backends = append(iRule.Backends, *backend)
@@ -369,13 +299,7 @@ func CompileGRPCRoute(
 		compiledRules = append(compiledRules, iRule)
 	}
 
-	if noPolicyHosts := noPolicyTLSBackendHosts(compiledRules); len(noPolicyHosts) > 0 && resolvedRefsCondition.Status == metav1.ConditionTrue {
-		if len(noPolicyHosts) == 1 {
-			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName %s (backend Service specifies appProtocol: https without a BackendTLSPolicy)", noPolicyHosts[0])
-		} else {
-			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName for %s (backend Services specify appProtocol: https without a BackendTLSPolicy)", strings.Join(noPolicyHosts, ", "))
-		}
-	}
+	applyNoPolicyTLSMessage(&resolvedRefsCondition, compiledRules)
 
 	return &InternalGRPCRoute{
 		Route:                 route,

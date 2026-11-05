@@ -1188,6 +1188,50 @@ func TestGRPCRoute_ExtensionRef_And_UnsupportedFilters(t *testing.T) {
 		}
 	})
 
+	t.Run("reports first unsupported backend filter error when multiple are present", func(t *testing.T) {
+		route := &gatewayv1.GRPCRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "multi-unsupported-backend-filter", Namespace: "default"},
+			Spec: gatewayv1.GRPCRouteSpec{
+				Rules: []gatewayv1.GRPCRouteRule{
+					{
+						BackendRefs: []gatewayv1.GRPCBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: &port8080,
+									},
+								},
+								Filters: []gatewayv1.GRPCRouteFilter{
+									{
+										Type: gatewayv1.GRPCRouteFilterType("FirstUnsupportedFilter"),
+									},
+									{
+										Type: gatewayv1.GRPCRouteFilterType("SecondUnsupportedFilter"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileGRPCRoute(route, services, nil, nil, nil)
+		if compiled.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", compiled.ValidationCondition.Status)
+		}
+		if compiled.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %v", compiled.ValidationCondition.Reason)
+		}
+		if !strings.Contains(compiled.ValidationCondition.Message, "FirstUnsupportedFilter") {
+			t.Errorf("expected error message to mention FirstUnsupportedFilter, got %q", compiled.ValidationCondition.Message)
+		}
+		if strings.Contains(compiled.ValidationCondition.Message, "SecondUnsupportedFilter") {
+			t.Errorf("expected error message not to mention SecondUnsupportedFilter, got %q", compiled.ValidationCondition.Message)
+		}
+	})
+
 	t.Run("rule-level unknown filter rejected with UnsupportedValue", func(t *testing.T) {
 		route := &gatewayv1.GRPCRoute{
 			ObjectMeta: metav1.ObjectMeta{Name: "unknown-filter", Namespace: "default"},

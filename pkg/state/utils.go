@@ -17,9 +17,11 @@ package state
 import (
 	"encoding/pem"
 	"fmt"
+	"net/http"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -204,4 +206,52 @@ func noPolicyTLSBackendHosts(rules []InternalRule) []string {
 		}
 	}
 	return hosts
+}
+
+// recordRuleValidationError sets a RouteConditionAccepted=False condition with reason UnsupportedValue,
+// and records an ErrorState on the rule if not already present.
+func recordRuleValidationError(validationCond *metav1.Condition, rule *InternalRule, msg string, generation int64) {
+	errCond := NewCondition(
+		string(gatewayv1.RouteConditionAccepted),
+		metav1.ConditionFalse,
+		string(gatewayv1.RouteReasonUnsupportedValue),
+		msg,
+		generation,
+	)
+	if validationCond != nil && validationCond.Status == metav1.ConditionTrue {
+		*validationCond = errCond
+	}
+	if rule != nil && rule.Error == nil {
+		rule.Error = &ErrorState{
+			Condition:      errCond,
+			HTTPStatusCode: http.StatusInternalServerError,
+			HTTPMessage:    msg,
+		}
+	}
+}
+
+// resolveBackendWeight returns the backend weight, defaulting to 1 if nil and clamping negative values to 0.
+func resolveBackendWeight(w *int32) int32 {
+	if w == nil {
+		return 1
+	}
+	if *w < 0 {
+		return 0
+	}
+	return *w
+}
+
+// applyNoPolicyTLSMessage updates resolvedRefsCondition with a descriptive message
+// when backends or mirrors specify appProtocol: https without a BackendTLSPolicy.
+func applyNoPolicyTLSMessage(resolvedRefsCondition *metav1.Condition, rules []InternalRule) {
+	if resolvedRefsCondition == nil || resolvedRefsCondition.Status != metav1.ConditionTrue {
+		return
+	}
+	if noPolicyHosts := noPolicyTLSBackendHosts(rules); len(noPolicyHosts) > 0 {
+		if len(noPolicyHosts) == 1 {
+			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName %s (backend Service specifies appProtocol: https without a BackendTLSPolicy)", noPolicyHosts[0])
+		} else {
+			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName for %s (backend Services specify appProtocol: https without a BackendTLSPolicy)", strings.Join(noPolicyHosts, ", "))
+		}
+	}
 }
