@@ -773,6 +773,9 @@ func resolveBackendTarget(
 
 	// Service resolution
 	port := int32(80)
+	if routeKind == "TLSRoute" {
+		port = int32(443)
+	}
 	if backendRef.Port != nil {
 		port = int32(*backendRef.Port)
 	}
