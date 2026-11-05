@@ -201,8 +201,7 @@ func TestManager_Pebble_Renewal(t *testing.T) {
 	tempDir := t.TempDir()
 	cacheDir := filepath.Join(tempDir, "cache")
 
-	initialTime := time.Now().Truncate(time.Second)
-	clock := &mockClock{now: initialTime}
+	clock := &mockClock{now: time.Now()}
 
 	mgr, _ := createTestManager(t, pebble, cacheDir, clock)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -219,8 +218,8 @@ func TestManager_Pebble_Renewal(t *testing.T) {
 		t.Fatalf("Obtain failed: %v", err)
 	}
 
-	// Advance clock past 2/3 lifetime (e.g. 45 seconds out of 60 seconds)
-	clock.Advance(45 * time.Second)
+	// Advance clock into renewal window (45s of 60s from cert issuance)
+	clock.Set(cert1.IssuedAt.Add(45 * time.Second))
 
 	// Trigger renewal check
 	if err := mgr.CheckRenewals(ctx); err != nil {
