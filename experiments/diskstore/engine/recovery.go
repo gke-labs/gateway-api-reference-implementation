@@ -15,9 +15,11 @@
 package engine
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -427,10 +429,55 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 		return nil
 	}
 
+	// Both removeOversizeFileForRedo and removeOversizeFileIfOlder must sync oversizeDir
+	// after removing an oversize file so the directory entry deletion is durable and the
+	// unlinked file cannot reappear after a subsequent crash.
+	removeOversizeFileOnDisk := func(oversizePath, oversizeDir string) error {
+		if removeErr := fs.Remove(oversizePath); removeErr != nil {
+			if errors.Is(removeErr, os.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("failed to remove oversize file %s during redo: %w", oversizePath, removeErr)
+		}
+		if syncErr := fs.SyncDir(oversizeDir); syncErr != nil {
+			return fmt.Errorf("failed to sync oversize dir: %w", syncErr)
+		}
+		return nil
+	}
+
 	removeOversizeFileForRedo := func(qKey string) error {
-		oversizePath := filepath.Join(filepath.Dir(walDir), "oversize", oversizeFileName(qKey))
-		if err := fs.Remove(oversizePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("failed to remove oversize file %s during redo: %w", oversizePath, err)
+		oversizeDir := filepath.Join(filepath.Dir(walDir), "oversize")
+		return removeOversizeFileOnDisk(filepath.Join(oversizeDir, oversizeFileName(qKey)), oversizeDir)
+	}
+
+	removeOversizeFileIfOlder := func(qKey string, recordLSN uint64) error {
+		oversizeDir := filepath.Join(filepath.Dir(walDir), "oversize")
+		oversizePath := filepath.Join(oversizeDir, oversizeFileName(qKey))
+		file, openErr := fs.OpenFile(oversizePath, os.O_RDONLY, 0644)
+		if openErr != nil {
+			if errors.Is(openErr, os.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("failed to open oversize file %s during redo: %w", oversizePath, openErr)
+		}
+		header := make([]byte, OversizeHeaderSize)
+		_, readErr := file.ReadAt(header, 0)
+		if closeErr := file.Close(); closeErr != nil {
+			return fmt.Errorf("failed to close oversize file %s: %w", oversizePath, closeErr)
+		}
+		if readErr != nil {
+			slog.Warn("diskstore: cannot read header of oversize file during redo; leaving in place", "path", oversizePath, "reason", readErr)
+			return nil
+		}
+		magic := binary.BigEndian.Uint32(header[0:4])
+		version := binary.BigEndian.Uint32(header[4:8])
+		if magic != OversizeMagic || version != OversizeVersion {
+			slog.Warn("diskstore: corrupt oversize file header during redo; leaving in place", "path", oversizePath, "reason", "invalid magic or version")
+			return nil
+		}
+		fileLSN := binary.BigEndian.Uint64(header[8:16])
+		if fileLSN < recordLSN {
+			return removeOversizeFileOnDisk(oversizePath, oversizeDir)
 		}
 		return nil
 	}
@@ -503,6 +550,10 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 
 				if inIndex && existing.IsOversize {
 					if err := removeOversizeFileForRedo(rec.Key); err != nil {
+						return nil, err
+					}
+				} else {
+					if err := removeOversizeFileIfOlder(rec.Key, rec.LSN); err != nil {
 						return nil, err
 					}
 				}
@@ -672,6 +723,9 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 						return nil, err
 					}
 					delete(keyIndex, rec.Key)
+				}
+				if err := removeOversizeFileIfOlder(rec.Key, rec.LSN); err != nil {
+					return nil, err
 				}
 			}
 		}
