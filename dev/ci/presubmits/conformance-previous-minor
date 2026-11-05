@@ -20,4 +20,4 @@ set -o pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
-go run github.com/gke-labs/gke-labs-infra/ap@latest bash ./dev/tasks/test-conformance-previous-minor
+go run github.com/gke-labs/gke-labs-infra/ap@latest bash ./dev/tasks/conformance-previous-minor
