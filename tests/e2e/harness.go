@@ -91,7 +91,7 @@ func (h *Harness) Setup() {
 
 func (h *Harness) InstallMetallb() {
 	h.t.Log("Installing Metallb")
-	h.runCmd("kubectl", "apply", "-f", "https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml")
+	h.KubectlApplyWithRetry("-f", "https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml")
 	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=available", "deployment/controller", "--timeout=90s")
 	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=ready", "pod", "--selector=app=metallb", "--timeout=90s")
 
@@ -170,6 +170,28 @@ func (h *Harness) KubectlApplyContentWithRetry(content string, timeout time.Dura
 func (h *Harness) KubectlApplyFile(path string) {
 	h.t.Logf("Applying kubectl file: %s", path)
 	h.runCmd("kubectl", "apply", "-f", path)
+}
+
+var applyRetryDelays = []time.Duration{5 * time.Second, 10 * time.Second, 15 * time.Second}
+
+// KubectlApplyWithRetry runs kubectl apply with the provided arguments, retrying
+// with backoff on failure before failing the test.
+func (h *Harness) KubectlApplyWithRetry(args ...string) {
+	commandArgs := append([]string{"apply"}, args...)
+	maxAttempts := len(applyRetryDelays) + 1
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		_, err := h.runCommand("kubectl", commandArgs...)
+		if err == nil {
+			return
+		}
+		lastErr = err
+		if attempt < maxAttempts {
+			h.t.Logf("kubectl %v failed (attempt %d/%d): %v; retrying...", commandArgs, attempt, maxAttempts, err)
+			time.Sleep(applyRetryDelays[attempt-1])
+		}
+	}
+	h.t.Fatalf("kubectl %v failed after %d attempts: %v", commandArgs, maxAttempts, lastErr)
 }
 
 func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
@@ -311,15 +333,23 @@ func (h *Harness) GetPodLogs(name string) string {
 	return string(out)
 }
 
-func (h *Harness) runCmd(name string, args ...string) string {
+func (h *Harness) runCommand(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		h.t.Fatalf("Command %s %v failed: %v\nStdout: %s\nStderr: %s", name, args, err, stdout.String(), stderr.String())
+		return "", fmt.Errorf("command %s %v failed: %w\nStdout: %s\nStderr: %s", name, args, err, stdout.String(), stderr.String())
 	}
-	return stdout.String()
+	return stdout.String(), nil
+}
+
+func (h *Harness) runCmd(name string, args ...string) string {
+	stdout, err := h.runCommand(name, args...)
+	if err != nil {
+		h.t.Fatalf("%v", err)
+	}
+	return stdout
 }
 
 // PreviousMinorCRDVersion is the previous minor Gateway API release bundle version supported by the controller.
@@ -327,7 +357,7 @@ const PreviousMinorCRDVersion = "v1.6.3"
 
 func (h *Harness) InstallGatewayAPI(version string) {
 	h.t.Logf("Installing Gateway API CRDs (%s)", version)
-	h.runCmd("kubectl", "apply", "--server-side", "--force-conflicts", "-f", fmt.Sprintf("https://github.com/kubernetes-sigs/gateway-api/releases/download/%s/experimental-install.yaml", version))
+	h.KubectlApplyWithRetry("--server-side", "--force-conflicts", "-f", fmt.Sprintf("https://github.com/kubernetes-sigs/gateway-api/releases/download/%s/experimental-install.yaml", version))
 }
 
 func (h *Harness) DeployController() {
