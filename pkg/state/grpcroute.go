@@ -430,16 +430,7 @@ func (s *GRPCRouteState) IsAccepted(controllerName string) bool {
 	if s == nil || s.GRPCRoute == nil {
 		return false
 	}
-	for _, ps := range s.Status.Parents {
-		if string(ps.ControllerName) == controllerName {
-			for _, c := range ps.Conditions {
-				if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return isRouteAccepted(s.Status.Parents, controllerName)
 }
 
 // IsAcceptedForParentRef checks if the route is accepted for a specific parent reference.
@@ -447,46 +438,5 @@ func (s *GRPCRouteState) IsAcceptedForParentRef(parentRef gatewayv1.ParentRefere
 	if s == nil || s.GRPCRoute == nil {
 		return false
 	}
-	parentNamespace := s.Namespace
-	if ns := ValueOf(parentRef.Namespace); ns != "" {
-		parentNamespace = string(ns)
-	}
-	pKind := ValueOf(parentRef.Kind)
-	if pKind == "" {
-		pKind = "Gateway"
-	}
-	pGroup := ValueOf(parentRef.Group)
-	if pGroup == "" {
-		pGroup = gatewayv1.GroupName
-	}
-	for _, ps := range s.Status.Parents {
-		if string(ps.ControllerName) != controllerName {
-			continue
-		}
-		psNamespace := s.Namespace
-		if ns := ValueOf(ps.ParentRef.Namespace); ns != "" {
-			psNamespace = string(ns)
-		}
-		psKind := ValueOf(ps.ParentRef.Kind)
-		if psKind == "" {
-			psKind = "Gateway"
-		}
-		psGroup := ValueOf(ps.ParentRef.Group)
-		if psGroup == "" {
-			psGroup = gatewayv1.GroupName
-		}
-		if string(ps.ParentRef.Name) == string(parentRef.Name) &&
-			psNamespace == parentNamespace &&
-			psKind == pKind &&
-			psGroup == pGroup &&
-			ValueOf(ps.ParentRef.SectionName) == ValueOf(parentRef.SectionName) &&
-			ValueOf(ps.ParentRef.Port) == ValueOf(parentRef.Port) {
-			for _, c := range ps.Conditions {
-				if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return isRouteAcceptedForParentRef(s.Status.Parents, parentRef, s.Namespace, controllerName)
 }

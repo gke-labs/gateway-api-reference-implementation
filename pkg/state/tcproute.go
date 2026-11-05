@@ -127,7 +127,7 @@ func (s *TCPRouteState) IsAccepted(controllerName string) bool {
 	if s == nil || s.TCPRoute == nil {
 		return false
 	}
-	return isL4RouteAccepted(s.Status.Parents, controllerName)
+	return isRouteAccepted(s.Status.Parents, controllerName)
 }
 
 // IsAcceptedForParentRef checks if the route is accepted for a specific parent reference.
@@ -135,5 +135,5 @@ func (s *TCPRouteState) IsAcceptedForParentRef(parentRef gatewayv1.ParentReferen
 	if s == nil || s.TCPRoute == nil {
 		return false
 	}
-	return isL4RouteAcceptedForParentRef(s.Status.Parents, parentRef, s.Namespace, controllerName)
+	return isRouteAcceptedForParentRef(s.Status.Parents, parentRef, s.Namespace, controllerName)
 }
