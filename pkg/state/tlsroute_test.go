@@ -598,13 +598,13 @@ func TestTLSRoute_HostnameIntersection_SelectedBackendMatrix(t *testing.T) {
 				gotBackend, ok := pListener.SelectTLSBackend(sni)
 				if wantBackend == "" {
 					if ok {
-						t.Errorf("sni %q: expected no backend, got %q", sni, gotBackend)
+						t.Errorf("sni %q: expected no backend, got %q", sni, gotBackend.Target)
 					}
 				} else {
 					if !ok {
 						t.Errorf("sni %q: expected backend %q, got none", sni, wantBackend)
-					} else if gotBackend != wantBackend {
-						t.Errorf("sni %q: expected backend %q, got %q", sni, wantBackend, gotBackend)
+					} else if gotBackend.Target != wantBackend {
+						t.Errorf("sni %q: expected backend %q, got %q", sni, wantBackend, gotBackend.Target)
 					}
 				}
 			}
@@ -674,7 +674,7 @@ func TestTLSRoute_UnresolvableBackendRef(t *testing.T) {
 
 		// Listener must have NO TLS backend for that hostname
 		if backend, ok := pLis.SelectTLSBackend("example.com"); ok {
-			t.Errorf("expected no TLS backend for example.com, got %q", backend)
+			t.Errorf("expected no TLS backend for example.com, got %q", backend.Target)
 		}
 		if backends, ok := pLis.TLSBackends["example.com"]; ok && len(backends) > 0 {
 			t.Errorf("expected empty or missing TLSBackends for example.com, got %v", backends)
@@ -749,7 +749,7 @@ func TestTLSRoute_UnresolvableBackendRef(t *testing.T) {
 
 		// Listener must have NO TLS backend for that hostname
 		if backend, ok := pLis.SelectTLSBackend("example.com"); ok {
-			t.Errorf("expected no TLS backend for example.com, got %q", backend)
+			t.Errorf("expected no TLS backend for example.com, got %q", backend.Target)
 		}
 		if backends, ok := pLis.TLSBackends["example.com"]; ok && len(backends) > 0 {
 			t.Errorf("expected empty or missing TLSBackends for example.com, got %v", backends)
@@ -1276,8 +1276,8 @@ func TestTLSRoute_BindsToTerminateListener(t *testing.T) {
 	}
 
 	backend, ok := pLis.SelectTLSBackend("tls.example.com")
-	if !ok || backend != "tcp-backend.default.svc.cluster.local:3000" {
-		t.Errorf("expected backend tcp-backend.default.svc.cluster.local:3000, got %q (ok=%v)", backend, ok)
+	if !ok || backend.Target != "tcp-backend.default.svc.cluster.local:3000" {
+		t.Errorf("expected backend tcp-backend.default.svc.cluster.local:3000, got %q (ok=%v)", backend.Target, ok)
 	}
 	if len(pLis.TLSBackends["tls.example.com"]) != 1 {
 		t.Fatalf("expected 1 backend in TLSBackends, got %d", len(pLis.TLSBackends["tls.example.com"]))
@@ -1463,13 +1463,13 @@ func TestTLSRoute_MixedTerminationGateway(t *testing.T) {
 	}
 
 	bTerm, ok := termLis.SelectTLSBackend("tls.example.com")
-	if !ok || bTerm != "tcp-backend.default.svc.cluster.local:3000" {
-		t.Errorf("terminate listener expected tcp-backend.default.svc.cluster.local:3000, got %q", bTerm)
+	if !ok || bTerm.Target != "tcp-backend.default.svc.cluster.local:3000" {
+		t.Errorf("terminate listener expected tcp-backend.default.svc.cluster.local:3000, got %q", bTerm.Target)
 	}
 
 	bPass, ok := passLis.SelectTLSBackend("abc.example.com")
-	if !ok || bPass != "tcp-backend.default.svc.cluster.local:8443" {
-		t.Errorf("passthrough listener expected tcp-backend.default.svc.cluster.local:8443, got %q", bPass)
+	if !ok || bPass.Target != "tcp-backend.default.svc.cluster.local:8443" {
+		t.Errorf("passthrough listener expected tcp-backend.default.svc.cluster.local:8443, got %q", bPass.Target)
 	}
 }
 
@@ -1622,7 +1622,7 @@ func TestTLSRoute_WeightedBackendsSelection(t *testing.T) {
 		if !ok {
 			t.Fatalf("draw %d failed to select backend", i)
 		}
-		counts[target]++
+		counts[target.Target]++
 	}
 
 	target1 := "b1.default.svc.cluster.local:3001"
@@ -1642,5 +1642,101 @@ func TestTLSRoute_WeightedBackendsSelection(t *testing.T) {
 	}
 	if ratio2 < 0.20 || ratio2 > 0.30 {
 		t.Errorf("expected target2 proportion ~0.25, got %f (%d/%d)", ratio2, counts[target2], totalDraws)
+	}
+}
+
+func TestTLSRoute_BackendTLSPolicy(t *testing.T) {
+	terminateMode := gatewayv1.TLSModeTerminate
+	port8443 := gatewayv1.PortNumber(8443)
+	port443 := gatewayv1.PortNumber(443)
+	hostTerminate := gatewayv1.Hostname("tls.example.com")
+
+	certPEM, keyPEM := generateTestCertPEM(t, "tls.example.com")
+	caCertPEM, _ := generateTestCertPEM(t, "backend.local")
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gateway-tlsroute", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{{
+				Name:     "tls-terminate",
+				Port:     port8443,
+				Protocol: gatewayv1.TLSProtocolType,
+				Hostname: &hostTerminate,
+				TLS: &gatewayv1.ListenerTLSConfig{
+					Mode:            &terminateMode,
+					CertificateRefs: []gatewayv1.SecretObjectReference{{Name: "cert-secret"}},
+				},
+			}},
+		},
+	}
+
+	route := &gatewayv1.TLSRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "tlsroute-policy", Namespace: "default"},
+		Spec: gatewayv1.TLSRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gateway-tlsroute"}}},
+			Hostnames:       []gatewayv1.Hostname{"tls.example.com"},
+			Rules: []gatewayv1.TLSRouteRule{{
+				BackendRefs: []gatewayv1.BackendRef{{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "tls-backend", Port: &port443}}},
+			}},
+		},
+	}
+
+	tests := []struct {
+		name       string
+		caRef      string
+		expectPass bool
+	}{
+		{name: "re-encryption attaches TLS settings", caRef: "backend-ca", expectPass: true},
+		{name: "invalid policy sets error", caRef: "nonexistent-ca", expectPass: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := &gatewayv1.BackendTLSPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "policy", Namespace: "default"},
+				Spec: gatewayv1.BackendTLSPolicySpec{
+					TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{{
+						LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{Kind: "Service", Name: "tls-backend"},
+					}},
+					Validation: gatewayv1.BackendTLSPolicyValidation{
+						CACertificateRefs: []gatewayv1.LocalObjectReference{{Kind: "ConfigMap", Name: gatewayv1.ObjectName(tt.caRef)}},
+						Hostname:          "backend.local",
+					},
+				},
+			}
+
+			outputs := ComputeOutputs(ModelInputs{
+				Gateways:           []*gatewayv1.Gateway{gw},
+				GatewayClasses:     []*gatewayv1.GatewayClass{{ObjectMeta: metav1.ObjectMeta{Name: "ref-class"}, Spec: gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"}}},
+				TLSRoutes:          []*gatewayv1.TLSRoute{route},
+				BackendTLSPolicies: []*gatewayv1.BackendTLSPolicy{policy},
+				Services: map[types.NamespacedName]*corev1.Service{
+					{Namespace: "default", Name: "tls-backend"}: {ObjectMeta: metav1.ObjectMeta{Name: "tls-backend", Namespace: "default"}, Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 443}}}},
+				},
+				ConfigMaps: map[types.NamespacedName]*corev1.ConfigMap{
+					{Namespace: "default", Name: "backend-ca"}: {ObjectMeta: metav1.ObjectMeta{Name: "backend-ca", Namespace: "default"}, Data: map[string]string{ConfigMapCACertKey: string(caCertPEM)}},
+				},
+				Secrets: map[types.NamespacedName]*corev1.Secret{
+					{Namespace: "default", Name: "cert-secret"}: {Type: corev1.SecretTypeTLS, Data: map[string][]byte{corev1.TLSCertKey: certPEM, corev1.TLSPrivateKeyKey: keyPEM}},
+				},
+				ControllerName: "example.net/gateway-controller",
+			})
+
+			if len(outputs.ProxyListeners) != 1 {
+				t.Fatalf("expected 1 proxy listener, got %d", len(outputs.ProxyListeners))
+			}
+			b, ok := outputs.ProxyListeners[0].SelectTLSBackend("tls.example.com")
+			if !ok {
+				t.Fatalf("expected backend for tls.example.com")
+			}
+			if tt.expectPass {
+				if b.TLSConfig == nil || b.TLSConfig.Hostname != "backend.local" || len(b.TLSConfig.CACerts) != 1 || b.Error != nil {
+					t.Fatalf("expected valid TLSConfig without error, got %+v (error: %v)", b.TLSConfig, b.Error)
+				}
+			} else if b.Error == nil || b.Error.HTTPStatusCode != 500 {
+				t.Fatalf("expected Error with status 500, got %v", b.Error)
+			}
+		})
 	}
 }

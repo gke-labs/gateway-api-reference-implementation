@@ -1515,3 +1515,124 @@ func TestTLSSessionResumption_TLSRouteTerminate(t *testing.T) {
 	}
 	conn2.Close()
 }
+
+func TestTLSRouteTerminate_BackendTLSPolicy(t *testing.T) {
+	frontendCAPEM, frontendCert := generateTestCAAndCert(t, []string{"tls.example.com"}, nil)
+	backendCAPEM, backendCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
+	_, wrongBackendCert := generateTestCAAndCert(t, []string{"wrong.host.local"}, nil)
+
+	startBackend := func(cert tls.Certificate) (net.Listener, string) {
+		lis, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		go func() {
+			for {
+				c, err := lis.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					buf := make([]byte, 64)
+					n, err := conn.Read(buf)
+					if err != nil {
+						return // expected when client verification fails before sending data
+					}
+					if _, err := conn.Write([]byte("echo:" + string(buf[:n]))); err != nil {
+						return // peer may close immediately
+					}
+				}(c)
+			}
+		}()
+		return lis, lis.Addr().String()
+	}
+
+	validLis, validAddr := startBackend(backendCert)
+	defer validLis.Close()
+	wrongLis, wrongAddr := startBackend(wrongBackendCert)
+	defer wrongLis.Close()
+
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(frontendCAPEM)
+	clientTLS := &tls.Config{ServerName: "tls.example.com", RootCAs: caPool}
+	terminateMode := gatewayv1.TLSModeTerminate
+
+	tests := []struct {
+		name       string
+		backend    state.InternalTLSBackend
+		expectEcho bool
+	}{
+		{
+			name: "re-encryption succeeds",
+			backend: state.InternalTLSBackend{
+				Target:    validAddr,
+				Weight:    1,
+				TLSConfig: &state.InternalTLSConfig{Hostname: "backend.local", CACerts: [][]byte{backendCAPEM}},
+			},
+			expectEcho: true,
+		},
+		{
+			name: "verification fails",
+			backend: state.InternalTLSBackend{
+				Target:    wrongAddr,
+				Weight:    1,
+				TLSConfig: &state.InternalTLSConfig{Hostname: "backend.local", CACerts: [][]byte{backendCAPEM}},
+			},
+			expectEcho: false,
+		},
+		{
+			name: "backend is unresolved",
+			backend: state.InternalTLSBackend{
+				Target: "invalid:443",
+				Weight: 1,
+				Error:  &state.ErrorState{HTTPMessage: "unresolved backend"},
+			},
+			expectEcho: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewProxy()
+			p.UpdateCertificates(map[string]*tls.Certificate{"tls.example.com": &frontendCert}, &frontendCert)
+			p.UpdateConfig([]state.InternalListener{{
+				Name:        "listener",
+				Protocol:    gatewayv1.TLSProtocolType,
+				Port:        8443,
+				Hostname:    "tls.example.com",
+				TLSMode:     &terminateMode,
+				TLSBackends: map[string][]state.InternalTLSBackend{"tls.example.com": {tt.backend}},
+			}}, nil)
+
+			rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer rawLis.Close()
+
+			sniLis := p.NewSNIListener(rawLis)
+			defer sniLis.Close()
+
+			conn, err := tls.Dial("tcp", rawLis.Addr().String(), clientTLS)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+
+			if _, err := conn.Write([]byte("ping")); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			buf := make([]byte, 64)
+			n, err := conn.Read(buf)
+			if tt.expectEcho {
+				if err != nil || string(buf[:n]) != "echo:ping" {
+					t.Fatalf("expected echo:ping, got %q (err: %v)", string(buf[:n]), err)
+				}
+			} else if err != io.EOF {
+				t.Fatalf("expected EOF on failure, got err: %v, read: %q", err, string(buf[:n]))
+			}
+		})
+	}
+}

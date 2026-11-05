@@ -1997,7 +1997,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 		rs := &TLSRouteState{TLSRoute: route}
-		rs.Compile(inputs.Services, refValidator)
+		rs.Compile(inputs.Services, inputs.BackendTLSPolicies, inputs.ConfigMaps, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
 		boundListenersForRoute := make(map[*EffectiveListener]bool)
