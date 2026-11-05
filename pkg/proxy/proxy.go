@@ -38,7 +38,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
-	"golang.org/x/net/http2"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -1837,12 +1836,12 @@ func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper 
 			}
 		}
 	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
-		transport = &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, network, addr)
-			},
+		// Enabling only UnencryptedHTTP2 makes net/http use HTTP/2 with prior knowledge over plain TCP, which kubernetes.io/h2c backends expect.
+		var protocols http.Protocols
+		protocols.SetUnencryptedHTTP2(true)
+		transport = &http.Transport{
+			DialContext: (&net.Dialer{}).DialContext,
+			Protocols:   &protocols,
 		}
 	} else {
 		return http.DefaultTransport
