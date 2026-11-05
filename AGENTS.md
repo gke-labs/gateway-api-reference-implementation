@@ -42,6 +42,22 @@ as this:
 
 > ...preserving point-in-time consistency via `writerMu.RLock()` offers a balance of architectural simplicity, zero steady-state memory overhead, and data integrity...
 
+## Naming
+
+**Don't abbreviate identifiers.** Write `header`, not `hdr`, and `buffer`, not `buf`. An abbreviation saves the writer a few keystrokes and costs every reader a lookup. When naming an error from a specific operation, spell out the operation. For example, an error from `Remove` is `removeErr`, not `rErr`.
+
+The only exceptions are conventional Go:
+- `i`, `j` and `k` as integer loop indices.
+- A one- or two-letter method receiver, such as `p *Proxy`.
+- The ecosystem idioms `ctx`, `err`, `ok`, `wg`, `mu` and `tx`. `context` and `error` are also package and type names.
+- Protocol or on-disk field names that are themselves abbreviations, such as `fd` or `sha256`.
+
+**Names must match signatures.** For example, a function that returns `[]byte` is `build...`, not `write...`. A `write...` function takes an `io.Writer` or a destination slice.
+
+**Names must reflect side effects.** Use `init...` or `set...` rather than `new...` when a function modifies or initializes existing state. Reserve `New...` for constructors that allocate and return a fresh value.
+
+**Use one name per concept.** Do not introduce multiple names for the same thing, such as `prepared` beside `encoded`.
+
 ## Development Workflow
 
 - Use standard Go tooling (`go build`, `go test`, `go mod`).
