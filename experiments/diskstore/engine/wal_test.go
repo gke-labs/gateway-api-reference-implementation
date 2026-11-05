@@ -490,7 +490,6 @@ func TestWAL_WriteCounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
-	defer wal.Close()
 
 	// Append 5 complete blocks of data without sync in a single record.
 	// Block 0 has 32 bytes segment header.
@@ -533,25 +532,51 @@ func TestWAL_WriteCounts(t *testing.T) {
 		t.Fatalf("expected write call at offset 0 of len %d, got offset %d len %d", 5*WALBlockSize, calls[0].offset, calls[0].len)
 	}
 
-	// Now append 2.5 blocks of data and call Sync().
-	// 2 full blocks + 0.5 block partial: 2 * 4096 + 2048 = 10240 bytes.
-	cf.reset()
-	p3 := make([]byte, 10240-RecordHeaderSize)
-	if _, err := wal.AppendRecord(&Record{Type: RecordTypePut, Payload: p3}); err != nil {
-		t.Fatalf("AppendRecord 3 failed: %v", err)
+	if err := wal.Close(); err != nil {
+		t.Fatalf("wal.Close failed: %v", err)
 	}
 
-	if err := wal.Sync(); err != nil {
+	// In the second phase, test that complete blocks and a sync-time padded tail
+	// go out in a single write call where possible. Open with a large TickInterval
+	// so the background writer cannot race and flush complete blocks before Sync().
+	var dbID2 [16]byte
+	copy(dbID2[:], []byte("wal-writecounts-2"))
+	wal2, err := OpenWAL(cfs, "wal_sync_dir", dbID2, 0, WALOptions{
+		TickInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("OpenWAL 2 failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := wal2.Close(); err != nil {
+			t.Errorf("wal2.Close failed: %v", err)
+		}
+	})
+
+	// Append 2.5 blocks of data and call Sync().
+	// 2 full blocks + 0.5 block partial: 2 * 4096 + 2048 = 10240 bytes.
+	// Block 0 has 32 bytes segment header.
+	p2 := make([]byte, 2*WALBlockSize+WALBlockSize/2-SegmentHeaderSize-RecordHeaderSize)
+	if _, err := wal2.AppendRecord(&Record{Type: RecordTypePut, Payload: p2}); err != nil {
+		t.Fatalf("AppendRecord 2 failed: %v", err)
+	}
+
+	if err := wal2.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
 
-	calls = cf.getCalls()
+	cf2 := cfs.getFile(filepath.Join("wal_sync_dir", segmentFileName(1)))
+	if cf2 == nil {
+		t.Fatalf("segment file not found in countingFS")
+	}
+
+	calls = cf2.getCalls()
 	// The 2 complete blocks AND the 0.5 padded tail block must go out in ONE flush (3 blocks = 12288 bytes)
 	if len(calls) != 1 {
 		t.Fatalf("expected exactly 1 write call covering complete blocks and padded tail, got %d: %+v", len(calls), calls)
 	}
-	if calls[0].offset != 5*WALBlockSize || calls[0].len != 3*WALBlockSize {
-		t.Fatalf("expected write call at offset %d of len %d, got offset %d len %d", 5*WALBlockSize, 3*WALBlockSize, calls[0].offset, calls[0].len)
+	if calls[0].offset != 0 || calls[0].len != 3*WALBlockSize {
+		t.Fatalf("expected write call at offset 0 of len %d, got offset %d len %d", 3*WALBlockSize, calls[0].offset, calls[0].len)
 	}
 }
 
