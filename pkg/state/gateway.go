@@ -696,6 +696,7 @@ type InternalBackend struct {
 	Host                   string
 	Port                   int32
 	AppProtocol            *string
+	HTTP2                  bool // indicates that the backend expects HTTP/2 traffic (e.g. for GRPCRoute backends)
 	TLSConfig              *InternalTLSConfig
 	Weight                 int32
 	RequestHeaderModifier  *gatewayv1.HTTPHeaderFilter

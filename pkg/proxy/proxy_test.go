@@ -3878,6 +3878,161 @@ func TestProxy_GRPCRoute_HeaderModifiers(t *testing.T) {
 	}
 }
 
+func TestProxy_GRPCRoute_BackendTLSPolicy(t *testing.T) {
+	backendCAPEM, backendCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
+
+	tests := []struct {
+		name       string
+		serverALPN []string
+		wantStatus int
+		wantErr    string
+	}{
+		{
+			name:       "ALPN h2 negotiated",
+			serverALPN: []string{"h2"},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "ALPN mismatch",
+			serverALPN: nil, // server does not configure ALPN, handshake completes without h2
+			wantStatus: http.StatusBadGateway,
+			wantErr:    "unexpected ALPN protocol",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if te := r.Header.Get("Te"); !strings.EqualFold(te, "trailers") {
+					t.Errorf("expected Te header 'trailers', got %q", te)
+				}
+				w.Header().Set("Content-Type", "application/grpc")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("grpc-reply"))
+				w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+			})
+
+			backendTLS := &tls.Config{
+				Certificates: []tls.Certificate{backendCert},
+				NextProtos:   tc.serverALPN,
+			}
+			backendLn, err := tls.Listen("tcp", "127.0.0.1:0", backendTLS)
+			if err != nil {
+				t.Fatalf("failed to listen for backend: %v", err)
+			}
+			defer backendLn.Close()
+			backendSrv := &http.Server{Handler: backendHandler}
+			if len(tc.serverALPN) > 0 {
+				if err := http2.ConfigureServer(backendSrv, &http2.Server{}); err != nil {
+					t.Fatalf("failed to configure http2 server: %v", err)
+				}
+			}
+			go backendSrv.Serve(backendLn)
+			defer backendSrv.Close()
+
+			backendHost, backendPortStr, err := net.SplitHostPort(backendLn.Addr().String())
+			if err != nil {
+				t.Fatalf("failed to split host port: %v", err)
+			}
+			backendPort, err := strconv.Atoi(backendPortStr)
+			if err != nil {
+				t.Fatalf("failed to parse backend port: %v", err)
+			}
+
+			backend := state.InternalBackend{
+				Host:        backendHost,
+				Port:        int32(backendPort),
+				AppProtocol: state.Ptr("https"),
+				HTTP2:       true,
+				Weight:      1,
+				TLSConfig: &state.InternalTLSConfig{
+					Hostname: "backend.local",
+					CACerts:  [][]byte{backendCAPEM},
+				},
+			}
+
+			p := NewProxy()
+			p.UpdateRoutes([]state.InternalRoute{
+				{
+					Hostnames: testRouteHostnames("example.com"),
+					Rules: []state.InternalRule{
+						{Backends: []state.InternalBackend{backend}},
+					},
+				},
+			})
+
+			if tc.wantErr != "" {
+				transport := p.buildTransport(backend)
+				outReq, err := http.NewRequest("POST", fmt.Sprintf("https://%s:%d/my.service/Echo", backendHost, backendPort), bytes.NewReader([]byte("ping")))
+				if err != nil {
+					t.Fatalf("failed to create direct request: %v", err)
+				}
+				outReq.Host = "example.com"
+				_, roundTripErr := transport.RoundTrip(outReq)
+				if roundTripErr == nil || !strings.Contains(roundTripErr.Error(), tc.wantErr) {
+					t.Fatalf("expected error containing %q, got: %v", tc.wantErr, roundTripErr)
+				}
+			}
+
+			req := httptest.NewRequest("POST", "http://example.com/my.service/Echo", bytes.NewReader([]byte("ping")))
+			req.Header.Set("Content-Type", "application/grpc")
+			req.Header.Set("Te", "trailers")
+			w := httptest.NewRecorder()
+			p.ServeHTTP(w, req)
+
+			resp := w.Result()
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("expected status %d, got %d", tc.wantStatus, resp.StatusCode)
+			}
+			if tc.wantStatus == http.StatusOK {
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					t.Fatalf("failed to read body: %v", err)
+				}
+				if string(body) != "grpc-reply" {
+					t.Errorf("expected body 'grpc-reply', got %q", string(body))
+				}
+				if resp.Header.Get("Grpc-Status") != "0" && resp.Trailer.Get("Grpc-Status") != "0" {
+					t.Errorf("expected Grpc-Status trailer '0', got header %q trailer %q", resp.Header.Get("Grpc-Status"), resp.Trailer.Get("Grpc-Status"))
+				}
+			}
+		})
+	}
+}
+
+func TestRemoveHopByHopHeaders_TETrailers(t *testing.T) {
+	h := http.Header{
+		"Te":         []string{"trailers"},
+		"Connection": []string{"close"},
+		"Upgrade":    []string{"websocket"},
+	}
+	removeHopByHopHeaders(h)
+	if got := h.Get("Te"); got != "trailers" {
+		t.Errorf("expected TE: trailers to be preserved, got %q", got)
+	}
+	if h.Get("Connection") != "" || h.Get("Upgrade") != "" {
+		t.Errorf("expected hop-by-hop headers to be removed, got %v", h)
+	}
+
+	hNonTrailers := http.Header{
+		"Te": []string{"deflate"},
+	}
+	removeHopByHopHeaders(hNonTrailers)
+	if got := hNonTrailers.Get("Te"); got != "" {
+		t.Errorf("expected non-trailers TE to be removed, got %q", got)
+	}
+
+	hConnTe := http.Header{
+		"Connection": []string{"te"},
+		"Te":         []string{"deflate"},
+	}
+	removeHopByHopHeaders(hConnTe)
+	if got := hConnTe.Get("Te"); got != "" {
+		t.Errorf("expected TE listed in Connection to be removed, got %q", got)
+	}
+}
+
 func TestProxy_BackendConnectionReuse(t *testing.T) {
 	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
 
@@ -4000,6 +4155,28 @@ func TestProxy_BackendTransportCachingAndEviction(t *testing.T) {
 	}
 	if b2Cached {
 		t.Errorf("expected b2 to be evicted")
+	}
+
+	// HTTP/2 transport for b1 (via GRPCRoute) should be separate from HTTP/1.1
+	b1H2 := b1
+	b1H2.HTTP2 = true
+	http2Transport := p.buildTransport(b1H2)
+	if tr1 == http2Transport {
+		t.Fatalf("expected HTTP/1.1 and HTTP/2 transports to be separate")
+	}
+
+	// Update routes with only b1H2; b1 HTTP/1.1 transport should be evicted
+	p.UpdateRoutes([]state.InternalRoute{
+		{Rules: []state.InternalRule{{Backends: []state.InternalBackend{b1H2}}}},
+	})
+
+	p.transportsMu.Lock()
+	_, b1CachedAfter := p.transports[backendTransportKey(b1)]
+	_, b1H2CachedAfter := p.transports[backendTransportKey(b1H2)]
+	p.transportsMu.Unlock()
+
+	if b1CachedAfter || !b1H2CachedAfter {
+		t.Errorf("expected b1 HTTP/1.1 evicted and b1H2 HTTP/2 retained, got b1=%v, b1H2=%v", b1CachedAfter, b1H2CachedAfter)
 	}
 }
 
