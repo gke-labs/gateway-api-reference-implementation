@@ -265,17 +265,18 @@ func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 		selected := matched[0]
 		if selected.Protocol == gatewayv1.TLSProtocolType && selected.TLSMode != nil && *selected.TLSMode == gatewayv1.TLSModePassthrough {
 			backend, ok := selected.SelectTLSBackend(sniHostname)
-			if !ok || backend == "" {
+			if !ok || backend.Target == "" {
 				return
 			}
 			handedOff = true
-			l.spliceToBackend(peekedConn, backend)
+			l.spliceToBackend(peekedConn, backend.Target)
 			return
 		}
 
 		if selected.Protocol == gatewayv1.TLSProtocolType && (selected.TLSMode == nil || *selected.TLSMode == gatewayv1.TLSModeTerminate) {
 			backend, ok := selected.SelectTLSBackend(sniHostname)
-			if !ok || backend == "" {
+			if !ok || backend.Target == "" {
+				klog.Errorf("no backend resolved for SNI %q on listener %q", sniHostname, selected.Name)
 				return
 			}
 			handedOff = true
@@ -301,7 +302,7 @@ func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 	handOffToHTTPS()
 }
 
-func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, backend string) {
+func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname string, backend state.InternalTLSBackend) {
 	select {
 	case <-l.done:
 		closeConn(clientConn)
@@ -310,6 +311,7 @@ func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, ba
 	}
 
 	if !l.p.HasCertificate(sniHostname) {
+		klog.Errorf("no certificate found for SNI %q", sniHostname)
 		closeConn(clientConn)
 		return
 	}
@@ -330,9 +332,26 @@ func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, ba
 		return
 	}
 
+	if backend.Error != nil {
+		klog.Errorf("cannot proxy to backend %s: %s", backend.Target, backend.Error.HTTPMessage)
+		closeConn(tlsConn)
+		return
+	}
+
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	backendConn, err := dialer.Dial("tcp", backend)
+	var backendConn net.Conn
+	var err error
+	if backend.TLSConfig != nil {
+		// ServerName is derived from backend.TLSConfig.Hostname; Host is omitted.
+		tlsConfig := l.p.buildBackendTLSConfig(state.InternalBackend{
+			TLSConfig: backend.TLSConfig,
+		})
+		backendConn, err = tls.DialWithDialer(dialer, "tcp", backend.Target, tlsConfig)
+	} else {
+		backendConn, err = dialer.Dial("tcp", backend.Target)
+	}
 	if err != nil {
+		klog.Errorf("failed to dial backend %q: %v", backend.Target, err)
 		closeConn(tlsConn)
 		return
 	}

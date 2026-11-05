@@ -26,8 +26,10 @@ import (
 
 // InternalTLSBackend represents a resolved backend target and weight for a TLSRoute.
 type InternalTLSBackend struct {
-	Target string
-	Weight int32
+	Target    string
+	Weight    int32
+	TLSConfig *InternalTLSConfig
+	Error     *ErrorState
 }
 
 // InternalTLSRule represents a compiled TLSRoute rule with resolved backend targets.
@@ -79,7 +81,7 @@ func (s *TLSRouteState) Validate() error {
 		return nil
 	}
 	if s.Internal == nil {
-		s.Compile(nil, nil)
+		s.Compile(nil, nil, nil, nil)
 	}
 	if s.Internal.ValidationCondition.Status == metav1.ConditionFalse {
 		return errors.New(s.Internal.ValidationCondition.Message)
@@ -90,12 +92,14 @@ func (s *TLSRouteState) Validate() error {
 // Compile compiles the TLSRoute into an InternalTLSRoute, resolving references and recording conditions.
 func (s *TLSRouteState) Compile(
 	services map[types.NamespacedName]*corev1.Service,
+	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalTLSRoute {
 	if s == nil || s.TLSRoute == nil {
 		return nil
 	}
-	s.Internal = CompileTLSRoute(s.TLSRoute, services, refValidator)
+	s.Internal = CompileTLSRoute(s.TLSRoute, services, backendTLSPolicies, configMaps, refValidator)
 	return s.Internal
 }
 
@@ -103,6 +107,8 @@ func (s *TLSRouteState) Compile(
 func CompileTLSRoute(
 	route *gatewayv1.TLSRoute,
 	services map[types.NamespacedName]*corev1.Service,
+	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalTLSRoute {
 	if route == nil {
@@ -130,6 +136,8 @@ func CompileTLSRoute(
 		hostnames = append(hostnames, string(h))
 	}
 
+	sortedTLSPolicies := sortBackendTLSPolicies(backendTLSPolicies)
+
 	var compiledRules []InternalTLSRule
 	for _, rule := range route.Spec.Rules {
 		iRule := InternalTLSRule{
@@ -143,8 +151,8 @@ func CompileTLSRoute(
 				route.Namespace,
 				route.Generation,
 				services,
-				nil,
-				nil,
+				sortedTLSPolicies,
+				configMaps,
 				refValidator,
 			)
 			if resolutionErr != nil {
@@ -164,8 +172,10 @@ func CompileTLSRoute(
 
 			target := fmt.Sprintf("%s:%d", backend.Host, backend.Port)
 			iRule.Backends = append(iRule.Backends, InternalTLSBackend{
-				Target: target,
-				Weight: weight,
+				Target:    target,
+				Weight:    weight,
+				TLSConfig: backend.TLSConfig,
+				Error:     backend.Error,
 			})
 		}
 
