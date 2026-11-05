@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -801,6 +802,9 @@ func (s *Engine) loadOversizeObjects() error {
 	if err != nil {
 		return err
 	}
+
+	var movedUncommitted bool
+	lostDir := filepath.Join(oversizeDir, "lost+found")
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -843,6 +847,26 @@ func (s *Engine) loadOversizeObjects() error {
 			return fmt.Errorf("corrupt oversize file %s: %w", name, err)
 		}
 
+		// Do not load oversize files from future uncommitted writes beyond recovered WAL LSN.
+		// Quarantine to lost+found for optional offline recovery/reconstruction.
+		if s.wal != nil && lsn > s.wal.MaxLSN() {
+			if err := s.fs.MkdirAll(lostDir, 0755); err != nil {
+				return fmt.Errorf("failed to create oversize lost+found dir: %w", err)
+			}
+			dest := uniqueQuarantinePath(lostDir, name)
+			if renameErr := s.fs.Rename(filePath, dest); renameErr != nil {
+				if !errors.Is(renameErr, os.ErrNotExist) {
+					return fmt.Errorf("failed to move uncommitted oversize file %s to %s: %w", filePath, dest, renameErr)
+				}
+				// Safe to ignore if already gone: the file disappeared after ReadDir listed it,
+				// so there is nothing left to load or quarantine.
+			} else {
+				slog.Warn("diskstore: moved uncommitted oversize file", "from", filePath, "to", dest, "lsn", lsn, "recoveredLSN", s.wal.MaxLSN())
+			}
+			movedUncommitted = true
+			continue
+		}
+
 		// Item 2: Loading must respect LSNs
 		if existing, ok := s.keyIndex[qKey]; ok {
 			if !existing.IsOversize || existing.LSN > lsn {
@@ -859,6 +883,11 @@ func (s *Engine) loadOversizeObjects() error {
 		}
 		s.oversizeObjects[qKey] = bytes.Clone(payload)
 		GlobalMetrics.OversizeObjectsCount.Add(1)
+	}
+	if movedUncommitted {
+		if err := s.fs.SyncDir(oversizeDir); err != nil {
+			return fmt.Errorf("failed to sync oversize dir after moving uncommitted files: %w", err)
+		}
 	}
 	return nil
 }
