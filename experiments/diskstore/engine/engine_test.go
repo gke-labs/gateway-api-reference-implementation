@@ -1902,3 +1902,58 @@ func TestOpen_EraseOnErrorOption(t *testing.T) {
 		})
 	}
 }
+
+type renameHookFS struct {
+	FS
+	beforeRename func(oldpath, newpath string)
+}
+
+func (h *renameHookFS) Rename(oldpath, newpath string) error {
+	if h.beforeRename != nil {
+		h.beforeRename(oldpath, newpath)
+	}
+	return h.FS.Rename(oldpath, newpath)
+}
+
+func TestRegression_OversizeWriteAheadRule(t *testing.T) {
+	memFS := NewMemFS()
+	renamed := false
+	var store *Engine
+
+	const (
+		bucket = "ConfigMap"
+		key    = "largeKey"
+	)
+
+	hookedFS := &renameHookFS{
+		FS: memFS,
+		beforeRename: func(oldpath, newpath string) {
+			if store != nil && newpath == store.oversizeFilePath(qualifyKey(bucket, key)) {
+				renamed = true
+				if store.wal.FsyncedLSN() < store.wal.MaxLSN() {
+					t.Fatalf("write-ahead rule violation: oversize file renamed before WAL fsynced (fsynced=%d, max=%d)",
+						store.wal.FsyncedLSN(), store.wal.MaxLSN())
+				}
+			}
+		},
+	}
+
+	var err error
+	store, err = Open(WithFS(hookedFS), WithDir("test_oversize_war"), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("store.Close failed: %v", closeErr)
+		}
+	}()
+
+	oversizePayload := make([]byte, 2100*1024)
+	if err := store.Put(bucket, key, oversizePayload, "1"); err != nil {
+		t.Fatalf("Put oversize failed: %v", err)
+	}
+	if !renamed {
+		t.Fatalf("expected oversize file to be renamed")
+	}
+}
