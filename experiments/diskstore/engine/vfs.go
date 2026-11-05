@@ -285,7 +285,7 @@ func (m *MemFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) 
 	cleaned := cleanPath(name)
 	dir := filepath.Dir(cleaned)
 	if dir != "." && dir != "/" && !m.directories[dir] {
-		return nil, fmt.Errorf("directory does not exist: %s", dir)
+		return nil, fmt.Errorf("directory does not exist: %s: %w", dir, os.ErrNotExist)
 	}
 
 	data, exists := m.files[cleaned]
@@ -338,7 +338,7 @@ func (m *MemFS) Rename(oldpath, newpath string) error {
 	}
 	newDir := filepath.Dir(newClean)
 	if newDir != "." && newDir != "/" && !m.directories[newDir] {
-		return fmt.Errorf("directory does not exist: %s", newDir)
+		return fmt.Errorf("directory does not exist: %s: %w", newDir, os.ErrNotExist)
 	}
 
 	m.files[newClean] = data

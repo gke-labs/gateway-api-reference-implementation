@@ -550,7 +550,7 @@ func BenchmarkPut(b *testing.B) {
 
 func runBenchmarkPutOverwrite(b *testing.B, payload []byte, codec CompressionCodec) {
 	dir := b.TempDir()
-	store, err := Open(WithDir(dir), WithNumPoolBlocks(4096), WithCompressionCodec(codec))
+	store, err := Open(WithDir(dir), WithNumPoolBlocks(4096), WithCompressionCodec(codec), WithCreate())
 	if err != nil {
 		b.Fatalf("Open failed: %v", err)
 	}
@@ -591,7 +591,7 @@ func BenchmarkRealisticCorpusHeapSize(b *testing.B) {
 func runCorpusHeapSizeBenchmark(b *testing.B, corpus []corpusItem, codec CompressionCodec) {
 	dir := b.TempDir()
 
-	store, err := Open(WithDir(dir), WithNumPoolBlocks(4096), WithCompressionCodec(codec))
+	store, err := Open(WithDir(dir), WithNumPoolBlocks(4096), WithCompressionCodec(codec), WithCreate())
 	if err != nil {
 		b.Fatalf("Open failed: %v", err)
 	}

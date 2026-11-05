@@ -34,7 +34,7 @@ import (
 // and List, ListKeys, and ByIndex never return partial results.
 func TestAdapterFailure_EngineError(t *testing.T) {
 	memFS := engine.NewMemFS()
-	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("fail_engine_err"))
+	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("fail_engine_err"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestAdapterFailure_EngineError(t *testing.T) {
 // notify the adapter and call OnFatal exactly once without returning partial results.
 func TestAdapterFailure_BackgroundFailureNotification(t *testing.T) {
 	memFS := engine.NewMemFS()
-	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("fail_bg_err"))
+	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("fail_bg_err"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestAdapterFailure_BackgroundFailureNotification(t *testing.T) {
 // and List, ListKeys, and ByIndex never return partial results.
 func TestAdapterFailure_DecodeFailure(t *testing.T) {
 	memFS := engine.NewMemFS()
-	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("fail_decode_err"))
+	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("fail_decode_err"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestAdapterFailure_DecryptFailure(t *testing.T) {
 		t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
 	}
 
-	eng, err := engine.Open(engine.WithFS(memFS), engine.WithCipher(cipher), engine.WithDir("fail_decrypt_err"))
+	eng, err := engine.Open(engine.WithFS(memFS), engine.WithCipher(cipher), engine.WithDir("fail_decrypt_err"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestAdapterFailure_DecryptFailure(t *testing.T) {
 // exactly once and List, ListKeys, and ByIndex never return partial results.
 func TestAdapterFailure_IndexFunctionError(t *testing.T) {
 	memFS := engine.NewMemFS()
-	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("fail_index_err"))
+	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("fail_index_err"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestAdapterFailure_IndexFunctionError(t *testing.T) {
 func TestForcedFatalVisibility(t *testing.T) {
 	if os.Getenv("TEST_KUBECACHE_FORCED_FATAL") == "1" {
 		memFS := engine.NewMemFS()
-		eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("forced_fatal_proc"))
+		eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("forced_fatal_proc"), engine.WithCreate())
 		if err != nil {
 			t.Fatalf("Open failed: %v", err)
 		}

@@ -71,6 +71,8 @@ type Options struct {
 	NumPoolBlocks int
 	AutoDelete    bool
 	Clock         Clock
+	Create        bool
+	EraseOnError  bool
 
 	CompressionCodec CompressionCodec
 	MaxObjectSize    int
@@ -80,6 +82,26 @@ type Options struct {
 
 // Option is a functional option for configuring an Engine.
 type Option func(*Options)
+
+// WithCreate specifies that Open should create a new database when no store files exist.
+// Without it, Open returns an error if there is no existing database.
+// When Dir is empty, Open creates a temporary store, which implies WithCreate.
+func WithCreate() Option {
+	return func(o *Options) {
+		o.Create = true
+	}
+}
+
+// WithEraseOnError enables erasing the store and starting fresh when an unreadable,
+// outdated, or corrupt meta file, orphaned store files, or failure markers are detected.
+// Erasing destroys data, which suits a cache that can rebuild from its source,
+// but not every caller can do that. Without it, Open returns an error describing
+// the issue without modifying existing files.
+func WithEraseOnError() Option {
+	return func(o *Options) {
+		o.EraseOnError = true
+	}
+}
 
 // WithClock sets the Clock used for WAL timing.
 func WithClock(clock Clock) Option {
@@ -339,13 +361,7 @@ func Open(opts ...Option) (*Engine, error) {
 		dir = tmpDir
 		isTemp = true
 		options.AutoDelete = true
-	}
-
-	if err := options.FS.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create store dir: %w", err)
-	}
-	if err := options.FS.SyncDir(dir); err != nil {
-		return nil, fmt.Errorf("failed to sync store dir: %w", err)
+		options.Create = true
 	}
 
 	// Check for failure marker from a prior failed instance
@@ -415,7 +431,12 @@ func Open(opts ...Option) (*Engine, error) {
 
 				isNewStore = true
 			} else {
-				return nil, err
+				if !options.EraseOnError {
+					return nil, err
+				}
+				needsErase = true
+				eraseReason = "unreadable meta file"
+				isNewStore = true
 			}
 		} else {
 			// meta.db exists. Read dbID and store format version.
@@ -425,34 +446,55 @@ func Open(opts ...Option) (*Engine, error) {
 				return nil, fmt.Errorf("failed to close meta file: %w", cErr)
 			}
 			if rErr != nil && !errors.Is(rErr, io.EOF) {
-				return nil, fmt.Errorf("failed to read meta file: %w", rErr)
-			}
-
-			validVersion := false
-			if n >= metaFileSize {
-				version := binary.BigEndian.Uint32(metaBuf[16:20])
-				if version == StoreFormatVersion {
-					validVersion = true
-					copy(dbID[:], metaBuf[:16])
+				if !options.EraseOnError {
+					return nil, fmt.Errorf("failed to read meta file: %w", rErr)
 				}
-			}
-
-			if !validVersion {
-				// Missing format version (e.g. 16-byte version 1 meta.db) or version mismatch:
-				// wipe the store and initialize a fresh database.
 				needsErase = true
-				eraseReason = "outdated or corrupt meta file"
+				eraseReason = "unreadable meta file"
 				isNewStore = true
+			} else {
+				validVersion := false
+				if n >= metaFileSize {
+					version := binary.BigEndian.Uint32(metaBuf[16:20])
+					if version == StoreFormatVersion {
+						validVersion = true
+						copy(dbID[:], metaBuf[:16])
+					}
+				}
+
+				if !validVersion {
+					// Missing format version (e.g. 16-byte version 1 meta.db) or version mismatch:
+					// wipe the store and initialize a fresh database.
+					needsErase = true
+					eraseReason = "outdated or corrupt meta file"
+					isNewStore = true
+				}
 			}
 		}
 	}
 
 	if needsErase {
+		if !options.EraseOnError {
+			return nil, fmt.Errorf("store requires erase: %s", eraseReason)
+		}
 		if wipeErr := wipeStoreFiles(options.FS, dir); wipeErr != nil {
 			return nil, fmt.Errorf("failed to wipe store files after %s: %w", eraseReason, wipeErr)
 		}
 		wiped = true
 		isNewStore = true
+	}
+
+	if isNewStore && !wiped && !options.Create {
+		return nil, fmt.Errorf("database does not exist: %w", os.ErrNotExist)
+	}
+
+	if options.Create || wiped {
+		if err := options.FS.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create store dir: %w", err)
+		}
+		if err := options.FS.SyncDir(dir); err != nil {
+			return nil, fmt.Errorf("failed to sync store dir: %w", err)
+		}
 	}
 
 	if err := options.FS.MkdirAll(oversizeDir, 0755); err != nil {

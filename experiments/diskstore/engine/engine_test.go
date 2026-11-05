@@ -34,7 +34,7 @@ func TestDiskStore_BasicCRUD(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_store"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestDiskStore_OversizeObject(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_oversize_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_oversize_store"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestDiskStore_FailedStateOnErrors(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_fail_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_fail_store"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_stale_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_stale_store"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := Open(WithFS(faultFS), WithDir("test_reuse_rule_promote"))
+	store, err := Open(WithFS(faultFS), WithDir("test_reuse_rule_promote"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestRegression_Item15_16_NoOldRecordResurrection(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_no_old_record_resurrection"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestRegression_Item17_OversizeObjectPersistence(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_persistence"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestRegression_Item19_BucketIsolation(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_bucket_isolation"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestRegression_Item20_EngineScanConsistent(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_scan_rebuild"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestRegression_Round2_Item1_OversizeDeleteThenReopen(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_delete_reopen"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestRegression_Round2_Item2_OversizeToSmallUpdateThenReopen(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_to_small_reopen"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestRegression_Round2_Item3_OversizeLongNameAndTornFiles(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_long_name"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -510,7 +510,7 @@ func TestRegression_Round2_Item4_LogicalPageReuseNoLeak(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_page_reuse_no_leak"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithNumPoolBlocks(64))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithNumPoolBlocks(64), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestEngine_SetTokenNoFakeObject(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_token_no_fake_obj"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -572,7 +572,7 @@ func TestEngine_TokenPerBucket(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_rv_per_bucket"
 
-	store, err := Open(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -658,7 +658,7 @@ func TestKeyBoundaries_TableTest(t *testing.T) {
 					memFS := NewMemFS()
 					dir := "test_boundary_store"
 
-					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 					if err != nil {
 						t.Fatalf("Open failed: %v", err)
 					}
@@ -738,7 +738,7 @@ func TestSlottedPage_KeyOver64BytesNearBoundary(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_slotted_boundary"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -780,7 +780,7 @@ func TestMultiBlockPage_KeyOver64BytesNearBoundary(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_multiblock_boundary"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -822,7 +822,7 @@ func TestMultiBlockPage_RecordSizesBetweenSlottedAndBlockLimitRoundTrip(t *testi
 	memFS := NewMemFS()
 	dir := "test_multiblock_transition_store"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1126,7 +1126,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 					memFS := NewMemFS()
 					dir := fmt.Sprintf("test_transition_%s_%s", tc.name, m.name)
 
-					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(tc.codec))
+					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(tc.codec), WithCreate())
 					if err != nil {
 						t.Fatalf("Open failed: %v", err)
 					}
@@ -1229,7 +1229,7 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_mb_redo_idempotent"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1333,7 +1333,7 @@ func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
 		dir := b.TempDir()
-		store, err := Open(WithDir(dir), WithNumPoolBlocks(numPoolBlocks))
+		store, err := Open(WithDir(dir), WithNumPoolBlocks(numPoolBlocks), WithCreate())
 		if err != nil {
 			b.Fatalf("Open failed: %v", err)
 		}
@@ -1361,7 +1361,7 @@ func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
 // keys that writers rewrite continuously with checkpoints running complete with no read errors.
 func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 	memFS := NewMemFS()
-	store, err := Open(WithFS(memFS), WithDir("stress_store"), WithNumPoolBlocks(64))
+	store, err := Open(WithFS(memFS), WithDir("stress_store"), WithNumPoolBlocks(64), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1450,7 +1450,7 @@ func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 // returns exists=false and does not cause a fatal corruption error.
 func TestGet_MissingOversizeObjectReturnsNotFound(t *testing.T) {
 	memFS := NewMemFS()
-	store, err := Open(WithFS(memFS), WithDir("missing_oversize_test"))
+	store, err := Open(WithFS(memFS), WithDir("missing_oversize_test"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1487,7 +1487,7 @@ func TestGet_MissingOversizeObjectReturnsNotFound(t *testing.T) {
 // the engine failure error includes the cause.
 func TestGet_PinPageFailurePreservesCause(t *testing.T) {
 	memFS := NewMemFS()
-	store, err := Open(WithFS(memFS), WithDir("pin_fail_test"))
+	store, err := Open(WithFS(memFS), WithDir("pin_fail_test"), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1532,7 +1532,7 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 		fs := NewOSFS()
 		dir := t.TempDir()
 
-		store, err := Open(WithFS(fs), WithDir(dir))
+		store, err := Open(WithFS(fs), WithDir(dir), WithCreate())
 		if err != nil {
 			t.Fatalf("Open failed: %v", err)
 		}
@@ -1542,7 +1542,7 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 
 		corrupt(dir)
 
-		store2, err := Open(WithFS(fs), WithDir(dir))
+		store2, err := Open(WithFS(fs), WithDir(dir), WithEraseOnError())
 		if err != nil {
 			t.Fatalf("Open after wipe failed: %v", err)
 		}
@@ -1591,6 +1591,7 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 type readErrorHookFS struct {
 	FS
 	failMetaRead bool
+	failMetaOpen bool
 }
 
 type readErrorFile struct {
@@ -1606,6 +1607,9 @@ func (f *readErrorFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (h *readErrorHookFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	if strings.Contains(name, "meta.db") && h.failMetaOpen {
+		return nil, errors.New("simulated open error")
+	}
 	f, err := h.FS.OpenFile(name, flag, perm)
 	if err != nil {
 		return nil, err
@@ -1622,7 +1626,7 @@ func TestRegression_MetaFileReadErrorNoWipe(t *testing.T) {
 	dir := "test_meta_read_err"
 
 	// 1. Initialize store with data
-	store, err := Open(WithFS(hookedFS), WithDir(dir))
+	store, err := Open(WithFS(hookedFS), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1692,7 +1696,7 @@ func TestRegression_SyncDirOnStoreInit(t *testing.T) {
 		storeDir: dir,
 	}
 
-	store, err := Open(WithFS(tracker), WithDir(dir))
+	store, err := Open(WithFS(tracker), WithDir(dir), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1704,5 +1708,197 @@ func TestRegression_SyncDirOnStoreInit(t *testing.T) {
 
 	if !tracker.syncedStoreDirAfterHeapCreation {
 		t.Fatalf("expected store directory %q to be synced after heap file creation, sync calls: %v", dir, tracker.syncDirDirs)
+	}
+}
+
+func TestOpen_CreateOption(t *testing.T) {
+	// 1. Without WithCreate, Open on non-existent path fails and does not create directory
+	nonExistent := filepath.Join(t.TempDir(), "sub", "not_there")
+	if _, err := Open(WithDir(nonExistent)); err == nil {
+		t.Fatalf("expected Open without WithCreate to fail on non-existent directory")
+	}
+	if _, err := os.Stat(nonExistent); !os.IsNotExist(err) {
+		t.Fatalf("expected non-existent directory to not be created, got err: %v", err)
+	}
+
+	// 2. Without WithCreate, Open on empty directory fails and leaves directory empty
+	emptyDir := t.TempDir()
+	if _, err := Open(WithDir(emptyDir)); err == nil {
+		t.Fatalf("expected Open without WithCreate to fail on empty directory")
+	}
+	entries, err := os.ReadDir(emptyDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected directory to remain empty, found %d entries", len(entries))
+	}
+
+	// 3. Temporary store (empty Dir) implies WithCreate
+	tempStore, err := Open()
+	if err != nil {
+		t.Fatalf("Open temporary store failed: %v", err)
+	}
+	if err := tempStore.Close(); err != nil {
+		t.Fatalf("Close temporary store failed: %v", err)
+	}
+
+	// 4. With WithCreate, Open creates database
+	dir := filepath.Join(t.TempDir(), "create_store")
+	store, err := Open(WithDir(dir), WithCreate())
+	if err != nil {
+		t.Fatalf("Open with WithCreate failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "key1", []byte("val1"), "1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 5. Reopening existing database succeeds without WithCreate
+	store2, err := Open(WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open on existing store failed: %v", err)
+	}
+	val, exists, err := store2.Get("ConfigMap", "key1")
+	if err != nil || !exists || string(val) != "val1" {
+		t.Fatalf("Get on reopened store failed: exists=%v, val=%q, err=%v", exists, string(val), err)
+	}
+	if err := store2.Close(); err != nil {
+		t.Fatalf("Close on reopened store failed: %v", err)
+	}
+}
+
+func TestOpen_EraseOnErrorOption(t *testing.T) {
+	assertFileExists := func(t *testing.T, fs FS, path string) {
+		t.Helper()
+		f, err := fs.OpenFile(path, os.O_RDONLY, 0)
+		if err != nil {
+			t.Fatalf("file %s does not exist: %v", path, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close %s failed: %v", path, err)
+		}
+	}
+
+	cases := []struct {
+		name      string
+		damage    func(t *testing.T, fs *readErrorHookFS, dir string)
+		expectErr string
+		files     []string
+	}{
+		{
+			name: "FailureMarker",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				mf, err := fs.OpenFile(filepath.Join(dir, "FAILED"), os.O_CREATE|os.O_WRONLY, 0644)
+				if err != nil {
+					t.Fatalf("create FAILED marker failed: %v", err)
+				}
+				if err := mf.Close(); err != nil {
+					t.Fatalf("close FAILED marker failed: %v", err)
+				}
+			},
+			expectErr: "failure marker",
+			files:     []string{"FAILED", "meta.db", "heap.db"},
+		},
+		{
+			name: "OrphanedFiles",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				if err := fs.Remove(filepath.Join(dir, "meta.db")); err != nil {
+					t.Fatalf("remove meta.db failed: %v", err)
+				}
+			},
+			expectErr: "orphaned store files",
+			files:     []string{"heap.db"},
+		},
+		{
+			name: "CorruptMeta",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				metaPath := filepath.Join(dir, "meta.db")
+				mf, err := fs.OpenFile(metaPath, os.O_RDWR, 0644)
+				if err != nil {
+					t.Fatalf("open meta.db failed: %v", err)
+				}
+				var badVer [4]byte
+				binary.BigEndian.PutUint32(badVer[:], 999)
+				if _, err := mf.WriteAt(badVer[:], 16); err != nil {
+					t.Fatalf("write bad version failed: %v", err)
+				}
+				if err := mf.Close(); err != nil {
+					t.Fatalf("close meta.db failed: %v", err)
+				}
+			},
+			expectErr: "outdated or corrupt meta file",
+			files:     []string{"meta.db", "heap.db"},
+		},
+		{
+			name: "UnreadableMetaRead",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				fs.failMetaRead = true
+			},
+			expectErr: "simulated read error",
+			files:     []string{"meta.db", "heap.db"},
+		},
+		{
+			name: "UnreadableMetaOpen",
+			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
+				fs.failMetaOpen = true
+			},
+			expectErr: "simulated open error",
+			files:     []string{"meta.db", "heap.db"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hookFS := &readErrorHookFS{FS: NewMemFS()}
+			dir := "test_erase_" + tc.name
+
+			store, err := Open(WithFS(hookFS), WithDir(dir), WithCreate())
+			if err != nil {
+				t.Fatalf("Open failed: %v", err)
+			}
+			if err := store.Put("ConfigMap", "k1", []byte("val1"), "1"); err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close failed: %v", err)
+			}
+
+			tc.damage(t, hookFS, dir)
+
+			// Without WithEraseOnError, Open must return error and leave files in place
+			_, err = Open(WithFS(hookFS), WithDir(dir))
+			if err == nil {
+				t.Fatalf("expected Open without WithEraseOnError to fail")
+			}
+			if !strings.Contains(err.Error(), tc.expectErr) {
+				t.Fatalf("expected error containing %q, got: %v", tc.expectErr, err)
+			}
+
+			// Verify files were left in place
+			readFailed := hookFS.failMetaRead
+			openFailed := hookFS.failMetaOpen
+			hookFS.failMetaOpen = false
+			hookFS.failMetaRead = false
+			for _, file := range tc.files {
+				assertFileExists(t, hookFS, filepath.Join(dir, file))
+			}
+			hookFS.failMetaRead = readFailed
+			hookFS.failMetaOpen = openFailed
+
+			// With WithEraseOnError, Open must erase and report Wiped()
+			store2, err := Open(WithFS(hookFS), WithDir(dir), WithEraseOnError())
+			if err != nil {
+				t.Fatalf("Open with WithEraseOnError failed: %v", err)
+			}
+			if !store2.Wiped() {
+				t.Fatalf("expected store to report Wiped()")
+			}
+			if err := store2.Close(); err != nil {
+				t.Fatalf("store2.Close failed: %v", err)
+			}
+		})
 	}
 }

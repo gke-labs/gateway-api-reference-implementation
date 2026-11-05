@@ -28,7 +28,7 @@ import (
 
 func TestConcurrency_ReadersWritersAndCheckpoints(t *testing.T) {
 	memFS := engine.NewMemFS()
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("conc_store"), engine.WithNumPoolBlocks(64))
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("conc_store"), engine.WithNumPoolBlocks(64), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
