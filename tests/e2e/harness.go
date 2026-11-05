@@ -38,65 +38,67 @@ import (
 )
 
 type Harness struct {
-	t           *testing.T
-	clusterName string
+	// T is the test context. Exported so embedding test harnesses can access it.
+	T *testing.T
+	// ClusterName is the kind cluster name. Exported so embedding test harnesses can access it.
+	ClusterName string
 }
 
 func NewHarness(t *testing.T, clusterName string) *Harness {
 	return &Harness{
-		t:           t,
-		clusterName: clusterName,
+		T:           t,
+		ClusterName: clusterName,
 	}
 }
 
 func (h *Harness) Setup() {
-	h.t.Logf("Setting up harness for cluster %s", h.clusterName)
+	h.T.Logf("Setting up harness for cluster %s", h.ClusterName)
 	// Check if kind is installed
 	if _, err := exec.LookPath("kind"); err != nil {
-		h.t.Fatalf("kind not found: %v", err)
+		h.T.Fatalf("kind not found: %v", err)
 	}
 	// Check if kubectl is installed
 	if _, err := exec.LookPath("kubectl"); err != nil {
-		h.t.Fatalf("kubectl not found: %v", err)
+		h.T.Fatalf("kubectl not found: %v", err)
 	}
 
 	// Create kind cluster if it doesn't exist
-	clusters := h.runCmd("kind", "get", "clusters")
+	clusters := h.RunCmd("kind", "get", "clusters")
 	exists := false
 	for _, cluster := range strings.Split(clusters, "\n") {
-		if strings.TrimSpace(cluster) == h.clusterName {
+		if strings.TrimSpace(cluster) == h.ClusterName {
 			exists = true
 			break
 		}
 	}
 
 	if !exists {
-		h.t.Logf("Creating kind cluster %s", h.clusterName)
-		h.runCmd("kind", "create", "cluster", "--name", h.clusterName)
-		h.t.Cleanup(func() {
+		h.T.Logf("Creating kind cluster %s", h.ClusterName)
+		h.RunCmd("kind", "create", "cluster", "--name", h.ClusterName)
+		h.T.Cleanup(func() {
 			if os.Getenv("SKIP_CLEANUP") == "" {
-				h.t.Logf("Deleting kind cluster %s", h.clusterName)
-				h.runCmd("kind", "delete", "cluster", "--name", h.clusterName)
+				h.T.Logf("Deleting kind cluster %s", h.ClusterName)
+				h.RunCmd("kind", "delete", "cluster", "--name", h.ClusterName)
 			}
 		})
 	}
 
 	// Ensure we are using the correct context and namespace
-	contextName := "kind-" + h.clusterName
-	h.runCmd("kubectl", "config", "use-context", contextName)
-	h.runCmd("kubectl", "config", "set-context", "--current", "--namespace=default")
+	contextName := "kind-" + h.ClusterName
+	h.RunCmd("kubectl", "config", "use-context", contextName)
+	h.RunCmd("kubectl", "config", "set-context", "--current", "--namespace=default")
 
 	h.InstallMetallb()
 }
 
 func (h *Harness) InstallMetallb() {
-	h.t.Log("Installing Metallb")
+	h.T.Log("Installing Metallb")
 	h.KubectlApplyWithRetry("-f", "https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml")
-	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=available", "deployment/controller", "--timeout=90s")
-	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=ready", "pod", "--selector=app=metallb", "--timeout=90s")
+	h.RunCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=available", "deployment/controller", "--timeout=90s")
+	h.RunCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=ready", "pod", "--selector=app=metallb", "--timeout=90s")
 
 	// Configure Metallb with a range of IPs from the kind network
-	h.runCmd("docker", "network", "inspect", "kind")
+	h.RunCmd("docker", "network", "inspect", "kind")
 
 	h.KubectlApplyContentWithRetry(h.MetallbConfigManifest(), 90*time.Second)
 }
@@ -108,7 +110,7 @@ func (h *Harness) RESTConfig() *rest.Config {
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
 	cfg, err := kubeConfig.ClientConfig()
 	if err != nil {
-		h.t.Fatalf("Failed to load Kubernetes config: %v", err)
+		h.T.Fatalf("Failed to load Kubernetes config: %v", err)
 	}
 	return cfg
 }
@@ -117,34 +119,34 @@ func (h *Harness) GetGitRoot() string {
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
 	out, err := cmd.Output()
 	if err != nil {
-		h.t.Fatalf("Failed to get git root: %v", err)
+		h.T.Fatalf("Failed to get git root: %v", err)
 	}
 	return strings.TrimSpace(string(out))
 }
 
 func (h *Harness) DockerBuild(tag, dockerfile, context string) {
-	h.t.Logf("Building docker image %s", tag)
-	h.runCmd("docker", "build", "-t", tag, "-f", dockerfile, context)
+	h.T.Logf("Building docker image %s", tag)
+	h.RunCmd("docker", "build", "-t", tag, "-f", dockerfile, context)
 }
 
 func (h *Harness) KindLoad(tag string) {
-	h.t.Logf("Loading image %s into kind cluster %s", tag, h.clusterName)
-	h.runCmd("kind", "load", "docker-image", tag, "--name", h.clusterName)
+	h.T.Logf("Loading image %s into kind cluster %s", tag, h.ClusterName)
+	h.RunCmd("kind", "load", "docker-image", tag, "--name", h.ClusterName)
 }
 
 func (h *Harness) KubectlApplyContent(content string) {
-	h.t.Logf("Applying kubectl content:\n%s", content)
+	h.T.Logf("Applying kubectl content:\n%s", content)
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(content)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		h.t.Fatalf("kubectl apply failed: %v\nStderr: %s", err, stderr.String())
+		h.T.Fatalf("kubectl apply failed: %v\nStderr: %s", err, stderr.String())
 	}
 }
 
 func (h *Harness) KubectlApplyContentWithRetry(content string, timeout time.Duration) {
-	h.t.Logf("Applying kubectl content (with retry):\n%s", content)
+	h.T.Logf("Applying kubectl content (with retry):\n%s", content)
 	start := time.Now()
 	var lastErr error
 	var lastStderr string
@@ -161,15 +163,15 @@ func (h *Harness) KubectlApplyContentWithRetry(content string, timeout time.Dura
 		}
 
 		if time.Since(start) > timeout {
-			h.t.Fatalf("Timeout waiting for kubectl apply to succeed: %v\nStderr: %s", lastErr, lastStderr)
+			h.T.Fatalf("Timeout waiting for kubectl apply to succeed: %v\nStderr: %s", lastErr, lastStderr)
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
 func (h *Harness) KubectlApplyFile(path string) {
-	h.t.Logf("Applying kubectl file: %s", path)
-	h.runCmd("kubectl", "apply", "-f", path)
+	h.T.Logf("Applying kubectl file: %s", path)
+	h.RunCmd("kubectl", "apply", "-f", path)
 }
 
 var applyRetryDelays = []time.Duration{5 * time.Second, 10 * time.Second, 15 * time.Second}
@@ -181,39 +183,50 @@ func (h *Harness) KubectlApplyWithRetry(args ...string) {
 	maxAttempts := len(applyRetryDelays) + 1
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		_, err := h.runCommand("kubectl", commandArgs...)
+		_, err := h.RunCommand("kubectl", commandArgs...)
 		if err == nil {
 			return
 		}
 		lastErr = err
 		if attempt < maxAttempts {
-			h.t.Logf("kubectl %v failed (attempt %d/%d): %v; retrying...", commandArgs, attempt, maxAttempts, err)
+			h.T.Logf("kubectl %v failed (attempt %d/%d): %v; retrying...", commandArgs, attempt, maxAttempts, err)
 			time.Sleep(applyRetryDelays[attempt-1])
 		}
 	}
-	h.t.Fatalf("kubectl %v failed after %d attempts: %v", commandArgs, maxAttempts, lastErr)
+	h.T.Fatalf("kubectl %v failed after %d attempts: %v", commandArgs, maxAttempts, lastErr)
 }
 
+// WaitForDeployment waits for a deployment in the default namespace to be ready.
 func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
-	h.t.Logf("Waiting for deployment %s to be ready", name)
-	h.runCmd("kubectl", "wait", "--namespace", "default", "--for=condition=available", "--timeout="+timeout.String(), "deployment/"+name)
+	h.WaitForDeploymentInNamespace("default", name, timeout)
+}
+
+// WaitForDeploymentInNamespace waits for a deployment in the specified namespace to be ready.
+// Exported so embedding test harnesses can wait in non-default namespaces.
+func (h *Harness) WaitForDeploymentInNamespace(namespace, name string, timeout time.Duration) {
+	h.T.Logf("Waiting for deployment %s/%s to be ready", namespace, name)
+	h.RunCmd("kubectl", "wait", "--namespace", namespace, "--for=condition=available", "--timeout="+timeout.String(), "deployment/"+name)
 }
 
 func (h *Harness) WaitForGatewayClassStatus(name string, timeout time.Duration) {
-	h.t.Logf("Waiting for GatewayClass %s to have supportedFeatures populated", name)
+	h.T.Logf("Waiting for GatewayClass %s to have supportedFeatures populated", name)
 	start := time.Now()
 	for {
 		if time.Since(start) > timeout {
-			logs := h.runCmd("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
-			h.t.Logf("Controller logs on timeout:\n%s", logs)
-			h.t.Fatalf("Timeout waiting for GatewayClass %s supportedFeatures", name)
+			logs, err := h.RunCommand("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
+			if err != nil {
+				h.T.Logf("Failed to get controller logs on timeout: %v", err)
+			} else if logs != "" {
+				h.T.Logf("Controller logs on timeout:\n%s", logs)
+			}
+			h.T.Fatalf("Timeout waiting for GatewayClass %s supportedFeatures", name)
 		}
 
 		out, err := exec.Command("kubectl", "get", "gatewayclass", name, "-o", "jsonpath={.status.supportedFeatures}").Output()
 		if err != nil {
-			h.t.Logf("waiting for gatewayclass %s: %v", name, err)
+			h.T.Logf("waiting for gatewayclass %s: %v", name, err)
 		} else if strings.TrimSpace(string(out)) != "" {
-			h.t.Logf("GatewayClass %s has supportedFeatures populated", name)
+			h.T.Logf("GatewayClass %s has supportedFeatures populated", name)
 			return
 		}
 		time.Sleep(1 * time.Second)
@@ -221,22 +234,26 @@ func (h *Harness) WaitForGatewayClassStatus(name string, timeout time.Duration) 
 }
 
 func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Duration) string {
-	h.t.Logf("Waiting for Gateway %s/%s to have an address assigned", namespace, name)
+	h.T.Logf("Waiting for Gateway %s/%s to have an address assigned", namespace, name)
 	start := time.Now()
 	for {
 		if time.Since(start) > timeout {
-			logs := h.runCmd("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
-			h.t.Logf("Controller logs on timeout:\n%s", logs)
-			h.t.Fatalf("Timeout waiting for Gateway %s/%s address", namespace, name)
+			logs, err := h.RunCommand("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
+			if err != nil {
+				h.T.Logf("Failed to get controller logs on timeout: %v", err)
+			} else if logs != "" {
+				h.T.Logf("Controller logs on timeout:\n%s", logs)
+			}
+			h.T.Fatalf("Timeout waiting for Gateway %s/%s address", namespace, name)
 		}
 
 		out, err := exec.Command("kubectl", "get", "gateway", name, "--namespace", namespace, "-o", "jsonpath={.status.addresses[0].value}").Output()
 		if err != nil {
-			h.t.Logf("waiting for gateway %s/%s address: %v", namespace, name, err)
+			h.T.Logf("waiting for gateway %s/%s address: %v", namespace, name, err)
 		} else {
 			addr := strings.TrimSpace(string(out))
 			if addr != "" {
-				h.t.Logf("Gateway %s/%s assigned address: %s", namespace, name, addr)
+				h.T.Logf("Gateway %s/%s assigned address: %s", namespace, name, addr)
 				return addr
 			}
 		}
@@ -245,23 +262,26 @@ func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Dur
 }
 
 func (h *Harness) WaitForGatewayClassSupportedVersion(name string, timeout time.Duration) {
-	h.t.Logf("Waiting for GatewayClass %s to have SupportedVersion=True", name)
+	h.T.Logf("Waiting for GatewayClass %s to have SupportedVersion=True", name)
 	start := time.Now()
 	var lastErr error
 	for {
 		if time.Since(start) > timeout {
-			out := h.runCmd("kubectl", "get", "gatewayclass", name, "-o", `jsonpath=status={.status.conditions[?(@.type=="SupportedVersion")].status} reason={.status.conditions[?(@.type=="SupportedVersion")].reason} message={.status.conditions[?(@.type=="SupportedVersion")].message}`)
-			if lastErr != nil {
-				h.t.Fatalf("Timeout waiting for GatewayClass %s SupportedVersion=True (last error: %v): %s", name, lastErr, out)
+			out, err := h.RunCommand("kubectl", "get", "gatewayclass", name, "-o", `jsonpath=status={.status.conditions[?(@.type=="SupportedVersion")].status} reason={.status.conditions[?(@.type=="SupportedVersion")].reason} message={.status.conditions[?(@.type=="SupportedVersion")].message}`)
+			if err != nil {
+				h.T.Logf("failed getting conditions on timeout: %v", err)
 			}
-			h.t.Fatalf("Timeout waiting for GatewayClass %s SupportedVersion=True: %s", name, out)
+			if lastErr != nil {
+				h.T.Fatalf("Timeout waiting for GatewayClass %s SupportedVersion=True (last error: %v): %s", name, lastErr, out)
+			}
+			h.T.Fatalf("Timeout waiting for GatewayClass %s SupportedVersion=True: %s", name, out)
 		}
 
 		cmd := exec.Command("kubectl", "get", "gatewayclass", name, "-o", `jsonpath={.status.conditions[?(@.type=="SupportedVersion")].status} {.status.conditions[?(@.type=="SupportedVersion")].reason}`)
 		out, err := cmd.Output()
 		if err != nil {
 			lastErr = err
-			h.t.Logf("waiting for GatewayClass %s SupportedVersion condition: %v", name, err)
+			h.T.Logf("waiting for GatewayClass %s SupportedVersion condition: %v", name, err)
 		} else {
 			fields := strings.Fields(strings.TrimSpace(string(out)))
 			if len(fields) >= 2 && fields[0] == "True" && fields[1] == "SupportedVersion" {
@@ -273,11 +293,11 @@ func (h *Harness) WaitForGatewayClassSupportedVersion(name string, timeout time.
 }
 
 func (h *Harness) WaitForResourceDeletion(kind, name, namespace string, timeout time.Duration) {
-	h.t.Logf("Waiting for %s %s/%s to be deleted", kind, namespace, name)
+	h.T.Logf("Waiting for %s %s/%s to be deleted", kind, namespace, name)
 	start := time.Now()
 	for {
 		if time.Since(start) > timeout {
-			h.t.Fatalf("Timeout waiting for %s %s/%s deletion", kind, namespace, name)
+			h.T.Fatalf("Timeout waiting for %s %s/%s deletion", kind, namespace, name)
 		}
 
 		out, err := exec.Command("kubectl", "get", kind, name, "--namespace", namespace, "-o", "jsonpath={.metadata.name}").Output()
@@ -288,52 +308,95 @@ func (h *Harness) WaitForResourceDeletion(kind, name, namespace string, timeout 
 	}
 }
 
+// DeletePod deletes a pod in the default namespace, ignoring if not found.
 func (h *Harness) DeletePod(name string) {
-	h.t.Logf("Deleting pod %s", name)
-	if err := exec.Command("kubectl", "delete", "pod", name, "--namespace", "default", "--ignore-not-found").Run(); err != nil {
-		h.t.Logf("failed to delete pod %s: %v", name, err)
+	h.DeletePodInNamespace("default", name)
+}
+
+// DeletePodInNamespace deletes a pod in the specified namespace, ignoring if not found.
+// Exported so embedding test harnesses can delete pods in non-default namespaces.
+func (h *Harness) DeletePodInNamespace(namespace, name string) {
+	h.T.Logf("Deleting pod %s/%s", namespace, name)
+	if err := exec.Command("kubectl", "delete", "pod", name, "--namespace", namespace, "--ignore-not-found").Run(); err != nil {
+		h.T.Logf("failed to delete pod %s/%s: %v", namespace, name, err)
 	}
 }
 
+// WaitForPodSuccess waits for a pod in the default namespace to reach the Succeeded phase.
 func (h *Harness) WaitForPodSuccess(name string, timeout time.Duration) {
-	h.t.Logf("Waiting for pod %s to succeed", name)
+	h.WaitForPodSuccessInNamespace("default", name, timeout)
+}
+
+// WaitForPodSuccessInNamespace waits for a pod in the specified namespace to reach the Succeeded phase.
+// Exported so embedding test harnesses can wait in non-default namespaces.
+func (h *Harness) WaitForPodSuccessInNamespace(namespace, name string, timeout time.Duration) {
+	h.T.Logf("Waiting for pod %s/%s to succeed", namespace, name)
 	start := time.Now()
 	for {
 		if time.Since(start) > timeout {
-			h.t.Fatalf("Timeout waiting for pod %s to succeed", name)
+			h.T.Fatalf("Timeout waiting for pod %s/%s to succeed", namespace, name)
 		}
 
-		out, err := exec.Command("kubectl", "get", "pod", name, "--namespace", "default", "-o", "jsonpath={.status.phase}").Output()
+		out, err := exec.Command("kubectl", "get", "pod", name, "--namespace", namespace, "-o", "jsonpath={.status.phase}").Output()
 		if err != nil {
-			h.t.Logf("waiting for pod %s phase: %v", name, err)
+			h.T.Logf("waiting for pod %s/%s phase: %v", namespace, name, err)
 		} else {
 			phase := strings.TrimSpace(string(out))
 			if phase == "Succeeded" {
 				return
 			}
 			if phase == "Failed" {
-				podLogs := h.GetPodLogs(name)
-				h.t.Logf("Pod %s logs on failure:\n%s", name, podLogs)
-				dataplaneLogs := h.runCmd("kubectl", "logs", "--selector=app.kubernetes.io/managed-by=gari-singlepod", "--namespace=default")
-				h.t.Logf("Dataplane logs on failure:\n%s", dataplaneLogs)
-				dataplanePods := h.runCmd("kubectl", "get", "pods", "--namespace=default")
-				h.t.Logf("All pods on failure:\n%s", dataplanePods)
-				h.t.Fatalf("Pod %s failed", name)
+				podLogs := h.GetPodLogsInNamespace(namespace, name)
+				h.T.Logf("Pod %s/%s logs on failure:\n%s", namespace, name, podLogs)
+				dataplaneLogs, err := h.RunCommand("kubectl", "logs", "--selector=app.kubernetes.io/managed-by=gari-singlepod", "--namespace="+namespace)
+				if err != nil {
+					h.T.Logf("Failed to get dataplane logs on failure: %v", err)
+				} else if dataplaneLogs != "" {
+					h.T.Logf("Dataplane logs on failure:\n%s", dataplaneLogs)
+				}
+				dataplanePods, err := h.RunCommand("kubectl", "get", "pods", "--namespace="+namespace)
+				if err != nil {
+					h.T.Logf("Failed to get dataplane pods on failure: %v", err)
+				} else if dataplanePods != "" {
+					h.T.Logf("All pods on failure:\n%s", dataplanePods)
+				}
+				h.T.Fatalf("Pod %s/%s failed", namespace, name)
 			}
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
+// GetPodLogs returns logs for a pod in the default namespace.
 func (h *Harness) GetPodLogs(name string) string {
-	out, err := exec.Command("kubectl", "logs", name, "--namespace", "default").Output()
+	return h.GetPodLogsInNamespace("default", name)
+}
+
+// GetPodLogsInNamespace returns logs for a pod in the specified namespace.
+// Exported so embedding test harnesses can get logs in non-default namespaces.
+func (h *Harness) GetPodLogsInNamespace(namespace, name string) string {
+	out, err := exec.Command("kubectl", "logs", name, "--namespace", namespace).Output()
 	if err != nil {
-		h.t.Fatalf("Failed to get pod logs for %s: %v", name, err)
+		h.T.Fatalf("Failed to get pod logs for %s/%s: %v", namespace, name, err)
 	}
 	return string(out)
 }
 
-func (h *Harness) runCommand(name string, args ...string) (string, error) {
+// GetPodIP returns the IP address of a pod in the default namespace.
+func (h *Harness) GetPodIP(name string) string {
+	return h.GetPodIPInNamespace("default", name)
+}
+
+// GetPodIPInNamespace returns the IP address of a pod in the specified namespace.
+// Exported so embedding test harnesses can query pod IP in non-default namespaces.
+func (h *Harness) GetPodIPInNamespace(namespace, name string) string {
+	out := h.RunCmd("kubectl", "get", "pod", name, "--namespace", namespace, "-o", "jsonpath={.status.podIP}")
+	return strings.TrimSpace(out)
+}
+
+// RunCommand executes a command and returns its stdout or an error containing stderr.
+// Exported so external test harnesses (such as snigateway) can execute commands.
+func (h *Harness) RunCommand(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -344,10 +407,12 @@ func (h *Harness) runCommand(name string, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-func (h *Harness) runCmd(name string, args ...string) string {
-	stdout, err := h.runCommand(name, args...)
+// RunCmd executes a command and fails the test if it exits with an error.
+// Exported so external test harnesses (such as snigateway) can execute commands.
+func (h *Harness) RunCmd(name string, args ...string) string {
+	stdout, err := h.RunCommand(name, args...)
 	if err != nil {
-		h.t.Fatalf("%v", err)
+		h.T.Fatalf("%v", err)
 	}
 	return stdout
 }
@@ -356,21 +421,21 @@ func (h *Harness) runCmd(name string, args ...string) string {
 const PreviousMinorCRDVersion = "v1.6.3"
 
 func (h *Harness) InstallGatewayAPI(version string) {
-	h.t.Logf("Installing Gateway API CRDs (%s)", version)
+	h.T.Logf("Installing Gateway API CRDs (%s)", version)
 	h.KubectlApplyWithRetry("--server-side", "--force-conflicts", "-f", fmt.Sprintf("https://github.com/kubernetes-sigs/gateway-api/releases/download/%s/experimental-install.yaml", version))
 }
 
 func (h *Harness) DeployController() {
-	h.t.Log("Deploying Controller")
+	h.T.Log("Deploying Controller")
 	gitRoot := h.GetGitRoot()
 	h.DockerBuild("gari-controller:e2e", filepath.Join(gitRoot, "images/gari-controller/Dockerfile"), gitRoot)
 	h.KindLoad("gari-controller:e2e")
 
 	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/controller.yaml"))
-	h.runCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
-	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--dataplane-image","gari-controller:e2e","--enable-h2c"]}]}}}}`)
-	h.runCmd("kubectl", "rollout", "restart", "deployment/gari-controller", "--namespace=default")
-	h.runCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
+	h.RunCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
+	h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--dataplane-image","gari-controller:e2e","--enable-h2c"]}]}}}}`)
+	h.RunCmd("kubectl", "rollout", "restart", "deployment/gari-controller", "--namespace=default")
+	h.RunCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
 }
 
 func (h *Harness) BackendManifest() string {
@@ -482,7 +547,7 @@ spec:
 }
 
 func (h *Harness) CreateTLSSecret(name, namespace string, certPEM, keyPEM []byte) {
-	h.t.Logf("Creating TLS secret %s/%s", namespace, name)
+	h.T.Logf("Creating TLS secret %s/%s", namespace, name)
 	content := fmt.Sprintf(`
 apiVersion: v1
 kind: Secret
@@ -550,7 +615,7 @@ func (h *Harness) ClientManifest(url string, host string) string {
 func (h *Harness) ClientManifestWithArgs(name string, args ...string) string {
 	argsJSON, err := json.Marshal(args)
 	if err != nil {
-		h.t.Fatalf("failed to marshal args: %v", err)
+		h.T.Fatalf("failed to marshal args: %v", err)
 	}
 	return fmt.Sprintf(`
 apiVersion: v1
@@ -569,7 +634,7 @@ spec:
 }
 
 func (h *Harness) DeployBackend() {
-	h.t.Log("Deploying Backend")
+	h.T.Log("Deploying Backend")
 	gitRoot := h.GetGitRoot()
 	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), gitRoot)
 	h.KindLoad("toolbox:e2e")
