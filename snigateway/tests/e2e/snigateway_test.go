@@ -61,16 +61,16 @@ func TestSNIGateway(t *testing.T) {
 	frontendNS := "snigateway-frontend"
 	h.DeploySNIGatewayFrontend(frontendNS, infraCerts)
 	t.Cleanup(func() {
-		h.runCmd("kubectl", "delete", "namespace", frontendNS, "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "namespace", frontendNS, "--ignore-not-found")
 	})
 
 	// 6. Deploy snigateway controller with 2 replicas
 	frontendAddr := fmt.Sprintf("snigateway-frontend.%s.svc.cluster.local:443", frontendNS)
 	h.DeploySNIGatewayController(infraCerts, frontendAddr, 2)
 	t.Cleanup(func() {
-		h.runCmd("kubectl", "delete", "deployment", "snigateway-controller", "--namespace=default", "--ignore-not-found")
-		h.runCmd("kubectl", "delete", "secret", "snigateway-client-cert", "--namespace=default", "--ignore-not-found")
-		h.runCmd("kubectl", "delete", "gatewayclass", "snigateway", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "deployment", "snigateway-controller", "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "secret", "snigateway-client-cert", "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "gatewayclass", "snigateway", "--ignore-not-found")
 	})
 
 	// 7. Generate TLS certificates for echo.snigateway.test and echo2.snigateway.test
@@ -80,7 +80,7 @@ func TestSNIGateway(t *testing.T) {
 	}
 	h.CreateTLSSecret("echo-tls-cert", "default", echoCertPEM, echoKeyPEM)
 	t.Cleanup(func() {
-		h.runCmd("kubectl", "delete", "secret", "echo-tls-cert", "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "secret", "echo-tls-cert", "--namespace=default", "--ignore-not-found")
 	})
 
 	echo2CertPEM, echo2KeyPEM, err := GenerateTestCertificate("echo2.snigateway.test", "echo2.snigateway.test")
@@ -89,16 +89,16 @@ func TestSNIGateway(t *testing.T) {
 	}
 	h.CreateTLSSecret("echo2-tls-cert", "default", echo2CertPEM, echo2KeyPEM)
 	t.Cleanup(func() {
-		h.runCmd("kubectl", "delete", "secret", "echo2-tls-cert", "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "secret", "echo2-tls-cert", "--namespace=default", "--ignore-not-found")
 	})
 
 	// 8. Create Gateway and HTTPRoute
 	h.KubectlApplyContent(h.SNIGatewayManifest("echo.snigateway.test", "echo-tls-cert"))
 	h.KubectlApplyContent(h.SNIHTTPRouteManifest("echo-route", "snigateway-test", "echo.snigateway.test", "backend", 8080))
 	t.Cleanup(func() {
-		h.runCmd("kubectl", "delete", "httproute", "echo-route", "--namespace=default", "--ignore-not-found")
-		h.runCmd("kubectl", "delete", "httproute", "echo2-route", "--namespace=default", "--ignore-not-found")
-		h.runCmd("kubectl", "delete", "gateway", "snigateway-test", "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "httproute", "echo-route", "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "httproute", "echo2-route", "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "gateway", "snigateway-test", "--namespace=default", "--ignore-not-found")
 	})
 
 	dumpLogsIfFailed := func(currentT *testing.T) {
@@ -235,14 +235,14 @@ func TestSNIGateway(t *testing.T) {
 		}
 		h.CreateTLSSecret("disallowed-tls-cert", "default", disallowedCertPEM, disallowedKeyPEM)
 		t.Cleanup(func() {
-			h.runCmd("kubectl", "delete", "secret", "disallowed-tls-cert", "--namespace=default", "--ignore-not-found")
+			h.RunCmd("kubectl", "delete", "secret", "disallowed-tls-cert", "--namespace=default", "--ignore-not-found")
 		})
 
 		h.KubectlApplyContent(h.SNIGatewayManifestWithName("disallowed-gw", "disallowed.example.com", "disallowed-tls-cert"))
 		h.KubectlApplyContent(h.SNIHTTPRouteManifest("disallowed-route", "disallowed-gw", "disallowed.example.com", "backend", 8080))
 		t.Cleanup(func() {
-			h.runCmd("kubectl", "delete", "httproute", "disallowed-route", "--namespace=default", "--ignore-not-found")
-			h.runCmd("kubectl", "delete", "gateway", "disallowed-gw", "--namespace=default", "--ignore-not-found")
+			h.RunCmd("kubectl", "delete", "httproute", "disallowed-route", "--namespace=default", "--ignore-not-found")
+			h.RunCmd("kubectl", "delete", "gateway", "disallowed-gw", "--namespace=default", "--ignore-not-found")
 		})
 
 		// Wait for controller reconciliation attempt
@@ -272,14 +272,14 @@ func TestSNIGateway(t *testing.T) {
 		t.Cleanup(func() { dumpLogsIfFailed(t) })
 
 		// Find one of the running controller replica pods
-		podListOut := h.runCmd("kubectl", "get", "pods", "--namespace=default", "-l", "app=snigateway-controller", "--field-selector=status.phase=Running", "-o", "jsonpath={.items[*].metadata.name}")
+		podListOut := h.RunCmd("kubectl", "get", "pods", "--namespace=default", "-l", "app=snigateway-controller", "--field-selector=status.phase=Running", "-o", "jsonpath={.items[*].metadata.name}")
 		pods := strings.Fields(podListOut)
 		if len(pods) < 2 {
 			t.Fatalf("expected at least 2 running snigateway-controller pods, got %d: %v", len(pods), pods)
 		}
 
 		// Force-kill the first replica so its pooled connections become dead without clean session close
-		h.runCmd("kubectl", "delete", "pod", pods[0], "--namespace=default", "--grace-period=0", "--force")
+		h.RunCmd("kubectl", "delete", "pod", pods[0], "--namespace=default", "--grace-period=0", "--force")
 
 		// Immediately send multiple requests with --retries=0 to verify frontend replay-until-first-byte failover
 		for i := 1; i <= 5; i++ {
@@ -371,7 +371,7 @@ func TestSNIGateway(t *testing.T) {
 		})
 		h.DeploySNIGatewayFrontendTCPOnly(fallbackNS, infraCerts)
 		t.Cleanup(func() {
-			h.runCmd("kubectl", "delete", "namespace", fallbackNS, "--ignore-not-found")
+			h.RunCmd("kubectl", "delete", "namespace", fallbackNS, "--ignore-not-found")
 		})
 
 		fallbackAddr := fmt.Sprintf("snigateway-frontend.%s.svc.cluster.local:443", fallbackNS)
@@ -475,13 +475,13 @@ func TestSNIGateway(t *testing.T) {
 	// Assertion 10: Kill frontend session: Gateway goes Programmed=False; restore and it returns to True without restart
 	t.Run("Gateway flips to Programmed=False when frontend drops and restores without restart", func(t *testing.T) {
 		t.Cleanup(func() {
-			h.runCmd("kubectl", "scale", "deployment/snigateway-frontend", "--replicas=1", "-n", frontendNS)
-			h.runCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+frontendNS, "--timeout=2m")
+			h.RunCmd("kubectl", "scale", "deployment/snigateway-frontend", "--replicas=1", "-n", frontendNS)
+			h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+frontendNS, "--timeout=2m")
 			dumpLogsIfFailed(t)
 		})
 
 		// Scale frontend down to 0 replicas to drop tunnel session
-		h.runCmd("kubectl", "scale", "deployment/snigateway-frontend", "--replicas=0", "-n", frontendNS)
+		h.RunCmd("kubectl", "scale", "deployment/snigateway-frontend", "--replicas=0", "-n", frontendNS)
 		reason, msg := h.WaitForGatewayProgrammedFalse("snigateway-test", "default", 30*time.Second)
 		t.Logf("Gateway unready when frontend is down: reason=%s msg=%s", reason, msg)
 		if !strings.Contains(strings.ToLower(msg), "tunnel") {
@@ -489,8 +489,8 @@ func TestSNIGateway(t *testing.T) {
 		}
 
 		// Restore frontend to 1 replica
-		h.runCmd("kubectl", "scale", "deployment/snigateway-frontend", "--replicas=1", "-n", frontendNS)
-		h.runCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+frontendNS, "--timeout=2m")
+		h.RunCmd("kubectl", "scale", "deployment/snigateway-frontend", "--replicas=1", "-n", frontendNS)
+		h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+frontendNS, "--timeout=2m")
 
 		// Gateway returns to Programmed=True without restarting the controller
 		h.WaitForGatewayProgrammed("snigateway-test", "default", 1*time.Minute)
