@@ -630,6 +630,7 @@ type CompiledTLSRoute struct {
 	TLSRoute         *gatewayv1.TLSRoute
 	RouteState       *TLSRouteState
 	ParentConditions []metav1.Condition
+	BoundListeners   []*EffectiveListener
 }
 
 // CompiledGRPCRoute contains the compiled state for a GRPCRoute.
@@ -2012,10 +2013,16 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			)
 		}
 
+		var boundListeners []*EffectiveListener
+		for listener := range boundListenersForRoute {
+			boundListeners = append(boundListeners, listener)
+		}
+
 		cm.TLSRoutes[routeKey] = &CompiledTLSRoute{
 			TLSRoute:         route,
 			RouteState:       rs,
 			ParentConditions: parentConditions,
+			BoundListeners:   boundListeners,
 		}
 	}
 
@@ -3136,6 +3143,96 @@ func ComputeDesiredUDPRouteStatus(
 	}
 }
 
+type backendTLSPolicyRouteTarget struct {
+	namespace        string
+	parentRefs       []gatewayv1.ParentReference
+	parentConditions []metav1.Condition
+	backendRefs      []gatewayv1.BackendObjectReference
+	isTLSRoute       bool
+	boundListeners   []*EffectiveListener
+}
+
+func collectBackendTLSPolicyRouteTargets(compiled *CompiledModel) []backendTLSPolicyRouteTarget {
+	if compiled == nil {
+		return nil
+	}
+	var targets []backendTLSPolicyRouteTarget
+
+	for _, cr := range compiled.HTTPRoutes {
+		if cr == nil || cr.HTTPRoute == nil {
+			continue
+		}
+		var backendRefs []gatewayv1.BackendObjectReference
+		for _, rule := range cr.HTTPRoute.Spec.Rules {
+			for _, b := range rule.BackendRefs {
+				backendRefs = append(backendRefs, b.BackendObjectReference)
+			}
+		}
+		targets = append(targets, backendTLSPolicyRouteTarget{
+			namespace:        cr.HTTPRoute.Namespace,
+			parentRefs:       cr.HTTPRoute.Spec.ParentRefs,
+			parentConditions: cr.ParentConditions,
+			backendRefs:      backendRefs,
+		})
+	}
+
+	for _, cr := range compiled.GRPCRoutes {
+		if cr == nil || cr.GRPCRoute == nil {
+			continue
+		}
+		var backendRefs []gatewayv1.BackendObjectReference
+		for _, rule := range cr.GRPCRoute.Spec.Rules {
+			for _, b := range rule.BackendRefs {
+				backendRefs = append(backendRefs, b.BackendObjectReference)
+			}
+		}
+		targets = append(targets, backendTLSPolicyRouteTarget{
+			namespace:        cr.GRPCRoute.Namespace,
+			parentRefs:       cr.GRPCRoute.Spec.ParentRefs,
+			parentConditions: cr.ParentConditions,
+			backendRefs:      backendRefs,
+		})
+	}
+
+	for _, cr := range compiled.TLSRoutes {
+		if cr == nil || cr.TLSRoute == nil {
+			continue
+		}
+		var backendRefs []gatewayv1.BackendObjectReference
+		for _, rule := range cr.TLSRoute.Spec.Rules {
+			for _, b := range rule.BackendRefs {
+				backendRefs = append(backendRefs, b.BackendObjectReference)
+			}
+		}
+		targets = append(targets, backendTLSPolicyRouteTarget{
+			namespace:        cr.TLSRoute.Namespace,
+			parentRefs:       cr.TLSRoute.Spec.ParentRefs,
+			parentConditions: cr.ParentConditions,
+			backendRefs:      backendRefs,
+			isTLSRoute:       true,
+			boundListeners:   cr.BoundListeners,
+		})
+	}
+
+	return targets
+}
+
+func hasBoundTLSTerminateListener(boundListeners []*EffectiveListener, cg *CompiledGateway) bool {
+	if cg == nil || len(boundListeners) == 0 {
+		return false
+	}
+	for _, listener := range cg.EffectiveListeners {
+		if listener.Protocol == gatewayv1.TLSProtocolType && listener.TLS != nil && (listener.TLS.Mode == nil || *listener.TLS.Mode == gatewayv1.TLSModeTerminate) {
+			for _, boundListener := range boundListeners {
+				if boundListener == listener {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // ComputeDesiredBackendTLSPolicyStatus computes the desired BackendTLSPolicy PolicyStatus.
 func ComputeDesiredBackendTLSPolicyStatus(
 	policy *gatewayv1.BackendTLSPolicy,
@@ -3252,6 +3349,7 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	var ancestors []gatewayv1.PolicyAncestorStatus
 
 	if compiled != nil {
+		routes := collectBackendTLSPolicyRouteTargets(compiled)
 		for _, cg := range compiled.Gateways {
 			if cg == nil || cg.Gateway == nil {
 				continue
@@ -3259,16 +3357,14 @@ func ComputeDesiredBackendTLSPolicyStatus(
 			gw := cg.Gateway
 
 			usesPolicy := false
-			for _, cr := range compiled.HTTPRoutes {
-				if cr == nil || cr.HTTPRoute == nil {
-					continue
-				}
-				route := cr.HTTPRoute
-
+			for _, route := range routes {
 				routeMatchesGw := false
-				for i, pref := range route.Spec.ParentRefs {
+				for i, pref := range route.parentRefs {
 					if string(pref.Name) == gw.Name && (ValueOf(pref.Namespace) == "" || string(ValueOf(pref.Namespace)) == gw.Namespace) {
-						if i < len(cr.ParentConditions) && cr.ParentConditions[i].Status == metav1.ConditionTrue {
+						if i < len(route.parentConditions) && route.parentConditions[i].Status == metav1.ConditionTrue {
+							if route.isTLSRoute && !hasBoundTLSTerminateListener(route.boundListeners, cg) {
+								continue
+							}
 							routeMatchesGw = true
 							break
 						}
@@ -3276,23 +3372,18 @@ func ComputeDesiredBackendTLSPolicyStatus(
 				}
 
 				if routeMatchesGw {
-					for _, rule := range route.Spec.Rules {
-						for _, backendRef := range rule.BackendRefs {
-							if string(ValueOf(backendRef.Kind)) == "Service" || ValueOf(backendRef.Kind) == "" {
-								svcNs := route.Namespace
-								if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
-									svcNs = string(*backendRef.Namespace)
-								}
-								for _, targetRef := range policy.Spec.TargetRefs {
-									if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
-										svcNs == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
-										usesPolicy = true
-										break
-									}
-								}
+					for _, backendRef := range route.backendRefs {
+						if string(ValueOf(backendRef.Kind)) == "Service" || ValueOf(backendRef.Kind) == "" {
+							svcNs := route.namespace
+							if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
+								svcNs = string(*backendRef.Namespace)
 							}
-							if usesPolicy {
-								break
+							for _, targetRef := range policy.Spec.TargetRefs {
+								if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+									svcNs == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
+									usesPolicy = true
+									break
+								}
 							}
 						}
 						if usesPolicy {
