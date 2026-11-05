@@ -72,7 +72,7 @@ func TestGatewayAPI(t *testing.T) {
 
 	// 6. Verify HTTP
 	if !strings.Contains(logs, "Status: 200 OK") || (!strings.Contains(logs, "\"hostname\":\"example.com\"") && !strings.Contains(logs, "\"host\": \"example.com\"")) {
-		controllerLogs := h.runCmd("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
+		controllerLogs := h.RunCmd("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
 		t.Logf("Controller logs: %s", controllerLogs)
 		if !strings.Contains(logs, "Status: 200 OK") {
 			t.Errorf("Expected 200 OK, got: %s", logs)
@@ -149,27 +149,27 @@ spec:
 
 	// Verify Service, Deployment, ServiceAccount, Role, RoleBinding, and Secret were created for second-gateway
 	secondResName := singlepod.ResourceNameForGateway("second-gateway")
-	out := h.runCmd("kubectl", "get", "svc", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	out := h.RunCmd("kubectl", "get", "svc", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(out) != secondResName {
 		t.Errorf("Expected Service %s to exist, got: %s", secondResName, out)
 	}
-	deployOut := h.runCmd("kubectl", "get", "deployment", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	deployOut := h.RunCmd("kubectl", "get", "deployment", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(deployOut) != secondResName {
 		t.Errorf("Expected Deployment %s to exist, got: %s", secondResName, deployOut)
 	}
-	saOut := h.runCmd("kubectl", "get", "serviceaccount", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	saOut := h.RunCmd("kubectl", "get", "serviceaccount", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(saOut) != secondResName {
 		t.Errorf("Expected ServiceAccount %s to exist, got: %s", secondResName, saOut)
 	}
-	roleOut := h.runCmd("kubectl", "get", "role", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	roleOut := h.RunCmd("kubectl", "get", "role", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(roleOut) != secondResName {
 		t.Errorf("Expected Role %s to exist, got: %s", secondResName, roleOut)
 	}
-	rbOut := h.runCmd("kubectl", "get", "rolebinding", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	rbOut := h.RunCmd("kubectl", "get", "rolebinding", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(rbOut) != secondResName {
 		t.Errorf("Expected RoleBinding %s to exist, got: %s", secondResName, rbOut)
 	}
-	secOut := h.runCmd("kubectl", "get", "secret", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	secOut := h.RunCmd("kubectl", "get", "secret", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(secOut) != secondResName {
 		t.Errorf("Expected Secret %s to exist, got: %s", secondResName, secOut)
 	}
@@ -181,17 +181,17 @@ spec:
 	}
 
 	// Verify GatewayClass has SupportedVersion=True condition
-	gcSupportedCond := h.runCmd("kubectl", "get", "gatewayclass", "reference-class", "-o", "jsonpath={.status.conditions[?(@.type==\"SupportedVersion\")].status}")
+	gcSupportedCond := h.RunCmd("kubectl", "get", "gatewayclass", "reference-class", "-o", "jsonpath={.status.conditions[?(@.type==\"SupportedVersion\")].status}")
 	if strings.TrimSpace(gcSupportedCond) != "True" {
 		t.Errorf("Expected GatewayClass SupportedVersion=True, got: %s", gcSupportedCond)
 	}
-	gcSupportedReason := h.runCmd("kubectl", "get", "gatewayclass", "reference-class", "-o", "jsonpath={.status.conditions[?(@.type==\"SupportedVersion\")].reason}")
+	gcSupportedReason := h.RunCmd("kubectl", "get", "gatewayclass", "reference-class", "-o", "jsonpath={.status.conditions[?(@.type==\"SupportedVersion\")].reason}")
 	if strings.TrimSpace(gcSupportedReason) != "SupportedVersion" {
 		t.Errorf("Expected GatewayClass SupportedVersion reason=SupportedVersion, got: %s", gcSupportedReason)
 	}
 
 	// Delete second-gateway and verify Service, Deployment, ServiceAccount, Role, RoleBinding, and Secret are cleaned up
-	h.runCmd("kubectl", "delete", "gateway", "second-gateway", "--namespace=default")
+	h.RunCmd("kubectl", "delete", "gateway", "second-gateway", "--namespace=default")
 	h.WaitForResourceDeletion("svc", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("serviceaccount", secondResName, "default", 30*time.Second)
@@ -234,11 +234,11 @@ spec:
 	}
 
 	liveResName := singlepod.ResourceNameForGateway("live-switch-gw")
-	svcType := strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
+	svcType := strings.TrimSpace(h.RunCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
 	if svcType != "LoadBalancer" {
 		t.Errorf("Expected Service type LoadBalancer, got: %s", svcType)
 	}
-	etp := strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.externalTrafficPolicy}"))
+	etp := strings.TrimSpace(h.RunCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.externalTrafficPolicy}"))
 	if etp != "Local" {
 		t.Errorf("Expected externalTrafficPolicy Local, got: %s", etp)
 	}
@@ -278,7 +278,7 @@ spec:
 	waitForServiceType := func(expectedType string, timeout time.Duration) {
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
-			st := strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
+			st := strings.TrimSpace(h.RunCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
 			if st == expectedType {
 				return
 			}
@@ -289,20 +289,20 @@ spec:
 
 	waitForServiceType("ClusterIP", 30*time.Second)
 
-	svcType = strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
+	svcType = strings.TrimSpace(h.RunCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
 	if svcType != "ClusterIP" {
 		t.Errorf("Expected Service type ClusterIP after switch, got: %s", svcType)
 	}
-	etp = strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.externalTrafficPolicy}"))
+	etp = strings.TrimSpace(h.RunCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.externalTrafficPolicy}"))
 	if etp != "" {
 		t.Errorf("Expected externalTrafficPolicy empty for ClusterIP, got: %s", etp)
 	}
-	lbIngress := strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.status.loadBalancer.ingress}"))
+	lbIngress := strings.TrimSpace(h.RunCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.status.loadBalancer.ingress}"))
 	if lbIngress != "" && lbIngress != "[]" {
 		t.Errorf("Expected no loadBalancer ingress for ClusterIP Service, got: %s", lbIngress)
 	}
 
-	gwStaticAddr := strings.TrimSpace(h.runCmd("kubectl", "get", "gateway", "live-switch-gw", "--namespace=default", "-o", "jsonpath={.status.addresses[0].value}"))
+	gwStaticAddr := strings.TrimSpace(h.RunCmd("kubectl", "get", "gateway", "live-switch-gw", "--namespace=default", "-o", "jsonpath={.status.addresses[0].value}"))
 	if gwStaticAddr != "10.96.0.123" {
 		t.Errorf("Expected Gateway status address 10.96.0.123, got: %s", gwStaticAddr)
 	}
@@ -311,8 +311,8 @@ spec:
 	h.KubectlApplyContent(liveSwitchCM)
 	waitForServiceType("LoadBalancer", 30*time.Second)
 
-	h.runCmd("kubectl", "delete", "gateway", "live-switch-gw", "--namespace=default")
-	h.runCmd("kubectl", "delete", "configmap", "live-switch-params", "--namespace=default")
+	h.RunCmd("kubectl", "delete", "gateway", "live-switch-gw", "--namespace=default")
+	h.RunCmd("kubectl", "delete", "configmap", "live-switch-params", "--namespace=default")
 	h.WaitForResourceDeletion("svc", liveResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", liveResName, "default", 30*time.Second)
 }
@@ -323,7 +323,7 @@ func runCmdAllowError(h *Harness, name string, args ...string) string {
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
 	if err := cmd.Run(); err != nil {
-		h.t.Logf("Command %s %v returned error (allowed): %v", name, args, err)
+		h.T.Logf("Command %s %v returned error (allowed): %v", name, args, err)
 	}
 	return combined.String()
 }

@@ -15,17 +15,8 @@
 package e2e
 
 import (
-	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
-	"encoding/pem"
 	"fmt"
-	"math/big"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -33,206 +24,22 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
+	roote2e "github.com/gke-labs/gateway-api-reference-implementation/tests/e2e"
 )
 
 type Harness struct {
-	t           *testing.T
-	clusterName string
+	*roote2e.Harness
 }
 
 func NewHarness(t *testing.T, clusterName string) *Harness {
 	return &Harness{
-		t:           t,
-		clusterName: clusterName,
+		Harness: roote2e.NewHarness(t, clusterName),
 	}
 }
 
-func (h *Harness) Setup() {
-	h.t.Logf("Setting up harness for cluster %s", h.clusterName)
-	if _, err := exec.LookPath("kind"); err != nil {
-		h.t.Fatalf("kind not found: %v", err)
-	}
-	if _, err := exec.LookPath("kubectl"); err != nil {
-		h.t.Fatalf("kubectl not found: %v", err)
-	}
-
-	clusters := h.runCmd("kind", "get", "clusters")
-	exists := false
-	for _, cluster := range strings.Split(clusters, "\n") {
-		if strings.TrimSpace(cluster) == h.clusterName {
-			exists = true
-			break
-		}
-	}
-
-	if !exists {
-		h.t.Logf("Creating kind cluster %s", h.clusterName)
-		h.runCmd("kind", "create", "cluster", "--name", h.clusterName)
-		h.t.Cleanup(func() {
-			if os.Getenv("SKIP_CLEANUP") == "" {
-				h.t.Logf("Deleting kind cluster %s", h.clusterName)
-				h.runCmd("kind", "delete", "cluster", "--name", h.clusterName)
-			}
-		})
-	}
-
-	contextName := "kind-" + h.clusterName
-	h.runCmd("kubectl", "config", "use-context", contextName)
-	h.runCmd("kubectl", "config", "set-context", "--current", "--namespace=default")
-
-	h.InstallMetallb()
-}
-
-func (h *Harness) InstallMetallb() {
-	h.t.Log("Installing Metallb")
-	h.KubectlApplyWithRetry("-f", "https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml")
-	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=available", "deployment/controller", "--timeout=90s")
-	h.runCmd("kubectl", "wait", "--namespace", "metallb-system", "--for=condition=ready", "pod", "--selector=app=metallb", "--timeout=90s")
-
-	h.runCmd("docker", "network", "inspect", "kind")
-	h.KubectlApplyContentWithRetry(h.MetallbConfigManifest(), 90*time.Second)
-}
-
-func (h *Harness) GetGitRoot() string {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	out, err := cmd.Output()
-	if err != nil {
-		h.t.Fatalf("Failed to get git root: %v", err)
-	}
-	return strings.TrimSpace(string(out))
-}
-
-func (h *Harness) DockerBuild(tag, dockerfile, context string) {
-	h.t.Logf("Building docker image %s", tag)
-	h.runCmd("docker", "build", "-t", tag, "-f", dockerfile, context)
-}
-
-func (h *Harness) KindLoad(tag string) {
-	h.t.Logf("Loading image %s into kind cluster %s", tag, h.clusterName)
-	h.runCmd("kind", "load", "docker-image", tag, "--name", h.clusterName)
-}
-
-func (h *Harness) KubectlApplyContent(content string) {
-	h.t.Logf("Applying kubectl content:\n%s", content)
-	cmd := exec.Command("kubectl", "apply", "-f", "-")
-	cmd.Stdin = strings.NewReader(content)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		h.t.Fatalf("kubectl apply failed: %v\nStderr: %s", err, stderr.String())
-	}
-}
-
-func (h *Harness) KubectlApplyContentWithRetry(content string, timeout time.Duration) {
-	h.t.Logf("Applying kubectl content (with retry):\n%s", content)
-	start := time.Now()
-	var lastErr error
-	var lastStderr string
-	for {
-		cmd := exec.Command("kubectl", "apply", "-f", "-")
-		cmd.Stdin = strings.NewReader(content)
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err == nil {
-			return
-		} else {
-			lastErr = err
-			lastStderr = stderr.String()
-		}
-
-		if time.Since(start) > timeout {
-			h.t.Fatalf("Timeout waiting for kubectl apply to succeed: %v\nStderr: %s", lastErr, lastStderr)
-		}
-		time.Sleep(2 * time.Second)
-	}
-}
-
-func (h *Harness) KubectlApplyFile(path string) {
-	h.t.Logf("Applying kubectl file: %s", path)
-	h.runCmd("kubectl", "apply", "-f", path)
-}
-
-var applyRetryDelays = []time.Duration{5 * time.Second, 10 * time.Second, 15 * time.Second}
-
-// KubectlApplyWithRetry runs kubectl apply with the provided arguments, retrying
-// with backoff on failure before failing the test.
-func (h *Harness) KubectlApplyWithRetry(args ...string) {
-	commandArgs := append([]string{"apply"}, args...)
-	maxAttempts := len(applyRetryDelays) + 1
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		_, err := h.runCommand("kubectl", commandArgs...)
-		if err == nil {
-			return
-		}
-		lastErr = err
-		if attempt < maxAttempts {
-			h.t.Logf("kubectl %v failed (attempt %d/%d): %v; retrying...", commandArgs, attempt, maxAttempts, err)
-			time.Sleep(applyRetryDelays[attempt-1])
-		}
-	}
-	h.t.Fatalf("kubectl %v failed after %d attempts: %v", commandArgs, maxAttempts, lastErr)
-}
-
-func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
-	h.WaitForDeploymentInNamespace("default", name, timeout)
-}
-
-func (h *Harness) WaitForDeploymentInNamespace(namespace, name string, timeout time.Duration) {
-	h.t.Logf("Waiting for deployment %s/%s to be ready", namespace, name)
-	h.runCmd("kubectl", "wait", "--namespace", namespace, "--for=condition=available", "--timeout="+timeout.String(), "deployment/"+name)
-}
-
-func (h *Harness) DeletePod(name string) {
-	h.DeletePodInNamespace("default", name)
-}
-
-func (h *Harness) DeletePodInNamespace(namespace, name string) {
-	h.t.Logf("Deleting pod %s/%s", namespace, name)
-	if err := exec.Command("kubectl", "delete", "pod", name, "--namespace", namespace, "--ignore-not-found").Run(); err != nil {
-		h.t.Logf("failed to delete pod %s/%s: %v", namespace, name, err)
-	}
-}
-
-func (h *Harness) WaitForPodSuccess(name string, timeout time.Duration) {
-	h.WaitForPodSuccessInNamespace("default", name, timeout)
-}
-
-func (h *Harness) WaitForPodSuccessInNamespace(namespace, name string, timeout time.Duration) {
-	h.t.Logf("Waiting for pod %s/%s to succeed", namespace, name)
-	start := time.Now()
-	for {
-		if time.Since(start) > timeout {
-			h.t.Fatalf("Timeout waiting for pod %s/%s to succeed", namespace, name)
-		}
-
-		out, err := exec.Command("kubectl", "get", "pod", name, "--namespace", namespace, "-o", "jsonpath={.status.phase}").Output()
-		if err != nil {
-			h.t.Logf("waiting for pod %s/%s phase: %v", namespace, name, err)
-		} else {
-			phase := strings.TrimSpace(string(out))
-			if phase == "Succeeded" {
-				return
-			}
-			if phase == "Failed" {
-				logs := h.GetPodLogsInNamespace(namespace, name)
-				h.t.Fatalf("Pod %s/%s failed. Logs:\n%s", namespace, name, logs)
-			}
-		}
-		time.Sleep(2 * time.Second)
-	}
-}
-
-func (h *Harness) GetPodLogs(name string) string {
-	return h.GetPodLogsInNamespace("default", name)
-}
-
-func (h *Harness) GetPodLogsInNamespace(namespace, name string) string {
-	out, err := exec.Command("kubectl", "logs", name, "--namespace", namespace).Output()
-	if err != nil {
-		h.t.Fatalf("Failed to get pod logs for %s/%s: %v", namespace, name, err)
-	}
-	return string(out)
+// GenerateTestCertificate delegates to root e2e.GenerateTestCertificate.
+func GenerateTestCertificate(commonName string, dnsNames ...string) (certPEM, keyPEM []byte, err error) {
+	return roote2e.GenerateTestCertificate(commonName, dnsNames...)
 }
 
 func (h *Harness) GetControllerPod() string {
@@ -265,46 +72,16 @@ func (h *Harness) WaitForControllerLog(expectedSubstring string, timeout time.Du
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	h.t.Fatalf("Timed out after %v waiting for controller log containing %q; current logs:\n%s", timeout, expectedSubstring, h.GetControllerLogs())
+	h.T.Fatalf("Timed out after %v waiting for controller log containing %q; current logs:\n%s", timeout, expectedSubstring, h.GetControllerLogs())
 	return ""
 }
 
-func (h *Harness) GetPodIP(name string) string {
-	return h.GetPodIPInNamespace("default", name)
-}
-
-func (h *Harness) GetPodIPInNamespace(namespace, name string) string {
-	out := h.runCmd("kubectl", "get", "pod", name, "--namespace", namespace, "-o", "jsonpath={.status.podIP}")
-	return strings.TrimSpace(out)
-}
-
-func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Duration) string {
-	h.t.Logf("Waiting for Gateway %s/%s address...", namespace, name)
-	deadline := time.Now().Add(timeout)
-	for {
-		if time.Now().After(deadline) {
-			h.t.Fatalf("Timeout waiting for Gateway %s/%s address", namespace, name)
-		}
-		cmd := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.addresses[0].value}")
-		out, err := cmd.Output()
-		if err != nil {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-		addr := strings.TrimSpace(string(out))
-		if addr != "" {
-			return addr
-		}
-		time.Sleep(1 * time.Second)
-	}
-}
-
 func (h *Harness) WaitForGatewayProgrammed(name, namespace string, timeout time.Duration) {
-	h.t.Logf("Waiting for Gateway %s/%s to have Programmed=True condition...", namespace, name)
+	h.T.Logf("Waiting for Gateway %s/%s to have Programmed=True condition...", namespace, name)
 	deadline := time.Now().Add(timeout)
 	for {
 		if time.Now().After(deadline) {
-			h.t.Fatalf("Timeout waiting for Gateway %s/%s to be Programmed=True", namespace, name)
+			h.T.Fatalf("Timeout waiting for Gateway %s/%s to be Programmed=True", namespace, name)
 		}
 		cmd := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Programmed\")].status}")
 		out, err := cmd.Output()
@@ -321,11 +98,11 @@ func (h *Harness) WaitForGatewayProgrammed(name, namespace string, timeout time.
 }
 
 func (h *Harness) WaitForGatewayProgrammedFalse(name, namespace string, timeout time.Duration) (reason string, message string) {
-	h.t.Logf("Waiting for Gateway %s/%s to have Programmed=False condition...", namespace, name)
+	h.T.Logf("Waiting for Gateway %s/%s to have Programmed=False condition...", namespace, name)
 	deadline := time.Now().Add(timeout)
 	for {
 		if time.Now().After(deadline) {
-			h.t.Fatalf("Timeout waiting for Gateway %s/%s to be Programmed=False", namespace, name)
+			h.T.Fatalf("Timeout waiting for Gateway %s/%s to be Programmed=False", namespace, name)
 		}
 		cmdStatus := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Programmed\")].status}")
 		outStatus, err := cmdStatus.Output()
@@ -337,12 +114,12 @@ func (h *Harness) WaitForGatewayProgrammedFalse(name, namespace string, timeout 
 			cmdReason := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Programmed\")].reason}")
 			outReason, err := cmdReason.Output()
 			if err != nil {
-				h.t.Logf("Failed getting condition reason: %v", err)
+				h.T.Logf("Failed getting condition reason: %v", err)
 			}
 			cmdMsg := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Programmed\")].message}")
 			outMsg, err := cmdMsg.Output()
 			if err != nil {
-				h.t.Logf("Failed getting condition message: %v", err)
+				h.T.Logf("Failed getting condition message: %v", err)
 			}
 			return strings.TrimSpace(string(outReason)), strings.TrimSpace(string(outMsg))
 		}
@@ -353,106 +130,19 @@ func (h *Harness) WaitForGatewayProgrammedFalse(name, namespace string, timeout 
 func (h *Harness) DumpDeploymentLogs(namespace, name string) {
 	out, err := exec.Command("kubectl", "logs", "deployment/"+name, "--namespace="+namespace, "--all-containers=true").CombinedOutput()
 	if err != nil {
-		h.t.Logf("Failed to get deployment logs for %s/%s: %v\nOutput: %s", namespace, name, err, string(out))
+		h.T.Logf("Failed to get deployment logs for %s/%s: %v\nOutput: %s", namespace, name, err, string(out))
 		return
 	}
-	h.t.Logf("=== Logs for deployment %s/%s ===\n%s\n=== End of logs for %s/%s ===", namespace, name, string(out), namespace, name)
-}
-
-func (h *Harness) runCommand(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("command %s %v failed: %w\nStdout: %s\nStderr: %s", name, args, err, stdout.String(), stderr.String())
-	}
-	return stdout.String(), nil
-}
-
-func (h *Harness) runCmd(name string, args ...string) string {
-	stdout, err := h.runCommand(name, args...)
-	if err != nil {
-		h.t.Fatalf("%v", err)
-	}
-	return stdout
+	h.T.Logf("=== Logs for deployment %s/%s ===\n%s\n=== End of logs for %s/%s ===", namespace, name, string(out), namespace, name)
 }
 
 func (h *Harness) InstallGatewayAPI() {
-	h.t.Log("Installing Gateway API CRDs")
+	h.T.Log("Installing Gateway API CRDs")
 	h.KubectlApplyWithRetry("-f", "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml")
 }
 
-func (h *Harness) BackendManifest() string {
-	return `
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: backend
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: backend
-  template:
-    metadata:
-      labels:
-        app: backend
-    spec:
-      containers:
-      - name: toolbox
-        image: toolbox:e2e
-        imagePullPolicy: Never
-        args: ["server"]
-        ports:
-        - containerPort: 8080
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: backend
-  namespace: default
-spec:
-  selector:
-    app: backend
-  ports:
-  - port: 8080
-    targetPort: 8080
-`
-}
-
-func (h *Harness) MetallbConfigManifest() string {
-	return `
-apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata:
-  name: example
-  namespace: metallb-system
-spec:
-  addresses:
-  - 172.18.255.200-172.18.255.250
----
-apiVersion: metallb.io/v1beta1
-kind: L2Advertisement
-metadata:
-  name: empty
-  namespace: metallb-system
-`
-}
-
-func (h *Harness) DeployBackend() {
-	h.t.Log("Deploying Backend")
-	gitRoot := h.GetGitRoot()
-	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), gitRoot)
-	h.KindLoad("toolbox:e2e")
-
-	h.KubectlApplyContent(h.BackendManifest())
-	h.WaitForDeployment("backend", 2*time.Minute)
-}
-
 func (h *Harness) CreateGenericSecret(name, namespace string, data map[string][]byte) {
-	h.t.Logf("Creating secret %s/%s", namespace, name)
+	h.T.Logf("Creating secret %s/%s", namespace, name)
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("apiVersion: v1\nkind: Secret\nmetadata:\n  name: %s\n  namespace: %s\ntype: Opaque\ndata:\n", name, namespace))
 	for k, v := range data {
@@ -461,70 +151,8 @@ func (h *Harness) CreateGenericSecret(name, namespace string, data map[string][]
 	h.KubectlApplyContent(b.String())
 }
 
-func (h *Harness) CreateTLSSecret(name, namespace string, certPEM, keyPEM []byte) {
-	h.t.Logf("Creating TLS secret %s/%s", namespace, name)
-	content := fmt.Sprintf(`
-apiVersion: v1
-kind: Secret
-metadata:
-  name: %s
-  namespace: %s
-type: kubernetes.io/tls
-data:
-  tls.crt: %s
-  tls.key: %s
-`, name, namespace, base64.StdEncoding.EncodeToString(certPEM), base64.StdEncoding.EncodeToString(keyPEM))
-	h.KubectlApplyContent(content)
-}
-
-// GenerateTestCertificate generates a self-signed ECDSA certificate and private key for testing.
-func GenerateTestCertificate(commonName string, dnsNames ...string) (certPEM, keyPEM []byte, err error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generating key: %w", err)
-	}
-
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serial, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generating serial: %w", err)
-	}
-
-	if len(dnsNames) == 0 {
-		dnsNames = []string{commonName}
-	}
-
-	now := time.Now().Add(-1 * time.Hour)
-	template := &x509.Certificate{
-		SerialNumber: serial,
-		Subject: pkix.Name{
-			CommonName:   commonName,
-			Organization: []string{"snigateway-e2e-test"},
-		},
-		DNSNames:              dnsNames,
-		NotBefore:             now,
-		NotAfter:              now.Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		return nil, nil, fmt.Errorf("creating cert: %w", err)
-	}
-
-	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyBytes, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		return nil, nil, fmt.Errorf("marshaling key: %w", err)
-	}
-	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
-	return certPEM, keyPEM, nil
-}
-
 func (h *Harness) DeploySNIGatewayFrontend(namespace string, infraCerts *certs.GeneratedCerts) {
-	h.t.Logf("Deploying snigateway-frontend in namespace %s", namespace)
+	h.T.Logf("Deploying snigateway-frontend in namespace %s", namespace)
 	h.KubectlApplyContent(fmt.Sprintf(`
 apiVersion: v1
 kind: Namespace
@@ -600,12 +228,12 @@ spec:
     name: https-udp
 `, namespace, namespace))
 
-	h.runCmd("kubectl", "patch", "service", "snigateway-frontend", "--namespace="+namespace, "--type=merge", "-p", `{"spec":{"ports":[{"name":"https","port":443,"protocol":"TCP","targetPort":443},{"name":"https-udp","port":443,"protocol":"UDP","targetPort":443}]}}`)
-	h.runCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+namespace, "--timeout=2m")
+	h.RunCmd("kubectl", "patch", "service", "snigateway-frontend", "--namespace="+namespace, "--type=merge", "-p", `{"spec":{"ports":[{"name":"https","port":443,"protocol":"TCP","targetPort":443},{"name":"https-udp","port":443,"protocol":"UDP","targetPort":443}]}}`)
+	h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+namespace, "--timeout=2m")
 }
 
 func (h *Harness) DeploySNIGatewayFrontendTCPOnly(namespace string, infraCerts *certs.GeneratedCerts) {
-	h.t.Logf("Deploying TCP-only snigateway-frontend in namespace %s", namespace)
+	h.T.Logf("Deploying TCP-only snigateway-frontend in namespace %s", namespace)
 	h.KubectlApplyContent(fmt.Sprintf(`
 apiVersion: v1
 kind: Namespace
@@ -677,11 +305,11 @@ spec:
     name: https
 `, namespace, namespace))
 
-	h.runCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+namespace, "--timeout=2m")
+	h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+namespace, "--timeout=2m")
 }
 
 func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, frontendAddr string, replicas int, transport ...string) {
-	h.t.Logf("Deploying snigateway controller with %d replicas", replicas)
+	h.T.Logf("Deploying snigateway controller with %d replicas", replicas)
 	gitRoot := h.GetGitRoot()
 
 	h.CreateGenericSecret("snigateway-client-cert", "default", map[string][]byte{
@@ -741,7 +369,7 @@ spec:
 `, replicas, frontendAddr, transportMode, extraArgs)
 
 	h.KubectlApplyContent(manifest)
-	h.runCmd("kubectl", "rollout", "status", "deployment/snigateway-controller", "--namespace=default", "--timeout=2m")
+	h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-controller", "--namespace=default", "--timeout=2m")
 }
 
 func (h *Harness) SNIGatewayManifest(hostname, secretName string) string {
