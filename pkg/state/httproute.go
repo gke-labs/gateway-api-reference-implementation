@@ -902,6 +902,7 @@ func resolveBackendTarget(
 		Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, svcNamespace),
 		Port:        port,
 		AppProtocol: appProtocol,
+		HTTP2:       routeKind == "GRPCRoute",
 		TLSConfig:   tlsConfig,
 		Error:       backendErr,
 	}, nil

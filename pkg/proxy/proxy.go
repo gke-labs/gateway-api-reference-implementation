@@ -1381,11 +1381,17 @@ var hopByHopHeaders = []string{
 
 func removeHopByHopHeaders(h http.Header) {
 	for _, k := range hopByHopHeaders {
+		if k == "Te" && strings.EqualFold(h.Get("Te"), "trailers") {
+			continue
+		}
 		h.Del(k)
 	}
 	if c := h.Get("Connection"); c != "" {
 		for _, f := range strings.Split(c, ",") {
 			if f = strings.TrimSpace(f); f != "" {
+				if strings.EqualFold(f, "Te") && strings.EqualFold(h.Get("Te"), "trailers") {
+					continue
+				}
 				h.Del(f)
 			}
 		}
@@ -1676,7 +1682,11 @@ func backendTransportKey(backend state.InternalBackend) string {
 	}
 
 	var b strings.Builder
-	b.WriteString("https|")
+	if backend.HTTP2 {
+		b.WriteString("https-h2|")
+	} else {
+		b.WriteString("https|")
+	}
 	b.WriteString(target)
 	b.WriteString("|")
 	if backend.TLSConfig != nil {
@@ -1735,7 +1745,7 @@ func (p *Proxy) evictUnusedTransports(activeRoutes []state.InternalRoute) {
 				key := backendTransportKey(b)
 				if !activeKeys[key] {
 					activeKeys[key] = true
-					if strings.HasPrefix(key, "https|") {
+					if strings.HasPrefix(key, "https|") || strings.HasPrefix(key, "https-h2|") {
 						distinctTLSCount++
 					}
 				}
@@ -1744,7 +1754,7 @@ func (p *Proxy) evictUnusedTransports(activeRoutes []state.InternalRoute) {
 				key := backendTransportKey(m.Backend)
 				if !activeKeys[key] {
 					activeKeys[key] = true
-					if strings.HasPrefix(key, "https|") {
+					if strings.HasPrefix(key, "https|") || strings.HasPrefix(key, "https-h2|") {
 						distinctTLSCount++
 					}
 				}
@@ -1783,17 +1793,51 @@ func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper 
 	if p.transports == nil {
 		p.transports = make(map[string]http.RoundTripper)
 	}
-	if tr, ok := p.transports[key]; ok {
-		return tr
+	if transport, ok := p.transports[key]; ok {
+		return transport
 	}
 
-	var tr http.RoundTripper
+	var transport http.RoundTripper
 	if strings.EqualFold(state.ValueOf(backend.AppProtocol), "https") {
-		tr = &http.Transport{
-			TLSClientConfig: p.buildBackendTLSConfig(backend),
+		// When a custom TLSClientConfig is configured on http.Transport, Go disables
+		// HTTP/2 by default and falls back to HTTP/1.1. Because GARI always sets
+		// TLSClientConfig for BackendTLSPolicy (CA validation, client certs, SAN checks),
+		// we must explicitly configure Protocols to enable HTTP/2 for backends that
+		// require it (such as GRPCRoute backends). For non-HTTP/2 backends, http.Transport
+		// defaults to HTTP/1.1.
+		if backend.HTTP2 {
+			var protocols http.Protocols
+			protocols.SetHTTP2(true)
+			tlsConfig := p.buildBackendTLSConfig(backend).Clone()
+			// Even with Protocols set to HTTP/2 only, net/http falls back to HTTP/1.1
+			// if the backend does not negotiate h2 through ALPN. Because gRPC cannot
+			// work over HTTP/1.1, reject the connection with a clear error.
+			originalVerifyConnection := tlsConfig.VerifyConnection
+			tlsConfig.VerifyConnection = func(connState tls.ConnectionState) error {
+				if originalVerifyConnection != nil {
+					if err := originalVerifyConnection(connState); err != nil {
+						return err
+					}
+				}
+				if connState.NegotiatedProtocol != "h2" {
+					return fmt.Errorf("unexpected ALPN protocol %q; want %q", connState.NegotiatedProtocol, "h2")
+				}
+				return nil
+			}
+			transport = &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout: 5 * time.Second,
+				}).DialContext,
+				TLSClientConfig: tlsConfig,
+				Protocols:       &protocols,
+			}
+		} else {
+			transport = &http.Transport{
+				TLSClientConfig: p.buildBackendTLSConfig(backend),
+			}
 		}
 	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
-		tr = &http2.Transport{
+		transport = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 				var d net.Dialer
@@ -1804,8 +1848,8 @@ func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper 
 		return http.DefaultTransport
 	}
 
-	p.transports[key] = tr
-	return tr
+	p.transports[key] = transport
+	return transport
 }
 
 func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, timeouts *state.InternalTimeouts) {

@@ -156,7 +156,7 @@ var skippedTests = map[string]struct{}{
 	"TLSRouteListenerTerminateNotSupported":        {},
 	"TLSRouteListenerMixedTerminationNotSupported": {},
 
-	// fails: BackendTLSPolicy Accepted condition not set when targeted by GRPCRoute
+	// data plane is done; only the policy status is missing when targeted by GRPCRoute
 	"BackendTLSPolicyGRPCRoute": {},
 	// fails: BackendTLSPolicy Accepted condition not set when targeted by TLSRoute in terminate mode
 	"BackendTLSPolicyTLSRouteTerminate": {},
