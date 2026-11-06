@@ -213,7 +213,7 @@ func TestAdapterFailure_DecodeFailure(t *testing.T) {
 	// Put corrupted non-decodable bytes directly into engine for this bucket
 	bucketName := fmt.Sprintf("%T", &corev1.ConfigMap{})
 	corruptBytes := []byte("this is corrupt raw non-protobuf non-json data")
-	if err := eng.Put(bucketName, "default/cm-corrupt", corruptBytes, "rv-corrupt"); err != nil {
+	if err := eng.Put(bucketName, "default/cm-corrupt", corruptBytes); err != nil {
 		t.Fatalf("eng.Put corrupt failed: %v", err)
 	}
 

@@ -44,7 +44,6 @@ func TestWAL_AppendAndIterate(t *testing.T) {
 			LSN:     i,
 			Key:     fmt.Sprintf("ns/cm-%d", i),
 			Payload: []byte(fmt.Sprintf("payload-%d", i)),
-			Token:   fmt.Sprintf("rv-%d", i),
 		}
 		if err := wal.Append(rec); err != nil {
 			t.Fatalf("Append failed: %v", err)
@@ -107,7 +106,6 @@ func TestWAL_StopAtBadCRC(t *testing.T) {
 			LSN:     i,
 			Key:     fmt.Sprintf("key-%d", i),
 			Payload: []byte("payload"),
-			Token:   "100",
 		})
 	}
 	_ = wal.Sync()
@@ -166,7 +164,6 @@ func TestWAL_TruncateSegments(t *testing.T) {
 			LSN:     i,
 			Key:     fmt.Sprintf("k%d", i),
 			Payload: []byte("short"),
-			Token:   "1",
 		})
 	}
 	_ = wal.Sync()
@@ -353,9 +350,9 @@ func TestWAL_FiveSecondBound_UnsyncedBlocks(t *testing.T) {
 	// Append record 1 that fills exactly the rest of the first 4 KiB block.
 	// Block 0 has 32 bytes segment header.
 	// Space remaining in block 0: 4096 - 32 = 4064 bytes.
-	// Record header is 36 bytes.
-	// Payload needed: 4064 - 36 = 4028 bytes.
-	p1 := make([]byte, 4028)
+	// Record header is 32 bytes.
+	// Payload needed: 4064 - 32 = 4032 bytes.
+	p1 := make([]byte, 4032)
 	_, err = wal.AppendRecord(&Record{
 		Type:    RecordTypePut,
 		Payload: p1,
@@ -365,8 +362,8 @@ func TestWAL_FiveSecondBound_UnsyncedBlocks(t *testing.T) {
 	}
 
 	// Append record 2 that fills exactly the next 4 KiB block (4096 bytes).
-	// Payload needed: 4096 - 36 = 4060 bytes.
-	p2 := make([]byte, 4060)
+	// Payload needed: 4096 - 32 = 4064 bytes.
+	p2 := make([]byte, 4064)
 	lsn2, err := wal.AppendRecord(&Record{
 		Type:    RecordTypePut,
 		Payload: p2,
@@ -494,7 +491,7 @@ func TestWAL_WriteCounts(t *testing.T) {
 	// Append 5 complete blocks of data without sync in a single record.
 	// Block 0 has 32 bytes segment header.
 	// Space in 5 blocks: 5 * 4096 - 32 = 20448 bytes.
-	// Record header: 36 bytes. Payload needed: 20448 - 36 = 20412 bytes.
+	// Record header: 32 bytes. Payload needed: 20448 - 32 = 20416 bytes.
 	p1 := make([]byte, 5*WALBlockSize-SegmentHeaderSize-RecordHeaderSize)
 	if _, err := wal.AppendRecord(&Record{Type: RecordTypePut, Payload: p1}); err != nil {
 		t.Fatalf("AppendRecord 1 failed: %v", err)
@@ -603,7 +600,6 @@ func TestWAL_RecordLargerThanBuffer(t *testing.T) {
 		Type:    RecordTypePut,
 		Key:     "large",
 		Payload: payload,
-		Token:   "tok-large",
 	}
 	_, err = wal.AppendRecord(&rec)
 	if err != nil {
@@ -645,8 +641,8 @@ func TestWAL_RecordSpanningBufferSwitch(t *testing.T) {
 	defer wal.Close()
 
 	// Append record 1 (5000 bytes payload).
-	// Occupies bytes 32..5068 in buffer 0.
-	// Remaining in buffer 0: 8192 - 5068 = 3124 bytes.
+	// Occupies bytes 32..5064 in buffer 0.
+	// Remaining in buffer 0: 8192 - 5064 = 3128 bytes.
 	p1 := make([]byte, 5000)
 	for i := range p1 {
 		p1[i] = byte(i % 251)
@@ -655,15 +651,14 @@ func TestWAL_RecordSpanningBufferSwitch(t *testing.T) {
 		Type:    RecordTypePut,
 		Key:     "rec-1",
 		Payload: p1,
-		Token:   "tok-1",
 	})
 	if err != nil {
 		t.Fatalf("AppendRecord 1 failed: %v", err)
 	}
 
 	// Append record 2 (4000 bytes payload).
-	// Length: 36 + 5 + 4000 + 5 = 4046 bytes.
-	// 4046 > 3124, so record 2 spans the buffer switch from buffer 0 to buffer 1!
+	// Length: 32 + 5 + 4000 = 4037 bytes.
+	// 4037 > 3128, so record 2 spans the buffer switch from buffer 0 to buffer 1!
 	p2 := make([]byte, 4000)
 	for i := range p2 {
 		p2[i] = byte((i + 7) % 251)
@@ -672,7 +667,6 @@ func TestWAL_RecordSpanningBufferSwitch(t *testing.T) {
 		Type:    RecordTypePut,
 		Key:     "rec-2",
 		Payload: p2,
-		Token:   "tok-2",
 	})
 	if err != nil {
 		t.Fatalf("AppendRecord 2 failed: %v", err)
@@ -922,7 +916,6 @@ func TestWAL_WriteErrorSticky(t *testing.T) {
 		Type:    RecordTypePut,
 		Key:     "fail-rec",
 		Payload: make([]byte, 2*WALBlockSize),
-		Token:   "tok-fail",
 	}
 	if err := wal.Append(rec); err != nil {
 		t.Fatalf("Append failed: %v", err)
@@ -1048,10 +1041,9 @@ func TestRegression_WALZeroPaddingRecovery(t *testing.T) {
 	}
 
 	key := "ConfigMap k1"
-	token := "tok1"
 	totalRecordLength := WALBlockSize - SegmentHeaderSize - paddingBytes
-	payloadLength := totalRecordLength - RecordHeaderSize - len(key) - len(token)
-	record1 := Record{Type: RecordTypePut, Key: key, Token: token, Payload: make([]byte, payloadLength)}
+	payloadLength := totalRecordLength - RecordHeaderSize - len(key)
+	record1 := Record{Type: RecordTypePut, Key: key, Payload: make([]byte, payloadLength)}
 	firstLSN, err := wal.AppendRecord(&record1)
 	if err != nil {
 		t.Fatalf("AppendRecord 1 failed: %v", err)
@@ -1063,7 +1055,7 @@ func TestRegression_WALZeroPaddingRecovery(t *testing.T) {
 	}
 
 	// Write record 2 (starts at block boundary, offset 4096)
-	record2 := Record{Type: RecordTypePut, Key: "ConfigMap k2", Token: "tok2", Payload: []byte("val2")}
+	record2 := Record{Type: RecordTypePut, Key: "ConfigMap k2", Payload: []byte("val2")}
 	secondLSN, err := wal.AppendRecord(&record2)
 	if err != nil {
 		t.Fatalf("AppendRecord 2 failed: %v", err)

@@ -49,18 +49,17 @@ To maintain separation of concerns and avoid exposing Kubernetes dependencies to
 
 The engine provides a byte-oriented key-value store with crash consistency, bounded memory usage, and no dependencies on `k8s.io/...`:
 - **Data abstraction:** All keys and values are processed as raw byte slices (`[]byte`) partitioned across buckets.
-- **Operations:** Supports `Open`, `Put(bucket, key, value, token)`, `Delete(bucket, key, token)`, `Get(bucket, key)`, point-in-time consistent `Scan(bucket, fn)`, `Flush`, `Sync`, `Checkpoint`, and `Close`.
-- **Progress tokens:** Write and delete operations accept an opaque string `token` persisted in the WAL record. During crash recovery, the engine tracks the highest token for each bucket and exposes them via `Token(bucket)` and `Tokens()`.
+- **Operations:** Supports `Open`, `Put(bucket, key, value)`, `Delete(bucket, key)`, `Get(bucket, key)`, point-in-time consistent `Scan(bucket, fn)`, `Flush`, `Sync`, `Checkpoint`, and `Close`.
 - **Payload encryption:** If a cipher is configured, encryption and decryption occur inside the engine using the bucket and key as authenticated additional data.
 - **Sticky error state and notifications:** Once an unrecoverable error occurs (such as an fsync failure or page corruption), the engine transitions permanently into a failed state where all subsequent calls return `ErrFailed`. Callers receive asynchronous notification via `Err()` and `Failed() <-chan struct{}`.
-- **Failure marker:** Upon entering the failed state, the engine writes a `FAILED` marker file to the storage directory. If a subsequent `Open` encounters this marker, it wipes the directory, reports the wipe via `Wiped() bool`, and initializes a fresh database with a new ID and no progress tokens.
+- **Failure marker:** Upon entering the failed state, the engine writes a `FAILED` marker file to the storage directory. If a subsequent `Open` encounters this marker, it wipes the directory, reports the wipe via `Wiped() bool`, and initializes a fresh database with a new ID.
 
 ### 2. Kubernetes Adapter (`experiments/diskstore/kubecache`)
 
 The adapter implements client-go's `cache.Indexer` on top of the engine:
 - **Object serialization:** Handles conversion between `runtime.Object` instances and raw bytes using protobuf or JSON codecs (`ObjectCodec`).
 - **Secondary indexes:** Maintains index functions and index tables (`Indexers`, `Indices`) in memory, reconstructing them on startup via `engine.Scan`.
-- **ResourceVersion tracking:** Maps the Kubernetes `resourceVersion` and watch bookmarks to the engine's per-bucket progress tokens.
+- **ResourceVersion tracking:** Persists the Kubernetes `resourceVersion` and watch bookmarks to a reserved table in the engine.
 - **Fail-fast policy:** Holds the unified error policy required to safely back client-go informer caches with persistent storage.
 
 ---
@@ -190,7 +189,7 @@ To conserve disk space and reduce multi-block power-of-two page allocation overh
 - **On-Disk Value Record Format:**
   - Stored raw (`CodecNone`): `[Codec (1B)][Raw Payload Bytes...]`
   - Stored compressed (`CodecZstd`): `[Codec (1B)][Uncompressed Length uint32 Big-Endian (4B)][Compressed Stream Bytes...]`
-- **Store Format Version in `meta.db`:** `meta.db` records a 4-byte `StoreFormatVersion` (version 2) alongside the 16-byte database ID. On `Open`, if `meta.db` is missing the format version (as in version 1 stores written prior to value compression) or contains a mismatched version, the engine wipes the store via the existing wipe path and reports `Wiped()`. Because the store functions as a cache, starting fresh and relisting ensures data consistency without misreading legacy unversioned payloads.
+- **Store Format Version in `meta.db`:** `meta.db` records a 4-byte `StoreFormatVersion` (version 3) alongside the 16-byte database ID. On `Open`, if `meta.db` is missing the format version (as in version 1 stores written prior to value compression) or contains a mismatched version, `Open` returns an error unless `WithEraseOnError()` is set. When configured with `WithEraseOnError()`, the engine wipes the store via the existing wipe path and reports `Wiped()`. Because the store functions as a cache, starting fresh and relisting ensures data consistency without misreading legacy unversioned payloads.
 - **Universal Compression (No Arbitrary Threshold):** Every value is passed through the configured codec regardless of size. This unifies the write path: whether a value lands in a 1-block slotted page or a multi-block page depends entirely on its stored (compressed) size.
 - **10% Savings Rule:** If an object's compressed size is not at least about 10% smaller than the raw payload (`compressedLen * 10 <= rawLen * 9`), the value is stored raw with `CodecNone` to avoid compression framing overhead and growth for tiny or incompressible data.
 - **Consistency Between Writes and Reads:** Reads must not reject what writes accepted. `compressValue` stores any payload larger than `MaxObjectSize` uncompressed with `CodecNone`, ensuring that large payloads accepted on write are read back without error, while `decompressValue` protects against decompression bombs from untrusted or corrupted inputs.

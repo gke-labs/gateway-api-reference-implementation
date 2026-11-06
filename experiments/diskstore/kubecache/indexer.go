@@ -290,7 +290,7 @@ func (d *Indexer) persistResourceVersion(rv string) error {
 	d.persistMu.Lock()
 	defer d.persistMu.Unlock()
 
-	if err := d.eng.Put(reservedResourceVersionWatch, d.bucketName, []byte(rv), rv); err != nil {
+	if err := d.eng.Put(reservedResourceVersionWatch, d.bucketName, []byte(rv)); err != nil {
 		return err
 	}
 	d.rvMu.Lock()
@@ -342,7 +342,7 @@ func (d *Indexer) extractResourceVersion(obj any) string {
 	return d.lastSyncRV
 }
 
-func (d *Indexer) putObject(obj any, rv string) error {
+func (d *Indexer) putObject(obj any) error {
 	key, err := d.keyFunc(obj)
 	if err != nil {
 		keyErr := toolscache.KeyError{Obj: obj, Err: err}
@@ -372,7 +372,7 @@ func (d *Indexer) putObject(obj any, rv string) error {
 	}
 	d.mu.Unlock()
 
-	if err := d.eng.Put(d.bucketName, key, encoded, rv); err != nil {
+	if err := d.eng.Put(d.bucketName, key, encoded); err != nil {
 		d.fatal(err)
 		return err
 	}
@@ -391,7 +391,7 @@ func (d *Indexer) Update(obj any) error {
 	}
 
 	objRV := d.extractResourceVersion(obj)
-	if err := d.putObject(obj, objRV); err != nil {
+	if err := d.putObject(obj); err != nil {
 		return err
 	}
 	d.recordEventResourceVersion(objRV)
@@ -425,7 +425,7 @@ func (d *Indexer) Delete(obj any) error {
 	d.mu.Unlock()
 
 	delRV := d.extractResourceVersion(obj)
-	if err := d.eng.Delete(d.bucketName, key, delRV); err != nil {
+	if err := d.eng.Delete(d.bucketName, key); err != nil {
 		d.fatal(err)
 		return err
 	}
@@ -479,7 +479,7 @@ func (d *Indexer) Replace(list []any, rv string) error {
 			}
 			d.mu.Unlock()
 
-			if err := d.eng.Delete(d.bucketName, existingKey, rv); err != nil {
+			if err := d.eng.Delete(d.bucketName, existingKey); err != nil {
 				d.fatal(err)
 				return err
 			}
@@ -487,7 +487,7 @@ func (d *Indexer) Replace(list []any, rv string) error {
 	}
 
 	for _, item := range list {
-		if err := d.putObject(item, rv); err != nil {
+		if err := d.putObject(item); err != nil {
 			return err
 		}
 	}

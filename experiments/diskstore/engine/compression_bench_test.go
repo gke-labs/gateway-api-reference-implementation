@@ -560,7 +560,7 @@ func runBenchmarkPutOverwrite(b *testing.B, payload []byte, codec CompressionCod
 	keys := make([]string, numKeys)
 	for i := 0; i < numKeys; i++ {
 		keys[i] = fmt.Sprintf("k-%04d", i)
-		if err := store.Put("bench", keys[i], payload, "init"); err != nil {
+		if err := store.Put("bench", keys[i], payload); err != nil {
 			b.Fatalf("Init Put failed: %v", err)
 		}
 	}
@@ -570,7 +570,7 @@ func runBenchmarkPutOverwrite(b *testing.B, payload []byte, codec CompressionCod
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if err := store.Put("bench", keys[i%numKeys], payload, "1"); err != nil {
+		if err := store.Put("bench", keys[i%numKeys], payload); err != nil {
 			b.Fatalf("Put failed at %d: %v", i, err)
 		}
 	}
@@ -609,7 +609,7 @@ func runCorpusHeapSizeBenchmark(b *testing.B, corpus []corpusItem, codec Compres
 	start := time.Now()
 	for i, item := range corpus {
 		key := fmt.Sprintf("obj-%05d", i)
-		if err := store.Put("corpus", key, item.payload, fmt.Sprintf("%d", i)); err != nil {
+		if err := store.Put("corpus", key, item.payload); err != nil {
 			b.Fatalf("Put failed at %d: %v", i, err)
 		}
 	}

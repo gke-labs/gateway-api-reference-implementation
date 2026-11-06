@@ -250,10 +250,8 @@ type Engine struct {
 	failedErr error
 	wiped     bool
 
-	lastRecoveredTokenByBucket map[string]string
-	lastRecoveredToken         string
-	closed                     atomic.Bool
-	closedCh                   chan struct{}
+	closed   atomic.Bool
+	closedCh chan struct{}
 }
 
 func removeDirRecursive(fs FS, dir string) error {
@@ -326,7 +324,8 @@ const (
 	// StoreFormatVersion is the format version recorded in meta.db.
 	// Version 1 did not record a version and stored uncompressed values without a codec byte.
 	// Version 2 records this version in meta.db and prefixes each stored value with a codec byte.
-	StoreFormatVersion uint32 = 2
+	// Version 3 removes resourceVersion (token) handling from WAL records and the engine.
+	StoreFormatVersion uint32 = 3
 
 	// metaFileSize is 16 bytes DB ID + 4 bytes StoreFormatVersion.
 	metaFileSize = 20
@@ -560,23 +559,22 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 
 	s := &Engine{
-		fs:                         options.FS,
-		dir:                        dir,
-		dbID:                       dbID,
-		isTemp:                     isTemp,
-		autoDelete:                 options.AutoDelete,
-		cipher:                     options.Cipher,
-		compressionCodec:           options.CompressionCodec,
-		maxObjectSize:              options.MaxObjectSize,
-		heapFile:                   heapFile,
-		keyIndex:                   make(map[string]KeyIndexEntry),
-		oversizeObjects:            make(map[string][]byte),
-		emptyPages:                 newEmptyPageTracker(nil),
-		lastRecoveredTokenByBucket: make(map[string]string),
-		failedCh:                   make(chan struct{}),
-		closedCh:                   make(chan struct{}),
-		wiped:                      wiped,
-		nextLogicalPage:            1,
+		fs:               options.FS,
+		dir:              dir,
+		dbID:             dbID,
+		isTemp:           isTemp,
+		autoDelete:       options.AutoDelete,
+		cipher:           options.Cipher,
+		compressionCodec: options.CompressionCodec,
+		maxObjectSize:    options.MaxObjectSize,
+		heapFile:         heapFile,
+		keyIndex:         make(map[string]KeyIndexEntry),
+		oversizeObjects:  make(map[string][]byte),
+		emptyPages:       newEmptyPageTracker(nil),
+		failedCh:         make(chan struct{}),
+		closedCh:         make(chan struct{}),
+		wiped:            wiped,
+		nextLogicalPage:  1,
 	}
 
 	if isNewStore {
@@ -607,10 +605,6 @@ func Open(opts ...Option) (*Engine, error) {
 		s.buddy = recoveryRes.Buddy
 		s.keyIndex = recoveryRes.KeyIndex
 		s.emptyPages = newEmptyPageTracker(recoveryRes.EmptyLogicalPages)
-		s.lastRecoveredToken = recoveryRes.LastToken
-		if recoveryRes.LastTokenByBucket != nil {
-			s.lastRecoveredTokenByBucket = recoveryRes.LastTokenByBucket
-		}
 		s.nextLogicalPage = recoveryRes.NextLogicalPage
 		if s.nextLogicalPage == 0 {
 			s.nextLogicalPage = 1
@@ -967,46 +961,6 @@ func (s *Engine) Wiped() bool {
 	return s.wiped
 }
 
-// Token returns the last recovered token for the specified bucket.
-func (s *Engine) Token(bucketName string) string {
-	s.keyMu.RLock()
-	defer s.keyMu.RUnlock()
-	return s.lastRecoveredTokenByBucket[bucketName]
-}
-
-// Tokens returns a copy of all recovered bucket tokens.
-func (s *Engine) Tokens() map[string]string {
-	s.keyMu.RLock()
-	defer s.keyMu.RUnlock()
-	res := make(map[string]string, len(s.lastRecoveredTokenByBucket))
-	for k, v := range s.lastRecoveredTokenByBucket {
-		res[k] = v
-	}
-	return res
-}
-
-// SetToken records a progress token in the WAL for a bucket without creating a key/value object.
-func (s *Engine) SetToken(bucketName, token string) error {
-	if s.isFailed() {
-		return s.failErr()
-	}
-
-	rec := Record{
-		Type:  RecordTypeToken,
-		Key:   qualifyKey(bucketName, ""),
-		Token: token,
-	}
-	if _, err := s.wal.AppendRecord(&rec); err != nil {
-		s.setFailed(err)
-		return s.failErr()
-	}
-
-	s.keyMu.Lock()
-	s.lastRecoveredTokenByBucket[bucketName] = token
-	s.keyMu.Unlock()
-	return nil
-}
-
 // DBID returns the store's unique database ID.
 func (s *Engine) DBID() [16]byte {
 	return s.dbID
@@ -1046,7 +1000,7 @@ func (s *Engine) decompress(data []byte) ([]byte, error) {
 }
 
 // Put writes an object to the engine, encrypting if a cipher is configured.
-func (s *Engine) Put(bucketName, key string, payload []byte, token string) error {
+func (s *Engine) Put(bucketName, key string, payload []byte) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
@@ -1089,18 +1043,12 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 		Type:    RecordTypePut,
 		Key:     qKey,
 		Payload: toStore,
-		Token:   token,
 	}
 	lsn, err := s.wal.AppendRecord(&rec)
 	if err != nil {
 		s.setFailed(err)
 		return s.failErr()
 	}
-
-	// Update per-bucket progress token
-	s.keyMu.Lock()
-	s.lastRecoveredTokenByBucket[bucketName] = token
-	s.keyMu.Unlock()
 
 	// Handle oversize object: records exceeding 512-block multi-block capacity persist to disk under oversize directory
 	if !fitsInMultiBlockPage(len(qKey), len(toStore)) {
@@ -1561,8 +1509,8 @@ func (s *Engine) readIndexEntry(bucketName, key, qKey string, entry KeyIndexEntr
 	return decompressed, true, nil
 }
 
-// Delete removes an object by key, updating the progress token if provided.
-func (s *Engine) Delete(bucketName, key string, token ...string) error {
+// Delete removes an object by key.
+func (s *Engine) Delete(bucketName, key string) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
@@ -1571,11 +1519,6 @@ func (s *Engine) Delete(bucketName, key string, token ...string) error {
 	defer s.writerMu.Unlock()
 
 	qKey := qualifyKey(bucketName, key)
-
-	tok := ""
-	if len(token) > 0 {
-		tok = token[0]
-	}
 
 	s.keyMu.Lock()
 	entry, exists := s.keyIndex[qKey]
@@ -1588,15 +1531,11 @@ func (s *Engine) Delete(bucketName, key string, token ...string) error {
 		delete(s.oversizeObjects, qKey)
 		GlobalMetrics.OversizeObjectsCount.Add(-1)
 	}
-	if tok != "" {
-		s.lastRecoveredTokenByBucket[bucketName] = tok
-	}
 	s.keyMu.Unlock()
 
 	rec := Record{
-		Type:  RecordTypeDelete,
-		Key:   qKey,
-		Token: tok,
+		Type: RecordTypeDelete,
+		Key:  qKey,
 	}
 	lsn, err := s.wal.AppendRecord(&rec)
 	if err != nil {

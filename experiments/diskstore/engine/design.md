@@ -15,7 +15,7 @@ The engine uses the following terms:
 - **Record slot.** An entry in a slotted page's directory. "Slot" is used only in this sense.
 - **WAL terms:**
   - **Segment.** An append-only log file named by its starting 64-bit LSN, formatted as a 20-digit zero-padded decimal number with a `.wal` extension. The engine appends records to the active segment. In accordance with invariant 4, once a 4 KiB block within a segment is fsynced to disk, the engine never rewrites that block.
-  - **Record.** A single log entry recording an operation, such as a write, deletion, checkpoint, or progress token.
+  - **Record.** A single log entry recording an operation, such as a write, deletion, or checkpoint.
   - **LSN.** A 64-bit monotonically increasing Log Sequence Number.
   - **Durable LSN.** The highest LSN confirmed flushed and fsynced to disk.
 
@@ -129,32 +129,30 @@ The header contains:
 
 ### WAL Record
 
-Each WAL record contains a 36-byte header followed by variable-length fields:
+Each WAL record contains a 32-byte header followed by variable-length fields:
 
 ```
-+-----------+-----------+-----------+---------------+-----------+-------------------+-------------+----------------+-------------+------------+
-| Magic(1B) |Format(1B) | Type (1B) | Reserved (1B) |  LSN (8B) | RedoStartLSN (8B) | KeyLen (4B) | PayloadLen (4B)| TokenLen(4B)| CRC32C(4B) |
-+-----------+-----------+-----------+---------------+-----------+-------------------+-------------+----------------+-------------+------------+
-| Key bytes (KeyLen) ...                    | Payload bytes (PayloadLen) ...        | Token bytes (TokenLen) ...                  |
-+-------------------------------------------+---------------------------------------+---------------------------------------------+
++-----------+-----------+-----------+---------------+-----------+-------------------+-------------+----------------+------------+
+| Magic(1B) |Format(1B) | Type (1B) | Reserved (1B) |  LSN (8B) | RedoStartLSN (8B) | KeyLen (4B) | PayloadLen (4B)| CRC32C(4B) |
++-----------+-----------+-----------+---------------+-----------+-------------------+-------------+----------------+------------+
+| Key bytes (KeyLen) ...                    | Payload bytes (PayloadLen) ...                         |
++-------------------------------------------+--------------------------------------------------------+
 ```
 
 The record fields contain:
 - **Magic (1 byte):** The constant `0x52` (ASCII `'R'`).
-- **Format Version (1 byte):** The integer `1`.
+- **Format Version (1 byte):** The integer `2`.
 - **Operation Type (1 byte):** The operation code:
   - `1`: `Put`
   - `2`: `Delete`
   - `3`: `Checkpoint`
-  - `4`: `Token`
 - **Reserved (1 byte):** Zero padding.
 - **LSN (8 bytes):** The monotonically assigned log sequence number.
 - **RedoStartLSN (8 bytes):** The starting LSN for WAL redo replay. This field is populated on Checkpoint records.
 - **KeyLen (4 bytes):** Length of the key in bytes.
 - **PayloadLen (4 bytes):** Length of the payload in bytes.
-- **TokenLen (4 bytes):** Length of the progress token string in bytes.
 - **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the record header and body with the CRC field zeroed.
-- **Body:** The key bytes, payload bytes, and token bytes.
+- **Body:** The key bytes and payload bytes.
 
 ## Invariants
 

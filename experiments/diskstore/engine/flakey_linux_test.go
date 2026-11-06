@@ -49,7 +49,7 @@ func TestDMFlakey(t *testing.T) {
 	}
 	defer store.Close()
 
-	_ = store.Put("ConfigMap", "test/key", []byte("data"), "1")
+	_ = store.Put("ConfigMap", "test/key", []byte("data"))
 
 	// Verify fail-stop state after write failures
 	store.setFailed(errors.New("dm-flakey simulated write failure"))
