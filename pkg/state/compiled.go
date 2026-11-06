@@ -2062,7 +2062,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			continue
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
-		rs := &TCPRouteState{TCPRoute: route}
+		rs := &TCPRouteState{Route: route}
 		rs.Compile(inputs.Services, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
@@ -2092,7 +2092,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			continue
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
-		rs := &UDPRouteState{UDPRoute: route}
+		rs := &UDPRouteState{Route: route}
 		rs.Compile(inputs.Services, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
