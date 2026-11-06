@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -573,17 +574,26 @@ func (r *Responder) handleQuery(p *dnsmessage.Parser, queryHeader dnsmessage.Hea
 
 	// 1. Simultaneous probe conflict check (RFC 6762 §8.2)
 	if handler != nil && len(probes) > 0 && len(authorities) > 0 {
-		for _, q := range questions {
-			qname := strings.ToLower(q.Name.String())
-			proposed, probing := probes[qname]
+		for _, question := range questions {
+			questionName := strings.ToLower(question.Name.String())
+			proposed, probing := probes[questionName]
 			if !probing {
 				continue
 			}
-			for _, nsRR := range authorities {
-				if strings.ToLower(nsRR.Header.Name.String()) == qname {
-					if isLexicographicallyGreater(nsRR, proposed) {
-						handler(qname, nsRR)
-					}
+			var opponentRecords []dnsmessage.Resource
+			for _, authorityRecord := range authorities {
+				if strings.ToLower(authorityRecord.Header.Name.String()) == questionName {
+					opponentRecords = append(opponentRecords, authorityRecord)
+				}
+			}
+			if len(opponentRecords) > 0 {
+				greater, compareErr := isLexicographicallyGreater(opponentRecords, proposed)
+				if compareErr != nil {
+					klog.Warningf("probe tie-break comparison failed for %q: %v", questionName, compareErr)
+					continue
+				}
+				if greater {
+					handler(questionName, opponentRecords[0])
 				}
 			}
 		}
@@ -795,42 +805,128 @@ func isConflictingRecord(received dnsmessage.Resource, proposed []dnsmessage.Res
 	return false
 }
 
-// isLexicographicallyGreater determines whether opponent's authority record is greater than ours (RFC 6762 §8.2).
-func isLexicographicallyGreater(oppRR dnsmessage.Resource, ourRRs []dnsmessage.Resource) bool {
-	// If opponent record is identical to any of our proposed records, it is not a conflict (RFC 6762 §8.2).
-	for _, ourRR := range ourRRs {
-		if recordsEqual(oppRR, ourRR) {
-			return false
+type canonicalRecord struct {
+	class uint16
+	typ   dnsmessage.Type
+	rdata []byte
+}
+
+func toCanonicalRecord(record dnsmessage.Resource) (canonicalRecord, error) {
+	rdata, recordType, extractErr := uncompressedRData(record)
+	if extractErr != nil {
+		return canonicalRecord{}, extractErr
+	}
+	recordClass := uint16(record.Header.Class) &^ CacheFlushBit
+	return canonicalRecord{
+		class: recordClass,
+		typ:   recordType,
+		rdata: rdata,
+	}, nil
+}
+
+// uncompressedRData extracts the raw wire bytes of a resource record's RDATA
+// in canonical uncompressed form.
+//
+// The trick works by building a standalone DNS message containing only this record
+// using dnsmessage.Builder with compression disabled (the Builder does not compress
+// by default unless b.EnableCompression() is explicitly called). A non-empty placeholder
+// name ("name.") is substituted if record.Header.Name is empty, because dnsmessage
+// requires a valid domain name to pack the ResourceHeader without error; the placeholder
+// does not affect RDATA since compression is disabled. The resulting wire bytes are
+// then parsed back with dnsmessage.Parser up to the answer section, where UnknownResource()
+// retrieves the raw, uncompressed RDATA bytes without unpacking into Go structs.
+func uncompressedRData(record dnsmessage.Resource) ([]byte, dnsmessage.Type, error) {
+	builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{})
+	startErr := builder.StartAnswers()
+	if startErr != nil {
+		return nil, 0, startErr
+	}
+	header := record.Header
+	if header.Name.Length == 0 {
+		name, nameErr := dnsmessage.NewName("name.")
+		if nameErr != nil {
+			return nil, 0, nameErr
+		}
+		header.Name = name
+	}
+	record.Header = header
+	appendErr := appendResource(&builder, record)
+	if appendErr != nil {
+		return nil, 0, appendErr
+	}
+	packedMessage, finishErr := builder.Finish()
+	if finishErr != nil {
+		return nil, 0, finishErr
+	}
+
+	var parser dnsmessage.Parser
+	_, startParserErr := parser.Start(packedMessage)
+	if startParserErr != nil {
+		return nil, 0, startParserErr
+	}
+	skipQuestionsErr := parser.SkipAllQuestions()
+	if skipQuestionsErr != nil {
+		return nil, 0, skipQuestionsErr
+	}
+	parsedHeader, answerHeaderErr := parser.AnswerHeader()
+	if answerHeaderErr != nil {
+		return nil, 0, answerHeaderErr
+	}
+	unknownResource, unknownErr := parser.UnknownResource()
+	if unknownErr != nil {
+		return nil, 0, unknownErr
+	}
+	return unknownResource.Data, parsedHeader.Type, nil
+}
+
+func compareCanonical(first, second canonicalRecord) int {
+	if first.class != second.class {
+		if first.class < second.class {
+			return -1
+		}
+		return 1
+	}
+	if first.typ != second.typ {
+		if first.typ < second.typ {
+			return -1
+		}
+		return 1
+	}
+	return bytes.Compare(first.rdata, second.rdata)
+}
+
+// isLexicographicallyGreater determines whether opponent's authority records are greater than ours (RFC 6762 §8.2).
+func isLexicographicallyGreater(opponentRecords, ourRecords []dnsmessage.Resource) (bool, error) {
+	opponentCanonical := make([]canonicalRecord, 0, len(opponentRecords))
+	for _, record := range opponentRecords {
+		canonical, canonicalErr := toCanonicalRecord(record)
+		if canonicalErr != nil {
+			return false, fmt.Errorf("canonicalizing opponent record: %w", canonicalErr)
+		}
+		opponentCanonical = append(opponentCanonical, canonical)
+	}
+
+	ourCanonical := make([]canonicalRecord, 0, len(ourRecords))
+	for _, record := range ourRecords {
+		canonical, canonicalErr := toCanonicalRecord(record)
+		if canonicalErr != nil {
+			return false, fmt.Errorf("canonicalizing proposed record: %w", canonicalErr)
+		}
+		ourCanonical = append(ourCanonical, canonical)
+	}
+
+	slices.SortFunc(opponentCanonical, compareCanonical)
+	slices.SortFunc(ourCanonical, compareCanonical)
+
+	count := min(len(opponentCanonical), len(ourCanonical))
+	for i := 0; i < count; i++ {
+		difference := compareCanonical(opponentCanonical[i], ourCanonical[i])
+		if difference != 0 {
+			return difference > 0, nil
 		}
 	}
 
-	oppData, err := packResource(oppRR)
-	if err != nil {
-		return false
-	}
-
-	// Compare against our proposed record of the same RR type
-	for _, ourRR := range ourRRs {
-		if ourRR.Header.Type == oppRR.Header.Type {
-			ourData, err := packResource(ourRR)
-			if err != nil {
-				continue
-			}
-			return bytes.Compare(oppData, ourData) > 0
-		}
-	}
-
-	// If no same-type record found, compare against all
-	for _, ourRR := range ourRRs {
-		ourData, err := packResource(ourRR)
-		if err != nil {
-			continue
-		}
-		if bytes.Compare(oppData, ourData) > 0 {
-			return true
-		}
-	}
-	return false
+	return len(opponentCanonical) > len(ourCanonical), nil
 }
 
 func recordsEqual(a, b dnsmessage.Resource) bool {
@@ -851,17 +947,6 @@ func recordsEqual(a, b dnsmessage.Resource) bool {
 		}
 	}
 	return false
-}
-
-func packResource(r dnsmessage.Resource) ([]byte, error) {
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{})
-	if err := b.StartAnswers(); err != nil {
-		return nil, err
-	}
-	if err := appendResource(&b, r); err != nil {
-		return nil, err
-	}
-	return b.Finish()
 }
 
 func appendResource(b *dnsmessage.Builder, r dnsmessage.Resource) error {
