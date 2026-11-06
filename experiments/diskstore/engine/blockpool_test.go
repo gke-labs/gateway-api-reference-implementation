@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -713,5 +714,112 @@ func TestBlockPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
 		defer hNew.Unpin()
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for AllocateNewPage after unpin")
+	}
+}
+
+type blockingDirectIO struct {
+	base         DirectIO
+	writeStarted chan struct{}
+	releaseWrite chan struct{}
+}
+
+func (b *blockingDirectIO) Readv(file File, off int64, iov [][]byte) error {
+	return b.base.Readv(file, off, iov)
+}
+
+func (b *blockingDirectIO) Writev(file File, off int64, iov [][]byte) error {
+	return b.base.Writev(file, off, iov)
+}
+
+func (b *blockingDirectIO) Write(file File, off int64, buffer []byte) error {
+	select {
+	case b.writeStarted <- struct{}{}:
+	default:
+	}
+	<-b.releaseWrite
+	return b.base.Write(file, off, buffer)
+}
+
+func TestRegression_BlockPoolInFlightWait(t *testing.T) {
+	memoryFS := NewMemFS()
+	rawHeapFile, createErr := memoryFS.Create("heap.db")
+	if createErr != nil {
+		t.Fatalf("Create heap.db failed: %v", createErr)
+	}
+	defer rawHeapFile.Close()
+
+	buddy := NewBuddyAllocator(512)
+	var databaseID [16]byte
+	bp := NewBlockPool(rawHeapFile, nil, buddy, databaseID, BlockPoolOptions{
+		NumPoolBlocks: 2,
+	})
+	defer bp.Close()
+
+	blockingIO := &blockingDirectIO{
+		base:         bp.directIO,
+		writeStarted: make(chan struct{}, 1),
+		releaseWrite: make(chan struct{}),
+	}
+	bp.directIO = blockingIO
+
+	// Fill pool with 2 dirty pages
+	handle1, allocErr1 := bp.AllocateNewPage(1, 1, 10)
+	if allocErr1 != nil {
+		t.Fatalf("AllocateNewPage 1 failed: %v", allocErr1)
+	}
+	bp.MarkDirty(1, 10)
+	handle1.Unpin()
+
+	handle2, allocErr2 := bp.AllocateNewPage(2, 1, 10)
+	if allocErr2 != nil {
+		t.Fatalf("AllocateNewPage 2 failed: %v", allocErr2)
+	}
+	bp.MarkDirty(2, 10)
+	handle2.Unpin()
+
+	// Start a flush in the background. The flush will chunk the dirty pages and block in Write.
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- bp.FlushAllDirty()
+	}()
+
+	// Wait until the flush is actively writing via direct I/O with all pool blocks in flight.
+	<-blockingIO.writeStarted
+
+	// Attempt to allocate while all pool blocks are in flight.
+	allocStarted := make(chan struct{})
+	allocDone := make(chan struct{})
+	var handle3 *PageHandle
+	var allocErr error
+	go func() {
+		close(allocStarted)
+		handle3, allocErr = bp.AllocateNewPage(3, 1, 10)
+		close(allocDone)
+	}()
+	<-allocStarted
+	runtime.Gosched()
+
+	// Verify the allocation has not returned while the flush is in flight.
+	select {
+	case <-allocDone:
+		t.Fatalf("AllocateNewPage returned while flush was in flight: %v", allocErr)
+	default:
+	}
+
+	// Release the direct I/O write and confirm the flush completes.
+	close(blockingIO.releaseWrite)
+	if flushErr := <-flushDone; flushErr != nil {
+		t.Fatalf("FlushAllDirty failed: %v", flushErr)
+	}
+
+	// The allocation must now wake up and succeed.
+	select {
+	case <-allocDone:
+		if allocErr != nil {
+			t.Fatalf("AllocateNewPage failed: %v", allocErr)
+		}
+		defer handle3.Unpin()
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for AllocateNewPage after flush completed")
 	}
 }
