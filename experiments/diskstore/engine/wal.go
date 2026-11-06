@@ -660,11 +660,9 @@ func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 
 	keyBytes := stringToBytes(r.Key)
 	payloadBytes := r.Payload
-	tokenBytes := stringToBytes(r.Token)
 	keyLen := len(keyBytes)
 	payloadLen := len(payloadBytes)
-	tokenLen := len(tokenBytes)
-	recLen := RecordHeaderSize + keyLen + payloadLen + tokenLen
+	recLen := RecordHeaderSize + keyLen + payloadLen
 
 	now := w.clock.Now()
 	if w.oldestUnsyncedTime.IsZero() {
@@ -682,7 +680,7 @@ func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 		w.tailBlockOpenTime = now
 	}
 
-	// Format record header into 36-byte stack buffer and compute CRC incrementally
+	// Format record header into 32-byte stack buffer and compute CRC incrementally
 	var hdr [RecordHeaderSize]byte
 	hdr[0] = RecordMagic
 	hdr[1] = RecordFormatVersion
@@ -692,8 +690,7 @@ func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 	binary.BigEndian.PutUint64(hdr[12:20], r.RedoStartLSN)
 	binary.BigEndian.PutUint32(hdr[20:24], uint32(keyLen))
 	binary.BigEndian.PutUint32(hdr[24:28], uint32(payloadLen))
-	binary.BigEndian.PutUint32(hdr[28:32], uint32(tokenLen))
-	// bytes 32..36 are zero for CRC calculation
+	// bytes 28..32 are zero for CRC calculation
 
 	crc := crc32.Update(0, castagnoliTable, hdr[:])
 	if keyLen > 0 {
@@ -702,10 +699,7 @@ func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 	if payloadLen > 0 {
 		crc = crc32.Update(crc, castagnoliTable, payloadBytes)
 	}
-	if tokenLen > 0 {
-		crc = crc32.Update(crc, castagnoliTable, tokenBytes)
-	}
-	binary.BigEndian.PutUint32(hdr[32:36], crc)
+	binary.BigEndian.PutUint32(hdr[28:32], crc)
 
 	copyToRing := func(p []byte) error {
 		for len(p) > 0 {
@@ -759,11 +753,6 @@ func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 	}
 	if payloadLen > 0 {
 		if err := copyToRing(payloadBytes); err != nil {
-			return 0, err
-		}
-	}
-	if tokenLen > 0 {
-		if err := copyToRing(tokenBytes); err != nil {
 			return 0, err
 		}
 	}
@@ -1056,8 +1045,7 @@ func (it *WALIterator) Next() (Record, error) {
 
 		keyLen := binary.BigEndian.Uint32(hdr[20:24])
 		payloadLen := binary.BigEndian.Uint32(hdr[24:28])
-		tokenLen := binary.BigEndian.Uint32(hdr[28:32])
-		totalRecordLen := RecordHeaderSize + int(keyLen) + int(payloadLen) + int(tokenLen)
+		totalRecordLen := RecordHeaderSize + int(keyLen) + int(payloadLen)
 
 		recordBytes := make([]byte, totalRecordLen)
 		n, err = it.currFile.ReadAt(recordBytes, it.currOffset)

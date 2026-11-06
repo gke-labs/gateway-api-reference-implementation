@@ -38,7 +38,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 
 	// 1. Write Version 1 of a multi-block page (LSN 10) and make it durable
 	payloadV1 := bytes.Repeat([]byte("v1-payload-"), 1000) // ~11 KB -> 4 blocks
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "large-obj", Payload: payloadV1, Token: "10"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "large-obj", Payload: payloadV1})
 	_ = wal.Sync()
 
 	mbV1, err := NewMultiBlockPage(1, 10, "large-obj", payloadV1)
@@ -51,7 +51,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 
 	// 2. Write Version 2 of the multi-block page (LSN 20) to a new location, but TEAR one of its blocks
 	payloadV2 := bytes.Repeat([]byte("v2-payload-"), 1000)
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "large-obj", Payload: payloadV2, Token: "20"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "large-obj", Payload: payloadV2})
 	_ = wal.Sync()
 
 	mbV2, err := NewMultiBlockPage(1, 20, "large-obj", payloadV2)
@@ -141,7 +141,7 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	cp := NewCheckpointer(bp, heapFile, wal)
 
 	// Add key-1, checkpoint, then delete key-1 and checkpoint again
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 1, Key: "key-1", Payload: []byte("val-1"), Token: "1"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 1, Key: "key-1", Payload: []byte("val-1")})
 	h1, _ := bp.AllocateNewPage(1, 1, 1)
 	slotted, _ := WrapSlottedPage(h1.Block(0))
 	_, _ = slotted.Put("key-1", []byte("val-1"), 1)
@@ -151,7 +151,7 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	_, _ = cp.Checkpoint()
 
 	// Now delete key-1
-	_ = wal.Append(Record{Type: RecordTypeDelete, LSN: 3, Key: "key-1", Token: "3"})
+	_ = wal.Append(Record{Type: RecordTypeDelete, LSN: 3, Key: "key-1"})
 	h1Reload, _ := bp.PinPage(1)
 	slottedReload, _ := WrapSlottedPage(h1Reload.Block(0))
 	_ = slottedReload.Delete(0, 3)
@@ -210,7 +210,7 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	}
 
 	// Store real legitimate object first at LSN 5
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 5, Key: "legit-key", Payload: []byte("legit-val"), Token: "5"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 5, Key: "legit-key", Payload: []byte("legit-val")})
 	h1, _ := bp.AllocateNewPage(1, 1, 5)
 	s1, _ := WrapSlottedPage(h1.Block(0))
 	_, _ = s1.Put("legit-key", []byte("legit-val"), 5)
@@ -219,7 +219,7 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	_ = bp.FlushPage(1)
 
 	// Now store the malicious object containing forged headers at LSN 10
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "malicious-key", Payload: maliciousPayload, Token: "10"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "malicious-key", Payload: maliciousPayload})
 	_ = wal.Sync()
 	mbPage, err := NewMultiBlockPage(2, 10, "malicious-key", maliciousPayload)
 	if err != nil {
@@ -269,13 +269,13 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	}
 
 	largeVal := bytes.Repeat([]byte("large-payload-bytes-"), 500) // ~10 KB
-	_ = store.Put("ConfigMap", "key1", []byte("val1-initial"), "1")
+	_ = store.Put("ConfigMap", "key1", []byte("val1-initial"))
 	model["key1"] = "val1-initial"
 
-	_ = store.Put("ConfigMap", "key2", []byte("val2-initial"), "2")
+	_ = store.Put("ConfigMap", "key2", []byte("val2-initial"))
 	model["key2"] = "val2-initial"
 
-	_ = store.Put("ConfigMap", "key-large", largeVal, "3")
+	_ = store.Put("ConfigMap", "key-large", largeVal)
 	model["key-large"] = string(largeVal)
 
 	chk1, err := store.Checkpoint()
@@ -284,10 +284,10 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	}
 
 	// Update key1 and put key3
-	_ = store.Put("ConfigMap", "key1", []byte("val1-updated"), "4")
+	_ = store.Put("ConfigMap", "key1", []byte("val1-updated"))
 	model["key1"] = "val1-updated"
 
-	_ = store.Put("ConfigMap", "key3", []byte("val3-initial"), "5")
+	_ = store.Put("ConfigMap", "key3", []byte("val3-initial"))
 	model["key3"] = "val3-initial"
 
 	// Checkpoint 2
@@ -300,7 +300,7 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	}
 
 	// Un-checkpointed writes before crash
-	_ = store.Put("ConfigMap", "key4", []byte("val4-uncheckpointed"), "6")
+	_ = store.Put("ConfigMap", "key4", []byte("val4-uncheckpointed"))
 	model["key4"] = "val4-uncheckpointed"
 
 	// Simulate crash with tearing of un-fsynced writes
@@ -332,10 +332,10 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	}
 	delete(model, "key1")
 
-	_ = store2.Put("ConfigMap", "key2", []byte("val2-cycle2"), "7")
+	_ = store2.Put("ConfigMap", "key2", []byte("val2-cycle2"))
 	model["key2"] = "val2-cycle2"
 
-	_ = store2.Put("ConfigMap", "key5", []byte("val5-cycle2"), "8")
+	_ = store2.Put("ConfigMap", "key5", []byte("val5-cycle2"))
 	model["key5"] = "val5-cycle2"
 
 	_, err = store2.Checkpoint()
@@ -383,8 +383,8 @@ func TestRegression_Item1_LSNReopenContinuation(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	_ = store.Put("ConfigMap", "k1", []byte("v1"), "1")
-	_ = store.Put("ConfigMap", "k2", []byte("v2"), "2")
+	_ = store.Put("ConfigMap", "k1", []byte("v1"))
+	_ = store.Put("ConfigMap", "k2", []byte("v2"))
 	chkLSN, _ := store.Checkpoint()
 	_ = store.Close()
 
@@ -396,7 +396,7 @@ func TestRegression_Item1_LSNReopenContinuation(t *testing.T) {
 	defer store2.Close()
 
 	// First Put after reopen must NOT fail with "segment already used" and must have LSN > chkLSN
-	if err := store2.Put("ConfigMap", "k3", []byte("v3"), "3"); err != nil {
+	if err := store2.Put("ConfigMap", "k3", []byte("v3")); err != nil {
 		t.Fatalf("first Put after reopen failed: %v", err)
 	}
 
@@ -486,8 +486,8 @@ func TestRegression_Item3_RedoAppliesPayload(t *testing.T) {
 	}
 
 	// Write keys without checkpointing
-	_ = store.Put("ConfigMap", "key-redo-1", []byte("payload-redo-1"), "1")
-	_ = store.Put("ConfigMap", "key-redo-2", []byte("payload-redo-2"), "2")
+	_ = store.Put("ConfigMap", "key-redo-1", []byte("payload-redo-1"))
+	_ = store.Put("ConfigMap", "key-redo-2", []byte("payload-redo-2"))
 
 	// Sync WAL so records are durable, but do NOT sync heap
 	_ = store.wal.Sync()
@@ -586,19 +586,19 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	}
 
 	// Step 1: Occupy block 0
-	_ = store.Put("ConfigMap", "dummy-0", bytes.Repeat([]byte("0"), 3000), "1")
+	_ = store.Put("ConfigMap", "dummy-0", bytes.Repeat([]byte("0"), 3000))
 	if _, err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint dummy 0 failed: %v", err)
 	}
 
 	// Step 2: Occupy block 1
-	_ = store.Put("ConfigMap", "dummy-1", bytes.Repeat([]byte("1"), 3000), "2")
+	_ = store.Put("ConfigMap", "dummy-1", bytes.Repeat([]byte("1"), 3000))
 	if _, err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint dummy 1 failed: %v", err)
 	}
 
 	// Step 3: Put key1 v1 (small payload) -> goes to page 3, gets block 2
-	if err := store.Put("ConfigMap", "key1", []byte("val1-v1"), "3"); err != nil {
+	if err := store.Put("ConfigMap", "key1", []byte("val1-v1")); err != nil {
 		t.Fatalf("Put key1 failed: %v", err)
 	}
 	if _, err := store.Checkpoint(); err != nil {
@@ -612,14 +612,14 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	t.Logf("key1 v1 on page %d has DurableLoc %d", entryK1.LogicalPage, v1Loc)
 
 	// Step 4: Occupy block 3
-	_ = store.Put("ConfigMap", "dummy-3", bytes.Repeat([]byte("3"), 3000), "4")
+	_ = store.Put("ConfigMap", "dummy-3", bytes.Repeat([]byte("3"), 3000))
 	if _, err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint dummy 3 failed: %v", err)
 	}
 
 	// Step 5: Update key1 v2 (small payload, fits in same page 3).
 	// When checkpointed, page 3 is written to block 4. Block 2 is freed!
-	if err := store.Put("ConfigMap", "key1", []byte("val1-v2"), "5"); err != nil {
+	if err := store.Put("ConfigMap", "key1", []byte("val1-v2")); err != nil {
 		t.Fatalf("Put key1 v2 failed: %v", err)
 	}
 	if _, err := store.Checkpoint(); err != nil {
@@ -632,7 +632,7 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	t.Logf("key1 v2 on page %d has DurableLoc %d", entryK1.LogicalPage, v2Loc)
 
 	// Step 6: Free block 1 by updating dummy-1 so block 1 is the lowest free block
-	_ = store.Put("ConfigMap", "dummy-1", bytes.Repeat([]byte("x"), 3000), "6")
+	_ = store.Put("ConfigMap", "dummy-1", bytes.Repeat([]byte("x"), 3000))
 	if _, err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint dummy-1 v2 failed: %v", err)
 	}
@@ -866,7 +866,7 @@ func TestRegression_OversizeUncommittedDiscard(t *testing.T) {
 	}
 
 	payload1 := append([]byte("valid-oversize-v1"), make([]byte, 2100*1024)...)
-	if err := store.Put("ConfigMap", "largeKey", payload1, "1"); err != nil {
+	if err := store.Put("ConfigMap", "largeKey", payload1); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 	if err := store.Close(); err != nil {

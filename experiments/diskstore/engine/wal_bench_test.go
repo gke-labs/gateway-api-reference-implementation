@@ -50,7 +50,6 @@ func BenchmarkWAL_AppendThroughput(b *testing.B) {
 					Type:    RecordTypePut,
 					Key:     "bench-key",
 					Payload: payload,
-					Token:   "tok",
 				}
 				if err := wal.Append(rec); err != nil {
 					b.Fatalf("Append failed: %v", err)
@@ -99,7 +98,6 @@ func BenchmarkWAL_AppendThroughput_Parallel(b *testing.B) {
 					Type:    RecordTypePut,
 					Key:     "bench-key",
 					Payload: payload,
-					Token:   "tok",
 				}
 				for pb.Next() {
 					if err := wal.Append(rec); err != nil {

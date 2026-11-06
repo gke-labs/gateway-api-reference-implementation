@@ -54,7 +54,7 @@ func TestCompression_RawFallbackAndSavingsRule(t *testing.T) {
 
 	// 1. Compressible value (8000 bytes)
 	compressibleVal := makeRepetitivePayload(8000)
-	if err := store.Put("ConfigMap", "cm-compressed", compressibleVal, "1"); err != nil {
+	if err := store.Put("ConfigMap", "cm-compressed", compressibleVal); err != nil {
 		t.Fatalf("Put compressible failed: %v", err)
 	}
 
@@ -94,7 +94,7 @@ func TestCompression_RawFallbackAndSavingsRule(t *testing.T) {
 
 	// 2. Incompressible value (5000 random bytes)
 	incompressibleVal := makeRandomPayload(5000)
-	if err := store.Put("ConfigMap", "cm-raw-above-thresh", incompressibleVal, "2"); err != nil {
+	if err := store.Put("ConfigMap", "cm-raw-above-thresh", incompressibleVal); err != nil {
 		t.Fatalf("Put incompressible failed: %v", err)
 	}
 
@@ -127,7 +127,7 @@ func TestCompression_RawFallbackAndSavingsRule(t *testing.T) {
 
 	// 3. Compressible small value (2000 bytes) is now compressed
 	smallVal := makeRepetitivePayload(2000)
-	if err := store.Put("ConfigMap", "cm-small", smallVal, "3"); err != nil {
+	if err := store.Put("ConfigMap", "cm-small", smallVal); err != nil {
 		t.Fatalf("Put small failed: %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestCompression_RawFallbackAndSavingsRule(t *testing.T) {
 
 	// 4. Tiny compressible value (64 bytes) fails 10% savings rule and falls back to CodecNone
 	tinyVal := makeRepetitivePayload(64)
-	if err := store.Put("ConfigMap", "cm-tiny", tinyVal, "4"); err != nil {
+	if err := store.Put("ConfigMap", "cm-tiny", tinyVal); err != nil {
 		t.Fatalf("Put tiny failed: %v", err)
 	}
 
@@ -232,7 +232,7 @@ func TestCompression_RoundTripAllCodecs(t *testing.T) {
 				key := fmt.Sprintf("key-size-%d", size)
 				payload := makeRepetitivePayload(size)
 
-				if err := store.Put("Bucket", key, payload, "rv"); err != nil {
+				if err := store.Put("Bucket", key, payload); err != nil {
 					t.Fatalf("Put failed for size %d (codec %s): %v", size, tc.name, err)
 				}
 
@@ -269,7 +269,7 @@ func TestCompression_PayloadExceedingMaxObjectSize_StoredRawAndReadable(t *testi
 	// compressValue must store it uncompressed with CodecNone rather than compressing it,
 	// so that Get on read back will never reject it.
 	largePayload := makeRepetitivePayload(7000)
-	if err := store.Put("ConfigMap", "large-cm", largePayload, "1"); err != nil {
+	if err := store.Put("ConfigMap", "large-cm", largePayload); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
@@ -359,7 +359,7 @@ func TestEngine_OldFormatVersion_WipedOnOpen(t *testing.T) {
 	}
 
 	// Verify fresh store can write and read normally
-	if err := store.Put("ConfigMap", "fresh-key", []byte("fresh-val"), "1"); err != nil {
+	if err := store.Put("ConfigMap", "fresh-key", []byte("fresh-val")); err != nil {
 		t.Fatalf("Put on wiped store failed: %v", err)
 	}
 	val, exists, err := store.Get("ConfigMap", "fresh-key")
@@ -367,7 +367,7 @@ func TestEngine_OldFormatVersion_WipedOnOpen(t *testing.T) {
 		t.Fatalf("Get on wiped store failed")
 	}
 
-	// 3. Reopening the version 2 store must NOT wipe it
+	// 3. Reopening the store must NOT wipe it
 	_ = store.Close()
 	store2, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
@@ -375,7 +375,7 @@ func TestEngine_OldFormatVersion_WipedOnOpen(t *testing.T) {
 	}
 	defer store2.Close()
 	if store2.Wiped() {
-		t.Fatalf("expected Wiped() == false on reopening version 2 store")
+		t.Fatalf("expected Wiped() == false on reopening store")
 	}
 	val2, exists2, err := store2.Get("ConfigMap", "fresh-key")
 	if err != nil || !exists2 || !bytes.Equal(val2, []byte("fresh-val")) {
@@ -397,7 +397,7 @@ func TestCompression_PageClassReduction(t *testing.T) {
 	}
 	defer storeNone.Close()
 
-	if err := storeNone.Put("ConfigMap", "cm-10k", payload, "1"); err != nil {
+	if err := storeNone.Put("ConfigMap", "cm-10k", payload); err != nil {
 		t.Fatalf("Put none failed: %v", err)
 	}
 	entryNone := storeNone.keyIndex[qualifyKey("ConfigMap", "cm-10k")]
@@ -410,7 +410,7 @@ func TestCompression_PageClassReduction(t *testing.T) {
 	}
 	defer storeZstd.Close()
 
-	if err := storeZstd.Put("ConfigMap", "cm-10k", payload, "1"); err != nil {
+	if err := storeZstd.Put("ConfigMap", "cm-10k", payload); err != nil {
 		t.Fatalf("Put zstd failed: %v", err)
 	}
 	entryZstd := storeZstd.keyIndex[qualifyKey("ConfigMap", "cm-10k")]
@@ -453,9 +453,9 @@ func TestCompression_RecoveryWALReplay(t *testing.T) {
 	p2 := makeRepetitivePayload(16000)
 	p3 := makeRepetitivePayload(2000)
 
-	_ = store.Put("ConfigMap", "cm-1", p1, "1")
-	_ = store.Put("ConfigMap", "cm-2", p2, "2")
-	_ = store.Put("ConfigMap", "cm-3", p3, "3")
+	_ = store.Put("ConfigMap", "cm-1", p1)
+	_ = store.Put("ConfigMap", "cm-2", p2)
+	_ = store.Put("ConfigMap", "cm-3", p3)
 
 	// Ensure WAL records are durable, but do not checkpoint
 	if err := store.wal.Sync(); err != nil {
@@ -593,7 +593,7 @@ func TestCompression_Rejection_StoreState(t *testing.T) {
 			defer store.Close()
 
 			// Write a normal record first
-			_ = store.Put("ConfigMap", "corrupt-cm", []byte("placeholder"), "1")
+			_ = store.Put("ConfigMap", "corrupt-cm", []byte("placeholder"))
 
 			// Delete existing slot and put corruptPayload with matching key and LSN
 			entry := store.keyIndex[qualifyKey("ConfigMap", "corrupt-cm")]
@@ -639,7 +639,7 @@ func TestCompression_Rejection_StoreState(t *testing.T) {
 			}
 
 			// Subsequent operations must return ErrFailed
-			if err := store.Put("ConfigMap", "new-key", []byte("val"), "2"); !errors.Is(err, ErrFailed) {
+			if err := store.Put("ConfigMap", "new-key", []byte("val")); !errors.Is(err, ErrFailed) {
 				t.Fatalf("expected ErrFailed from Put on failed store, got %v", err)
 			}
 		})
@@ -696,7 +696,7 @@ func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
 
 			payload := makeRepetitivePayload(size)
 			key := fmt.Sprintf("key-%d", size)
-			if err := store.Put("bucket", key, payload, "1"); err != nil {
+			if err := store.Put("bucket", key, payload); err != nil {
 				t.Fatalf("Put failed: %v", err)
 			}
 
@@ -743,7 +743,7 @@ func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
 
 			payload := makeRandomPayload(size)
 			key := fmt.Sprintf("key-%d", size)
-			if err := store.Put("bucket", key, payload, "1"); err != nil {
+			if err := store.Put("bucket", key, payload); err != nil {
 				t.Fatalf("Put failed: %v", err)
 			}
 
@@ -799,7 +799,7 @@ func TestCompression_ReopenUncompressedSmallValues(t *testing.T) {
 	}
 
 	for k, v := range testPayloads {
-		if err := store1.Put("bucket", k, v, "1"); err != nil {
+		if err := store1.Put("bucket", k, v); err != nil {
 			t.Fatalf("Put %s failed: %v", k, err)
 		}
 		// Confirm it was written as CodecNone
@@ -840,7 +840,7 @@ func TestCompression_ReopenUncompressedSmallValues(t *testing.T) {
 
 	// 4. Verify new writes in the reopened store compress small compressible payloads
 	newPayload := makeRepetitivePayload(500)
-	if err := store2.Put("bucket", "new-small-500", newPayload, "2"); err != nil {
+	if err := store2.Put("bucket", "new-small-500", newPayload); err != nil {
 		t.Fatalf("Put new small payload failed: %v", err)
 	}
 

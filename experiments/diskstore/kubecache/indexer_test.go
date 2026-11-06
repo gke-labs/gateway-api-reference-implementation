@@ -743,7 +743,7 @@ func TestIndexer_ResourceVersionSurvivesCheckpointTruncation(t *testing.T) {
 	putPads := func(start, end int) {
 		pad := bytes.Repeat([]byte("p"), 30*1024)
 		for i := start; i < end; i++ {
-			if err := store.Put("PaddingBucket", fmt.Sprintf("pad-%d", i), pad, ""); err != nil {
+			if err := store.Put("PaddingBucket", fmt.Sprintf("pad-%d", i), pad); err != nil {
 				t.Fatalf("Put pad %d failed: %v", i, err)
 			}
 		}

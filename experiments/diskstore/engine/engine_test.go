@@ -42,7 +42,7 @@ func TestDiskStore_BasicCRUD(t *testing.T) {
 
 	// Put
 	payload := []byte("hello-diskstore-world")
-	if err := store.Put("ConfigMap", "default/cm-1", payload, "1001"); err != nil {
+	if err := store.Put("ConfigMap", "default/cm-1", payload); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestDiskStore_OversizeObject(t *testing.T) {
 	_, _ = rand.Read(oversizePayload[len("large-payload-prefix-data"):])
 
 	// Write must NOT fail
-	if err := store.Put("ConfigMap", "default/large-cm", oversizePayload, "1002"); err != nil {
+	if err := store.Put("ConfigMap", "default/large-cm", oversizePayload); err != nil {
 		t.Fatalf("Put oversize object failed: %v", err)
 	}
 
@@ -122,7 +122,7 @@ func TestDiskStore_FailedStateOnErrors(t *testing.T) {
 	}
 	defer store.Close()
 
-	_ = store.Put("ConfigMap", "default/cm-1", []byte("data-1"), "1")
+	_ = store.Put("ConfigMap", "default/cm-1", []byte("data-1"))
 
 	// Inject write error into filesystem
 	injectedErr := errors.New("simulated unrecoverable disk error")
@@ -131,7 +131,7 @@ func TestDiskStore_FailedStateOnErrors(t *testing.T) {
 	// Flush will attempt to write to disk, fail, and transition store into failed state
 	err = store.Flush()
 	if err == nil {
-		err = store.Put("ConfigMap", "default/cm-2", []byte("data-2"), "2")
+		err = store.Put("ConfigMap", "default/cm-2", []byte("data-2"))
 	}
 	if err == nil {
 		t.Fatalf("expected error on injected write failure")
@@ -155,7 +155,7 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 	defer store.Close()
 
 	// Put version 1 and checkpoint to disk
-	_ = store.Put("ConfigMap", "default/cm-stale", []byte("val-v1"), "1")
+	_ = store.Put("ConfigMap", "default/cm-stale", []byte("val-v1"))
 	_, _ = store.Checkpoint()
 
 	qKey := qualifyKey("ConfigMap", "default/cm-stale")
@@ -171,7 +171,7 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 	_, _ = store.heapFile.ReadAt(v1Block, int64(locV1*BlockSize))
 
 	// Put version 2 (LSN increments to 3)
-	_ = store.Put("ConfigMap", "default/cm-stale", []byte("val-v2"), "2")
+	_ = store.Put("ConfigMap", "default/cm-stale", []byte("val-v2"))
 
 	// Evict page from memory pool blocks by unloading pool blocks
 	store.bp.mu.Lock()
@@ -203,7 +203,7 @@ func TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync(t *testing.T) {
 	defer store.Close()
 
 	// Put page 1, flush it
-	_ = store.Put("ConfigMap", "k1", []byte("v1"), "1")
+	_ = store.Put("ConfigMap", "k1", []byte("v1"))
 	store.bp.mu.Lock()
 	desc := store.bp.pageTable[store.keyIndex[qualifyKey("ConfigMap", "k1")].LogicalPage]
 	_ = store.bp.FlushPageLocked(desc)
@@ -214,7 +214,7 @@ func TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync(t *testing.T) {
 	store.bp.SnapshotFlushedForSync()
 
 	// Put page 2 and flush it AFTER snapshot was taken
-	_ = store.Put("ConfigMap", "k2", []byte("v2"), "2")
+	_ = store.Put("ConfigMap", "k2", []byte("v2"))
 	store.bp.mu.Lock()
 	desc2 := store.bp.pageTable[store.keyIndex[qualifyKey("ConfigMap", "k2")].LogicalPage]
 	_ = store.bp.FlushPageLocked(desc2)
@@ -248,7 +248,7 @@ func TestRegression_Item15_16_NoOldRecordResurrection(t *testing.T) {
 	}
 
 	largeVal := bytes.Repeat([]byte("multi-block-payload-"), 500) // ~10 KB
-	_ = store.Put("ConfigMap", "large-cm", largeVal, "1")
+	_ = store.Put("ConfigMap", "large-cm", largeVal)
 
 	// Delete large-cm
 	if err := store.Delete("ConfigMap", "large-cm"); err != nil {
@@ -285,7 +285,7 @@ func TestRegression_Item17_OversizeObjectPersistence(t *testing.T) {
 	}
 
 	oversizeVal := bytes.Repeat([]byte("0123456789abcdef"), 150000) // ~2.4 MiB
-	if err := store.Put("ConfigMap", "oversize-cm", oversizeVal, "1"); err != nil {
+	if err := store.Put("ConfigMap", "oversize-cm", oversizeVal); err != nil {
 		t.Fatalf("Put oversize failed: %v", err)
 	}
 
@@ -321,8 +321,8 @@ func TestRegression_Item19_BucketIsolation(t *testing.T) {
 	defer store.Close()
 
 	// Put "default/my-name" into ConfigMap and Secret buckets with different values
-	_ = store.Put("ConfigMap", "default/my-name", []byte("cm-data"), "1")
-	_ = store.Put("Secret", "default/my-name", []byte("secret-data"), "2")
+	_ = store.Put("ConfigMap", "default/my-name", []byte("cm-data"))
+	_ = store.Put("Secret", "default/my-name", []byte("secret-data"))
 
 	cmVal, exists, err := store.Get("ConfigMap", "default/my-name")
 	if err != nil || !exists || string(cmVal) != "cm-data" {
@@ -356,8 +356,8 @@ func TestRegression_Item20_EngineScanConsistent(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	_ = store.Put("ConfigMap", "cm-1", []byte("val-1"), "1")
-	_ = store.Put("ConfigMap", "cm-2", []byte("val-2"), "2")
+	_ = store.Put("ConfigMap", "cm-1", []byte("val-1"))
+	_ = store.Put("ConfigMap", "cm-2", []byte("val-2"))
 	_ = store.Close()
 
 	store2, err := Open(WithFS(memFS), WithDir(dir))
@@ -387,7 +387,7 @@ func TestRegression_Round2_Item1_OversizeDeleteThenReopen(t *testing.T) {
 	}
 
 	oversizeVal := bytes.Repeat([]byte("0123456789abcdef"), 150000) // ~2.4 MiB
-	if err := store.Put("ConfigMap", "large-cm", oversizeVal, "1"); err != nil {
+	if err := store.Put("ConfigMap", "large-cm", oversizeVal); err != nil {
 		t.Fatalf("Put oversize failed: %v", err)
 	}
 
@@ -426,7 +426,7 @@ func TestRegression_Round2_Item2_OversizeToSmallUpdateThenReopen(t *testing.T) {
 	oversizeVal := make([]byte, 2300000) // ~2.2 MiB
 	copy(oversizeVal, []byte("large-payload-block"))
 	_, _ = rand.Read(oversizeVal[len("large-payload-block"):])
-	if err := store.Put("ConfigMap", "cm-transition", oversizeVal, "1"); err != nil {
+	if err := store.Put("ConfigMap", "cm-transition", oversizeVal); err != nil {
 		t.Fatalf("Put oversize failed: %v", err)
 	}
 	if OversizeCount() != initialCount+1 {
@@ -435,7 +435,7 @@ func TestRegression_Round2_Item2_OversizeToSmallUpdateThenReopen(t *testing.T) {
 
 	// Update to small payload
 	smallVal := []byte("small-payload-data")
-	if err := store.Put("ConfigMap", "cm-transition", smallVal, "2"); err != nil {
+	if err := store.Put("ConfigMap", "cm-transition", smallVal); err != nil {
 		t.Fatalf("Put small failed: %v", err)
 	}
 	if OversizeCount() != initialCount {
@@ -480,7 +480,7 @@ func TestRegression_Round2_Item3_OversizeLongNameAndTornFiles(t *testing.T) {
 	key := longNamespace + "/" + longName
 
 	oversizeVal := bytes.Repeat([]byte("a"), 2*1024*1024+100) // > 2 MiB
-	if err := store.Put("ConfigMap", key, oversizeVal, "1"); err != nil {
+	if err := store.Put("ConfigMap", key, oversizeVal); err != nil {
 		t.Fatalf("Put with legal long name failed: %v", err)
 	}
 
@@ -519,8 +519,7 @@ func TestRegression_Round2_Item4_LogicalPageReuseNoLeak(t *testing.T) {
 	payload20KB := bytes.Repeat([]byte("0123456789abcdef"), 1280) // 20 KB (needs 5 4-KiB blocks)
 
 	for i := 0; i < 200; i++ {
-		rv := fmt.Sprintf("%d", i+1)
-		if err := store.Put("ConfigMap", "obj-20kb", payload20KB, rv); err != nil {
+		if err := store.Put("ConfigMap", "obj-20kb", payload20KB); err != nil {
 			t.Fatalf("iteration %d: Put failed: %v", i, err)
 		}
 		if err := store.Delete("ConfigMap", "obj-20kb"); err != nil {
@@ -532,74 +531,6 @@ func TestRegression_Round2_Item4_LogicalPageReuseNoLeak(t *testing.T) {
 	allocatedCount := store.buddy.AllocatedCount()
 	if allocatedCount > 32 {
 		t.Fatalf("buddy allocator leaked blocks across 200 put/delete cycles: %d blocks allocated", allocatedCount)
-	}
-}
-
-// TestEngine_SetTokenNoFakeObject asserts that SetToken does not store fake objects in buckets.
-func TestEngine_SetTokenNoFakeObject(t *testing.T) {
-	memFS := NewMemFS()
-	dir := "test_token_no_fake_obj"
-
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer store.Close()
-
-	// Set progress token
-	if err := store.SetToken("ConfigMap", "99999"); err != nil {
-		t.Fatalf("SetToken failed: %v", err)
-	}
-
-	// ListKeys must be empty
-	keys := store.ListKeys("ConfigMap")
-	if len(keys) != 0 {
-		t.Fatalf("expected 0 keys in store, got %d: %v", len(keys), keys)
-	}
-
-	// List must return empty
-	objs, err := store.List("ConfigMap")
-	if err != nil {
-		t.Fatalf("List failed: %v", err)
-	}
-	if len(objs) != 0 {
-		t.Fatalf("expected 0 objects in store, got %d", len(objs))
-	}
-}
-
-// TestEngine_TokenPerBucket asserts tokens are isolated per bucket.
-func TestEngine_TokenPerBucket(t *testing.T) {
-	memFS := NewMemFS()
-	dir := "test_rv_per_bucket"
-
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-
-	_ = store.Put("ConfigMap", "cm-1", []byte("val-1"), "cm-rv-100")
-	_ = store.Put("Secret", "sec-1", []byte("sec-1"), "secret-rv-500")
-
-	// Secret watch is ahead of ConfigMap watch
-	_ = store.SetToken("Secret", "secret-rv-600")
-
-	_ = store.Close()
-
-	// Reopen store
-	store2, err := Open(WithFS(memFS), WithDir(dir))
-	if err != nil {
-		t.Fatalf("Reopen failed: %v", err)
-	}
-	defer store2.Close()
-
-	// ConfigMap must recover cm-rv-100 (NOT secret-rv-600!)
-	if store2.Token("ConfigMap") != "cm-rv-100" {
-		t.Fatalf("ConfigMap recovered wrong RV: got %q, want %q", store2.Token("ConfigMap"), "cm-rv-100")
-	}
-
-	// Secret must recover secret-rv-600
-	if store2.Token("Secret") != "secret-rv-600" {
-		t.Fatalf("Secret recovered wrong RV: got %q, want %q", store2.Token("Secret"), "secret-rv-600")
 	}
 }
 
@@ -673,7 +604,7 @@ func TestKeyBoundaries_TableTest(t *testing.T) {
 						payload[i] = byte((i*37 + 11) % 256)
 					}
 
-					putErr := store.Put(bucket, tc.key, payload, "rv-1")
+					putErr := store.Put(bucket, tc.key, payload)
 					if putErr != nil {
 						// Must be a non-sticky "too large" error
 						if !errors.Is(putErr, ErrObjectOversize) {
@@ -685,7 +616,7 @@ func TestKeyBoundaries_TableTest(t *testing.T) {
 
 						// Subsequent operations must succeed
 						probeVal := []byte("probe-value")
-						if err := store.Put(bucket, "probe", probeVal, "rv-probe"); err != nil {
+						if err := store.Put(bucket, "probe", probeVal); err != nil {
 							t.Fatalf("Put after non-sticky error failed: %v", err)
 						}
 						got, exists, err := store.Get(bucket, "probe")
@@ -750,7 +681,7 @@ func TestSlottedPage_KeyOver64BytesNearBoundary(t *testing.T) {
 		for i := range payload {
 			payload[i] = byte(i % 251)
 		}
-		if err := store.Put("ConfigMap", key100, payload, fmt.Sprintf("%d", sz)); err != nil {
+		if err := store.Put("ConfigMap", key100, payload); err != nil {
 			t.Fatalf("Put for size %d failed: %v", sz, err)
 		}
 		got, exists, err := store.Get("ConfigMap", key100)
@@ -792,7 +723,7 @@ func TestMultiBlockPage_KeyOver64BytesNearBoundary(t *testing.T) {
 		for i := range payload {
 			payload[i] = byte((i * 13) % 256)
 		}
-		if err := store.Put("ConfigMap", key300, payload, fmt.Sprintf("%d", sz)); err != nil {
+		if err := store.Put("ConfigMap", key300, payload); err != nil {
 			t.Fatalf("Put for size %d failed: %v", sz, err)
 		}
 		got, exists, err := store.Get("ConfigMap", key300)
@@ -847,7 +778,7 @@ func TestMultiBlockPage_RecordSizesBetweenSlottedAndBlockLimitRoundTrip(t *testi
 		payloads[recSize] = payload
 
 		k := fmt.Sprintf("k-%d", recSize)
-		if err := store.Put(bucket, k, payload, fmt.Sprintf("%d", recSize)); err != nil {
+		if err := store.Put(bucket, k, payload); err != nil {
 			t.Fatalf("Put for record size %d failed: %v", recSize, err)
 		}
 
@@ -913,7 +844,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecNone,
 			setup: func(t *testing.T, store *Engine, bucket string) {
 				// Fill active slotted page mostly full with a sibling record
-				if err := store.Put(bucket, "sibling", makeIncompressible(3500), "s-1"); err != nil {
+				if err := store.Put(bucket, "sibling", makeIncompressible(3500)); err != nil {
 					t.Fatalf("Put sibling failed: %v", err)
 				}
 			},
@@ -1139,7 +1070,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 					}
 
 					// 1. Put val1
-					if err := store.Put(bucket, key, tc.val1, "rv-1"); err != nil {
+					if err := store.Put(bucket, key, tc.val1); err != nil {
 						t.Fatalf("Put val1 failed: %v", err)
 					}
 
@@ -1154,7 +1085,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 					store.keyMu.RUnlock()
 
 					// 2. Put val2 (transition)
-					if err := store.Put(bucket, key, tc.val2, "rv-2"); err != nil {
+					if err := store.Put(bucket, key, tc.val2); err != nil {
 						t.Fatalf("Put val2 failed: %v", err)
 					}
 
@@ -1238,7 +1169,7 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 	key := "mb-key"
 	val := makeIncompressible(20 * 1024)
 
-	if err := store.Put(bucket, key, val, "rv-1"); err != nil {
+	if err := store.Put(bucket, key, val); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
@@ -1341,8 +1272,7 @@ func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
 
 		for i := 0; i < objectCount; i++ {
 			key := fmt.Sprintf("bench-key-%05d", i)
-			token := fmt.Sprintf("%d", i)
-			if err := store.Put("bench-bucket", key, payload, token); err != nil {
+			if err := store.Put("bench-bucket", key, payload); err != nil {
 				b.Fatalf("Put failed at %d: %v", i, err)
 			}
 		}
@@ -1373,7 +1303,7 @@ func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 	// Seed keys
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k-%d", i)
-		if err := store.Put(bucket, key, []byte("initial"), "0"); err != nil {
+		if err := store.Put(bucket, key, []byte("initial")); err != nil {
 			t.Fatalf("initial Put failed: %v", err)
 		}
 	}
@@ -1394,7 +1324,7 @@ func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 				default:
 					key := fmt.Sprintf("k-%d", step%numKeys)
 					val := fmt.Sprintf("w%d-%d", writerID, step)
-					_ = store.Put(bucket, key, []byte(val), fmt.Sprintf("%d", step))
+					_ = store.Put(bucket, key, []byte(val))
 					step++
 				}
 			}
@@ -1460,7 +1390,7 @@ func TestGet_MissingOversizeObjectReturnsNotFound(t *testing.T) {
 	key := "oversize-key"
 	payload := makeIncompressible(MaxPayloadCapacity + 1024)
 
-	if err := store.Put(bucket, key, payload, "0"); err != nil {
+	if err := store.Put(bucket, key, payload); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
@@ -1495,7 +1425,7 @@ func TestGet_PinPageFailurePreservesCause(t *testing.T) {
 
 	bucket := "TestBucket"
 	key := "pin-fail-key"
-	if err := store.Put(bucket, key, []byte("val"), "0"); err != nil {
+	if err := store.Put(bucket, key, []byte("val")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
@@ -1552,7 +1482,7 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 			}
 		}()
 
-		if err := store2.Put("ConfigMap", "largeKey", oversizePayload, "1"); err != nil {
+		if err := store2.Put("ConfigMap", "largeKey", oversizePayload); err != nil {
 			t.Fatalf("Put oversize object failed after wipe: %v", err)
 		}
 		val, exists, err := store2.Get("ConfigMap", "largeKey")
@@ -1630,7 +1560,7 @@ func TestRegression_MetaFileReadErrorNoWipe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	if err := store.Put("ConfigMap", "importantKey", []byte("val"), "1"); err != nil {
+	if err := store.Put("ConfigMap", "importantKey", []byte("val")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -1749,7 +1679,7 @@ func TestOpen_CreateOption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open with WithCreate failed: %v", err)
 	}
-	if err := store.Put("ConfigMap", "key1", []byte("val1"), "1"); err != nil {
+	if err := store.Put("ConfigMap", "key1", []byte("val1")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -1859,7 +1789,7 @@ func TestOpen_EraseOnErrorOption(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Open failed: %v", err)
 			}
-			if err := store.Put("ConfigMap", "k1", []byte("val1"), "1"); err != nil {
+			if err := store.Put("ConfigMap", "k1", []byte("val1")); err != nil {
 				t.Fatalf("Put failed: %v", err)
 			}
 			if err := store.Close(); err != nil {
@@ -1950,7 +1880,7 @@ func TestRegression_OversizeWriteAheadRule(t *testing.T) {
 	}()
 
 	oversizePayload := make([]byte, 2100*1024)
-	if err := store.Put(bucket, key, oversizePayload, "1"); err != nil {
+	if err := store.Put(bucket, key, oversizePayload); err != nil {
 		t.Fatalf("Put oversize failed: %v", err)
 	}
 	if !renamed {

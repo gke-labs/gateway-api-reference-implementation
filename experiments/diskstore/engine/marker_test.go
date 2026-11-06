@@ -29,7 +29,7 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 	memFS := engine.NewMemFS()
 	dir := "test_failure_marker_dir"
 
-	// 1. Initial run: write objects with per-bucket progress tokens
+	// 1. Initial run: write objects
 	eng1, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
@@ -41,24 +41,14 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 
 	origDBID := eng1.DBID()
 
-	if err := eng1.Put("bucketA", "k1", []byte("val1"), "token-A-1"); err != nil {
+	if err := eng1.Put("bucketA", "k1", []byte("val1")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
-	if err := eng1.Put("bucketB", "k2", []byte("val2"), "token-B-1"); err != nil {
+	if err := eng1.Put("bucketB", "k2", []byte("val2")); err != nil {
 		t.Fatalf("Put failed: %v", err)
-	}
-	if err := eng1.SetToken("bucketA", "token-A-2"); err != nil {
-		t.Fatalf("SetToken failed: %v", err)
 	}
 	if err := eng1.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
-	}
-
-	if tok := eng1.Token("bucketA"); tok != "token-A-2" {
-		t.Fatalf("expected token-A-2, got %q", tok)
-	}
-	if tok := eng1.Token("bucketB"); tok != "token-B-1" {
-		t.Fatalf("expected token-B-1, got %q", tok)
 	}
 
 	// 2. Simulate a failure: transition into failed state, which writes the failure marker
@@ -76,14 +66,14 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 	}
 
 	// Any operation on failed engine must fail
-	if err := eng1.Put("bucketA", "k3", []byte("val3"), "token-3"); !errors.Is(err, engine.ErrFailed) {
+	if err := eng1.Put("bucketA", "k3", []byte("val3")); !errors.Is(err, engine.ErrFailed) {
 		t.Fatalf("expected ErrFailed on Put after failure, got %v", err)
 	}
 
 	_ = eng1.Close()
 
 	// 3. Reopen: engine must detect the failure marker, wipe the store, report the wipe,
-	// generate a new DB ID, and return no tokens.
+	// and generate a new DB ID.
 	eng2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithEraseOnError())
 	if err != nil {
 		t.Fatalf("reopening store after failure failed: %v", err)
@@ -98,32 +88,20 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 		t.Fatalf("expected new database ID after wipe, got same ID %x", origDBID)
 	}
 
-	tokens := eng2.Tokens()
-	if len(tokens) != 0 {
-		t.Fatalf("expected no tokens after wipe, got %v", tokens)
-	}
-
-	if tok := eng2.Token("bucketA"); tok != "" {
-		t.Fatalf("expected empty token for bucketA after wipe, got %q", tok)
-	}
-	if tok := eng2.Token("bucketB"); tok != "" {
-		t.Fatalf("expected empty token for bucketB after wipe, got %q", tok)
-	}
-
 	keys := eng2.ListKeys()
 	if len(keys) != 0 {
 		t.Fatalf("expected 0 keys after wipe, got %v", keys)
 	}
 
-	// 4. Verify fresh engine works normally and saves tokens
-	if err := eng2.Put("bucketC", "k4", []byte("val4"), "token-C-1"); err != nil {
+	// 4. Verify fresh engine works normally
+	if err := eng2.Put("bucketC", "k4", []byte("val4")); err != nil {
 		t.Fatalf("Put on wiped store failed: %v", err)
 	}
 	if err := eng2.Sync(); err != nil {
 		t.Fatalf("Sync on wiped store failed: %v", err)
 	}
 
-	// 5. Subsequent clean reopen must NOT report wiped and must preserve tokens
+	// 5. Subsequent clean reopen must NOT report wiped and must preserve data
 	_ = eng2.Close()
 
 	eng3, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
@@ -135,8 +113,9 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 	if eng3.Wiped() {
 		t.Fatalf("clean reopen should NOT report Wiped()")
 	}
-	if tok := eng3.Token("bucketC"); tok != "token-C-1" {
-		t.Fatalf("expected token-C-1 after clean reopen, got %q", tok)
+	val, exists, err := eng3.Get("bucketC", "k4")
+	if err != nil || !exists || !bytes.Equal(val, []byte("val4")) {
+		t.Fatalf("expected val4 after clean reopen, got %s (exists=%v, err=%v)", string(val), exists, err)
 	}
 }
 
@@ -149,7 +128,7 @@ func TestEngine_FailureMarkerPreservesUnrelatedFiles(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	if err := eng1.Put("bucket1", "k1", []byte("val1"), "tok-1"); err != nil {
+	if err := eng1.Put("bucket1", "k1", []byte("val1")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 	if err := eng1.Sync(); err != nil {
@@ -245,7 +224,7 @@ func TestEngine_InterruptedWipe_FailurePartWay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	if err := eng1.Put("bucketA", "k1", []byte("val1"), "tok-1"); err != nil {
+	if err := eng1.Put("bucketA", "k1", []byte("val1")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 	if err := eng1.Sync(); err != nil {
@@ -287,15 +266,12 @@ func TestEngine_InterruptedWipe_FailurePartWay(t *testing.T) {
 	if !eng2.Wiped() {
 		t.Fatalf("expected Wiped() == true on successful recovery from interrupted wipe")
 	}
-	if len(eng2.Tokens()) != 0 {
-		t.Fatalf("expected 0 tokens after wipe, got %v", eng2.Tokens())
-	}
 	if keys := eng2.ListKeys(); len(keys) != 0 {
 		t.Fatalf("expected 0 keys after wipe, got %v", keys)
 	}
 
 	// Verify fresh store can write and read normally
-	if err := eng2.Put("bucketA", "k2", []byte("val2"), "tok-2"); err != nil {
+	if err := eng2.Put("bucketA", "k2", []byte("val2")); err != nil {
 		t.Fatalf("Put on recovered store failed: %v", err)
 	}
 	val, exists, err := eng2.Get("bucketA", "k2")
@@ -313,7 +289,7 @@ func TestEngine_OrphanedStoreFilesWithoutMeta_TreatedAsCorrupt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	_ = eng.Put("bucketA", "k1", []byte("val1"), "tok-1")
+	_ = eng.Put("bucketA", "k1", []byte("val1"))
 	_ = eng.Sync()
 	_ = eng.Close()
 
@@ -332,9 +308,6 @@ func TestEngine_OrphanedStoreFilesWithoutMeta_TreatedAsCorrupt(t *testing.T) {
 
 	if !eng2.Wiped() {
 		t.Fatalf("expected Wiped() == true when opening orphaned store without meta.db")
-	}
-	if len(eng2.Tokens()) != 0 {
-		t.Fatalf("expected no tokens from orphaned store, got %v", eng2.Tokens())
 	}
 	if keys := eng2.ListKeys(); len(keys) != 0 {
 		t.Fatalf("expected 0 keys from orphaned store, got %v", keys)

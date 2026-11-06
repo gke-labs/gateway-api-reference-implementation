@@ -37,19 +37,18 @@ const (
 	RecordTypePut        RecordType = 1
 	RecordTypeDelete     RecordType = 2
 	RecordTypeCheckpoint RecordType = 3
-	RecordTypeToken      RecordType = 4
 )
 
 const (
 	// RecordMagic identifies valid log records ('R').
 	RecordMagic byte = 0x52
 
-	// RecordFormatVersion is 1.
-	RecordFormatVersion byte = 1
+	// RecordFormatVersion is 2.
+	RecordFormatVersion byte = 2
 
-	// RecordHeaderSize is 36 bytes:
-	// Magic(1) + Version(1) + Type(1) + Reserved(1) + LSN(8) + RedoStartLSN(8) + KeyLen(4) + PayloadLen(4) + TokenLen(4) + CRC32C(4)
-	RecordHeaderSize = 36
+	// RecordHeaderSize is 32 bytes:
+	// Magic(1) + Version(1) + Type(1) + Reserved(1) + LSN(8) + RedoStartLSN(8) + KeyLen(4) + PayloadLen(4) + CRC32C(4)
+	RecordHeaderSize = 32
 
 	// MaxRecordFieldLength is a sanity check limit (64 MiB).
 	MaxRecordFieldLength = 64 * 1024 * 1024
@@ -62,16 +61,14 @@ type Record struct {
 	RedoStartLSN uint64 // Redo start LSN for Checkpoint records
 	Key          string
 	Payload      []byte
-	Token        string // Opaque per-bucket progress token
 	CRC32C       uint32
 }
 
 // EncodeRecord serializes a record into binary format with a valid CRC32C.
 func EncodeRecord(r Record) []byte {
 	keyBytes := []byte(r.Key)
-	tokenBytes := []byte(r.Token)
 
-	totalLen := RecordHeaderSize + len(keyBytes) + len(r.Payload) + len(tokenBytes)
+	totalLen := RecordHeaderSize + len(keyBytes) + len(r.Payload)
 	buf := make([]byte, totalLen)
 
 	buf[0] = RecordMagic
@@ -83,27 +80,24 @@ func EncodeRecord(r Record) []byte {
 	binary.BigEndian.PutUint64(buf[12:20], r.RedoStartLSN)
 	binary.BigEndian.PutUint32(buf[20:24], uint32(len(keyBytes)))
 	binary.BigEndian.PutUint32(buf[24:28], uint32(len(r.Payload)))
-	binary.BigEndian.PutUint32(buf[28:32], uint32(len(tokenBytes)))
 
 	// Zero CRC field before calculation
-	buf[32] = 0
-	buf[33] = 0
-	buf[34] = 0
-	buf[35] = 0
+	buf[28] = 0
+	buf[29] = 0
+	buf[30] = 0
+	buf[31] = 0
 
 	off := RecordHeaderSize
 	copy(buf[off:], keyBytes)
 	off += len(keyBytes)
 	copy(buf[off:], r.Payload)
-	off += len(r.Payload)
-	copy(buf[off:], tokenBytes)
 
 	// Compute CRC32C over header + body
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	_, _ = h.Write(buf)
 	crc := h.Sum32()
 
-	binary.BigEndian.PutUint32(buf[32:36], crc)
+	binary.BigEndian.PutUint32(buf[28:32], crc)
 	return buf
 }
 
@@ -125,14 +119,13 @@ func DecodeRecord(r io.Reader) (Record, error) {
 	redoStartLSN := binary.BigEndian.Uint64(header[12:20])
 	keyLen := binary.BigEndian.Uint32(header[20:24])
 	payloadLen := binary.BigEndian.Uint32(header[24:28])
-	tokenLen := binary.BigEndian.Uint32(header[28:32])
-	storedCRC := binary.BigEndian.Uint32(header[32:36])
+	storedCRC := binary.BigEndian.Uint32(header[28:32])
 
-	if keyLen > MaxRecordFieldLength || payloadLen > MaxRecordFieldLength || tokenLen > MaxRecordFieldLength {
+	if keyLen > MaxRecordFieldLength || payloadLen > MaxRecordFieldLength {
 		return Record{}, fmt.Errorf("%w: field length exceeds limit", ErrCorruptRecord)
 	}
 
-	bodyLen := int(keyLen) + int(payloadLen) + int(tokenLen)
+	bodyLen := int(keyLen) + int(payloadLen)
 	body := make([]byte, bodyLen)
 	if _, err := io.ReadFull(r, body); err != nil {
 		return Record{}, fmt.Errorf("%w: incomplete record body", ErrCorruptRecord)
@@ -141,10 +134,10 @@ func DecodeRecord(r io.Reader) (Record, error) {
 	// Verify CRC
 	headerCopy := make([]byte, RecordHeaderSize)
 	copy(headerCopy, header)
-	headerCopy[32] = 0
-	headerCopy[33] = 0
-	headerCopy[34] = 0
-	headerCopy[35] = 0
+	headerCopy[28] = 0
+	headerCopy[29] = 0
+	headerCopy[30] = 0
+	headerCopy[31] = 0
 
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	_, _ = h.Write(headerCopy)
@@ -157,7 +150,6 @@ func DecodeRecord(r io.Reader) (Record, error) {
 
 	key := string(body[:keyLen])
 	payload := body[keyLen : keyLen+payloadLen]
-	token := string(body[keyLen+payloadLen:])
 
 	return Record{
 		Type:         recType,
@@ -165,7 +157,6 @@ func DecodeRecord(r io.Reader) (Record, error) {
 		RedoStartLSN: redoStartLSN,
 		Key:          key,
 		Payload:      payload,
-		Token:        token,
 		CRC32C:       storedCRC,
 	}, nil
 }

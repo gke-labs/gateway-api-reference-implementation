@@ -40,8 +40,6 @@ type RecoveryResult struct {
 	Buddy             *BuddyAllocator
 	KeyIndex          map[string]KeyIndexEntry
 	EmptyLogicalPages []uint64
-	LastToken         string
-	LastTokenByBucket map[string]string
 	MaxLSN            uint64
 	NextLogicalPage   uint64
 }
@@ -324,9 +322,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 
 	// Step 4: Scan WAL to find the last checkpoint's redo start LSN
 	var redoStartLSN uint64 = 1
-	var lastToken string
 	var maxWAL_LSN uint64
-	lastTokenByBucket := make(map[string]string)
 
 	walScanIt, err := NewWALIterator(fs, walDir, dbID, 1)
 	if err == nil {
@@ -340,16 +336,6 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 			}
 			if rec.LSN > maxWAL_LSN {
 				maxWAL_LSN = rec.LSN
-			}
-			if rec.Token != "" {
-				lastToken = rec.Token
-				bucket, _ := unqualifyKey(rec.Key)
-				if bucket != "" {
-					lastTokenByBucket[bucket] = rec.Token
-				}
-			}
-			if rec.Type == RecordTypeToken {
-				continue
 			}
 			if rec.Type == RecordTypeCheckpoint && rec.RedoStartLSN > 0 {
 				redoStartLSN = rec.RedoStartLSN
@@ -457,16 +443,6 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 			}
 			if rec.LSN > maxWAL_LSN {
 				maxWAL_LSN = rec.LSN
-			}
-			if rec.Token != "" {
-				lastToken = rec.Token
-				bucket, _ := unqualifyKey(rec.Key)
-				if bucket != "" {
-					lastTokenByBucket[bucket] = rec.Token
-				}
-			}
-			if rec.Type == RecordTypeToken {
-				continue
 			}
 
 			// Apply Put
@@ -734,8 +710,6 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 		Buddy:             buddy,
 		KeyIndex:          keyIndex,
 		EmptyLogicalPages: emptyTracker.Pages(),
-		LastToken:         lastToken,
-		LastTokenByBucket: lastTokenByBucket,
 		MaxLSN:            maxWAL_LSN,
 		NextLogicalPage:   maxRecoveredLogicalPage + 1,
 	}, nil
