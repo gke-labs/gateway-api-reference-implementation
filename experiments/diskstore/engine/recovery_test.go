@@ -73,7 +73,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 	reopenedHeap, _ := faultFS.OpenFile("heap.db", 0, 0)
 	defer reopenedHeap.Close()
 
-	res, err := Recover(faultFS, reopenedHeap, "wal_dir", dbID)
+	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestRecovery_InvalidMagicBlocks(t *testing.T) {
 	_ = heapFile.Sync()
 
 	// Run recovery
-	res, err := Recover(faultFS, heapFile, "wal_dir", dbID)
+	res, err := Recover(faultFS, heapFile, ".", "wal_dir", dbID)
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	reopenedHeap, _ := faultFS.OpenFile("heap.db", 0, 0)
 	defer reopenedHeap.Close()
 
-	res, err := Recover(faultFS, reopenedHeap, "wal_dir", dbID)
+	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	reopenedHeap, _ := faultFS.OpenFile("heap.db", 0, 0)
 	defer reopenedHeap.Close()
 
-	res, err := Recover(faultFS, reopenedHeap, "wal_dir", dbID)
+	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -551,7 +551,7 @@ func TestRegression_Item4_HighestLSNKeySelection(t *testing.T) {
 	reopenedHeap, _ := faultFS.OpenFile("heap.db", 0, 0)
 	defer reopenedHeap.Close()
 
-	res, err := Recover(faultFS, reopenedHeap, "wal_dir", dbID)
+	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -847,7 +847,7 @@ func TestRegression_RecoveryStep6ReuseRule(t *testing.T) {
 		},
 	}
 
-	_, err = Recover(memFS, trackingHeap, "wal", dbID)
+	_, err = Recover(memFS, trackingHeap, ".", "wal", dbID)
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -931,5 +931,56 @@ func TestRegression_OversizeUncommittedDiscard(t *testing.T) {
 	entries, err := memFS.ReadDir(lostDir)
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("expected quarantined file in %s, err=%v, count=%d", lostDir, err, len(entries))
+	}
+}
+
+func TestRegression_OversizeRedoRecreate(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_oversize_redo_recreate"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	payload := make([]byte, 2100*1024)
+	copy(payload, "recreated-from-wal-payload")
+	if err := store.Put("ConfigMap", "largeKey", payload); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Delete the oversize file from disk to simulate missing file
+	qualifiedKey := qualifyKey("ConfigMap", "largeKey")
+	oversizePath := filepath.Join(dir, "oversize", oversizeFileName(qualifiedKey))
+	if err := memFS.Remove(oversizePath); err != nil {
+		t.Fatalf("Remove failed: %v", err)
+	}
+
+	// Reopen store: WAL redo must recreate the oversize file from the WAL payload
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer func() {
+		if closeErr := store2.Close(); closeErr != nil {
+			t.Errorf("store2.Close failed: %v", closeErr)
+		}
+	}()
+
+	val, exists, err := store2.Get("ConfigMap", "largeKey")
+	if err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected largeKey to exist after redo recreation")
+	}
+	if !bytes.HasPrefix(val, []byte("recreated-from-wal-payload")) {
+		t.Fatalf("content mismatch: got %q", string(val[:30]))
 	}
 }
