@@ -55,6 +55,11 @@ func (e *StoreError) Unwrap() error {
 type ResourceVersionStore interface {
 	// Bookmark records a watch bookmark resourceVersion in the store.
 	Bookmark(resourceVersion string)
+	// LastStoreSyncResourceVersion returns the latest resource version that the store has seen.
+	// Resumption from this resourceVersion succeeds as long as the API server still has history
+	// for it (on the order of minutes with default etcd compaction); older resourceVersions
+	// fall back to a re-list.
+	LastStoreSyncResourceVersion() string
 }
 
 // Store is the interface required by WatchLoop to update cached objects.
@@ -126,6 +131,10 @@ func NewWatchLoop(listerWatcher toolscache.ListerWatcher, store Store, options .
 }
 
 // Run runs the watch loop until the context is canceled or a fatal store error occurs.
+// At start-up, if the store provides a stored resourceVersion, the initial LIST is skipped
+// and the watch resumes from it. Resumption only works while the API server still has history
+// for that resourceVersion (on the order of minutes with default compaction); if the
+// resourceVersion has expired (410 Gone / Expired), the loop falls back to LIST and Replace.
 // It stops cleanly on context cancellation with no goroutine leak.
 func (w *WatchLoop) Run(ctx context.Context) error {
 	if w.listerWatcher == nil {
@@ -136,8 +145,8 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 	}
 
 	currentBackoff := w.backoff
-	var resourceVersion string
-	fallbackToList := true
+	resourceVersion := w.store.LastStoreSyncResourceVersion()
+	fallbackToList := resourceVersion == ""
 
 	for {
 		select {
@@ -164,6 +173,7 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 			}
 			resourceVersion = newResourceVersion
 			fallbackToList = false
+			currentBackoff = w.backoff
 		}
 
 		watcher, err := w.listerWatcher.WatchWithContext(ctx, metav1.ListOptions{
@@ -188,6 +198,7 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 
 		start := time.Now()
 		nextResourceVersion, eventCount, err := w.receive(ctx, watcher, resourceVersion)
+		resourceVersion = nextResourceVersion
 		if err != nil {
 			if errors.Is(err, errExpired) {
 				fallbackToList = true
@@ -201,7 +212,6 @@ func (w *WatchLoop) Run(ctx context.Context) error {
 				return nil
 			}
 		} else {
-			resourceVersion = nextResourceVersion
 			if eventCount > 0 || time.Since(start) >= currentBackoff.Duration {
 				currentBackoff = w.backoff
 			} else {
