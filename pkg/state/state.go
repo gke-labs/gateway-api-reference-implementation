@@ -691,8 +691,8 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 
 	var tcpRoutes []*gatewayv1.TCPRoute
 	for _, rState := range s.tcpRoutes {
-		if rState != nil && rState.TCPRoute != nil {
-			tcpRoutes = append(tcpRoutes, rState.TCPRoute)
+		if rState != nil && rState.Route != nil {
+			tcpRoutes = append(tcpRoutes, rState.Route)
 		}
 	}
 	// Precedence order:
@@ -710,8 +710,8 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 
 	var udpRoutes []*gatewayv1.UDPRoute
 	for _, rState := range s.udpRoutes {
-		if rState != nil && rState.UDPRoute != nil {
-			udpRoutes = append(udpRoutes, rState.UDPRoute)
+		if rState != nil && rState.Route != nil {
+			udpRoutes = append(udpRoutes, rState.Route)
 		}
 	}
 	// Precedence order:
@@ -1715,12 +1715,12 @@ func (s *State) UpsertTCPRoute(route *gatewayv1.TCPRoute) {
 
 	key := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 	old := s.tcpRoutes[key]
-	if old != nil && old.TCPRoute != nil && reflect.DeepEqual(old.Spec, route.Spec) && reflect.DeepEqual(old.Labels, route.Labels) && old.Generation == route.Generation {
+	if old != nil && old.Route != nil && reflect.DeepEqual(old.Route.Spec, route.Spec) && reflect.DeepEqual(old.Route.Labels, route.Labels) && old.Route.Generation == route.Generation {
 		return
 	}
 
 	s.tcpRoutes[key] = &TCPRouteState{
-		TCPRoute: route.DeepCopy(),
+		Route: route.DeepCopy(),
 	}
 	s.revision++
 	s.markDirtyLocked()
@@ -1753,12 +1753,12 @@ func (s *State) UpsertUDPRoute(route *gatewayv1.UDPRoute) {
 
 	key := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 	old := s.udpRoutes[key]
-	if old != nil && old.UDPRoute != nil && reflect.DeepEqual(old.Spec, route.Spec) && reflect.DeepEqual(old.Labels, route.Labels) && old.Generation == route.Generation {
+	if old != nil && old.Route != nil && reflect.DeepEqual(old.Route.Spec, route.Spec) && reflect.DeepEqual(old.Route.Labels, route.Labels) && old.Route.Generation == route.Generation {
 		return
 	}
 
 	s.udpRoutes[key] = &UDPRouteState{
-		UDPRoute: route.DeepCopy(),
+		Route: route.DeepCopy(),
 	}
 	s.revision++
 	s.markDirtyLocked()
@@ -1910,13 +1910,13 @@ func (s *State) GetTCPRoutes() []*TCPRouteState {
 	// 1. Creation time (oldest first)
 	// 2. Alphabetically by "{namespace}/{name}"
 	sort.Slice(routes, func(i, j int) bool {
-		if !routes[i].CreationTimestamp.Equal(&routes[j].CreationTimestamp) {
-			return routes[i].CreationTimestamp.Before(&routes[j].CreationTimestamp)
+		if !routes[i].Route.CreationTimestamp.Equal(&routes[j].Route.CreationTimestamp) {
+			return routes[i].Route.CreationTimestamp.Before(&routes[j].Route.CreationTimestamp)
 		}
-		if routes[i].Namespace != routes[j].Namespace {
-			return routes[i].Namespace < routes[j].Namespace
+		if routes[i].Route.Namespace != routes[j].Route.Namespace {
+			return routes[i].Route.Namespace < routes[j].Route.Namespace
 		}
-		return routes[i].Name < routes[j].Name
+		return routes[i].Route.Name < routes[j].Route.Name
 	})
 
 	return routes
@@ -1935,13 +1935,13 @@ func (s *State) GetUDPRoutes() []*UDPRouteState {
 	// 1. Creation time (oldest first)
 	// 2. Alphabetically by "{namespace}/{name}"
 	sort.Slice(routes, func(i, j int) bool {
-		if !routes[i].CreationTimestamp.Equal(&routes[j].CreationTimestamp) {
-			return routes[i].CreationTimestamp.Before(&routes[j].CreationTimestamp)
+		if !routes[i].Route.CreationTimestamp.Equal(&routes[j].Route.CreationTimestamp) {
+			return routes[i].Route.CreationTimestamp.Before(&routes[j].Route.CreationTimestamp)
 		}
-		if routes[i].Namespace != routes[j].Namespace {
-			return routes[i].Namespace < routes[j].Namespace
+		if routes[i].Route.Namespace != routes[j].Route.Namespace {
+			return routes[i].Route.Namespace < routes[j].Route.Namespace
 		}
-		return routes[i].Name < routes[j].Name
+		return routes[i].Route.Name < routes[j].Route.Name
 	})
 
 	return routes
