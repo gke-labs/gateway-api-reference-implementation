@@ -20,6 +20,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/engine"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -27,6 +28,14 @@ import (
 	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 )
+
+// reservedResourceVersionWatch is the reserved watch name used to persist
+// the last synced resourceVersion for each watch.
+const reservedResourceVersionWatch = "//resourceVersions"
+
+// lazyResourceVersionSyncInterval is the maximum frequency at which watch
+// resourceVersions are lazily persisted to the reserved table.
+const lazyResourceVersionSyncInterval = 2 * time.Second
 
 // DefaultOnFatal logs the fatal error at error level and exits the process.
 func DefaultOnFatal(err error) {
@@ -95,7 +104,19 @@ type Indexer struct {
 	indexers   toolscache.Indexers
 	indices    map[string]map[string]map[string]struct{} // indexName -> indexVal -> set of keys
 	revIndices map[string]map[string][]string            // key -> indexName -> []indexVal
-	lastSyncRV string
+
+	// persistMu serializes writes to the reserved table so concurrent flushes
+	// (e.g. from the timer and watch events) never interleave or write out of order.
+	// If both mutexes are held, persistMu must always be acquired before rvMu.
+	persistMu sync.Mutex
+
+	// rvMu guards the in-memory resourceVersion state (lastSyncRV, lastPersistedRV,
+	// lastPersistTime) and the relisting flag.
+	rvMu            sync.Mutex
+	relisting       bool
+	lastSyncRV      string
+	lastPersistedRV string
+	lastPersistTime time.Time
 }
 
 var _ toolscache.Indexer = (*Indexer)(nil)
@@ -123,6 +144,10 @@ func New(eng *engine.Engine, example k8sruntime.Object, onFatal func(error), opt
 		opt(&options)
 	}
 
+	if options.BucketName == reservedResourceVersionWatch {
+		return nil, fmt.Errorf("bucket name %q is reserved", reservedResourceVersionWatch)
+	}
+
 	d := &Indexer{
 		eng:        eng,
 		bucketName: options.BucketName,
@@ -147,15 +172,43 @@ func New(eng *engine.Engine, example k8sruntime.Object, onFatal func(error), opt
 		return nil, err
 	}
 
-	// Listen for asynchronous background engine failures or engine closure
+	payload, exists, err := eng.Get(reservedResourceVersionWatch, d.bucketName)
+	if err != nil {
+		d.fatal(err)
+		return nil, fmt.Errorf("failed to read watch resourceVersion: %w", err)
+	}
+	if exists {
+		d.lastSyncRV = string(payload)
+		d.lastPersistedRV = d.lastSyncRV
+		d.lastPersistTime = time.Now()
+	}
+
+	// Listen for asynchronous background engine failures or engine closure,
+	// and periodically persist watch resourceVersions lazily.
 	go func() {
-		select {
-		case <-eng.Failed():
-			d.fatal(eng.Err())
-		case <-eng.Closed():
-			return
-		case <-d.closed:
-			return
+		ticker := time.NewTicker(lazyResourceVersionSyncInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-eng.Failed():
+				d.fatal(eng.Err())
+				return
+			case <-eng.Closed():
+				return
+			case <-d.closed:
+				return
+			case <-ticker.C:
+				d.rvMu.Lock()
+				rv := d.lastSyncRV
+				needsSync := !d.relisting && rv != "" && rv != d.lastPersistedRV
+				d.rvMu.Unlock()
+				if needsSync {
+					if err := d.persistResourceVersion(rv); err != nil {
+						d.fatal(err)
+						return
+					}
+				}
+			}
 		}
 	}()
 
@@ -203,27 +256,93 @@ func (d *Indexer) getFatalErr() error {
 	return d.fatalErr
 }
 
-// Close terminates the background failure listener.
+// Close terminates the background failure listener and persists the last synced resourceVersion.
 func (d *Indexer) Close() error {
 	select {
 	case <-d.closed:
+		return nil
 	default:
 		close(d.closed)
 	}
+
+	select {
+	case <-d.eng.Closed():
+		return nil
+	default:
+	}
+	if d.isFatal() || d.eng.Err() != nil {
+		return nil
+	}
+
+	d.rvMu.Lock()
+	rv := d.lastSyncRV
+	d.rvMu.Unlock()
+	return d.persistResourceVersion(rv)
+}
+
+// Invariant: Never write a resourceVersion before the Put or Delete for that
+// event has returned. That ordering is what keeps a stored resourceVersion
+// from ever being ahead of the stored data.
+func (d *Indexer) persistResourceVersion(rv string) error {
+	if rv == "" || d.isFatal() {
+		return nil
+	}
+	d.persistMu.Lock()
+	defer d.persistMu.Unlock()
+
+	if err := d.eng.Put(reservedResourceVersionWatch, d.bucketName, []byte(rv), rv); err != nil {
+		return err
+	}
+	d.rvMu.Lock()
+	d.lastPersistedRV = rv
+	d.lastPersistTime = time.Now()
+	d.rvMu.Unlock()
 	return nil
 }
 
-// Add inserts an object into the indexer.
-func (d *Indexer) Add(obj any) error {
-	return d.Update(obj)
+func (d *Indexer) recordEventResourceVersion(rv string) {
+	if rv == "" {
+		return
+	}
+	d.rvMu.Lock()
+	d.lastSyncRV = rv
+	shouldSync := d.lastPersistedRV == "" || time.Since(d.lastPersistTime) >= lazyResourceVersionSyncInterval
+	d.rvMu.Unlock()
+
+	if shouldSync {
+		if err := d.persistResourceVersion(rv); err != nil {
+			d.fatal(err)
+		}
+	}
 }
 
-// Update updates an existing object or inserts a new object.
-func (d *Indexer) Update(obj any) error {
-	if err := d.getFatalErr(); err != nil {
-		return err
+func (d *Indexer) extractResourceVersion(obj any) string {
+	acc, err := meta.Accessor(obj)
+	if err != nil {
+		if dUnknown, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
+			uAcc, uErr := meta.Accessor(dUnknown.Obj)
+			if uErr != nil {
+				d.rvMu.Lock()
+				defer d.rvMu.Unlock()
+				return d.lastSyncRV
+			}
+			if rv := uAcc.GetResourceVersion(); rv != "" {
+				return rv
+			}
+		}
+		d.rvMu.Lock()
+		defer d.rvMu.Unlock()
+		return d.lastSyncRV
 	}
+	if rv := acc.GetResourceVersion(); rv != "" {
+		return rv
+	}
+	d.rvMu.Lock()
+	defer d.rvMu.Unlock()
+	return d.lastSyncRV
+}
 
+func (d *Indexer) putObject(obj any, rv string) error {
 	key, err := d.keyFunc(obj)
 	if err != nil {
 		keyErr := toolscache.KeyError{Obj: obj, Err: err}
@@ -251,23 +370,31 @@ func (d *Indexer) Update(obj any) error {
 		d.fatal(err)
 		return err
 	}
-
-	objRV := ""
-	acc, err := meta.Accessor(obj)
-	if err != nil {
-		objRV = d.lastSyncRV
-	} else {
-		objRV = acc.GetResourceVersion()
-		if objRV == "" {
-			objRV = d.lastSyncRV
-		}
-	}
 	d.mu.Unlock()
 
-	if err := d.eng.Put(d.bucketName, key, encoded, objRV); err != nil {
+	if err := d.eng.Put(d.bucketName, key, encoded, rv); err != nil {
 		d.fatal(err)
 		return err
 	}
+	return nil
+}
+
+// Add inserts an object into the indexer.
+func (d *Indexer) Add(obj any) error {
+	return d.Update(obj)
+}
+
+// Update updates an existing object or inserts a new object.
+func (d *Indexer) Update(obj any) error {
+	if err := d.getFatalErr(); err != nil {
+		return err
+	}
+
+	objRV := d.extractResourceVersion(obj)
+	if err := d.putObject(obj, objRV); err != nil {
+		return err
+	}
+	d.recordEventResourceVersion(objRV)
 	return nil
 }
 
@@ -295,13 +422,14 @@ func (d *Indexer) Delete(obj any) error {
 		}
 		delete(d.revIndices, key)
 	}
-	rv := d.lastSyncRV
 	d.mu.Unlock()
 
-	if err := d.eng.Delete(d.bucketName, key, rv); err != nil {
+	delRV := d.extractResourceVersion(obj)
+	if err := d.eng.Delete(d.bucketName, key, delRV); err != nil {
 		d.fatal(err)
 		return err
 	}
+	d.recordEventResourceVersion(delRV)
 	return nil
 }
 
@@ -310,6 +438,15 @@ func (d *Indexer) Replace(list []any, rv string) error {
 	if err := d.getFatalErr(); err != nil {
 		return err
 	}
+
+	d.rvMu.Lock()
+	d.relisting = true
+	d.rvMu.Unlock()
+	defer func() {
+		d.rvMu.Lock()
+		d.relisting = false
+		d.rvMu.Unlock()
+	}()
 
 	newKeys := make(map[string]struct{}, len(list))
 	for _, item := range list {
@@ -350,14 +487,19 @@ func (d *Indexer) Replace(list []any, rv string) error {
 	}
 
 	for _, item := range list {
-		if err := d.Update(item); err != nil {
+		if err := d.putObject(item, rv); err != nil {
 			return err
 		}
 	}
 
-	d.mu.Lock()
+	d.rvMu.Lock()
+	d.relisting = false
 	d.lastSyncRV = rv
-	d.mu.Unlock()
+	d.rvMu.Unlock()
+	if err := d.persistResourceVersion(rv); err != nil {
+		d.fatal(err)
+		return err
+	}
 	return nil
 }
 
@@ -536,18 +678,14 @@ func (d *Indexer) Index(indexName string, obj any) ([]any, error) {
 	return items, nil
 }
 
-// Bookmark records a watch bookmark resourceVersion in the engine.
+// Bookmark records a watch bookmark resourceVersion in memory and lazily persists it.
+// Callers must invoke Bookmark only after every earlier event has been applied,
+// ensuring the stored resourceVersion is never ahead of queued events.
 func (d *Indexer) Bookmark(rv string) {
 	if d.isFatal() {
 		return
 	}
-	d.mu.Lock()
-	d.lastSyncRV = rv
-	d.mu.Unlock()
-
-	if err := d.eng.SetToken(d.bucketName, rv); err != nil {
-		d.fatal(err)
-	}
+	d.recordEventResourceVersion(rv)
 }
 
 // AddIndexers adds new secondary indexers to the Indexer.
@@ -620,14 +758,11 @@ func (d *Indexer) ListIndexFuncValues(indexName string) []string {
 	return values
 }
 
-// LastStoreSyncResourceVersion returns the last synced resourceVersion or recovered token.
+// LastStoreSyncResourceVersion returns the last synced resourceVersion for the watch.
 func (d *Indexer) LastStoreSyncResourceVersion() string {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.lastSyncRV != "" {
-		return d.lastSyncRV
-	}
-	return d.eng.Token(d.bucketName)
+	d.rvMu.Lock()
+	defer d.rvMu.Unlock()
+	return d.lastSyncRV
 }
 
 // Resync is a no-op required by cache.Indexer.

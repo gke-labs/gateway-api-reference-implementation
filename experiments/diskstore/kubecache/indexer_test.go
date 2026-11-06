@@ -506,7 +506,15 @@ func TestRegression_Round2_Item6_ResourceVersionPerBucket(t *testing.T) {
 	// Secret watch is ahead of ConfigMap watch
 	secretIndexer.Bookmark("secret-rv-600")
 
-	_ = store.Close()
+	if err := cmIndexer.Close(); err != nil {
+		t.Fatalf("cmIndexer.Close failed: %v", err)
+	}
+	if err := secretIndexer.Close(); err != nil {
+		t.Fatalf("secretIndexer.Close failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("store.Close failed: %v", err)
+	}
 
 	// Reopen store and create new indexers
 	store2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
@@ -577,5 +585,205 @@ func TestIndexer_NoGoroutineLeakOnEngineClose(t *testing.T) {
 	}
 	if !returnedToBaseline {
 		t.Fatalf("goroutine leak: expected goroutine count to return to baseline %d, got %d", baseline, current)
+	}
+}
+
+func openTestStoreAndIndexer(t *testing.T, dir string, opts ...engine.Option) (*engine.Engine, *Indexer, engine.FS) {
+	t.Helper()
+	memFS := engine.NewMemFS()
+	allOpts := append([]engine.Option{engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate()}, opts...)
+	store, err := engine.Open(allOpts...)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	idx, err := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	return store, idx, memFS
+}
+
+func TestNew_RejectsReservedBucketName(t *testing.T) {
+	memFS := engine.NewMemFS()
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("test_reserved_bucket"), engine.WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName(reservedResourceVersionWatch)); err == nil {
+		t.Fatalf("expected New with reserved bucket name to fail")
+	}
+}
+
+// TestIndexer_ReplaceResourceVersionAtomicity verifies that items with out-of-order resourceVersions
+// in Replace never cause the persisted resourceVersion to move until Replace returns.
+func TestIndexer_ReplaceResourceVersionAtomicity(t *testing.T) {
+	memFS := engine.NewMemFS()
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("test_replace_rv_atomicity"), engine.WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	var checkedDuringReplace bool
+	idx, err := New(store, &corev1.ConfigMap{}, testOnFatal(t),
+		WithBucketName("ConfigMap"),
+		WithIndexers(toolscache.Indexers{
+			"check": func(obj any) ([]string, error) {
+				payload, exists, err := store.Get(reservedResourceVersionWatch, "ConfigMap")
+				if err == nil && exists {
+					checkedDuringReplace = true
+					if string(payload) != "100" {
+						t.Errorf("persisted RV moved mid-re-list: got %q, want '100'", string(payload))
+					}
+				}
+				return nil, nil
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer idx.Close()
+
+	if err := idx.Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-0", ResourceVersion: "100"}}); err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
+
+	payload, exists, err := store.Get(reservedResourceVersionWatch, "ConfigMap")
+	if err != nil || !exists || string(payload) != "100" {
+		t.Fatalf("expected initial persisted RV '100', got %q", string(payload))
+	}
+
+	// List with items whose resourceVersions are out of order (500 then 300)
+	list := []any{
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-1", ResourceVersion: "500"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-2", ResourceVersion: "300"}},
+	}
+
+	if err := idx.Replace(list, "600"); err != nil {
+		t.Fatalf("Replace failed: %v", err)
+	}
+
+	if !checkedDuringReplace {
+		t.Fatalf("expected check to run during Replace")
+	}
+
+	payload, exists, err = store.Get(reservedResourceVersionWatch, "ConfigMap")
+	if err != nil || !exists || string(payload) != "600" {
+		t.Fatalf("expected persisted RV to equal list RV '600', got %q", string(payload))
+	}
+	if got := idx.LastStoreSyncResourceVersion(); got != "600" {
+		t.Fatalf("expected LastStoreSyncResourceVersion '600', got %q", got)
+	}
+}
+
+// TestIndexer_CrashBeforeLazyResourceVersionWrite verifies that if a crash occurs before
+// the next lazy resourceVersion write, the recovered resourceVersion is at or behind the data, never ahead.
+func TestIndexer_CrashBeforeLazyResourceVersionWrite(t *testing.T) {
+	store, idx, memFS := openTestStoreAndIndexer(t, "test_crash_lazy_rv")
+
+	// 1. Initial write: persists initial resourceVersion "100"
+	if err := idx.Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-1", ResourceVersion: "100"}}); err != nil {
+		t.Fatalf("Add cm1 failed: %v", err)
+	}
+
+	// 2. Write newer objects with resourceVersions "101" and "102".
+	// Within lazyResourceVersionSyncInterval, these are kept in memory and not yet persisted.
+	if err := idx.Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-2", ResourceVersion: "101"}}); err != nil {
+		t.Fatalf("Add cm2 failed: %v", err)
+	}
+	if err := idx.Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-3", ResourceVersion: "102"}}); err != nil {
+		t.Fatalf("Add cm3 failed: %v", err)
+	}
+
+	// 3. Simulate crash before the lazy write occurs: close store directly without idx.Close()
+	if err := store.Close(); err != nil {
+		t.Fatalf("store.Close failed: %v", err)
+	}
+
+	// 4. Reopen and verify recovered resourceVersion is at or behind data ("100"), never ahead
+	store2, err := engine.Open(engine.WithFS(memFS), engine.WithDir("test_crash_lazy_rv"))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	idx2, err := New(store2, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	if err != nil {
+		t.Fatalf("New reopened failed: %v", err)
+	}
+	defer idx2.Close()
+
+	if got := idx2.LastStoreSyncResourceVersion(); got != "100" {
+		t.Fatalf("expected recovered RV to be '100' (at or behind data), got %q", got)
+	}
+	if len(idx2.ListKeys()) != 3 {
+		t.Fatalf("expected 3 objects present after crash recovery, got %d", len(idx2.ListKeys()))
+	}
+}
+
+// TestIndexer_ResourceVersionSurvivesCheckpointTruncation verifies that the watch resourceVersion
+// survives across a checkpoint that truncates WAL segments (Issue #968).
+func TestIndexer_ResourceVersionSurvivesCheckpointTruncation(t *testing.T) {
+	store, idx, memFS := openTestStoreAndIndexer(t, "test_checkpoint_rv_truncation", engine.WithCompressionCodec(engine.CodecNone))
+
+	if err := idx.Add(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-survive", ResourceVersion: "rv-checkpoint-100"}}); err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatalf("idx.Close failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint 1 failed: %v", err)
+	}
+
+	// Write ~18 MB across checkpoints to roll the 16 MiB WAL segment and truncate segment 1
+	putPads := func(start, end int) {
+		pad := bytes.Repeat([]byte("p"), 30*1024)
+		for i := start; i < end; i++ {
+			if err := store.Put("PaddingBucket", fmt.Sprintf("pad-%d", i), pad, ""); err != nil {
+				t.Fatalf("Put pad %d failed: %v", i, err)
+			}
+		}
+	}
+	putPads(0, 560)
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint 2 failed: %v", err)
+	}
+	putPads(560, 580)
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint 3 failed: %v", err)
+	}
+
+	walEntries, err := memFS.ReadDir("test_checkpoint_rv_truncation/wal")
+	if err != nil {
+		t.Fatalf("ReadDir wal failed: %v", err)
+	}
+	for _, e := range walEntries {
+		if e.Name() == "00000000000000000001.wal" {
+			t.Fatalf("expected segment 1 to be truncated after checkpoint")
+		}
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("store.Close failed: %v", err)
+	}
+
+	store2, err := engine.Open(engine.WithFS(memFS), engine.WithDir("test_checkpoint_rv_truncation"))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	idx2, err := New(store2, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	if err != nil {
+		t.Fatalf("New reopened failed: %v", err)
+	}
+	defer idx2.Close()
+
+	if got := idx2.LastStoreSyncResourceVersion(); got != "rv-checkpoint-100" {
+		t.Fatalf("expected recovered RV to survive checkpoint truncation, got %q, want 'rv-checkpoint-100'", got)
 	}
 }
