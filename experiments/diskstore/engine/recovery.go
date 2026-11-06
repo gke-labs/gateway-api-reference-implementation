@@ -106,7 +106,7 @@ func (r *chunkBlockReader) ReadBlock(b uint64) ([]byte, error) {
 
 // Recover scans the heap file, filters out foreign and torn copies, replays the WAL from
 // the last checkpoint's redo start, and rebuilds the in-memory indexes and allocator state.
-func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResult, error) {
+func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte) (*RecoveryResult, error) {
 	// Item 10: Fsync every existing WAL segment and walDir before trusting them
 	entries, err := fs.ReadDir(walDir)
 	if err == nil {
@@ -414,7 +414,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	}
 
 	removeOversizeFileForRedo := func(qKey string) error {
-		oversizePath := filepath.Join(filepath.Dir(walDir), "oversize", oversizeFileName(qKey))
+		oversizePath := filepath.Join(storeDir, "oversize", oversizeFileName(qKey))
 		if err := fs.Remove(oversizePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("failed to remove oversize file %s during redo: %w", oversizePath, err)
 		}
@@ -473,6 +473,9 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 						Slot:        0,
 						LSN:         rec.LSN,
 						IsOversize:  true,
+					}
+					if err := writeOversizeFileWithTemp(fs, storeDir, rec.Key, rec.LSN, rec.Payload); err != nil {
+						return nil, fmt.Errorf("failed to recreate oversize file during redo: %w", err)
 					}
 					continue
 				}
