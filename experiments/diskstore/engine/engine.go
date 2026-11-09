@@ -464,27 +464,22 @@ func Open(opts ...Option) (*Engine, error) {
 			// meta.db exists. Read dbID and store format version.
 			metaBuf := make([]byte, metaFileSize)
 			n, rErr := metaFile.ReadAt(metaBuf, 0)
-			sz, sErr := metaFile.Size()
 			if cErr := metaFile.Close(); cErr != nil {
 				return nil, fmt.Errorf("failed to close meta file: %w", cErr)
 			}
-			if (rErr != nil && !errors.Is(rErr, io.EOF)) || sErr != nil {
-				readErr := rErr
-				if readErr == nil || errors.Is(readErr, io.EOF) {
-					readErr = sErr
-				}
+			if rErr != nil && !errors.Is(rErr, io.EOF) {
 				if !options.EraseOnError {
-					return nil, fmt.Errorf("failed to read meta file: %w", readErr)
+					return nil, fmt.Errorf("failed to read meta file: %w", rErr)
 				}
 				needsErase = true
 				eraseReason = "unreadable meta file"
 				isNewStore = true
 			} else {
 				validVersion := false
-				if sz == int64(metaFileSize) && n >= metaFileSize {
+				if n >= metaFileSize {
 					version := binary.BigEndian.Uint32(metaBuf[16:20])
-					encFlag := metaBuf[20]
-					if version == StoreFormatVersion && (encFlag == 0 || encFlag == 1) {
+					encryptedFlag := metaBuf[20]
+					if version == StoreFormatVersion && (encryptedFlag == 0 || encryptedFlag == 1) {
 						validVersion = true
 						copy(dbID[:], metaBuf[:16])
 					}
@@ -551,8 +546,6 @@ func Open(opts ...Option) (*Engine, error) {
 		binary.BigEndian.PutUint32(metaBuf[16:20], StoreFormatVersion)
 		if isEncrypted(options.Cipher) {
 			metaBuf[20] = 1
-		} else {
-			metaBuf[20] = 0
 		}
 		if _, wErr := metaFile.WriteAt(metaBuf, 0); wErr != nil {
 			closeErr := metaFile.Close()
