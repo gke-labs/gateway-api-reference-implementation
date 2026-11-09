@@ -221,23 +221,42 @@ When `--token-file` is specified, `--client-cert` and `--client-key` are optiona
 
 ### 4. Deploy `snigateway` Controller
 
-#### Using the Dev Task (Kind / Local Cluster)
+Before deploying the controller, complete these prerequisites:
 
-To automatically build the image, load it into a local Kind cluster, install the Gateway API CRDs, and apply the controller manifests:
+1. Install the Gateway API CRDs. For example, run:
+   ```bash
+   kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
+   ```
+2. Create the `snigateway-client-cert` Secret in your target namespace, as shown in Step 3.
+3. Set the `--frontend` argument in `snigateway/k8s/controller.yaml` to the address (`<host-or-ip>:443`) of your `snigateway-frontend` instance. `controller.yaml` ships with `--frontend=snigateway-frontend.example.com:443`. Deployment tools apply the manifest as written.
+
+#### Using `ap deploy`
+
+Target the file `snigateway/k8s/controller.yaml`, not the `snigateway` directory. Deploying the directory also applies `snigateway/k8s/example.yaml`. That manifest creates an example Secret, Service, Gateway, and HTTPRoute.
+
+`ap deploy` does not install the Gateway API CRDs. It also does not create the `snigateway-client-cert` Secret in the target namespace.
+
+To deploy to a cluster using a remote BuildKit host without a local Docker daemon, run this example command:
 
 ```bash
-KUBERNETES_CLUSTER=kind dev/tasks/deploy-snigateway-to-kube
+ap deploy snigateway/k8s/controller.yaml -n <namespace> --cluster <context> --buildkit-host <buildkit-host>
+```
+
+To deploy to a local kind cluster, run this example command:
+
+```bash
+ap deploy snigateway/k8s/controller.yaml --cluster=kind://<name>
 ```
 
 #### Manual Deployment
 
-Deploy the controller RBAC, GatewayClass, and Deployment:
+To deploy the manifests directly using `kubectl`, apply the controller configuration:
+
+For example, run:
 
 ```bash
 kubectl apply -f snigateway/k8s/controller.yaml
 ```
-
-Update the `--frontend` argument in `snigateway/k8s/controller.yaml` (or via `kubectl edit deployment snigateway-controller`) to point to the address (`<host-or-ip>:443`) of your `snigateway-frontend` instance.
 
 ---
 
