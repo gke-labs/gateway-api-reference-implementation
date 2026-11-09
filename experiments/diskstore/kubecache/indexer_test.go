@@ -16,6 +16,7 @@ package kubecache
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -249,16 +250,17 @@ func TestIndexer_WithEncryption(t *testing.T) {
 	_ = indexer.Close()
 	_ = store.Close()
 
-	// Verify reading through store without cipher fails to decompress ciphertext
+	// Verify reopening store without cipher fails with encryption error
 	storeNoCipher, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_crypto_store"))
-	if err != nil {
-		t.Fatalf("Open without cipher failed: %v", err)
-	}
-	defer storeNoCipher.Close()
-
-	_, _, err = storeNoCipher.Get(fmt.Sprintf("%T", secret), "kube-system/sensitive-secret")
 	if err == nil {
-		t.Fatalf("expected Get without cipher to fail on ciphertext, but succeeded")
+		storeNoCipher.Close()
+		t.Fatalf("expected Open without cipher to fail on encrypted store, but succeeded")
+	}
+	if !errors.Is(err, engine.ErrStoreEncrypted) {
+		t.Fatalf("expected ErrStoreEncrypted, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "store is encrypted") {
+		t.Fatalf("expected error to mention that store is encrypted, got: %v", err)
 	}
 
 	// Verify on-disk files do not contain the plaintext token

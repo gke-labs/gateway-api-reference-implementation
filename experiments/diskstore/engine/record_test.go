@@ -108,7 +108,7 @@ func TestEngine_RejectsOldStoreFormatVersion(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
-	// Create meta.db with previous StoreFormatVersion (version 2)
+	// Create meta.db with previous StoreFormatVersion (version 3)
 	metaPath := filepath.Join(dir, "meta.db")
 	mf, err := memFS.Create(metaPath)
 	if err != nil {
@@ -116,7 +116,7 @@ func TestEngine_RejectsOldStoreFormatVersion(t *testing.T) {
 	}
 	var metaBuf [metaFileSize]byte
 	copy(metaBuf[:16], []byte("old-db-id-000001"))
-	binary.BigEndian.PutUint32(metaBuf[16:20], 2) // previous StoreFormatVersion
+	binary.BigEndian.PutUint32(metaBuf[16:20], StoreFormatVersion-1) // previous StoreFormatVersion
 	if _, err := mf.WriteAt(metaBuf[:], 0); err != nil {
 		t.Fatalf("WriteAt meta.db failed: %v", err)
 	}

@@ -341,7 +341,7 @@ func TestEngine_OldFormatVersion_WipedOnOpen(t *testing.T) {
 		t.Fatalf("expected Wiped() == true for store with old 16-byte meta.db format")
 	}
 
-	// Verify meta.db has been rewritten with 20 bytes containing StoreFormatVersion
+	// Verify meta.db has been rewritten with metaFileSize bytes containing StoreFormatVersion
 	metaF, err := memFS.Open(metaPath)
 	if err != nil {
 		t.Fatalf("Open meta.db failed: %v", err)
