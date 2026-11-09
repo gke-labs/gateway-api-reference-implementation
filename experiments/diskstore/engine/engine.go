@@ -320,16 +320,38 @@ func wipeStoreFiles(fs FS, dir string) error {
 	return nil
 }
 
+var (
+	// ErrStoreEncrypted is returned when opening an encrypted store without a cipher.
+	ErrStoreEncrypted = errors.New("store is encrypted: cipher option required")
+
+	// ErrStoreNotEncrypted is returned when opening an unencrypted store with a cipher.
+	ErrStoreNotEncrypted = errors.New("store is not encrypted: cipher option provided")
+)
+
 const (
 	// StoreFormatVersion is the format version recorded in meta.db.
 	// Version 1 did not record a version and stored uncompressed values without a codec byte.
 	// Version 2 records this version in meta.db and prefixes each stored value with a codec byte.
 	// Version 3 removes resourceVersion (token) handling from WAL records and the engine.
-	StoreFormatVersion uint32 = 3
+	// Version 4 records whether the store was created with a cipher in meta.db.
+	StoreFormatVersion uint32 = 4
 
-	// metaFileSize is 16 bytes DB ID + 4 bytes StoreFormatVersion.
-	metaFileSize = 20
+	// metaFileSize is 16 bytes DB ID + 4 bytes StoreFormatVersion + 1 byte encrypted flag.
+	metaFileSize = 21
 )
+
+// isEncrypted reports whether c represents an active encryption cipher.
+func isEncrypted(c Cipher) bool {
+	if c == nil {
+		return false
+	}
+	switch c.(type) {
+	case NoopCipher, *NoopCipher:
+		return false
+	default:
+		return true
+	}
+}
 
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (*Engine, error) {
@@ -456,7 +478,8 @@ func Open(opts ...Option) (*Engine, error) {
 				validVersion := false
 				if n >= metaFileSize {
 					version := binary.BigEndian.Uint32(metaBuf[16:20])
-					if version == StoreFormatVersion {
+					encryptedFlag := metaBuf[20]
+					if version == StoreFormatVersion && (encryptedFlag == 0 || encryptedFlag == 1) {
 						validVersion = true
 						copy(dbID[:], metaBuf[:16])
 					}
@@ -468,6 +491,15 @@ func Open(opts ...Option) (*Engine, error) {
 					needsErase = true
 					eraseReason = "outdated or corrupt meta file"
 					isNewStore = true
+				} else {
+					storeEncrypted := metaBuf[20] == 1
+					optEncrypted := isEncrypted(options.Cipher)
+					if storeEncrypted && !optEncrypted {
+						return nil, ErrStoreEncrypted
+					}
+					if !storeEncrypted && optEncrypted {
+						return nil, ErrStoreNotEncrypted
+					}
 				}
 			}
 		}
@@ -512,6 +544,9 @@ func Open(opts ...Option) (*Engine, error) {
 		metaBuf := make([]byte, metaFileSize)
 		copy(metaBuf[:16], dbID[:])
 		binary.BigEndian.PutUint32(metaBuf[16:20], StoreFormatVersion)
+		if isEncrypted(options.Cipher) {
+			metaBuf[20] = 1
+		}
 		if _, wErr := metaFile.WriteAt(metaBuf, 0); wErr != nil {
 			closeErr := metaFile.Close()
 			return nil, errors.Join(wErr, closeErr)
