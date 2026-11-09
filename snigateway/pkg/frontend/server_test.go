@@ -848,7 +848,7 @@ func TestFailover_UnresponsiveBackend(t *testing.T) {
 	}
 }
 
-func setupTestServerWithUDPAndClient(t *testing.T) (*Server, string, *certs.GeneratedCerts, func()) {
+func setupTestServerWithUDPAndClient(t testing.TB, modifyConfig ...func(*ServerConfig)) (*Server, string, *certs.GeneratedCerts, func()) {
 	t.Helper()
 
 	generated, err := certs.GenerateAll("snigateway.internal", "test-cluster-client")
@@ -873,13 +873,18 @@ func setupTestServerWithUDPAndClient(t *testing.T) (*Server, string, *certs.Gene
 		t.Fatalf("ListenPacket failed: %v", err)
 	}
 
-	srv, err := NewServer(ServerConfig{
+	config := ServerConfig{
 		ServerTLSConfig:   serverTLS,
 		InternalHostname:  "snigateway.internal",
 		ConnectTimeout:    5 * time.Second,
 		PerAttemptTimeout: 500 * time.Millisecond,
 		ReadSNITimeout:    2 * time.Second,
-	})
+	}
+	for _, modify := range modifyConfig {
+		modify(&config)
+	}
+
+	srv, err := NewServer(config)
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
 	}

@@ -1,12 +1,12 @@
-# SNIGateway Tunnel Overhead Benchmarks: TCP Pool vs QUIC vs HTTP/2 CONNECT
+# SNIGateway Tunnel Overhead Benchmarks: TCP Pool vs QUIC vs HTTP/2 CONNECT vs WireGuard
 
-This document records the benchmarking methodology, empirical measurements, CPU profile analysis, optimizations, and architectural recommendations for SNIGateway's reverse tunnel transports (TCP Pool, QUIC, and HTTP/2 CONNECT), addressing [Issue #621](https://github.com/gke-labs/gateway-api-reference-implementation/issues/621) and [Issue #689](https://github.com/gke-labs/gateway-api-reference-implementation/issues/689).
+This document records the benchmarking methodology, empirical measurements, CPU profile analysis, optimizations, and architectural recommendations for SNIGateway's reverse tunnel transports (TCP Pool, QUIC, HTTP/2 CONNECT, and WireGuard), addressing [Issue #621](https://github.com/gke-labs/gateway-api-reference-implementation/issues/621), [Issue #689](https://github.com/gke-labs/gateway-api-reference-implementation/issues/689), and [Issue #1079](https://github.com/gke-labs/gateway-api-reference-implementation/issues/1079).
 
 ---
 
 ## 1. Executive Summary & Transport Recommendations
 
-### Architectural Comparison: Three Transports
+### Architectural Comparison: Four Transports
 1. **QUIC (`--tunnel-transport=quic`)**:
    - 0-RTT/1-RTT stream multiplexing without pre-dialed pool.
    - Survives NAT rebindings and uses a single UDP 4-tuple.
@@ -19,6 +19,11 @@ This document records the benchmarking methodology, empirical measurements, CPU 
    - Multiplexes client streams as HTTP/2 CONNECT streams over a small pool of long-lived mTLS TCP connections (default 4).
    - Combines the burst-latency advantage of stream multiplexing (p50 TTFB comparable to QUIC under WAN delay) with the CPU efficiency of TCP-backed framing (~20% within TCP pool on bulk transfer, more than 2x lower CPU per byte than QUIC).
    - Uses standard HTTP/2 flow control, PING liveness, GOAWAY graceful drain, and error handling.
+4. **WireGuard (`--tunnel-transport=wireguard`)**:
+   - Multiplexes client connections inside an end-to-end WireGuard tunnel using userspace `wireguard-go` and `netstack` on both frontend and backend.
+   - Survives NAT rebinding and operates over a single UDP socket.
+   - Avoids TCP pool burst starvation under WAN latency (achieving ~66 ms p50 TTFB at 20 ms RTT and ~157 ms at 50 ms RTT, though paying 1 RTT for establishing a netstack TCP connection through the tunnel).
+   - Trade-off: Significantly higher CPU consumption (~116 CPU-s/GB) and lower single-stream bulk throughput (~86 MB/s on loopback) due to userspace netstack TCP/IP processing and ChaCha20-Poly1305 framing.
 
 ### Architectural Decision: `auto` Mode
 - `auto` remains QUIC-first in this phase; evaluating switching default to HTTP/2 is planned once comprehensive cluster data is gathered.
@@ -26,11 +31,11 @@ This document records the benchmarking methodology, empirical measurements, CPU 
 
 ### Key Empirical Findings
 1. **Connection Burst Latency (WAN Impairment)**: Under a burst of 32 concurrent requests against a pool size of 8:
-   - At **20 ms RTT**: QUIC TTFB p50 is **59.3 ms** / p99 is **74.3 ms**, whereas TCP Pool degrades to **156.3 ms** p50 / **253.6 ms** p99 (~3.4x higher latency).
-   - At **50 ms RTT**: QUIC TTFB p50 is **137.6 ms** / p99 is **207.6 ms**, whereas TCP Pool degrades to **395.3 ms** p50 / **611.4 ms** p99 (~3.0x higher latency).
-2. **Loopback TTFB with Warm Pool**: On loopback with a warm pre-dialed pool, TCP Pool achieves a faster TTFB (**1.28 ms** vs **1.69 ms**). This is expected because loopback hides the 2–3 RTT connection-dialing penalty, and the pre-dialed TCP connection is already waiting in memory.
-3. **Frontend CPU per Byte at Saturation**: Under sustained bulk transfer saturation on loopback, the frontend process uses **~3.9–4.1 CPU-seconds per GB** with the **TCP Pool** compared to **~9.9–13.4 CPU-seconds per GB** with **QUIC** (~2.5x to 3.4x higher CPU per byte). Because frontend instances carry aggregated traffic from multiple backends, TCP Pool provides higher bulk throughput per CPU core on line-rate frontend VMs.
-4. **Connection Setup Allocations**: QUIC achieves **~45% fewer allocations per connection** (~1,245 allocs/conn) compared to TCP Pool (~2,252 allocs/conn).
+   - At **20 ms RTT**: HTTP/2 CONNECT p50 is **42.5 ms** and QUIC p50 is **48.0 ms** (both stream multiplexed without new connection dials). WireGuard achieves **65.6 ms** p50 (incurring a 1-RTT netstack TCP handshake over the tunnel), whereas TCP Pool degrades to **155.2 ms** p50 / **250.3 ms** p99 (~3.2x higher latency) due to pool exhaustion stalls on new dials.
+   - At **50 ms RTT**: HTTP/2 CONNECT p50 is **102.8 ms**, QUIC p50 is **114.2 ms**, and WireGuard p50 is **156.5 ms**, whereas TCP Pool degrades to **404.0 ms** p50 / **609.3 ms** p99 (~2.6x–3.9x higher latency).
+2. **Loopback TTFB with Warm Pool**: On loopback with a warm pre-dialed pool, TCP Pool achieves a faster TTFB (**1.03 ms**), HTTP/2 CONNECT achieves **1.13 ms**, QUIC achieves **1.20 ms**, and WireGuard achieves **1.48 ms**. This is expected because loopback hides connection-dialing penalties, and the pre-dialed TCP connection is already waiting in memory.
+3. **Frontend CPU per Byte at Saturation**: Under sustained bulk transfer saturation on loopback, the frontend process uses **~3.40 CPU-seconds per GB** with **HTTP/2 CONNECT**, **~3.95 CPU-seconds per GB** with **TCP Pool**, **~13.35 CPU-seconds per GB** with **QUIC**, and **~39.56 CPU-seconds per GB** with **WireGuard** (total process CPU across frontend and backend: ~8.41 s/GB for H2, ~7.52 s/GB for TCP Pool, ~19.78 s/GB for QUIC, and ~115.51 s/GB for WireGuard).
+4. **Connection Setup Allocations**: QUIC and HTTP/2 achieve **~1,138–1,144 allocs/conn**, WireGuard achieves **~1,522 allocs/conn**, and TCP Pool uses **~2,061 allocs/conn**.
 
 ---
 
@@ -54,53 +59,71 @@ Previous benchmarks compared a hand-rolled raw QUIC loop against an `http.Server
 
 ## 3. Benchmark Results
 
-Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27):
+Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27.3, commit 90a731b plus this change):
 
 ### 3.1 Loopback Saturation Baseline (Comparable Transport Data)
 
-| Metric | QUIC | TCP Pool | HTTP/2 CONNECT | Analysis |
-|---|---|---|---|---|
-| **TTFB (p50, warm pool)** | 1.25 ms | 1.13 ms | 1.15 ms | H2 & TCP fastest with 0-RTT pipelining |
-| **TTFB (p99, warm pool)** | 2.24 ms | 2.22 ms | 2.09 ms | All three within ~5% |
-| **Connection Setup Allocations** | 1,159 allocs/conn | 2,230 allocs/conn | 1,124 allocs/conn | **H2 & QUIC lowest allocations** |
-| **Single-Stream Throughput** | 436 MB/s | 708 MB/s | **841 MB/s** | **H2 exceeds TCP pool throughput** |
-| **8-Stream Aggregate Throughput** | 337 MB/s | 3,421 MB/s | **2,532 MB/s** | **H2 7.5x faster than QUIC** |
-| **Throughput Memory Allocations** | 3,329 allocs/MB | 10.8 allocs/MB | **57.1 allocs/MB** | **H2 ~58x fewer allocs than QUIC, 5.7x reduction from #705** |
-| **Frontend Process CPU (separate proc)** | 13.94 CPU-s/GB | 4.34 CPU-s/GB | **3.78 CPU-s/GB** | **H2 frontend CPU lower than TCP pool** |
-| **Backend Process CPU (separate proc)** | 6.34 CPU-s/GB | 3.79 CPU-s/GB | 4.81 CPU-s/GB | H2 close to TCP pool |
-| **Total Process CPU (separate proc)** | 20.28 CPU-s/GB | 8.13 CPU-s/GB | **8.59 CPU-s/GB** | **H2 within 5.6% of TCP pool total CPU** |
+Measured using standalone harness benchmarks: `BenchmarkLatency_*` for TTFB and connection setup allocations, `BenchmarkThroughput_*` for single-stream throughput and allocations, `BenchmarkThroughput_Concurrent_*` for 8-stream aggregate throughput, and `TestBenchmark_SeparateProcessCPU` for frontend and backend process CPU at saturation in separate processes:
+
+| Metric | QUIC | TCP Pool | HTTP/2 CONNECT | WireGuard | Analysis |
+|---|---|---|---|---|---|
+| **TTFB (p50, warm pool)** | 1.20 ms | 1.03 ms | 1.13 ms | 1.48 ms | TCP pool & H2 fastest; WireGuard incurs userspace netstack processing |
+| **TTFB (p99, warm pool)** | 1.59 ms | 2.11 ms | 1.48 ms | 2.18 ms | All four transports around ~1.5–2.2 ms on loopback |
+| **Connection Setup Allocations** | 1,138 allocs/conn | 2,061 allocs/conn | 1,144 allocs/conn | 1,522 allocs/conn | H2 & QUIC lowest allocations; WireGuard allocates userspace TCP endpoints |
+| **Single-Stream Throughput** | 435 MB/s | 742 MB/s | **791 MB/s** | 86 MB/s | WireGuard throughput constrained by userspace netstack and framing |
+| **8-Stream Aggregate Throughput** | 333 MB/s | **3,210 MB/s** | 2,327 MB/s | 72 MB/s | TCP pool & H2 scale across cores; WireGuard event processing bounds stream rate |
+| **Throughput Memory Allocations** | 3,322 allocs/MB | **10.5 allocs/MB** | 57.6 allocs/MB | 18,368 allocs/MB | WireGuard buffer/view churn in userspace packet pipelines |
+| **Frontend Process CPU (separate proc)** | 13.35 CPU-s/GB | 3.95 CPU-s/GB | **3.40 CPU-s/GB** | 39.56 CPU-s/GB | High userspace netstack and WireGuard framing overhead |
+| **Backend Process CPU (separate proc)** | 6.43 CPU-s/GB | **3.57 CPU-s/GB** | 5.01 CPU-s/GB | 75.95 CPU-s/GB | Netstack listener + device encryption/decryption overhead |
+| **Total Process CPU (separate proc)** | 19.78 CPU-s/GB | **7.52 CPU-s/GB** | 8.41 CPU-s/GB | 115.51 CPU-s/GB | WireGuard consumes substantially higher CPU per GB than other transports |
 
 ### 3.2 Connection Burst Latency (Burst = 32, Pool Size = 4–8)
 
-When traffic bursts exceed the warm pool capacity under network RTT, both multiplexed transports (QUIC and HTTP/2 CONNECT) avoid connection-dialing round trips:
+Measured using `BenchmarkLatency_Burst`. When traffic bursts exceed the warm pool capacity under network RTT, QUIC and HTTP/2 stream multiplexing avoid connection-dialing round trips entirely, while WireGuard incurs 1 RTT for establishing a netstack TCP connection through the tunnel:
 
 | Network RTT | Transport | TTFB p50 | TTFB p99 | Comparison |
 |---|---|---|---|---|
-| **20 ms RTT** | **HTTP/2 CONNECT** | **42.5 ms** | **82.6 ms** | **Zero new dial penalty, ~3.7x faster than TCP pool** |
-| | **QUIC** | **48.2 ms** | **69.8 ms** | Fast multiplexing |
-| | TCP Pool | 157.0 ms | 249.4 ms | Pool exhaustion stalls on new dials across RTT |
-| **50 ms RTT** | **HTTP/2 CONNECT** | **102.2 ms** | **203.2 ms** | **Zero new dial penalty, ~4x faster than TCP pool** |
-| | **QUIC** | **122.4 ms** | **206.7 ms** | Fast multiplexing |
-| | TCP Pool | 405.2 ms | 610.0 ms | Multi-RTT handshake penalties compound |
+| **20 ms RTT** | **HTTP/2 CONNECT** | **42.5 ms** | **83.1 ms** | Zero new dial penalty |
+| | **QUIC** | **48.0 ms** | **67.9 ms** | Fast multiplexing |
+| | **WireGuard** | **65.6 ms** | **70.6 ms** | 1-RTT dial penalty (netstack TCP handshake over tunnel), ~2.4x faster than TCP pool |
+| | TCP Pool | 155.2 ms | 250.3 ms | Pool exhaustion stalls on new dials across RTT |
+| **50 ms RTT** | **HTTP/2 CONNECT** | **102.8 ms** | **202.2 ms** | Zero new dial penalty |
+| | **QUIC** | **114.2 ms** | **173.5 ms** | Fast multiplexing |
+| | **WireGuard** | **156.5 ms** | **158.9 ms** | 1-RTT dial penalty (netstack TCP handshake over tunnel), ~2.6x faster than TCP pool |
+| | TCP Pool | 404.0 ms | 609.3 ms | Multi-RTT handshake penalties compound |
 
 ### 3.3 Synthetic In-Process Impairment (Sensitivity Analysis)
 
+Measured using `BenchmarkMatrix` with a 10 MB single-stream transfer per scenario and in-process CPU metrics:
+
 > **Methodological Note on In-Process Impairment**:
 > The in-process `simulatedPacketConn` wrapper intercepts packets in user space by wrapping `net.PacketConn`. Because the wrapper hides the underlying `*net.UDPConn`, **quic-go automatically disables Generic Segmentation Offload (GSO), Generic Receive Offload (GRO), and batch read/write syscalls (`recvmmsg`/`WriteMsgUDP`)**.
+> For WireGuard, the simulated `PacketConn` wraps the controller's WireGuard UDP socket using a batch-size-1 `conn.Bind`. Like QUIC, impaired WireGuard rows lose `recvmmsg`/`sendmmsg` socket batching. Only the controller's socket is impaired, injecting symmetric one-way delay and loss into WireGuard frames comparable to QUIC.
 > Meanwhile, the byte-stream `simulatedConn` wrapper for TCP and HTTP/2 models loss as a per-exchange delay or drop on request-response boundaries rather than kernel-level TCP/IP packet drops on a byte stream.
 > Therefore, in-process synthetic drop rows reflect **sensitivity analysis under user-space simulated delay/loss** rather than kernel congestion control dynamics (e.g. TCP Reno/Cubic loss recovery vs BBR). Cross-transport kernel-level impairment should be tested with `tc netem`.
 
 | In-Process Scenario | Transport | Throughput | Total CPU / GB | Allocs / MB | Notes |
 |---|---|---|---|---|---|
-| **RTT 0ms, Loss 0%** | TCP Pool | 708 MB/s | 8.13 s/GB | 10.8 | Loopback baseline |
-| | H2 | 841 MB/s | 8.59 s/GB | 57.1 | Right-sized framed writes via bounded chunk queues |
-| | QUIC | 436 MB/s | 20.28 s/GB | 3,329 | Userspace UDP crypto & event loop |
-| **RTT 20ms, Loss 0%** | TCP Pool | 294 MB/s | 3.80 s/GB | 15.7 | Pre-dialed pool |
-| | H2 (Pool=4) | 118 MB/s | 6.50 s/GB | 330.0 | High window multiplexing |
-| | QUIC | 138 MB/s | 26.66 s/GB | 5,323 | Simulated RTT delay |
-| **RTT 20ms, Loss 1%** | TCP Pool | 291 MB/s | 4.03 s/GB | 15.7 | Simulated loss delay |
-| | H2 (Pool=4) | 118 MB/s | 6.37 s/GB | 329.4 | Multiplexed stream delay |
-| | QUIC | 0.91 MB/s* | 53.06 s/GB | 5,717 | Drops with default 208 kiB socket buffer |
+| **RTT 0ms, Loss 0%** | TCP Pool | 741 MB/s | 3.87 s/GB | 10.5 | Loopback baseline |
+| | H2 | 766 MB/s | 4.69 s/GB | 199.8 | Framed multiplexing baseline |
+| | QUIC | 400 MB/s | 10.02 s/GB | 3,541 | Userspace UDP crypto & event loop |
+| | WireGuard | 71.9 MB/s | 70.03 s/GB | 19,854 | Userspace netstack & WireGuard framing |
+| **RTT 20ms, Loss 0%** | TCP Pool | 228 MB/s | 4.09 s/GB | 222.1 | Pre-dialed pool |
+| | H2 (Pool=4) | 183 MB/s | 3.87 s/GB | 218.8 | High window multiplexing |
+| | QUIC | 45.8 MB/s | 26.79 s/GB | 6,499 | Simulated RTT delay |
+| | WireGuard | 14.8 MB/s* | 98.45 s/GB | 1,087,091 | Netstack window scaling (measures ~30.5 MB/s and 21,566 allocs/MB in isolated benchmark) |
+| **RTT 20ms, Loss 1%** | TCP Pool | 220 MB/s | 4.55 s/GB | 222.1 | Simulated loss delay |
+| | H2 (Pool=4) | 181 MB/s | 4.24 s/GB | 221.4 | Multiplexed stream delay |
+| | QUIC | 0.90 MB/s* | 56.67 s/GB | 5,744 | Drops with default 208 kiB socket buffer |
+| | WireGuard | 0.75 MB/s | 78.92 s/GB | 60,328 | Loss recovery over impaired UDP socket |
+| **RTT 50ms, Loss 0%** | TCP Pool | 95.8 MB/s | 4.70 s/GB | 222.1 | Pre-dialed pool |
+| | H2 (Pool=4) | 65.8 MB/s | 4.63 s/GB | 218.6 | High window multiplexing |
+| | QUIC | 47.2 MB/s | 24.08 s/GB | 6,396 | Simulated RTT delay |
+| | WireGuard | 13.7 MB/s | 54.67 s/GB | 21,156 | Netstack window scaling under simulated RTT |
+| **RTT 50ms, Loss 1%** | TCP Pool | 95.1 MB/s | 4.58 s/GB | 222.3 | Pre-dialed pool with loss |
+| | H2 (Pool=4) | 65.3 MB/s | 4.27 s/GB | 218.9 | Multiplexed stream delay |
+| | QUIC | 0.44 MB/s* | 76.54 s/GB | 6,009 | Drops with default 208 kiB socket buffer |
+| | WireGuard | 0.30 MB/s | 83.20 s/GB | 42,333 | Loss recovery over impaired UDP socket |
 
 *\*Note on UDP Buffer Sizes*: Under packet loss, quic-go's recovery mechanisms require raised OS socket buffers (`rmem_max` = 7 MiB). Under default Linux container limits (208 kiB), packet loss triggers kernel socket buffer drops.
 
@@ -121,7 +144,7 @@ sudo tc qdisc del dev lo root
 
 ## 4. CPU Profile Analysis (`cpu.pprof`) at Saturation
 
-CPU profiling with `go tool pprof` during 10 MB saturation transfers reveals the internal bottlenecks of both transports:
+CPU profiling with `go tool pprof` during 10 MB saturation transfers reveals the internal bottlenecks of the transports:
 
 ### QUIC Transport Hotspots
 1. **Linux Syscalls (`linux.Syscall6` 40.6%)**:
@@ -141,6 +164,19 @@ CPU profiling with `go tool pprof` during 10 MB saturation transfers reveals the
    - Go standard library TLS 1.3 bulk record decryption.
 3. **Copy Path (`io.CopyBuffer` ~8%)**:
    - Splicing between the pooled TLS tunnel connection and the client connection.
+
+### WireGuard Transport Hotspots
+1. **Userspace TCP/IP Netstack (`gvisor.dev/gvisor/pkg/tcpip` ~35%)**:
+   - In-process TCP state machine, segment processing, loss detection, and window management (`transport/tcp`).
+   - IPv6 packet processing and packet buffer transfers across the channel interface (`network/ipv6`, `link/channel`).
+2. **Linux Syscalls (`linux.Syscall6` / `RawSyscall6` ~24% flat / ~42% cum)**:
+   - Batched UDP datagram sending and receiving (`sendmmsg` / `recvmmsg` via `x/net/internal/socket`).
+   - Kernel socket I/O for client TLS connections and WireGuard UDP sockets.
+3. **WireGuard Device Queues & Encryption (`golang.zx2c4.com/wireguard/device` ~20%)**:
+   - `RoutineSequentialSender` and `RoutineSequentialReceiver` managing staged packet queues.
+   - ChaCha20-Poly1305 symmetric AEAD packet encryption/decryption (`x/crypto/chacha20poly1305` ~3%).
+4. **Buffer & Memory Management (`gvisor.dev/gvisor/pkg/buffer` and `sync.Pool` ~14%)**:
+   - Packet buffer views and chunk allocations/recycling between netstack and the TUN interface.
 
 ---
 
