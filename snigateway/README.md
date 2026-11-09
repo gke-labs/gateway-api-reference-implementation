@@ -221,23 +221,48 @@ When `--token-file` is specified, `--client-cert` and `--client-key` are optiona
 
 ### 4. Deploy `snigateway` Controller
 
-#### Using the Dev Task (Kind / Local Cluster)
+Before deploying the controller, complete these prerequisites:
 
-To automatically build the image, load it into a local Kind cluster, install the Gateway API CRDs, and apply the controller manifests:
+1. Install the Gateway API CRDs. For example, run:
+   ```bash
+   kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
+   ```
+2. Create the target namespace if it does not already exist, and create the `snigateway-client-cert` Secret in that namespace as shown in Step 3.
+3. Set the `--frontend` argument in `snigateway/k8s/controller.yaml` to the address (`<host-or-ip>:443`) of your `snigateway-frontend` instance. `controller.yaml` ships with `--frontend=snigateway-frontend.example.com:443`. Deployment tools apply the manifest as written.
+
+#### Using `ap deploy`
+
+In these commands, `ap` is shorthand for `go run github.com/gke-labs/gke-labs-infra/ap@latest`.
+
+Target the file `snigateway/k8s/controller.yaml`, not the `snigateway` directory. Deploying the directory also applies `snigateway/k8s/example.yaml`, which creates an example Secret, Service, Gateway, and HTTPRoute.
+
+`ap deploy` does not install the Gateway API CRDs. It also does not create the `snigateway-client-cert` Secret in the target namespace.
+
+When you pass `-n <namespace>`, `ap deploy` rewrites `metadata.namespace` on the ServiceAccount and Deployment. It also updates the ServiceAccount subject namespace in the ClusterRoleBinding. The target namespace must already exist in the cluster.
+
+To deploy to a cluster using the cluster's BuildKit daemon without a local Docker daemon, run this example command:
 
 ```bash
-KUBERNETES_CLUSTER=kind dev/tasks/deploy-snigateway-to-kube
+ap deploy snigateway/k8s/controller.yaml -n <namespace> --cluster <context> --buildkit-host k8s
+```
+
+Passing `--buildkit-host k8s` builds the image on the cluster's BuildKit service and pushes it to the registry.
+
+To deploy to a local kind cluster, run this example command:
+
+```bash
+ap deploy snigateway/k8s/controller.yaml --cluster=kind://<name>
 ```
 
 #### Manual Deployment
 
-Deploy the controller RBAC, GatewayClass, and Deployment:
+`snigateway/k8s/controller.yaml` sets `namespace: default` on the ServiceAccount, Deployment, and ClusterRoleBinding subject. To deploy into another namespace with `kubectl`, edit those namespace fields in `controller.yaml` first.
+
+To deploy the manifests directly using `kubectl`, run:
 
 ```bash
 kubectl apply -f snigateway/k8s/controller.yaml
 ```
-
-Update the `--frontend` argument in `snigateway/k8s/controller.yaml` (or via `kubectl edit deployment snigateway-controller`) to point to the address (`<host-or-ip>:443`) of your `snigateway-frontend` instance.
 
 ---
 

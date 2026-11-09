@@ -92,6 +92,8 @@ The git history is the permanent record; the GitHub PR description is not. It is
 
 The project uses the `ap` tool for various tasks. Since `ap` is a custom tool, it should be run using `go run`:
 
+- `go run github.com/gke-labs/gke-labs-infra/ap@latest build`: Build container images and artifacts.
+- `go run github.com/gke-labs/gke-labs-infra/ap@latest deploy`: Build artifacts and deploy manifests to a cluster.
 - `go run github.com/gke-labs/gke-labs-infra/ap@latest generate`: Regenerate any code and format.
 - `go run github.com/gke-labs/gke-labs-infra/ap@latest test`: Run unit tests.
 - `go run github.com/gke-labs/gke-labs-infra/ap@latest e2e`: Run e2e tests.
