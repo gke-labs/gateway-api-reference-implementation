@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -37,7 +38,130 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/tunnel"
 	"github.com/quic-go/quic-go"
+	"golang.zx2c4.com/wireguard/conn"
 )
+
+type packetEndpoint struct {
+	netip.AddrPort
+}
+
+func (e *packetEndpoint) ClearSrc()           {}
+func (e *packetEndpoint) SrcToString() string { return "" }
+func (e *packetEndpoint) DstToString() string { return e.AddrPort.String() }
+func (e *packetEndpoint) DstToBytes() []byte {
+	// AddrPort.MarshalBinary never returns an error in Go standard library netip implementation.
+	binaryData, err := e.AddrPort.MarshalBinary()
+	if err != nil {
+		return nil
+	}
+	return binaryData
+}
+func (e *packetEndpoint) DstIP() netip.Addr { return e.AddrPort.Addr() }
+func (e *packetEndpoint) SrcIP() netip.Addr { return netip.Addr{} }
+
+type simulatedBind struct {
+	mu                        sync.Mutex
+	simulatedPacketConnection *simulatedPacketConn
+	delay                     time.Duration
+	lossRate                  float64
+}
+
+func newSimulatedBind(delay time.Duration, lossRate float64) conn.Bind {
+	return &simulatedBind{delay: delay, lossRate: lossRate}
+}
+
+func (b *simulatedBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.simulatedPacketConnection != nil {
+		return nil, 0, conn.ErrBindAlreadyOpen
+	}
+
+	packetConnection, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return nil, 0, err
+	}
+	simulatedPacketConnection := newSimulatedPacketConn(packetConnection, b.delay, b.lossRate)
+	b.simulatedPacketConnection = simulatedPacketConnection
+
+	receiveFunction := func(packets [][]byte, sizes []int, endpoints []conn.Endpoint) (int, error) {
+		if len(packets) == 0 {
+			return 0, nil
+		}
+		bytesRead, remoteAddress, readErr := simulatedPacketConnection.ReadFrom(packets[0])
+		if readErr != nil {
+			return 0, readErr
+		}
+		sizes[0] = bytesRead
+		udpAddress := remoteAddress.(*net.UDPAddr)
+		endpoints[0] = &packetEndpoint{AddrPort: udpAddress.AddrPort()}
+		return 1, nil
+	}
+	actualPort := uint16(packetConnection.LocalAddr().(*net.UDPAddr).Port)
+	return []conn.ReceiveFunc{receiveFunction}, actualPort, nil
+}
+
+func (b *simulatedBind) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.simulatedPacketConnection != nil {
+		err := b.simulatedPacketConnection.Close()
+		b.simulatedPacketConnection = nil
+		return err
+	}
+	return nil
+}
+
+func (b *simulatedBind) SetMark(mark uint32) error {
+	return nil
+}
+
+func (b *simulatedBind) BatchSize() int {
+	return 1
+}
+
+func (b *simulatedBind) ParseEndpoint(endpointString string) (conn.Endpoint, error) {
+	addressPort, err := netip.ParseAddrPort(endpointString)
+	if err != nil {
+		return nil, err
+	}
+	return &packetEndpoint{AddrPort: addressPort}, nil
+}
+
+func (b *simulatedBind) Send(buffers [][]byte, endpoint conn.Endpoint) error {
+	b.mu.Lock()
+	simulatedPacketConnection := b.simulatedPacketConnection
+	b.mu.Unlock()
+	if simulatedPacketConnection == nil {
+		return net.ErrClosed
+	}
+
+	var destinationAddress *net.UDPAddr
+	if targetEndpoint, ok := endpoint.(*packetEndpoint); ok {
+		destinationAddress = net.UDPAddrFromAddrPort(targetEndpoint.AddrPort)
+	} else {
+		var resolveError error
+		destinationAddress, resolveError = net.ResolveUDPAddr("udp", endpoint.DstToString())
+		if resolveError != nil {
+			return resolveError
+		}
+	}
+
+	for _, buffer := range buffers {
+		if _, writeErr := simulatedPacketConnection.WriteTo(buffer, destinationAddress); writeErr != nil {
+			return writeErr
+		}
+	}
+	return nil
+}
+
+func withBenchmarkServerSettings(config *ServerConfig) {
+	config.ConnectTimeout = 15 * time.Second
+	config.PerAttemptTimeout = 2 * time.Second
+	config.ReadSNITimeout = 5 * time.Second
+	config.WireGuardListenAddr = "127.0.0.1:0"
+}
 
 type benchConfig struct {
 	Transport string
@@ -83,18 +207,18 @@ func setupBenchmarkBackend(b testing.TB, srv *Server, serverAddr string, generat
 	if cfg.RTT > 0 || cfg.Loss > 0 {
 		if cfg.Transport == "quic" {
 			clientOpts = append(clientOpts, client.WithQUICDialFunc(func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error) {
-				pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+				packetConnection, err := net.ListenPacket("udp", "127.0.0.1:0")
 				if err != nil {
 					return nil, err
 				}
-				simPConn := newSimulatedPacketConn(pconn, cfg.RTT/2, cfg.Loss)
-				udpAddr, err := net.ResolveUDPAddr("udp", addr)
+				simulatedPacketConnection := newSimulatedPacketConn(packetConnection, cfg.RTT/2, cfg.Loss)
+				udpAddress, err := net.ResolveUDPAddr("udp", addr)
 				if err != nil {
 					return nil, err
 				}
-				return quic.Dial(ctx, simPConn, udpAddr, tlsConf, quicConf)
+				return quic.Dial(ctx, simulatedPacketConnection, udpAddress, tlsConf, quicConf)
 			}))
-		} else {
+		} else if cfg.Transport != "wireguard" {
 			clientOpts = append(clientOpts, client.WithDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
 				if cfg.RTT > 0 {
 					time.Sleep(cfg.RTT)
@@ -112,6 +236,9 @@ func setupBenchmarkBackend(b testing.TB, srv *Server, serverAddr string, generat
 	ctx, cancel := context.WithCancel(b.Context())
 
 	mgrOpts := []tunnel.ManagerOption{tunnel.WithTransport(cfg.Transport)}
+	if (cfg.RTT > 0 || cfg.Loss > 0) && cfg.Transport == "wireguard" {
+		mgrOpts = append(mgrOpts, tunnel.WithWireGuardBind(newSimulatedBind(cfg.RTT/2, cfg.Loss)))
+	}
 	if cfg.PoolSize > 0 {
 		mgrOpts = append(mgrOpts, tunnel.WithPoolSize(cfg.PoolSize))
 	} else if cfg.Transport == "tcp" || cfg.Transport == "h2" {
@@ -165,7 +292,7 @@ func setupBenchmarkBackend(b testing.TB, srv *Server, serverAddr string, generat
 func runLatencyBenchmark(b *testing.B, cfg benchConfig, hostname string) {
 	checkSocketBufferSizes(b)
 
-	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(&testing.T{})
+	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(b, withBenchmarkServerSettings)
 	defer cleanupSrv()
 
 	_, cleanupBackend := setupBenchmarkBackend(b, srv, serverAddr, generated, hostname, cfg, nil)
@@ -227,7 +354,7 @@ func runLatencyBenchmark(b *testing.B, cfg benchConfig, hostname string) {
 func runThroughputBenchmark(b *testing.B, cfg benchConfig, hostname string) {
 	checkSocketBufferSizes(b)
 
-	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(&testing.T{})
+	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(b, withBenchmarkServerSettings)
 	defer cleanupSrv()
 
 	payload := make([]byte, 10*1024*1024) // 10 MB
@@ -247,7 +374,7 @@ func runThroughputBenchmark(b *testing.B, cfg benchConfig, hostname string) {
 				})
 			},
 		},
-		Timeout: 30 * time.Second,
+		Timeout: 60 * time.Second,
 	}
 
 	b.SetBytes(int64(len(payload)))
@@ -293,7 +420,7 @@ func runThroughputBenchmark(b *testing.B, cfg benchConfig, hostname string) {
 func runConcurrentThroughputBenchmark(b *testing.B, cfg benchConfig, hostname string, concurrency int) {
 	checkSocketBufferSizes(b)
 
-	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(&testing.T{})
+	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(b, withBenchmarkServerSettings)
 	defer cleanupSrv()
 
 	payload := make([]byte, 5*1024*1024) // 5 MB per transfer
@@ -439,6 +566,12 @@ func BenchmarkMatrix(b *testing.B) {
 		{"H2_RTT50ms_Loss0%", benchConfig{Transport: "h2", RTT: 50 * time.Millisecond, Loss: 0, PoolSize: 4}},
 		{"H2_RTT20ms_Loss1%", benchConfig{Transport: "h2", RTT: 20 * time.Millisecond, Loss: 0.01, PoolSize: 4}},
 		{"H2_RTT50ms_Loss1%", benchConfig{Transport: "h2", RTT: 50 * time.Millisecond, Loss: 0.01, PoolSize: 4}},
+
+		{"WireGuard_RTT0ms_Loss0%", benchConfig{Transport: "wireguard", RTT: 0, Loss: 0}},
+		{"WireGuard_RTT20ms_Loss0%", benchConfig{Transport: "wireguard", RTT: 20 * time.Millisecond, Loss: 0}},
+		{"WireGuard_RTT50ms_Loss0%", benchConfig{Transport: "wireguard", RTT: 50 * time.Millisecond, Loss: 0}},
+		{"WireGuard_RTT20ms_Loss1%", benchConfig{Transport: "wireguard", RTT: 20 * time.Millisecond, Loss: 0.01}},
+		{"WireGuard_RTT50ms_Loss1%", benchConfig{Transport: "wireguard", RTT: 50 * time.Millisecond, Loss: 0.01}},
 	}
 
 	for _, sc := range scenarios {
@@ -454,7 +587,7 @@ func BenchmarkMatrix(b *testing.B) {
 func runBurstLatencyBenchmark(b *testing.B, cfg benchConfig, hostname string, burstSize int) {
 	checkSocketBufferSizes(b)
 
-	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(&testing.T{})
+	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(b, withBenchmarkServerSettings)
 	defer cleanupSrv()
 
 	_, cleanupBackend := setupBenchmarkBackend(b, srv, serverAddr, generated, hostname, cfg, nil)
@@ -530,6 +663,8 @@ func BenchmarkLatency_Burst(b *testing.B) {
 		{"TCPPool_RTT50ms", benchConfig{Transport: "tcp", RTT: 50 * time.Millisecond, PoolSize: 8}},
 		{"H2_RTT20ms", benchConfig{Transport: "h2", RTT: 20 * time.Millisecond, PoolSize: 4}},
 		{"H2_RTT50ms", benchConfig{Transport: "h2", RTT: 50 * time.Millisecond, PoolSize: 4}},
+		{"WireGuard_RTT20ms", benchConfig{Transport: "wireguard", RTT: 20 * time.Millisecond}},
+		{"WireGuard_RTT50ms", benchConfig{Transport: "wireguard", RTT: 50 * time.Millisecond}},
 	}
 
 	for _, sc := range scenarios {
@@ -549,9 +684,9 @@ func TestBenchmark_SeparateProcessCPU(t *testing.T) {
 
 	checkSocketBufferSizes(t)
 
-	for _, transport := range []string{"quic", "tcp", "h2"} {
+	for _, transport := range []string{"quic", "tcp", "h2", "wireguard"} {
 		t.Run(transport, func(t *testing.T) {
-			srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(t)
+			srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(t, withBenchmarkServerSettings)
 			defer cleanupSrv()
 			_ = srv
 
@@ -578,7 +713,18 @@ func TestBenchmark_SeparateProcessCPU(t *testing.T) {
 			}
 
 			// Wait for backend child to register
-			time.Sleep(300 * time.Millisecond)
+			deadline := time.Now().Add(10 * time.Second)
+			registered := false
+			for time.Now().Before(deadline) {
+				if len(srv.RegistrationTable().MatchSessions(hostname)) > 0 {
+					registered = true
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !registered {
+				t.Fatalf("backend child for %s failed to register within deadline", hostname)
+			}
 
 			httpClient := &http.Client{
 				Transport: &http.Transport{

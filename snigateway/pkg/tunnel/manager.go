@@ -114,6 +114,15 @@ func WithWireGuardHandshakeMaxAge(d time.Duration) ManagerOption {
 	}
 }
 
+// WithWireGuardBind sets a custom conn.Bind for the controller's WireGuard device.
+// The Manager opens and closes the bind once per WireGuard session, so the bind
+// must support Open again after Close.
+func WithWireGuardBind(bind conn.Bind) ManagerOption {
+	return func(m *Manager) {
+		m.wireguardBind = bind
+	}
+}
+
 // WithH2PingInterval sets the interval for sending HTTP/2 PINGs on idle connections.
 func WithH2PingInterval(d time.Duration) ManagerOption {
 	return func(m *Manager) {
@@ -187,6 +196,7 @@ type Manager struct {
 	h2DrainTimeout            time.Duration
 	wireguardHandshakeTimeout time.Duration
 	wireguardHandshakeMaxAge  time.Duration
+	wireguardBind             conn.Bind
 	backoffMin                time.Duration
 	backoffMax                time.Duration
 
@@ -1697,7 +1707,10 @@ func (m *Manager) runWireGuardSessionWithBackoff(ctx context.Context, backoff *t
 		return
 	}
 
-	bind := conn.NewDefaultBind()
+	bind := m.wireguardBind
+	if bind == nil {
+		bind = conn.NewDefaultBind()
+	}
 	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelSilent, ""))
 	defer dev.Close()
 
