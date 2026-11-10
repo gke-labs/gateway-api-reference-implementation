@@ -302,7 +302,9 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 			log.Printf("certserver: failed to initiate revalidation for %s: %v", hostnamesKey, revalErr)
 		}
 
-		return nil, status.Errorf(codes.Unavailable, "binding verification in progress for %s; retry later", hostnamesKey)
+		return &certserverv1.GetCertificateResponse{
+			Challenges: s.mgr.GetPendingChallenges(ctx, requester),
+		}, nil
 	}
 
 	if !errors.Is(err, cache.ErrNotFound) {
@@ -316,7 +318,9 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 		log.Printf("certserver: failed to initiate issuance for %s: %v", hostnamesKey, err)
 	}
 
-	audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionAllowed, "certificate issuance started; returning retryable status")
+	audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionAllowed, "certificate issuance in progress; returning pending challenges")
 
-	return nil, status.Errorf(codes.Unavailable, "certificate issuance in progress for %s; retry later", hostnamesKey)
+	return &certserverv1.GetCertificateResponse{
+		Challenges: s.mgr.GetPendingChallenges(ctx, requester),
+	}, nil
 }

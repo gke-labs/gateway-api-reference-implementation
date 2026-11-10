@@ -22,7 +22,7 @@ option go_package = "github.com/gke-labs/gateway-api-reference-implementation/ce
 service CertificateService {
   // GetCertificate retrieves a certificate chain (and private key in release mode)
   // for the specified hostnames and Gateway. If not already cached, issuance is
-  // started asynchronously and a retryable status (Unavailable) is returned.
+  // started asynchronously and pending HTTP-01 challenges are returned.
   rpc GetCertificate(GetCertificateRequest) returns (GetCertificateResponse);
 }
 
@@ -43,10 +43,24 @@ message GetCertificateRequest {
   string token = 5;
 }
 
+message HTTP01Challenge {
+  // The hostname for which the challenge is issued.
+  string hostname = 1;
+
+  // The challenge token.
+  string token = 2;
+
+  // The key authorization response string.
+  string key_authorization = 3;
+}
+
 message GetCertificateResponse {
   // PEM-encoded certificate chain (leaf certificate followed by intermediate CA certificates).
   bytes certificate_chain = 1;
 
   // PEM-encoded private key for the leaf certificate (present only in release mode).
   bytes private_key = 2;
+
+  // Pending HTTP-01 challenges that the caller's Gateway should serve.
+  repeated HTTP01Challenge challenges = 3;
 }

@@ -311,15 +311,13 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 
 	callCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 
-	// 8. First call: Expect retryable status (codes.Unavailable) as issuance is started in background
+	// 8. First call: Expect pending response (empty certificate chain) as issuance is started in background
 	resp, err := client.GetCertificate(callCtx, req)
-	if err == nil {
-		t.Fatalf("expected initial call to return Unavailable, but got response: %+v", resp)
+	if err != nil {
+		t.Fatalf("expected initial call to return pending response, got error: %v", err)
 	}
-
-	st, ok := status.FromError(err)
-	if !ok || st.Code() != codes.Unavailable {
-		t.Fatalf("expected status Unavailable, got code %v: %v", st.Code(), err)
+	if len(resp.CertificateChain) > 0 {
+		t.Fatalf("expected empty certificate chain on initial call, got %d bytes", len(resp.CertificateChain))
 	}
 
 	// 9. Verify that binding mapping was recorded immediately
@@ -340,7 +338,7 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 	for time.Now().Before(retryDeadline) {
 		time.Sleep(200 * time.Millisecond)
 		r, err := client.GetCertificate(callCtx, req)
-		if err == nil && r != nil {
+		if err == nil && r != nil && len(r.CertificateChain) > 0 {
 			successResp = r
 			break
 		}
@@ -407,5 +405,152 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 		t.Errorf("expected Unauthenticated, got: %v", err)
 	} else if st.Message() != "authentication failed" {
 		t.Errorf("expected generic message 'authentication failed', got: %q", st.Message())
+	}
+}
+
+// TestGetCertificate_RequesterFromDifferentGatewayDoesNotReceiveChallenge verifies that:
+// a requester from a different Gateway, which isn't a candidate, doesn't receive the challenge.
+func TestGetCertificate_RequesterFromDifferentGatewayDoesNotReceiveChallenge(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	pebble := testserver.StartPebble(t, testserver.ServerConfig{})
+
+	clusterKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate cluster key: %v", err)
+	}
+	const kid = "key-diff-gw"
+	jwksServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(buildTestJWKS(map[string]*rsa.PublicKey{kid: &clusterKey.PublicKey}))
+	}))
+	defer jwksServer.Close()
+
+	const clusterID = "cluster-diff-gw"
+	clusters := []registry.ClusterConfig{
+		{
+			ClusterID:                clusterID,
+			IssuerURL:                jwksServer.URL,
+			JWKSURL:                  jwksServer.URL,
+			ControllerNamespace:      "gateway-system",
+			ControllerServiceAccount: "gari-controller",
+			AllowedHostnames: []string{
+				"shared.example.com",
+			},
+		},
+	}
+	reg, err := registry.NewRegistry(clusters, registry.WithHTTPClient(jwksServer.Client()))
+	if err != nil {
+		t.Fatalf("failed to create registry: %v", err)
+	}
+	defer reg.Close()
+
+	bindingStore := registry.NewMemoryBindingStore()
+	auditLogger := registry.NewAuditLogger(nil)
+	challengeStore := challenge.NewMemoryStore()
+
+	// Register a challenge for Gateway A with candidate Gateway Candidate
+	reqA := challenge.Requester{
+		ClusterID:               clusterID,
+		Gateway:                 "default/gw-a",
+		DataPlaneServiceAccount: "default/dp-a",
+		HostnamesKey:            "shared.example.com",
+	}
+	candidateShared := challenge.Requester{
+		ClusterID:               clusterID,
+		Gateway:                 "default/gw-candidate",
+		DataPlaneServiceAccount: "default/dp-candidate",
+		HostnamesKey:            "shared.example.com",
+	}
+	if err := challengeStore.PutWithCandidates(ctx, "tok-xyz", "shared.example.com", "tok-xyz.auth", time.Now().Add(10*time.Minute), reqA, []challenge.Requester{candidateShared}); err != nil {
+		t.Fatalf("failed to register challenge: %v", err)
+	}
+
+	tempDir := t.TempDir()
+	diskCache, err := cache.NewDiskCache(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create disk cache: %v", err)
+	}
+	accountKey, err := diskCache.LoadOrGenerateAccountKey()
+	if err != nil {
+		t.Fatalf("failed to generate account key: %v", err)
+	}
+	acmeCli, err := acmeclient.NewClient(ctx, acmeclient.Config{
+		DirectoryURL: pebble.DirectoryURL,
+		AccountKey:   accountKey,
+		HTTPClient:   pebble.HTTPClient,
+	})
+	if err != nil {
+		t.Fatalf("failed to create ACME client: %v", err)
+	}
+
+	m := metrics.New(prometheus.NewRegistry())
+	mgr := manager.NewManager(acmeCli, diskCache, challengeStore, m)
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("failed to start manager: %v", err)
+	}
+	defer mgr.Stop()
+
+	srvTLS := generateSelfSignedCert(t)
+	srv, err := NewServer(Options{ListenAddr: "127.0.0.1:0", TLSConfig: srvTLS}, reg, mgr, bindingStore, auditLogger)
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer srv.Stop()
+
+	conn, err := grpc.NewClient(srv.Addr(), grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})))
+	if err != nil {
+		t.Fatalf("failed to connect grpc: %v", err)
+	}
+	defer conn.Close()
+
+	client := certserverv1.NewCertificateServiceClient(conn)
+	token := signControllerToken(t, jwksServer.URL, "system:serviceaccount:gateway-system:gari-controller", clusterKey, kid)
+	callCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+
+	// 1. Gateway A (the primary requester) receives the challenge
+	respA, err := client.GetCertificate(callCtx, &certserverv1.GetCertificateRequest{
+		Hostnames:               []string{"shared.example.com"},
+		Gateway:                 "default/gw-a",
+		DataPlaneServiceAccount: "default/dp-a",
+		ClusterId:               clusterID,
+	})
+	if err != nil {
+		t.Fatalf("Gateway A GetCertificate failed: %v", err)
+	}
+	if len(respA.Challenges) != 1 || respA.Challenges[0].Token != "tok-xyz" {
+		t.Fatalf("expected Gateway A to receive challenge tok-xyz, got %+v", respA.Challenges)
+	}
+
+	// 2. Gateway Candidate (the candidate) receives the challenge
+	respCandidate, err := client.GetCertificate(callCtx, &certserverv1.GetCertificateRequest{
+		Hostnames:               []string{"shared.example.com"},
+		Gateway:                 "default/gw-candidate",
+		DataPlaneServiceAccount: "default/dp-candidate",
+		ClusterId:               clusterID,
+	})
+	if err != nil {
+		t.Fatalf("Gateway Candidate GetCertificate failed: %v", err)
+	}
+	if len(respCandidate.Challenges) != 1 || respCandidate.Challenges[0].Token != "tok-xyz" {
+		t.Fatalf("expected Gateway Candidate to receive challenge tok-xyz, got %+v", respCandidate.Challenges)
+	}
+
+	// 3. Gateway B (unrelated gateway, not candidate) does NOT receive the challenge
+	respB, err := client.GetCertificate(callCtx, &certserverv1.GetCertificateRequest{
+		Hostnames:               []string{"shared.example.com"},
+		Gateway:                 "default/gw-b",
+		DataPlaneServiceAccount: "default/dp-b",
+		ClusterId:               clusterID,
+	})
+	if err != nil {
+		t.Fatalf("Gateway B GetCertificate failed: %v", err)
+	}
+	if len(respB.Challenges) != 0 {
+		t.Fatalf("expected Gateway B to receive 0 challenges, got %d: %+v", len(respB.Challenges), respB.Challenges)
 	}
 }

@@ -145,12 +145,15 @@ func TestPureClient_TokenRotation(t *testing.T) {
 		Hostnames: []string{"example.com"},
 		Gateway:   "default/gw",
 	}
-	tlsCert, leaf, err := cli.GetCertificate(t.Context(), req)
+	tlsCert, leaf, challenges, err := cli.GetCertificate(t.Context(), req)
 	if err != nil {
 		t.Fatalf("GetCertificate failed: %v", err)
 	}
 	if tlsCert == nil || leaf == nil {
 		t.Fatalf("expected parsed tlsCert and leaf")
+	}
+	if len(challenges) != 0 {
+		t.Errorf("expected 0 challenges for issued certificate, got %d", len(challenges))
 	}
 	if got := capturedToken.Load().(string); got != "Bearer token-1" {
 		t.Errorf("expected Bearer token-1, got %q", got)
@@ -162,12 +165,60 @@ func TestPureClient_TokenRotation(t *testing.T) {
 	}
 
 	// Second call uses token-rotated
-	_, _, err = cli.GetCertificate(t.Context(), req)
+	_, _, _, err = cli.GetCertificate(t.Context(), req)
 	if err != nil {
 		t.Fatalf("GetCertificate after rotation failed: %v", err)
 	}
 	if got := capturedToken.Load().(string); got != "Bearer token-rotated" {
 		t.Errorf("expected Bearer token-rotated, got %q", got)
+	}
+}
+
+func TestPureClient_PendingChallengesReturned(t *testing.T) {
+	tempDir := t.TempDir()
+	tokenFile := filepath.Join(tempDir, "token")
+	_ = os.WriteFile(tokenFile, []byte("token"), 0600)
+
+	expectedChallenges := []*certserverv1.HTTP01Challenge{
+		{
+			Hostname:         "example.com",
+			Token:            "chal-tok-123",
+			KeyAuthorization: "chal-tok-123.auth-key-456",
+		},
+	}
+
+	mock := &mockGRPCClient{
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest, opts ...grpc.CallOption) (*certserverv1.GetCertificateResponse, error) {
+			return &certserverv1.GetCertificateResponse{
+				Challenges: expectedChallenges,
+			}, nil
+		},
+	}
+
+	cli, err := New(Config{
+		TokenPath:  tokenFile,
+		GRPCClient: mock,
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer cli.Close()
+
+	tlsCert, leaf, challenges, err := cli.GetCertificate(t.Context(), &certserverv1.GetCertificateRequest{
+		Hostnames: []string{"example.com"},
+		Gateway:   "default/gw",
+	})
+	if err != nil {
+		t.Fatalf("GetCertificate failed: %v", err)
+	}
+	if tlsCert != nil || leaf != nil {
+		t.Errorf("expected nil tlsCert and leaf for pending cert, got cert=%v, leaf=%v", tlsCert, leaf)
+	}
+	if len(challenges) != 1 {
+		t.Fatalf("expected 1 pending challenge, got %d", len(challenges))
+	}
+	if challenges[0].Hostname != "example.com" || challenges[0].Token != "chal-tok-123" || challenges[0].KeyAuthorization != "chal-tok-123.auth-key-456" {
+		t.Errorf("unexpected challenge: %+v", challenges[0])
 	}
 }
 
@@ -191,7 +242,7 @@ func TestPureClient_StatusErrorPreserved(t *testing.T) {
 	}
 	defer cli.Close()
 
-	_, _, err = cli.GetCertificate(t.Context(), &certserverv1.GetCertificateRequest{
+	_, _, _, err = cli.GetCertificate(t.Context(), &certserverv1.GetCertificateRequest{
 		Hostnames: []string{"denied.example.com"},
 	})
 	if err == nil {

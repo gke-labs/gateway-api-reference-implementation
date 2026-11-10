@@ -31,6 +31,7 @@ import (
 	"golang.org/x/crypto/acme"
 	"golang.org/x/sync/singleflight"
 
+	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
@@ -145,6 +146,26 @@ func (m *Manager) GetCertificate(hostnamesKey string, releaseMode bool) (*Certif
 		data.PrivateKey = cachedCert.KeyPEM
 	}
 	return data, nil
+}
+
+// GetPendingChallenges returns any active HTTP-01 challenges matching the given requester.
+func (m *Manager) GetPendingChallenges(ctx context.Context, req challenge.Requester) []*certserverv1.HTTP01Challenge {
+	if m.challengeStore == nil {
+		return nil
+	}
+	items := m.challengeStore.GetChallengesForRequester(ctx, req)
+	if len(items) == 0 {
+		return nil
+	}
+	challenges := make([]*certserverv1.HTTP01Challenge, len(items))
+	for i, item := range items {
+		challenges[i] = &certserverv1.HTTP01Challenge{
+			Hostname:         item.Identifier,
+			Token:            item.Token,
+			KeyAuthorization: item.KeyAuth,
+		}
+	}
+	return challenges
 }
 
 // EnsureIssuance starts asynchronous certificate issuance for the given hostnames

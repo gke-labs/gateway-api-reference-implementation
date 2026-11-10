@@ -116,19 +116,84 @@ func (x *GetCertificateRequest) GetToken() string {
 	return ""
 }
 
+type HTTP01Challenge struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The hostname for which the challenge is issued.
+	Hostname string `protobuf:"bytes,1,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	// The challenge token.
+	Token string `protobuf:"bytes,2,opt,name=token,proto3" json:"token,omitempty"`
+	// The key authorization response string.
+	KeyAuthorization string `protobuf:"bytes,3,opt,name=key_authorization,json=keyAuthorization,proto3" json:"key_authorization,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *HTTP01Challenge) Reset() {
+	*x = HTTP01Challenge{}
+	mi := &file_certserver_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HTTP01Challenge) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HTTP01Challenge) ProtoMessage() {}
+
+func (x *HTTP01Challenge) ProtoReflect() protoreflect.Message {
+	mi := &file_certserver_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HTTP01Challenge.ProtoReflect.Descriptor instead.
+func (*HTTP01Challenge) Descriptor() ([]byte, []int) {
+	return file_certserver_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *HTTP01Challenge) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
+func (x *HTTP01Challenge) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
+func (x *HTTP01Challenge) GetKeyAuthorization() string {
+	if x != nil {
+		return x.KeyAuthorization
+	}
+	return ""
+}
+
 type GetCertificateResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// PEM-encoded certificate chain (leaf certificate followed by intermediate CA certificates).
 	CertificateChain []byte `protobuf:"bytes,1,opt,name=certificate_chain,json=certificateChain,proto3" json:"certificate_chain,omitempty"`
 	// PEM-encoded private key for the leaf certificate (present only in release mode).
-	PrivateKey    []byte `protobuf:"bytes,2,opt,name=private_key,json=privateKey,proto3" json:"private_key,omitempty"`
+	PrivateKey []byte `protobuf:"bytes,2,opt,name=private_key,json=privateKey,proto3" json:"private_key,omitempty"`
+	// Pending HTTP-01 challenges that the caller's Gateway should serve.
+	Challenges    []*HTTP01Challenge `protobuf:"bytes,3,rep,name=challenges,proto3" json:"challenges,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetCertificateResponse) Reset() {
 	*x = GetCertificateResponse{}
-	mi := &file_certserver_proto_msgTypes[1]
+	mi := &file_certserver_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -140,7 +205,7 @@ func (x *GetCertificateResponse) String() string {
 func (*GetCertificateResponse) ProtoMessage() {}
 
 func (x *GetCertificateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_certserver_proto_msgTypes[1]
+	mi := &file_certserver_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -153,7 +218,7 @@ func (x *GetCertificateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCertificateResponse.ProtoReflect.Descriptor instead.
 func (*GetCertificateResponse) Descriptor() ([]byte, []int) {
-	return file_certserver_proto_rawDescGZIP(), []int{1}
+	return file_certserver_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *GetCertificateResponse) GetCertificateChain() []byte {
@@ -170,6 +235,13 @@ func (x *GetCertificateResponse) GetPrivateKey() []byte {
 	return nil
 }
 
+func (x *GetCertificateResponse) GetChallenges() []*HTTP01Challenge {
+	if x != nil {
+		return x.Challenges
+	}
+	return nil
+}
+
 var File_certserver_proto protoreflect.FileDescriptor
 
 const file_certserver_proto_rawDesc = "" +
@@ -181,11 +253,18 @@ const file_certserver_proto_rawDesc = "" +
 	"\x1adata_plane_service_account\x18\x03 \x01(\tR\x17dataPlaneServiceAccount\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x04 \x01(\tR\tclusterId\x12\x14\n" +
-	"\x05token\x18\x05 \x01(\tR\x05token\"f\n" +
+	"\x05token\x18\x05 \x01(\tR\x05token\"p\n" +
+	"\x0fHTTP01Challenge\x12\x1a\n" +
+	"\bhostname\x18\x01 \x01(\tR\bhostname\x12\x14\n" +
+	"\x05token\x18\x02 \x01(\tR\x05token\x12+\n" +
+	"\x11key_authorization\x18\x03 \x01(\tR\x10keyAuthorization\"\xa6\x01\n" +
 	"\x16GetCertificateResponse\x12+\n" +
 	"\x11certificate_chain\x18\x01 \x01(\fR\x10certificateChain\x12\x1f\n" +
 	"\vprivate_key\x18\x02 \x01(\fR\n" +
-	"privateKey2s\n" +
+	"privateKey\x12>\n" +
+	"\n" +
+	"challenges\x18\x03 \x03(\v2\x1e.certserver.v1.HTTP01ChallengeR\n" +
+	"challenges2s\n" +
 	"\x12CertificateService\x12]\n" +
 	"\x0eGetCertificate\x12$.certserver.v1.GetCertificateRequest\x1a%.certserver.v1.GetCertificateResponseBYZWgithub.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1;certserverv1b\x06proto3"
 
@@ -201,19 +280,21 @@ func file_certserver_proto_rawDescGZIP() []byte {
 	return file_certserver_proto_rawDescData
 }
 
-var file_certserver_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_certserver_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
 var file_certserver_proto_goTypes = []any{
 	(*GetCertificateRequest)(nil),  // 0: certserver.v1.GetCertificateRequest
-	(*GetCertificateResponse)(nil), // 1: certserver.v1.GetCertificateResponse
+	(*HTTP01Challenge)(nil),        // 1: certserver.v1.HTTP01Challenge
+	(*GetCertificateResponse)(nil), // 2: certserver.v1.GetCertificateResponse
 }
 var file_certserver_proto_depIdxs = []int32{
-	0, // 0: certserver.v1.CertificateService.GetCertificate:input_type -> certserver.v1.GetCertificateRequest
-	1, // 1: certserver.v1.CertificateService.GetCertificate:output_type -> certserver.v1.GetCertificateResponse
-	1, // [1:2] is the sub-list for method output_type
-	0, // [0:1] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	1, // 0: certserver.v1.GetCertificateResponse.challenges:type_name -> certserver.v1.HTTP01Challenge
+	0, // 1: certserver.v1.CertificateService.GetCertificate:input_type -> certserver.v1.GetCertificateRequest
+	2, // 2: certserver.v1.CertificateService.GetCertificate:output_type -> certserver.v1.GetCertificateResponse
+	2, // [2:3] is the sub-list for method output_type
+	1, // [1:2] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_certserver_proto_init() }
@@ -227,7 +308,7 @@ func file_certserver_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_certserver_proto_rawDesc), len(file_certserver_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

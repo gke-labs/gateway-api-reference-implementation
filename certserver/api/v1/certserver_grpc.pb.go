@@ -44,7 +44,7 @@ const (
 type CertificateServiceClient interface {
 	// GetCertificate retrieves a certificate chain (and private key in release mode)
 	// for the specified hostnames and Gateway. If not already cached, issuance is
-	// started asynchronously and a retryable status (Unavailable) is returned.
+	// started asynchronously and pending HTTP-01 challenges are returned.
 	GetCertificate(ctx context.Context, in *GetCertificateRequest, opts ...grpc.CallOption) (*GetCertificateResponse, error)
 }
 
@@ -74,7 +74,7 @@ func (c *certificateServiceClient) GetCertificate(ctx context.Context, in *GetCe
 type CertificateServiceServer interface {
 	// GetCertificate retrieves a certificate chain (and private key in release mode)
 	// for the specified hostnames and Gateway. If not already cached, issuance is
-	// started asynchronously and a retryable status (Unavailable) is returned.
+	// started asynchronously and pending HTTP-01 challenges are returned.
 	GetCertificate(context.Context, *GetCertificateRequest) (*GetCertificateResponse, error)
 	mustEmbedUnimplementedCertificateServiceServer()
 }
