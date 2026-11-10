@@ -238,6 +238,26 @@ func TestManager_EndToEnd(t *testing.T) {
 	}
 }
 
+// listenTCPAndUDP binds both a UDP PacketConn and a TCP Listener on the same ephemeral port.
+// It binds UDP first (on an ephemeral port) and attempts to bind TCP on that same port,
+// retrying on conflict to avoid assuming that a port free for TCP is also free for UDP.
+func listenTCPAndUDP(t *testing.T) (net.Listener, net.PacketConn) {
+	t.Helper()
+	for i := 0; i < 20; i++ {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("net.ListenPacket failed: %v", err)
+		}
+		ln, err := net.Listen("tcp", pc.LocalAddr().String())
+		if err == nil {
+			return ln, pc
+		}
+		pc.Close()
+	}
+	t.Fatalf("failed to bind both TCP and UDP on the same port after retries")
+	return nil, nil
+}
+
 func TestManager_Transports(t *testing.T) {
 	for _, mode := range []string{TransportModeQUIC, TransportModeTCP, TransportModeAuto, TransportModeH2, TransportModeWireGuard} {
 		t.Run("Mode_"+mode, func(t *testing.T) {
@@ -262,16 +282,8 @@ func TestManager_Transports(t *testing.T) {
 				t.Fatalf("NewServerTLSConfig failed: %v", err)
 			}
 
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatalf("net.Listen failed: %v", err)
-			}
+			ln, pc := listenTCPAndUDP(t)
 			serverAddr := ln.Addr().String()
-
-			pc, err := net.ListenPacket("udp", serverAddr)
-			if err != nil {
-				t.Fatalf("net.ListenPacket failed: %v", err)
-			}
 
 			var wgListen string
 			if mode == TransportModeWireGuard {
