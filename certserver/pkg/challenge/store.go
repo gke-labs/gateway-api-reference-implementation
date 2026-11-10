@@ -64,6 +64,7 @@ type Store interface {
 	Put(ctx context.Context, token string, identifier string, keyAuth string, expiresAt time.Time, req Requester) error
 	PutWithCandidates(ctx context.Context, token string, identifier string, keyAuth string, expiresAt time.Time, req Requester, candidates []Requester) error
 	Get(ctx context.Context, token string) (*Item, error)
+	GetChallengesForRequester(ctx context.Context, req Requester) []*Item
 	RecordAnswer(ctx context.Context, token string, identity registry.CallerIdentity) error
 	Remove(ctx context.Context, token string) error
 }
@@ -133,6 +134,42 @@ func (s *MemoryStore) Get(ctx context.Context, token string) (*Item, error) {
 		copy(cp.CandidateRequesters, item.CandidateRequesters)
 	}
 	return &cp, nil
+}
+
+// GetChallengesForRequester returns all active challenges matching the given requester
+// either as primary requester or as candidate requester.
+func (s *MemoryStore) GetChallengesForRequester(ctx context.Context, req Requester) []*Item {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := s.timeNow()
+	var matches []*Item
+	for _, item := range s.challenges {
+		if !item.ExpiresAt.IsZero() && now.After(item.ExpiresAt) {
+			continue
+		}
+		if requesterMatches(item, req) {
+			cp := *item
+			matches = append(matches, &cp)
+		}
+	}
+	return matches
+}
+
+func requesterMatches(item *Item, req Requester) bool {
+	if item.Requester.ClusterID == req.ClusterID && item.Requester.Gateway == req.Gateway {
+		if req.HostnamesKey == "" || item.Requester.HostnamesKey == "" || item.Requester.HostnamesKey == req.HostnamesKey {
+			return true
+		}
+	}
+	for _, candidate := range item.CandidateRequesters {
+		if candidate.ClusterID == req.ClusterID && candidate.Gateway == req.Gateway {
+			if req.HostnamesKey == "" || candidate.HostnamesKey == "" || candidate.HostnamesKey == req.HostnamesKey {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RecordAnswer appends the answering caller identity to the challenge item.

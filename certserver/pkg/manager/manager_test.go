@@ -68,6 +68,7 @@ func createTestManager(
 	optFns ...func(*Options),
 ) (*Manager, *metrics.Metrics) {
 	t.Helper()
+
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
 
@@ -805,6 +806,13 @@ func (b *brokenChallengeStore) Get(ctx context.Context, token string) (*challeng
 		return nil, challenge.ErrNotFound
 	}
 	return b.store.Get(ctx, token)
+}
+
+func (b *brokenChallengeStore) GetChallengesForRequester(ctx context.Context, req challenge.Requester) []*challenge.Item {
+	if !b.pass {
+		return nil
+	}
+	return b.store.GetChallengesForRequester(ctx, req)
 }
 
 func (b *brokenChallengeStore) RecordAnswer(ctx context.Context, token string, identity registry.CallerIdentity) error {

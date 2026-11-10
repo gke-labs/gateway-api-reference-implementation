@@ -85,3 +85,68 @@ func TestMemoryStore_Lifecycle(t *testing.T) {
 		t.Fatalf("expected ErrNotFound after Remove, got %v", err)
 	}
 }
+
+func TestMemoryStore_GetChallengesForRequester(t *testing.T) {
+	ctx := t.Context()
+	store := NewMemoryStore()
+
+	now := time.Now()
+	store.timeNow = func() time.Time { return now }
+
+	req1 := Requester{
+		ClusterID:    "cluster-1",
+		Gateway:      "default/gw-1",
+		HostnamesKey: "app.example.com",
+	}
+	candidate1 := Requester{
+		ClusterID:    "cluster-1",
+		Gateway:      "default/gw-shared",
+		HostnamesKey: "app.example.com",
+	}
+
+	// 1. Put challenge with primary req1 and candidate candidate1
+	if err := store.PutWithCandidates(ctx, "tok-1", "app.example.com", "keyauth-1", now.Add(10*time.Minute), req1, []Requester{candidate1}); err != nil {
+		t.Fatalf("PutWithCandidates failed: %v", err)
+	}
+
+	// Primary requester matches
+	matches1 := store.GetChallengesForRequester(ctx, req1)
+	if len(matches1) != 1 || matches1[0].Token != "tok-1" {
+		t.Fatalf("expected 1 match for primary requester, got %d", len(matches1))
+	}
+
+	// Candidate requester matches
+	matchesCandidate := store.GetChallengesForRequester(ctx, candidate1)
+	if len(matchesCandidate) != 1 || matchesCandidate[0].Token != "tok-1" {
+		t.Fatalf("expected 1 match for candidate requester, got %d", len(matchesCandidate))
+	}
+
+	// Different gateway in same cluster does not receive challenge
+	reqOtherGW := Requester{
+		ClusterID:    "cluster-1",
+		Gateway:      "default/gw-other",
+		HostnamesKey: "app.example.com",
+	}
+	matchesOtherGW := store.GetChallengesForRequester(ctx, reqOtherGW)
+	if len(matchesOtherGW) != 0 {
+		t.Fatalf("expected 0 matches for unrelated gateway, got %d", len(matchesOtherGW))
+	}
+
+	// Same gateway in different cluster does not receive challenge
+	reqOtherCluster := Requester{
+		ClusterID:    "cluster-2",
+		Gateway:      "default/gw-1",
+		HostnamesKey: "app.example.com",
+	}
+	matchesOtherCluster := store.GetChallengesForRequester(ctx, reqOtherCluster)
+	if len(matchesOtherCluster) != 0 {
+		t.Fatalf("expected 0 matches for unrelated cluster, got %d", len(matchesOtherCluster))
+	}
+
+	// Expired challenge is not returned
+	store.timeNow = func() time.Time { return now.Add(11 * time.Minute) }
+	matchesExpired := store.GetChallengesForRequester(ctx, req1)
+	if len(matchesExpired) != 0 {
+		t.Fatalf("expected 0 matches after expiry, got %d", len(matchesExpired))
+	}
+}
