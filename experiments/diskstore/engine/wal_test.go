@@ -232,13 +232,13 @@ func TestWAL_AppendRecordCompletesWhileWriteOrSyncBlocked(t *testing.T) {
 	// Start a background sync on record 2
 	syncDone := make(chan error, 1)
 	go func() {
-		_, aErr := wal.AppendRecord(&Record{
+		_, appendErr := wal.AppendRecord(&Record{
 			Type:    RecordTypePut,
 			Key:     "k1",
 			Payload: []byte("v1"),
 		})
-		if aErr != nil {
-			syncDone <- aErr
+		if appendErr != nil {
+			syncDone <- appendErr
 			return
 		}
 		syncDone <- wal.Sync()
@@ -254,12 +254,12 @@ func TestWAL_AppendRecordCompletesWhileWriteOrSyncBlocked(t *testing.T) {
 	// Now call AppendRecord from this goroutine: it must complete immediately without waiting for fsync!
 	appendDone := make(chan error, 1)
 	go func() {
-		_, aErr := wal.AppendRecord(&Record{
+		_, appendErr := wal.AppendRecord(&Record{
 			Type:    RecordTypePut,
 			Key:     "k2",
 			Payload: []byte("v2"),
 		})
-		appendDone <- aErr
+		appendDone <- appendErr
 	}()
 
 	select {
@@ -1003,8 +1003,8 @@ func TestRegression_AbandonedWALSegmentOnOpen(t *testing.T) {
 	// Verify abandoned segment was moved out of WAL root
 	abandonedPath := filepath.Join(walDir, segmentFileName(2))
 	if af, err := memFS.Open(abandonedPath); err == nil {
-		if cErr := af.Close(); cErr != nil {
-			t.Errorf("Close failed: %v", cErr)
+		if closeErr := af.Close(); closeErr != nil {
+			t.Errorf("Close failed: %v", closeErr)
 		}
 		t.Fatalf("expected abandoned segment %s to be moved, but still exists", abandonedPath)
 	} else if !errors.Is(err, os.ErrNotExist) {

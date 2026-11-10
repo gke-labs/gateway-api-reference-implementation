@@ -145,11 +145,11 @@ func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error
 	defer f.mu.Unlock()
 	ff, exists := f.files[cleaned]
 	if !exists {
-		var nErr error
-		ff, nErr = newFaultFile(f, cleaned, file)
-		if nErr != nil {
+		var newErr error
+		ff, newErr = newFaultFile(f, cleaned, file)
+		if newErr != nil {
 			closeErr := file.Close()
-			return nil, errors.Join(nErr, closeErr)
+			return nil, errors.Join(newErr, closeErr)
 		}
 		f.files[cleaned] = ff
 	} else {

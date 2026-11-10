@@ -213,9 +213,9 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 				return nil, fmt.Errorf("failed to create lost+found dir: %w", err)
 			}
 			dest := uniqueQuarantinePath(lostDir, seg.name)
-			if rErr := w.fs.Rename(seg.path, dest); rErr != nil {
-				if !errors.Is(rErr, os.ErrNotExist) {
-					return nil, fmt.Errorf("failed to move abandoned segment %s to %s: %w", seg.path, dest, rErr)
+			if renameErr := w.fs.Rename(seg.path, dest); renameErr != nil {
+				if !errors.Is(renameErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("failed to move abandoned segment %s to %s: %w", seg.path, dest, renameErr)
 				}
 				// Safe to ignore if already gone: the abandoned segment cannot cause an LSN collision.
 			} else {

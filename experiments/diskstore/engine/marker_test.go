@@ -249,9 +249,9 @@ func TestEngine_InterruptedWipe_FailurePartWay(t *testing.T) {
 
 	// Because wipe failed, FAILED marker must still be present on disk
 	markerPath := filepath.Join(dir, "FAILED")
-	mf, mErr := faultyFS.OpenFile(markerPath, os.O_RDONLY, 0)
-	if mErr != nil {
-		t.Fatalf("FAILED marker was prematurely removed when wipe failed: %v", mErr)
+	mf, openErr := faultyFS.OpenFile(markerPath, os.O_RDONLY, 0)
+	if openErr != nil {
+		t.Fatalf("FAILED marker was prematurely removed when wipe failed: %v", openErr)
 	}
 	_ = mf.Close()
 
