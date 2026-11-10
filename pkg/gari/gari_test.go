@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1787,7 +1788,7 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 
 	waitForRevision := func(expectedRev string) {
 		t.Helper()
-		var lastRevs map[string]string
+		var lastRevs []string
 		pollErr := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
 			resp, err := httpClient.Get(healthURL)
 			if err != nil {
@@ -1797,19 +1798,22 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				return false, nil
 			}
-			var revs map[string]string
+			var revs []string
 			if err := json.NewDecoder(resp.Body).Decode(&revs); err != nil {
 				return false, err
 			}
 			lastRevs = revs
-			return revs[gwKey.String()] == expectedRev, nil
+			if expectedRev == "" {
+				return len(revs) == 0, nil
+			}
+			return slices.Contains(revs, expectedRev), nil
 		})
 		if pollErr != nil {
 			t.Fatalf("timed out waiting for revision %q, last got: %v", expectedRev, lastRevs)
 		}
 	}
 
-	// 1. Before config is applied: endpoint returns 200 OK with empty revisions map (Gateway appears only after config applied)
+	// 1. Before config is applied: endpoint returns 200 OK with empty revisions list (Gateway appears only after config applied)
 	waitForRevision("")
 
 	// 2. Create initial config Secret
@@ -1894,7 +1898,22 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	// Wait for endpoint to report revision 2
 	waitForRevision(dpConfig2.Revision)
 
-	// 4. Verify security limit: endpoint must NOT be served on Gateway listener (proxy)
+	// 4. Verify security limits:
+	// a) Endpoint returns only revision hashes and reveals no Gateway names or namespaces
+	resp, err := httpClient.Get(healthURL)
+	if err != nil {
+		t.Fatalf("failed to GET applied revisions: %v", err)
+	}
+	defer resp.Body.Close()
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+	if strings.Contains(string(bodyBytes), gwName) || strings.Contains(string(bodyBytes), gwNamespace) {
+		t.Errorf("security violation: applied endpoint exposed gateway identity: %s", string(bodyBytes))
+	}
+
+	// b) Endpoint must NOT be served on Gateway listener (proxy)
 	rec := httptest.NewRecorder()
 	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/_gari/applied", nil)
 	if err != nil {

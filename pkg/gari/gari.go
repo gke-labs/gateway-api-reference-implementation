@@ -664,13 +664,14 @@ func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Han
 	return rHandler, hHandler
 }
 
-func (s *Server) appliedRevisionsCopy() map[string]string {
+func (s *Server) appliedRevisionsList() []string {
 	s.appliedMu.RLock()
 	defer s.appliedMu.RUnlock()
-	revisions := make(map[string]string, len(s.appliedRevisions))
-	for k, v := range s.appliedRevisions {
-		revisions[k] = v
+	revisions := make([]string, 0, len(s.appliedRevisions))
+	for _, rev := range s.appliedRevisions {
+		revisions = append(revisions, rev)
 	}
+	slices.Sort(revisions)
 	return revisions
 }
 
@@ -687,7 +688,7 @@ func (s *Server) appliedHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		revisions := s.appliedRevisionsCopy()
+		revisions := s.appliedRevisionsList()
 		if err := json.NewEncoder(w).Encode(revisions); err != nil {
 			// Disconnects while writing the response are safe to ignore; the probe will retry.
 			klog.Warningf("failed to write applied revisions response: %v", err)
