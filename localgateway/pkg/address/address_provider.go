@@ -57,7 +57,14 @@ type Options struct {
 	InterfaceAddrsFunc func(name string) ([]net.Addr, error)
 }
 
-// AddressProvider determines and reports the node's LAN IP addresses in Gateway status.
+// AddressProvider determines and reports the node's LAN IP addresses in Gateway status
+// for localgateway's in-process data plane.
+//
+// Readiness approximation: reports ready as soon as the node's LAN IP addresses are resolved
+// from the network interface or Node resource, assuming the co-located in-process proxy will serve traffic.
+//
+// Gap: reports ready based purely on address discovery, without verifying that the in-process proxy
+// has bound listener ports or that the Gateway's current configuration is applied and being served.
 type AddressProvider struct {
 	// mu guards client, interfaceName, and nodeName from concurrent read/write access.
 	mu                 sync.RWMutex

@@ -113,6 +113,11 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // AddressProvider returns the addresses to report in Gateway.status.addresses and whether the Gateway infrastructure is ready.
 // An empty result means the address is not assigned yet.
+//
+// The ready flag indicates whether the data path from the reported addresses to this Gateway's
+// listeners is serving the Gateway's current configuration, as far as the provider can tell.
+// Concrete providers approximate this readiness contract using available infrastructure signals,
+// but fall short of confirming that the latest configuration revision is actively being served.
 type AddressProvider interface {
 	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) (addresses []gatewayv1.GatewayStatusAddress, ready bool, err error)
 }
@@ -125,6 +130,11 @@ type AddressWatcher interface {
 
 // AddressReadinessProvider is an optional interface that an AddressProvider can implement
 // to report addresses and detailed readiness state (including reason and message) in a single call.
+// GatewayReadiness.Ready shares the same semantics as AddressProvider's ready return value:
+// the data path from the reported addresses to this Gateway's listeners is serving the Gateway's
+// current configuration, as far as the provider can tell. Like AddressProvider, providers
+// implementing AddressReadinessProvider approximate this signal and fall short of an end-to-end
+// confirmation that the current configuration is applied by all data-plane replicas.
 type AddressReadinessProvider interface {
 	GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error)
 }
