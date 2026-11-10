@@ -8,7 +8,7 @@ certserver operates on a core principle:
 
 > certserver never grants more than ACME HTTP-01 would grant to the same network position.
 
-certserver acts as an Automated Certificate Management Environment (ACME) client toward public certificate authorities such as Google Public CA and Let's Encrypt. certserver uses the HTTP-01 challenge type exclusively. It holds no DNS credentials and does not edit DNS records.
+certserver acts as an Automated Certificate Management Environment (ACME) client toward public certificate authorities such as Google Public CA and Let's Encrypt. certserver uses the HTTP-01 challenge type. It holds no DNS credentials and does not edit DNS records.
 
 GARI data planes participate directly in challenge verification by serving HTTP-01 challenges from memory ("serve, don't forward"). When certserver needs HTTP-01 validation for a requester, its `GetCertificate` reply says the certificate is pending and lists the challenges to serve: hostname, token, and key authorization. None of these is secret, because certificate authorities fetch key authorizations over plain HTTP. The GARI controller inserts these challenges into the requesting Gateway's data-plane config. The data plane answers exactly those `GET /.well-known/acme-challenge/<token>` requests for that hostname from memory. Every other path takes normal HTTPRoute routing immediately without timing dependencies or fall-through timeouts. certserver fetches each challenge URL itself (a self-check) and asks the certificate authority to validate only after the self-check succeeds.
 
@@ -30,7 +30,7 @@ This design separates key custody from TLS termination. GARI selects certificate
 1. **Keep private keys and DNS credentials out of Kubernetes clusters (end-state goal).** GARI clusters run no ACME clients and store no DNS update credentials. Phase 1 provides an exception for key delivery: the controller receives keys from certserver and writes them to GARI's per-Gateway config Secret, which stores them in etcd. In the end state, certserver keeps keys out of etcd by releasing them directly to data-plane memory or by retaining them on certserver for keyless signing.
 2. **Centralize issuance and renewal.** certserver caches certificates by normalized hostname set. Multiple Gateways and clusters that serve the same hostnames share one certificate, which avoids duplicate orders and conserves certificate authority rate limits.
 3. **Derive authorization from the real network path.** certserver validates domain control by routing HTTP-01 challenges through public DNS and the data plane. It requires no secondary policy language to grant certificates for public hostnames.
-4. **Prevent cross-Gateway certificate hijacking.** certserver binds each challenge by returning it exclusively to the requesting Gateway (and its shared-front-end candidates). A Gateway cannot obtain certificates for hostnames that route to a different Gateway.
+4. **Prevent cross-Gateway certificate hijacking.** certserver binds each challenge by returning it to the requesting Gateway (and its shared-front-end candidates). A Gateway cannot obtain certificates for hostnames that route to a different Gateway.
 5. **Support gradual security hardening.** The architecture supports releasing certificates and keys to data planes in phase 1, keyless remote signing in phase 2, and private certificate authority issuance in phase 3.
 
 ## Non-Goals
@@ -124,8 +124,8 @@ The upstream certificate authority (such as Google Public CA or Let's Encrypt) i
 This architecture defines clear boundaries between components:
 
 1. **Public Internet to Data Plane:** Incoming traffic on port 80 and port 443 comes from untrusted clients, certserver self-checks, and public certificate authorities. The data plane exposes only standard HTTP and HTTPS ports to the internet.
-2. **Cluster to certserver Network:** Communication between cluster components and certserver is strictly controller-to-certserver over gRPC/TLS using projected service-account bearer tokens. certserver exposes only its gRPC API; it exposes no challenge endpoint, and data planes never connect to certserver.
-3. **Controller versus Data Plane Roles:** The GARI controller is the only component that authenticates to certserver to request certificates. The data plane receives its configuration (certificates, keys, and pending challenge tokens to serve) strictly from the controller via Kubernetes configuration. The data plane holds no certserver credentials, has no access to certserver APIs, and cannot request certificates or forward challenges.
+2. **Cluster to certserver Network:** Communication between cluster components and certserver is limited to controller-to-certserver over gRPC/TLS using projected service-account bearer tokens. certserver exposes only its gRPC API; it exposes no challenge endpoint, and data planes do not connect to certserver.
+3. **Controller versus Data Plane Roles:** The GARI controller is the only component that authenticates to certserver to request certificates. The data plane receives its configuration (certificates, keys, and pending challenge tokens to serve) from the controller via Kubernetes configuration. The data plane holds no certserver credentials, has no access to certserver APIs, and cannot request certificates or forward challenges.
 4. **Inter-Cluster Boundary:** Clusters share a certserver instance but do not trust each other. A workload in cluster A cannot view, modify, or obtain certificates intended for cluster B without explicit configuration in a shared-front-end group.
 5. **Host Isolation:** certserver runs on an isolated operating system outside Kubernetes. Kubernetes cluster administrators have no access to certserver host storage, ACME account credentials, or cached certificates of other clusters.
 
@@ -156,7 +156,7 @@ certserver authorizes requests using three distinct controls:
    - The Gateway resource name (`namespace/name`).
    - The requested hostnames.
    - The Gateway's external addresses (`status.addresses`).
-3. **In-Path Challenge Validation:** certserver validates domain control by returning challenges solely to the requesting Gateway (and its shared-front-end candidates), verifying via local self-check that the data plane serves the token over public DNS, and requesting validation from the upstream certificate authority.
+3. **In-Path Challenge Validation:** certserver validates domain control by returning challenges to the requesting Gateway (and its shared-front-end candidates), verifying via local self-check that the data plane serves the token over public DNS, and requesting validation from the upstream certificate authority.
 
 ### Cluster Registration and Live Directory Reload
 
@@ -176,8 +176,8 @@ Before certserver initiates an order or notifies the public certificate authorit
 
 1. **DNS Resolution Check:** certserver resolves public DNS (A and AAAA records) for each requested hostname from its own vantage point using authoritative or public recursive resolvers. certserver compares the resolved IP addresses against the Gateway addresses that the controller attested in `GetCertificate`. If DNS does not resolve (NXDOMAIN) or points to an unrelated address, certserver rejects or requeues the request immediately with a retryable error. This check prevents certserver from creating premature ACME orders while users wait for DNS records to propagate.
 2. **Challenge Self-Check:** Before asking the certificate authority to validate a challenge, certserver fetches each challenge URL itself: `GET http://<hostname>/.well-known/acme-challenge/<token>`. It asks the certificate authority to validate only after the self-check succeeds by returning an HTTP 200 response with the expected key authorization body (after trimming whitespace).
-   - **Invariants and Security Limits:** certserver executes self-checks only for hostnames that passed cluster registry policy and DNS pre-checks. It sends requests strictly over plain HTTP on port 80 and does not follow HTTP redirects. It enforces a bounded timeout (a few seconds) and limits response body reads to at most 1 KiB.
-   - **Trade-Off:** The self-check adds an outgoing HTTP fetch per challenge from certserver and depends on certserver reaching the hostname the way the certificate authority does. This trade-off ensures that certificate authority validation attempts and rate limits are never consumed when the data plane is not yet ready to serve the challenge.
+   - **Invariants and Security Limits:** certserver executes self-checks only for hostnames that passed cluster registry policy and DNS pre-checks. It sends requests over plain HTTP on port 80 and does not follow HTTP redirects. It enforces a bounded timeout (a few seconds) and limits response body reads to at most 1 KiB.
+   - **Trade-Off and Vantage Point:** The self-check is an operational gate that saves certificate authority rate limits and avoids most wasted validation attempts, not the security boundary. Challenge binding comes from which Gateway serves the token where public DNS points, and the certificate authority's own fetch is what proves domain control. The self-check adds an outgoing HTTP fetch per challenge from certserver and depends on certserver reaching the hostname the way the certificate authority does. If the certificate authority resolves DNS differently from certserver's network position (for example, with split-horizon DNS), validation attempts may still be wasted or fail.
 
 ### Challenge Binding and Attack Prevention
 
@@ -198,16 +198,16 @@ Consider two independent clusters that use the same certserver:
 
 Under the "serve, don't forward" model, binding follows directly from who serves the token:
 
-1. When the controller for Gateway A requests a certificate, certserver initiates an order and returns the pending challenges (hostname, token, key authorization) **exclusively** to Gateway A (and its configured shared-front-end candidates).
+1. When the controller for Gateway A requests a certificate, certserver initiates an order and returns the pending challenges (hostname, token, key authorization) to Gateway A (and its configured shared-front-end candidates).
 2. Gateway A puts the challenge into its data-plane configuration. Gateway A's data plane now serves that token from memory.
 3. Gateway B was never given the challenge. Gateway B's data plane has no entry in memory for that token.
 4. When certserver executes its self-check (and subsequently when the certificate authority validates), the HTTP GET request for `http://app.example.com/.well-known/acme-challenge/<token>` resolves via public DNS to Gateway B's IP address.
 5. Gateway B receives the request. Because Gateway B was not given the challenge, Gateway B's data plane has no matching token in memory and routes normally (falling through to user routes or returning 404). Gateway B cannot answer with the key authorization.
-6. The self-check fails, and certserver never requests CA validation. Even if the certificate authority queried Gateway B, validation would fail with HTTP 404.
-7. Gateway A never receives the certificate. A Gateway that wasn't given a challenge cannot serve it, and therefore cannot complete it.
-8. **Deactivating Pre-Validated Authorizations:** Certificate authorities may retain authorization state across orders for an ACME account. To prevent an unauthorized Gateway from capitalizing on an authorization previously validated by another Gateway, certserver explicitly deactivates pre-validated authorizations. This invariant guarantees that every issuance requires fresh HTTP-01 validation.
+6. The self-check fails, and certserver does not request CA validation. Even if the certificate authority queried Gateway B, validation would fail with HTTP 404.
+7. Gateway A does not receive the certificate. A Gateway that wasn't given a challenge cannot serve it, and therefore cannot complete it.
+8. **Deactivating Pre-Validated Authorizations:** Certificate authorities may retain authorization state across orders for an ACME account. To prevent an unauthorized Gateway from capitalizing on an authorization previously validated by another Gateway, certserver deactivates pre-validated authorizations so that each issuance requires fresh HTTP-01 validation.
 
-This design completely removes the data plane's challenge forwarder, the data plane's service-account token for certserver, certserver's HTTP challenge endpoint, and forwarder-identity checks.
+This design removes the data plane's challenge forwarder, the data plane's service-account token for certserver, certserver's HTTP challenge endpoint, and forwarder-identity checks.
 
 ### Shared-Front-End Groups
 
@@ -217,7 +217,7 @@ When multiple Gateways share a front end, incoming HTTP-01 validation traffic ma
 
 ### Cache Reuse and Authorization Checks
 
-certserver caches issued certificates by normalized hostname set to avoid redundant ACME orders. However, certserver must never allow a cache hit to bypass authorization checks:
+certserver caches issued certificates by normalized hostname set to avoid redundant ACME orders. However, certserver does not allow a cache hit to bypass authorization checks:
 
 - If Gateway X requests a certificate that certserver already holds in cache from a prior issuance for Gateway Y, certserver does not release the certificate immediately.
 - certserver releases the cached certificate only after Gateway X proves that it currently controls the hostnames.
@@ -226,7 +226,7 @@ certserver caches issued certificates by normalized hostname set to avoid redund
   2. certserver generates a local probe challenge (token and key authorization) and returns it as a pending challenge to Gateway X.
   3. Gateway X configures its data plane to serve the probe challenge from memory.
   4. certserver executes an HTTP self-check against `http://<hostname>/.well-known/acme-challenge/<probe-token>`. Because public DNS resolves to Gateway X, Gateway X serves the challenge and the self-check succeeds.
-  5. Once Gateway X satisfies this local check, certserver safely releases the cached certificate.
+  5. Once Gateway X satisfies this local check, certserver releases the cached certificate.
 - This local validation prevents unauthorized Gateways from reading certificates out of the cache while avoiding duplicate ACME orders and unnecessary certificate authority rate limit consumption.
 
 ## Issuance and Renewal Flow
@@ -344,7 +344,7 @@ certserver handles common operational and network failures predictably:
 
 A user creates a Gateway or Route before pointing public DNS records at the Gateway's external IP address.
 - **Symptom:** When public DNS resolves the hostname, DNS returns NXDOMAIN or points to an unrelated server.
-- **Handling:** certserver's DNS pre-check or local self-check fails before contacting the certificate authority. certserver never calls validation on the upstream challenge. certserver returns a pending/retryable status to the GARI controller, which requeues reconciliation with exponential backoff. Certificate authority rate limits and failure quotas are preserved. Once the user configures DNS and records propagate across public resolvers, subsequent self-checks and challenge attempts succeed.
+- **Handling:** certserver's DNS pre-check or local self-check fails before contacting the certificate authority. certserver withholds validation on the upstream challenge and returns a pending or retryable status to the GARI controller, which requeues reconciliation with exponential backoff. This avoids wasting certificate authority rate limits and failure quotas. Once the user configures DNS and records propagate across public resolvers, subsequent self-checks and challenge attempts succeed.
 
 ### 2. Port 80 Unreachable
 
