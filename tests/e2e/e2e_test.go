@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,6 +24,10 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
@@ -315,6 +320,84 @@ spec:
 	h.RunCmd("kubectl", "delete", "configmap", "live-switch-params", "--namespace=default")
 	h.WaitForResourceDeletion("svc", liveResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", liveResName, "default", 30*time.Second)
+
+	// 11. Verify Config Change Transitions Through Not-Ready and Back to Ready
+	t.Log("Verifying config change transitions through not-ready and back to ready")
+	dynClient, err := dynamic.NewForConfig(h.RESTConfig())
+	if err != nil {
+		t.Fatalf("Failed to create dynamic client: %v", err)
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Version:  "v1",
+		Resource: "gateways",
+	}
+	watchCtx, cancel := context.WithTimeout(t.Context(), 1*time.Minute)
+	defer cancel()
+
+	w, err := dynClient.Resource(gvr).Namespace("default").Watch(watchCtx, metav1.ListOptions{
+		FieldSelector: "metadata.name=reference-gateway",
+	})
+	if err != nil {
+		t.Fatalf("Failed to watch Gateway: %v", err)
+	}
+	defer w.Stop()
+
+	// Apply updated HTTPRoute to trigger a new config revision
+	updatedRouteManifest := `
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: reference-route
+  namespace: default
+spec:
+  parentRefs:
+  - name: reference-gateway
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: backend
+      port: 8080
+`
+	h.KubectlApplyContent(updatedRouteManifest)
+
+	sawFalse := false
+	sawTrueAfterFalse := false
+
+	for evt := range w.ResultChan() {
+		unstr, ok := evt.Object.(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+		conds, _, _ := unstructured.NestedSlice(unstr.Object, "status", "conditions")
+		for _, c := range conds {
+			cm, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if cm["type"] == "Programmed" {
+				status, _ := cm["status"].(string)
+				if status == "False" {
+					sawFalse = true
+				} else if status == "True" && sawFalse {
+					sawTrueAfterFalse = true
+					break
+				}
+			}
+		}
+		if sawTrueAfterFalse {
+			break
+		}
+	}
+	if !sawFalse {
+		t.Errorf("Expected Gateway Programmed condition to transition to False during config update")
+	}
+	if !sawTrueAfterFalse {
+		t.Errorf("Expected Gateway Programmed condition to transition back to True after config update")
+	}
 }
 
 func runCmdAllowError(h *Harness, name string, args ...string) string {

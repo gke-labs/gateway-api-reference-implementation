@@ -21,11 +21,14 @@ import (
 	"flag"
 	"fmt"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +36,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -4512,5 +4516,177 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 	}
 	if errs := validation.IsDNS1035Label(svc.Name); len(errs) > 0 {
 		t.Errorf("Service name %q is not a valid DNS-1035 label: %v", svc.Name, errs)
+	}
+}
+
+func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = discoveryv1.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	var rev1 atomic.Pointer[[]string]
+	r1 := []string{"current-rev"}
+	rev1.Store(&r1)
+	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(*rev1.Load())
+	}))
+	defer server1.Close()
+
+	var rev2 atomic.Pointer[[]string]
+	r2 := []string{"old-rev"}
+	rev2.Store(&r2)
+	var failServer2 atomic.Bool
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failServer2.Load() {
+			http.Error(w, "server unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(*rev2.Load())
+	}))
+	defer server2.Close()
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+			UID:       types.UID("test-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      resName + "-slice",
+			Namespace: "default",
+			Labels: map[string]string{
+				discoveryv1.LabelServiceName: resName,
+			},
+		},
+		Endpoints: []discoveryv1.Endpoint{
+			{
+				Addresses: []string{server1.Listener.Addr().String()},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: state.Ptr(true),
+				},
+			},
+			{
+				Addresses: []string{server2.Listener.Addr().String()},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: state.Ptr(true),
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw, slice).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
+		Build()
+
+	p := NewAddressProvider(cl, WithPollInterval(20*time.Millisecond))
+	ctx := t.Context()
+
+	// Initial reconcile creates Service and Deployment
+	listeners := []*state.EffectiveListener{
+		{Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+	}
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Publish DataplaneConfig with current revision
+	dpCfg := &state.DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: "default", Name: "test-gw"},
+		Revision:    "current-rev",
+	}
+	if err := p.PublishDataplaneConfig(ctx, gw, dpCfg); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed: %v", err)
+	}
+
+	// Simulate Service receiving LB IP and Deployment having 2 available replicas
+	var svc corev1.Service
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}}
+	if err := cl.Status().Update(ctx, &svc); err != nil {
+		t.Fatalf("failed to update Service status: %v", err)
+	}
+
+	var deploy appsv1.Deployment
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	deploy.Status.AvailableReplicas = 2
+	deploy.Status.ReadyReplicas = 2
+	if err := cl.Status().Update(ctx, &deploy); err != nil {
+		t.Fatalf("failed to update Deployment status: %v", err)
+	}
+
+	// 1. One replica still reports an old revision -> Gateway is NOT ready
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Fatalf("expected readiness.Ready=false while replica 2 reports old revision")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Fatalf("expected reason Pending, got %s", readiness.Reason)
+	}
+	if len(addrs) != 1 || addrs[0].Value != "1.2.3.4" {
+		t.Fatalf("expected LB address reported, got %+v", addrs)
+	}
+
+	// 2. A replica that doesn't answer counts as not current
+	failServer2.Store(true)
+	_, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Fatalf("expected readiness.Ready=false when replica 2 fails to answer")
+	}
+
+	// 3. Once both replicas report current revision, it becomes ready without another spec change
+	failServer2.Store(false)
+	r2Updated := []string{"current-rev"}
+	rev2.Store(&r2Updated)
+
+	// Wait for background poller to detect convergence and trigger reconcile via eventCh
+	select {
+	case evt := <-p.eventCh:
+		if evt.Object.GetName() != "test-gw" || evt.Object.GetNamespace() != "default" {
+			t.Fatalf("unexpected event object: %+v", evt.Object)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for background poller to trigger reconcile on convergence")
+	}
+
+	// Now reconcile runs without any spec change: Gateway is ready
+	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !readiness.Ready {
+		t.Fatalf("expected readiness.Ready=true once all replicas converged, got reason=%s message=%s", readiness.Reason, readiness.Message)
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Fatalf("expected reason Programmed, got %s", readiness.Reason)
+	}
+	if len(addrs) != 1 || addrs[0].Value != "1.2.3.4" {
+		t.Fatalf("expected LB address 1.2.3.4, got %+v", addrs)
 	}
 }

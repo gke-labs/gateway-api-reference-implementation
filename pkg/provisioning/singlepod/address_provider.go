@@ -20,14 +20,20 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -39,11 +45,14 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -174,13 +183,10 @@ func WithAPIReader(reader client.Reader) Option {
 
 // AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
 //
-// Readiness approximation: reports ready when the per-Gateway Deployment has at least one ready/available
-// replica and addresses are assigned. Because data-plane pods only pass readiness probes after applying a
-// configuration Secret, ready guarantees a replica has applied a config.
-//
-// Gap: ready means "a replica has applied a config", not necessarily "the current configuration applied". The Secret-based
-// config distribution path has no acknowledgement channel carrying the applied configuration revision back from
-// data-plane replicas to the controller, so the provider cannot verify that the latest config is actively being served.
+// Readiness: reports ready when addresses are assigned, the per-Gateway Deployment has available replicas,
+// and every ready data-plane replica reports that it has applied the Gateway's current configuration revision.
+// Singlepod discovers data-plane endpoints from the Service's EndpointSlices and polls each ready endpoint's
+// applied-revision endpoint (/_gari/applied) until all replicas converge on the current revision.
 type AddressProvider struct {
 	client                        client.Client
 	apiReader                     client.Reader
@@ -199,6 +205,35 @@ type AddressProvider struct {
 	acmeChallengeTokenPath        string
 	acmeChallengeAudience         string
 	acmeChallengeTokenExpiration  int64
+
+	mu               sync.Mutex
+	eventCh          chan event.GenericEvent
+	currentRevisions map[types.NamespacedName]string
+	pollers          map[types.NamespacedName]context.CancelFunc
+	pollInterval     time.Duration
+	probeTimeout     time.Duration
+	httpClient       *http.Client
+}
+
+// WithPollInterval configures the poll interval for data-plane replica applied revision convergence checks.
+func WithPollInterval(interval time.Duration) Option {
+	return func(p *AddressProvider) {
+		p.pollInterval = interval
+	}
+}
+
+// WithProbeTimeout configures the timeout for individual applied revision probe requests.
+func WithProbeTimeout(timeout time.Duration) Option {
+	return func(p *AddressProvider) {
+		p.probeTimeout = timeout
+	}
+}
+
+// WithHTTPClient configures the HTTP client used to probe data-plane replicas.
+func WithHTTPClient(client *http.Client) Option {
+	return func(p *AddressProvider) {
+		p.httpClient = client
+	}
 }
 
 // WithACMEChallengeUpstreamURL configures the upstream certificate server URL for forwarding ACME HTTP-01 challenges.
@@ -296,8 +331,14 @@ func (p *AddressProvider) acmeTokenPath() string {
 // NewAddressProvider creates a new singlepod AddressProvider.
 func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
 	p := &AddressProvider{
-		client:         c,
-		dataplaneImage: DefaultDataplaneImage,
+		client:           c,
+		dataplaneImage:   DefaultDataplaneImage,
+		eventCh:          make(chan event.GenericEvent, 50),
+		currentRevisions: make(map[types.NamespacedName]string),
+		pollers:          make(map[types.NamespacedName]context.CancelFunc),
+		pollInterval:     500 * time.Millisecond,
+		probeTimeout:     2 * time.Second,
+		httpClient:       &http.Client{Timeout: 2 * time.Second},
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -932,11 +973,8 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			}, nil
 		}
 
-		return addresses, state.GatewayReadiness{
-			Ready:   true,
-			Reason:  string(gatewayv1.GatewayReasonProgrammed),
-			Message: "Gateway programmed by reference implementation",
-		}, nil
+		gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+		return p.evaluateReplicasReadiness(ctx, gwKey, name, addresses)
 	}
 
 	var addresses []gatewayv1.GatewayStatusAddress
@@ -1023,11 +1061,8 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}, nil
 	}
 
-	return addresses, state.GatewayReadiness{
-		Ready:   true,
-		Reason:  string(gatewayv1.GatewayReasonProgrammed),
-		Message: "Gateway programmed by reference implementation",
-	}, nil
+	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	return p.evaluateReplicasReadiness(ctx, gwKey, name, addresses)
 }
 
 // GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
@@ -1074,15 +1109,31 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 
 	bldr.Watches(&corev1.Service{}, ownerHandler, builder.WithPredicates(pred))
 	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
+	if bldr != nil && p.eventCh != nil {
+		bldr.WatchesRawSource(source.Channel(p.eventCh, &handler.EnqueueRequestForObject{}))
+	}
 
 	return nil
 }
 
 // PublishDataplaneConfig writes the Gateway's compiled data-plane config to its per-Gateway Secret.
 func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
-	if p.client == nil || gw == nil || config == nil {
+	if p.client == nil || gw == nil {
 		return nil
 	}
+	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	if config == nil {
+		p.mu.Lock()
+		delete(p.currentRevisions, gwKey)
+		p.mu.Unlock()
+		p.stopPoller(gwKey)
+		return nil
+	}
+	p.mu.Lock()
+	if config.Revision != "" {
+		p.currentRevisions[gwKey] = config.Revision
+	}
+	p.mu.Unlock()
 
 	name := ResourceNameForGateway(gw.Name)
 
@@ -1126,6 +1177,212 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		return fmt.Errorf("failed to apply config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 	return nil
+}
+
+func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey types.NamespacedName, name string, addresses []gatewayv1.GatewayStatusAddress) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+	currentRev := p.currentRevisionForGateway(gwKey)
+	if currentRev != "" {
+		converged, err := p.checkEndpointsConverged(ctx, gwKey, currentRev, name)
+		if err != nil {
+			return nil, state.GatewayReadiness{}, err
+		}
+		if !converged {
+			p.startPoller(gwKey, name)
+			return addresses, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonPending),
+				Message: "Waiting for data-plane replicas to apply current configuration",
+			}, nil
+		}
+		p.stopPoller(gwKey)
+	}
+	return addresses, state.GatewayReadiness{
+		Ready:   true,
+		Reason:  string(gatewayv1.GatewayReasonProgrammed),
+		Message: "Gateway programmed by reference implementation",
+	}, nil
+}
+
+func (p *AddressProvider) currentRevisionForGateway(gwKey types.NamespacedName) string {
+	p.mu.Lock()
+	rev := p.currentRevisions[gwKey]
+	p.mu.Unlock()
+	if rev != "" {
+		return rev
+	}
+	if p.state != nil {
+		if cfg := p.state.GetDataplaneConfig(gwKey); cfg != nil && cfg.Revision != "" {
+			return cfg.Revision
+		}
+	}
+	if p.client != nil {
+		var sec corev1.Secret
+		name := ResourceNameForGateway(gwKey.Name)
+		err := p.client.Get(context.Background(), types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &sec)
+		if err != nil {
+			return ""
+		}
+		if data, ok := sec.Data[DataplaneSecretDataKey]; ok && len(data) > 0 {
+			var cfg state.DataplaneConfig
+			if err := json.Unmarshal(data, &cfg); err == nil && cfg.Revision != "" {
+				return cfg.Revision
+			}
+		}
+	}
+	return ""
+}
+
+func (p *AddressProvider) triggerReconcile(key types.NamespacedName) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: key.Namespace,
+			Name:      key.Name,
+		},
+	}
+	if p.eventCh != nil {
+		select {
+		case p.eventCh <- event.GenericEvent{Object: gw}:
+		default:
+		}
+	}
+}
+
+func (p *AddressProvider) startPoller(gwKey types.NamespacedName, name string) {
+	p.mu.Lock()
+	if _, running := p.pollers[gwKey]; running {
+		p.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.pollers[gwKey] = cancel
+	pollInterval := p.pollInterval
+	if pollInterval <= 0 {
+		pollInterval = 500 * time.Millisecond
+	}
+	p.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				currentRev := p.currentRevisionForGateway(gwKey)
+				if currentRev == "" {
+					continue
+				}
+				converged, err := p.checkEndpointsConverged(ctx, gwKey, currentRev, name)
+				if err == nil && converged {
+					p.mu.Lock()
+					delete(p.pollers, gwKey)
+					p.mu.Unlock()
+					p.triggerReconcile(gwKey)
+					return
+				}
+			}
+		}
+	}()
+}
+
+func (p *AddressProvider) stopPoller(gwKey types.NamespacedName) {
+	p.mu.Lock()
+	if cancel, ok := p.pollers[gwKey]; ok {
+		cancel()
+		delete(p.pollers, gwKey)
+	}
+	p.mu.Unlock()
+}
+
+func (p *AddressProvider) checkEndpointsConverged(ctx context.Context, gwKey types.NamespacedName, currentRev, svcName string) (bool, error) {
+	if p.client == nil {
+		return false, nil
+	}
+	var slicesList discoveryv1.EndpointSliceList
+	if err := p.client.List(ctx, &slicesList, client.InNamespace(gwKey.Namespace), client.MatchingLabels{
+		discoveryv1.LabelServiceName: svcName,
+	}); err != nil {
+		return false, err
+	}
+
+	var readyEndpoints []string
+	seen := make(map[string]bool)
+	for _, sl := range slicesList.Items {
+		for _, ep := range sl.Endpoints {
+			isReady := ep.Conditions.Ready == nil || *ep.Conditions.Ready
+			if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+				isReady = false
+			}
+			if !isReady {
+				continue
+			}
+			for _, addr := range ep.Addresses {
+				if addr != "" && !seen[addr] {
+					seen[addr] = true
+					readyEndpoints = append(readyEndpoints, addr)
+				}
+			}
+		}
+	}
+
+	if len(slicesList.Items) == 0 {
+		return true, nil
+	}
+	if len(readyEndpoints) == 0 {
+		return false, nil
+	}
+
+	for _, addr := range readyEndpoints {
+		targetURL := p.appliedURL(addr)
+		if !p.probeEndpointRevision(ctx, targetURL, currentRev) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (p *AddressProvider) appliedURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err == nil && host != "" && port != "" {
+		return fmt.Sprintf("http://%s/_gari/applied", addr)
+	}
+	return fmt.Sprintf("http://%s/_gari/applied", net.JoinHostPort(addr, fmt.Sprintf("%d", DataPlaneHealthProbePort)))
+}
+
+func (p *AddressProvider) probeEndpointRevision(ctx context.Context, targetURL, currentRev string) bool {
+	timeout := p.probeTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return false
+	}
+	client := p.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			klog.V(4).Infof("failed closing applied revision response body: %v", closeErr)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var revs []string
+	if err := json.NewDecoder(resp.Body).Decode(&revs); err != nil {
+		return false
+	}
+	return slices.Contains(revs, currentRev)
 }
 
 // Begin implements state.DataplanePublisher.
