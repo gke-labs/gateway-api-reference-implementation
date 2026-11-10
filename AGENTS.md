@@ -23,6 +23,7 @@ The rules that matter most here:
 - **Write full sentences, one idea each.** Don't chain clauses with colons, semicolons and parenthetical asides.
 - **Define a term before you use it,** and use the project's existing words. Don't coin shorthand.
 - **Say what the code does and why,** not how it got that way.
+- **For critical code, state the invariants, then explain them in active voice.** Storage, recovery, concurrency and security code should list the invariants it relies on, as short statements that a reviewer can check the code against. Write invariants actively where possible: "the engine fsyncs a segment before it creates the next one", not "segments are rotated only after being fsynced". Then explain who does what, when, and why each invariant makes the code correct.
 - **Check all the prose in your change** before you send it. Start from the diff, and check every file that holds prose: docs (such as `design.md` and `README.md`), code comments, docstrings, proto and script comments, error and log messages, flag help, the commit message and the PR description.
 - **Don't oversell. State what you measured or can show, and qualify it.** Avoid superlatives and absolutes such as "optimal", "guaranteed", "zero", "always", "strictly", "drastically" and "cryptographically", unless the statement really is absolute and the text says why. Report performance numbers with how and where they were measured. Describe trade-offs as trade-offs, including what is given up.
 
