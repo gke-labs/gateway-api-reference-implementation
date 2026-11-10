@@ -64,6 +64,7 @@ const (
 
 // DataplaneConfig represents the serialized proxy configuration for a single Gateway.
 type DataplaneConfig struct {
+	Revision                  string                     `json:"revision,omitempty"`
 	GatewayName               types.NamespacedName       `json:"gatewayName"`
 	Listeners                 []InternalListener         `json:"listeners"`
 	Routes                    []InternalRoute            `json:"routes"`
@@ -74,6 +75,21 @@ type DataplaneConfig struct {
 	AllowedSourceCIDRs        []string                   `json:"allowedSourceCIDRs,omitempty"`
 	ProxyProtocol             string                     `json:"proxyProtocol,omitempty"`
 	ProxyProtocolTrustedCIDRs []string                   `json:"proxyProtocolTrustedCIDRs,omitempty"`
+}
+
+// ComputeRevision computes a deterministic hash of the DataplaneConfig excluding the Revision field.
+func (cfg *DataplaneConfig) ComputeRevision() (string, error) {
+	if cfg == nil {
+		return "", nil
+	}
+	clone := *cfg
+	clone.Revision = ""
+	data, err := json.Marshal(clone)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal dataplane config for revision: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // DataplanePublisher defines the interface for publishing a Gateway's compiled data-plane configuration.
@@ -219,6 +235,12 @@ func BuildDataplaneConfig(
 		}
 	}
 
+	rev, err := cfg.ComputeRevision()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Revision = rev
+
 	return cfg, nil
 }
 
@@ -293,11 +315,23 @@ func BuildGatewayDataplaneConfig(cg *CompiledGateway) (*DataplaneConfig, error) 
 		cfg.ProxyProtocol = cg.Parameters.ProxyProtocol
 		cfg.ProxyProtocolTrustedCIDRs = cg.Parameters.ProxyProtocolTrustedCIDRs
 	}
+	rev, err := cfg.ComputeRevision()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Revision = rev
 	return cfg, nil
 }
 
 // Marshal serializes DataplaneConfig to JSON.
 func (cfg *DataplaneConfig) Marshal() ([]byte, error) {
+	if cfg != nil && cfg.Revision == "" {
+		rev, err := cfg.ComputeRevision()
+		if err != nil {
+			return nil, err
+		}
+		cfg.Revision = rev
+	}
 	return json.Marshal(cfg)
 }
 

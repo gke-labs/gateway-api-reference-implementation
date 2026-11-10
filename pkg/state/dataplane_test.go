@@ -1068,3 +1068,113 @@ func TestApplyDataplaneConfig_MissingBackendClientCertID(t *testing.T) {
 		}
 	})
 }
+
+func TestDataplaneConfig_Revision(t *testing.T) {
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	makeBaseCfg := func() *DataplaneConfig {
+		return &DataplaneConfig{
+			GatewayName: gwKey,
+			Listeners: []InternalListener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+			Routes: []InternalRoute{
+				{
+					Hostnames: []RouteHostname{NewRouteHostname("example.com", "example.com")},
+					Rules: []InternalRule{
+						{
+							Backends: []InternalBackend{
+								{Host: "backend.svc", Port: 8080, Weight: 1},
+							},
+						},
+					},
+				},
+			},
+			AllowedSourceCIDRs:        []string{"10.0.0.0/8"},
+			ProxyProtocol:             "enabled",
+			ProxyProtocolTrustedCIDRs: []string{"192.168.0.0/16"},
+			Certificates: map[string]CertificateData{
+				"cert-1": {Certificate: [][]byte{[]byte("cert-bytes")}, PrivateKey: []byte("key-bytes")},
+			},
+			HostCertificates: map[string]string{
+				"example.com": "cert-1",
+			},
+			DefaultCertID: "cert-1",
+		}
+	}
+
+	baseCfg := makeBaseCfg()
+	equalCfg := makeBaseCfg()
+
+	baseRev, err := baseCfg.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision failed: %v", err)
+	}
+	if baseRev == "" {
+		t.Fatal("expected non-empty revision")
+	}
+
+	equalRev, err := equalCfg.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision failed: %v", err)
+	}
+	if baseRev != equalRev {
+		t.Errorf("expected identical revisions for equal configs, got %q != %q", baseRev, equalRev)
+	}
+
+	// Setting Revision on config should not affect ComputeRevision
+	equalCfg.Revision = "previous-revision-string"
+	equalRevWithField, err := equalCfg.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision failed: %v", err)
+	}
+	if equalRevWithField != baseRev {
+		t.Errorf("expected revision computation to ignore existing Revision field, got %q != %q", equalRevWithField, baseRev)
+	}
+
+	variations := map[string]func(*DataplaneConfig){
+		"gateway name": func(c *DataplaneConfig) {
+			c.GatewayName = types.NamespacedName{Namespace: "default", Name: "other-gw"}
+		},
+		"gateway namespace": func(c *DataplaneConfig) {
+			c.GatewayName = types.NamespacedName{Namespace: "prod", Name: "my-gw"}
+		},
+		"listener port": func(c *DataplaneConfig) {
+			c.Listeners[0].Port = 8080
+		},
+		"listener protocol": func(c *DataplaneConfig) {
+			c.Listeners[0].Protocol = gatewayv1.HTTPSProtocolType
+		},
+		"route backend host": func(c *DataplaneConfig) {
+			c.Routes[0].Rules[0].Backends[0].Host = "other-backend.svc"
+		},
+		"allowed source CIDRs": func(c *DataplaneConfig) {
+			c.AllowedSourceCIDRs = []string{"10.0.0.0/16"}
+		},
+		"proxy protocol": func(c *DataplaneConfig) {
+			c.ProxyProtocol = "disabled"
+		},
+		"trusted CIDRs": func(c *DataplaneConfig) {
+			c.ProxyProtocolTrustedCIDRs = []string{"172.16.0.0/12"}
+		},
+		"certificate key": func(c *DataplaneConfig) {
+			c.Certificates["cert-1"] = CertificateData{Certificate: [][]byte{[]byte("cert-bytes")}, PrivateKey: []byte("different-key")}
+		},
+		"default cert ID": func(c *DataplaneConfig) {
+			c.DefaultCertID = "cert-2"
+		},
+	}
+
+	for name, mutate := range variations {
+		t.Run(name, func(t *testing.T) {
+			modCfg := makeBaseCfg()
+			mutate(modCfg)
+			modRev, err := modCfg.ComputeRevision()
+			if err != nil {
+				t.Fatalf("ComputeRevision failed: %v", err)
+			}
+			if modRev == baseRev {
+				t.Errorf("expected different revision after modifying %s, got same %q", name, modRev)
+			}
+		})
+	}
+}

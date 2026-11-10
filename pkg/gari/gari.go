@@ -17,6 +17,7 @@ package gari
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -374,6 +375,9 @@ type Server struct {
 	listenerOpts *proxyproto.ListenerOptions
 	httpFilter   *proxyproto.Listener
 	httpsFilter  *proxyproto.Listener
+
+	appliedMu        sync.RWMutex
+	appliedRevisions map[string]string
 }
 
 func (s *Server) listenerOptionsLocked() proxyproto.ListenerOptions {
@@ -524,17 +528,20 @@ func New(opts Options) (*Server, error) {
 		}
 
 		readyzHandler, healthzHandler := s.healthzHandlers()
+		appliedHandler := s.AppliedHandler()
 		metricsOpts := metricsserver.Options{
 			BindAddress: opts.MetricsAddr,
 		}
 		healthProbeBindAddress := opts.HealthProbeBindAddress
 		extraHandlers := map[string]http.Handler{
-			"/healthz":       http.StripPrefix("/healthz", healthzHandler),
-			"/healthz/":      http.StripPrefix("/healthz", healthzHandler),
-			"/readyz":        http.StripPrefix("/readyz", readyzHandler),
-			"/readyz/":       http.StripPrefix("/readyz", readyzHandler),
-			"/_gari/readyz":  http.StripPrefix("/_gari/readyz", readyzHandler),
-			"/_gari/readyz/": http.StripPrefix("/_gari/readyz", readyzHandler),
+			"/healthz":        http.StripPrefix("/healthz", healthzHandler),
+			"/healthz/":       http.StripPrefix("/healthz", healthzHandler),
+			"/readyz":         http.StripPrefix("/readyz", readyzHandler),
+			"/readyz/":        http.StripPrefix("/readyz", readyzHandler),
+			"/_gari/readyz":   http.StripPrefix("/_gari/readyz", readyzHandler),
+			"/_gari/readyz/":  http.StripPrefix("/_gari/readyz", readyzHandler),
+			"/_gari/applied":  appliedHandler,
+			"/_gari/applied/": appliedHandler,
 		}
 		if samePortOrAddr(opts.MetricsAddr, opts.HealthProbeBindAddress) && opts.MetricsAddr != "" && opts.MetricsAddr != "0" && opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
 			metricsOpts.ExtraHandlers = extraHandlers
@@ -656,6 +663,45 @@ func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Han
 	return rHandler, hHandler
 }
 
+// AppliedRevisions returns a copy of the applied configuration revisions per Gateway.
+func (s *Server) AppliedRevisions() map[string]string {
+	if s == nil {
+		return make(map[string]string)
+	}
+	s.appliedMu.RLock()
+	defer s.appliedMu.RUnlock()
+	revisions := make(map[string]string, len(s.appliedRevisions))
+	for k, v := range s.appliedRevisions {
+		revisions[k] = v
+	}
+	return revisions
+}
+
+// RecordAppliedRevision records the applied configuration revision for a Gateway.
+func (s *Server) RecordAppliedRevision(gatewayKey, revision string) {
+	if s == nil {
+		return
+	}
+	s.appliedMu.Lock()
+	defer s.appliedMu.Unlock()
+	if s.appliedRevisions == nil {
+		s.appliedRevisions = make(map[string]string)
+	}
+	s.appliedRevisions[gatewayKey] = revision
+}
+
+// AppliedHandler returns an HTTP handler serving the applied configuration revision per Gateway.
+func (s *Server) AppliedHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		revisions := s.AppliedRevisions()
+		if err := json.NewEncoder(w).Encode(revisions); err != nil {
+			klog.V(4).Infof("failed to write applied revisions response: %v", err)
+		}
+	})
+}
+
 // SetupWithManager registers all GARI reconcilers with the given Manager.
 func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.AddReadyzCheck("readyz", s.readyzChecker()); err != nil {
@@ -674,6 +720,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 			gatewayNamespace: s.opts.DataplaneGatewayNamespace,
 			secretName:       secretName,
 			onConfigUpdate:   s.updateListenerFilters,
+			onConfigApplied:  s.RecordAppliedRevision,
 		}
 		if err := ctrl.NewControllerManagedBy(mgr).
 			For(&corev1.Secret{}).
@@ -686,6 +733,26 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	userHook := s.opts.OnGatewaysUpdate
 	wrappedHook := func(gateways []*gatewayv1.Gateway) {
 		s.proxySynced.Store(true)
+		for _, gw := range gateways {
+			if gw == nil {
+				continue
+			}
+			gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+			if s.state != nil {
+				if dpCfg := s.state.GetDataplaneConfig(gwKey); dpCfg != nil {
+					rev := dpCfg.Revision
+					if rev == "" {
+						var err error
+						rev, err = dpCfg.ComputeRevision()
+						if err != nil {
+							klog.Errorf("failed to compute dataplane config revision for gateway %s: %v", gwKey, err)
+							continue
+						}
+					}
+					s.RecordAppliedRevision(gwKey.String(), rev)
+				}
+			}
+		}
 		if userHook != nil {
 			userHook(gateways)
 		}
@@ -711,6 +778,7 @@ type dataplaneSecretReconciler struct {
 	gatewayNamespace string
 	secretName       string
 	onConfigUpdate   func(opts proxyproto.ListenerOptions) error
+	onConfigApplied  func(gwKey string, revision string)
 }
 
 func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -736,11 +804,12 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	r.proxySynced.Store(true)
 
+	dpCfg, err := state.UnmarshalDataplaneConfig(data)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
+	}
+
 	if r.onConfigUpdate != nil {
-		dpCfg, err := state.UnmarshalDataplaneConfig(data)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
-		}
 		opts := proxyproto.ListenerOptions{
 			AllowedSourceCIDRs:        dpCfg.AllowedSourceCIDRs,
 			ProxyProtocol:             dpCfg.ProxyProtocol,
@@ -748,6 +817,24 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		if err := r.onConfigUpdate(opts); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update listener filters: %w", err)
+		}
+	}
+
+	if r.onConfigApplied != nil {
+		gwKey := dpCfg.GatewayName.String()
+		if dpCfg.GatewayName.Namespace == "" && r.gatewayNamespace != "" && dpCfg.GatewayName.Name != "" {
+			gwKey = r.gatewayNamespace + "/" + dpCfg.GatewayName.Name
+		}
+		if gwKey != "" && gwKey != "/" {
+			rev := dpCfg.Revision
+			if rev == "" {
+				var err error
+				rev, err = dpCfg.ComputeRevision()
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to compute dataplane config revision: %w", err)
+				}
+			}
+			r.onConfigApplied(gwKey, rev)
 		}
 	}
 

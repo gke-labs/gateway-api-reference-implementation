@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -1711,6 +1712,218 @@ func TestDataplaneSecretReconciler(t *testing.T) {
 	}
 	if rec.Body.String() != "backend ok" {
 		t.Errorf("expected 'backend ok' body, got %q", rec.Body.String())
+	}
+}
+
+func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	p := proxy.NewProxy()
+	gwName := "test-gw"
+	gwKey := types.NamespacedName{Namespace: "test-ns", Name: gwName}
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      gwName,
+		},
+		proxy: p,
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on test port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	appliedHandler := server.AppliedHandler()
+	ms, err := metricsserver.NewServer(metricsserver.Options{
+		BindAddress: fmt.Sprintf("127.0.0.1:%d", port),
+		ExtraHandlers: map[string]http.Handler{
+			"/_gari/applied":  appliedHandler,
+			"/_gari/applied/": appliedHandler,
+		},
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("failed to create metrics server: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = ms.Start(ctx)
+	}()
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+
+	// 1. Before config is applied: endpoint returns 200 OK with empty revisions map (Gateway appears only after config applied)
+	var resp *http.Response
+	for i := 0; i < 20; i++ {
+		resp, err = httpClient.Get(baseURL + "/_gari/applied")
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("failed to connect to /_gari/applied: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK before config applied, got %d", resp.StatusCode)
+	}
+	var revs0 map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&revs0); err != nil {
+		t.Fatalf("failed to decode json before config applied: %v", err)
+	}
+	if len(revs0) != 0 {
+		t.Errorf("expected empty revisions before config applied, got %v", revs0)
+	}
+
+	// 2. Prepare first config and reconcile
+	route1 := state.InternalRoute{
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/v1"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: "backend-1", Port: 8080, Weight: 1},
+				},
+			},
+		},
+	}
+	dpConfig1 := &state.DataplaneConfig{
+		GatewayName: gwKey,
+		Listeners: []state.InternalListener{
+			{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
+		},
+		Routes: []state.InternalRoute{route1},
+	}
+	configBytes1, err := dpConfig1.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig1: %v", err)
+	}
+	rev1 := dpConfig1.Revision
+	if rev1 == "" {
+		t.Fatal("expected dpConfig1.Revision to be populated after Marshal")
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			singlepod.DataplaneSecretDataKey: configBytes1,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &dataplaneSecretReconciler{
+		Client:           cl,
+		proxy:            p,
+		proxySynced:      &server.proxySynced,
+		gatewayNamespace: "test-ns",
+		secretName:       secretName,
+		onConfigApplied:  server.RecordAppliedRevision,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: secretName}}
+	if _, err := reconciler.Reconcile(ctx, req); err != nil {
+		t.Fatalf("first Reconcile failed: %v", err)
+	}
+
+	// Query /_gari/applied after first config applied
+	resp1, err := httpClient.Get(baseURL + "/_gari/applied")
+	if err != nil {
+		t.Fatalf("failed to GET /_gari/applied: %v", err)
+	}
+	defer resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK after first apply, got %d", resp1.StatusCode)
+	}
+	var revs1 map[string]string
+	if err := json.NewDecoder(resp1.Body).Decode(&revs1); err != nil {
+		t.Fatalf("failed to decode response after first apply: %v", err)
+	}
+	if revs1["test-ns/test-gw"] != rev1 {
+		t.Errorf("expected revision %q for test-ns/test-gw, got %q (all: %v)", rev1, revs1["test-ns/test-gw"], revs1)
+	}
+
+	// 3. Prepare second config with modified route and reconcile
+	route2 := state.InternalRoute{
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/v2"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: "backend-2", Port: 8080, Weight: 1},
+				},
+			},
+		},
+	}
+	dpConfig2 := &state.DataplaneConfig{
+		GatewayName: gwKey,
+		Listeners: []state.InternalListener{
+			{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route2}},
+		},
+		Routes: []state.InternalRoute{route2},
+	}
+	configBytes2, err := dpConfig2.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig2: %v", err)
+	}
+	rev2 := dpConfig2.Revision
+	if rev2 == "" {
+		t.Fatal("expected dpConfig2.Revision to be populated after Marshal")
+	}
+	if rev1 == rev2 {
+		t.Fatalf("expected new revision %q to differ from old %q", rev2, rev1)
+	}
+
+	secret.Data[singlepod.DataplaneSecretDataKey] = configBytes2
+	if err := cl.Update(ctx, secret); err != nil {
+		t.Fatalf("failed to update secret in fake client: %v", err)
+	}
+
+	if _, err := reconciler.Reconcile(ctx, req); err != nil {
+		t.Fatalf("second Reconcile failed: %v", err)
+	}
+
+	// Query /_gari/applied after second config applied
+	resp2, err := httpClient.Get(baseURL + "/_gari/applied")
+	if err != nil {
+		t.Fatalf("failed to GET /_gari/applied: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK after second apply, got %d", resp2.StatusCode)
+	}
+	var revs2 map[string]string
+	if err := json.NewDecoder(resp2.Body).Decode(&revs2); err != nil {
+		t.Fatalf("failed to decode response after second apply: %v", err)
+	}
+	if revs2["test-ns/test-gw"] != rev2 {
+		t.Errorf("expected new revision %q for test-ns/test-gw, got %q (all: %v)", rev2, revs2["test-ns/test-gw"], revs2)
+	}
+
+	// 4. Verify security limit: endpoint must NOT be served on Gateway listener (proxy)
+	rec := httptest.NewRecorder()
+	proxyReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/_gari/applied", nil)
+	p.ServeHTTP(rec, proxyReq)
+	if strings.Contains(rec.Body.String(), rev2) {
+		t.Errorf("security violation: proxy listener served revision endpoint: %s", rec.Body.String())
 	}
 }
 
