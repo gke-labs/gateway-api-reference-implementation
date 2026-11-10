@@ -66,6 +66,7 @@ type Config struct {
 	RateLimitBurst         int
 	MaxHostnames           int
 	MaxPendingOrders       int64
+	ValidatedBindingTTL    time.Duration
 	HTTPClient             *http.Client
 	PrometheusRegistry     *prometheus.Registry
 }
@@ -91,6 +92,7 @@ func parseFlags(args []string) (*Config, error) {
 	fs.IntVar(&cfg.RateLimitBurst, "rate-limit-burst", 20, "Per-identity rate limit burst size")
 	fs.IntVar(&cfg.MaxHostnames, "max-hostnames", 100, "Maximum number of hostnames permitted per certificate set")
 	fs.Int64Var(&cfg.MaxPendingOrders, "max-pending-orders", 50, "Maximum number of concurrent pending ACME orders")
+	fs.DurationVar(&cfg.ValidatedBindingTTL, "validated-binding-ttl", challenge.DefaultValidatedBindingTTL, "Validity duration for recorded Gateway binding validations")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -473,6 +475,7 @@ func run(ctx context.Context, cfg *Config) error {
 		o.MaxHostnamesPerSet = cfg.MaxHostnames
 		o.MaxPendingOrders = cfg.MaxPendingOrders
 		o.BindingStore = bindingStore
+		o.ValidatedBindingTTL = cfg.ValidatedBindingTTL
 	})
 
 	if err := mgr.Start(ctx); err != nil {

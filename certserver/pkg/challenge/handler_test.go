@@ -381,9 +381,10 @@ func TestChallengeHandler_WithRegistryAndBinding(t *testing.T) {
 		t.Errorf("expected body %q, got %q", testKeyAuth, rr.Body.String())
 	}
 
-	// Verify validated binding was recorded
-	if !bindingStore.HasValidatedBinding("cluster-1", "default/gw-1", testHost, now) {
-		t.Errorf("expected validated binding to be recorded in binding store")
+	// Verify validated binding is NOT recorded by the challenge handler.
+	// Validated bindings are recorded exclusively in fulfillAuthorization once ACME authorization succeeds.
+	if bindingStore.HasValidatedBinding("cluster-1", "default/gw-1", testHost, now) {
+		t.Errorf("challenge handler must not record validated binding; only fulfillAuthorization records upon successful ACME authorization")
 	}
 
 	// 5. Shared front end group: cluster-2 Gateway has recorded binding

@@ -188,33 +188,48 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 
 		if isDue {
 			item.state = metrics.StateRenewing
-			var req challenge.Requester
 			var candidates []challenge.Requester
 			if m.opts.BindingStore != nil {
-				for _, b := range m.opts.BindingStore.ListBindings() {
-					_, bKey, err := NormalizeHostnames(b.Hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
-					if err == nil && bKey == item.hostnamesKey {
-						cand := challenge.Requester{
-							ClusterID:               b.ClusterID,
-							Gateway:                 b.Gateway,
-							DataPlaneServiceAccount: b.DataPlaneServiceAccount,
+				for _, binding := range m.opts.BindingStore.ListBindings() {
+					_, bKey, err := NormalizeHostnames(binding.Hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
+					if err != nil || bKey != item.hostnamesKey {
+						continue
+					}
+					// Build candidates only from Gateways that hold a validated binding for that hostnames key.
+					if _, ok := m.opts.BindingStore.GetValidatedBinding(binding.ClusterID, binding.Gateway, item.hostnamesKey); ok {
+						candidate := challenge.Requester{
+							ClusterID:               binding.ClusterID,
+							Gateway:                 binding.Gateway,
+							DataPlaneServiceAccount: binding.DataPlaneServiceAccount,
 							HostnamesKey:            item.hostnamesKey,
 						}
-						candidates = append(candidates, cand)
+						candidates = append(candidates, candidate)
 					}
 				}
 			}
 
-			if len(candidates) > 0 {
-				req = candidates[0]
-			} else if item.cert != nil {
+			if len(candidates) == 0 && item.cert != nil {
+				// Fall back to the Gateway that the certificate was issued to.
+				candidates = append(candidates, challenge.Requester{
+					ClusterID:               item.cert.ClusterID,
+					Gateway:                 item.cert.Gateway,
+					DataPlaneServiceAccount: item.cert.DataPlaneServiceAccount,
+					HostnamesKey:            item.hostnamesKey,
+				})
+			}
+
+			var req challenge.Requester
+			if item.cert != nil {
 				req = challenge.Requester{
 					ClusterID:               item.cert.ClusterID,
 					Gateway:                 item.cert.Gateway,
 					DataPlaneServiceAccount: item.cert.DataPlaneServiceAccount,
-					HostnamesKey:            item.cert.HostnamesKey,
+					HostnamesKey:            item.hostnamesKey,
 				}
+			} else if len(candidates) > 0 {
+				req = candidates[0]
 			}
+
 			dueTasks = append(dueTasks, dueTask{
 				hostnamesKey: item.hostnamesKey,
 				hostnames:    item.hostnames,

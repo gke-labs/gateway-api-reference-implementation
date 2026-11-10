@@ -38,6 +38,24 @@ const (
 	DefaultValidatedBindingTTL = 24 * time.Hour
 )
 
+// RecordValidatedBinding records a validated binding in the binding store for the requester with the specified TTL.
+//
+// Invariant: a Gateway holds a validated binding for a set of hostnames only after that Gateway
+// itself proved that it serves them. Callers must only pass requesters whose domain
+// control has been verified.
+func RecordValidatedBinding(bindingStore registry.BindingStore, requester Requester, now time.Time, ttl time.Duration) {
+	if bindingStore == nil || requester.ClusterID == "" || requester.HostnamesKey == "" {
+		return
+	}
+	bindingStore.RecordValidatedBinding(registry.ValidatedBinding{
+		ClusterID:    requester.ClusterID,
+		Gateway:      requester.Gateway,
+		HostnamesKey: requester.HostnamesKey,
+		ValidatedAt:  now,
+		ExpiresAt:    now.Add(ttl),
+	})
+}
+
 // isValidToken reports whether token is non-empty, within length bounds, and composed
 // exclusively of base64url characters (RFC 8555 Section 8.3).
 func isValidToken(token string) bool {
@@ -98,32 +116,23 @@ func WithTimeNow(fn func() time.Time) HandlerOption {
 	}
 }
 
-// WithValidatedBindingTTL configures the validity duration for recorded Gateway binding validations.
-func WithValidatedBindingTTL(ttl time.Duration) HandlerOption {
-	return func(h *Handler) {
-		h.validatedBindingTTL = ttl
-	}
-}
-
 // Handler implements http.Handler to serve HTTP-01 ACME challenge validations.
 type Handler struct {
-	resolver            ChallengeResolver
-	store               Store
-	registry            *registry.Registry
-	bindingStore        registry.BindingStore
-	auditLogger         *registry.AuditLogger
-	metrics             *metrics.Metrics
-	callerFunc          func(*http.Request) string
-	timeNow             func() time.Time
-	validatedBindingTTL time.Duration
+	resolver     ChallengeResolver
+	store        Store
+	registry     *registry.Registry
+	bindingStore registry.BindingStore
+	auditLogger  *registry.AuditLogger
+	metrics      *metrics.Metrics
+	callerFunc   func(*http.Request) string
+	timeNow      func() time.Time
 }
 
 // NewHandler creates a new ACME HTTP-01 challenge handler using the provided resolver.
 func NewHandler(resolver ChallengeResolver, opts ...HandlerOption) *Handler {
 	h := &Handler{
-		resolver:            resolver,
-		timeNow:             time.Now,
-		validatedBindingTTL: DefaultValidatedBindingTTL,
+		resolver: resolver,
+		timeNow:  time.Now,
 	}
 	if s, ok := resolver.(Store); ok {
 		h.store = s
@@ -250,23 +259,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Challenge binding passed! Record answering identity and validated binding.
+		// Challenge binding passed! Record answering identity.
 		if recErr := h.store.RecordAnswer(r.Context(), token, identity); recErr != nil {
 			log.Printf("certserver: failed to record answering identity for challenge %s: %v", token, recErr)
-		}
-
-		if h.bindingStore != nil && matchedReq.ClusterID != "" {
-			hostnamesKey := matchedReq.HostnamesKey
-			if hostnamesKey == "" {
-				hostnamesKey = item.Identifier
-			}
-			h.bindingStore.RecordValidatedBinding(registry.ValidatedBinding{
-				ClusterID:    matchedReq.ClusterID,
-				Gateway:      matchedReq.Gateway,
-				HostnamesKey: hostnamesKey,
-				ValidatedAt:  now,
-				ExpiresAt:    now.Add(h.validatedBindingTTL),
-			})
 		}
 
 		audit.FromContext(r.Context()).Set(matchedReq.Gateway, []string{normHost}, audit.DecisionAllowed, "challenge validation succeeded")
