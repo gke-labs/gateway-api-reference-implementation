@@ -79,9 +79,6 @@ type DataplaneConfig struct {
 
 // ComputeRevision computes a deterministic hash of the DataplaneConfig excluding the Revision field.
 func (cfg *DataplaneConfig) ComputeRevision() (string, error) {
-	if cfg == nil {
-		return "", nil
-	}
 	clone := *cfg
 	clone.Revision = ""
 	data, err := json.Marshal(clone)
@@ -235,12 +232,6 @@ func BuildDataplaneConfig(
 		}
 	}
 
-	rev, err := cfg.ComputeRevision()
-	if err != nil {
-		return nil, err
-	}
-	cfg.Revision = rev
-
 	return cfg, nil
 }
 
@@ -314,12 +305,12 @@ func BuildGatewayDataplaneConfig(cg *CompiledGateway) (*DataplaneConfig, error) 
 		cfg.AllowedSourceCIDRs = cg.Parameters.AllowedSourceCIDRs
 		cfg.ProxyProtocol = cg.Parameters.ProxyProtocol
 		cfg.ProxyProtocolTrustedCIDRs = cg.Parameters.ProxyProtocolTrustedCIDRs
-		rev, err := cfg.ComputeRevision()
-		if err != nil {
-			return nil, err
-		}
-		cfg.Revision = rev
 	}
+	rev, err := cfg.ComputeRevision()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Revision = rev
 	return cfg, nil
 }
 

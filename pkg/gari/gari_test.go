@@ -1741,12 +1741,22 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 		t.Fatalf("failed to create namespace: %v", err)
 	}
 
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	healthAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	opts := DefaultOptions()
 	opts.RestConfig = env.Config
 	opts.Scheme = env.Scheme
 	opts.DataplaneMode = true
 	opts.DataplaneGatewayNamespace = gwNamespace
 	opts.DataplaneGatewayName = gwName
+	opts.HealthProbeBindAddress = healthAddr
+	opts.MetricsAddr = healthAddr
 	opts.ProxyAddr = ""
 	opts.ProxyHTTPSAddr = ""
 	opts.LeaderElection = false
@@ -1772,31 +1782,35 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 		}
 	})
 
-	healthURL := fmt.Sprintf("http://127.0.0.1:%d/_gari/applied", state.DataPlaneHealthProbePort)
+	healthURL := fmt.Sprintf("http://%s/_gari/applied", healthAddr)
 	httpClient := &http.Client{Timeout: 2 * time.Second}
 
+	waitForRevision := func(expectedRev string) {
+		t.Helper()
+		var lastRevs map[string]string
+		pollErr := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+			resp, err := httpClient.Get(healthURL)
+			if err != nil {
+				return false, nil
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return false, nil
+			}
+			var revs map[string]string
+			if err := json.NewDecoder(resp.Body).Decode(&revs); err != nil {
+				return false, err
+			}
+			lastRevs = revs
+			return revs[gwKey.String()] == expectedRev, nil
+		})
+		if pollErr != nil {
+			t.Fatalf("timed out waiting for revision %q, last got: %v", expectedRev, lastRevs)
+		}
+	}
+
 	// 1. Before config is applied: endpoint returns 200 OK with empty revisions map (Gateway appears only after config applied)
-	var initialRevisions map[string]string
-	pollErr := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		resp, err := httpClient.Get(healthURL)
-		if err != nil {
-			return false, nil
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return false, nil
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&initialRevisions); err != nil {
-			return false, err
-		}
-		return true, nil
-	})
-	if pollErr != nil {
-		t.Fatalf("failed to query applied endpoint before config applied: %v", pollErr)
-	}
-	if len(initialRevisions) != 0 {
-		t.Errorf("expected empty revisions before config applied, got %v", initialRevisions)
-	}
+	waitForRevision("")
 
 	// 2. Create initial config Secret
 	route1 := state.InternalRoute{
@@ -1818,6 +1832,10 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildDataplaneConfig 1 failed: %v", err)
 	}
+	dpConfig1.Revision, err = dpConfig1.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 1 failed: %v", err)
+	}
 	configBytes1, err := dpConfig1.Marshal()
 	if err != nil {
 		t.Fatalf("failed to marshal dpConfig1: %v", err)
@@ -1837,29 +1855,7 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	}
 
 	// Wait for endpoint to report revision 1
-	var revs1 map[string]string
-	pollErr = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
-		resp, err := httpClient.Get(healthURL)
-		if err != nil {
-			return false, nil
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return false, nil
-		}
-		var revs map[string]string
-		if err := json.NewDecoder(resp.Body).Decode(&revs); err != nil {
-			return false, err
-		}
-		if revs[gwKey.String()] == dpConfig1.Revision {
-			revs1 = revs
-			return true, nil
-		}
-		return false, nil
-	})
-	if pollErr != nil {
-		t.Fatalf("timed out waiting for revision 1 %q, last got: %v", dpConfig1.Revision, revs1)
-	}
+	waitForRevision(dpConfig1.Revision)
 
 	// 3. Update config Secret with new route and verify new revision reported
 	route2 := state.InternalRoute{
@@ -1881,6 +1877,10 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildDataplaneConfig 2 failed: %v", err)
 	}
+	dpConfig2.Revision, err = dpConfig2.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 2 failed: %v", err)
+	}
 	configBytes2, err := dpConfig2.Marshal()
 	if err != nil {
 		t.Fatalf("failed to marshal dpConfig2: %v", err)
@@ -1892,33 +1892,14 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	}
 
 	// Wait for endpoint to report revision 2
-	var revs2 map[string]string
-	pollErr = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
-		resp, err := httpClient.Get(healthURL)
-		if err != nil {
-			return false, nil
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return false, nil
-		}
-		var revs map[string]string
-		if err := json.NewDecoder(resp.Body).Decode(&revs); err != nil {
-			return false, err
-		}
-		if revs[gwKey.String()] == dpConfig2.Revision {
-			revs2 = revs
-			return true, nil
-		}
-		return false, nil
-	})
-	if pollErr != nil {
-		t.Fatalf("timed out waiting for revision 2 %q, last got: %v", dpConfig2.Revision, revs2)
-	}
+	waitForRevision(dpConfig2.Revision)
 
 	// 4. Verify security limit: endpoint must NOT be served on Gateway listener (proxy)
 	rec := httptest.NewRecorder()
-	proxyReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/_gari/applied", nil)
+	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/_gari/applied", nil)
+	if err != nil {
+		t.Fatalf("failed to create proxy request: %v", err)
+	}
 	server.Proxy().ServeHTTP(rec, proxyReq)
 	if strings.Contains(rec.Body.String(), dpConfig2.Revision) {
 		t.Errorf("security violation: proxy listener served revision endpoint: %s", rec.Body.String())

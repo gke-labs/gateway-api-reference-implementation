@@ -665,9 +665,6 @@ func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Han
 }
 
 func (s *Server) appliedRevisionsCopy() map[string]string {
-	if s == nil {
-		return make(map[string]string)
-	}
 	s.appliedMu.RLock()
 	defer s.appliedMu.RUnlock()
 	revisions := make(map[string]string, len(s.appliedRevisions))
@@ -678,9 +675,6 @@ func (s *Server) appliedRevisionsCopy() map[string]string {
 }
 
 func (s *Server) recordAppliedRevision(gatewayKey, revision string) {
-	if s == nil {
-		return
-	}
 	s.appliedMu.Lock()
 	defer s.appliedMu.Unlock()
 	if s.appliedRevisions == nil {
