@@ -1142,9 +1142,9 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 
 					// If sibling existed, verify sibling is still intact
 					if tc.setup != nil {
-						sVal, sFound, sErr := store2.Get(bucket, "sibling")
-						if sErr != nil || !sFound {
-							t.Fatalf("sibling key missing after reopen: found=%v, err=%v", sFound, sErr)
+						sVal, sFound, getErr := store2.Get(bucket, "sibling")
+						if getErr != nil || !sFound {
+							t.Fatalf("sibling key missing after reopen: found=%v, err=%v", sFound, getErr)
 						}
 						if len(sVal) != 3500 {
 							t.Fatalf("sibling key corrupted: len=%d, want 3500", len(sVal))

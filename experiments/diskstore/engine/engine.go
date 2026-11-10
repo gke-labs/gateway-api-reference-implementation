@@ -393,8 +393,8 @@ func Open(opts ...Option) (*Engine, error) {
 	eraseReason := ""
 	markerFile, markerErr := options.FS.OpenFile(markerPath, os.O_RDONLY, 0)
 	if markerErr == nil {
-		if cErr := markerFile.Close(); cErr != nil {
-			return nil, fmt.Errorf("failed to close failure marker: %w", cErr)
+		if closeErr := markerFile.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to close failure marker: %w", closeErr)
 		}
 		needsErase = true
 		eraseReason = "failure marker"
@@ -419,32 +419,32 @@ func Open(opts ...Option) (*Engine, error) {
 			if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
 				// meta.db does not exist. Check if orphaned store files exist (heap.db, wal/, or oversize/)
 				hasOrphaned := false
-				hf, hErr := options.FS.OpenFile(heapPath, os.O_RDONLY, 0)
-				if hErr == nil {
-					if cErr := hf.Close(); cErr != nil {
-						return nil, fmt.Errorf("failed to close heap.db check file: %w", cErr)
+				hf, openErr := options.FS.OpenFile(heapPath, os.O_RDONLY, 0)
+				if openErr == nil {
+					if closeErr := hf.Close(); closeErr != nil {
+						return nil, fmt.Errorf("failed to close heap.db check file: %w", closeErr)
 					}
 					hasOrphaned = true
-				} else if !os.IsNotExist(hErr) && !errors.Is(hErr, os.ErrNotExist) {
-					return nil, fmt.Errorf("failed to check heap.db: %w", hErr)
+				} else if !os.IsNotExist(openErr) && !errors.Is(openErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("failed to check heap.db: %w", openErr)
 				}
 
-				wEntries, wErr := options.FS.ReadDir(walDir)
-				if wErr == nil {
+				wEntries, readDirErr := options.FS.ReadDir(walDir)
+				if readDirErr == nil {
 					if len(wEntries) > 0 {
 						hasOrphaned = true
 					}
-				} else if !os.IsNotExist(wErr) && !errors.Is(wErr, os.ErrNotExist) {
-					return nil, fmt.Errorf("failed to check wal directory: %w", wErr)
+				} else if !os.IsNotExist(readDirErr) && !errors.Is(readDirErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("failed to check wal directory: %w", readDirErr)
 				}
 
-				oEntries, oErr := options.FS.ReadDir(oversizeDir)
-				if oErr == nil {
+				oEntries, readDirErr := options.FS.ReadDir(oversizeDir)
+				if readDirErr == nil {
 					if len(oEntries) > 0 {
 						hasOrphaned = true
 					}
-				} else if !os.IsNotExist(oErr) && !errors.Is(oErr, os.ErrNotExist) {
-					return nil, fmt.Errorf("failed to check oversize directory: %w", oErr)
+				} else if !os.IsNotExist(readDirErr) && !errors.Is(readDirErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("failed to check oversize directory: %w", readDirErr)
 				}
 				if hasOrphaned {
 					needsErase = true
@@ -463,13 +463,13 @@ func Open(opts ...Option) (*Engine, error) {
 		} else {
 			// meta.db exists. Read dbID and store format version.
 			metaBuf := make([]byte, metaFileSize)
-			n, rErr := metaFile.ReadAt(metaBuf, 0)
-			if cErr := metaFile.Close(); cErr != nil {
-				return nil, fmt.Errorf("failed to close meta file: %w", cErr)
+			n, readErr := metaFile.ReadAt(metaBuf, 0)
+			if closeErr := metaFile.Close(); closeErr != nil {
+				return nil, fmt.Errorf("failed to close meta file: %w", closeErr)
 			}
-			if rErr != nil && !errors.Is(rErr, io.EOF) {
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
 				if !options.EraseOnError {
-					return nil, fmt.Errorf("failed to read meta file: %w", rErr)
+					return nil, fmt.Errorf("failed to read meta file: %w", readErr)
 				}
 				needsErase = true
 				eraseReason = "unreadable meta file"
@@ -547,9 +547,9 @@ func Open(opts ...Option) (*Engine, error) {
 		if isEncrypted(options.Cipher) {
 			metaBuf[20] = 1
 		}
-		if _, wErr := metaFile.WriteAt(metaBuf, 0); wErr != nil {
+		if _, writeErr := metaFile.WriteAt(metaBuf, 0); writeErr != nil {
 			closeErr := metaFile.Close()
-			return nil, errors.Join(wErr, closeErr)
+			return nil, errors.Join(writeErr, closeErr)
 		}
 		if err := metaFile.Sync(); err != nil {
 			closeErr := metaFile.Close()
@@ -585,9 +585,9 @@ func Open(opts ...Option) (*Engine, error) {
 	} else if conn != nil {
 		if rawConn, ok := conn.(interface{ Control(func(uintptr)) error }); ok {
 			var ctrlErr error
-			if cErr := rawConn.Control(func(fd uintptr) {
+			if controlErr := rawConn.Control(func(fd uintptr) {
 				ctrlErr = applyPlatformDirectIOFlags(fd)
-			}); cErr != nil || ctrlErr != nil {
+			}); controlErr != nil || ctrlErr != nil {
 				GlobalMetrics.DirectIOFallbackCount.Add(1)
 			}
 		}
@@ -847,8 +847,8 @@ func (s *Engine) loadOversizeObjects() error {
 
 		if strings.HasPrefix(name, ".tmp-") {
 			// Clean up abandoned temporary files from previous crashes
-			if rErr := s.fs.Remove(filePath); rErr != nil && !os.IsNotExist(rErr) {
-				return fmt.Errorf("failed to remove abandoned temp file %s: %w", filePath, rErr)
+			if removeErr := s.fs.Remove(filePath); removeErr != nil && !os.IsNotExist(removeErr) {
+				return fmt.Errorf("failed to remove abandoned temp file %s: %w", filePath, removeErr)
 			}
 			continue
 		}
@@ -859,20 +859,20 @@ func (s *Engine) loadOversizeObjects() error {
 		}
 		info, err := entry.Info()
 		if err != nil {
-			if cErr := f.Close(); cErr != nil {
-				err = errors.Join(err, cErr)
+			if closeErr := f.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
 			}
 			return fmt.Errorf("failed to stat oversize file %s: %w", name, err)
 		}
 		data := make([]byte, info.Size())
-		if _, rErr := f.ReadAt(data, 0); rErr != nil {
-			if cErr := f.Close(); cErr != nil {
-				rErr = errors.Join(rErr, cErr)
+		if _, readErr := f.ReadAt(data, 0); readErr != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				readErr = errors.Join(readErr, closeErr)
 			}
-			return fmt.Errorf("failed to read oversize file %s: %w", name, rErr)
+			return fmt.Errorf("failed to read oversize file %s: %w", name, readErr)
 		}
-		if cErr := f.Close(); cErr != nil {
-			return fmt.Errorf("failed to close oversize file %s: %w", name, cErr)
+		if closeErr := f.Close(); closeErr != nil {
+			return fmt.Errorf("failed to close oversize file %s: %w", name, closeErr)
 		}
 
 		qKey, lsn, payload, err := decodeOversizeFile(data)
@@ -934,8 +934,8 @@ func (s *Engine) setFailed(err error) {
 	if s.failedErr == nil {
 		s.failedErr = fmt.Errorf("%w: %v", ErrFailed, err)
 		close(s.failedCh)
-		if mErr := s.writeFailureMarker(err); mErr != nil {
-			s.failedErr = fmt.Errorf("%w (marker error: %v)", s.failedErr, mErr)
+		if markerErr := s.writeFailureMarker(err); markerErr != nil {
+			s.failedErr = fmt.Errorf("%w (marker error: %v)", s.failedErr, markerErr)
 		}
 	}
 	s.failMu.Unlock()
@@ -943,22 +943,22 @@ func (s *Engine) setFailed(err error) {
 
 func (s *Engine) writeFailureMarker(err error) error {
 	markerPath := filepath.Join(s.dir, "FAILED")
-	f, mErr := s.fs.OpenFile(markerPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if mErr != nil {
-		return mErr
+	f, openErr := s.fs.OpenFile(markerPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if openErr != nil {
+		return openErr
 	}
 	var errs []error
-	if _, wErr := f.WriteAt([]byte(err.Error()+"\n"), 0); wErr != nil {
-		errs = append(errs, wErr)
+	if _, writeErr := f.WriteAt([]byte(err.Error()+"\n"), 0); writeErr != nil {
+		errs = append(errs, writeErr)
 	}
-	if sErr := f.Sync(); sErr != nil {
-		errs = append(errs, sErr)
+	if syncErr := f.Sync(); syncErr != nil {
+		errs = append(errs, syncErr)
 	}
-	if cErr := f.Close(); cErr != nil {
-		errs = append(errs, cErr)
+	if closeErr := f.Close(); closeErr != nil {
+		errs = append(errs, closeErr)
 	}
-	if dErr := s.fs.SyncDir(s.dir); dErr != nil {
-		errs = append(errs, dErr)
+	if syncDirErr := s.fs.SyncDir(s.dir); syncDirErr != nil {
+		errs = append(errs, syncDirErr)
 	}
 	return errors.Join(errs...)
 }

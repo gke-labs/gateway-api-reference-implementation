@@ -57,9 +57,9 @@ func (d *defaultDirectIO) Readv(file File, off int64, iov [][]byte) error {
 	// Fallback to sequential ReadAt
 	currOff := off
 	for i, buf := range iov {
-		n, rErr := file.ReadAt(buf, currOff)
-		if rErr != nil && !errors.Is(rErr, io.EOF) {
-			return fmt.Errorf("readv fallback failed at block %d: %w", i, rErr)
+		n, readErr := file.ReadAt(buf, currOff)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return fmt.Errorf("readv fallback failed at block %d: %w", i, readErr)
 		}
 		currOff += int64(n)
 	}
@@ -88,9 +88,9 @@ func (d *defaultDirectIO) Writev(file File, off int64, iov [][]byte) error {
 	// Fallback to sequential WriteAt
 	currOff := off
 	for i, buf := range iov {
-		n, wErr := file.WriteAt(buf, currOff)
-		if wErr != nil {
-			return fmt.Errorf("writev fallback failed at block %d: %w", i, wErr)
+		n, writeErr := file.WriteAt(buf, currOff)
+		if writeErr != nil {
+			return fmt.Errorf("writev fallback failed at block %d: %w", i, writeErr)
 		}
 		currOff += int64(n)
 	}
@@ -117,9 +117,9 @@ func (d *defaultDirectIO) Write(file File, off int64, buf []byte) error {
 	}
 
 	// Fallback to WriteAt
-	_, wErr := file.WriteAt(buf, off)
-	if wErr != nil {
-		return fmt.Errorf("write fallback failed at offset %d: %w", off, wErr)
+	_, writeErr := file.WriteAt(buf, off)
+	if writeErr != nil {
+		return fmt.Errorf("write fallback failed at offset %d: %w", off, writeErr)
 	}
 	return nil
 }

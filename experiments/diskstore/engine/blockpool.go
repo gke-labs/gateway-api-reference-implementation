@@ -748,8 +748,8 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 		// Reclaim allocated blocks on failure
 		var freeErrs []error
 		for _, loc := range locs {
-			if fErr := bp.buddy.Free(loc); fErr != nil {
-				freeErrs = append(freeErrs, fErr)
+			if freeErr := bp.buddy.Free(loc); freeErr != nil {
+				freeErrs = append(freeErrs, freeErr)
 			}
 		}
 		if len(freeErrs) > 0 {
