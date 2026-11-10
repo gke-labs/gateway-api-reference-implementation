@@ -26,6 +26,7 @@ updates:
       - "/"
       - "/certserver"
       - "/certserver/api"
+      - "/experiments/keycustodian"
       - "/gcpgateway"
       - "/localgateway"
       - "/snigateway"
