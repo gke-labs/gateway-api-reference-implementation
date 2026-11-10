@@ -984,3 +984,98 @@ func TestRegression_OversizeRedoRecreate(t *testing.T) {
 		t.Fatalf("content mismatch: got %q", string(val[:30]))
 	}
 }
+
+func setupDeletedOversizeStore(t *testing.T, dir string) (*MemFS, string, []byte, [16]byte) {
+	t.Helper()
+	memFS := NewMemFS()
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	oversizeVal := make([]byte, 2100*1024)
+	if err := store.Put("ConfigMap", "largeKey", oversizeVal); err != nil {
+		t.Fatalf("Put oversize failed: %v", err)
+	}
+	for i := 2; i <= 5; i++ {
+		if err := store.Put("ConfigMap", fmt.Sprintf("k%d", i), []byte("v")); err != nil {
+			t.Fatalf("Put pad failed: %v", err)
+		}
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	qKey := qualifyKey("ConfigMap", "largeKey")
+	oversizePath := filepath.Join(dir, "oversize", oversizeFileName(qKey))
+
+	memFS.mu.RLock()
+	oversizeData := append([]byte(nil), memFS.files[oversizePath]...)
+	memFS.mu.RUnlock()
+
+	dbID := store.dbID
+	if err := store.Delete("ConfigMap", "largeKey"); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	return memFS, oversizePath, oversizeData, dbID
+}
+
+func TestRegression_OversizeNoResurrectionAcrossCheckpointTruncation(t *testing.T) {
+	const dir = "test_oversize_no_resurrect"
+	memFS, oversizePath, oversizeData, _ := setupDeletedOversizeStore(t, dir)
+
+	// Restore oversize file to simulate crash after Delete WAL record but before unlink.
+	memFS.mu.Lock()
+	memFS.files[oversizePath] = oversizeData
+	memFS.mu.Unlock()
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("Close failed: %v", closeErr)
+		}
+	})
+
+	if _, exists, err := store.Get("ConfigMap", "largeKey"); err != nil || exists {
+		t.Fatalf("deleted oversize key resurrected after recovery (exists=%v, err=%v)", exists, err)
+	}
+}
+
+func TestRegression_OversizeUndecodableHeaderPreserved(t *testing.T) {
+	const dir = "test_oversize_undecodable"
+	memFS, oversizePath, _, dbID := setupDeletedOversizeStore(t, dir)
+
+	// Leave a truncated (undecodable) oversize file in place.
+	memFS.mu.Lock()
+	memFS.files[oversizePath] = []byte("short-header")
+	memFS.mu.Unlock()
+
+	heapFile, err := memFS.OpenFile(filepath.Join(dir, "heap.db"), os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile heap failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := heapFile.Close(); closeErr != nil {
+			t.Errorf("Close failed: %v", closeErr)
+		}
+	})
+
+	// Recovery must succeed without aborting, leaving the damaged file in place.
+	if _, err := Recover(memFS, heapFile, dir, filepath.Join(dir, "wal"), dbID); err != nil {
+		t.Fatalf("Recover failed on undecodable oversize file: %v", err)
+	}
+
+	memFS.mu.RLock()
+	_, exists := memFS.files[oversizePath]
+	memFS.mu.RUnlock()
+	if !exists {
+		t.Fatalf("expected undecodable oversize file to remain on disk, but was removed")
+	}
+}
