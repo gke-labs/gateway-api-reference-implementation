@@ -513,12 +513,25 @@ func (bp *BlockPool) acquirePoolBlocksLocked(count int) ([]int, error) {
 		}
 
 		var candidates []*PageDesc
+		hasInFlight := false
 		for _, desc := range bp.pageTable {
-			if len(desc.PoolBlocks) > 0 && desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
-				candidates = append(candidates, desc)
+			if len(desc.PoolBlocks) > 0 {
+				if desc.InFlight {
+					hasInFlight = true
+				}
+				if desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
+					candidates = append(candidates, desc)
+				}
 			}
 		}
 		if len(candidates) == 0 {
+			if hasInFlight {
+				// Waiting is safe because flushBlockRunUnlocked clears InFlight and
+				// broadcasts on bp.cond on both success and failure with bp.mu held,
+				// waking this waiter to re-check candidate pages.
+				bp.cond.Wait()
+				continue
+			}
 			return nil, ErrBlockPoolFull
 		}
 
