@@ -314,24 +314,17 @@ func BuildGatewayDataplaneConfig(cg *CompiledGateway) (*DataplaneConfig, error) 
 		cfg.AllowedSourceCIDRs = cg.Parameters.AllowedSourceCIDRs
 		cfg.ProxyProtocol = cg.Parameters.ProxyProtocol
 		cfg.ProxyProtocolTrustedCIDRs = cg.Parameters.ProxyProtocolTrustedCIDRs
-	}
-	rev, err := cfg.ComputeRevision()
-	if err != nil {
-		return nil, err
-	}
-	cfg.Revision = rev
-	return cfg, nil
-}
-
-// Marshal serializes DataplaneConfig to JSON.
-func (cfg *DataplaneConfig) Marshal() ([]byte, error) {
-	if cfg != nil && cfg.Revision == "" {
 		rev, err := cfg.ComputeRevision()
 		if err != nil {
 			return nil, err
 		}
 		cfg.Revision = rev
 	}
+	return cfg, nil
+}
+
+// Marshal serializes DataplaneConfig to JSON.
+func (cfg *DataplaneConfig) Marshal() ([]byte, error) {
 	return json.Marshal(cfg)
 }
 

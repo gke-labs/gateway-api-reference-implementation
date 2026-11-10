@@ -376,6 +376,7 @@ type Server struct {
 	httpFilter   *proxyproto.Listener
 	httpsFilter  *proxyproto.Listener
 
+	// appliedMu guards appliedRevisions.
 	appliedMu        sync.RWMutex
 	appliedRevisions map[string]string
 }
@@ -528,7 +529,7 @@ func New(opts Options) (*Server, error) {
 		}
 
 		readyzHandler, healthzHandler := s.healthzHandlers()
-		appliedHandler := s.AppliedHandler()
+		appliedHandler := s.appliedHandler()
 		metricsOpts := metricsserver.Options{
 			BindAddress: opts.MetricsAddr,
 		}
@@ -663,8 +664,7 @@ func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Han
 	return rHandler, hHandler
 }
 
-// AppliedRevisions returns a copy of the applied configuration revisions per Gateway.
-func (s *Server) AppliedRevisions() map[string]string {
+func (s *Server) appliedRevisionsCopy() map[string]string {
 	if s == nil {
 		return make(map[string]string)
 	}
@@ -677,8 +677,7 @@ func (s *Server) AppliedRevisions() map[string]string {
 	return revisions
 }
 
-// RecordAppliedRevision records the applied configuration revision for a Gateway.
-func (s *Server) RecordAppliedRevision(gatewayKey, revision string) {
+func (s *Server) recordAppliedRevision(gatewayKey, revision string) {
 	if s == nil {
 		return
 	}
@@ -690,14 +689,14 @@ func (s *Server) RecordAppliedRevision(gatewayKey, revision string) {
 	s.appliedRevisions[gatewayKey] = revision
 }
 
-// AppliedHandler returns an HTTP handler serving the applied configuration revision per Gateway.
-func (s *Server) AppliedHandler() http.Handler {
+func (s *Server) appliedHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		revisions := s.AppliedRevisions()
+		revisions := s.appliedRevisionsCopy()
 		if err := json.NewEncoder(w).Encode(revisions); err != nil {
-			klog.V(4).Infof("failed to write applied revisions response: %v", err)
+			// Disconnects while writing the response are safe to ignore; the probe will retry.
+			klog.Warningf("failed to write applied revisions response: %v", err)
 		}
 	})
 }
@@ -720,7 +719,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 			gatewayNamespace: s.opts.DataplaneGatewayNamespace,
 			secretName:       secretName,
 			onConfigUpdate:   s.updateListenerFilters,
-			onConfigApplied:  s.RecordAppliedRevision,
+			onConfigApplied:  s.recordAppliedRevision,
 		}
 		if err := ctrl.NewControllerManagedBy(mgr).
 			For(&corev1.Secret{}).
@@ -733,26 +732,21 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	userHook := s.opts.OnGatewaysUpdate
 	wrappedHook := func(gateways []*gatewayv1.Gateway) {
 		s.proxySynced.Store(true)
+		newRevisions := make(map[string]string, len(gateways))
 		for _, gw := range gateways {
 			if gw == nil {
 				continue
 			}
 			gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
 			if s.state != nil {
-				if dpCfg := s.state.GetDataplaneConfig(gwKey); dpCfg != nil {
-					rev := dpCfg.Revision
-					if rev == "" {
-						var err error
-						rev, err = dpCfg.ComputeRevision()
-						if err != nil {
-							klog.Errorf("failed to compute dataplane config revision for gateway %s: %v", gwKey, err)
-							continue
-						}
-					}
-					s.RecordAppliedRevision(gwKey.String(), rev)
+				if dpCfg := s.state.GetDataplaneConfig(gwKey); dpCfg != nil && dpCfg.Revision != "" {
+					newRevisions[gwKey.String()] = dpCfg.Revision
 				}
 			}
 		}
+		s.appliedMu.Lock()
+		s.appliedRevisions = newRevisions
+		s.appliedMu.Unlock()
 		if userHook != nil {
 			userHook(gateways)
 		}
@@ -820,22 +814,8 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	if r.onConfigApplied != nil {
-		gwKey := dpCfg.GatewayName.String()
-		if dpCfg.GatewayName.Namespace == "" && r.gatewayNamespace != "" && dpCfg.GatewayName.Name != "" {
-			gwKey = r.gatewayNamespace + "/" + dpCfg.GatewayName.Name
-		}
-		if gwKey != "" && gwKey != "/" {
-			rev := dpCfg.Revision
-			if rev == "" {
-				var err error
-				rev, err = dpCfg.ComputeRevision()
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("failed to compute dataplane config revision: %w", err)
-				}
-			}
-			r.onConfigApplied(gwKey, rev)
-		}
+	if r.onConfigApplied != nil && dpCfg.Revision != "" {
+		r.onConfigApplied(dpCfg.GatewayName.String(), dpCfg.Revision)
 	}
 
 	return ctrl.Result{}, nil

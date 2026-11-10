@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -1098,7 +1099,7 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		WithController(true).
 		WithBlockOwnerDeletion(true)
 
-	configJSON, err := config.Marshal()
+	configJSON, err := json.Marshal(config)
 	if err != nil {
 		return fmt.Errorf("failed to marshal dataplane config: %w", err)
 	}
