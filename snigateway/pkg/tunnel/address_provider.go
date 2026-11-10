@@ -50,6 +50,13 @@ var (
 
 // AddressProvider reports frontend public addresses in Gateway status
 // and gates readiness on tunnel connectivity and hostname registration.
+//
+// Readiness approximation: reports ready when the reverse tunnel session to the frontend is
+// connected and the frontend has acknowledged registration of this Gateway's hostnames.
+//
+// Gap: frontend acknowledgement confirms hostname routing at the tunnel edge, but does not
+// confirm that the data plane behind the tunnel has applied this Gateway's current configuration
+// (listeners, routes, and certificates) or that the current configuration is actively being served.
 type AddressProvider struct {
 	mu             sync.Mutex
 	tunnelState    TunnelState

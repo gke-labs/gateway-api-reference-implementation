@@ -173,6 +173,14 @@ func WithAPIReader(reader client.Reader) Option {
 }
 
 // AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
+//
+// Readiness approximation: reports ready when the per-Gateway Deployment has at least one ready/available
+// replica and addresses are assigned. Because data-plane pods only pass readiness probes after applying a
+// configuration Secret, ready guarantees a replica has applied a config.
+//
+// Gap: ready means "a replica has applied a config", not necessarily "the current configuration applied". The Secret-based
+// config distribution path has no acknowledgement channel carrying the applied configuration revision back from
+// data-plane replicas to the controller, so the provider cannot verify that the latest config is actively being served.
 type AddressProvider struct {
 	client                        client.Client
 	apiReader                     client.Reader

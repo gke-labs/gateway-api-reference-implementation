@@ -125,7 +125,16 @@ func (r *GatewayStatusResult) equal(other *GatewayStatusResult) bool {
 	return true
 }
 
-// GatewayReconciler reconciles Gateways using Google Cloud zonal NEGs and L4 load balancers.
+// GatewayReconciler reconciles Gateways using Google Cloud zonal NEGs and L4 load balancers,
+// evaluating data-plane readiness for Gateway status.
+//
+// Readiness approximation: reports ready (Programmed=True) when at least one data-plane pod is
+// attached to zonal NEGs and confirmed HEALTHY by the Google Cloud load balancer health check
+// (/_gari/readyz), satisfying the load-balancer-ready pod readiness gate.
+//
+// Gap: the health check confirms that a pod is running and has applied an initial configuration,
+// but does not confirm that the pod has applied the Gateway's current configuration revision,
+// nor does it verify that the current configuration is applied and serving across the end-to-end data path.
 type GatewayReconciler struct {
 	client.Client
 	Scheme         *runtime.Scheme
