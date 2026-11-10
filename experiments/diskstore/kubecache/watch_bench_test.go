@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/experiments/bboltcache"
 	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/engine"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -312,6 +314,64 @@ func runKubecacheWatch(t *testing.T, count int, tmpDir string) WatchBenchResult 
 	}
 }
 
+func runBBoltWatch(t *testing.T, count int, tmpDir string) WatchBenchResult {
+	baseMem, ch := readMemStats(), make(chan watch.Event, 256)
+	lw := newFakeLW(ch)
+	dbPath := filepath.Join(tmpDir, "bbolt.db")
+	store, err := bboltcache.NewStore(
+		bboltcache.WithFilePath(dbPath),
+		bboltcache.WithCodec(bboltcache.NewHybridCodec()),
+		bboltcache.WithAutoDelete(false),
+	)
+	if err != nil {
+		t.Fatalf("bboltcache.NewStore failed: %v", err)
+	}
+	defer store.Close()
+
+	idx, err := bboltcache.NewBBoltIndexer(store, &corev1.ConfigMap{},
+		bboltcache.WithBucketName("ConfigMap"),
+		bboltcache.WithIndexerCodec(bboltcache.NewHybridCodec()),
+	)
+	if err != nil {
+		t.Fatalf("bboltcache.NewBBoltIndexer failed: %v", err)
+	}
+
+	var processed atomic.Int64
+	loop := NewWatchLoop(lw, &countingStore{Store: idx, processed: &processed})
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- loop.Run(ctx)
+	}()
+	go feedWatch(ch, count)
+
+	peakMB, dur := measureIngestion(&processed, count)
+	cancel()
+	if loopErr := <-errCh; loopErr != nil {
+		t.Fatalf("watch loop failed: %v", loopErr)
+	}
+
+	snap := readMemStats()
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("stat bbolt db failed: %v", err)
+	}
+	totalDiskMB := float64(fi.Size()) / (1024 * 1024)
+	deltaHeap := snap.HeapAllocMB - baseMem.HeapAllocMB
+	return WatchBenchResult{
+		Engine:        "bbolt WatchLoop",
+		Count:         count,
+		DurationSec:   dur.Seconds(),
+		Throughput:    float64(count) / dur.Seconds(),
+		PeakHeapMB:    peakMB,
+		SteadyHeapMB:  deltaHeap,
+		SteadyInUseMB: snap.HeapInUseMB - baseMem.HeapInUseMB,
+		SteadyRSSMB:   snap.RSSMB,
+		BytesPerObj:   (deltaHeap * 1024 * 1024) / float64(count),
+		DiskMB:        totalDiskMB,
+	}
+}
+
 // TestWatchMemory_Worker runs a single isolated watch memory benchmark.
 func TestWatchMemory_Worker(t *testing.T) {
 	if os.Getenv("WATCH_BENCH_WORKER") != "1" {
@@ -330,10 +390,15 @@ func TestWatchMemory_Worker(t *testing.T) {
 		cnt = n
 	}
 	var res WatchBenchResult
-	if eng == "stock" {
+	switch eng {
+	case "stock":
 		res = runStockInformerWatch(t, cnt)
-	} else {
+	case "bbolt":
+		res = runBBoltWatch(t, cnt, t.TempDir())
+	case "kubecache":
 		res = runKubecacheWatch(t, cnt, t.TempDir())
+	default:
+		t.Fatalf("unknown WATCH_BENCH_ENGINE: %q", eng)
 	}
 	out, err := json.Marshal(res)
 	if err != nil {
@@ -383,10 +448,13 @@ func TestWatchMemoryComparison(t *testing.T) {
 
 	for _, n := range counts {
 		stockRes := runWatchBenchmarkSubprocess(t, "stock", n)
+		bboltRes := runWatchBenchmarkSubprocess(t, "bbolt", n)
 		kubeRes := runWatchBenchmarkSubprocess(t, "kubecache", n)
 
 		fmt.Printf("%-24s | %7d | %8.1f MB | %8.1f MB | %8.1f MB | %8.0f B | %8.0f op/s | %10s\n",
 			stockRes.Engine, n, stockRes.PeakHeapMB, stockRes.SteadyHeapMB, stockRes.SteadyRSSMB, stockRes.BytesPerObj, stockRes.Throughput, "-")
+		fmt.Printf("%-24s | %7d | %8.1f MB | %8.1f MB | %8.1f MB | %8.0f B | %8.0f op/s | %8.1f MB\n",
+			bboltRes.Engine, n, bboltRes.PeakHeapMB, bboltRes.SteadyHeapMB, bboltRes.SteadyRSSMB, bboltRes.BytesPerObj, bboltRes.Throughput, bboltRes.DiskMB)
 		fmt.Printf("%-24s | %7d | %8.1f MB | %8.1f MB | %8.1f MB | %8.0f B | %8.0f op/s | %8.1f MB\n",
 			kubeRes.Engine, n, kubeRes.PeakHeapMB, kubeRes.SteadyHeapMB, kubeRes.SteadyRSSMB, kubeRes.BytesPerObj, kubeRes.Throughput, kubeRes.DiskMB)
 		fmt.Println("------------------------------------------------------------------------------------------------------------------------------------------")
