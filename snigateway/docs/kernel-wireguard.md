@@ -31,9 +31,9 @@ Frontend (Kernel TCP & WireGuard)                   Controller (Kernel TCP & Wir
   - The frontend and controller create a kernel link of type `wireguard` using rtnetlink (for example, via `vishvananda/netlink`).
   - Device keys, listening UDP ports, peer public keys, endpoints, and allowed IPs are configured via netlink using `golang.zx2c4.com/wireguard/wgctrl`.
 - **Tunnel IP Addressing & Routes**:
-  - Tunnels use an IPv6 Unique Local Address (ULA) prefix (default `fd00::/64`).
-  - **Frontend**: Assigns `fd00::1/64` to `wg0` and adds a route for `fd00::/64 dev wg0`. For each registered session, the frontend configures a WireGuard peer with `AllowedIPs = <peer-ip>/128`.
-  - **Controller**: When establishing a session, the controller generates an ephemeral X25519 keypair and requests an address via `WireGuardExchange`. The frontend allocates `<peer-ip>/128` (e.g. `fd00::2/128`). The controller assigns `<peer-ip>/128` to `wg0`, adds a route to `fd00::1/128 dev wg0`, and configures the frontend peer with `AllowedIPs = fd00::/64` (or `fd00::1/128`) and a persistent keepalive of 25 seconds.
+  - Tunnels use an IPv6 Unique Local Address (ULA) prefix. Hardcoding `fd00::/64` violates RFC 4193 (which requires a pseudo-random 40-bit Global ID) and risks colliding with an operator's existing internal networks. Instead, the prefix is generated per frontend following RFC 4193 (e.g. `fdxx:xxxx:xxxx:1::/64`) or made explicitly configurable via `--wireguard-prefix`.
+  - **Frontend**: Assigns `<prefix>::1/64` to `wg0` and adds a route for `<prefix>::/64 dev wg0`. For each registered session, the frontend configures a WireGuard peer with `AllowedIPs = <peer-ip>/128`.
+  - **Controller**: When establishing a session, the controller generates an ephemeral X25519 keypair and requests an address via `WireGuardExchange`. The frontend allocates `<peer-ip>/128` (e.g. `<prefix>::2/128`). The controller assigns `<peer-ip>/128` to `wg0`, adds a route to `<prefix>::1/128 dev wg0`, and configures the frontend peer with `AllowedIPs = <prefix>::/64` (or `<frontend-ip>/128`) and a persistent keepalive of 25 seconds.
 - **Listen and Dial Roles**:
   - **Controller listens**: The controller binds a standard Go listener to the kernel TCP stack inside the tunnel: `net.Listen("tcp", "[<peer-ip>]:51821")`. Inbound connections are accepted by the kernel and dispatched to GARI's proxy handler.
   - **Frontend dials**: When a client connects on `:443` matching a registered SNI hostname, the frontend dials the backend's kernel TCP socket: `net.DialTCP("tcp", nil, &net.TCPAddr{IP: peerIP, Port: 51821})`.
@@ -49,9 +49,13 @@ Kernel WireGuard requires elevated privileges to create network links, assign ad
 - **Kernel Requirements**: Linux kernel 5.6 or later (which includes in-tree WireGuard support), or earlier kernels with the out-of-tree `wireguard.ko` module loaded.
 - **Comparison with Existing Transports**:
   - Today's transports (`tcp`, `quic`, `h2`, and userspace `wireguard`) run entirely in userspace with zero Linux capabilities. Controller pods run under the Kubernetes `restricted` Pod Security Standard as non-root (`runAsUser: 65532`).
+- **Pod Security Standards (PSS)**:
+  - `CAP_NET_ADMIN` is disallowed by both the `restricted` and `baseline` PSS levels (baseline only permits default unprivileged capabilities plus `NET_BIND_SERVICE`). Running the controller pod with kernel WireGuard requires the namespace to be configured with the `privileged` PSS level, or granted an explicit namespace exemption.
+- **Scope of `CAP_NET_ADMIN`**:
+  - In a standard deployment where the pod does not use `hostNetwork`, `CAP_NET_ADMIN` is scoped strictly to the pod's own network namespace. It allows manipulating only the pod's own interfaces (`wg0`, `eth0`), routes, and iptables/nftables rules; it does not grant permissions to modify the host node's network interfaces, host routing tables, or node-level firewall rules.
 - **Trade-off for the Maintainer**:
   - Kernel WireGuard offers significant potential CPU reductions and throughput gains by offloading crypto and TCP processing to the kernel.
-  - What is given up is the unprivileged security boundary: granting `CAP_NET_ADMIN` to the controller pod increases the blast radius if the pod is compromised, prevents deployment in clusters enforcing strict `restricted` pod security policies, and introduces host kernel dependencies.
+  - What is given up is the zero-privilege security boundary: controller pods require `CAP_NET_ADMIN` and a `privileged` PSS level (or namespace exemption), expand exposure to host kernel network vulnerabilities, and introduce a host kernel version dependency.
 
 ## 3. Fallback Strategy
 
