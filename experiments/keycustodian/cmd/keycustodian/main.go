@@ -51,7 +51,7 @@ func parseIDList(input string) ([]uint32, error) {
 	return results, nil
 }
 
-func main() {
+func run() error {
 	var (
 		socketPath     string
 		keysDirectory  string
@@ -66,31 +66,31 @@ func main() {
 	flag.Parse()
 
 	if socketPath == "" {
-		log.Fatal("--socket is required")
+		return fmt.Errorf("--socket is required")
 	}
 
 	allowedUIDs, err := parseIDList(allowedUIDsRaw)
 	if err != nil {
-		log.Fatalf("Invalid --allowed-uids: %v", err)
+		return fmt.Errorf("Invalid --allowed-uids: %w", err)
 	}
 
 	allowedGIDs, err := parseIDList(allowedGIDsRaw)
 	if err != nil {
-		log.Fatalf("Invalid --allowed-gids: %v", err)
+		return fmt.Errorf("Invalid --allowed-gids: %w", err)
 	}
 
 	if len(allowedUIDs) == 0 && len(allowedGIDs) == 0 {
-		log.Fatal("at least one of --allowed-uids or --allowed-gids must be specified")
+		return fmt.Errorf("at least one of --allowed-uids or --allowed-gids must be specified")
 	}
 
 	custodianServer, err := custodian.NewServer(keysDirectory)
 	if err != nil {
-		log.Fatalf("Failed to initialize custodian server: %v", err)
+		return fmt.Errorf("Failed to initialize custodian server: %w", err)
 	}
 
 	listener, err := custodian.ListenUnix(socketPath)
 	if err != nil {
-		log.Fatalf("Failed to listen on unix socket %s: %v", socketPath, err)
+		return fmt.Errorf("Failed to listen on unix socket %s: %w", socketPath, err)
 	}
 	defer func() {
 		if closeErr := listener.Close(); closeErr != nil {
@@ -116,6 +116,13 @@ func main() {
 
 	log.Printf("keycustodian daemon listening on %s (mode 0660)", socketPath)
 	if serveErr := grpcServer.Serve(listener); serveErr != nil {
-		log.Fatalf("gRPC server error: %v", serveErr)
+		return fmt.Errorf("gRPC server error: %w", serveErr)
+	}
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatalf("%v", err)
 	}
 }

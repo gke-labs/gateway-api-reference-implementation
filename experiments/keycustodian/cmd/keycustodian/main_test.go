@@ -17,7 +17,10 @@
 package main
 
 import (
+	"flag"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -63,6 +66,62 @@ func TestParseIDList(t *testing.T) {
 			}
 			if !testCase.expectError && !reflect.DeepEqual(result, testCase.expected) {
 				t.Fatalf("parseIDList(%q) = %v, expected %v", testCase.input, result, testCase.expected)
+			}
+		})
+	}
+}
+
+func TestRun(t *testing.T) {
+	testCases := []struct {
+		name        string
+		args        []string
+		errContains string
+	}{
+		{
+			name:        "missing socket",
+			args:        []string{"keycustodian", "--socket="},
+			errContains: "--socket is required",
+		},
+		{
+			name:        "invalid allowed-uids",
+			args:        []string{"keycustodian", "--allowed-uids=abc"},
+			errContains: "Invalid --allowed-uids",
+		},
+		{
+			name:        "invalid allowed-gids",
+			args:        []string{"keycustodian", "--allowed-gids=xyz"},
+			errContains: "Invalid --allowed-gids",
+		},
+		{
+			name:        "no allowed uids or gids",
+			args:        []string{"keycustodian"},
+			errContains: "at least one of --allowed-uids or --allowed-gids must be specified",
+		},
+		{
+			name:        "invalid keys directory",
+			args:        []string{"keycustodian", "--allowed-uids=1000", "--keys-dir=/nonexistent/dir/that/does/not/exist"},
+			errContains: "Failed to initialize custodian server",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			oldCommandLine := flag.CommandLine
+			oldArgs := os.Args
+			defer func() {
+				flag.CommandLine = oldCommandLine
+				os.Args = oldArgs
+			}()
+
+			flag.CommandLine = flag.NewFlagSet(tc.args[0], flag.ContinueOnError)
+			os.Args = tc.args
+
+			err := run()
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.errContains)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Fatalf("expected error containing %q, got %q", tc.errContains, err.Error())
 			}
 		})
 	}
