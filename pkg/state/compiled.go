@@ -2966,179 +2966,134 @@ func routePartiallyInvalidMessage(rules []InternalRule) string {
 	return fmt.Sprintf("Dropped Rule(s): %s", strings.Join(dropped, ", "))
 }
 
-// ComputeDesiredHTTPRouteStatus computes the desired HTTPRouteStatus from the compiled model.
-func ComputeDesiredHTTPRouteStatus(
-	route *gatewayv1.HTTPRoute,
-	compiledRoute *CompiledRoute,
-	controllerName string,
-) gatewayv1.HTTPRouteStatus {
-	var desiredParents []gatewayv1.RouteParentStatus
-	if compiledRoute != nil {
-		for i, parentRef := range route.Spec.ParentRefs {
-			cond := NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", route.Generation)
-			if i < len(compiledRoute.ParentConditions) {
-				cond = compiledRoute.ParentConditions[i]
-			}
-			conditions := []metav1.Condition{
-				cond,
-				compiledRoute.RouteState.Internal.ResolvedRefsCondition,
-			}
-			if cond.Status == metav1.ConditionTrue && compiledRoute.RouteState != nil && compiledRoute.RouteState.Internal != nil {
-				if isRoutePartiallyInvalid(compiledRoute.RouteState.Internal.Rules) {
-					conditions = append(conditions, NewCondition(
-						string(gatewayv1.RouteConditionPartiallyInvalid),
-						metav1.ConditionTrue,
-						string(gatewayv1.RouteReasonUnsupportedValue),
-						routePartiallyInvalidMessage(compiledRoute.RouteState.Internal.Rules),
-						route.Generation,
-					))
-				}
-			}
-			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
-				ParentRef:      parentRef,
-				ControllerName: gatewayv1.GatewayController(controllerName),
-				Conditions:     conditions,
-			})
-		}
+// routePartiallyInvalidCondition returns a PartiallyInvalid condition if the rules are partially invalid, or nil otherwise.
+func routePartiallyInvalidCondition(rules []InternalRule, generation int64) *metav1.Condition {
+	if !isRoutePartiallyInvalid(rules) {
+		return nil
 	}
+	cond := NewCondition(
+		string(gatewayv1.RouteConditionPartiallyInvalid),
+		metav1.ConditionTrue,
+		string(gatewayv1.RouteReasonUnsupportedValue),
+		routePartiallyInvalidMessage(rules),
+		generation,
+	)
+	return &cond
+}
 
+// computeDesiredRouteParentStatuses computes desired RouteParentStatus entries for route parents.
+func computeDesiredRouteParentStatuses(
+	parentRefs []gatewayv1.ParentReference,
+	parentConditions []metav1.Condition,
+	resolvedRefsCond metav1.Condition,
+	controllerName string,
+	generation int64,
+	partiallyInvalidCond *metav1.Condition,
+) []gatewayv1.RouteParentStatus {
+	var desiredParents []gatewayv1.RouteParentStatus
+	for i, parentRef := range parentRefs {
+		cond := NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", generation)
+		if i < len(parentConditions) {
+			cond = parentConditions[i]
+		}
+		conditions := []metav1.Condition{
+			cond,
+			resolvedRefsCond,
+		}
+		if cond.Status == metav1.ConditionTrue && partiallyInvalidCond != nil {
+			conditions = append(conditions, *partiallyInvalidCond)
+		}
+		desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
+			ParentRef:      parentRef,
+			ControllerName: gatewayv1.GatewayController(controllerName),
+			Conditions:     conditions,
+		})
+	}
+	return desiredParents
+}
+
+// ComputeDesiredHTTPRouteStatus computes the desired HTTPRouteStatus from the compiled model.
+func ComputeDesiredHTTPRouteStatus(route *gatewayv1.HTTPRoute, compiledRoute *CompiledRoute, controllerName string) gatewayv1.HTTPRouteStatus {
+	if route == nil || compiledRoute == nil || len(route.Spec.ParentRefs) == 0 {
+		return gatewayv1.HTTPRouteStatus{}
+	}
+	var partiallyInvalid *metav1.Condition
+	if compiledRoute.RouteState != nil && compiledRoute.RouteState.Internal != nil {
+		partiallyInvalid = routePartiallyInvalidCondition(compiledRoute.RouteState.Internal.Rules, route.Generation)
+	}
 	return gatewayv1.HTTPRouteStatus{
-		Parents: desiredParents,
+		Parents: computeDesiredRouteParentStatuses(
+			route.Spec.ParentRefs, compiledRoute.ParentConditions,
+			compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+			controllerName, route.Generation, partiallyInvalid,
+		),
 	}
 }
 
 // ComputeDesiredTLSRouteStatus computes the desired TLSRouteStatus from the compiled model.
-func ComputeDesiredTLSRouteStatus(
-	route *gatewayv1.TLSRoute,
-	compiledRoute *CompiledTLSRoute,
-	controllerName string,
-) gatewayv1.TLSRouteStatus {
-	var desiredParents []gatewayv1.RouteParentStatus
-	if compiledRoute != nil {
-		for i, parentRef := range route.Spec.ParentRefs {
-			cond := NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", route.Generation)
-			if i < len(compiledRoute.ParentConditions) {
-				cond = compiledRoute.ParentConditions[i]
-			}
-			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
-				ParentRef:      parentRef,
-				ControllerName: gatewayv1.GatewayController(controllerName),
-				Conditions: []metav1.Condition{
-					cond,
-					compiledRoute.RouteState.Internal.ResolvedRefsCondition,
-				},
-			})
-		}
+func ComputeDesiredTLSRouteStatus(route *gatewayv1.TLSRoute, compiledRoute *CompiledTLSRoute, controllerName string) gatewayv1.TLSRouteStatus {
+	if route == nil || compiledRoute == nil || len(route.Spec.ParentRefs) == 0 {
+		return gatewayv1.TLSRouteStatus{}
 	}
-
 	return gatewayv1.TLSRouteStatus{
 		RouteStatus: gatewayv1.RouteStatus{
-			Parents: desiredParents,
+			Parents: computeDesiredRouteParentStatuses(
+				route.Spec.ParentRefs, compiledRoute.ParentConditions,
+				compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+				controllerName, route.Generation, nil,
+			),
 		},
 	}
 }
 
 // ComputeDesiredGRPCRouteStatus computes the desired GRPCRouteStatus from the compiled model.
-func ComputeDesiredGRPCRouteStatus(
-	route *gatewayv1.GRPCRoute,
-	compiledRoute *CompiledGRPCRoute,
-	controllerName string,
-) gatewayv1.GRPCRouteStatus {
-	var desiredParents []gatewayv1.RouteParentStatus
-	if compiledRoute != nil {
-		for i, parentRef := range route.Spec.ParentRefs {
-			cond := NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", route.Generation)
-			if i < len(compiledRoute.ParentConditions) {
-				cond = compiledRoute.ParentConditions[i]
-			}
-			conditions := []metav1.Condition{
-				cond,
-				compiledRoute.RouteState.Internal.ResolvedRefsCondition,
-			}
-			if cond.Status == metav1.ConditionTrue && compiledRoute.RouteState != nil && compiledRoute.RouteState.Internal != nil {
-				if isRoutePartiallyInvalid(compiledRoute.RouteState.Internal.Rules) {
-					conditions = append(conditions, NewCondition(
-						string(gatewayv1.RouteConditionPartiallyInvalid),
-						metav1.ConditionTrue,
-						string(gatewayv1.RouteReasonUnsupportedValue),
-						routePartiallyInvalidMessage(compiledRoute.RouteState.Internal.Rules),
-						route.Generation,
-					))
-				}
-			}
-			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
-				ParentRef:      parentRef,
-				ControllerName: gatewayv1.GatewayController(controllerName),
-				Conditions:     conditions,
-			})
-		}
+func ComputeDesiredGRPCRouteStatus(route *gatewayv1.GRPCRoute, compiledRoute *CompiledGRPCRoute, controllerName string) gatewayv1.GRPCRouteStatus {
+	if route == nil || compiledRoute == nil || len(route.Spec.ParentRefs) == 0 {
+		return gatewayv1.GRPCRouteStatus{}
 	}
-
+	var partiallyInvalid *metav1.Condition
+	if compiledRoute.RouteState != nil && compiledRoute.RouteState.Internal != nil {
+		partiallyInvalid = routePartiallyInvalidCondition(compiledRoute.RouteState.Internal.Rules, route.Generation)
+	}
 	return gatewayv1.GRPCRouteStatus{
 		RouteStatus: gatewayv1.RouteStatus{
-			Parents: desiredParents,
+			Parents: computeDesiredRouteParentStatuses(
+				route.Spec.ParentRefs, compiledRoute.ParentConditions,
+				compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+				controllerName, route.Generation, partiallyInvalid,
+			),
 		},
 	}
 }
 
 // ComputeDesiredTCPRouteStatus computes the desired TCPRouteStatus from the compiled model.
-func ComputeDesiredTCPRouteStatus(
-	route *gatewayv1.TCPRoute,
-	compiledRoute *CompiledTCPRoute,
-	controllerName string,
-) gatewayv1.TCPRouteStatus {
-	var desiredParents []gatewayv1.RouteParentStatus
-	if compiledRoute != nil {
-		for i, parentRef := range route.Spec.ParentRefs {
-			cond := NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", route.Generation)
-			if i < len(compiledRoute.ParentConditions) {
-				cond = compiledRoute.ParentConditions[i]
-			}
-			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
-				ParentRef:      parentRef,
-				ControllerName: gatewayv1.GatewayController(controllerName),
-				Conditions: []metav1.Condition{
-					cond,
-					compiledRoute.RouteState.Internal.ResolvedRefsCondition,
-				},
-			})
-		}
+func ComputeDesiredTCPRouteStatus(route *gatewayv1.TCPRoute, compiledRoute *CompiledTCPRoute, controllerName string) gatewayv1.TCPRouteStatus {
+	if route == nil || compiledRoute == nil || len(route.Spec.ParentRefs) == 0 {
+		return gatewayv1.TCPRouteStatus{}
 	}
-
 	return gatewayv1.TCPRouteStatus{
 		RouteStatus: gatewayv1.RouteStatus{
-			Parents: desiredParents,
+			Parents: computeDesiredRouteParentStatuses(
+				route.Spec.ParentRefs, compiledRoute.ParentConditions,
+				compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+				controllerName, route.Generation, nil,
+			),
 		},
 	}
 }
 
 // ComputeDesiredUDPRouteStatus computes the desired UDPRouteStatus from the compiled model.
-func ComputeDesiredUDPRouteStatus(
-	route *gatewayv1.UDPRoute,
-	compiledRoute *CompiledUDPRoute,
-	controllerName string,
-) gatewayv1.UDPRouteStatus {
-	var desiredParents []gatewayv1.RouteParentStatus
-	if compiledRoute != nil {
-		for i, parentRef := range route.Spec.ParentRefs {
-			cond := NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", route.Generation)
-			if i < len(compiledRoute.ParentConditions) {
-				cond = compiledRoute.ParentConditions[i]
-			}
-			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
-				ParentRef:      parentRef,
-				ControllerName: gatewayv1.GatewayController(controllerName),
-				Conditions: []metav1.Condition{
-					cond,
-					compiledRoute.RouteState.Internal.ResolvedRefsCondition,
-				},
-			})
-		}
+func ComputeDesiredUDPRouteStatus(route *gatewayv1.UDPRoute, compiledRoute *CompiledUDPRoute, controllerName string) gatewayv1.UDPRouteStatus {
+	if route == nil || compiledRoute == nil || len(route.Spec.ParentRefs) == 0 {
+		return gatewayv1.UDPRouteStatus{}
 	}
-
 	return gatewayv1.UDPRouteStatus{
 		RouteStatus: gatewayv1.RouteStatus{
-			Parents: desiredParents,
+			Parents: computeDesiredRouteParentStatuses(
+				route.Spec.ParentRefs, compiledRoute.ParentConditions,
+				compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+				controllerName, route.Generation, nil,
+			),
 		},
 	}
 }
@@ -3624,44 +3579,42 @@ func MergeListenerSetStatus(current *gatewayv1.ListenerSetStatus, desired gatewa
 	return updated
 }
 
+// mergeRouteParentStatuses merges desired RouteParentStatus slice into current, preserving LastTransitionTime and other controllers' parents.
+// It returns true if semantic changes occurred that require updating status in the API server.
+func mergeRouteParentStatuses(current *[]gatewayv1.RouteParentStatus, desired []gatewayv1.RouteParentStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
+	newParents, updated := UpdateRouteParentStatuses(*current, desired, routeNamespace, controllerName)
+	*current = newParents
+	return updated
+}
+
 // MergeHTTPRouteStatus merges desired HTTPRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
 // It returns true if semantic changes occurred that require updating status in the API server.
 func MergeHTTPRouteStatus(current *gatewayv1.HTTPRouteStatus, desired gatewayv1.HTTPRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
-	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
-	current.Parents = newParents
-	return updated
+	return mergeRouteParentStatuses(&current.Parents, desired.Parents, routeNamespace, controllerName)
 }
 
 // MergeTLSRouteStatus merges desired TLSRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
 // It returns true if semantic changes occurred that require updating status in the API server.
 func MergeTLSRouteStatus(current *gatewayv1.TLSRouteStatus, desired gatewayv1.TLSRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
-	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
-	current.Parents = newParents
-	return updated
+	return mergeRouteParentStatuses(&current.Parents, desired.Parents, routeNamespace, controllerName)
 }
 
 // MergeGRPCRouteStatus merges desired GRPCRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
 // It returns true if semantic changes occurred that require updating status in the API server.
 func MergeGRPCRouteStatus(current *gatewayv1.GRPCRouteStatus, desired gatewayv1.GRPCRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
-	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
-	current.Parents = newParents
-	return updated
+	return mergeRouteParentStatuses(&current.Parents, desired.Parents, routeNamespace, controllerName)
 }
 
 // MergeTCPRouteStatus merges desired TCPRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
 // It returns true if semantic changes occurred that require updating status in the API server.
 func MergeTCPRouteStatus(current *gatewayv1.TCPRouteStatus, desired gatewayv1.TCPRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
-	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
-	current.Parents = newParents
-	return updated
+	return mergeRouteParentStatuses(&current.Parents, desired.Parents, routeNamespace, controllerName)
 }
 
 // MergeUDPRouteStatus merges desired UDPRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
 // It returns true if semantic changes occurred that require updating status in the API server.
 func MergeUDPRouteStatus(current *gatewayv1.UDPRouteStatus, desired gatewayv1.UDPRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
-	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
-	current.Parents = newParents
-	return updated
+	return mergeRouteParentStatuses(&current.Parents, desired.Parents, routeNamespace, controllerName)
 }
 
 // MergeBackendTLSPolicyStatus merges desired PolicyStatus into current, preserving LastTransitionTime and other controllers' ancestors.
@@ -3700,79 +3653,44 @@ func GatewayStatusesEqual(a, b gatewayv1.GatewayStatus) bool {
 	return reflectListenerStatusesEqual(a.Listeners, b.Listeners)
 }
 
-// HTTPRouteStatusesEqual compares two HTTPRouteStatus objects (ignoring LastTransitionTime).
-func HTTPRouteStatusesEqual(a, b gatewayv1.HTTPRouteStatus) bool {
-	if len(a.Parents) != len(b.Parents) {
+// routeParentStatusesEqual compares two slices of RouteParentStatus (ignoring LastTransitionTime).
+func routeParentStatusesEqual(a, b []gatewayv1.RouteParentStatus) bool {
+	if len(a) != len(b) {
 		return false
 	}
-	for i := range a.Parents {
-		if !reflectParentReferenceEqual(a.Parents[i].ParentRef, b.Parents[i].ParentRef) ||
-			a.Parents[i].ControllerName != b.Parents[i].ControllerName ||
-			!ConditionsEqual(a.Parents[i].Conditions, b.Parents[i].Conditions) {
+	for i := range a {
+		if !reflectParentReferenceEqual(a[i].ParentRef, b[i].ParentRef) ||
+			a[i].ControllerName != b[i].ControllerName ||
+			!ConditionsEqual(a[i].Conditions, b[i].Conditions) {
 			return false
 		}
 	}
 	return true
+}
+
+// HTTPRouteStatusesEqual compares two HTTPRouteStatus objects (ignoring LastTransitionTime).
+func HTTPRouteStatusesEqual(a, b gatewayv1.HTTPRouteStatus) bool {
+	return routeParentStatusesEqual(a.Parents, b.Parents)
 }
 
 // TLSRouteStatusesEqual compares two TLSRouteStatus objects (ignoring LastTransitionTime).
 func TLSRouteStatusesEqual(a, b gatewayv1.TLSRouteStatus) bool {
-	if len(a.Parents) != len(b.Parents) {
-		return false
-	}
-	for i := range a.Parents {
-		if !reflectParentReferenceEqual(a.Parents[i].ParentRef, b.Parents[i].ParentRef) ||
-			a.Parents[i].ControllerName != b.Parents[i].ControllerName ||
-			!ConditionsEqual(a.Parents[i].Conditions, b.Parents[i].Conditions) {
-			return false
-		}
-	}
-	return true
+	return routeParentStatusesEqual(a.Parents, b.Parents)
 }
 
 // GRPCRouteStatusesEqual compares two GRPCRouteStatus objects (ignoring LastTransitionTime).
 func GRPCRouteStatusesEqual(a, b gatewayv1.GRPCRouteStatus) bool {
-	if len(a.Parents) != len(b.Parents) {
-		return false
-	}
-	for i := range a.Parents {
-		if !reflectParentReferenceEqual(a.Parents[i].ParentRef, b.Parents[i].ParentRef) ||
-			a.Parents[i].ControllerName != b.Parents[i].ControllerName ||
-			!ConditionsEqual(a.Parents[i].Conditions, b.Parents[i].Conditions) {
-			return false
-		}
-	}
-	return true
+	return routeParentStatusesEqual(a.Parents, b.Parents)
 }
 
 // TCPRouteStatusesEqual compares two TCPRouteStatus objects (ignoring LastTransitionTime).
 func TCPRouteStatusesEqual(a, b gatewayv1.TCPRouteStatus) bool {
-	if len(a.Parents) != len(b.Parents) {
-		return false
-	}
-	for i := range a.Parents {
-		if !reflectParentReferenceEqual(a.Parents[i].ParentRef, b.Parents[i].ParentRef) ||
-			a.Parents[i].ControllerName != b.Parents[i].ControllerName ||
-			!ConditionsEqual(a.Parents[i].Conditions, b.Parents[i].Conditions) {
-			return false
-		}
-	}
-	return true
+	return routeParentStatusesEqual(a.Parents, b.Parents)
 }
 
 // UDPRouteStatusesEqual compares two UDPRouteStatus objects (ignoring LastTransitionTime).
 func UDPRouteStatusesEqual(a, b gatewayv1.UDPRouteStatus) bool {
-	if len(a.Parents) != len(b.Parents) {
-		return false
-	}
-	for i := range a.Parents {
-		if !reflectParentReferenceEqual(a.Parents[i].ParentRef, b.Parents[i].ParentRef) ||
-			a.Parents[i].ControllerName != b.Parents[i].ControllerName ||
-			!ConditionsEqual(a.Parents[i].Conditions, b.Parents[i].Conditions) {
-			return false
-		}
-	}
-	return true
+	return routeParentStatusesEqual(a.Parents, b.Parents)
 }
 
 // ListenerSetStatusesEqual compares two ListenerSetStatus objects (ignoring LastTransitionTime).

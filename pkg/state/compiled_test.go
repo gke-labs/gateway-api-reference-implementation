@@ -6969,3 +6969,45 @@ func TestRoute_HostnameIntersectionPrecedence_GRPCRoute(t *testing.T) {
 		})
 	}
 }
+
+func TestComputeDesiredRouteStatus_NoParentRefs(t *testing.T) {
+	httpRoute := &gatewayv1.HTTPRoute{}
+	tlsRoute := &gatewayv1.TLSRoute{}
+	grpcRoute := &gatewayv1.GRPCRoute{}
+	tcpRoute := &gatewayv1.TCPRoute{}
+	udpRoute := &gatewayv1.UDPRoute{}
+
+	// Compiled routes with nil RouteState should not panic when ParentRefs is empty.
+	if s := ComputeDesiredHTTPRouteStatus(httpRoute, &CompiledRoute{}, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+	if s := ComputeDesiredTLSRouteStatus(tlsRoute, &CompiledTLSRoute{}, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+	if s := ComputeDesiredGRPCRouteStatus(grpcRoute, &CompiledGRPCRoute{}, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+	if s := ComputeDesiredTCPRouteStatus(tcpRoute, &CompiledTCPRoute{}, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+	if s := ComputeDesiredUDPRouteStatus(udpRoute, &CompiledUDPRoute{}, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+
+	// Nil compiled routes should also return empty status.
+	if s := ComputeDesiredHTTPRouteStatus(httpRoute, nil, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+	if s := ComputeDesiredTLSRouteStatus(tlsRoute, nil, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+	if s := ComputeDesiredGRPCRouteStatus(grpcRoute, nil, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+	if s := ComputeDesiredTCPRouteStatus(tcpRoute, nil, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+	if s := ComputeDesiredUDPRouteStatus(udpRoute, nil, "ctrl"); len(s.Parents) != 0 {
+		t.Errorf("expected 0 parents, got %d", len(s.Parents))
+	}
+}
