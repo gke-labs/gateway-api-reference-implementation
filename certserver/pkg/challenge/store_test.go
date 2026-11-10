@@ -143,6 +143,28 @@ func TestMemoryStore_GetChallengesForRequester(t *testing.T) {
 		t.Fatalf("expected 0 matches for unrelated cluster, got %d", len(matchesOtherCluster))
 	}
 
+	// Different HostnamesKey does not match
+	reqDifferentHost := Requester{
+		ClusterID:    "cluster-1",
+		Gateway:      "default/gw-1",
+		HostnamesKey: "other.example.com",
+	}
+	matchesDifferentHost := store.GetChallengesForRequester(ctx, reqDifferentHost)
+	if len(matchesDifferentHost) != 0 {
+		t.Fatalf("expected 0 matches for different HostnamesKey, got %d", len(matchesDifferentHost))
+	}
+
+	// Empty HostnamesKey does not match
+	reqEmptyHost := Requester{
+		ClusterID:    "cluster-1",
+		Gateway:      "default/gw-1",
+		HostnamesKey: "",
+	}
+	matchesEmptyHost := store.GetChallengesForRequester(ctx, reqEmptyHost)
+	if len(matchesEmptyHost) != 0 {
+		t.Fatalf("expected 0 matches for empty HostnamesKey, got %d", len(matchesEmptyHost))
+	}
+
 	// Expired challenge is not returned
 	store.timeNow = func() time.Time { return now.Add(11 * time.Minute) }
 	matchesExpired := store.GetChallengesForRequester(ctx, req1)
