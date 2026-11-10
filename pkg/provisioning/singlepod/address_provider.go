@@ -51,6 +51,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -92,6 +93,9 @@ const (
 
 	// DataPlaneHealthProbePort is the container port for health probes and metrics.
 	DataPlaneHealthProbePort = state.DataPlaneHealthProbePort
+
+	defaultPollInterval = 500 * time.Millisecond
+	defaultProbeTimeout = 2 * time.Second
 
 	// DefaultACMEChallengeAudience is the token audience expected by certserver for ACME HTTP-01 challenge forwarding.
 	DefaultACMEChallengeAudience = "certserver"
@@ -206,34 +210,20 @@ type AddressProvider struct {
 	acmeChallengeAudience         string
 	acmeChallengeTokenExpiration  int64
 
-	mu               sync.Mutex
-	eventCh          chan event.GenericEvent
+	// revMu guards currentRevisions.
+	revMu            sync.Mutex
 	currentRevisions map[types.NamespacedName]string
-	pollers          map[types.NamespacedName]context.CancelFunc
-	pollInterval     time.Duration
-	probeTimeout     time.Duration
-	httpClient       *http.Client
-}
 
-// WithPollInterval configures the poll interval for data-plane replica applied revision convergence checks.
-func WithPollInterval(interval time.Duration) Option {
-	return func(p *AddressProvider) {
-		p.pollInterval = interval
-	}
-}
+	// pollerMu guards poller lifecycle and active pollers.
+	pollerMu      sync.Mutex
+	parentCtx     context.Context
+	cancelPollers context.CancelFunc
+	pollers       map[types.NamespacedName]context.CancelFunc
+	pollInterval  time.Duration
+	probeTimeout  time.Duration
+	httpClient    *http.Client
 
-// WithProbeTimeout configures the timeout for individual applied revision probe requests.
-func WithProbeTimeout(timeout time.Duration) Option {
-	return func(p *AddressProvider) {
-		p.probeTimeout = timeout
-	}
-}
-
-// WithHTTPClient configures the HTTP client used to probe data-plane replicas.
-func WithHTTPClient(client *http.Client) Option {
-	return func(p *AddressProvider) {
-		p.httpClient = client
-	}
+	eventCh chan event.GenericEvent
 }
 
 // WithACMEChallengeUpstreamURL configures the upstream certificate server URL for forwarding ACME HTTP-01 challenges.
@@ -336,9 +326,9 @@ func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
 		eventCh:          make(chan event.GenericEvent, 50),
 		currentRevisions: make(map[types.NamespacedName]string),
 		pollers:          make(map[types.NamespacedName]context.CancelFunc),
-		pollInterval:     500 * time.Millisecond,
-		probeTimeout:     2 * time.Second,
-		httpClient:       &http.Client{Timeout: 2 * time.Second},
+		pollInterval:     defaultPollInterval,
+		probeTimeout:     defaultProbeTimeout,
+		httpClient:       &http.Client{},
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -1095,6 +1085,17 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 		p.apiReader = mgr.GetAPIReader()
 		scheme = mgr.GetScheme()
 		mapper = mgr.GetRESTMapper()
+
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			p.pollerMu.Lock()
+			p.parentCtx, p.cancelPollers = context.WithCancel(ctx)
+			p.pollerMu.Unlock()
+			<-ctx.Done()
+			p.stopAllPollers()
+			return nil
+		})); err != nil {
+			return fmt.Errorf("failed to register poller lifecycle with manager: %w", err)
+		}
 	} else if p.client != nil {
 		scheme = p.client.Scheme()
 		mapper = p.client.RESTMapper()
@@ -1109,9 +1110,7 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 
 	bldr.Watches(&corev1.Service{}, ownerHandler, builder.WithPredicates(pred))
 	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
-	if bldr != nil && p.eventCh != nil {
-		bldr.WatchesRawSource(source.Channel(p.eventCh, &handler.EnqueueRequestForObject{}))
-	}
+	bldr.WatchesRawSource(source.Channel(p.eventCh, &handler.EnqueueRequestForObject{}))
 
 	return nil
 }
@@ -1123,17 +1122,21 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 	}
 	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
 	if config == nil {
-		p.mu.Lock()
+		p.revMu.Lock()
 		delete(p.currentRevisions, gwKey)
-		p.mu.Unlock()
+		p.revMu.Unlock()
 		p.stopPoller(gwKey)
 		return nil
 	}
-	p.mu.Lock()
-	if config.Revision != "" {
-		p.currentRevisions[gwKey] = config.Revision
+	p.revMu.Lock()
+	oldRev, exists := p.currentRevisions[gwKey]
+	revChanged := !exists || oldRev != config.Revision
+	p.currentRevisions[gwKey] = config.Revision
+	p.revMu.Unlock()
+
+	if revChanged {
+		p.triggerReconcile(ctx, gwKey)
 	}
-	p.mu.Unlock()
 
 	name := ResourceNameForGateway(gw.Name)
 
@@ -1181,21 +1184,28 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 
 func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey types.NamespacedName, name string, addresses []gatewayv1.GatewayStatusAddress) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	currentRev := p.currentRevisionForGateway(gwKey)
-	if currentRev != "" {
-		converged, err := p.checkEndpointsConverged(ctx, gwKey, currentRev, name)
-		if err != nil {
-			return nil, state.GatewayReadiness{}, err
-		}
-		if !converged {
-			p.startPoller(gwKey, name)
-			return addresses, state.GatewayReadiness{
-				Ready:   false,
-				Reason:  string(gatewayv1.GatewayReasonPending),
-				Message: "Waiting for data-plane replicas to apply current configuration",
-			}, nil
-		}
-		p.stopPoller(gwKey)
+	if currentRev == "" {
+		return addresses, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonPending),
+			Message: "Waiting for data-plane configuration to be published",
+		}, nil
 	}
+
+	converged, err := p.checkEndpointsConverged(ctx, gwKey, currentRev, name)
+	if err != nil {
+		return nil, state.GatewayReadiness{}, err
+	}
+	if !converged {
+		p.startPoller(gwKey, name)
+		return addresses, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonPending),
+			Message: "Waiting for data-plane replicas to apply current configuration",
+		}, nil
+	}
+	p.stopPoller(gwKey)
+
 	return addresses, state.GatewayReadiness{
 		Ready:   true,
 		Reason:  string(gatewayv1.GatewayReasonProgrammed),
@@ -1204,65 +1214,40 @@ func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey t
 }
 
 func (p *AddressProvider) currentRevisionForGateway(gwKey types.NamespacedName) string {
-	p.mu.Lock()
-	rev := p.currentRevisions[gwKey]
-	p.mu.Unlock()
-	if rev != "" {
-		return rev
-	}
-	if p.state != nil {
-		if cfg := p.state.GetDataplaneConfig(gwKey); cfg != nil && cfg.Revision != "" {
-			return cfg.Revision
-		}
-	}
-	if p.client != nil {
-		var sec corev1.Secret
-		name := ResourceNameForGateway(gwKey.Name)
-		err := p.client.Get(context.Background(), types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &sec)
-		if err != nil {
-			return ""
-		}
-		if data, ok := sec.Data[DataplaneSecretDataKey]; ok && len(data) > 0 {
-			var cfg state.DataplaneConfig
-			if err := json.Unmarshal(data, &cfg); err == nil && cfg.Revision != "" {
-				return cfg.Revision
-			}
-		}
-	}
-	return ""
+	p.revMu.Lock()
+	defer p.revMu.Unlock()
+	return p.currentRevisions[gwKey]
 }
 
-func (p *AddressProvider) triggerReconcile(key types.NamespacedName) {
+func (p *AddressProvider) triggerReconcile(ctx context.Context, key types.NamespacedName) {
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: key.Namespace,
 			Name:      key.Name,
 		},
 	}
-	if p.eventCh != nil {
-		select {
-		case p.eventCh <- event.GenericEvent{Object: gw}:
-		default:
-		}
+	select {
+	case p.eventCh <- event.GenericEvent{Object: gw}:
+	case <-ctx.Done():
 	}
 }
 
 func (p *AddressProvider) startPoller(gwKey types.NamespacedName, name string) {
-	p.mu.Lock()
+	p.pollerMu.Lock()
 	if _, running := p.pollers[gwKey]; running {
-		p.mu.Unlock()
+		p.pollerMu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	p.pollers[gwKey] = cancel
-	pollInterval := p.pollInterval
-	if pollInterval <= 0 {
-		pollInterval = 500 * time.Millisecond
+	parent := p.parentCtx
+	if parent == nil {
+		parent = context.Background()
 	}
-	p.mu.Unlock()
+	ctx, cancel := context.WithCancel(parent)
+	p.pollers[gwKey] = cancel
+	p.pollerMu.Unlock()
 
 	go func() {
-		ticker := time.NewTicker(pollInterval)
+		ticker := time.NewTicker(p.pollInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -1275,10 +1260,10 @@ func (p *AddressProvider) startPoller(gwKey types.NamespacedName, name string) {
 				}
 				converged, err := p.checkEndpointsConverged(ctx, gwKey, currentRev, name)
 				if err == nil && converged {
-					p.mu.Lock()
+					p.pollerMu.Lock()
 					delete(p.pollers, gwKey)
-					p.mu.Unlock()
-					p.triggerReconcile(gwKey)
+					p.pollerMu.Unlock()
+					p.triggerReconcile(ctx, gwKey)
 					return
 				}
 			}
@@ -1287,12 +1272,24 @@ func (p *AddressProvider) startPoller(gwKey types.NamespacedName, name string) {
 }
 
 func (p *AddressProvider) stopPoller(gwKey types.NamespacedName) {
-	p.mu.Lock()
+	p.pollerMu.Lock()
+	defer p.pollerMu.Unlock()
 	if cancel, ok := p.pollers[gwKey]; ok {
 		cancel()
 		delete(p.pollers, gwKey)
 	}
-	p.mu.Unlock()
+}
+
+func (p *AddressProvider) stopAllPollers() {
+	p.pollerMu.Lock()
+	defer p.pollerMu.Unlock()
+	if p.cancelPollers != nil {
+		p.cancelPollers()
+	}
+	for key, cancel := range p.pollers {
+		cancel()
+		delete(p.pollers, key)
+	}
 }
 
 func (p *AddressProvider) checkEndpointsConverged(ctx context.Context, gwKey types.NamespacedName, currentRev, svcName string) (bool, error) {
@@ -1326,9 +1323,6 @@ func (p *AddressProvider) checkEndpointsConverged(ctx context.Context, gwKey typ
 		}
 	}
 
-	if len(slicesList.Items) == 0 {
-		return true, nil
-	}
 	if len(readyEndpoints) == 0 {
 		return false, nil
 	}
@@ -1343,46 +1337,44 @@ func (p *AddressProvider) checkEndpointsConverged(ctx context.Context, gwKey typ
 }
 
 func (p *AddressProvider) appliedURL(addr string) string {
-	host, port, err := net.SplitHostPort(addr)
-	if err == nil && host != "" && port != "" {
-		return fmt.Sprintf("http://%s/_gari/applied", addr)
-	}
 	return fmt.Sprintf("http://%s/_gari/applied", net.JoinHostPort(addr, fmt.Sprintf("%d", DataPlaneHealthProbePort)))
 }
 
 func (p *AddressProvider) probeEndpointRevision(ctx context.Context, targetURL, currentRev string) bool {
-	timeout := p.probeTimeout
-	if timeout <= 0 {
-		timeout = 2 * time.Second
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	probeCtx, cancel := context.WithTimeout(ctx, p.probeTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, targetURL, nil)
 	if err != nil {
+		klog.V(2).Infof("failed to create applied revision request for %s: %v", targetURL, err)
 		return false
 	}
-	client := p.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+	resp, err := p.httpClient.Do(req)
 	if err != nil {
+		klog.V(2).Infof("applied revision probe failed for %s: %v", targetURL, err)
 		return false
 	}
 	defer func() {
+		// Closing a response body on an HTTP GET to an in-cluster endpoint only frees
+		// transport buffers; logging at V(4) is sufficient if close fails.
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			klog.V(4).Infof("failed closing applied revision response body: %v", closeErr)
 		}
 	}()
 	if resp.StatusCode != http.StatusOK {
+		klog.V(2).Infof("applied revision probe for %s returned status %d", targetURL, resp.StatusCode)
 		return false
 	}
 	var revs []string
 	if err := json.NewDecoder(resp.Body).Decode(&revs); err != nil {
+		klog.V(2).Infof("failed to decode applied revision response from %s: %v", targetURL, err)
 		return false
 	}
-	return slices.Contains(revs, currentRev)
+	if !slices.Contains(revs, currentRev) {
+		klog.V(2).Infof("endpoint %s has not applied revision %s (applied: %v)", targetURL, currentRev, revs)
+		return false
+	}
+	return true
 }
 
 // Begin implements state.DataplanePublisher.

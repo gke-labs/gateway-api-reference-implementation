@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -313,6 +314,8 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	if err := client.Status().Update(ctx, &deploy); err != nil {
 		t.Fatalf("failed to update deploy status: %v", err)
 	}
+
+	mockReadyEndpoints(t, client, p, gw, "rev-1")
 
 	// Reconcile again -> should return the assigned LB address and ready=true
 	addrs, ready, err = p.GatewayAddresses(ctx, gw, effectiveListeners)
@@ -1768,6 +1771,8 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 		t.Fatalf("failed to update Service status: %v", err)
 	}
 
+	mockReadyEndpoints(t, c, p, gw, "rev-1")
+
 	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error on second reconcile: %v", err)
@@ -1853,6 +1858,8 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 	_ = c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: svc1Name}, &deploy1)
 	deploy1.Status.ReadyReplicas = 1
 	_ = c.Status().Update(ctx, &deploy1)
+
+	mockReadyEndpoints(t, c, p, gw1, "rev-1")
 
 	_, readiness1, _ := p.GatewayAddressesWithReadiness(ctx, gw1, nil)
 	if !readiness1.Ready {
@@ -2494,6 +2501,8 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 	if err := c.Status().Update(ctx, &svc); err != nil {
 		t.Fatalf("failed to update Service status with LB IP: %v", err)
 	}
+
+	mockReadyEndpoints(t, c, p, gw, "rev-1")
 
 	// Provider level check
 	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
@@ -3339,6 +3348,8 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		if err := c.Status().Update(ctx, &deploy); err != nil {
 			t.Fatalf("failed to update Deployment status: %v", err)
 		}
+
+		mockReadyEndpoints(t, c, p, gw, "rev-1")
 
 		// 3. Reconcile again: data plane is ready -> addresses are reported
 		addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
@@ -4376,6 +4387,8 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 		t.Fatalf("failed to update Deployment status: %v", err)
 	}
 
+	mockReadyEndpoints(t, c, p, gw, "rev-1")
+
 	finalAddrs, readiness, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
@@ -4519,6 +4532,62 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 	}
 }
 
+func mockReadyEndpoints(t *testing.T, cl client.Client, p *AddressProvider, gw *gatewayv1.Gateway, rev string, podIPs ...string) {
+	t.Helper()
+	if rev == "" {
+		rev = "rev-1"
+	}
+	if len(podIPs) == 0 {
+		podIPs = []string{"10.0.0.1"}
+	}
+	dpCfg := &state.DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name},
+		Revision:    rev,
+	}
+	_ = p.PublishDataplaneConfig(t.Context(), gw, dpCfg)
+
+	resName := ResourceNameForGateway(gw.Name)
+	var eps discoveryv1.EndpointSlice
+	err := cl.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName + "-eps"}, &eps)
+	if err != nil && apierrors.IsNotFound(err) {
+		var endpoints []discoveryv1.Endpoint
+		for _, ip := range podIPs {
+			endpoints = append(endpoints, discoveryv1.Endpoint{
+				Addresses: []string{ip},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: state.Ptr(true),
+				},
+			})
+		}
+		eps = discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      resName + "-eps",
+				Namespace: gw.Namespace,
+				Labels: map[string]string{
+					discoveryv1.LabelServiceName: resName,
+				},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints:   endpoints,
+		}
+		_ = cl.Create(t.Context(), &eps)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]string{rev})
+	}))
+	t.Cleanup(server.Close)
+
+	p.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+			},
+		},
+	}
+}
+
 func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -4573,13 +4642,13 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 		},
 		Endpoints: []discoveryv1.Endpoint{
 			{
-				Addresses: []string{server1.Listener.Addr().String()},
+				Addresses: []string{"10.0.0.1"},
 				Conditions: discoveryv1.EndpointConditions{
 					Ready: state.Ptr(true),
 				},
 			},
 			{
-				Addresses: []string{server2.Listener.Addr().String()},
+				Addresses: []string{"10.0.0.2"},
 				Conditions: discoveryv1.EndpointConditions{
 					Ready: state.Ptr(true),
 				},
@@ -4594,7 +4663,22 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
 
-	p := NewAddressProvider(cl, WithPollInterval(20*time.Millisecond))
+	p := NewAddressProvider(cl)
+	p.pollInterval = 20 * time.Millisecond
+	p.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				switch addr {
+				case fmt.Sprintf("10.0.0.1:%d", DataPlaneHealthProbePort):
+					return (&net.Dialer{}).DialContext(ctx, network, server1.Listener.Addr().String())
+				case fmt.Sprintf("10.0.0.2:%d", DataPlaneHealthProbePort):
+					return (&net.Dialer{}).DialContext(ctx, network, server2.Listener.Addr().String())
+				default:
+					return nil, fmt.Errorf("unexpected dial to %s", addr)
+				}
+			},
+		},
+	}
 	ctx := t.Context()
 
 	// Initial reconcile creates Service and Deployment
@@ -4688,5 +4772,68 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 	}
 	if len(addrs) != 1 || addrs[0].Value != "1.2.3.4" {
 		t.Fatalf("expected LB address 1.2.3.4, got %+v", addrs)
+	}
+}
+
+func TestSinglePodAddressProvider_PollerManagerLifecycle(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = discoveryv1.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "lifecycle-gw",
+			Namespace: "default",
+			UID:       types.UID("lifecycle-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
+		Build()
+
+	p := NewAddressProvider(cl)
+	p.pollInterval = 10 * time.Millisecond
+
+	mgrCtx, cancelMgr := context.WithCancel(t.Context())
+	p.pollerMu.Lock()
+	p.parentCtx, p.cancelPollers = context.WithCancel(mgrCtx)
+	p.pollerMu.Unlock()
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "lifecycle-gw"}
+	dpCfg := &state.DataplaneConfig{
+		GatewayName: gwKey,
+		Revision:    "rev-1",
+	}
+	_ = p.PublishDataplaneConfig(mgrCtx, gw, dpCfg)
+
+	resName := ResourceNameForGateway("lifecycle-gw")
+	p.startPoller(gwKey, resName)
+
+	p.pollerMu.Lock()
+	_, running := p.pollers[gwKey]
+	p.pollerMu.Unlock()
+	if !running {
+		t.Fatalf("expected poller to be running")
+	}
+
+	cancelMgr()
+	p.stopAllPollers()
+
+	p.pollerMu.Lock()
+	runningCount := len(p.pollers)
+	p.pollerMu.Unlock()
+	if runningCount != 0 {
+		t.Fatalf("expected 0 running pollers after manager stop, got %d", runningCount)
 	}
 }
