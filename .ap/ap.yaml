@@ -2,3 +2,4 @@ version: latest
 generate:
   ignoreOrphans:
     - "certserver/api/v1/*.pb.go"
+    - "experiments/keycustodian/api/v1alpha1/*.pb.go"

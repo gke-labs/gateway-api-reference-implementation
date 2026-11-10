@@ -1,0 +1,77 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package keycustodian.v1alpha1;
+
+option go_package = "github.com/gke-labs/gateway-api-reference-implementation/experiments/keycustodian/api/v1alpha1;keycustodianv1alpha1";
+
+// KeyCustodianService provides private key operations and certificate retrieval
+// for clients over a Unix domain socket. Private keys never cross the socket.
+service KeyCustodianService {
+  // ListKeys returns the names of all keys held by the custodian.
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
+
+  // GetCertificateChain returns the PEM-encoded certificate chain for a key.
+  rpc GetCertificateChain(GetCertificateChainRequest) returns (GetCertificateChainResponse);
+
+  // Sign performs a digital signature using the specified key and hash algorithm.
+  rpc Sign(SignRequest) returns (SignResponse);
+}
+
+message ListKeysRequest {}
+
+message ListKeysResponse {
+  // Names of all keys held by the custodian.
+  repeated string keys = 1;
+}
+
+message GetCertificateChainRequest {
+  // Name of the key whose certificate chain is requested.
+  string key = 1;
+}
+
+message GetCertificateChainResponse {
+  // PEM-encoded certificate chain.
+  bytes certificate_chain = 1;
+}
+
+// HashAlgorithm specifies the digest algorithm used for signing.
+enum HashAlgorithm {
+  HASH_ALGORITHM_UNSPECIFIED = 0;
+  HASH_ALGORITHM_SHA256 = 1;
+  HASH_ALGORITHM_SHA384 = 2;
+  HASH_ALGORITHM_SHA512 = 3;
+}
+
+message SignRequest {
+  // Name of the key to sign with.
+  string key = 1;
+
+  // Hash algorithm corresponding to the provided digest.
+  HashAlgorithm hash_algorithm = 2;
+
+  // The pre-computed digest to sign. Digest length must match hash_algorithm.
+  bytes digest = 3;
+
+  // Optional salt length for RSA-PSS signatures.
+  // If omitted or unset, standard signing behavior applies.
+  optional int32 rsa_pss_salt_length = 4;
+}
+
+message SignResponse {
+  // The digital signature bytes.
+  bytes signature = 1;
+}
