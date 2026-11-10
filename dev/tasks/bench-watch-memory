@@ -20,4 +20,14 @@ set -o pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
-WATCH_BENCH=1 GOTOOLCHAIN=auto go test -count=1 -v -run=^TestWatchMemoryComparison$ ./experiments/diskstore/kubecache "$@" | grep -E '(\||={10,}|-{10,})'
+LOG_FILE="${BENCH_LOG_FILE:-bench-watch-memory.log}"
+
+if ! WATCH_BENCH=1 go test -count=1 -v -run=^TestWatchMemoryComparison$ ./experiments/diskstore/kubecache "$@" > "${LOG_FILE}" 2>&1; then
+  cat "${LOG_FILE}"
+  exit 1
+fi
+
+if ! grep -E '(\||={10,}|-{10,})' "${LOG_FILE}"; then
+  cat "${LOG_FILE}"
+  exit 1
+fi
