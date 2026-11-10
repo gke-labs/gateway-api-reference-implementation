@@ -4805,17 +4805,12 @@ func TestSinglePodAddressProvider_PollerManagerLifecycle(t *testing.T) {
 	p := NewAddressProvider(cl)
 	p.pollInterval = 10 * time.Millisecond
 
-	mgrCtx, cancelMgr := context.WithCancel(t.Context())
-	p.pollerMu.Lock()
-	p.parentCtx, p.cancelPollers = context.WithCancel(mgrCtx)
-	p.pollerMu.Unlock()
-
 	gwKey := types.NamespacedName{Namespace: "default", Name: "lifecycle-gw"}
 	dpCfg := &state.DataplaneConfig{
 		GatewayName: gwKey,
 		Revision:    "rev-1",
 	}
-	_ = p.PublishDataplaneConfig(mgrCtx, gw, dpCfg)
+	_ = p.PublishDataplaneConfig(t.Context(), gw, dpCfg)
 
 	resName := ResourceNameForGateway("lifecycle-gw")
 	p.startPoller(gwKey, resName)
@@ -4827,7 +4822,6 @@ func TestSinglePodAddressProvider_PollerManagerLifecycle(t *testing.T) {
 		t.Fatalf("expected poller to be running")
 	}
 
-	cancelMgr()
 	p.stopAllPollers()
 
 	p.pollerMu.Lock()
@@ -4835,5 +4829,9 @@ func TestSinglePodAddressProvider_PollerManagerLifecycle(t *testing.T) {
 	p.pollerMu.Unlock()
 	if runningCount != 0 {
 		t.Fatalf("expected 0 running pollers after manager stop, got %d", runningCount)
+	}
+
+	if p.parentCtx.Err() == nil {
+		t.Fatalf("expected parentCtx to be cancelled after stopAllPollers")
 	}
 }

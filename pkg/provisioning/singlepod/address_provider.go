@@ -320,11 +320,14 @@ func (p *AddressProvider) acmeTokenPath() string {
 
 // NewAddressProvider creates a new singlepod AddressProvider.
 func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
+	parentCtx, cancelPollers := context.WithCancel(context.Background())
 	p := &AddressProvider{
 		client:           c,
 		dataplaneImage:   DefaultDataplaneImage,
 		eventCh:          make(chan event.GenericEvent, 50),
 		currentRevisions: make(map[types.NamespacedName]string),
+		parentCtx:        parentCtx,
+		cancelPollers:    cancelPollers,
 		pollers:          make(map[types.NamespacedName]context.CancelFunc),
 		pollInterval:     defaultPollInterval,
 		probeTimeout:     defaultProbeTimeout,
@@ -1087,9 +1090,6 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 		mapper = mgr.GetRESTMapper()
 
 		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			p.pollerMu.Lock()
-			p.parentCtx, p.cancelPollers = context.WithCancel(ctx)
-			p.pollerMu.Unlock()
 			<-ctx.Done()
 			p.stopAllPollers()
 			return nil
@@ -1238,11 +1238,7 @@ func (p *AddressProvider) startPoller(gwKey types.NamespacedName, name string) {
 		p.pollerMu.Unlock()
 		return
 	}
-	parent := p.parentCtx
-	if parent == nil {
-		parent = context.Background()
-	}
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithCancel(p.parentCtx)
 	p.pollers[gwKey] = cancel
 	p.pollerMu.Unlock()
 
@@ -1259,7 +1255,11 @@ func (p *AddressProvider) startPoller(gwKey types.NamespacedName, name string) {
 					continue
 				}
 				converged, err := p.checkEndpointsConverged(ctx, gwKey, currentRev, name)
-				if err == nil && converged {
+				if err != nil {
+					klog.V(2).Infof("error checking endpoint convergence for Gateway %s: %v", gwKey, err)
+					continue
+				}
+				if converged {
 					p.pollerMu.Lock()
 					delete(p.pollers, gwKey)
 					p.pollerMu.Unlock()
