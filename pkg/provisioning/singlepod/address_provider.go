@@ -214,14 +214,14 @@ type AddressProvider struct {
 	revMu            sync.Mutex
 	currentRevisions map[types.NamespacedName]string
 
-	// pollerMu guards poller lifecycle and active pollers.
-	pollerMu      sync.Mutex
-	parentCtx     context.Context
-	cancelPollers context.CancelFunc
-	pollers       map[types.NamespacedName]context.CancelFunc
-	pollInterval  time.Duration
-	probeTimeout  time.Duration
-	httpClient    *http.Client
+	// endpointMu guards appliedRevisions and endpointGateways.
+	endpointMu       sync.Mutex
+	appliedRevisions map[string][]string
+	endpointGateways map[string]types.NamespacedName
+
+	pollInterval time.Duration
+	probeTimeout time.Duration
+	httpClient   *http.Client
 
 	eventCh chan event.GenericEvent
 }
@@ -320,15 +320,13 @@ func (p *AddressProvider) acmeTokenPath() string {
 
 // NewAddressProvider creates a new singlepod AddressProvider.
 func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
-	parentCtx, cancelPollers := context.WithCancel(context.Background())
 	p := &AddressProvider{
 		client:           c,
 		dataplaneImage:   DefaultDataplaneImage,
 		eventCh:          make(chan event.GenericEvent, 50),
 		currentRevisions: make(map[types.NamespacedName]string),
-		parentCtx:        parentCtx,
-		cancelPollers:    cancelPollers,
-		pollers:          make(map[types.NamespacedName]context.CancelFunc),
+		appliedRevisions: make(map[string][]string),
+		endpointGateways: make(map[string]types.NamespacedName),
 		pollInterval:     defaultPollInterval,
 		probeTimeout:     defaultProbeTimeout,
 		httpClient:       &http.Client{},
@@ -1089,12 +1087,8 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 		scheme = mgr.GetScheme()
 		mapper = mgr.GetRESTMapper()
 
-		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			<-ctx.Done()
-			p.stopAllPollers()
-			return nil
-		})); err != nil {
-			return fmt.Errorf("failed to register poller lifecycle with manager: %w", err)
+		if err := mgr.Add(manager.RunnableFunc(p.runProber)); err != nil {
+			return fmt.Errorf("failed to register prober with manager: %w", err)
 		}
 	} else if p.client != nil {
 		scheme = p.client.Scheme()
@@ -1125,7 +1119,6 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		p.revMu.Lock()
 		delete(p.currentRevisions, gwKey)
 		p.revMu.Unlock()
-		p.stopPoller(gwKey)
 		return nil
 	}
 	p.revMu.Lock()
@@ -1192,19 +1185,53 @@ func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey t
 		}, nil
 	}
 
-	converged, err := p.checkEndpointsConverged(ctx, gwKey, currentRev, name)
-	if err != nil {
+	var slicesList discoveryv1.EndpointSliceList
+	if err := p.client.List(ctx, &slicesList, client.InNamespace(gwKey.Namespace), client.MatchingLabels{
+		discoveryv1.LabelServiceName: name,
+	}); err != nil {
 		return nil, state.GatewayReadiness{}, err
 	}
-	if !converged {
-		p.startPoller(gwKey, name)
+
+	var readyEndpoints []string
+	seen := make(map[string]bool)
+	for _, sl := range slicesList.Items {
+		for _, ep := range sl.Endpoints {
+			isReady := ep.Conditions.Ready == nil || *ep.Conditions.Ready
+			if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+				isReady = false
+			}
+			if !isReady {
+				continue
+			}
+			for _, addr := range ep.Addresses {
+				if addr != "" && !seen[addr] {
+					seen[addr] = true
+					readyEndpoints = append(readyEndpoints, addr)
+				}
+			}
+		}
+	}
+
+	if len(readyEndpoints) == 0 {
 		return addresses, state.GatewayReadiness{
 			Ready:   false,
 			Reason:  string(gatewayv1.GatewayReasonPending),
 			Message: "Waiting for data-plane replicas to apply current configuration",
 		}, nil
 	}
-	p.stopPoller(gwKey)
+
+	p.endpointMu.Lock()
+	defer p.endpointMu.Unlock()
+	for _, addr := range readyEndpoints {
+		applied := p.appliedRevisions[addr]
+		if !slices.Contains(applied, currentRev) {
+			return addresses, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonPending),
+				Message: "Waiting for data-plane replicas to apply current configuration",
+			}, nil
+		}
+	}
 
 	return addresses, state.GatewayReadiness{
 		Ready:   true,
@@ -1232,127 +1259,115 @@ func (p *AddressProvider) triggerReconcile(ctx context.Context, key types.Namesp
 	}
 }
 
-func (p *AddressProvider) startPoller(gwKey types.NamespacedName, name string) {
-	p.pollerMu.Lock()
-	if _, running := p.pollers[gwKey]; running {
-		p.pollerMu.Unlock()
+func (p *AddressProvider) runProber(ctx context.Context) error {
+	ticker := time.NewTicker(p.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			p.probeEndpoints(ctx)
+		}
+	}
+}
+
+func (p *AddressProvider) probeEndpoints(ctx context.Context) {
+	if p.client == nil {
 		return
 	}
-	ctx, cancel := context.WithCancel(p.parentCtx)
-	p.pollers[gwKey] = cancel
-	p.pollerMu.Unlock()
 
-	go func() {
-		ticker := time.NewTicker(p.pollInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				currentRev := p.currentRevisionForGateway(gwKey)
-				if currentRev == "" {
+	var svcList corev1.ServiceList
+	if err := p.client.List(ctx, &svcList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
+		klog.V(2).Infof("error listing provisioned Services for probing: %v", err)
+		return
+	}
+
+	newApplied := make(map[string][]string)
+	newGateways := make(map[string]types.NamespacedName)
+	changedGateways := make(map[types.NamespacedName]bool)
+
+	for _, svc := range svcList.Items {
+		gwName := svc.Labels[LabelGatewayName]
+		if gwName == "" {
+			continue
+		}
+		gwKey := types.NamespacedName{Namespace: svc.Namespace, Name: gwName}
+
+		var slicesList discoveryv1.EndpointSliceList
+		if err := p.client.List(ctx, &slicesList, client.InNamespace(svc.Namespace), client.MatchingLabels{
+			discoveryv1.LabelServiceName: svc.Name,
+		}); err != nil {
+			klog.V(2).Infof("error listing EndpointSlices for Service %s/%s (Gateway %s): %v", svc.Namespace, svc.Name, gwKey, err)
+			continue
+		}
+
+		for _, sl := range slicesList.Items {
+			for _, ep := range sl.Endpoints {
+				isReady := ep.Conditions.Ready == nil || *ep.Conditions.Ready
+				if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+					isReady = false
+				}
+				if !isReady {
 					continue
 				}
-				converged, err := p.checkEndpointsConverged(ctx, gwKey, currentRev, name)
-				if err != nil {
-					klog.V(2).Infof("error checking endpoint convergence for Gateway %s: %v", gwKey, err)
-					continue
-				}
-				if converged {
-					p.pollerMu.Lock()
-					delete(p.pollers, gwKey)
-					p.pollerMu.Unlock()
-					p.triggerReconcile(ctx, gwKey)
-					return
-				}
-			}
-		}
-	}()
-}
+				for _, addr := range ep.Addresses {
+					if addr == "" {
+						continue
+					}
+					targetURL := p.appliedURL(addr)
+					revs, err := p.probeEndpoint(ctx, targetURL)
+					p.endpointMu.Lock()
+					oldRevs, hadOld := p.appliedRevisions[addr]
+					p.endpointMu.Unlock()
 
-func (p *AddressProvider) stopPoller(gwKey types.NamespacedName) {
-	p.pollerMu.Lock()
-	defer p.pollerMu.Unlock()
-	if cancel, ok := p.pollers[gwKey]; ok {
-		cancel()
-		delete(p.pollers, gwKey)
-	}
-}
-
-func (p *AddressProvider) stopAllPollers() {
-	p.pollerMu.Lock()
-	defer p.pollerMu.Unlock()
-	if p.cancelPollers != nil {
-		p.cancelPollers()
-	}
-	for key, cancel := range p.pollers {
-		cancel()
-		delete(p.pollers, key)
-	}
-}
-
-func (p *AddressProvider) checkEndpointsConverged(ctx context.Context, gwKey types.NamespacedName, currentRev, svcName string) (bool, error) {
-	if p.client == nil {
-		return false, nil
-	}
-	var slicesList discoveryv1.EndpointSliceList
-	if err := p.client.List(ctx, &slicesList, client.InNamespace(gwKey.Namespace), client.MatchingLabels{
-		discoveryv1.LabelServiceName: svcName,
-	}); err != nil {
-		return false, err
-	}
-
-	var readyEndpoints []string
-	seen := make(map[string]bool)
-	for _, sl := range slicesList.Items {
-		for _, ep := range sl.Endpoints {
-			isReady := ep.Conditions.Ready == nil || *ep.Conditions.Ready
-			if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
-				isReady = false
-			}
-			if !isReady {
-				continue
-			}
-			for _, addr := range ep.Addresses {
-				if addr != "" && !seen[addr] {
-					seen[addr] = true
-					readyEndpoints = append(readyEndpoints, addr)
+					if err != nil {
+						klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, gwKey, err)
+						if hadOld {
+							changedGateways[gwKey] = true
+						}
+					} else {
+						newApplied[addr] = revs
+						newGateways[addr] = gwKey
+						if !hadOld || !slices.Equal(oldRevs, revs) {
+							changedGateways[gwKey] = true
+						}
+					}
 				}
 			}
 		}
 	}
 
-	if len(readyEndpoints) == 0 {
-		return false, nil
-	}
-
-	for _, addr := range readyEndpoints {
-		targetURL := p.appliedURL(addr)
-		if !p.probeEndpointRevision(ctx, targetURL, currentRev) {
-			return false, nil
+	p.endpointMu.Lock()
+	for addr, oldGwKey := range p.endpointGateways {
+		if _, stillPresent := newApplied[addr]; !stillPresent {
+			changedGateways[oldGwKey] = true
 		}
 	}
-	return true, nil
+	p.appliedRevisions = newApplied
+	p.endpointGateways = newGateways
+	p.endpointMu.Unlock()
+
+	for gwKey := range changedGateways {
+		p.triggerReconcile(ctx, gwKey)
+	}
 }
 
 func (p *AddressProvider) appliedURL(addr string) string {
 	return fmt.Sprintf("http://%s/_gari/applied", net.JoinHostPort(addr, fmt.Sprintf("%d", DataPlaneHealthProbePort)))
 }
 
-func (p *AddressProvider) probeEndpointRevision(ctx context.Context, targetURL, currentRev string) bool {
+func (p *AddressProvider) probeEndpoint(ctx context.Context, targetURL string) ([]string, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, p.probeTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, targetURL, nil)
 	if err != nil {
-		klog.V(2).Infof("failed to create applied revision request for %s: %v", targetURL, err)
-		return false
+		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		klog.V(2).Infof("applied revision probe failed for %s: %v", targetURL, err)
-		return false
+		return nil, fmt.Errorf("HTTP GET: %w", err)
 	}
 	defer func() {
 		// Closing a response body on an HTTP GET to an in-cluster endpoint only frees
@@ -1362,19 +1377,13 @@ func (p *AddressProvider) probeEndpointRevision(ctx context.Context, targetURL, 
 		}
 	}()
 	if resp.StatusCode != http.StatusOK {
-		klog.V(2).Infof("applied revision probe for %s returned status %d", targetURL, resp.StatusCode)
-		return false
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 	var revs []string
 	if err := json.NewDecoder(resp.Body).Decode(&revs); err != nil {
-		klog.V(2).Infof("failed to decode applied revision response from %s: %v", targetURL, err)
-		return false
+		return nil, fmt.Errorf("decoding JSON: %w", err)
 	}
-	if !slices.Contains(revs, currentRev) {
-		klog.V(2).Infof("endpoint %s has not applied revision %s (applied: %v)", targetURL, currentRev, revs)
-		return false
-	}
-	return true
+	return revs, nil
 }
 
 // Begin implements state.DataplanePublisher.

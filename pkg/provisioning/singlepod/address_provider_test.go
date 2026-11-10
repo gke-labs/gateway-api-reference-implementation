@@ -4586,6 +4586,7 @@ func mockReadyEndpoints(t *testing.T, cl client.Client, p *AddressProvider, gw *
 			},
 		},
 	}
+	p.probeEndpoints(t.Context())
 }
 
 func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
@@ -4719,6 +4720,13 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 		t.Fatalf("failed to update Deployment status: %v", err)
 	}
 
+	// Probe endpoints initially: 10.0.0.1 has current-rev, 10.0.0.2 has old-rev
+	p.probeEndpoints(ctx)
+	select {
+	case <-p.eventCh:
+	default:
+	}
+
 	// 1. One replica still reports an old revision -> Gateway is NOT ready
 	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, listeners)
 	if err != nil {
@@ -4736,6 +4744,11 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 
 	// 2. A replica that doesn't answer counts as not current
 	failServer2.Store(true)
+	p.probeEndpoints(ctx)
+	select {
+	case <-p.eventCh:
+	default:
+	}
 	_, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, listeners)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -4744,19 +4757,20 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 		t.Fatalf("expected readiness.Ready=false when replica 2 fails to answer")
 	}
 
-	// 3. Once both replicas report current revision, it becomes ready without another spec change
+	// 3. Once both replicas report current revision, prober enqueues Gateway and it becomes ready without spec change
 	failServer2.Store(false)
 	r2Updated := []string{"current-rev"}
 	rev2.Store(&r2Updated)
+	p.probeEndpoints(ctx)
 
-	// Wait for background poller to detect convergence and trigger reconcile via eventCh
+	// Verify prober enqueued Gateway on revision convergence
 	select {
 	case evt := <-p.eventCh:
 		if evt.Object.GetName() != "test-gw" || evt.Object.GetNamespace() != "default" {
 			t.Fatalf("unexpected event object: %+v", evt.Object)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for background poller to trigger reconcile on convergence")
+		t.Fatal("timed out waiting for prober to enqueue Gateway on convergence")
 	}
 
 	// Now reconcile runs without any spec change: Gateway is ready
@@ -4773,65 +4787,50 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 	if len(addrs) != 1 || addrs[0].Value != "1.2.3.4" {
 		t.Fatalf("expected LB address 1.2.3.4, got %+v", addrs)
 	}
+
+	// 4. If a replica restarts with an old config, prober enqueues Gateway and it stops being ready
+	r2Old := []string{"old-rev"}
+	rev2.Store(&r2Old)
+	p.probeEndpoints(ctx)
+
+	select {
+	case evt := <-p.eventCh:
+		if evt.Object.GetName() != "test-gw" || evt.Object.GetNamespace() != "default" {
+			t.Fatalf("unexpected event object: %+v", evt.Object)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for prober to enqueue Gateway on regression")
+	}
+
+	_, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Fatalf("expected readiness.Ready=false after replica regressed to old revision")
+	}
 }
 
-func TestSinglePodAddressProvider_PollerManagerLifecycle(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = discoveryv1.AddToScheme(scheme)
-	_ = gatewayv1.AddToScheme(scheme)
-
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "lifecycle-gw",
-			Namespace: "default",
-			UID:       types.UID("lifecycle-gw-uid"),
-		},
-		Spec: gatewayv1.GatewaySpec{
-			GatewayClassName: "reference-class",
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-			},
-		},
-	}
-
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(gw).
-		WithReturnManagedFields().
-		WithInterceptorFuncs(ssaNoOpInterceptor()).
-		Build()
-
+func TestSinglePodAddressProvider_ProberLifecycle(t *testing.T) {
+	cl := fake.NewClientBuilder().Build()
 	p := NewAddressProvider(cl)
-	p.pollInterval = 10 * time.Millisecond
+	p.pollInterval = 5 * time.Millisecond
 
-	gwKey := types.NamespacedName{Namespace: "default", Name: "lifecycle-gw"}
-	dpCfg := &state.DataplaneConfig{
-		GatewayName: gwKey,
-		Revision:    "rev-1",
-	}
-	_ = p.PublishDataplaneConfig(t.Context(), gw, dpCfg)
+	ctx, cancel := context.WithCancel(t.Context())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- p.runProber(ctx)
+	}()
 
-	resName := ResourceNameForGateway("lifecycle-gw")
-	p.startPoller(gwKey, resName)
+	time.Sleep(20 * time.Millisecond)
+	cancel()
 
-	p.pollerMu.Lock()
-	_, running := p.pollers[gwKey]
-	p.pollerMu.Unlock()
-	if !running {
-		t.Fatalf("expected poller to be running")
-	}
-
-	p.stopAllPollers()
-
-	p.pollerMu.Lock()
-	runningCount := len(p.pollers)
-	p.pollerMu.Unlock()
-	if runningCount != 0 {
-		t.Fatalf("expected 0 running pollers after manager stop, got %d", runningCount)
-	}
-
-	if p.parentCtx.Err() == nil {
-		t.Fatalf("expected parentCtx to be cancelled after stopAllPollers")
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("unexpected error from runProber: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for runProber to exit on context cancellation")
 	}
 }
