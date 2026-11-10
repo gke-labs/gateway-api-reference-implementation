@@ -887,9 +887,206 @@ func (p *Proxy) maybeForwardACMEChallenge(w http.ResponseWriter, r *http.Request
 	return f.tryForward(w, r)
 }
 
+// isUnreserved reports whether byteValue is an unreserved character per RFC 3986 §2.3:
+// unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"
+func isUnreserved(byteValue byte) bool {
+	return (byteValue >= 'a' && byteValue <= 'z') ||
+		(byteValue >= 'A' && byteValue <= 'Z') ||
+		(byteValue >= '0' && byteValue <= '9') ||
+		byteValue == '-' || byteValue == '.' || byteValue == '_' || byteValue == '~'
+}
+
+func fromHex(character byte) (byte, bool) {
+	switch {
+	case character >= '0' && character <= '9':
+		return character - '0', true
+	case character >= 'a' && character <= 'f':
+		return character - 'a' + 10, true
+	case character >= 'A' && character <= 'F':
+		return character - 'A' + 10, true
+	}
+	return 0, false
+}
+
+func toUpperHex(character byte) byte {
+	if character >= 'a' && character <= 'f' {
+		return character - 'a' + 'A'
+	}
+	return character
+}
+
+// normalizePercentEncoding implements RFC 3986 §6.2.2.1 (case normalization) and
+// §6.2.2.2 (percent-encoding normalization): uppercase hex digits within percent-encoded
+// triplets and decode unreserved characters. Reserved characters (such as %2F) remain encoded.
+func normalizePercentEncoding(input string) (string, error) {
+	var builder strings.Builder
+	for i := 0; i < len(input); {
+		if input[i] == '%' {
+			if i+2 >= len(input) {
+				return "", fmt.Errorf("malformed percent-encoding in %q", input)
+			}
+			highNibble, firstHexValid := fromHex(input[i+1])
+			lowNibble, secondHexValid := fromHex(input[i+2])
+			if !firstHexValid || !secondHexValid {
+				return "", fmt.Errorf("invalid hex in percent-encoding in %q", input)
+			}
+			decodedByte := (highNibble << 4) | lowNibble
+			if isUnreserved(decodedByte) {
+				builder.WriteByte(decodedByte)
+			} else {
+				builder.WriteByte('%')
+				builder.WriteByte(toUpperHex(input[i+1]))
+				builder.WriteByte(toUpperHex(input[i+2]))
+			}
+			i += 3
+		} else {
+			builder.WriteByte(input[i])
+			i++
+		}
+	}
+	return builder.String(), nil
+}
+
+// removeDotSegments implements the algorithm in RFC 3986 §5.2.4 to remove dot segments
+// ('.' and '..') from a path, dropping '..' above root.
+func removeDotSegments(path string) string {
+	var output []string
+	input := path
+
+	for len(input) > 0 {
+		if strings.HasPrefix(input, "../") {
+			input = input[3:]
+		} else if strings.HasPrefix(input, "./") {
+			input = input[2:]
+		} else if strings.HasPrefix(input, "/./") {
+			input = "/" + input[3:]
+		} else if input == "/." {
+			input = "/"
+		} else if strings.HasPrefix(input, "/../") {
+			input = "/" + input[4:]
+			if len(output) > 0 {
+				output = output[:len(output)-1]
+			}
+		} else if input == "/.." {
+			input = "/"
+			if len(output) > 0 {
+				output = output[:len(output)-1]
+			}
+		} else if input == "." || input == ".." {
+			input = ""
+		} else {
+			var segment string
+			if input[0] == '/' {
+				nextSlash := strings.IndexByte(input[1:], '/')
+				if nextSlash == -1 {
+					segment = input
+					input = ""
+				} else {
+					segment = input[:1+nextSlash]
+					input = input[1+nextSlash:]
+				}
+			} else {
+				nextSlash := strings.IndexByte(input, '/')
+				if nextSlash == -1 {
+					segment = input
+					input = ""
+				} else {
+					segment = input[:nextSlash]
+					input = input[nextSlash:]
+				}
+			}
+			output = append(output, segment)
+		}
+	}
+
+	result := strings.Join(output, "")
+	if result == "" || result[0] != '/' {
+		result = "/" + result
+	}
+	return result
+}
+
+// mergeSlashes collapses consecutive slashes into a single slash (e.g. //admin -> /admin),
+// matching Envoy and kgateway defaults.
+func mergeSlashes(path string) string {
+	var builder strings.Builder
+	var lastSlash bool
+	for i := 0; i < len(path); i++ {
+		if path[i] == '/' {
+			if !lastSlash {
+				builder.WriteByte('/')
+				lastSlash = true
+			}
+		} else {
+			builder.WriteByte(path[i])
+			lastSlash = false
+		}
+	}
+	result := builder.String()
+	if result == "" {
+		return "/"
+	}
+	return result
+}
+
+// normalizeRequestPath normalizes r.URL.Path and r.URL.RawPath per RFC 3986 §6.2.2:
+//  1. Percent-encoding normalization (§6.2.2.1 and §6.2.2.2): uppercase hex digits and
+//     decode unreserved characters. Reserved characters (e.g., %2F) remain encoded.
+//  2. Remove dot segments (§5.2.4): resolve '.' and '..' segments, dropping '..' above root.
+//  3. Merge repeated slashes: collapse consecutive slashes into a single slash.
+//
+// Matches routes on the normalized path and keeps URL.Path and URL.RawPath consistent for forwarding.
+// Returns an error (resulting in 400 Bad Request) if percent-encoding cannot be parsed.
+func normalizeRequestPath(r *http.Request) error {
+	rawPath := r.URL.RawPath
+	if rawPath == "" {
+		rawPath = r.URL.EscapedPath()
+	}
+	if rawPath == "" {
+		rawPath = "/"
+	}
+
+	// Only normalize origin-form paths (starting with '/').
+	// Asterisk-form (e.g. OPTIONS *) is returned unchanged.
+	if !strings.HasPrefix(rawPath, "/") {
+		return nil
+	}
+
+	// 1. Percent-encoding normalization (§6.2.2.1, §6.2.2.2)
+	normalizedPath, err := normalizePercentEncoding(rawPath)
+	if err != nil {
+		return err
+	}
+
+	// 2. Merge repeated slashes before removing dot segments
+	normalizedPath = mergeSlashes(normalizedPath)
+
+	// 3. Remove dot segments (§5.2.4)
+	normalizedPath = removeDotSegments(normalizedPath)
+
+	// 4. Decode normalized path into URL.Path and keep URL.RawPath consistent
+	decodedPath, err := url.PathUnescape(normalizedPath)
+	if err != nil {
+		return err
+	}
+
+	r.URL.Path = decodedPath
+	if normalizedPath != decodedPath {
+		r.URL.RawPath = normalizedPath
+	} else {
+		r.URL.RawPath = ""
+	}
+
+	return nil
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Value(originalHostContextKey) == nil {
 		r = r.WithContext(context.WithValue(r.Context(), originalHostContextKey, r.Host))
+	}
+	if err := normalizeRequestPath(r); err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
 	}
 	p.mu.RLock()
 	routes := p.routes
@@ -1276,6 +1473,7 @@ func (p *Proxy) rewrite(r *http.Request, rewrite state.InternalRewrite, match *s
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {
 	newURL := &url.URL{
 		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
 		RawQuery: r.URL.RawQuery,
 	}
 
@@ -1493,6 +1691,7 @@ func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backen
 		Scheme:   scheme,
 		Host:     fmt.Sprintf("%s:%d", backend.Host, backend.Port),
 		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
 		RawQuery: r.URL.RawQuery,
 	}
 
@@ -1899,6 +2098,7 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 		Scheme:   scheme,
 		Host:     fmt.Sprintf("%s:%d", backend.Host, backend.Port),
 		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
 		RawQuery: r.URL.RawQuery,
 	}
 
@@ -2096,6 +2296,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		Scheme:   scheme,
 		Host:     fmt.Sprintf("%s:%d", backend.Host, backend.Port),
 		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
 		RawQuery: r.URL.RawQuery,
 	}
 

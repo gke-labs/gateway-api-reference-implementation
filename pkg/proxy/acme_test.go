@@ -169,7 +169,7 @@ func TestACMEChallenge_OffByDefault(t *testing.T) {
 	}
 
 	// Malformed tokens are also unaffected and reach the HTTPRoute
-	reqMalformed := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/..", nil)
+	reqMalformed := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/bad$token", nil)
 	recMalformed := httptest.NewRecorder()
 	p.ServeHTTP(recMalformed, reqMalformed)
 
@@ -556,9 +556,9 @@ func TestACMEChallenge_MalformedTokensFallThroughWithoutContactingUpstream(t *te
 			rec := httptest.NewRecorder()
 			p.ServeHTTP(rec, req)
 
-			if path == "/.well-known/acme-challenge" {
+			if path == "/.well-known/acme-challenge" || path == "/.well-known/acme-challenge/.." {
 				if rec.Code != http.StatusNotFound {
-					t.Fatalf("expected 404 for %q without trailing slash, got %d", path, rec.Code)
+					t.Fatalf("expected 404 for %q, got %d", path, rec.Code)
 				}
 			} else {
 				// Malformed tokens must fall through to the HTTPRoute, not return 400
