@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -573,17 +574,21 @@ func (r *Responder) handleQuery(p *dnsmessage.Parser, queryHeader dnsmessage.Hea
 
 	// 1. Simultaneous probe conflict check (RFC 6762 §8.2)
 	if handler != nil && len(probes) > 0 && len(authorities) > 0 {
-		for _, q := range questions {
-			qname := strings.ToLower(q.Name.String())
-			proposed, probing := probes[qname]
+		for _, question := range questions {
+			questionName := strings.ToLower(question.Name.String())
+			proposed, probing := probes[questionName]
 			if !probing {
 				continue
 			}
-			for _, nsRR := range authorities {
-				if strings.ToLower(nsRR.Header.Name.String()) == qname {
-					if isLexicographicallyGreater(nsRR, proposed) {
-						handler(qname, nsRR)
-					}
+			var opponentRecords []dnsmessage.Resource
+			for _, authorityRecord := range authorities {
+				if strings.ToLower(authorityRecord.Header.Name.String()) == questionName {
+					opponentRecords = append(opponentRecords, authorityRecord)
+				}
+			}
+			if len(opponentRecords) > 0 {
+				if isLexicographicallyGreater(opponentRecords, proposed) {
+					handler(questionName, opponentRecords[0])
 				}
 			}
 		}
@@ -795,42 +800,93 @@ func isConflictingRecord(received dnsmessage.Resource, proposed []dnsmessage.Res
 	return false
 }
 
-// isLexicographicallyGreater determines whether opponent's authority record is greater than ours (RFC 6762 §8.2).
-func isLexicographicallyGreater(oppRR dnsmessage.Resource, ourRRs []dnsmessage.Resource) bool {
-	// If opponent record is identical to any of our proposed records, it is not a conflict (RFC 6762 §8.2).
-	for _, ourRR := range ourRRs {
-		if recordsEqual(oppRR, ourRR) {
-			return false
-		}
-	}
+type canonicalRecord struct {
+	class uint16
+	typ   dnsmessage.Type
+	rdata []byte
+}
 
-	oppData, err := packResource(oppRR)
-	if err != nil {
-		return false
+// toCanonicalRecord converts an A or AAAA resource record to its canonical form
+// for tie-break comparison. Returns false if the record type is not A or AAAA.
+func toCanonicalRecord(record dnsmessage.Resource) (canonicalRecord, bool) {
+	recordClass := uint16(record.Header.Class) &^ CacheFlushBit
+	switch body := record.Body.(type) {
+	case *dnsmessage.AResource:
+		return canonicalRecord{
+			class: recordClass,
+			typ:   dnsmessage.TypeA,
+			rdata: body.A[:],
+		}, true
+	case *dnsmessage.AAAAResource:
+		return canonicalRecord{
+			class: recordClass,
+			typ:   dnsmessage.TypeAAAA,
+			rdata: body.AAAA[:],
+		}, true
+	default:
+		return canonicalRecord{}, false
 	}
+}
 
-	// Compare against our proposed record of the same RR type
-	for _, ourRR := range ourRRs {
-		if ourRR.Header.Type == oppRR.Header.Type {
-			ourData, err := packResource(ourRR)
-			if err != nil {
-				continue
-			}
-			return bytes.Compare(oppData, ourData) > 0
+func compareCanonical(first, second canonicalRecord) int {
+	if first.class != second.class {
+		if first.class < second.class {
+			return -1
 		}
+		return 1
 	}
-
-	// If no same-type record found, compare against all
-	for _, ourRR := range ourRRs {
-		ourData, err := packResource(ourRR)
-		if err != nil {
-			continue
+	if first.typ != second.typ {
+		if first.typ < second.typ {
+			return -1
 		}
-		if bytes.Compare(oppData, ourData) > 0 {
+		return 1
+	}
+	return bytes.Compare(first.rdata, second.rdata)
+}
+
+// isLexicographicallyGreater determines whether opponent's authority records are
+// lexicographically greater than ours (RFC 6762 §8.2).
+//
+// This comparison runs when two hosts probe for the same .local name at the same
+// time and each sees the other's probe. RFC 6762 §8.2 specifies a tie-breaking rule
+// where both hosts compare the records in the Authority section of the query with
+// their own proposed records so that both sides reach the exact same answer and
+// exactly one of them backs off.
+func isLexicographicallyGreater(opponentRecords, ourRecords []dnsmessage.Resource) bool {
+	opponentCanonical := make([]canonicalRecord, 0, len(opponentRecords))
+	for _, record := range opponentRecords {
+		canonical, ok := toCanonicalRecord(record)
+		if !ok {
+			// Other record types in the other host's probe are not canonicalized.
+			// Treat the other host as the winner, so we back off and probe again.
+			// This is safe because deferring only delays us, and it never makes two
+			// hosts both take the name.
 			return true
 		}
+		opponentCanonical = append(opponentCanonical, canonical)
 	}
-	return false
+
+	ourCanonical := make([]canonicalRecord, 0, len(ourRecords))
+	for _, record := range ourRecords {
+		canonical, ok := toCanonicalRecord(record)
+		if !ok {
+			return true
+		}
+		ourCanonical = append(ourCanonical, canonical)
+	}
+
+	slices.SortFunc(opponentCanonical, compareCanonical)
+	slices.SortFunc(ourCanonical, compareCanonical)
+
+	count := min(len(opponentCanonical), len(ourCanonical))
+	for i := 0; i < count; i++ {
+		difference := compareCanonical(opponentCanonical[i], ourCanonical[i])
+		if difference != 0 {
+			return difference > 0
+		}
+	}
+
+	return len(opponentCanonical) > len(ourCanonical)
 }
 
 func recordsEqual(a, b dnsmessage.Resource) bool {
@@ -851,17 +907,6 @@ func recordsEqual(a, b dnsmessage.Resource) bool {
 		}
 	}
 	return false
-}
-
-func packResource(r dnsmessage.Resource) ([]byte, error) {
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{})
-	if err := b.StartAnswers(); err != nil {
-		return nil, err
-	}
-	if err := appendResource(&b, r); err != nil {
-		return nil, err
-	}
-	return b.Finish()
 }
 
 func appendResource(b *dnsmessage.Builder, r dnsmessage.Resource) error {
