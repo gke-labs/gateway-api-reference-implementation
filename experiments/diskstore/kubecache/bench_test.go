@@ -548,7 +548,14 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			t.Fatalf("cipher creation failed: %v", err)
 		}
 
-		bboltStore, err := bboltcache.NewStore(bboltcache.WithCipher(cipherBbolt), bboltcache.WithCodec(bboltcache.NewHybridCodec()))
+		bboltDir := t.TempDir()
+		bboltPath := filepath.Join(bboltDir, "bbolt.db")
+		bboltStore, err := bboltcache.NewStore(
+			bboltcache.WithFilePath(bboltPath),
+			bboltcache.WithAutoDelete(false),
+			bboltcache.WithCipher(cipherBbolt),
+			bboltcache.WithCodec(bboltcache.NewHybridCodec()),
+		)
 		if err != nil {
 			t.Fatalf("bbolt store creation failed: %v", err)
 		}
@@ -578,7 +585,24 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		l10Cold, l10Warm := measureRecomputeBBolt(t, bboltStore, bboltResolver, corpus, 10)
 		l1000Cold, l1000Warm := measureRecomputeBBolt(t, bboltStore, bboltResolver, corpus, 1000)
 
-		_ = bboltStore.Close()
+		if err := bboltStore.Close(); err != nil {
+			t.Fatalf("closing bbolt store failed: %v", err)
+		}
+
+		t0 = time.Now()
+		recoveredStore, err := bboltcache.NewStore(
+			bboltcache.WithFilePath(bboltPath),
+			bboltcache.WithAutoDelete(false),
+			bboltcache.WithCipher(cipherBbolt),
+			bboltcache.WithCodec(bboltcache.NewHybridCodec()),
+		)
+		if err != nil {
+			t.Fatalf("reopening bbolt store failed: %v", err)
+		}
+		recDur := time.Since(t0)
+		if err := recoveredStore.Close(); err != nil {
+			t.Fatalf("closing recovered bbolt store failed: %v", err)
+		}
 
 		res = WorkerResult{
 			Name:             "BBolt (mmap + NoSync)",
@@ -590,7 +614,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			TotalDiskMB:      diskSizeMB,
 			WriteDurationSec: writeDur.Seconds(),
 			Throughput:       float64(count) / writeDur.Seconds(),
-			RecoveryMs:       12.0,
+			RecoveryMs:       float64(recDur) / float64(time.Millisecond),
 			Lat0ColdUs:       float64(l0Cold.Microseconds()),
 			Lat0WarmUs:       float64(l0Warm.Microseconds()),
 			Lat10ColdUs:      float64(l10Cold.Microseconds()),
@@ -599,9 +623,10 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			Lat1000WarmUs:    float64(l1000Warm.Microseconds()),
 		}
 
-	case "disk-none", "disk-zstd":
+	case "disk-none", "disk-zstd", "disk-none-largepool":
 		var codec engine.CompressionCodec
 		var displayName string
+		poolBlocks := 2048 // 8 MiB block pool
 		switch engineType {
 		case "disk-none":
 			codec = engine.CodecNone
@@ -609,6 +634,10 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		case "disk-zstd":
 			codec = engine.CodecZstd
 			displayName = "DiskStore (zstd)"
+		case "disk-none-largepool":
+			codec = engine.CodecNone
+			displayName = "DiskStore (None, 64 MB pool)"
+			poolBlocks = 16384 // 64 MiB block pool
 		}
 
 		cipherDisk, err := engine.NewEphemeralAESGCMCipher()
@@ -620,7 +649,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		diskStore, err := engine.Open(
 			engine.WithDir(diskDir),
 			engine.WithCipher(cipherDisk),
-			engine.WithNumPoolBlocks(2048), // 8 MiB block pool
+			engine.WithNumPoolBlocks(poolBlocks),
 			engine.WithCompressionCodec(codec),
 			engine.WithCreate(),
 		)
@@ -662,7 +691,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		recoveredStore, err := engine.Open(
 			engine.WithDir(diskDir),
 			engine.WithCipher(cipherDisk),
-			engine.WithNumPoolBlocks(2048),
+			engine.WithNumPoolBlocks(poolBlocks),
 			engine.WithCompressionCodec(codec),
 		)
 		if err != nil {
@@ -681,7 +710,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			TotalDiskMB:      totalMB,
 			WriteDurationSec: writeDur.Seconds(),
 			Throughput:       float64(count) / writeDur.Seconds(),
-			RecoveryMs:       float64(recDur.Milliseconds()),
+			RecoveryMs:       float64(recDur) / float64(time.Millisecond),
 			Lat0ColdUs:       float64(l0Cold.Microseconds()),
 			Lat0WarmUs:       float64(l0Warm.Microseconds()),
 			Lat10ColdUs:      float64(l10Cold.Microseconds()),
@@ -721,6 +750,30 @@ func runSubprocessBenchmark(t *testing.T, corpus string, engineName string, coun
 	return WorkerResult{}
 }
 
+func formatBenchMs(ms float64) string {
+	if ms <= 0 {
+		return "-"
+	}
+	if ms < 10 {
+		return fmt.Sprintf("%.1f ms", ms)
+	}
+	return fmt.Sprintf("%.0f ms", ms)
+}
+
+func formatBenchLatency(us float64) string {
+	if us <= 0 {
+		return "0 µs"
+	}
+	if us >= 1000 {
+		ms := us / 1000.0
+		if ms < 10 {
+			return fmt.Sprintf("%.1f ms", ms)
+		}
+		return fmt.Sprintf("%.0f ms", ms)
+	}
+	return fmt.Sprintf("%.0f µs", us)
+}
+
 func runCorpusBenchmark(t *testing.T, corpusName string, corpusID string, objectCount int) {
 	t.Logf("Running comparative benchmark for [%s] with %d objects (~%.1f MB data)...",
 		corpusName, objectCount, float64(objectCount)*10.0/1024.0)
@@ -733,6 +786,7 @@ func runCorpusBenchmark(t *testing.T, corpusName string, corpusID string, object
 		{"bbolt", "BBolt (mmap + NoSync)"},
 		{"disk-none", "DiskStore (None)"},
 		{"disk-zstd", "DiskStore (zstd)"},
+		{"disk-none-largepool", "DiskStore (None, 64 MB pool)"},
 	}
 
 	var results []WorkerResult
@@ -746,11 +800,11 @@ func runCorpusBenchmark(t *testing.T, corpusName string, corpusID string, object
 	fmt.Println("\n====================================================================================================================================================================")
 	fmt.Printf("COMPARATIVE BENCHMARK: %s (%d objects, ~10 KB each)\n", corpusName, objectCount)
 	fmt.Println("====================================================================================================================================================================")
-	fmt.Printf("%-24s | %-12s | %-12s | %-12s | %-10s | %-12s | %-12s | %-14s | %-10s\n",
+	fmt.Printf("%-28s | %-12s | %-12s | %-12s | %-10s | %-12s | %-12s | %-14s | %-10s\n",
 		"Storage Engine", "Heap In-Use", "Process RSS", "Heap File", "WAL Size", "Total Disk", "Write Time", "Write Thruput", "Recovery")
 	fmt.Println("--------------------------------------------------------------------------------------------------------------------------------------------------------------------")
 	for _, res := range results {
-		recStr := fmt.Sprintf("%.2f ms", res.RecoveryMs)
+		recStr := formatBenchMs(res.RecoveryMs)
 		if res.Name == "In-Memory Informer" {
 			recStr = "-"
 		}
@@ -762,20 +816,20 @@ func runCorpusBenchmark(t *testing.T, corpusName string, corpusID string, object
 			walStr = "-"
 			diskStr = "0 MB (RAM)"
 		}
-		fmt.Printf("%-24s | %10.2f MB | %10.2f MB | %10s | %8s | %10s | %10.2f s | %10.0f op/s | %10s\n",
+		fmt.Printf("%-28s | %10.2f MB | %10.2f MB | %10s | %8s | %10s | %10.2f s | %10.0f op/s | %10s\n",
 			res.Name, res.HeapInUseMB, res.ProcessRSSMB, heapFileStr, walStr, diskStr, res.WriteDurationSec, res.Throughput, recStr)
 	}
 	fmt.Println("--------------------------------------------------------------------------------------------------------------------------------------------------------------------")
 	fmt.Println("Recompute Latency Comparison:")
 	for _, res := range results {
 		if res.Name == "In-Memory Informer" {
-			fmt.Printf("  %-23s:         0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
-				res.Name, res.Lat0ColdUs, res.Lat10ColdUs, res.Lat1000ColdUs)
+			fmt.Printf("  %-28s:         0 refs = %8s |   10 refs = %8s | 1000 refs = %8s\n",
+				res.Name, formatBenchLatency(res.Lat0ColdUs), formatBenchLatency(res.Lat10ColdUs), formatBenchLatency(res.Lat1000ColdUs))
 		} else {
-			fmt.Printf("  %-23s (Cold): 0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
-				res.Name, res.Lat0ColdUs, res.Lat10ColdUs, res.Lat1000ColdUs)
-			fmt.Printf("  %-23s (Warm): 0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
-				res.Name, res.Lat0WarmUs, res.Lat10WarmUs, res.Lat1000WarmUs)
+			fmt.Printf("  %-28s (Cold): 0 refs = %8s |   10 refs = %8s | 1000 refs = %8s\n",
+				res.Name, formatBenchLatency(res.Lat0ColdUs), formatBenchLatency(res.Lat10ColdUs), formatBenchLatency(res.Lat1000ColdUs))
+			fmt.Printf("  %-28s (Warm): 0 refs = %8s |   10 refs = %8s | 1000 refs = %8s\n",
+				res.Name, formatBenchLatency(res.Lat0WarmUs), formatBenchLatency(res.Lat10WarmUs), formatBenchLatency(res.Lat1000WarmUs))
 		}
 	}
 	fmt.Println("====================================================================================================================================================================")

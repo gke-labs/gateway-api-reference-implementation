@@ -315,8 +315,8 @@ func runKubecacheWatch(t *testing.T, count int, tmpDir string) WatchBenchResult 
 }
 
 func runBBoltWatch(t *testing.T, count int, tmpDir string) WatchBenchResult {
-	baseMem, ch := readMemStats(), make(chan watch.Event, 256)
-	lw := newFakeLW(ch)
+	baseMem, eventChannel := readMemStats(), make(chan watch.Event, 256)
+	listerWatcher := newFakeLW(eventChannel)
 	dbPath := filepath.Join(tmpDir, "bbolt.db")
 	store, err := bboltcache.NewStore(
 		bboltcache.WithFilePath(dbPath),
@@ -326,9 +326,13 @@ func runBBoltWatch(t *testing.T, count int, tmpDir string) WatchBenchResult {
 	if err != nil {
 		t.Fatalf("bboltcache.NewStore failed: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Fatalf("store.Close failed: %v", closeErr)
+		}
+	}()
 
-	idx, err := bboltcache.NewBBoltIndexer(store, &corev1.ConfigMap{},
+	indexer, err := bboltcache.NewBBoltIndexer(store, &corev1.ConfigMap{},
 		bboltcache.WithBucketName("ConfigMap"),
 		bboltcache.WithIndexerCodec(bboltcache.NewHybridCodec()),
 	)
@@ -337,36 +341,36 @@ func runBBoltWatch(t *testing.T, count int, tmpDir string) WatchBenchResult {
 	}
 
 	var processed atomic.Int64
-	loop := NewWatchLoop(lw, &countingStore{Store: idx, processed: &processed})
+	loop := NewWatchLoop(listerWatcher, &countingStore{Store: indexer, processed: &processed})
 	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
+	errChan := make(chan error, 1)
 	go func() {
-		errCh <- loop.Run(ctx)
+		errChan <- loop.Run(ctx)
 	}()
-	go feedWatch(ch, count)
+	go feedWatch(eventChannel, count)
 
-	peakMB, dur := measureIngestion(&processed, count)
+	peakMB, duration := measureIngestion(&processed, count)
 	cancel()
-	if loopErr := <-errCh; loopErr != nil {
+	if loopErr := <-errChan; loopErr != nil {
 		t.Fatalf("watch loop failed: %v", loopErr)
 	}
 
-	snap := readMemStats()
-	fi, err := os.Stat(dbPath)
+	snapshot := readMemStats()
+	fileInfo, err := os.Stat(dbPath)
 	if err != nil {
 		t.Fatalf("stat bbolt db failed: %v", err)
 	}
-	totalDiskMB := float64(fi.Size()) / (1024 * 1024)
-	deltaHeap := snap.HeapAllocMB - baseMem.HeapAllocMB
+	totalDiskMB := float64(fileInfo.Size()) / (1024 * 1024)
+	deltaHeap := snapshot.HeapAllocMB - baseMem.HeapAllocMB
 	return WatchBenchResult{
 		Engine:        "bbolt WatchLoop",
 		Count:         count,
-		DurationSec:   dur.Seconds(),
-		Throughput:    float64(count) / dur.Seconds(),
+		DurationSec:   duration.Seconds(),
+		Throughput:    float64(count) / duration.Seconds(),
 		PeakHeapMB:    peakMB,
 		SteadyHeapMB:  deltaHeap,
-		SteadyInUseMB: snap.HeapInUseMB - baseMem.HeapInUseMB,
-		SteadyRSSMB:   snap.RSSMB,
+		SteadyInUseMB: snapshot.HeapInUseMB - baseMem.HeapInUseMB,
+		SteadyRSSMB:   snapshot.RSSMB,
 		BytesPerObj:   (deltaHeap * 1024 * 1024) / float64(count),
 		DiskMB:        totalDiskMB,
 	}
