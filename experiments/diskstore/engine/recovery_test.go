@@ -18,9 +18,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -406,71 +407,6 @@ func TestRegression_Item1_LSNReopenContinuation(t *testing.T) {
 
 	if entryK3.LSN <= chkLSN {
 		t.Fatalf("LSN went backwards after reopen: k3 LSN=%d <= checkpoint LSN=%d", entryK3.LSN, chkLSN)
-	}
-}
-
-// TestRegression_Item2_TornTailAdvance asserts WAL iterator advances across segments after a torn tail.
-func TestRegression_Item2_TornTailAdvance(t *testing.T) {
-	memFS := NewMemFS()
-	var dbID [16]byte
-	copy(dbID[:], []byte("wal-torn-test-01"))
-
-	wal, err := OpenWAL(memFS, "wal_dir", dbID, 0, WALOptions{MaxSegmentSize: 4096})
-	if err != nil {
-		t.Fatalf("OpenWAL failed: %v", err)
-	}
-
-	// Write records to segment 1 (LSN 1..5)
-	for i := uint64(1); i <= 5; i++ {
-		_ = wal.Append(Record{Type: RecordTypePut, LSN: i, Key: fmt.Sprintf("k%d", i), Payload: []byte("v")})
-	}
-	_ = wal.Sync()
-
-	// Write records to segment 2 (LSN 6..10)
-	for i := uint64(6); i <= 10; i++ {
-		_ = wal.Append(Record{Type: RecordTypePut, LSN: i, Key: fmt.Sprintf("k%d", i), Payload: []byte("v")})
-	}
-	_ = wal.Sync()
-	_ = wal.Close()
-
-	// Corrupt tail of segment 1 (simulate torn crash at tail of seg 1)
-	entries, _ := memFS.ReadDir("wal_dir")
-	seg1File, _ := memFS.OpenFile(filepath.Join("wal_dir", entries[0].Name()), os.O_RDWR, 0644)
-	buf := make([]byte, 200)
-	_, _ = seg1File.ReadAt(buf, 200)
-	buf[50] ^= 0xff // corrupt record in seg 1
-	_, _ = seg1File.WriteAt(buf, 200)
-	_ = seg1File.Close()
-
-	// Iterator with expected continuation should advance to segment 2
-	it, err := NewWALIterator(memFS, "wal_dir", dbID, 1)
-	if err != nil {
-		t.Fatalf("NewWALIterator failed: %v", err)
-	}
-	defer it.Close()
-
-	var replayed []uint64
-	for {
-		rec, err := it.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			t.Fatalf("unexpected iterator error: %v", err)
-		}
-		replayed = append(replayed, rec.LSN)
-	}
-
-	// Must have read records from segment 2
-	hasSeg2 := false
-	for _, lsn := range replayed {
-		if lsn >= 6 {
-			hasSeg2 = true
-			break
-		}
-	}
-	if !hasSeg2 {
-		t.Fatalf("iterator failed to advance to segment 2 after torn tail; replayed: %v", replayed)
 	}
 }
 
@@ -919,3 +855,173 @@ func TestRegression_OversizeNoResurrectionAcrossCheckpointTruncation(t *testing.
 		t.Fatalf("deleted oversize key resurrected after recovery (exists=%v, err=%v)", exists, err)
 	}
 }
+
+func setupWALSegments(t *testing.T, dir string, numSegs int) (FS, []string) {
+	memFS := NewMemFS()
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	dbID := store.DBID()
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	walDir := filepath.Join(dir, "wal")
+	entries, err := memFS.ReadDir(walDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	for _, entry := range entries {
+		if err := memFS.Remove(filepath.Join(walDir, entry.Name())); err != nil {
+			t.Fatalf("Remove failed: %v", err)
+		}
+	}
+
+	wal, err := OpenWAL(memFS, walDir, dbID, 0, WALOptions{MaxSegmentSize: 80})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	for i := 1; i <= numSegs; i++ {
+		record := Record{
+			Type:    RecordTypePut,
+			LSN:     uint64(i),
+			Key:     qualifyKey("ConfigMap", fmt.Sprintf("k%d", i)),
+			Payload: append([]byte{byte(CodecNone)}, fmt.Sprintf("val%d", i)...),
+		}
+		if err := wal.Append(record); err != nil {
+			t.Fatalf("Append record %d failed: %v", i, err)
+		}
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	entries, err = memFS.ReadDir(walDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".wal") {
+			paths = append(paths, filepath.Join(walDir, entry.Name()))
+		}
+	}
+	sort.Strings(paths)
+	if len(paths) != numSegs {
+		t.Fatalf("expected %d segments, got %d", numSegs, len(paths))
+	}
+	return memFS, paths
+}
+
+func TestRecovery_WALCorruptFirstSegment_FailsOpen(t *testing.T) {
+	fs, paths := setupWALSegments(t, "test_wal_corrupt_first", 3)
+	file, err := fs.OpenFile(paths[0], os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	var byteBuffer [1]byte
+	if _, err := file.ReadAt(byteBuffer[:], 40); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	byteBuffer[0] ^= 0xff
+	if _, err := file.WriteAt(byteBuffer[:], 40); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	_, err = Open(WithFS(fs), WithDir("test_wal_corrupt_first"))
+	if !errors.Is(err, ErrCorruptWAL) {
+		t.Fatalf("expected ErrCorruptWAL, got: %v", err)
+	}
+}
+
+func TestRecovery_WALTornTailLastSegment_SucceedsOpen(t *testing.T) {
+	dir := "test_wal_torn_tail_last"
+	fs, paths := setupWALSegments(t, dir, 1)
+	file, err := fs.OpenFile(paths[0], os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	size, err := file.Size()
+	if err != nil {
+		t.Fatalf("Size failed: %v", err)
+	}
+	tornHeader := []byte{RecordMagic, RecordFormatVersion, byte(RecordTypePut), 0, 0, 0, 0, 10}
+	if _, err := file.WriteAt(tornHeader, size); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	store, err := Open(WithFS(fs), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	val, ok, err := store.Get("ConfigMap", "k1")
+	if err != nil || !ok || string(val) != "val1" {
+		t.Fatalf("Get k1 mismatch: ok=%v, val=%q, err=%v", ok, string(val), err)
+	}
+}
+
+func TestRecovery_WALSegmentGap_FailsOpen(t *testing.T) {
+	dir := "test_wal_segment_gap"
+	fs, paths := setupWALSegments(t, dir, 2)
+	gapPath := filepath.Join(filepath.Dir(paths[1]), fmt.Sprintf("%020d.wal", 5))
+	if err := fs.Rename(paths[1], gapPath); err != nil {
+		t.Fatalf("Rename failed: %v", err)
+	}
+
+	_, err := Open(WithFS(fs), WithDir(dir))
+	if !errors.Is(err, ErrCorruptWAL) {
+		t.Fatalf("expected ErrCorruptWAL, got: %v", err)
+	}
+}
+
+func TestRecovery_WALCrashAfterRotation_EmptySegment_SucceedsOpen(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_wal_crash_after_rotation"
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "k1", []byte("val1")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// store.Put used LSN 1, Close checkpointed at LSN 2; the next segment file starts at LSN 3.
+	nextSeg := filepath.Join(dir, "wal", segmentFileName(3))
+	file, err := memFS.Create(nextSeg)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithEraseOnError())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store2.Close()
+
+	if store2.Wiped() {
+		t.Fatalf("expected store not to be wiped")
+	}
+	val, ok, err := store2.Get("ConfigMap", "k1")
+	if err != nil || !ok || string(val) != "val1" {
+		t.Fatalf("Get k1 mismatch: ok=%v, val=%q, err=%v", ok, string(val), err)
+	}
+}
+>>>>>>> e0d70d2 (experiments/diskstore/engine: fail on WAL corruption outside the torn tail)

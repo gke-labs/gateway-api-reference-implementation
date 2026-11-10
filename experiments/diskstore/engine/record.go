@@ -103,7 +103,7 @@ const (
 	// Magic(1) + Version(1) + Type(1) + Reserved(1) + LSN(8) + RedoStartLSN(8) + KeyLen(4) + PayloadLen(4) + CRC32C(4)
 	RecordHeaderSize = 32
 
-	// MaxRecordFieldLength is a sanity check limit (64 MiB).
+	// MaxRecordFieldLength stops a corrupted length field from triggering a huge allocation (64 MiB).
 	MaxRecordFieldLength = 64 * 1024 * 1024
 )
 
