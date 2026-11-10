@@ -1068,3 +1068,61 @@ func TestApplyDataplaneConfig_MissingBackendClientCertID(t *testing.T) {
 		}
 	})
 }
+
+func TestDataplaneConfig_Revision(t *testing.T) {
+	base := func() *DataplaneConfig {
+		return &DataplaneConfig{
+			GatewayName: types.NamespacedName{Namespace: "default", Name: "my-gw"},
+			Listeners: []InternalListener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		}
+	}
+
+	baseRev, err := base().ComputeRevision()
+	if err != nil || baseRev == "" {
+		t.Fatalf("ComputeRevision failed: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		cfg       *DataplaneConfig
+		wantEqual bool
+	}{
+		{
+			name:      "equal configs produce identical revision",
+			cfg:       base(),
+			wantEqual: true,
+		},
+		{
+			name: "existing revision field ignored",
+			cfg: func() *DataplaneConfig {
+				c := base()
+				c.Revision = "old-revision"
+				return c
+			}(),
+			wantEqual: true,
+		},
+		{
+			name: "one-field change produces different revision",
+			cfg: func() *DataplaneConfig {
+				c := base()
+				c.Listeners[0].Port = 8080
+				return c
+			}(),
+			wantEqual: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rev, err := tc.cfg.ComputeRevision()
+			if err != nil {
+				t.Fatalf("ComputeRevision failed: %v", err)
+			}
+			if (rev == baseRev) != tc.wantEqual {
+				t.Errorf("got revision %q, base %q, wantEqual=%v", rev, baseRev, tc.wantEqual)
+			}
+		})
+	}
+}

@@ -19,6 +19,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -36,12 +39,15 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -1711,6 +1717,211 @@ func TestDataplaneSecretReconciler(t *testing.T) {
 	}
 	if rec.Body.String() != "backend ok" {
 		t.Errorf("expected 'backend ok' body, got %q", rec.Body.String())
+	}
+}
+
+func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
+	env := testenv.Start(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const (
+		gwNamespace = "test-ns"
+		gwName      = "test-gw"
+	)
+	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: gwNamespace,
+		},
+	}
+	if err := env.Client.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	healthAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	opts := DefaultOptions()
+	opts.RestConfig = env.Config
+	opts.Scheme = env.Scheme
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = gwNamespace
+	opts.DataplaneGatewayName = gwName
+	opts.HealthProbeBindAddress = healthAddr
+	opts.MetricsAddr = healthAddr
+	opts.ProxyAddr = ""
+	opts.ProxyHTTPSAddr = ""
+	opts.LeaderElection = false
+
+	server, err := New(opts)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("server exited with error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("timed out waiting for server to stop")
+		}
+	})
+
+	healthURL := fmt.Sprintf("http://%s/_gari/applied", healthAddr)
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+
+	waitForRevision := func(expectedRev string) {
+		t.Helper()
+		var lastRevs []string
+		pollErr := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+			resp, err := httpClient.Get(healthURL)
+			if err != nil {
+				return false, nil
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return false, nil
+			}
+			var revs []string
+			if err := json.NewDecoder(resp.Body).Decode(&revs); err != nil {
+				return false, err
+			}
+			lastRevs = revs
+			if expectedRev == "" {
+				return len(revs) == 0, nil
+			}
+			return slices.Contains(revs, expectedRev), nil
+		})
+		if pollErr != nil {
+			t.Fatalf("timed out waiting for revision %q, last got: %v", expectedRev, lastRevs)
+		}
+	}
+
+	// 1. Before config is applied: endpoint returns 200 OK with empty revisions list (Gateway appears only after config applied)
+	waitForRevision("")
+
+	// 2. Create initial config Secret
+	route1 := state.InternalRoute{
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/v1"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: "backend-1", Port: 8080, Weight: 1},
+				},
+			},
+		},
+	}
+	dpConfig1, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
+	}, []state.InternalRoute{route1}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig 1 failed: %v", err)
+	}
+	dpConfig1.Revision, err = dpConfig1.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 1 failed: %v", err)
+	}
+	configBytes1, err := dpConfig1.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig1: %v", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: gwNamespace,
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			singlepod.DataplaneSecretDataKey: configBytes1,
+		},
+	}
+	if err := env.Client.Create(ctx, secret); err != nil {
+		t.Fatalf("failed to create secret: %v", err)
+	}
+
+	// Wait for endpoint to report revision 1
+	waitForRevision(dpConfig1.Revision)
+
+	// 3. Update config Secret with new route and verify new revision reported
+	route2 := state.InternalRoute{
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/v2"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: "backend-2", Port: 8080, Weight: 1},
+				},
+			},
+		},
+	}
+	dpConfig2, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route2}},
+	}, []state.InternalRoute{route2}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig 2 failed: %v", err)
+	}
+	dpConfig2.Revision, err = dpConfig2.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 2 failed: %v", err)
+	}
+	configBytes2, err := dpConfig2.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig2: %v", err)
+	}
+
+	secret.Data[singlepod.DataplaneSecretDataKey] = configBytes2
+	if err := env.Client.Update(ctx, secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
+
+	// Wait for endpoint to report revision 2
+	waitForRevision(dpConfig2.Revision)
+
+	// 4. Verify security limits:
+	// a) Endpoint returns only revision hashes and reveals no Gateway names or namespaces
+	resp, err := httpClient.Get(healthURL)
+	if err != nil {
+		t.Fatalf("failed to GET applied revisions: %v", err)
+	}
+	defer resp.Body.Close()
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+	if strings.Contains(string(bodyBytes), gwName) || strings.Contains(string(bodyBytes), gwNamespace) {
+		t.Errorf("security violation: applied endpoint exposed gateway identity: %s", string(bodyBytes))
+	}
+
+	// b) Endpoint must NOT be served on Gateway listener (proxy)
+	rec := httptest.NewRecorder()
+	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/_gari/applied", nil)
+	if err != nil {
+		t.Fatalf("failed to create proxy request: %v", err)
+	}
+	server.Proxy().ServeHTTP(rec, proxyReq)
+	if strings.Contains(rec.Body.String(), dpConfig2.Revision) {
+		t.Errorf("security violation: proxy listener served revision endpoint: %s", rec.Body.String())
 	}
 }
 

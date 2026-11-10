@@ -17,6 +17,7 @@ package gari
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -374,6 +375,10 @@ type Server struct {
 	listenerOpts *proxyproto.ListenerOptions
 	httpFilter   *proxyproto.Listener
 	httpsFilter  *proxyproto.Listener
+
+	// appliedMu guards appliedRevisions.
+	appliedMu        sync.RWMutex
+	appliedRevisions map[string]string
 }
 
 func (s *Server) listenerOptionsLocked() proxyproto.ListenerOptions {
@@ -524,17 +529,20 @@ func New(opts Options) (*Server, error) {
 		}
 
 		readyzHandler, healthzHandler := s.healthzHandlers()
+		appliedHandler := s.appliedHandler()
 		metricsOpts := metricsserver.Options{
 			BindAddress: opts.MetricsAddr,
 		}
 		healthProbeBindAddress := opts.HealthProbeBindAddress
 		extraHandlers := map[string]http.Handler{
-			"/healthz":       http.StripPrefix("/healthz", healthzHandler),
-			"/healthz/":      http.StripPrefix("/healthz", healthzHandler),
-			"/readyz":        http.StripPrefix("/readyz", readyzHandler),
-			"/readyz/":       http.StripPrefix("/readyz", readyzHandler),
-			"/_gari/readyz":  http.StripPrefix("/_gari/readyz", readyzHandler),
-			"/_gari/readyz/": http.StripPrefix("/_gari/readyz", readyzHandler),
+			"/healthz":        http.StripPrefix("/healthz", healthzHandler),
+			"/healthz/":       http.StripPrefix("/healthz", healthzHandler),
+			"/readyz":         http.StripPrefix("/readyz", readyzHandler),
+			"/readyz/":        http.StripPrefix("/readyz", readyzHandler),
+			"/_gari/readyz":   http.StripPrefix("/_gari/readyz", readyzHandler),
+			"/_gari/readyz/":  http.StripPrefix("/_gari/readyz", readyzHandler),
+			"/_gari/applied":  appliedHandler,
+			"/_gari/applied/": appliedHandler,
 		}
 		if samePortOrAddr(opts.MetricsAddr, opts.HealthProbeBindAddress) && opts.MetricsAddr != "" && opts.MetricsAddr != "0" && opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
 			metricsOpts.ExtraHandlers = extraHandlers
@@ -656,6 +664,38 @@ func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Han
 	return rHandler, hHandler
 }
 
+func (s *Server) appliedRevisionsList() []string {
+	s.appliedMu.RLock()
+	defer s.appliedMu.RUnlock()
+	revisions := make([]string, 0, len(s.appliedRevisions))
+	for _, rev := range s.appliedRevisions {
+		revisions = append(revisions, rev)
+	}
+	slices.Sort(revisions)
+	return revisions
+}
+
+func (s *Server) recordAppliedRevision(gatewayKey, revision string) {
+	s.appliedMu.Lock()
+	defer s.appliedMu.Unlock()
+	if s.appliedRevisions == nil {
+		s.appliedRevisions = make(map[string]string)
+	}
+	s.appliedRevisions[gatewayKey] = revision
+}
+
+func (s *Server) appliedHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		revisions := s.appliedRevisionsList()
+		if err := json.NewEncoder(w).Encode(revisions); err != nil {
+			// Disconnects while writing the response are safe to ignore; the probe will retry.
+			klog.Warningf("failed to write applied revisions response: %v", err)
+		}
+	})
+}
+
 // SetupWithManager registers all GARI reconcilers with the given Manager.
 func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.AddReadyzCheck("readyz", s.readyzChecker()); err != nil {
@@ -674,6 +714,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 			gatewayNamespace: s.opts.DataplaneGatewayNamespace,
 			secretName:       secretName,
 			onConfigUpdate:   s.updateListenerFilters,
+			onConfigApplied:  s.recordAppliedRevision,
 		}
 		if err := ctrl.NewControllerManagedBy(mgr).
 			For(&corev1.Secret{}).
@@ -686,6 +727,21 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	userHook := s.opts.OnGatewaysUpdate
 	wrappedHook := func(gateways []*gatewayv1.Gateway) {
 		s.proxySynced.Store(true)
+		newRevisions := make(map[string]string, len(gateways))
+		for _, gw := range gateways {
+			if gw == nil {
+				continue
+			}
+			gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+			if s.state != nil {
+				if dpCfg := s.state.GetDataplaneConfig(gwKey); dpCfg != nil && dpCfg.Revision != "" {
+					newRevisions[gwKey.String()] = dpCfg.Revision
+				}
+			}
+		}
+		s.appliedMu.Lock()
+		s.appliedRevisions = newRevisions
+		s.appliedMu.Unlock()
 		if userHook != nil {
 			userHook(gateways)
 		}
@@ -711,6 +767,7 @@ type dataplaneSecretReconciler struct {
 	gatewayNamespace string
 	secretName       string
 	onConfigUpdate   func(opts proxyproto.ListenerOptions) error
+	onConfigApplied  func(gwKey string, revision string)
 }
 
 func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -736,11 +793,12 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	r.proxySynced.Store(true)
 
+	dpCfg, err := state.UnmarshalDataplaneConfig(data)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
+	}
+
 	if r.onConfigUpdate != nil {
-		dpCfg, err := state.UnmarshalDataplaneConfig(data)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
-		}
 		opts := proxyproto.ListenerOptions{
 			AllowedSourceCIDRs:        dpCfg.AllowedSourceCIDRs,
 			ProxyProtocol:             dpCfg.ProxyProtocol,
@@ -749,6 +807,10 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err := r.onConfigUpdate(opts); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update listener filters: %w", err)
 		}
+	}
+
+	if r.onConfigApplied != nil && dpCfg.Revision != "" {
+		r.onConfigApplied(dpCfg.GatewayName.String(), dpCfg.Revision)
 	}
 
 	return ctrl.Result{}, nil
