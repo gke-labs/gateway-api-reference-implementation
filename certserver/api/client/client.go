@@ -160,16 +160,16 @@ func (c *Client) ensureConn(ctx context.Context) (certserverv1.CertificateServic
 }
 
 // GetCertificate performs the GetCertificate RPC to certserver, reading the current
-// token from TokenPath and returning the parsed certificate and leaf.
-func (c *Client) GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, error) {
+// token from TokenPath and returning the parsed certificate and leaf, or pending challenges.
+func (c *Client) GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error) {
 	grpcCli, err := c.ensureConn(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	token, err := c.readToken()
 	if err != nil {
-		return nil, nil, status.Errorf(codes.Unauthenticated, "reading token file: %v", err)
+		return nil, nil, nil, status.Errorf(codes.Unauthenticated, "reading token file: %v", err)
 	}
 
 	rpcCtx, cancel := context.WithTimeout(ctx, c.cfg.RPCTimeout)
@@ -180,10 +180,19 @@ func (c *Client) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 
 	resp, err := grpcCli.GetCertificate(rpcCtx, req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return ParseCertificateChain(resp.GetCertificateChain(), resp.GetPrivateKey())
+	if len(resp.GetCertificateChain()) == 0 {
+		return nil, nil, resp.GetChallenges(), nil
+	}
+
+	tlsCert, leaf, err := ParseCertificateChain(resp.GetCertificateChain(), resp.GetPrivateKey())
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	return tlsCert, leaf, resp.GetChallenges(), nil
 }
 
 // ParseCertificateChain parses PEM-encoded certificate chain and private key into tls.Certificate and leaf.
