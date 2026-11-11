@@ -94,6 +94,16 @@ func (s *EventSource) Enqueue(req reconcile.Request) {
 
 var _ source.TypedSource[reconcile.Request] = (*EventSource)(nil)
 
+const (
+	defaultPublishRetryMinBackoff = 50 * time.Millisecond
+	defaultPublishRetryMaxBackoff = 30 * time.Second
+)
+
+type publishRetry struct {
+	timer   *time.Timer
+	backoff time.Duration
+}
+
 type State struct {
 	mu sync.RWMutex
 
@@ -130,9 +140,12 @@ type State struct {
 	gatewayFilter           func(gw *gatewayv1.Gateway) bool
 	listenerValidator       ListenerValidator
 
-	dataplanePublisher DataplanePublisher
-	lastWrittenConfigs map[types.NamespacedName][]byte
-	publishConflicts   map[types.NamespacedName]struct{}
+	dataplanePublisher     DataplanePublisher
+	lastWrittenConfigs     map[types.NamespacedName][]byte
+	publishConflicts       map[types.NamespacedName]struct{}
+	publishRetries         map[types.NamespacedName]*publishRetry
+	publishRetryMinBackoff time.Duration
+	publishRetryMaxBackoff time.Duration
 
 	previousOutputs *Outputs
 
@@ -183,6 +196,9 @@ func NewState() *State {
 		gatewayClassSource:     NewEventSource(),
 		lastWrittenConfigs:     make(map[types.NamespacedName][]byte),
 		publishConflicts:       make(map[types.NamespacedName]struct{}),
+		publishRetries:         make(map[types.NamespacedName]*publishRetry),
+		publishRetryMinBackoff: defaultPublishRetryMinBackoff,
+		publishRetryMaxBackoff: defaultPublishRetryMaxBackoff,
 		notifyCh:               make(chan struct{}, 1),
 		synced:                 true,
 		running:                false,
@@ -396,6 +412,7 @@ func (s *State) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			s.mu.Lock()
 			s.running = false
+			s.stopPublishRetriesLocked()
 			s.mu.Unlock()
 			return nil
 		case <-s.notifyCh:
@@ -405,6 +422,7 @@ func (s *State) Start(ctx context.Context) error {
 				timer.Stop()
 				s.mu.Lock()
 				s.running = false
+				s.stopPublishRetriesLocked()
 				s.mu.Unlock()
 				return nil
 			case <-timer.C:
@@ -517,7 +535,7 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 		}
 
 		if err := publisher.PublishDataplaneConfig(ctx, cg.Gateway, dpConfig); err != nil {
-			klog.Errorf("failed to publish dataplane config for %s: %v", gwKey, err)
+			klog.Errorf("failed to publish dataplane config for %s (revision %s): %v", gwKey, dpConfig.Revision, err)
 			var conflictErr *OwnershipConflictError
 			if errors.As(err, &conflictErr) {
 				s.mu.Lock()
@@ -525,6 +543,7 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 				s.mu.Unlock()
 				s.SetGatewayProvisioningError(gwKey, conflictErr.Error())
 			}
+			s.schedulePublishRetry(gwKey)
 			continue
 		}
 
@@ -533,6 +552,12 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 		_, hadConflict := s.publishConflicts[gwKey]
 		if hadConflict {
 			delete(s.publishConflicts, gwKey)
+		}
+		if r, ok := s.publishRetries[gwKey]; ok {
+			if r.timer != nil {
+				r.timer.Stop()
+			}
+			delete(s.publishRetries, gwKey)
 		}
 		s.mu.Unlock()
 
@@ -548,6 +573,14 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 			delete(s.lastWrittenConfigs, gwKey)
 			delete(s.publishConflicts, gwKey)
 			removedKeys = append(removedKeys, gwKey)
+		}
+	}
+	for gwKey, r := range s.publishRetries {
+		if _, ok := outputs.DataplaneConfigs[gwKey]; !ok {
+			if r.timer != nil {
+				r.timer.Stop()
+			}
+			delete(s.publishRetries, gwKey)
 		}
 	}
 	s.mu.Unlock()
@@ -566,6 +599,52 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 
 	if err := publisher.Commit(ctx); err != nil {
 		klog.Errorf("failed to commit dataplane publish batch: %v", err)
+	}
+}
+
+func (s *State) schedulePublishRetry(gwKey types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.running {
+		return
+	}
+
+	minBackoff := s.publishRetryMinBackoff
+	if minBackoff <= 0 {
+		minBackoff = defaultPublishRetryMinBackoff
+	}
+	maxBackoff := s.publishRetryMaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = defaultPublishRetryMaxBackoff
+	}
+
+	backoff := minBackoff
+	if r, ok := s.publishRetries[gwKey]; ok {
+		if r.timer != nil {
+			r.timer.Stop()
+		}
+		backoff = r.backoff * 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+
+	r := &publishRetry{
+		backoff: backoff,
+	}
+	r.timer = time.AfterFunc(backoff, func() {
+		s.TriggerRecompute()
+	})
+	s.publishRetries[gwKey] = r
+}
+
+func (s *State) stopPublishRetriesLocked() {
+	for gwKey, r := range s.publishRetries {
+		if r.timer != nil {
+			r.timer.Stop()
+		}
+		delete(s.publishRetries, gwKey)
 	}
 }
 
