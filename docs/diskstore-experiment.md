@@ -48,9 +48,9 @@ To maintain separation of concerns and avoid exposing Kubernetes dependencies to
 ### 1. Core Database Engine (`experiments/diskstore/engine`)
 
 The engine provides a byte-oriented key-value store with crash consistency, bounded memory usage, and no dependencies on `k8s.io/...`:
-- **Data abstraction:** All keys and values are processed as raw byte slices (`[]byte`) partitioned across buckets.
-- **Operations:** Supports `Open`, `Put(bucket, key, value)`, `Delete(bucket, key)`, `Get(bucket, key)`, point-in-time consistent `Scan(bucket, fn)`, `Flush`, `Sync`, `Checkpoint`, and `Close`.
-- **Payload encryption:** If a cipher is configured, encryption and decryption occur inside the engine using the bucket and key as authenticated additional data.
+- **Data abstraction:** All keys and values are processed as raw byte slices (`[]byte`) partitioned across tables.
+- **Operations:** Supports `Open`, `Put(table, key, value)`, `Delete(table, key)`, `Get(table, key)`, point-in-time consistent `Scan(table, fn)`, `Flush`, `Sync`, `Checkpoint`, and `Close`.
+- **Payload encryption:** If a cipher is configured, encryption and decryption occur inside the engine using the table and key as authenticated additional data.
 - **Sticky error state and notifications:** Once an unrecoverable error occurs (such as an fsync failure or page corruption), the engine transitions permanently into a failed state where all subsequent calls return `ErrFailed`. Callers receive asynchronous notification via `Err()` and `Failed() <-chan struct{}`.
 - **Failure marker:** Upon entering the failed state, the engine writes a `FAILED` marker file to the storage directory. If a subsequent `Open` encounters this marker, it wipes the directory, reports the wipe via `Wiped() bool`, and initializes a fresh database with a new ID.
 
@@ -459,8 +459,8 @@ Recompute Latency Comparison:
    - On compressible configuration text, `DiskStore (zstd)` recovers in **40 ms**, compared to **138 ms** uncompressed. On the 10,000 mixed corpus, recovery completes in **340 ms**, compared to **565 ms** uncompressed. Replaying WAL redo records copies compressed bytes directly into pages without decompression, minimizing recovery latency.
 
 7. **Broad Read Isolation and Locking Trade-offs (`List` vs Concurrent Writers):**
-   - **Point-in-Time Consistency:** `DiskStore.List(bucketName)` acquires `s.writerMu.RLock()` for the duration of the broad bucket read and object decoding. This provides point-in-time consistency across the bucket: concurrent writes (`Put`) or deletions (`Delete`) cannot mutate page contents, renumber slots during compaction, or modify the key index while objects are being retrieved and decoded.
-   - **Scope and Trade-off Analysis:** Because `writerMu` is store-wide, holding `writerMu.RLock()` stalls writes to every bucket for the duration of a `List` while all objects in the bucket are iterated and decoded into memory. An alternative architecture would provide non-blocking concurrency via per-page versioning or multi-version concurrency control (MVCC); however, MVCC introduces additional memory overhead, garbage collection complexity, and page table churn. The trade-off is that writes stall for the duration of a `List`, in exchange for a consistent view without per-page versioning.
+   - **Point-in-Time Consistency:** `DiskStore.List(tableName)` acquires `s.writerMu.RLock()` for the duration of the broad table read and object decoding. This provides point-in-time consistency across the table: concurrent writes (`Put`) or deletions (`Delete`) cannot mutate page contents, renumber slots during compaction, or modify the key index while objects are being retrieved and decoded.
+   - **Scope and Trade-off Analysis:** Because `writerMu` is store-wide, holding `writerMu.RLock()` stalls writes to every table for the duration of a `List` while all objects in the table are iterated and decoded into memory. An alternative architecture would provide non-blocking concurrency via per-page versioning or multi-version concurrency control (MVCC); however, MVCC introduces additional memory overhead, garbage collection complexity, and page table churn. The trade-off is that writes stall for the duration of a `List`, in exchange for a consistent view without per-page versioning.
    - **Alignment with Informer Access Patterns:** GARI consumes these caches through informer event handlers and doesn't call `List` on them, so broad reads mostly happen at startup and relist. Other controllers may differ in their access patterns, so workloads that frequently invoke `List` concurrently with active write streams would experience write stalls under this locking model.
 
 8. **Universal Value Compression: Small Objects & Realistic Corpus Evaluation:**

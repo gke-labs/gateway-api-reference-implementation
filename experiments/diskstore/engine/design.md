@@ -13,6 +13,7 @@ The engine uses the following terms:
 - **Page.** The logical unit, identified by a logical page number. It is either a slotted page (one block holding many small records, each in a record slot) or a multi-block page ($2^k$ blocks holding one large record). The engine writes pages out of place, so a logical page moves between block numbers over time.
 - **Block run.** A contiguous, aligned run of blocks allocated by the buddy allocator. A multi-block page always occupies one block run, and a flush batch writes several pages into one block run.
 - **Record slot.** An entry in a slotted page's directory. "Slot" is used only in this sense.
+- **Table.** A table is a named set of keys, with no schema or columns.
 - **WAL terms:**
   - **Segment.** An append-only log file named by its starting 64-bit LSN, formatted as a 20-digit zero-padded decimal number with a `.wal` extension. The engine appends records to the active segment. In accordance with invariant 4, once a 4 KiB block within a segment is fsynced to disk, the engine never rewrites that block.
   - **Record.** A single log entry recording an operation, such as a write, deletion, or checkpoint.

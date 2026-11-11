@@ -41,10 +41,10 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 
 	origDBID := eng1.DBID()
 
-	if err := eng1.Put("bucketA", "k1", []byte("val1")); err != nil {
+	if err := eng1.Put("tableA", "k1", []byte("val1")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
-	if err := eng1.Put("bucketB", "k2", []byte("val2")); err != nil {
+	if err := eng1.Put("tableB", "k2", []byte("val2")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 	if err := eng1.Sync(); err != nil {
@@ -66,7 +66,7 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 	}
 
 	// Any operation on failed engine must fail
-	if err := eng1.Put("bucketA", "k3", []byte("val3")); !errors.Is(err, engine.ErrFailed) {
+	if err := eng1.Put("tableA", "k3", []byte("val3")); !errors.Is(err, engine.ErrFailed) {
 		t.Fatalf("expected ErrFailed on Put after failure, got %v", err)
 	}
 
@@ -94,7 +94,7 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 	}
 
 	// 4. Verify fresh engine works normally
-	if err := eng2.Put("bucketC", "k4", []byte("val4")); err != nil {
+	if err := eng2.Put("tableC", "k4", []byte("val4")); err != nil {
 		t.Fatalf("Put on wiped store failed: %v", err)
 	}
 	if err := eng2.Sync(); err != nil {
@@ -113,7 +113,7 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 	if eng3.Wiped() {
 		t.Fatalf("clean reopen should NOT report Wiped()")
 	}
-	val, exists, err := eng3.Get("bucketC", "k4")
+	val, exists, err := eng3.Get("tableC", "k4")
 	if err != nil || !exists || !bytes.Equal(val, []byte("val4")) {
 		t.Fatalf("expected val4 after clean reopen, got %s (exists=%v, err=%v)", string(val), exists, err)
 	}
@@ -128,7 +128,7 @@ func TestEngine_FailureMarkerPreservesUnrelatedFiles(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	if err := eng1.Put("bucket1", "k1", []byte("val1")); err != nil {
+	if err := eng1.Put("table1", "k1", []byte("val1")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 	if err := eng1.Sync(); err != nil {
@@ -224,7 +224,7 @@ func TestEngine_InterruptedWipe_FailurePartWay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	if err := eng1.Put("bucketA", "k1", []byte("val1")); err != nil {
+	if err := eng1.Put("tableA", "k1", []byte("val1")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 	if err := eng1.Sync(); err != nil {
@@ -271,10 +271,10 @@ func TestEngine_InterruptedWipe_FailurePartWay(t *testing.T) {
 	}
 
 	// Verify fresh store can write and read normally
-	if err := eng2.Put("bucketA", "k2", []byte("val2")); err != nil {
+	if err := eng2.Put("tableA", "k2", []byte("val2")); err != nil {
 		t.Fatalf("Put on recovered store failed: %v", err)
 	}
-	val, exists, err := eng2.Get("bucketA", "k2")
+	val, exists, err := eng2.Get("tableA", "k2")
 	if err != nil || !exists || !bytes.Equal(val, []byte("val2")) {
 		t.Fatalf("Get on recovered store failed: exists=%v, val=%s, err=%v", exists, string(val), err)
 	}
@@ -289,7 +289,7 @@ func TestEngine_OrphanedStoreFilesWithoutMeta_TreatedAsCorrupt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	_ = eng.Put("bucketA", "k1", []byte("val1"))
+	_ = eng.Put("tableA", "k1", []byte("val1"))
 	_ = eng.Sync()
 	_ = eng.Close()
 

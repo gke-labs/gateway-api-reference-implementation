@@ -232,11 +232,11 @@ func TestCompression_RoundTripAllCodecs(t *testing.T) {
 				key := fmt.Sprintf("key-size-%d", size)
 				payload := makeRepetitivePayload(size)
 
-				if err := store.Put("Bucket", key, payload); err != nil {
+				if err := store.Put("Table", key, payload); err != nil {
 					t.Fatalf("Put failed for size %d (codec %s): %v", size, tc.name, err)
 				}
 
-				got, exists, err := store.Get("Bucket", key)
+				got, exists, err := store.Get("Table", key)
 				if err != nil || !exists {
 					t.Fatalf("Get failed for size %d (codec %s): exists=%v, err=%v", size, tc.name, exists, err)
 				}
@@ -646,9 +646,9 @@ func TestCompression_Rejection_StoreState(t *testing.T) {
 	}
 }
 
-func getStoredPayload(t *testing.T, store *Engine, bucket, key string) []byte {
+func getStoredPayload(t *testing.T, store *Engine, table, key string) []byte {
 	t.Helper()
-	qKey := qualifyKey(bucket, key)
+	qKey := qualifyKey(table, key)
 	store.keyMu.RLock()
 	entry, exists := store.keyIndex[qKey]
 	store.keyMu.RUnlock()
@@ -696,11 +696,11 @@ func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
 
 			payload := makeRepetitivePayload(size)
 			key := fmt.Sprintf("key-%d", size)
-			if err := store.Put("bucket", key, payload); err != nil {
+			if err := store.Put("table", key, payload); err != nil {
 				t.Fatalf("Put failed: %v", err)
 			}
 
-			stored := getStoredPayload(t, store, "bucket", key)
+			stored := getStoredPayload(t, store, "table", key)
 			if size >= 500 {
 				if stored[0] != byte(CodecZstd) {
 					t.Fatalf("expected CodecZstd (%d) for compressible size %d, got %d", CodecZstd, size, stored[0])
@@ -711,7 +711,7 @@ func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
 				}
 			}
 
-			got, exists, err := store.Get("bucket", key)
+			got, exists, err := store.Get("table", key)
 			if err != nil || !exists || !bytes.Equal(got, payload) {
 				t.Fatalf("Get returned invalid payload: exists=%v, err=%v", exists, err)
 			}
@@ -727,7 +727,7 @@ func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
 			}
 			defer store2.Close()
 
-			got2, exists2, err := store2.Get("bucket", key)
+			got2, exists2, err := store2.Get("table", key)
 			if err != nil || !exists2 || !bytes.Equal(got2, payload) {
 				t.Fatalf("Get after reopen returned invalid payload: exists=%v, err=%v", exists2, err)
 			}
@@ -743,16 +743,16 @@ func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
 
 			payload := makeRandomPayload(size)
 			key := fmt.Sprintf("key-%d", size)
-			if err := store.Put("bucket", key, payload); err != nil {
+			if err := store.Put("table", key, payload); err != nil {
 				t.Fatalf("Put failed: %v", err)
 			}
 
-			stored := getStoredPayload(t, store, "bucket", key)
+			stored := getStoredPayload(t, store, "table", key)
 			if stored[0] != byte(CodecNone) {
 				t.Fatalf("expected CodecNone (%d) for incompressible size %d, got %d", CodecNone, size, stored[0])
 			}
 
-			got, exists, err := store.Get("bucket", key)
+			got, exists, err := store.Get("table", key)
 			if err != nil || !exists || !bytes.Equal(got, payload) {
 				t.Fatalf("Get returned invalid payload: exists=%v, err=%v", exists, err)
 			}
@@ -768,7 +768,7 @@ func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
 			}
 			defer store2.Close()
 
-			got2, exists2, err := store2.Get("bucket", key)
+			got2, exists2, err := store2.Get("table", key)
 			if err != nil || !exists2 || !bytes.Equal(got2, payload) {
 				t.Fatalf("Get after reopen returned invalid payload: exists=%v, err=%v", exists2, err)
 			}
@@ -799,11 +799,11 @@ func TestCompression_ReopenUncompressedSmallValues(t *testing.T) {
 	}
 
 	for k, v := range testPayloads {
-		if err := store1.Put("bucket", k, v); err != nil {
+		if err := store1.Put("table", k, v); err != nil {
 			t.Fatalf("Put %s failed: %v", k, err)
 		}
 		// Confirm it was written as CodecNone
-		stored := getStoredPayload(t, store1, "bucket", k)
+		stored := getStoredPayload(t, store1, "table", k)
 		if stored[0] != byte(CodecNone) {
 			t.Fatalf("expected stored codec CodecNone for %s, got %d", k, stored[0])
 		}
@@ -826,7 +826,7 @@ func TestCompression_ReopenUncompressedSmallValues(t *testing.T) {
 
 	// 3. Read back all legacy uncompressed small values
 	for k, expected := range testPayloads {
-		got, exists, err := store2.Get("bucket", k)
+		got, exists, err := store2.Get("table", k)
 		if err != nil {
 			t.Fatalf("Get %s failed: %v", k, err)
 		}
@@ -840,16 +840,16 @@ func TestCompression_ReopenUncompressedSmallValues(t *testing.T) {
 
 	// 4. Verify new writes in the reopened store compress small compressible payloads
 	newPayload := makeRepetitivePayload(500)
-	if err := store2.Put("bucket", "new-small-500", newPayload); err != nil {
+	if err := store2.Put("table", "new-small-500", newPayload); err != nil {
 		t.Fatalf("Put new small payload failed: %v", err)
 	}
 
-	storedNew := getStoredPayload(t, store2, "bucket", "new-small-500")
+	storedNew := getStoredPayload(t, store2, "table", "new-small-500")
 	if storedNew[0] != byte(CodecZstd) {
 		t.Fatalf("expected CodecZstd for new write in reopened store, got %d", storedNew[0])
 	}
 
-	gotNew, exists, err := store2.Get("bucket", "new-small-500")
+	gotNew, exists, err := store2.Get("table", "new-small-500")
 	if err != nil || !exists || !bytes.Equal(gotNew, newPayload) {
 		t.Fatalf("Get new-small-500 failed: exists=%v, err=%v", exists, err)
 	}
