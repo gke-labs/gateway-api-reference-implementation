@@ -117,6 +117,6 @@ curl -v -H "Host: grafana.local" http://<NODE_LAN_IP>/
 | `--mdns-port` | `5353` | UDP port for mDNS responder |
 | `--interface` | `""` | Network interface to read LAN IP(s) from (e.g. `eth0`). If unset, node addresses are used. |
 | `--node-name` | `$NODE_NAME` | Kubernetes node name for resolving fallback LAN addresses |
-| `--metrics-bind-address` | `:8080` | Address for Prometheus metrics |
-| `--health-probe-bind-address` | `:8081` | Address for `/readyz` and `/healthz` health probes |
+| `--metrics-bind-address` | `:8999` | Address for Prometheus metrics |
+| `--health-probe-bind-address` | `:8999` | Address for `/readyz` and `/healthz` health probes |
 | `--leader-elect` | `false` | Enable leader election |

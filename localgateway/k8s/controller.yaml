@@ -75,8 +75,6 @@ spec:
         args:
         - --controller-name=github.com/gke-labs/gateway-api-reference-implementation/localgateway
         - --proxy-bind-address=:80
-        - --metrics-bind-address=:8080
-        - --health-probe-bind-address=:8081
         env:
         - name: NODE_NAME
           valueFrom:
@@ -89,9 +87,7 @@ spec:
           containerPort: 5353
           protocol: UDP
         - name: metrics
-          containerPort: 8080
-        - name: health
-          containerPort: 8081
+          containerPort: 8999
         securityContext:
           # Note: allowPrivilegeEscalation must not be set to false; doing so
           # clears the process's effective capability set and prevents the
@@ -102,12 +98,12 @@ spec:
         readinessProbe:
           httpGet:
             path: /readyz
-            port: 8081
+            port: 8999
           initialDelaySeconds: 1
           periodSeconds: 2
         livenessProbe:
           httpGet:
             path: /healthz
-            port: 8081
+            port: 8999
           initialDelaySeconds: 5
           periodSeconds: 10
