@@ -944,8 +944,9 @@ func TestState_PublishDataplaneConfig_RetryOnFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
+	errCh := make(chan error, 1)
 	go func() {
-		_ = st.Start(ctx)
+		errCh <- st.Start(ctx)
 	}()
 
 	gc := &gatewayv1.GatewayClass{
@@ -983,6 +984,11 @@ func TestState_PublishDataplaneConfig_RetryOnFailure(t *testing.T) {
 	if mockPub.attempts() != 2 {
 		t.Errorf("expected exactly 2 publish attempts (1 initial failure + 1 retry), got %d", mockPub.attempts())
 	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
 }
 
 func TestState_PublishDataplaneConfig_RepeatedFailuresBackoff(t *testing.T) {
@@ -997,8 +1003,9 @@ func TestState_PublishDataplaneConfig_RepeatedFailuresBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
+	errCh := make(chan error, 1)
 	go func() {
-		_ = st.Start(ctx)
+		errCh <- st.Start(ctx)
 	}()
 
 	gc := &gatewayv1.GatewayClass{
@@ -1052,6 +1059,11 @@ func TestState_PublishDataplaneConfig_RepeatedFailuresBackoff(t *testing.T) {
 	if d3 <= d2 {
 		t.Errorf("expected backoff interval d3 (%v) > d2 (%v)", d3, d2)
 	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
 }
 
 func TestState_PublishDataplaneConfig_RetryCancelledOnGatewayDelete(t *testing.T) {
@@ -1066,8 +1078,9 @@ func TestState_PublishDataplaneConfig_RetryCancelledOnGatewayDelete(t *testing.T
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
+	errCh := make(chan error, 1)
 	go func() {
-		_ = st.Start(ctx)
+		errCh <- st.Start(ctx)
 	}()
 
 	gc := &gatewayv1.GatewayClass{
@@ -1106,6 +1119,11 @@ func TestState_PublishDataplaneConfig_RetryCancelledOnGatewayDelete(t *testing.T
 	st.mu.Unlock()
 	if retryCount != 0 {
 		t.Errorf("expected 0 pending retries after Gateway deletion, got %d", retryCount)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
 	}
 }
 

@@ -99,6 +99,9 @@ const (
 	defaultPublishRetryMaxBackoff = 30 * time.Second
 )
 
+// publishRetry tracks the retry state for a failed data-plane config publish.
+// The state retries a failed publish for a Gateway with a backoff that doubles
+// up to the maximum, and a successful publish clears it.
 type publishRetry struct {
 	timer   *time.Timer
 	backoff time.Duration
@@ -143,7 +146,7 @@ type State struct {
 	dataplanePublisher     DataplanePublisher
 	lastWrittenConfigs     map[types.NamespacedName][]byte
 	publishConflicts       map[types.NamespacedName]struct{}
-	publishRetries         map[types.NamespacedName]*publishRetry
+	publishRetries         map[types.NamespacedName]*publishRetry // guarded by mu
 	publishRetryMinBackoff time.Duration
 	publishRetryMaxBackoff time.Duration
 
@@ -553,12 +556,7 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 		if hadConflict {
 			delete(s.publishConflicts, gwKey)
 		}
-		if r, ok := s.publishRetries[gwKey]; ok {
-			if r.timer != nil {
-				r.timer.Stop()
-			}
-			delete(s.publishRetries, gwKey)
-		}
+		s.cancelPublishRetryLocked(gwKey)
 		s.mu.Unlock()
 
 		if hadConflict {
@@ -575,12 +573,9 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 			removedKeys = append(removedKeys, gwKey)
 		}
 	}
-	for gwKey, r := range s.publishRetries {
+	for gwKey := range s.publishRetries {
 		if _, ok := outputs.DataplaneConfigs[gwKey]; !ok {
-			if r.timer != nil {
-				r.timer.Stop()
-			}
-			delete(s.publishRetries, gwKey)
+			s.cancelPublishRetryLocked(gwKey)
 		}
 	}
 	s.mu.Unlock()
@@ -602,6 +597,9 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 	}
 }
 
+// schedulePublishRetry schedules a retry for a failed data-plane config publish.
+// The state retries a failed publish for a Gateway with a backoff that doubles
+// up to the maximum, and a successful publish clears it.
 func (s *State) schedulePublishRetry(gwKey types.NamespacedName) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -610,41 +608,38 @@ func (s *State) schedulePublishRetry(gwKey types.NamespacedName) {
 		return
 	}
 
-	minBackoff := s.publishRetryMinBackoff
-	if minBackoff <= 0 {
-		minBackoff = defaultPublishRetryMinBackoff
-	}
-	maxBackoff := s.publishRetryMaxBackoff
-	if maxBackoff <= 0 {
-		maxBackoff = defaultPublishRetryMaxBackoff
-	}
-
-	backoff := minBackoff
-	if r, ok := s.publishRetries[gwKey]; ok {
-		if r.timer != nil {
-			r.timer.Stop()
+	backoff := s.publishRetryMinBackoff
+	if retry, ok := s.publishRetries[gwKey]; ok {
+		if retry.timer != nil {
+			retry.timer.Stop()
 		}
-		backoff = r.backoff * 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
+		backoff = retry.backoff * 2
+		if backoff > s.publishRetryMaxBackoff {
+			backoff = s.publishRetryMaxBackoff
 		}
 	}
 
-	r := &publishRetry{
+	retry := &publishRetry{
 		backoff: backoff,
 	}
-	r.timer = time.AfterFunc(backoff, func() {
+	retry.timer = time.AfterFunc(backoff, func() {
 		s.TriggerRecompute()
 	})
-	s.publishRetries[gwKey] = r
+	s.publishRetries[gwKey] = retry
+}
+
+func (s *State) cancelPublishRetryLocked(gwKey types.NamespacedName) {
+	if retry, ok := s.publishRetries[gwKey]; ok {
+		if retry.timer != nil {
+			retry.timer.Stop()
+		}
+		delete(s.publishRetries, gwKey)
+	}
 }
 
 func (s *State) stopPublishRetriesLocked() {
-	for gwKey, r := range s.publishRetries {
-		if r.timer != nil {
-			r.timer.Stop()
-		}
-		delete(s.publishRetries, gwKey)
+	for gwKey := range s.publishRetries {
+		s.cancelPublishRetryLocked(gwKey)
 	}
 }
 
