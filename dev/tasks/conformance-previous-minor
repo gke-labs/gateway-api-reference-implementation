@@ -17,7 +17,10 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+# Conformance runs typically take 8m50s-9m50s on CI; 20m provides safe headroom.
+TIMEOUT="20m"
+
 export RUN_E2E=1
 
 echo "Running Gateway API Conformance tests on previous minor CRDs..."
-CONFORMANCE_CRDS="previous-minor" go test -v ./tests/e2e/... -run '^TestConformance$'
+CONFORMANCE_CRDS="previous-minor" go test -v -timeout "${TIMEOUT}" ./tests/e2e/... -run '^TestConformance$'
