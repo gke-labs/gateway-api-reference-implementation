@@ -4788,7 +4788,69 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 		t.Fatalf("expected LB address 1.2.3.4, got %+v", addrs)
 	}
 
-	// 4. If a replica restarts with an old config, prober enqueues Gateway and it stops being ready
+	// 4. A stuck replica that never applies a new revision makes the Gateway not-ready:
+	// Publish a new revision that no replica applies.
+	stuckCfg := &state.DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: "default", Name: "test-gw"},
+		Revision:    "stuck-rev",
+	}
+	if err := p.PublishDataplaneConfig(ctx, gw, stuckCfg); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed: %v", err)
+	}
+
+	// Next probe tick detects readiness changed from true to false and enqueues the Gateway.
+	p.probeEndpoints(ctx)
+	select {
+	case evt := <-p.eventCh:
+		if evt.Object.GetName() != "test-gw" || evt.Object.GetNamespace() != "default" {
+			t.Fatalf("unexpected event object: %+v", evt.Object)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for prober to enqueue Gateway when stuck replica prevents convergence")
+	}
+
+	// Gateway readiness is now Pending.
+	_, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Fatalf("expected readiness.Ready=false while replicas have not applied stuck-rev")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Fatalf("expected reason Pending, got %s", readiness.Reason)
+	}
+
+	// An unchanged tick doesn't enqueue again.
+	p.probeEndpoints(ctx)
+	select {
+	case evt := <-p.eventCh:
+		t.Fatalf("unexpected enqueue on unchanged tick: %+v", evt.Object)
+	default:
+	}
+
+	// 5. If a replica restarts with an old config after having converged, prober enqueues Gateway and it stops being ready
+	r1Stuck := []string{"stuck-rev"}
+	r2Stuck := []string{"stuck-rev"}
+	rev1.Store(&r1Stuck)
+	rev2.Store(&r2Stuck)
+	p.probeEndpoints(ctx)
+
+	// Enqueued on convergence to stuck-rev
+	select {
+	case evt := <-p.eventCh:
+		if evt.Object.GetName() != "test-gw" {
+			t.Fatalf("unexpected event object: %+v", evt.Object)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for prober to enqueue Gateway on convergence to stuck-rev")
+	}
+	_, readiness, _ = p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if !readiness.Ready {
+		t.Fatalf("expected readiness.Ready=true after both replicas converged to stuck-rev")
+	}
+
+	// Now replica 2 regresses to an old config
 	r2Old := []string{"old-rev"}
 	rev2.Store(&r2Old)
 	p.probeEndpoints(ctx)

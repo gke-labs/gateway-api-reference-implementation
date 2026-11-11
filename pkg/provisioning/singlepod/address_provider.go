@@ -1196,6 +1196,21 @@ func readyEndpointAddresses(slices []discoveryv1.EndpointSlice) []string {
 	return readyEndpoints
 }
 
+// allEndpointsAppliedLocked returns true if currentRev is non-empty, endpoints is non-empty,
+// and every endpoint in endpoints has currentRev in its mirrored applied revisions list.
+// Caller must hold endpointMu.
+func (p *AddressProvider) allEndpointsAppliedLocked(currentRev string, endpoints []string) bool {
+	if currentRev == "" || len(endpoints) == 0 {
+		return false
+	}
+	for _, addr := range endpoints {
+		if !slices.Contains(p.appliedRevisions[addr], currentRev) {
+			return false
+		}
+	}
+	return true
+}
+
 func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey types.NamespacedName, name string, addresses []gatewayv1.GatewayStatusAddress) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	currentRev := p.currentRevisionForGateway(gwKey)
 	if currentRev == "" {
@@ -1231,21 +1246,13 @@ func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey t
 	}
 
 	p.endpointMu.Lock()
-	defer p.endpointMu.Unlock()
-	pending := false
-	for _, addr := range readyEndpoints {
-		applied := p.appliedRevisions[addr]
-		if !slices.Contains(applied, currentRev) {
-			pending = true
-			break
-		}
-	}
-
-	if pending {
+	ready := p.allEndpointsAppliedLocked(currentRev, readyEndpoints)
+	if !ready {
 		endpointSummaries := make([]string, 0, len(readyEndpoints))
 		for _, addr := range readyEndpoints {
 			endpointSummaries = append(endpointSummaries, fmt.Sprintf("%s=%v", addr, p.appliedRevisions[addr]))
 		}
+		p.endpointMu.Unlock()
 		klog.V(2).Infof("Gateway %s readiness is Pending: expected revision %s, endpoints: [%s]",
 			gwKey, currentRev, strings.Join(endpointSummaries, ", "))
 		p.revMu.Lock()
@@ -1257,6 +1264,7 @@ func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey t
 			Message: "Waiting for data-plane replicas to apply current configuration",
 		}, nil
 	}
+	p.endpointMu.Unlock()
 
 	p.revMu.Lock()
 	p.gatewayReady[gwKey] = true
@@ -1321,7 +1329,7 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 
 	var svcList corev1.ServiceList
 	if err := p.client.List(ctx, &svcList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
-		klog.V(2).Infof("error listing provisioned Services for probing: %v", err)
+		klog.Warningf("error listing provisioned Services for probing: %v", err)
 		return
 	}
 
@@ -1413,17 +1421,7 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 	// when its readiness would change in either direction.
 	for gwKey, endpoints := range gatewayEndpoints {
 		currentRev := p.currentRevisionForGateway(gwKey)
-		expectedReady := false
-		if currentRev != "" && len(endpoints) > 0 {
-			allMatch := true
-			for _, addr := range endpoints {
-				if !slices.Contains(p.appliedRevisions[addr], currentRev) {
-					allMatch = false
-					break
-				}
-			}
-			expectedReady = allMatch
-		}
+		expectedReady := p.allEndpointsAppliedLocked(currentRev, endpoints)
 
 		p.revMu.Lock()
 		lastReady, known := p.gatewayReady[gwKey]
