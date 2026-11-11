@@ -467,7 +467,7 @@ Recompute Latency Comparison:
    - **Background:** Previously, the engine compressed values only if they exceeded `DefaultCompressionThreshold` (4000 bytes, matching the 1-block slotted page capacity). However, most Kubernetes objects in informer caches are smaller than 4000 bytes once `managedFields` are stripped. Removing the threshold and passing every value through the configured codec (`zstd`) unifies the write path. Values whose compressed form is not at least about 10% smaller than the raw payload (`compressedLen * 10 <= rawLen * 9`) are stored raw with `CodecNone`, protecting incompressible or tiny inputs from expanding.
    - **Evaluation Environment:**
      - Machine: AMD EPYC 9B14 (60 vCPUs), Linux 6.6 amd64
-     - Go Version: go1.27.3 linux/amd64
+     - Go Version: go1.27.4 linux/amd64
      - Corpus: 10,000 objects built from real Kubernetes objects: Gateway API conformance manifests (Gateways, HTTPRoutes with status, Services, Policies), EndpointSlices with 12 endpoints, Secrets with real x509 certificate chains, random base64 Secrets, and ConfigMaps (average 1,911 B per object, 18.22 MB raw JSON).
 
    - **Isolated Compression CPU Cost (`compressValue` Benchmark):**
