@@ -2129,26 +2129,26 @@ type routeBindingConfig struct {
 	onBind               func(el *EffectiveListener, routeHostnames []RouteHostname)
 }
 
-func bindParentRef(
-	cfg routeBindingConfig,
+// matchAllowedListeners returns the listeners matching the parentRef that permit route attachment.
+func matchAllowedListeners(
 	parentRef gatewayv1.ParentReference,
+	routeNs string,
+	generation int64,
 	cm *CompiledModel,
 	namespaces map[string]*corev1.Namespace,
-	boundListenersForRoute map[*EffectiveListener]bool,
-) metav1.Condition {
-	if cfg.validationCond != nil && cfg.validationCond.Status == metav1.ConditionFalse {
-		return *cfg.validationCond
-	}
-
+	isProtocolCompatible func(el *EffectiveListener) bool,
+	isKindAllowed func(group *gatewayv1.Group, kind gatewayv1.Kind) bool,
+) ([]*EffectiveListener, bool, *metav1.Condition) {
 	group := ValueOf(parentRef.Group)
 	if group != "" && group != gatewayv1.GroupName {
-		return NewCondition(
+		cond := NewCondition(
 			string(gatewayv1.RouteConditionAccepted),
 			metav1.ConditionFalse,
 			string(gatewayv1.RouteReasonNoMatchingParent),
 			fmt.Sprintf("Unsupported parent group: %s", group),
-			cfg.generation,
+			generation,
 		)
+		return nil, false, &cond
 	}
 
 	kind := ValueOf(parentRef.Kind)
@@ -2156,16 +2156,17 @@ func bindParentRef(
 		kind = "Gateway"
 	}
 	if kind != "Gateway" && kind != "ListenerSet" {
-		return NewCondition(
+		cond := NewCondition(
 			string(gatewayv1.RouteConditionAccepted),
 			metav1.ConditionFalse,
 			string(gatewayv1.RouteReasonNoMatchingParent),
 			fmt.Sprintf("Unsupported parent kind: %s", kind),
-			cfg.generation,
+			generation,
 		)
+		return nil, false, &cond
 	}
 
-	targetNamespace := cfg.namespace
+	targetNamespace := routeNs
 	if parentNamespace := ValueOf(parentRef.Namespace); parentNamespace != "" {
 		targetNamespace = string(parentNamespace)
 	}
@@ -2176,13 +2177,14 @@ func bindParentRef(
 	if kind == "Gateway" {
 		cg := cm.Gateways[types.NamespacedName{Namespace: targetNamespace, Name: targetName}]
 		if cg == nil {
-			return NewCondition(
+			cond := NewCondition(
 				string(gatewayv1.RouteConditionAccepted),
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonNoMatchingParent),
 				"Gateway not found",
-				cfg.generation,
+				generation,
 			)
+			return nil, false, &cond
 		}
 		for _, el := range cg.EffectiveListeners {
 			if el.Owner.Kind == "Gateway" && el.IsAccepted() {
@@ -2192,13 +2194,14 @@ func bindParentRef(
 	} else if kind == "ListenerSet" {
 		targetLS := cm.ListenerSets[types.NamespacedName{Namespace: targetNamespace, Name: targetName}]
 		if targetLS == nil {
-			return NewCondition(
+			cond := NewCondition(
 				string(gatewayv1.RouteConditionAccepted),
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonNoMatchingParent),
 				"ListenerSet not found",
-				cfg.generation,
+				generation,
 			)
+			return nil, false, &cond
 		}
 
 		gwNs := targetLS.Namespace
@@ -2207,13 +2210,14 @@ func bindParentRef(
 		}
 		cg := cm.Gateways[types.NamespacedName{Namespace: gwNs, Name: string(targetLS.Spec.ParentRef.Name)}]
 		if cg == nil || !IsListenerSetAllowed(targetLS, cg.Gateway, namespaces) {
-			return NewCondition(
+			cond := NewCondition(
 				string(gatewayv1.RouteConditionAccepted),
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonNoMatchingParent),
 				"Parent ListenerSet is not accepted by Gateway",
-				cfg.generation,
+				generation,
 			)
+			return nil, false, &cond
 		}
 
 		for _, el := range cg.EffectiveListeners {
@@ -2224,8 +2228,7 @@ func bindParentRef(
 	}
 
 	hasMatchingListener := false
-	hasAllowedListener := false
-	hasMatchingHostname := false
+	var allowedListeners []*EffectiveListener
 
 	for _, el := range candidateListeners {
 		if sectionName := ValueOf(parentRef.SectionName); sectionName != "" && sectionName != el.Name {
@@ -2237,7 +2240,7 @@ func bindParentRef(
 		hasMatchingListener = true
 
 		// Check protocol compatibility
-		if !cfg.isProtocolCompatible(el) {
+		if !isProtocolCompatible(el) {
 			continue
 		}
 
@@ -2245,7 +2248,7 @@ func bindParentRef(
 		if el.AllowedRoutes != nil && len(el.AllowedRoutes.Kinds) > 0 {
 			kindAllowed := false
 			for _, k := range el.AllowedRoutes.Kinds {
-				if cfg.isKindAllowed(k.Group, k.Kind) {
+				if isKindAllowed(k.Group, k.Kind) {
 					kindAllowed = true
 					break
 				}
@@ -2259,7 +2262,7 @@ func bindParentRef(
 		if el.AllowedRoutes != nil && el.AllowedRoutes.Namespaces != nil && el.AllowedRoutes.Namespaces.From != nil {
 			switch *el.AllowedRoutes.Namespaces.From {
 			case gatewayv1.NamespacesFromSame:
-				if cfg.namespace != el.Owner.Namespace {
+				if routeNs != el.Owner.Namespace {
 					continue
 				}
 			case gatewayv1.NamespacesFromAll:
@@ -2272,26 +2275,58 @@ func bindParentRef(
 					}
 					var nsObj *corev1.Namespace
 					if namespaces != nil {
-						nsObj = namespaces[cfg.namespace]
+						nsObj = namespaces[routeNs]
 					}
 					if nsObj != nil {
 						if !sel.Matches(labels.Set(nsObj.Labels)) {
 							continue
 						}
-					} else if cfg.namespace != el.Owner.Namespace && namespaces != nil {
+					} else if routeNs != el.Owner.Namespace && namespaces != nil {
 						continue
 					}
 				}
 			}
 		} else {
 			// Default is Same namespace
-			if cfg.namespace != el.Owner.Namespace {
+			if routeNs != el.Owner.Namespace {
 				continue
 			}
 		}
 
-		hasAllowedListener = true
+		allowedListeners = append(allowedListeners, el)
+	}
 
+	return allowedListeners, hasMatchingListener, nil
+}
+
+func bindParentRef(
+	cfg routeBindingConfig,
+	parentRef gatewayv1.ParentReference,
+	cm *CompiledModel,
+	namespaces map[string]*corev1.Namespace,
+	boundListenersForRoute map[*EffectiveListener]bool,
+) metav1.Condition {
+	if cfg.validationCond != nil && cfg.validationCond.Status == metav1.ConditionFalse {
+		return *cfg.validationCond
+	}
+
+	allowedListeners, hasMatchingListener, errorCondition := matchAllowedListeners(
+		parentRef,
+		cfg.namespace,
+		cfg.generation,
+		cm,
+		namespaces,
+		cfg.isProtocolCompatible,
+		cfg.isKindAllowed,
+	)
+	if errorCondition != nil {
+		return *errorCondition
+	}
+
+	hasAllowedListener := len(allowedListeners) > 0
+	hasMatchingHostname := false
+
+	for _, el := range allowedListeners {
 		routeHostnames := IntersectRouteHostnames(cfg.hostnames, string(ValueOf(el.Hostname)))
 		if len(routeHostnames) > 0 || len(cfg.hostnames) == 0 {
 			hasMatchingHostname = true
