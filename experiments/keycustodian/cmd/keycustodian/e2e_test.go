@@ -26,6 +26,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -69,6 +70,40 @@ func createTestKey(dir, name string) error {
 	return os.WriteFile(filepath.Join(dir, name+".crt"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0644)
 }
 
+func createSocketDir(t *testing.T) string {
+	t.Helper()
+	socketDir, err := os.MkdirTemp("", "kc")
+	if err != nil {
+		t.Fatalf("failed to create temporary socket directory: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(socketDir)
+	})
+	return socketDir
+}
+
+func copyBinary(t *testing.T, src, dst string) {
+	t.Helper()
+	in, err := os.Open(src)
+	if err != nil {
+		t.Fatalf("failed to open source binary: %v", err)
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		t.Fatalf("failed to create destination binary: %v", err)
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		t.Fatalf("failed to copy binary: %v", err)
+	}
+	if err := os.Chmod(dst, 0755); err != nil {
+		t.Fatalf("failed to chmod destination binary: %v", err)
+	}
+}
+
 func startDaemon(t *testing.T, bin, keysDir, sockPath string, args ...string) {
 	t.Helper()
 	cmd := exec.Command(bin, append([]string{"--socket=" + sockPath, "--keys-dir=" + keysDir}, args...)...)
@@ -94,9 +129,9 @@ func startDaemon(t *testing.T, bin, keysDir, sockPath string, args ...string) {
 	}
 }
 
-func runClient(t *testing.T, sock string, expectDenied bool, uid uint32) {
+func runClient(t *testing.T, bin, sock string, expectDenied bool, uid uint32) {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$", "--")
+	cmd := exec.Command(bin, "-test.run=^TestHelperProcess$", "--")
 	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "KC_SOCK="+sock)
 	if expectDenied {
 		cmd.Env = append(cmd.Env, "KC_DENIED=1")
@@ -106,13 +141,6 @@ func runClient(t *testing.T, sock string, expectDenied bool, uid uint32) {
 			t.Skip("skipping denied caller test: running client as a different UID requires root or user namespace")
 		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: uid}}
-		for p := filepath.Dir(os.Args[0]); p != "/" && p != "."; p = filepath.Dir(p) {
-			_ = os.Chmod(p, 0755)
-		}
-		for p := filepath.Dir(sock); p != "/" && p != "."; p = filepath.Dir(p) {
-			_ = os.Chmod(p, 0755)
-		}
-		_ = os.Chmod(sock, 0666)
 	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -193,7 +221,7 @@ func TestDaemonE2E(t *testing.T) {
 	}
 
 	t.Run("RefusesEmptyAllowLists", func(t *testing.T) {
-		cmd := exec.Command(bin, "--socket="+filepath.Join(t.TempDir(), "s.sock"), "--keys-dir="+t.TempDir())
+		cmd := exec.Command(bin, "--socket="+filepath.Join(createSocketDir(t), "s.sock"), "--keys-dir="+t.TempDir())
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			t.Fatal("expected daemon startup to fail with empty allow lists")
@@ -208,26 +236,41 @@ func TestDaemonE2E(t *testing.T) {
 		t.Fatalf("createTestKey failed: %v", err)
 	}
 
-	sockPath := filepath.Join(t.TempDir(), "kc.sock")
+	sockPath := filepath.Join(createSocketDir(t), "kc.sock")
 	startDaemon(t, bin, keysDir, sockPath, "--allowed-uids="+fmt.Sprint(os.Getuid()))
 
 	t.Run("AllowedCaller", func(t *testing.T) {
-		runClient(t, sockPath, false, 0)
+		runClient(t, os.Args[0], sockPath, false, 0)
 	})
 
 	t.Run("AllowedGIDCaller", func(t *testing.T) {
-		gidSock := filepath.Join(t.TempDir(), "gid.sock")
+		gidSock := filepath.Join(createSocketDir(t), "gid.sock")
 		startDaemon(t, bin, keysDir, gidSock, "--allowed-gids="+fmt.Sprint(os.Getgid()))
-		runClient(t, gidSock, false, 0)
+		runClient(t, os.Args[0], gidSock, false, 0)
 	})
 
 	t.Run("DeniedCaller_DifferentUID", func(t *testing.T) {
-		runClient(t, sockPath, true, 65534)
+		if os.Geteuid() != 0 {
+			t.Skip("skipping denied caller test: running client as a different UID requires root or user namespace")
+		}
+		diffDir := createSocketDir(t)
+		if err := os.Chmod(diffDir, 0755); err != nil {
+			t.Fatalf("failed to chmod temp directory: %v", err)
+		}
+		clientBin := filepath.Join(diffDir, "client.test")
+		copyBinary(t, os.Args[0], clientBin)
+
+		diffSock := filepath.Join(diffDir, "diff.sock")
+		startDaemon(t, bin, keysDir, diffSock, "--allowed-uids="+fmt.Sprint(os.Getuid()))
+		if err := os.Chmod(diffSock, 0666); err != nil {
+			t.Fatalf("failed to chmod socket: %v", err)
+		}
+		runClient(t, clientBin, diffSock, true, 65534)
 	})
 
 	t.Run("DeniedCaller_DisallowedUID", func(t *testing.T) {
-		disallowedSock := filepath.Join(t.TempDir(), "disallowed.sock")
+		disallowedSock := filepath.Join(createSocketDir(t), "disallowed.sock")
 		startDaemon(t, bin, keysDir, disallowedSock, "--allowed-uids="+fmt.Sprint(os.Getuid()+9999))
-		runClient(t, disallowedSock, true, 0)
+		runClient(t, os.Args[0], disallowedSock, true, 0)
 	})
 }
