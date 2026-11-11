@@ -17,6 +17,7 @@ package state
 import (
 	"math/rand/v2"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1736,6 +1737,232 @@ func TestTLSRoute_BackendTLSPolicy(t *testing.T) {
 				}
 			} else if b.Error == nil || b.Error.HTTPStatusCode != 500 {
 				t.Fatalf("expected Error with status 500, got %v", b.Error)
+			}
+		})
+	}
+}
+
+func setupTLSRouteTieTest(listenerHostname string) *State {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+	st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	})
+	var hPtr *gatewayv1.Hostname
+	if listenerHostname != "" {
+		hPtr = Ptr(gatewayv1.Hostname(listenerHostname))
+	}
+	st.UpsertGateway(&gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gateway-tls", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{{
+				Name:     "tls-passthrough",
+				Port:     443,
+				Protocol: gatewayv1.TLSProtocolType,
+				Hostname: hPtr,
+				TLS:      &gatewayv1.ListenerTLSConfig{Mode: Ptr(gatewayv1.TLSModePassthrough)},
+				AllowedRoutes: &gatewayv1.AllowedRoutes{
+					Namespaces: &gatewayv1.RouteNamespaces{From: Ptr(gatewayv1.NamespacesFromAll)},
+				},
+			}},
+		},
+	})
+	for _, ns := range []string{"ns1", "ns2", "ns-a", "ns-b"} {
+		st.UpsertService(&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "backend", Namespace: ns},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8443}}},
+		})
+	}
+	return st
+}
+
+func testTLSRoute(name, ns string, createdAt time.Time, hostnames ...string) *gatewayv1.TLSRoute {
+	port := gatewayv1.PortNumber(8443)
+	var gh []gatewayv1.Hostname
+	for _, h := range hostnames {
+		if h != "" {
+			gh = append(gh, gatewayv1.Hostname(h))
+		}
+	}
+	return &gatewayv1.TLSRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         ns,
+			CreationTimestamp: metav1.NewTime(createdAt),
+		},
+		Spec: gatewayv1.TLSRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Namespace: Ptr(gatewayv1.Namespace("default")), Name: "gateway-tls"}},
+			},
+			Hostnames: gh,
+			Rules: []gatewayv1.TLSRouteRule{{
+				BackendRefs: []gatewayv1.BackendRef{{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port}}},
+			}},
+		},
+	}
+}
+
+func TestTLSRoute_IdenticalHostnameTiePrecedence(t *testing.T) {
+	now := time.Now()
+	tOlder := now.Add(-10 * time.Minute)
+	tNewer := now.Add(-5 * time.Minute)
+
+	tests := []struct {
+		name             string
+		listenerHostname string
+		effectiveHost    string
+		route1           *gatewayv1.TLSRoute
+		route2           *gatewayv1.TLSRoute
+		wantWinner       types.NamespacedName
+		wantLoser        types.NamespacedName
+		wantBackend      string
+		wantBackends     map[string]string
+		wantAttached     int32
+		testRecompute    bool
+	}{
+		{
+			name:          "older-wins",
+			effectiveHost: "foo.example.com",
+			route1:        testTLSRoute("route-older", "ns1", tOlder, "foo.example.com"),
+			route2:        testTLSRoute("route-newer", "ns2", tNewer, "foo.example.com"),
+			wantWinner:    types.NamespacedName{Namespace: "ns1", Name: "route-older"},
+			wantLoser:     types.NamespacedName{Namespace: "ns2", Name: "route-newer"},
+			wantBackend:   "backend.ns1.svc.cluster.local:8443",
+		},
+		{
+			name:          "equal timestamps",
+			effectiveHost: "foo.example.com",
+			route1:        testTLSRoute("route", "ns-b", tOlder, "foo.example.com"),
+			route2:        testTLSRoute("route", "ns-a", tOlder, "foo.example.com"),
+			wantWinner:    types.NamespacedName{Namespace: "ns-a", Name: "route"},
+			wantLoser:     types.NamespacedName{Namespace: "ns-b", Name: "route"},
+			wantBackend:   "backend.ns-a.svc.cluster.local:8443",
+		},
+		{
+			name:          "delete-older-then-newer-binds",
+			effectiveHost: "foo.example.com",
+			route1:        testTLSRoute("route-older", "ns1", tOlder, "foo.example.com"),
+			route2:        testTLSRoute("route-newer", "ns2", tNewer, "foo.example.com"),
+			wantWinner:    types.NamespacedName{Namespace: "ns1", Name: "route-older"},
+			wantLoser:     types.NamespacedName{Namespace: "ns2", Name: "route-newer"},
+			wantBackend:   "backend.ns1.svc.cluster.local:8443",
+			testRecompute: true,
+		},
+		{
+			name:          "two-hostname-less-routes",
+			effectiveHost: "*",
+			route1:        testTLSRoute("route-older", "ns1", tOlder),
+			route2:        testTLSRoute("route-newer", "ns2", tNewer),
+			wantWinner:    types.NamespacedName{Namespace: "ns1", Name: "route-older"},
+			wantLoser:     types.NamespacedName{Namespace: "ns2", Name: "route-newer"},
+			wantBackend:   "backend.ns1.svc.cluster.local:8443",
+		},
+		{
+			name:             "exact-beats-wildcard",
+			listenerHostname: "a.example.com",
+			effectiveHost:    "a.example.com",
+			route1:           testTLSRoute("route-older-wc", "ns1", tOlder, "*.example.com"),
+			route2:           testTLSRoute("route-newer-exact", "ns2", tNewer, "a.example.com"),
+			wantWinner:       types.NamespacedName{Namespace: "ns2", Name: "route-newer-exact"},
+			wantLoser:        types.NamespacedName{Namespace: "ns1", Name: "route-older-wc"},
+			wantBackend:      "backend.ns2.svc.cluster.local:8443",
+		},
+		{
+			name:             "older-wins-despite-newer-having-unrelated-long-hostname",
+			listenerHostname: "a.example.com",
+			effectiveHost:    "a.example.com",
+			route1:           testTLSRoute("route-older", "ns1", tOlder, "a.example.com"),
+			route2:           testTLSRoute("route-newer", "ns2", tNewer, "a.example.com", "aaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.org"),
+			wantWinner:       types.NamespacedName{Namespace: "ns1", Name: "route-older"},
+			wantLoser:        types.NamespacedName{Namespace: "ns2", Name: "route-newer"},
+			wantBackend:      "backend.ns1.svc.cluster.local:8443",
+		},
+		{
+			name:             "split-hostname-ownership",
+			listenerHostname: "*.example.com",
+			route1:           testTLSRoute("route-a", "ns1", tNewer, "*.example.com", "x.example.com"),
+			route2:           testTLSRoute("route-b", "ns2", tOlder, "*.com", "x.example.com"),
+			wantBackends: map[string]string{
+				"*.example.com": "backend.ns1.svc.cluster.local:8443",
+				"x.example.com": "backend.ns2.svc.cluster.local:8443",
+			},
+			wantAttached: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := setupTLSRouteTieTest(tc.listenerHostname)
+			st.UpsertTLSRoute(tc.route1)
+			st.UpsertTLSRoute(tc.route2)
+			st.Recompute()
+
+			lis := st.GetEffectiveListeners(types.NamespacedName{Namespace: "default", Name: "gateway-tls"})
+			if len(lis) != 1 {
+				t.Fatalf("expected 1 listener, got %d", len(lis))
+			}
+
+			if tc.wantBackends != nil {
+				if lis[0].AttachedRoutes != tc.wantAttached {
+					t.Errorf("expected %d attached routes, got %d", tc.wantAttached, lis[0].AttachedRoutes)
+				}
+				for host, wantTarget := range tc.wantBackends {
+					backends := lis[0].TLSBackends[host]
+					if len(backends) != 1 || backends[0].Target != wantTarget {
+						t.Errorf("expected 1 backend for %q with target %q, got %v", host, wantTarget, backends)
+					}
+				}
+				for _, rKey := range []types.NamespacedName{
+					{Namespace: tc.route1.Namespace, Name: tc.route1.Name},
+					{Namespace: tc.route2.Namespace, Name: tc.route2.Name},
+				} {
+					status, _ := st.GetDesiredTLSRouteStatus(rKey)
+					cond := FindCondition(status.Parents[0].Conditions, string(gatewayv1.RouteConditionAccepted))
+					if cond == nil || cond.Status != metav1.ConditionTrue {
+						t.Errorf("expected route %s to be accepted: %+v", rKey, cond)
+					}
+				}
+				return
+			}
+
+			if len(lis[0].TLSBackends[tc.effectiveHost]) != 1 {
+				t.Fatalf("expected 1 backend for %q, got %v", tc.effectiveHost, lis[0].TLSBackends)
+			}
+			if got := lis[0].TLSBackends[tc.effectiveHost][0].Target; got != tc.wantBackend {
+				t.Errorf("got backend %q, want %q", got, tc.wantBackend)
+			}
+			if lis[0].AttachedRoutes != 1 {
+				t.Errorf("expected 1 attached route, got %d", lis[0].AttachedRoutes)
+			}
+
+			wStatus, _ := st.GetDesiredTLSRouteStatus(tc.wantWinner)
+			wCond := FindCondition(wStatus.Parents[0].Conditions, string(gatewayv1.RouteConditionAccepted))
+			if wCond == nil || wCond.Status != metav1.ConditionTrue {
+				t.Errorf("winner not accepted: %+v", wCond)
+			}
+
+			lStatus, _ := st.GetDesiredTLSRouteStatus(tc.wantLoser)
+			lCond := FindCondition(lStatus.Parents[0].Conditions, string(gatewayv1.RouteConditionAccepted))
+			if lCond == nil || lCond.Status != metav1.ConditionFalse || lCond.Reason != string(RouteReasonAnotherRouteHoldsHostname) {
+				t.Errorf("loser not rejected with AnotherRouteHoldsHostname: %+v", lCond)
+			}
+
+			if tc.testRecompute {
+				st.DeleteTLSRoute(tc.wantWinner)
+				st.Recompute()
+
+				lis = st.GetEffectiveListeners(types.NamespacedName{Namespace: "default", Name: "gateway-tls"})
+				wantRecompute := "backend.ns2.svc.cluster.local:8443"
+				if len(lis[0].TLSBackends[tc.effectiveHost]) != 1 || lis[0].TLSBackends[tc.effectiveHost][0].Target != wantRecompute {
+					t.Fatalf("expected newer backend after delete, got %v", lis[0].TLSBackends)
+				}
+				rStatus, _ := st.GetDesiredTLSRouteStatus(tc.wantLoser)
+				rCond := FindCondition(rStatus.Parents[0].Conditions, string(gatewayv1.RouteConditionAccepted))
+				if rCond == nil || rCond.Status != metav1.ConditionTrue {
+					t.Errorf("newer route not accepted after delete: %+v", rCond)
+				}
 			}
 		})
 	}

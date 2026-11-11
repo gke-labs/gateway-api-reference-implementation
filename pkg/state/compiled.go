@@ -38,6 +38,11 @@ import (
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 )
 
+const (
+	// RouteReasonAnotherRouteHoldsHostname is used when a TLSRoute cannot bind because another route holds the hostname.
+	RouteReasonAnotherRouteHoldsHostname gatewayv1.RouteConditionReason = "AnotherRouteHoldsHostname"
+)
+
 var (
 	sourceErrorLogMu   sync.Mutex
 	lastSourceErrorLog = make(map[string]time.Time)
@@ -327,25 +332,26 @@ func ListenerEntryToSpec(l gatewayv1.ListenerEntry) ListenerSpec {
 // EffectiveListener represents a single compiled listener on a Gateway,
 // originating either directly from the Gateway spec or attached via an allowed ListenerSet.
 type EffectiveListener struct {
-	Owner            ListenerOwner
-	ParentGateway    types.NamespacedName
-	Name             gatewayv1.SectionName
-	Port             gatewayv1.PortNumber
-	Protocol         gatewayv1.ProtocolType
-	Hostname         *gatewayv1.Hostname
-	TLS              *gatewayv1.ListenerTLSConfig
-	AllowedRoutes    *gatewayv1.AllowedRoutes
-	SupportedKinds   []gatewayv1.RouteGroupKind
-	Conditions       []metav1.Condition
-	AttachedRoutes   int32
-	Routes           []InternalRoute
-	TLSBackends      map[string][]InternalTLSBackend
-	BoundTCPRoute    *types.NamespacedName
-	TCPBackends      []InternalTCPBackend
-	BoundUDPRoute    *types.NamespacedName
-	UDPBackends      []InternalUDPBackend
-	ClientValidation *InternalClientValidation
-	Generation       int64
+	Owner             ListenerOwner
+	ParentGateway     types.NamespacedName
+	Name              gatewayv1.SectionName
+	Port              gatewayv1.PortNumber
+	Protocol          gatewayv1.ProtocolType
+	Hostname          *gatewayv1.Hostname
+	TLS               *gatewayv1.ListenerTLSConfig
+	AllowedRoutes     *gatewayv1.AllowedRoutes
+	SupportedKinds    []gatewayv1.RouteGroupKind
+	Conditions        []metav1.Condition
+	AttachedRoutes    int32
+	Routes            []InternalRoute
+	TLSBackends       map[string][]InternalTLSBackend
+	TLSHostnameOwners map[string]types.NamespacedName
+	BoundTCPRoute     *types.NamespacedName
+	TCPBackends       []InternalTCPBackend
+	BoundUDPRoute     *types.NamespacedName
+	UDPBackends       []InternalUDPBackend
+	ClientValidation  *InternalClientValidation
+	Generation        int64
 
 	ResolvedCertificates []*tls.Certificate
 	ResolvedCertificate  *tls.Certificate
@@ -1654,6 +1660,128 @@ type portHostnameKey struct {
 	hostname string
 }
 
+// tlsHostnameClaim records a TLSRoute's claim on an effective listener hostname.
+type tlsHostnameClaim struct {
+	routeKey          types.NamespacedName
+	originalHostname  string
+	creationTimestamp metav1.Time
+}
+
+// hostnameSpecificity returns whether a hostname pattern is exact and its match length.
+func hostnameSpecificity(h string) (isExact bool, length int) {
+	if h == "" || h == "*" {
+		return false, 0
+	}
+	if strings.HasPrefix(h, "*.") {
+		return false, len(h)
+	}
+	return true, len(h)
+}
+
+// isBetterClaim reports whether the candidate claim has higher precedence than the current best claim.
+func isBetterClaim(candidate, best tlsHostnameClaim) bool {
+	candidateIsExact, candidateLen := hostnameSpecificity(candidate.originalHostname)
+	bestIsExact, bestLen := hostnameSpecificity(best.originalHostname)
+
+	// 1. Exact before wildcard
+	if candidateIsExact != bestIsExact {
+		return candidateIsExact
+	}
+
+	// 2. Longer wildcard (or exact) before shorter
+	if candidateLen != bestLen {
+		return candidateLen > bestLen
+	}
+
+	// 3. Oldest route by CreationTimestamp
+	if !candidate.creationTimestamp.Equal(&best.creationTimestamp) {
+		return candidate.creationTimestamp.Before(&best.creationTimestamp)
+	}
+
+	// 4. Alphabetically by namespace, then name
+	if candidate.routeKey.Namespace != best.routeKey.Namespace {
+		return candidate.routeKey.Namespace < best.routeKey.Namespace
+	}
+	return candidate.routeKey.Name < best.routeKey.Name
+}
+
+// isTLSRouteCompatible reports whether an effective listener supports TLSRoute binding.
+func isTLSRouteCompatible(el *EffectiveListener) bool {
+	if el.Protocol != gatewayv1.TLSProtocolType || el.TLS == nil {
+		return false
+	}
+	if el.TLS.Mode == nil {
+		return true
+	}
+	return *el.TLS.Mode == gatewayv1.TLSModePassthrough || *el.TLS.Mode == gatewayv1.TLSModeTerminate
+}
+
+// resolveTLSRouteHostnameClaims resolves hostname ownership across all candidate TLSRoutes.
+//
+// Invariant: each effective hostname on a listener has exactly one owning TLSRoute.
+// Precedence order:
+// 1. More specific route hostname first (exact match, then the longer wildcard).
+// 2. Oldest route by CreationTimestamp.
+// 3. Alphabetically by namespace, then name.
+//
+// This runs before binding because one route can win one hostname and lose another on the same listener.
+func resolveTLSRouteHostnameClaims(
+	routes []*gatewayv1.TLSRoute,
+	cm *CompiledModel,
+	namespaces map[string]*corev1.Namespace,
+) {
+	bestClaims := make(map[*EffectiveListener]map[string]tlsHostnameClaim)
+
+	for _, route := range routes {
+		if route == nil {
+			continue
+		}
+		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+		var hostnames []string
+		for _, h := range route.Spec.Hostnames {
+			hostnames = append(hostnames, string(h))
+		}
+
+		for _, parentRef := range route.Spec.ParentRefs {
+			allowedListeners, _, _ := matchAllowedListeners(
+				parentRef,
+				route.Namespace,
+				route.Generation,
+				cm,
+				namespaces,
+				isTLSRouteCompatible,
+				IsTLSRoute,
+			)
+
+			for _, el := range allowedListeners {
+				routeHostnames := IntersectRouteHostnames(hostnames, string(ValueOf(el.Hostname)))
+				for _, rh := range routeHostnames {
+					effectiveHostname := rh.Hostname
+					claim := tlsHostnameClaim{
+						routeKey:          routeKey,
+						originalHostname:  rh.OriginalHostname,
+						creationTimestamp: route.CreationTimestamp,
+					}
+
+					elClaims := bestClaims[el]
+					if elClaims == nil {
+						elClaims = make(map[string]tlsHostnameClaim)
+						bestClaims[el] = elClaims
+					}
+
+					if existing, exists := elClaims[effectiveHostname]; !exists || isBetterClaim(claim, existing) {
+						elClaims[effectiveHostname] = claim
+						if el.TLSHostnameOwners == nil {
+							el.TLSHostnameOwners = make(map[string]types.NamespacedName)
+						}
+						el.TLSHostnameOwners[effectiveHostname] = routeKey
+					}
+				}
+			}
+		}
+	}
+}
+
 // CompileModel compiles the effective listeners, route bindings, and statuses across all Gateways and ListenerSets.
 func CompileModel(inputs ModelInputs) *CompiledModel {
 	refValidator := inputs.RefValidator
@@ -1991,6 +2119,8 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 	}
 
 	// 3. Compile TLSRoutes and perform route binding
+	resolveTLSRouteHostnameClaims(inputs.TLSRoutes, cm, inputs.Namespaces)
+
 	for _, route := range inputs.TLSRoutes {
 		if route == nil {
 			continue
@@ -2120,13 +2250,14 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 }
 
 type routeBindingConfig struct {
-	namespace            string
-	generation           int64
-	hostnames            []string
-	validationCond       *metav1.Condition
-	isProtocolCompatible func(el *EffectiveListener) bool
-	isKindAllowed        func(group *gatewayv1.Group, kind gatewayv1.Kind) bool
-	onBind               func(el *EffectiveListener, routeHostnames []RouteHostname)
+	namespace             string
+	generation            int64
+	hostnames             []string
+	validationCond        *metav1.Condition
+	isProtocolCompatible  func(el *EffectiveListener) bool
+	isKindAllowed         func(group *gatewayv1.Group, kind gatewayv1.Kind) bool
+	checkHostnameConflict func(el *EffectiveListener, routeHostnames []RouteHostname) ([]RouteHostname, *metav1.Condition)
+	onBind                func(el *EffectiveListener, routeHostnames []RouteHostname)
 }
 
 // matchAllowedListeners returns the listeners matching the parentRef that permit route attachment.
@@ -2325,10 +2456,22 @@ func bindParentRef(
 
 	hasAllowedListener := len(allowedListeners) > 0
 	hasMatchingHostname := false
+	var conflictCond *metav1.Condition
 
 	for _, el := range allowedListeners {
 		routeHostnames := IntersectRouteHostnames(cfg.hostnames, string(ValueOf(el.Hostname)))
-		if len(routeHostnames) > 0 || len(cfg.hostnames) == 0 {
+		if len(routeHostnames) == 0 && len(cfg.hostnames) > 0 {
+			continue
+		}
+
+		if cfg.checkHostnameConflict != nil {
+			var cond *metav1.Condition
+			routeHostnames, cond = cfg.checkHostnameConflict(el, routeHostnames)
+			if cond != nil && conflictCond == nil {
+				conflictCond = cond
+			}
+		}
+		if len(routeHostnames) > 0 {
 			hasMatchingHostname = true
 
 			if !boundListenersForRoute[el] {
@@ -2349,6 +2492,9 @@ func bindParentRef(
 			"Route accepted by reference implementation",
 			cfg.generation,
 		)
+	}
+	if conflictCond != nil {
+		return *conflictCond
 	}
 	if hasAllowedListener {
 		return NewCondition(
@@ -2426,32 +2572,46 @@ func bindTLSRouteParentRef(
 	if rs.Internal != nil {
 		valCond = &rs.Internal.ValidationCondition
 	}
+	routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 	return bindParentRef(
 		routeBindingConfig{
-			namespace:      route.Namespace,
-			generation:     route.Generation,
-			hostnames:      rs.GetHostnames(),
-			validationCond: valCond,
-			isProtocolCompatible: func(el *EffectiveListener) bool {
-				if el.Protocol != gatewayv1.TLSProtocolType || el.TLS == nil {
-					return false
+			namespace:            route.Namespace,
+			generation:           route.Generation,
+			hostnames:            rs.GetHostnames(),
+			validationCond:       valCond,
+			isProtocolCompatible: isTLSRouteCompatible,
+			isKindAllowed:        IsTLSRoute,
+			checkHostnameConflict: func(el *EffectiveListener, routeHostnames []RouteHostname) ([]RouteHostname, *metav1.Condition) {
+				var available []RouteHostname
+				for _, rh := range routeHostnames {
+					effectiveHostname := rh.Hostname
+					if el.TLSHostnameOwners != nil && el.TLSHostnameOwners[effectiveHostname] != routeKey {
+						continue
+					}
+					available = append(available, rh)
 				}
-				if el.TLS.Mode == nil {
-					return true
+				if len(available) == 0 && len(routeHostnames) > 0 {
+					cond := NewCondition(
+						string(gatewayv1.RouteConditionAccepted),
+						metav1.ConditionFalse,
+						string(RouteReasonAnotherRouteHoldsHostname),
+						"Another route holds the hostname",
+						route.Generation,
+					)
+					return nil, &cond
 				}
-				return *el.TLS.Mode == gatewayv1.TLSModePassthrough || *el.TLS.Mode == gatewayv1.TLSModeTerminate
+				return available, nil
 			},
-			isKindAllowed: IsTLSRoute,
 			onBind: func(el *EffectiveListener, routeHostnames []RouteHostname) {
 				if el.TLSBackends == nil {
 					el.TLSBackends = make(map[string][]InternalTLSBackend)
 				}
 				for _, rh := range routeHostnames {
-					eh := rh.Hostname
+					effectiveHostname := rh.Hostname
 					if rs.Internal != nil {
 						for _, rule := range rs.Internal.Rules {
 							if len(rule.Backends) > 0 {
-								el.TLSBackends[eh] = append(el.TLSBackends[eh], rule.Backends...)
+								el.TLSBackends[effectiveHostname] = append(el.TLSBackends[effectiveHostname], rule.Backends...)
 							}
 						}
 					}
