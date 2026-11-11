@@ -145,15 +145,25 @@ func (p *SlottedPage) setFreeEnd(off uint16) {
 	binary.BigEndian.PutUint16(p.buf[BlockHeaderSize+4:BlockHeaderSize+6], off)
 }
 
-func (p *SlottedPage) slot(idx uint16) (offset uint16, length uint16) {
+const (
+	// SlotFlagOversize is bit 15 of the slot offset, indicating an oversize pointer record.
+	SlotFlagOversize uint16 = 0x8000
+)
+
+func (p *SlottedPage) slot(idx uint16) (offset uint16, length uint16, isOversize bool) {
 	pos := BlockHeaderSize + SlottedPageMetaSize + int(idx)*SlotEntrySize
-	offset = binary.BigEndian.Uint16(p.buf[pos : pos+2])
+	rawOff := binary.BigEndian.Uint16(p.buf[pos : pos+2])
+	offset = rawOff &^ SlotFlagOversize
+	isOversize = (rawOff & SlotFlagOversize) != 0
 	length = binary.BigEndian.Uint16(p.buf[pos+2 : pos+4])
-	return offset, length
+	return offset, length, isOversize
 }
 
-func (p *SlottedPage) setSlot(idx uint16, offset, length uint16) {
+func (p *SlottedPage) setSlot(idx uint16, offset, length uint16, isOversize bool) {
 	pos := BlockHeaderSize + SlottedPageMetaSize + int(idx)*SlotEntrySize
+	if isOversize {
+		offset |= SlotFlagOversize
+	}
 	binary.BigEndian.PutUint16(p.buf[pos:pos+2], offset)
 	binary.BigEndian.PutUint16(p.buf[pos+2:pos+4], length)
 }
@@ -168,7 +178,7 @@ func (p *SlottedPage) ActiveSlotsCount() int {
 	var count int
 	n := p.numSlots()
 	for i := uint16(0); i < n; i++ {
-		_, l := p.slot(i)
+		_, l, _ := p.slot(i)
 		if l > 0 {
 			count++
 		}
@@ -180,6 +190,11 @@ func (p *SlottedPage) ActiveSlotsCount() int {
 // if a tombstone slot exists, it reuses it; otherwise it appends a new slot.
 // If space is fragmented, it compacts the page internally.
 func (p *SlottedPage) Put(key string, payload []byte, lsn uint64) (uint32, error) {
+	return p.PutWithFlag(key, payload, lsn, false)
+}
+
+// PutWithFlag inserts or updates a record with an explicit oversize flag.
+func (p *SlottedPage) PutWithFlag(key string, payload []byte, lsn uint64, isOversize bool) (uint32, error) {
 	keyBytes := []byte(key)
 	if len(keyBytes) > 65535 {
 		return 0, ErrPageFull
@@ -191,7 +206,7 @@ func (p *SlottedPage) Put(key string, payload []byte, lsn uint64) (uint32, error
 	// Check if we can reuse an existing deleted (tombstone) slot
 	slotIdx := uint16(0xffff)
 	for i := uint16(0); i < numSlots; i++ {
-		off, l := p.slot(i)
+		off, l, _ := p.slot(i)
 		if off == 0 && l == 0 {
 			slotIdx = i
 			break
@@ -237,7 +252,7 @@ func (p *SlottedPage) Put(key string, payload []byte, lsn uint64) (uint32, error
 		p.setFreeStart(p.freeStart() + SlotEntrySize)
 	}
 
-	p.setSlot(slotIdx, newFreeEnd, uint16(recLen))
+	p.setSlot(slotIdx, newFreeEnd, uint16(recLen), isOversize)
 
 	// Update page LSN
 	binary.BigEndian.PutUint64(p.buf[BlockLSNOffset:BlockLSNOffset+8], lsn)
@@ -247,28 +262,34 @@ func (p *SlottedPage) Put(key string, payload []byte, lsn uint64) (uint32, error
 
 // Get retrieves a record by slot index.
 func (p *SlottedPage) Get(slotIdx uint32) (key string, payload []byte, lsn uint64, err error) {
+	key, payload, lsn, _, err = p.GetWithFlag(slotIdx)
+	return key, payload, lsn, err
+}
+
+// GetWithFlag retrieves a record by slot index along with its oversize flag.
+func (p *SlottedPage) GetWithFlag(slotIdx uint32) (key string, payload []byte, lsn uint64, isOversize bool, err error) {
 	if slotIdx >= uint32(p.numSlots()) {
-		return "", nil, 0, ErrSlotNotFound
+		return "", nil, 0, false, ErrSlotNotFound
 	}
-	off, l := p.slot(uint16(slotIdx))
+	off, l, isOversize := p.slot(uint16(slotIdx))
 	if off == 0 || l == 0 || int(off)+int(l) > len(p.buf) {
-		return "", nil, 0, ErrSlotNotFound
+		return "", nil, 0, false, ErrSlotNotFound
 	}
 
 	recBytes := p.buf[off : off+l]
 	if len(recBytes) < 14 {
-		return "", nil, 0, ErrSlotNotFound
+		return "", nil, 0, false, ErrSlotNotFound
 	}
 	keyLen := binary.BigEndian.Uint16(recBytes[0:2])
 	payloadLen := binary.BigEndian.Uint32(recBytes[2:6])
 	lsn = binary.BigEndian.Uint64(recBytes[6:14])
 	if 14+int(keyLen)+int(payloadLen) > len(recBytes) {
-		return "", nil, 0, ErrSlotNotFound
+		return "", nil, 0, false, ErrSlotNotFound
 	}
 	key = string(recBytes[14 : 14+keyLen])
 	payload = recBytes[14+keyLen : 14+int(keyLen)+int(payloadLen)]
 
-	return key, payload, lsn, nil
+	return key, payload, lsn, isOversize, nil
 }
 
 // Delete marks a slot as tombstone (offset=0, length=0).
@@ -277,7 +298,7 @@ func (p *SlottedPage) Delete(slotIdx uint32, lsn uint64) error {
 	if slotIdx >= uint32(p.numSlots()) {
 		return ErrSlotNotFound
 	}
-	p.setSlot(uint16(slotIdx), 0, 0)
+	p.setSlot(uint16(slotIdx), 0, 0, false)
 	binary.BigEndian.PutUint64(p.buf[BlockLSNOffset:BlockLSNOffset+8], lsn)
 	return nil
 }
@@ -294,7 +315,7 @@ func (p *SlottedPage) Compact() {
 
 	newFreeEnd := int(BlockSize)
 	for i := uint16(0); i < numSlots; i++ {
-		off, l := p.slot(i)
+		off, l, isOversize := p.slot(i)
 		if off == 0 || l == 0 {
 			continue // tombstone
 		}
@@ -308,7 +329,11 @@ func (p *SlottedPage) Compact() {
 
 		// Update slot offset in temp
 		pos := BlockHeaderSize + SlottedPageMetaSize + int(i)*SlotEntrySize
-		binary.BigEndian.PutUint16(temp[pos:pos+2], uint16(newFreeEnd))
+		offVal := uint16(newFreeEnd)
+		if isOversize {
+			offVal |= SlotFlagOversize
+		}
+		binary.BigEndian.PutUint16(temp[pos:pos+2], offVal)
 		binary.BigEndian.PutUint16(temp[pos+2:pos+4], l)
 	}
 

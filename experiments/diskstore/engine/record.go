@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -37,7 +38,59 @@ const (
 	RecordTypePut        RecordType = 1
 	RecordTypeDelete     RecordType = 2
 	RecordTypeCheckpoint RecordType = 3
+	RecordTypePutPointer RecordType = 4
 )
+
+const (
+	// OversizePointerMagic identifies an oversize pointer record stored in a slotted page or WAL.
+	OversizePointerMagic uint32 = 0x4F565350
+)
+
+// IsOversizePointer reports whether the payload is an oversize pointer record.
+func IsOversizePointer(data []byte) bool {
+	return len(data) >= 44 && binary.BigEndian.Uint32(data[0:4]) == OversizePointerMagic
+}
+
+// OversizeHash returns the SHA-256 hash of key combined with payload.
+func OversizeHash(key string, payload []byte) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(key))
+	h.Write(payload)
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
+}
+
+// OversizeFileName returns the hex-encoded SHA-256 hash of key and payload with .obj suffix.
+func OversizeFileName(key string, payload []byte) string {
+	sum := OversizeHash(key, payload)
+	return fmt.Sprintf("%x.obj", sum)
+}
+
+// EncodeOversizePointer serializes an oversize value pointer record payload:
+// magic (4 bytes) + length (8 bytes) + checksum (32 bytes) + fileName.
+func EncodeOversizePointer(length uint64, checksum [32]byte, fileName string) []byte {
+	buf := make([]byte, 44+len(fileName))
+	binary.BigEndian.PutUint32(buf[0:4], OversizePointerMagic)
+	binary.BigEndian.PutUint64(buf[4:12], length)
+	copy(buf[12:44], checksum[:])
+	copy(buf[44:], fileName)
+	return buf
+}
+
+// DecodeOversizePointer deserializes an oversize value pointer record payload.
+func DecodeOversizePointer(data []byte) (length uint64, checksum [32]byte, fileName string, err error) {
+	if !IsOversizePointer(data) {
+		return 0, [32]byte{}, "", errors.New("invalid oversize pointer payload")
+	}
+	length = binary.BigEndian.Uint64(data[4:12])
+	copy(checksum[:], data[12:44])
+	fileName = string(data[44:])
+	if len(fileName) == 0 {
+		return 0, [32]byte{}, "", errors.New("empty oversize file name")
+	}
+	return length, checksum, fileName, nil
+}
 
 const (
 	// RecordMagic identifies valid log records ('R').

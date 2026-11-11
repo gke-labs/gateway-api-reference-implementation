@@ -15,12 +15,9 @@
 package engine
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -28,11 +25,12 @@ import (
 
 // KeyIndexEntry maps an object key to its location in a logical page.
 type KeyIndexEntry struct {
-	LogicalPage uint64
-	Slot        uint32
-	LSN         uint64
-	NumBlocks   int
-	IsOversize  bool
+	LogicalPage      uint64
+	Slot             uint32
+	LSN              uint64
+	NumBlocks        int
+	IsOversize       bool
+	OversizeFileName string
 }
 
 // RecoveryResult contains the state reconstructed after a crash scan and log replay.
@@ -283,7 +281,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 				emptyPages = append(emptyPages, logicalPage)
 			} else {
 				for s := uint32(0); s < uint32(slotted.NumSlots()); s++ {
-					k, _, recLSN, err := slotted.Get(s)
+					k, val, recLSN, isOversize, err := slotted.GetWithFlag(s)
 					if err != nil {
 						if errors.Is(err, ErrSlotNotFound) {
 							continue
@@ -292,12 +290,21 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 					}
 					existing, exists := keyIndex[k]
 					if !exists || recLSN > existing.LSN {
-						keyIndex[k] = KeyIndexEntry{
+						entry := KeyIndexEntry{
 							LogicalPage: logicalPage,
 							Slot:        s,
 							LSN:         recLSN,
 							NumBlocks:   1,
+							IsOversize:  isOversize,
 						}
+						if isOversize {
+							_, _, fileName, decodeErr := DecodeOversizePointer(val)
+							if decodeErr != nil {
+								return nil, fmt.Errorf("failed to decode oversize pointer in page %d slot %d: %w", logicalPage, s, decodeErr)
+							}
+							entry.OversizeFileName = fileName
+						}
+						keyIndex[k] = entry
 					}
 				}
 			}
@@ -415,63 +422,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		return nil
 	}
 
-	// Both removeOversizeFileForRedo and removeOversizeFileIfOlder must sync oversizeDir
-	// after removing an oversize file so the directory entry deletion is durable and the
-	// unlinked file cannot reappear after a subsequent crash.
-	removeOversizeFileOnDisk := func(oversizePath, oversizeDir string) error {
-		if removeErr := fs.Remove(oversizePath); removeErr != nil {
-			if errors.Is(removeErr, os.ErrNotExist) {
-				return nil
-			}
-			return fmt.Errorf("failed to remove oversize file %s during redo: %w", oversizePath, removeErr)
-		}
-		if syncErr := fs.SyncDir(oversizeDir); syncErr != nil {
-			return fmt.Errorf("failed to sync oversize dir: %w", syncErr)
-		}
-		return nil
-	}
-
-	removeOversizeFileForRedo := func(qKey string) error {
-		oversizeDir := filepath.Join(storeDir, "oversize")
-		return removeOversizeFileOnDisk(filepath.Join(oversizeDir, oversizeFileName(qKey)), oversizeDir)
-	}
-
-	removeOversizeFileIfOlder := func(qKey string, recordLSN uint64) error {
-		oversizeDir := filepath.Join(storeDir, "oversize")
-		oversizePath := filepath.Join(oversizeDir, oversizeFileName(qKey))
-		file, openErr := fs.OpenFile(oversizePath, os.O_RDONLY, StoreFileMode)
-		if openErr != nil {
-			if errors.Is(openErr, os.ErrNotExist) {
-				return nil
-			}
-			return fmt.Errorf("failed to open oversize file %s during redo: %w", oversizePath, openErr)
-		}
-		header := make([]byte, OversizeHeaderSize)
-		_, readErr := file.ReadAt(header, 0)
-		if closeErr := file.Close(); closeErr != nil {
-			return fmt.Errorf("failed to close oversize file %s: %w", oversizePath, closeErr)
-		}
-		if readErr != nil {
-			slog.Warn("diskstore: cannot read header of oversize file during redo; leaving in place", "path", oversizePath, "reason", readErr)
-			return nil
-		}
-		magic := binary.BigEndian.Uint32(header[0:4])
-		version := binary.BigEndian.Uint32(header[4:8])
-		if magic != OversizeMagic || version != OversizeVersion {
-			slog.Warn("diskstore: corrupt oversize file header during redo; leaving in place", "path", oversizePath, "reason", "invalid magic or version")
-			return nil
-		}
-		fileLSN := binary.BigEndian.Uint64(header[8:16])
-		if fileLSN < recordLSN {
-			return removeOversizeFileOnDisk(oversizePath, oversizeDir)
-		}
-		return nil
-	}
-
 	cleanOldLocationForRedo := func(entry KeyIndexEntry, qKey string, lsn uint64) error {
-		if entry.IsOversize {
-			return removeOversizeFileForRedo(qKey)
-		}
 		if entry.NumBlocks == 1 {
 			return deleteSlotForRedo(entry.LogicalPage, entry.Slot, lsn)
 		}
@@ -492,56 +443,31 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 				maxWAL_LSN = rec.LSN
 			}
 
-			// Apply Put
-			if rec.Type == RecordTypePut {
+			// Apply Put or PutPointer
+			if rec.Type == RecordTypePut || rec.Type == RecordTypePutPointer {
 				existing, inIndex := keyIndex[rec.Key]
 				if inIndex {
-					if existing.IsOversize {
-						if existing.LSN >= rec.LSN {
-							continue // Oversize object already reflects this or newer write
-						}
-					} else {
-						desc, inPages := pageDescs[existing.LogicalPage]
-						if inPages && desc != nil && desc.PageLSN.Load() >= rec.LSN {
-							continue // Target page already reflects this or newer write
-						}
+					desc, inPages := pageDescs[existing.LogicalPage]
+					if inPages && desc != nil && desc.PageLSN.Load() >= rec.LSN {
+						continue // Target page already reflects this or newer write
 					}
 				}
 
-				if !fitsInMultiBlockPage(len(rec.Key), len(rec.Payload)) {
-					// Oversize object: lives in oversize directory, not heap blocks
-					if inIndex && !existing.IsOversize {
-						if err := cleanOldLocationForRedo(existing, rec.Key, rec.LSN); err != nil {
-							return nil, err
-						}
+				isPointer := rec.Type == RecordTypePutPointer
+				var oversizeFileName string
+				if isPointer {
+					_, _, fName, decodeErr := DecodeOversizePointer(rec.Payload)
+					if decodeErr != nil {
+						return nil, fmt.Errorf("%w: failed to decode oversize pointer: %v", ErrCorruptStore, decodeErr)
 					}
-					keyIndex[rec.Key] = KeyIndexEntry{
-						LogicalPage: 0,
-						Slot:        0,
-						LSN:         rec.LSN,
-						IsOversize:  true,
-					}
-					if err := writeOversizeFileWithTemp(fs, storeDir, rec.Key, rec.LSN, rec.Payload); err != nil {
-						return nil, fmt.Errorf("failed to recreate oversize file during redo: %w", err)
-					}
-					continue
-				}
-
-				if inIndex && existing.IsOversize {
-					if err := removeOversizeFileForRedo(rec.Key); err != nil {
-						return nil, err
-					}
-				} else {
-					if err := removeOversizeFileIfOlder(rec.Key, rec.LSN); err != nil {
-						return nil, err
-					}
+					oversizeFileName = fName
 				}
 
 				// Apply mutation to page buffer
 				if CanFitInSlottedPage(len(rec.Key), len(rec.Payload)) {
 					// 1-block slotted page
 					var targetPage uint64
-					if inIndex && !existing.IsOversize && pageDescs[existing.LogicalPage] != nil && pageDescs[existing.LogicalPage].NumBlocks == 1 {
+					if inIndex && pageDescs[existing.LogicalPage] != nil && pageDescs[existing.LogicalPage].NumBlocks == 1 {
 						targetPage = existing.LogicalPage
 					} else if p, ok := emptyTracker.Pop(); ok {
 						targetPage = p
@@ -572,15 +498,15 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 					if wrapErr != nil {
 						return nil, fmt.Errorf("failed to wrap page for redo: %w", wrapErr)
 					}
-					if inIndex && !existing.IsOversize && targetPage == existing.LogicalPage {
+					if inIndex && targetPage == existing.LogicalPage && existing.NumBlocks == 1 {
 						if delErr := slotted.Delete(existing.Slot, rec.LSN); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
 							return nil, fmt.Errorf("failed to delete slot for redo: %w", delErr)
 						}
 					}
-					slotIdx, err := slotted.Put(rec.Key, rec.Payload, rec.LSN)
+					slotIdx, err := slotted.PutWithFlag(rec.Key, rec.Payload, rec.LSN, isPointer)
 					if err != nil {
 						// Page full during redo: if old record was on targetPage, finalize old page
-						if inIndex && !existing.IsOversize && targetPage == existing.LogicalPage {
+						if inIndex && targetPage == existing.LogicalPage && existing.NumBlocks == 1 {
 							slotted.Finalize()
 							redoPages[targetPage] = pageBuf
 							delete(redoMBPages, targetPage)
@@ -606,7 +532,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 						if wrapErr != nil {
 							return nil, fmt.Errorf("failed to wrap new page for redo: %w", wrapErr)
 						}
-						slotIdx, err = slotted.Put(rec.Key, rec.Payload, rec.LSN)
+						slotIdx, err = slotted.PutWithFlag(rec.Key, rec.Payload, rec.LSN, isPointer)
 						if err != nil {
 							return nil, fmt.Errorf("failed to put record into new page during redo: %w", err)
 						}
@@ -617,17 +543,19 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 					delete(redoMBPages, targetPage)
 					dirtyLogicalPages[targetPage] = true
 
-					if inIndex && !existing.IsOversize && targetPage != existing.LogicalPage {
+					if inIndex && (targetPage != existing.LogicalPage || existing.NumBlocks > 1) {
 						if err := cleanOldLocationForRedo(existing, rec.Key, rec.LSN); err != nil {
 							return nil, err
 						}
 					}
 
 					keyIndex[rec.Key] = KeyIndexEntry{
-						LogicalPage: targetPage,
-						Slot:        slotIdx,
-						LSN:         rec.LSN,
-						NumBlocks:   1,
+						LogicalPage:      targetPage,
+						Slot:             slotIdx,
+						LSN:              rec.LSN,
+						NumBlocks:        1,
+						IsOversize:       isPointer,
+						OversizeFileName: oversizeFileName,
 					}
 					if desc, ok := pageDescs[targetPage]; ok {
 						desc.PageLSN.Store(rec.LSN)
@@ -702,9 +630,6 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 						return nil, err
 					}
 					delete(keyIndex, rec.Key)
-				}
-				if err := removeOversizeFileIfOlder(rec.Key, rec.LSN); err != nil {
-					return nil, err
 				}
 			}
 		}

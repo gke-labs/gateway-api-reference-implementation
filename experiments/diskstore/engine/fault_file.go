@@ -289,6 +289,9 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 
 	if beforeWriteAt != nil {
 		beforeWriteAt(f.name, p, off)
+		f.fs.mu.RLock()
+		writeErr = f.fs.writeErr
+		f.fs.mu.RUnlock()
 	}
 
 	if writeErr != nil {
@@ -370,6 +373,9 @@ func (f *FaultFile) Sync() error {
 
 	if beforeSync != nil {
 		beforeSync(f.name)
+		f.fs.mu.RLock()
+		syncErr = f.fs.syncErr
+		f.fs.mu.RUnlock()
 	}
 
 	if syncErr != nil {

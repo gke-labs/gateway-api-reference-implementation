@@ -953,7 +953,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 				if !newEntry.IsOversize {
 					t.Fatalf("expected oversize object")
 				}
-				if !store.emptyPages.Contains(oldEntry.LogicalPage) {
+				if oldEntry.LogicalPage != newEntry.LogicalPage && !store.emptyPages.Contains(oldEntry.LogicalPage) {
 					t.Fatalf("expected old slotted page %d to be in emptyPages", oldEntry.LogicalPage)
 				}
 			},
@@ -988,7 +988,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 					t.Fatalf("expected slotted object, got isOversize=%v, numBlocks=%d", newEntry.IsOversize, newEntry.NumBlocks)
 				}
 				// Verify oversize file was removed
-				p := store.oversizeFilePath(qualifyKey(table, key))
+				p := store.oversizeFilePath(oldEntry.OversizeFileName)
 				if f, err := store.fs.Open(p); err == nil {
 					_ = f.Close()
 					t.Fatalf("expected oversize file %s to be removed, but still exists", p)
@@ -1010,7 +1010,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 					t.Fatalf("expected multi-block object, got isOversize=%v, numBlocks=%d", newEntry.IsOversize, newEntry.NumBlocks)
 				}
 				// Verify oversize file was removed
-				p := store.oversizeFilePath(qualifyKey(table, key))
+				p := store.oversizeFilePath(oldEntry.OversizeFileName)
 				if f, err := store.fs.Open(p); err == nil {
 					_ = f.Close()
 					t.Fatalf("expected oversize file %s to be removed, but still exists", p)
@@ -1379,7 +1379,7 @@ func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 
 // TestGet_MissingOversizeObjectReturnsNotFound verifies that a missing oversize object
 // returns exists=false and does not cause a fatal corruption error.
-func TestGet_MissingOversizeObjectReturnsNotFound(t *testing.T) {
+func TestGet_MissingOversizeObjectReturnsCorruptionError(t *testing.T) {
 	memFS := NewMemFS()
 	store, err := Open(WithFS(memFS), WithDir("missing_oversize_test"), WithCreate())
 	if err != nil {
@@ -1395,22 +1395,21 @@ func TestGet_MissingOversizeObjectReturnsNotFound(t *testing.T) {
 		t.Fatalf("Put failed: %v", err)
 	}
 
-	// Remove from in-memory oversizeObjects map while leaving keyIndex entry
+	// Remove from in-memory oversizeObjects map and disk while leaving keyIndex entry
 	qKey := qualifyKey(table, key)
 	store.keyMu.Lock()
 	delete(store.oversizeObjects, qKey)
+	p := store.oversizeFilePath(store.keyIndex[qKey].OversizeFileName)
 	store.keyMu.Unlock()
+	_ = store.fs.Remove(p)
 
-	// Get should return not found (exists=false, err=nil) without failing the engine
-	val, exists, err := store.Get(table, key)
-	if err != nil {
-		t.Fatalf("expected nil error on missing oversize object, got: %v", err)
+	// Get must return ErrCorruptStore on missing oversize file
+	_, _, err = store.Get(table, key)
+	if err == nil {
+		t.Fatalf("expected ErrCorruptStore on missing oversize file, got nil")
 	}
-	if exists || val != nil {
-		t.Fatalf("expected exists=false, got exists=%v val=%v", exists, val)
-	}
-	if store.isFailed() {
-		t.Fatalf("engine unexpectedly transitioned to failed state")
+	if !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("expected ErrCorruptStore on missing oversize file, got: %v", err)
 	}
 }
 
@@ -1494,7 +1493,7 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 
 	t.Run("FailureMarker", func(t *testing.T) {
 		testWipe(t, func(dir string) {
-			if err := os.WriteFile(filepath.Join(dir, "FAILED"), []byte("simulated-failure"), 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, "FAILED"), []byte("simulated-failure"), StoreFileMode); err != nil {
 				t.Fatalf("failed to write FAILED marker: %v", err)
 			}
 		})
@@ -1505,7 +1504,7 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 			buffer := encodeMetaRecord(metaRecord{
 				version: StoreFormatVersion + 99,
 			})
-			if err := os.WriteFile(filepath.Join(dir, "meta.db"), buffer, 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, "meta.db"), buffer, StoreFileMode); err != nil {
 				t.Fatalf("failed to write incompatible version: %v", err)
 			}
 		})
@@ -1723,7 +1722,7 @@ func TestOpen_EraseOnErrorOption(t *testing.T) {
 		{
 			name: "FailureMarker",
 			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
-				mf, err := fs.OpenFile(filepath.Join(dir, "FAILED"), os.O_CREATE|os.O_WRONLY, 0644)
+				mf, err := fs.OpenFile(filepath.Join(dir, "FAILED"), os.O_CREATE|os.O_WRONLY, StoreFileMode)
 				if err != nil {
 					t.Fatalf("create FAILED marker failed: %v", err)
 				}
@@ -1748,7 +1747,7 @@ func TestOpen_EraseOnErrorOption(t *testing.T) {
 			name: "CorruptMeta",
 			damage: func(t *testing.T, fs *readErrorHookFS, dir string) {
 				metaPath := filepath.Join(dir, "meta.db")
-				mf, err := fs.OpenFile(metaPath, os.O_RDWR, 0644)
+				mf, err := fs.OpenFile(metaPath, os.O_RDWR, StoreFileMode)
 				if err != nil {
 					t.Fatalf("open meta.db failed: %v", err)
 				}
@@ -1847,7 +1846,7 @@ func (h *renameHookFS) Rename(oldpath, newpath string) error {
 	return h.FS.Rename(oldpath, newpath)
 }
 
-func TestRegression_OversizeWriteAheadRule(t *testing.T) {
+func TestRegression_OversizeValueFileFirst(t *testing.T) {
 	memFS := NewMemFS()
 	renamed := false
 	var store *Engine
@@ -1860,11 +1859,12 @@ func TestRegression_OversizeWriteAheadRule(t *testing.T) {
 	hookedFS := &renameHookFS{
 		FS: memFS,
 		beforeRename: func(oldpath, newpath string) {
-			if store != nil && newpath == store.oversizeFilePath(qualifyKey(table, key)) {
+			if strings.HasSuffix(newpath, ".obj") && strings.Contains(newpath, "oversize") {
 				renamed = true
-				if store.wal.FsyncedLSN() < store.wal.MaxLSN() {
-					t.Fatalf("write-ahead rule violation: oversize file renamed before WAL fsynced (fsynced=%d, max=%d)",
-						store.wal.FsyncedLSN(), store.wal.MaxLSN())
+				// Value file first: file must be renamed BEFORE the pointer record is appended to WAL
+				if store.wal != nil && store.wal.MaxLSN() > 0 {
+					t.Fatalf("value file first violation: oversize file renamed after WAL record was appended (max=%d)",
+						store.wal.MaxLSN())
 				}
 			}
 		},
@@ -1887,6 +1887,12 @@ func TestRegression_OversizeWriteAheadRule(t *testing.T) {
 	}
 	if !renamed {
 		t.Fatalf("expected oversize file to be renamed")
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if store.wal.FsyncedLSN() < store.wal.MaxLSN() {
+		t.Fatalf("expected WAL to be durable after Sync")
 	}
 }
 
@@ -2008,27 +2014,6 @@ func TestStore_FileAndDirectoryPermissions(t *testing.T) {
 	walDir := filepath.Join(storeDir, "wal")
 	oversizeDir := filepath.Join(storeDir, "oversize")
 
-	// Create an uncommitted oversize file past WAL max LSN to trigger lost+found creation
-	uncommittedQKey := qualifyKey("Secrets", "future-secret")
-	uncommittedFile := filepath.Join(oversizeDir, oversizeFileName(uncommittedQKey))
-	uncommittedPayload := append([]byte("uncommitted-future-data"), make([]byte, 2100*1024)...)
-	uncommittedPayload[0] = byte(CodecNone)
-	encoded := encodeOversizeFile(uncommittedQKey, 999999, uncommittedPayload)
-	if err := os.WriteFile(uncommittedFile, encoded, StoreFileMode); err != nil {
-		t.Fatalf("WriteFile uncommitted oversize failed: %v", err)
-	}
-
-	// Reopen to quarantine the uncommitted file to lost+found
-	store2, err := Open(WithDir(storeDir), WithCompressionCodec(CodecNone))
-	if err != nil {
-		t.Fatalf("Reopen failed: %v", err)
-	}
-	if err := store2.Close(); err != nil {
-		t.Fatalf("Close store2 failed: %v", err)
-	}
-
-	lostDir := filepath.Join(oversizeDir, "lost+found")
-
 	checkPerm := func(p string, want os.FileMode, isDir bool) {
 		t.Helper()
 		info, err := os.Stat(p)
@@ -2047,7 +2032,6 @@ func TestStore_FileAndDirectoryPermissions(t *testing.T) {
 	checkPerm(storeDir, StoreDirMode, true)
 	checkPerm(walDir, StoreDirMode, true)
 	checkPerm(oversizeDir, StoreDirMode, true)
-	checkPerm(lostDir, StoreDirMode, true)
 
 	// Check store files (0600)
 	checkPerm(filepath.Join(storeDir, "meta.db"), StoreFileMode, false)
@@ -2083,18 +2067,6 @@ func TestStore_FileAndDirectoryPermissions(t *testing.T) {
 	}
 	if !foundOversize {
 		t.Fatalf("no oversize file found in %s", oversizeDir)
-	}
-
-	// Check quarantined file in lost+found (0600)
-	lostEntries, err := os.ReadDir(lostDir)
-	if err != nil {
-		t.Fatalf("ReadDir lost+found failed: %v", err)
-	}
-	if len(lostEntries) == 0 {
-		t.Fatalf("no quarantined file found in %s", lostDir)
-	}
-	for _, e := range lostEntries {
-		checkPerm(filepath.Join(lostDir, e.Name()), StoreFileMode, false)
 	}
 }
 
