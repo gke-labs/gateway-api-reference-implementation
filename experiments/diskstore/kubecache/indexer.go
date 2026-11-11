@@ -29,9 +29,9 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// reservedResourceVersionWatch is the reserved watch name used to persist
+// reservedResourceVersionTable is the reserved table name used to persist
 // the last synced resourceVersion for each watch.
-const reservedResourceVersionWatch = "//resourceVersions"
+const reservedResourceVersionTable = "//resourceVersions"
 
 // lazyResourceVersionSyncInterval is the maximum frequency at which watch
 // resourceVersions are lazily persisted to the reserved table.
@@ -45,10 +45,10 @@ func DefaultOnFatal(err error) {
 
 // IndexerOptions configures an Indexer instance.
 type IndexerOptions struct {
-	BucketName string
-	KeyFunc    toolscache.KeyFunc
-	Indexers   toolscache.Indexers
-	Codec      ObjectCodec
+	WatchName string
+	KeyFunc   toolscache.KeyFunc
+	Indexers  toolscache.Indexers
+	Codec     ObjectCodec
 }
 
 // IndexerOption is a functional option for configuring an Indexer.
@@ -57,10 +57,10 @@ type IndexerOption func(*IndexerOptions)
 // Option is an alias for IndexerOption.
 type Option = IndexerOption
 
-// WithBucketName sets the storage bucket name.
-func WithBucketName(name string) IndexerOption {
+// WithWatchName sets the storage watch name.
+func WithWatchName(name string) IndexerOption {
 	return func(o *IndexerOptions) {
-		o.BucketName = name
+		o.WatchName = name
 	}
 }
 
@@ -86,10 +86,11 @@ func WithIndexerCodec(codec ObjectCodec) IndexerOption {
 }
 
 // Indexer implements k8s.io/client-go/tools/cache.Indexer backed by a core database Engine.
+// Each watch is stored in one engine table named after the watch.
 // It implements a fail-fast error policy via an OnFatal callback.
 type Indexer struct {
 	eng        *engine.Engine
-	bucketName string
+	watchName  string
 	example    k8sruntime.Object
 	keyFunc    toolscache.KeyFunc
 	codec      ObjectCodec
@@ -135,22 +136,22 @@ func New(eng *engine.Engine, example k8sruntime.Object, onFatal func(error), opt
 	}
 
 	options := IndexerOptions{
-		BucketName: fmt.Sprintf("%T", example),
-		KeyFunc:    toolscache.MetaNamespaceKeyFunc,
-		Indexers:   make(toolscache.Indexers),
-		Codec:      NewHybridCodec(),
+		WatchName: fmt.Sprintf("%T", example),
+		KeyFunc:   toolscache.MetaNamespaceKeyFunc,
+		Indexers:  make(toolscache.Indexers),
+		Codec:     NewHybridCodec(),
 	}
 	for _, opt := range opts {
 		opt(&options)
 	}
 
-	if options.BucketName == reservedResourceVersionWatch {
-		return nil, fmt.Errorf("bucket name %q is reserved", reservedResourceVersionWatch)
+	if options.WatchName == reservedResourceVersionTable {
+		return nil, fmt.Errorf("watch name %q is reserved", reservedResourceVersionTable)
 	}
 
 	d := &Indexer{
 		eng:        eng,
-		bucketName: options.BucketName,
+		watchName:  options.WatchName,
 		example:    example,
 		keyFunc:    options.KeyFunc,
 		codec:      options.Codec,
@@ -172,7 +173,7 @@ func New(eng *engine.Engine, example k8sruntime.Object, onFatal func(error), opt
 		return nil, err
 	}
 
-	payload, exists, err := eng.Get(reservedResourceVersionWatch, d.bucketName)
+	payload, exists, err := eng.Get(reservedResourceVersionTable, d.watchName)
 	if err != nil {
 		d.fatal(err)
 		return nil, fmt.Errorf("failed to read watch resourceVersion: %w", err)
@@ -213,7 +214,7 @@ func New(eng *engine.Engine, example k8sruntime.Object, onFatal func(error), opt
 	}()
 
 	// Rebuild secondary indexes by scanning existing data in engine
-	scanErr := d.eng.Scan(d.bucketName, func(key string, payload []byte) error {
+	scanErr := d.eng.Scan(d.watchName, func(key string, payload []byte) error {
 		target := d.example.DeepCopyObject()
 		if err := d.codec.Decode(payload, target); err != nil {
 			return fmt.Errorf("failed to decode object %s on reopen: %w", key, err)
@@ -290,7 +291,7 @@ func (d *Indexer) persistResourceVersion(rv string) error {
 	d.persistMu.Lock()
 	defer d.persistMu.Unlock()
 
-	if err := d.eng.Put(reservedResourceVersionWatch, d.bucketName, []byte(rv)); err != nil {
+	if err := d.eng.Put(reservedResourceVersionTable, d.watchName, []byte(rv)); err != nil {
 		return err
 	}
 	d.rvMu.Lock()
@@ -372,7 +373,7 @@ func (d *Indexer) putObject(obj any) error {
 	}
 	d.mu.Unlock()
 
-	if err := d.eng.Put(d.bucketName, key, encoded); err != nil {
+	if err := d.eng.Put(d.watchName, key, encoded); err != nil {
 		d.fatal(err)
 		return err
 	}
@@ -425,7 +426,7 @@ func (d *Indexer) Delete(obj any) error {
 	d.mu.Unlock()
 
 	delRV := d.extractResourceVersion(obj)
-	if err := d.eng.Delete(d.bucketName, key); err != nil {
+	if err := d.eng.Delete(d.watchName, key); err != nil {
 		d.fatal(err)
 		return err
 	}
@@ -479,7 +480,7 @@ func (d *Indexer) Replace(list []any, rv string) error {
 			}
 			d.mu.Unlock()
 
-			if err := d.eng.Delete(d.bucketName, existingKey); err != nil {
+			if err := d.eng.Delete(d.watchName, existingKey); err != nil {
 				d.fatal(err)
 				return err
 			}
@@ -523,7 +524,7 @@ func (d *Indexer) GetByKey(key string) (item any, exists bool, err error) {
 		return nil, false, err
 	}
 
-	payload, exists, err := d.eng.Get(d.bucketName, key)
+	payload, exists, err := d.eng.Get(d.watchName, key)
 	if err != nil {
 		d.fatal(err)
 		return nil, false, err
@@ -549,7 +550,7 @@ func (d *Indexer) List() []any {
 	}
 
 	var items []any
-	scanErr := d.eng.Scan(d.bucketName, func(key string, payload []byte) error {
+	scanErr := d.eng.Scan(d.watchName, func(key string, payload []byte) error {
 		target := d.example.DeepCopyObject()
 		if err := d.codec.Decode(payload, target); err != nil {
 			return fmt.Errorf("failed to decode object %s: %w", key, err)
@@ -572,7 +573,7 @@ func (d *Indexer) ListKeys() []string {
 	}
 
 	var keys []string
-	scanErr := d.eng.Scan(d.bucketName, func(key string, _ []byte) error {
+	scanErr := d.eng.Scan(d.watchName, func(key string, _ []byte) error {
 		keys = append(keys, key)
 		return nil
 	})
@@ -711,7 +712,7 @@ func (d *Indexer) AddIndexers(newIndexers toolscache.Indexers) error {
 	}
 
 	// Re-index all existing objects
-	scanErr := d.eng.Scan(d.bucketName, func(key string, payload []byte) error {
+	scanErr := d.eng.Scan(d.watchName, func(key string, payload []byte) error {
 		target := d.example.DeepCopyObject()
 		if err := d.codec.Decode(payload, target); err != nil {
 			return fmt.Errorf("failed to decode object %s: %w", key, err)

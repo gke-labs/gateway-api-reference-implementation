@@ -658,7 +658,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		}
 
 		diskIndexer, err := New(diskStore, &corev1.ConfigMap{}, testOnFatal(t),
-			WithBucketName("ConfigMap"),
+			WithWatchName("ConfigMap"),
 			WithIndexerCodec(NewHybridCodec()),
 		)
 		if err != nil {
