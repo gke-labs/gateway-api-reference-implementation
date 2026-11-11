@@ -1121,7 +1121,10 @@ func TestWAL_LostFoundQuarantineBound(t *testing.T) {
 	seg3 := writeSeg(3)
 	seg4 := writeSeg(4)
 
-	wal, err := OpenWAL(memFS, walDir, dbID, 1, WALOptions{MaxQuarantinedFiles: 2})
+	wal, err := OpenWAL(memFS, walDir, dbID, 1, WALOptions{
+		MaxQuarantinedFiles:     2,
+		MinQuarantinedRetention: -1,
+	})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -1151,5 +1154,71 @@ func TestWAL_LostFoundQuarantineBound(t *testing.T) {
 	}
 	if !found3 || !found4 {
 		t.Fatalf("expected segments %s and %s in lost+found, found3=%v, found4=%v", seg3, seg4, found3, found4)
+	}
+}
+
+func TestWAL_LostFoundMinRetention(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("wal-retention-t1"))
+	walDir := "wal"
+	if err := memFS.MkdirAll(walDir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	writeSeg := func(startLSN uint64) string {
+		name := segmentFileName(startLSN)
+		p := filepath.Join(walDir, name)
+		f, err := memFS.OpenFile(p, os.O_CREATE|os.O_RDWR, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+		return name
+	}
+
+	writeSeg(2)
+	writeSeg(3)
+	writeSeg(4)
+
+	// Open with default 7d retention: all 3 should be kept
+	wal, err := OpenWAL(memFS, walDir, dbID, 1, WALOptions{
+		MaxQuarantinedFiles: 2,
+	})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	_ = wal.Close()
+
+	lostDir := filepath.Join(walDir, "lost+found")
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected all 3 segments retained under 7d retention, got %d", len(entries))
+	}
+
+	// Prune with clock advanced 8 days: oldest should be removed
+	err = PruneLostFound(memFS, QuarantineOptions{
+		Dir:                     lostDir,
+		MaxQuarantinedFiles:     2,
+		MinQuarantinedRetention: 7 * 24 * time.Hour,
+		Now: func() time.Time {
+			return time.Now().Add(8 * 24 * time.Hour)
+		},
+	})
+	if err != nil {
+		t.Fatalf("PruneLostFound failed: %v", err)
+	}
+
+	entriesAfter, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir after pruning failed: %v", err)
+	}
+	if len(entriesAfter) != 2 {
+		t.Fatalf("expected 2 segments remaining after retention expired, got %d", len(entriesAfter))
 	}
 }

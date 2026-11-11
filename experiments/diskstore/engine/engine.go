@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -82,6 +83,11 @@ type Options struct {
 	// lost+found directory. When exceeded, the oldest files are removed.
 	// If <= 0, DefaultMaxQuarantinedFiles is used.
 	MaxQuarantinedFiles int
+
+	// MinQuarantinedRetention is the minimum retention duration for quarantined files.
+	// Files younger than this retention are not deleted even when MaxQuarantinedFiles is exceeded.
+	// If == 0, DefaultMinQuarantinedRetention (7 days) is used. If < 0, minimum retention is disabled.
+	MinQuarantinedRetention time.Duration
 
 	compressionCodecSet bool
 }
@@ -186,6 +192,15 @@ func WithMaxQuarantinedFiles(n int) Option {
 	}
 }
 
+// WithMinQuarantinedRetention sets the minimum retention duration for quarantined files.
+// Files younger than this retention are not deleted even when MaxQuarantinedFiles is exceeded.
+// If d == 0, DefaultMinQuarantinedRetention is used. If d < 0, retention duration check is disabled.
+func WithMinQuarantinedRetention(d time.Duration) Option {
+	return func(o *Options) {
+		o.MinQuarantinedRetention = d
+	}
+}
+
 // emptyPageTracker manages free logical page identifiers. It maintains a slice for LIFO
 // reuse order and a set for O(1) membership checks to prevent duplicate additions.
 type emptyPageTracker struct {
@@ -242,7 +257,8 @@ type Engine struct {
 	compressionCodec CompressionCodec
 	maxObjectSize    int
 
-	maxQuarantinedFiles int
+	maxQuarantinedFiles     int
+	minQuarantinedRetention time.Duration
 
 	heapFile File
 	wal      *WAL
@@ -357,6 +373,11 @@ const (
 	// kept in each lost+found directory (100).
 	DefaultMaxQuarantinedFiles = 100
 
+	// DefaultMinQuarantinedRetention is the default minimum retention duration
+	// for quarantined files in lost+found (7 days). Files younger than this retention
+	// are not deleted even if the file count exceeds MaxQuarantinedFiles.
+	DefaultMinQuarantinedRetention = 7 * 24 * time.Hour
+
 	// StoreFormatVersion is the format version recorded in meta.db.
 	// Version 1 did not record a version and stored uncompressed values without a codec byte.
 	// Version 2 records this version in meta.db and prefixes each stored value with a codec byte.
@@ -384,13 +405,14 @@ func isEncrypted(c Cipher) bool {
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (*Engine, error) {
 	options := Options{
-		FS:                  NewOSFS(),
-		Cipher:              NoopCipher{},
-		NumPoolBlocks:       DefaultBlockPoolBlocks,
-		AutoDelete:          false,
-		CompressionCodec:    CodecZstd,
-		MaxObjectSize:       DefaultMaxObjectSize,
-		MaxQuarantinedFiles: DefaultMaxQuarantinedFiles,
+		FS:                      NewOSFS(),
+		Cipher:                  NoopCipher{},
+		NumPoolBlocks:           DefaultBlockPoolBlocks,
+		AutoDelete:              false,
+		CompressionCodec:        CodecZstd,
+		MaxObjectSize:           DefaultMaxObjectSize,
+		MaxQuarantinedFiles:     DefaultMaxQuarantinedFiles,
+		MinQuarantinedRetention: DefaultMinQuarantinedRetention,
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -403,6 +425,9 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 	if options.MaxQuarantinedFiles <= 0 {
 		options.MaxQuarantinedFiles = DefaultMaxQuarantinedFiles
+	}
+	if options.MinQuarantinedRetention == 0 {
+		options.MinQuarantinedRetention = DefaultMinQuarantinedRetention
 	}
 
 	dir := options.Dir
@@ -626,30 +651,32 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 
 	s := &Engine{
-		fs:                  options.FS,
-		dir:                 dir,
-		dbID:                dbID,
-		isTemp:              isTemp,
-		autoDelete:          options.AutoDelete,
-		cipher:              options.Cipher,
-		compressionCodec:    options.CompressionCodec,
-		maxObjectSize:       options.MaxObjectSize,
-		maxQuarantinedFiles: options.MaxQuarantinedFiles,
-		heapFile:            heapFile,
-		keyIndex:            make(map[string]KeyIndexEntry),
-		oversizeObjects:     make(map[string][]byte),
-		emptyPages:          newEmptyPageTracker(nil),
-		failedCh:            make(chan struct{}),
-		closedCh:            make(chan struct{}),
-		wiped:               wiped,
-		nextLogicalPage:     1,
+		fs:                      options.FS,
+		dir:                     dir,
+		dbID:                    dbID,
+		isTemp:                  isTemp,
+		autoDelete:              options.AutoDelete,
+		cipher:                  options.Cipher,
+		compressionCodec:        options.CompressionCodec,
+		maxObjectSize:           options.MaxObjectSize,
+		maxQuarantinedFiles:     options.MaxQuarantinedFiles,
+		minQuarantinedRetention: options.MinQuarantinedRetention,
+		heapFile:                heapFile,
+		keyIndex:                make(map[string]KeyIndexEntry),
+		oversizeObjects:         make(map[string][]byte),
+		emptyPages:              newEmptyPageTracker(nil),
+		failedCh:                make(chan struct{}),
+		closedCh:                make(chan struct{}),
+		wiped:                   wiped,
+		nextLogicalPage:         1,
 	}
 
 	if isNewStore {
 		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{
-			OnFailure:           s.setFailed,
-			Clock:               options.Clock,
-			MaxQuarantinedFiles: options.MaxQuarantinedFiles,
+			OnFailure:               s.setFailed,
+			Clock:                   options.Clock,
+			MaxQuarantinedFiles:     options.MaxQuarantinedFiles,
+			MinQuarantinedRetention: options.MinQuarantinedRetention,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -681,9 +708,10 @@ func Open(opts ...Option) (*Engine, error) {
 
 		// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
 		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{
-			OnFailure:           s.setFailed,
-			Clock:               options.Clock,
-			MaxQuarantinedFiles: options.MaxQuarantinedFiles,
+			OnFailure:               s.setFailed,
+			Clock:                   options.Clock,
+			MaxQuarantinedFiles:     options.MaxQuarantinedFiles,
+			MinQuarantinedRetention: options.MinQuarantinedRetention,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -952,7 +980,11 @@ func (s *Engine) loadOversizeObjects() error {
 		s.oversizeObjects[qKey] = bytes.Clone(payload)
 		GlobalMetrics.OversizeObjectsCount.Add(1)
 	}
-	if err := pruneLostFound(s.fs, lostDir, s.maxQuarantinedFiles); err != nil {
+	if err := pruneLostFound(s.fs, QuarantineOptions{
+		Dir:                     lostDir,
+		MaxQuarantinedFiles:     s.maxQuarantinedFiles,
+		MinQuarantinedRetention: s.minQuarantinedRetention,
+	}); err != nil {
 		return fmt.Errorf("failed to prune oversize lost+found dir: %w", err)
 	}
 	if movedUncommitted {

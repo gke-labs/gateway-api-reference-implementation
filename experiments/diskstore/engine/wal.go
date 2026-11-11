@@ -108,13 +108,13 @@ type WAL struct {
 	appendOff  int64 // physical file offset in active segment where next record appends
 	flushedOff int64 // physical file offset in active segment up to which data has been written to disk
 
-	nextLSN             uint64 // Next monotonic LSN to allocate under mu
-	lastAppendedLSN     uint64 // Highest LSN successfully written to buffer
-	maxLSN              atomic.Uint64
-	fsyncedLSN          atomic.Uint64 // Highest LSN covered by fdatasync
-	maxSegSize          int64
-	maxQuarantinedFiles int
-	createdLSNs         map[uint64]bool // Asserts never reuse/recycle segment file names
+	nextLSN         uint64 // Next monotonic LSN to allocate under mu
+	lastAppendedLSN uint64 // Highest LSN successfully written to buffer
+	maxLSN          atomic.Uint64
+	fsyncedLSN      atomic.Uint64 // Highest LSN covered by fdatasync
+	maxSegSize      int64
+	quarantineOpts  QuarantineOptions
+	createdLSNs     map[uint64]bool // Asserts never reuse/recycle segment file names
 
 	writing   bool
 	writeCond *sync.Cond
@@ -136,12 +136,14 @@ type WAL struct {
 
 // WALOptions configures a WAL instance.
 type WALOptions struct {
-	MaxSegmentSize      int64
-	OnFailure           func(error)
-	Clock               Clock
-	TickInterval        time.Duration
-	BufferSize          int
-	MaxQuarantinedFiles int
+	MaxSegmentSize          int64
+	OnFailure               func(error)
+	Clock                   Clock
+	TickInterval            time.Duration
+	BufferSize              int
+	MaxQuarantinedFiles     int
+	MinQuarantinedRetention time.Duration
+	Quarantine              QuarantineOptions
 }
 
 // OpenWAL opens or creates a WAL in the given directory.
@@ -156,6 +158,8 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	maxSegSize := int64(DefaultMaxSegmentSize)
 	bufSize := DefaultWALBufferSize
 	maxQuarantined := DefaultMaxQuarantinedFiles
+	minRetention := DefaultMinQuarantinedRetention
+	var qNow func() time.Time
 	var onFailure func(error)
 	var clock Clock = realClock{}
 	var tickInterval time.Duration
@@ -165,6 +169,16 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		}
 		if opts[0].MaxQuarantinedFiles > 0 {
 			maxQuarantined = opts[0].MaxQuarantinedFiles
+		} else if opts[0].Quarantine.MaxQuarantinedFiles > 0 {
+			maxQuarantined = opts[0].Quarantine.MaxQuarantinedFiles
+		}
+		if opts[0].MinQuarantinedRetention != 0 {
+			minRetention = opts[0].MinQuarantinedRetention
+		} else if opts[0].Quarantine.MinQuarantinedRetention != 0 {
+			minRetention = opts[0].Quarantine.MinQuarantinedRetention
+		}
+		if opts[0].Quarantine.Now != nil {
+			qNow = opts[0].Quarantine.Now
 		}
 		if opts[0].BufferSize > 0 {
 			bufSize = opts[0].BufferSize
@@ -184,23 +198,31 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		}
 	}
 
+	lostDir := filepath.Join(dir, "lost+found")
+	qOpts := QuarantineOptions{
+		Dir:                     lostDir,
+		MaxQuarantinedFiles:     maxQuarantined,
+		MinQuarantinedRetention: minRetention,
+		Now:                     qNow,
+	}
+
 	w := &WAL{
-		fs:                  fs,
-		dir:                 dir,
-		dbID:                dbID,
-		bufSize:             bufSize,
-		bufs:                [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
-		maxSegSize:          maxSegSize,
-		maxQuarantinedFiles: maxQuarantined,
-		createdLSNs:         make(map[uint64]bool),
-		nextLSN:             initialLSN + 1,
-		lastAppendedLSN:     initialLSN,
-		clock:               clock,
-		tickInterval:        tickInterval,
-		wakeCh:              make(chan struct{}, 1),
-		bgStop:              make(chan struct{}),
-		bgDone:              make(chan struct{}),
-		onFailure:           onFailure,
+		fs:              fs,
+		dir:             dir,
+		dbID:            dbID,
+		bufSize:         bufSize,
+		bufs:            [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
+		maxSegSize:      maxSegSize,
+		quarantineOpts:  qOpts,
+		createdLSNs:     make(map[uint64]bool),
+		nextLSN:         initialLSN + 1,
+		lastAppendedLSN: initialLSN,
+		clock:           clock,
+		tickInterval:    tickInterval,
+		wakeCh:          make(chan struct{}, 1),
+		bgStop:          make(chan struct{}),
+		bgDone:          make(chan struct{}),
+		onFailure:       onFailure,
 	}
 	w.syncCond = sync.NewCond(&w.mu)
 	w.writeCond = sync.NewCond(&w.mu)
@@ -212,7 +234,6 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	}
 
 	var movedAbandoned bool
-	lostDir := filepath.Join(w.dir, "lost+found")
 	for _, seg := range segments {
 		if seg.startLSN > initialLSN {
 			// Abandoned segment from uncommitted rotation past recovered LSN.
@@ -234,7 +255,7 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		}
 		w.createdLSNs[seg.startLSN] = true
 	}
-	if err := pruneLostFound(w.fs, lostDir, w.maxQuarantinedFiles); err != nil {
+	if err := pruneLostFound(w.fs, w.quarantineOpts); err != nil {
 		return nil, fmt.Errorf("failed to prune lost+found dir: %w", err)
 	}
 	if movedAbandoned {
@@ -257,6 +278,28 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	go w.bgWriter()
 
 	return w, nil
+}
+
+// QuarantineOptions configures quarantine bounding and retention for lost+found directories.
+type QuarantineOptions struct {
+	// Dir is the lost+found directory path.
+	Dir string
+
+	// Directory is an alias for Dir.
+	Directory string
+
+	// MaxQuarantinedFiles is the maximum number of quarantined files kept in the directory.
+	// When exceeded, files older than MinQuarantinedRetention are removed.
+	// If <= 0, DefaultMaxQuarantinedFiles is used.
+	MaxQuarantinedFiles int
+
+	// MinQuarantinedRetention is the minimum duration a quarantined file is kept.
+	// Files younger than this retention are not deleted even when MaxQuarantinedFiles is exceeded.
+	// If == 0, DefaultMinQuarantinedRetention (7 days) is used. If < 0, minimum retention is disabled.
+	MinQuarantinedRetention time.Duration
+
+	// Now returns the current time for retention checks. If nil, time.Now is used.
+	Now func() time.Time
 }
 
 var quarantineCounter atomic.Uint64
@@ -295,10 +338,26 @@ type lostFile struct {
 	counter uint64
 }
 
-func pruneLostFound(storeFS FS, lostDir string, maxFiles int) error {
+func pruneLostFound(storeFS FS, opts QuarantineOptions) error {
+	maxFiles := opts.MaxQuarantinedFiles
 	if maxFiles <= 0 {
 		maxFiles = DefaultMaxQuarantinedFiles
 	}
+	minRetention := opts.MinQuarantinedRetention
+	if minRetention == 0 {
+		minRetention = DefaultMinQuarantinedRetention
+	} else if minRetention < 0 {
+		minRetention = 0
+	}
+
+	lostDir := opts.Dir
+	if lostDir == "" {
+		lostDir = opts.Directory
+	}
+	if lostDir == "" {
+		return nil
+	}
+
 	entries, err := storeFS.ReadDir(lostDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -339,14 +398,41 @@ func pruneLostFound(storeFS FS, lostDir string, maxFiles int) error {
 		return files[i].name < files[j].name
 	})
 
-	toDelete := files[:len(files)-maxFiles]
+	now := time.Now()
+	if opts.Now != nil {
+		now = opts.Now()
+	}
+
+	excess := len(files) - maxFiles
+	var toDelete []lostFile
+	for i := 0; i < excess; i++ {
+		f := files[i]
+		if minRetention > 0 && f.nano > 0 {
+			fileTime := time.Unix(0, f.nano)
+			if now.Sub(fileTime) < minRetention {
+				// Younger than minimum retention; do not delete even though over maximum.
+				break
+			}
+		}
+		toDelete = append(toDelete, f)
+	}
+
 	for _, f := range toDelete {
 		if err := storeFS.Remove(f.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("failed to remove excess quarantined file %s: %w", f.path, err)
 		}
 		slog.Warn("diskstore: deleted oldest quarantined file exceeding lost+found bound", "file", f.path)
 	}
-	return storeFS.SyncDir(lostDir)
+	if len(toDelete) > 0 {
+		return storeFS.SyncDir(lostDir)
+	}
+	return nil
+}
+
+// PruneLostFound removes quarantined files exceeding MaxQuarantinedFiles in the directory,
+// respecting MinQuarantinedRetention.
+func PruneLostFound(storeFS FS, opts QuarantineOptions) error {
+	return pruneLostFound(storeFS, opts)
 }
 
 type segmentMeta struct {

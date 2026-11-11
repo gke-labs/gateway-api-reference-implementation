@@ -2135,7 +2135,7 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 
 	// 1. First uncommitted file quarantined
 	f1 := writeUncommitted("key1", 101)
-	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
 	if err != nil {
 		t.Fatalf("Open 1 failed: %v", err)
 	}
@@ -2143,7 +2143,7 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 
 	// 2. Second uncommitted file quarantined
 	f2 := writeUncommitted("key2", 102)
-	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
 	if err != nil {
 		t.Fatalf("Open 2 failed: %v", err)
 	}
@@ -2151,7 +2151,7 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 
 	// 3. Third uncommitted file quarantined (exceeds bound of 2)
 	f3 := writeUncommitted("key3", 103)
-	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
 	if err != nil {
 		t.Fatalf("Open 3 failed: %v", err)
 	}
@@ -2185,5 +2185,95 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 	}
 	if !found2 || !found3 {
 		t.Fatalf("expected newer files %s and %s in lost+found; found2=%v, found3=%v", f2, f3, found2, found3)
+	}
+}
+
+func TestLostFound_MinRetentionProtected(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_lost_found_retention"
+
+	// Open with bound of 2 quarantined files and default 7d retention
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "durableKey", []byte("val")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	oversizeDir := filepath.Join(dir, "oversize")
+	lostDir := filepath.Join(oversizeDir, "lost+found")
+
+	writeUncommitted := func(key string, lsn uint64) string {
+		qKey := qualifyKey("ConfigMap", key)
+		payload := append([]byte("uncommitted-data"), make([]byte, 2100*1024)...)
+		payload[0] = byte(CodecNone)
+		encoded := encodeOversizeFile(qKey, lsn, payload)
+		fileName := oversizeFileName(qKey)
+		filePath := filepath.Join(oversizeDir, fileName)
+		f, err := memFS.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		if _, err := f.WriteAt(encoded, 0); err != nil {
+			t.Fatalf("WriteAt failed: %v", err)
+		}
+		_ = f.Close()
+		return fileName
+	}
+
+	// Quarantine 3 files under default 7-day retention
+	writeUncommitted("key1", 101)
+	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	if err != nil {
+		t.Fatalf("Open 1 failed: %v", err)
+	}
+	_ = s1.Close()
+
+	writeUncommitted("key2", 102)
+	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	if err != nil {
+		t.Fatalf("Open 2 failed: %v", err)
+	}
+	_ = s2.Close()
+
+	writeUncommitted("key3", 103)
+	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	if err != nil {
+		t.Fatalf("Open 3 failed: %v", err)
+	}
+	_ = s3.Close()
+
+	// Verify all 3 files are retained because they are younger than 7 days
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected all 3 quarantined files retained under 7d retention, got %d", len(entries))
+	}
+
+	// Prune with clock advanced 8 days into the future: oldest should now be removed
+	err = PruneLostFound(memFS, QuarantineOptions{
+		Dir:                     lostDir,
+		MaxQuarantinedFiles:     2,
+		MinQuarantinedRetention: 7 * 24 * time.Hour,
+		Now: func() time.Time {
+			return time.Now().Add(8 * 24 * time.Hour)
+		},
+	})
+	if err != nil {
+		t.Fatalf("PruneLostFound failed: %v", err)
+	}
+
+	entriesAfter, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir after pruning failed: %v", err)
+	}
+	if len(entriesAfter) != 2 {
+		t.Fatalf("expected 2 files remaining after retention expired, got %d", len(entriesAfter))
 	}
 }
