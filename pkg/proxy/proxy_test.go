@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1878,8 +1879,16 @@ func TestProxyCORS(t *testing.T) {
 func TestProxyRetries(t *testing.T) {
 	var requestCount atomic.Int32
 	var failUntil atomic.Int32
+	var receivedBodies []string
+	var bodyMutex sync.Mutex
 
 	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, readErr := io.ReadAll(r.Body)
+		if readErr == nil && len(body) > 0 {
+			bodyMutex.Lock()
+			receivedBodies = append(receivedBodies, string(body))
+			bodyMutex.Unlock()
+		}
 		reqNum := requestCount.Add(1)
 		if reqNum <= failUntil.Load() {
 			http.Error(w, "Temporary Error", http.StatusInternalServerError)
@@ -1958,6 +1967,190 @@ func TestProxyRetries(t *testing.T) {
 		if count := requestCount.Load(); count != 4 {
 			t.Errorf("expected 4 requests to backend (1 initial + 3 retries), got %d", count)
 		}
+	})
+
+	t.Run("retries with small body after backend failure", func(t *testing.T) {
+		requestCount.Store(0)
+		failUntil.Store(1)
+		bodyMutex.Lock()
+		receivedBodies = nil
+		bodyMutex.Unlock()
+
+		req := httptest.NewRequest("POST", "http://example.com/retry", strings.NewReader("small payload"))
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		if w.Result().StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", w.Result().StatusCode)
+		}
+		if count := requestCount.Load(); count != 2 {
+			t.Errorf("expected 2 requests to backend, got %d", count)
+		}
+		bodyMutex.Lock()
+		defer bodyMutex.Unlock()
+		if len(receivedBodies) != 2 || receivedBodies[0] != "small payload" || receivedBodies[1] != "small payload" {
+			t.Errorf("expected both attempts to receive 'small payload', got %v", receivedBodies)
+		}
+	})
+}
+
+func TestProxyRequestBodyStreaming(t *testing.T) {
+	testStreaming := func(t *testing.T, retry *state.CompiledHTTPRouteRetry, chunked bool) {
+		backendReceivedBytes := make(chan struct{})
+		var notifyOnce sync.Once
+		var totalBytesReceived atomic.Int64
+		var attemptCount atomic.Int32
+
+		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attemptCount.Add(1)
+			buffer := make([]byte, 64*1024)
+			for {
+				bytesRead, readErr := r.Body.Read(buffer)
+				if bytesRead > 0 {
+					totalBytesReceived.Add(int64(bytesRead))
+					notifyOnce.Do(func() {
+						close(backendReceivedBytes)
+					})
+				}
+				if readErr == io.EOF {
+					break
+				}
+				if readErr != nil {
+					http.Error(w, readErr.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer backendServer.Close()
+
+		backendURL, _ := url.Parse(backendServer.URL)
+		host, portString, _ := net.SplitHostPort(backendURL.Host)
+		port, _ := strconv.Atoi(portString)
+
+		proxyInstance := NewProxy()
+		proxyInstance.UpdateRoutes([]state.InternalRoute{
+			{
+				Rules: []state.InternalRule{
+					{
+						Matches: []state.InternalMatch{
+							{
+								Path: &state.InternalPathMatch{
+									Type:  gatewayv1.PathMatchPathPrefix,
+									Value: "/stream",
+								},
+							},
+						},
+						Backends: []state.InternalBackend{
+							{
+								Host:   host,
+								Port:   int32(port),
+								Weight: 1,
+							},
+						},
+						Retry: retry,
+					},
+				},
+			},
+		})
+
+		proxyServer := httptest.NewServer(proxyInstance)
+		defer proxyServer.Close()
+
+		totalBodySize := 12 * 1024 * 1024 // 12 MiB, larger than MaxBufferedBodySize (8 MiB)
+		pipeReader, pipeWriter := io.Pipe()
+
+		go func() {
+			defer pipeWriter.Close()
+			firstChunk := make([]byte, 64*1024)
+			if _, writeErr := pipeWriter.Write(firstChunk); writeErr != nil {
+				return
+			}
+
+			if !chunked {
+				select {
+				case <-backendReceivedBytes:
+				case <-time.After(5 * time.Second):
+					pipeWriter.CloseWithError(errors.New("timed out waiting for backend to receive first chunk"))
+					return
+				}
+			}
+
+			remainingBytes := totalBodySize - len(firstChunk)
+			chunkBuffer := make([]byte, 64*1024)
+			for remainingBytes > 0 {
+				bytesToWrite := len(chunkBuffer)
+				if bytesToWrite > remainingBytes {
+					bytesToWrite = remainingBytes
+				}
+				bytesWritten, writeErr := pipeWriter.Write(chunkBuffer[:bytesToWrite])
+				if writeErr != nil {
+					return
+				}
+				remainingBytes -= bytesWritten
+			}
+		}()
+
+		var memoryBefore, memoryAfter runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&memoryBefore)
+
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxyServer.URL+"/stream", pipeReader)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		if chunked {
+			request.ContentLength = -1
+		} else {
+			request.ContentLength = int64(totalBodySize)
+		}
+
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer response.Body.Close()
+
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", response.StatusCode)
+		}
+		if received := totalBytesReceived.Load(); received != int64(totalBodySize) {
+			t.Fatalf("expected backend to receive %d bytes, got %d", totalBodySize, received)
+		}
+		if attempts := attemptCount.Load(); attempts != 1 {
+			t.Fatalf("expected exactly 1 attempt, got %d", attempts)
+		}
+
+		runtime.GC()
+		runtime.ReadMemStats(&memoryAfter)
+		heapGrowth := int64(memoryAfter.HeapAlloc) - int64(memoryBefore.HeapAlloc)
+		if heapGrowth > 4*1024*1024 {
+			t.Errorf("heap growth %d bytes is not well below body size %d bytes", heapGrowth, totalBodySize)
+		}
+	}
+
+	t.Run("without retries", func(t *testing.T) {
+		testStreaming(t, nil, false)
+	})
+
+	t.Run("with retries over cap", func(t *testing.T) {
+		attempts := 2
+		backoff := 5 * time.Millisecond
+		testStreaming(t, &state.CompiledHTTPRouteRetry{
+			Codes:    []int{500},
+			Attempts: &attempts,
+			Backoff:  &backoff,
+		}, false)
+	})
+
+	t.Run("with retries chunked over cap", func(t *testing.T) {
+		attempts := 2
+		backoff := 5 * time.Millisecond
+		testStreaming(t, &state.CompiledHTTPRouteRetry{
+			Codes:    []int{500},
+			Attempts: &attempts,
+			Backoff:  &backoff,
+		}, true)
 	})
 }
 
@@ -2384,8 +2577,8 @@ func TestProxyRequestMirror_BodyTooLarge(t *testing.T) {
 		},
 	})
 
-	// Body larger than 8MB limit
-	largeBody := bytes.NewReader(bytes.Repeat([]byte("a"), 8*1024*1024+1))
+	// Body larger than MaxBufferedBodySize limit
+	largeBody := bytes.NewReader(bytes.Repeat([]byte("a"), MaxBufferedBodySize+1))
 	req := httptest.NewRequest("POST", "http://example.com/test-large", largeBody)
 	w := httptest.NewRecorder()
 

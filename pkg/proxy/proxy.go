@@ -72,6 +72,9 @@ const (
 
 	// DefaultTCPMaxConnections is the default maximum number of concurrent TCP connections per listener.
 	DefaultTCPMaxConnections = 10000
+
+	// MaxBufferedBodySize is the maximum request body size buffered in memory for mirroring or retry replay.
+	MaxBufferedBodySize = 8 * 1024 * 1024
 )
 
 type Proxy struct {
@@ -1099,8 +1102,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// TODO: Support streaming/spooling for request bodies exceeding the memory limit.
 			var bodyBytes []byte
 			if len(bestRule.Mirrors) > 0 && r.Body != nil && r.Body != http.NoBody {
-				const maxMirrorBodySize = 8 * 1024 * 1024 // 8MB limit to avoid OOM
-				limitedReader := io.LimitReader(r.Body, maxMirrorBodySize+1)
+				limitedReader := io.LimitReader(r.Body, MaxBufferedBodySize+1)
 				var errs []error
 				var readErr error
 				bodyBytes, readErr = io.ReadAll(limitedReader)
@@ -1122,8 +1124,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 					return
 				}
-				if int64(len(bodyBytes)) > maxMirrorBodySize {
-					log.Log.Info("Request body exceeds maximum size for mirroring", "path", r.URL.Path, "maxBytes", maxMirrorBodySize)
+				if int64(len(bodyBytes)) > MaxBufferedBodySize {
+					log.Log.Info("Request body exceeds maximum size for mirroring", "path", r.URL.Path, "maxBytes", MaxBufferedBodySize)
 					if backend.ResponseHeaderModifier != nil {
 						modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
 					}
@@ -2126,22 +2128,54 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		RawQuery: r.URL.RawQuery,
 	}
 
-	var bodyBytes []byte
-	if r.Body != nil && r.Body != http.NoBody {
-		var err error
-		bodyBytes, err = io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
-		}
-	}
-
-	transport := p.buildTransport(backend)
-
 	maxRetries := 0
 	if retry != nil && retry.Attempts != nil && *retry.Attempts > 0 {
 		maxRetries = *retry.Attempts
 	}
+
+	// Invariants:
+	// - The proxy streams the request body to the backend when the route does not configure retries.
+	// - The proxy buffers the request body in memory only when the route configures retries.
+	// - In-memory body buffering never exceeds MaxBufferedBodySize bytes.
+	// - When a request body exceeds the buffer cap, the proxy disables retries and forwards the body as a stream.
+	//
+	// Retrying a failed request requires replaying the body to the backend, so the proxy
+	// must retain the payload across attempts. The proxy caps the buffer at MaxBufferedBodySize
+	// to prevent unbounded memory growth and out-of-memory crashes from large payloads. When
+	// an upload exceeds this cap, the proxy foregoes retry support rather than rejecting the
+	// request, allowing large transfers to proceed without exhausting memory.
+	var bodyBytes []byte
+	var bodyStream io.Reader
+	if r.Body != nil && r.Body != http.NoBody {
+		if maxRetries > 0 {
+			if r.ContentLength > MaxBufferedBodySize {
+				klog.V(2).Infof("Request body exceeds retry buffer cap of %d bytes. Sending without retry support.", MaxBufferedBodySize)
+				maxRetries = 0
+				bodyStream = r.Body
+			} else {
+				limitedReader := io.LimitReader(r.Body, MaxBufferedBodySize+1)
+				buffered, readErr := io.ReadAll(limitedReader)
+				if readErr != nil {
+					http.Error(w, "Bad Request", http.StatusBadRequest)
+					return
+				}
+				if int64(len(buffered)) > MaxBufferedBodySize {
+					klog.V(2).Infof("Request body exceeds retry buffer cap of %d bytes. Sending without retry support.", MaxBufferedBodySize)
+					maxRetries = 0
+					bodyStream = io.MultiReader(bytes.NewReader(buffered), r.Body)
+				} else {
+					bodyBytes = buffered
+					if closeErr := r.Body.Close(); closeErr != nil {
+						klog.V(2).Infof("failed to close request body: %v", closeErr)
+					}
+				}
+			}
+		} else {
+			bodyStream = r.Body
+		}
+	}
+
+	transport := p.buildTransport(backend)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if reqCtx.Err() != nil {
@@ -2197,6 +2231,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		var bodyReader io.Reader
 		if bodyBytes != nil {
 			bodyReader = bytes.NewReader(bodyBytes)
+		} else if bodyStream != nil {
+			bodyReader = bodyStream
 		}
 		outReq, err := http.NewRequestWithContext(backendCtx, r.Method, targetURL.String(), bodyReader)
 		if err != nil {
@@ -2218,6 +2254,9 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 			}
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 			return
+		}
+		if bodyStream != nil {
+			outReq.ContentLength = r.ContentLength
 		}
 
 		outReq.Header = r.Header.Clone()
