@@ -818,6 +818,84 @@ func TestExtractCertificates_ListenerSetSANConflict(t *testing.T) {
 	}
 }
 
+func TestExtractCertificates_ExplicitHostnameBeatsSANFromOtherListener(t *testing.T) {
+	certPEMCatchAll, keyPEMCatchAll := generateTestCertPEM(t, "catchall.example.com", "b.example.com")
+	certPEMB, keyPEMB := generateTestCertPEM(t, "b.example.com")
+
+	tlsCertB, err := tls.X509KeyPair(certPEMB, keyPEMB)
+	if err != nil {
+		t.Fatalf("failed to parse cert B: %v", err)
+	}
+	hB := sha256.Sum256(tlsCertB.Certificate[0])
+	expectedCertBID := hex.EncodeToString(hB[:])
+
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "catchall-cert"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "catchall-cert"},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       certPEMCatchAll,
+				corev1.TLSPrivateKeyKey: keyPEMCatchAll,
+			},
+		},
+		{Namespace: "default", Name: "b-cert"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "b-cert"},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       certPEMB,
+				corev1.TLSPrivateKeyKey: keyPEMB,
+			},
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https-catchall",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					// Hostname is nil (hostname-less listener first)
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "catchall-cert"},
+						},
+					},
+				},
+				{
+					Name:     "https-b",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("b.example.com")),
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "b-cert"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways: []*gatewayv1.Gateway{gw},
+		Secrets:  secrets,
+	})
+
+	cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}]
+	if cg == nil {
+		t.Fatalf("expected compiled gateway")
+	}
+
+	dpCfg, err := BuildGatewayDataplaneConfig(cg)
+	if err != nil {
+		t.Fatalf("BuildGatewayDataplaneConfig failed: %v", err)
+	}
+
+	if got := dpCfg.HostCertificates["b.example.com"]; got != expectedCertBID {
+		t.Errorf("HostCertificates[b.example.com] = %q, want explicit listener cert ID %q", got, expectedCertBID)
+	}
+}
+
 func TestCompileModel_AttachedRoutesCount(t *testing.T) {
 	allFrom := gatewayv1.NamespacesFromAll
 	gw := &gatewayv1.Gateway{
@@ -5838,7 +5916,7 @@ func TestHTTPSAndTLSListener_AllInOneModeConflict(t *testing.T) {
 	inputs := ModelInputs{
 		Gateways:       []*gatewayv1.Gateway{gw2, gw1},
 		GatewayClasses: []*gatewayv1.GatewayClass{gc},
-		Secrets:        map[types.NamespacedName]*corev1.Secret{types.NamespacedName{Namespace: "default", Name: "tls-secret"}: secret},
+		Secrets:        map[types.NamespacedName]*corev1.Secret{{Namespace: "default", Name: "tls-secret"}: secret},
 		ControllerName: "test-controller",
 		AllInOneMode:   true,
 	}
