@@ -48,6 +48,11 @@ func TestConformance(t *testing.T) {
 
 	h := NewHarness(t, clusterName)
 	h.Setup()
+	t.Cleanup(func() {
+		if t.Failed() {
+			h.DumpDiagnostics()
+		}
+	})
 
 	crdVersion, isPreviousMinor, err := resolveConformanceCRDs(os.Getenv("CONFORMANCE_CRDS"))
 	if err != nil {

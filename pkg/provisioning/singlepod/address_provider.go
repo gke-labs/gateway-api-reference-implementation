@@ -1124,9 +1124,6 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		p.revMu.Unlock()
 		return nil
 	}
-	p.revMu.Lock()
-	p.currentRevisions[gwKey] = config.Revision
-	p.revMu.Unlock()
 
 	name := ResourceNameForGateway(gw.Name)
 
@@ -1169,6 +1166,11 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 	if err := p.client.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
+
+	p.revMu.Lock()
+	p.currentRevisions[gwKey] = config.Revision
+	p.revMu.Unlock()
+
 	return nil
 }
 
@@ -1246,29 +1248,27 @@ func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey t
 	}
 
 	p.endpointMu.Lock()
+	defer p.endpointMu.Unlock()
+
 	ready := p.allEndpointsAppliedLocked(currentRev, readyEndpoints)
+	p.revMu.Lock()
+	p.gatewayReady[gwKey] = ready
+	p.revMu.Unlock()
+
 	if !ready {
 		endpointSummaries := make([]string, 0, len(readyEndpoints))
 		for _, addr := range readyEndpoints {
 			endpointSummaries = append(endpointSummaries, fmt.Sprintf("%s=%v", addr, p.appliedRevisions[addr]))
 		}
-		p.endpointMu.Unlock()
 		klog.V(2).Infof("Gateway %s readiness is Pending: expected revision %s, endpoints: [%s]",
 			gwKey, currentRev, strings.Join(endpointSummaries, ", "))
-		p.revMu.Lock()
-		p.gatewayReady[gwKey] = false
-		p.revMu.Unlock()
 		return addresses, state.GatewayReadiness{
 			Ready:   false,
 			Reason:  string(gatewayv1.GatewayReasonPending),
 			Message: "Waiting for data-plane replicas to apply current configuration",
 		}, nil
 	}
-	p.endpointMu.Unlock()
 
-	p.revMu.Lock()
-	p.gatewayReady[gwKey] = true
-	p.revMu.Unlock()
 	return addresses, state.GatewayReadiness{
 		Ready:   true,
 		Reason:  string(gatewayv1.GatewayReasonProgrammed),
