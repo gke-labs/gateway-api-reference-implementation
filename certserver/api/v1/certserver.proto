@@ -41,6 +41,9 @@ message GetCertificateRequest {
 
   // Optional bearer token if not passed in gRPC Authorization metadata.
   string token = 5;
+
+  // Attested external addresses of the Gateway.
+  repeated string addresses = 6;
 }
 
 message HTTP01Challenge {
