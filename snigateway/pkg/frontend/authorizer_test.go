@@ -299,3 +299,110 @@ func TestCombinedAuthorizer(t *testing.T) {
 		}
 	})
 }
+
+func TestParseSubjectRule(t *testing.T) {
+	t.Run("valid rule without issuer", func(t *testing.T) {
+		rule, err := ParseSubjectRule("system:serviceaccount:default:sa=*.example.com,app.example.com")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rule.Issuer != "" {
+			t.Fatalf("expected empty issuer, got %q", rule.Issuer)
+		}
+		if rule.Namespace != "default" || rule.ServiceAccount != "sa" {
+			t.Fatalf("expected default:sa, got %s:%s", rule.Namespace, rule.ServiceAccount)
+		}
+		if len(rule.Patterns) != 2 || rule.Patterns[0] != "*.example.com" || rule.Patterns[1] != "app.example.com" {
+			t.Fatalf("unexpected patterns: %v", rule.Patterns)
+		}
+	})
+
+	t.Run("valid rule with issuer", func(t *testing.T) {
+		rule, err := ParseSubjectRule("https://kubernetes.default.svc|system:serviceaccount:prod:controller=*.prod.example.com")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rule.Issuer != "https://kubernetes.default.svc" {
+			t.Fatalf("expected issuer https://kubernetes.default.svc, got %q", rule.Issuer)
+		}
+		if rule.Namespace != "prod" || rule.ServiceAccount != "controller" {
+			t.Fatalf("expected prod:controller, got %s:%s", rule.Namespace, rule.ServiceAccount)
+		}
+		if len(rule.Patterns) != 1 || rule.Patterns[0] != "*.prod.example.com" {
+			t.Fatalf("unexpected patterns: %v", rule.Patterns)
+		}
+	})
+
+	t.Run("empty issuer with pipe rejected", func(t *testing.T) {
+		_, err := ParseSubjectRule("|system:serviceaccount:default:sa=*.example.com")
+		if err == nil || !strings.Contains(err.Error(), "issuer cannot be empty") {
+			t.Fatalf("expected issuer cannot be empty error, got: %v", err)
+		}
+	})
+
+	t.Run("missing subject prefix rejected", func(t *testing.T) {
+		_, err := ParseSubjectRule("https://issuer|other:sa=*.example.com")
+		if err == nil || !strings.Contains(err.Error(), "must begin with") {
+			t.Fatalf("expected must begin with prefix error, got: %v", err)
+		}
+	})
+}
+
+func TestSubjectAuthorizer_IssuerScoping(t *testing.T) {
+	ctx := t.Context()
+
+	rule1, err := ParseSubjectRule("https://cluster1.example.com|system:serviceaccount:default:controller=*.cluster1.com")
+	if err != nil {
+		t.Fatalf("ParseSubjectRule failed: %v", err)
+	}
+	rule2, err := ParseSubjectRule("https://cluster2.example.com/|system:serviceaccount:default:controller=*.cluster2.com")
+	if err != nil {
+		t.Fatalf("ParseSubjectRule failed: %v", err)
+	}
+
+	authorizer := NewSubjectAuthorizer([]SubjectRule{rule1, rule2})
+
+	t.Run("token from cluster2 cannot register cluster1 hostnames", func(t *testing.T) {
+		identity := ClientIdentity{
+			Issuer:  "https://cluster2.example.com",
+			Subject: "system:serviceaccount:default:controller",
+		}
+		err := authorizer.Authorize(ctx, identity, []string{"app.cluster1.com"})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "disallowed hostnames: app.cluster1.com") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("token from cluster1 can register cluster1 hostnames", func(t *testing.T) {
+		identity := ClientIdentity{
+			Issuer:  "https://cluster1.example.com",
+			Subject: "system:serviceaccount:default:controller",
+		}
+		if err := authorizer.Authorize(ctx, identity, []string{"app.cluster1.com"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("token from cluster2 can register cluster2 hostnames with normalized issuer trailing slash", func(t *testing.T) {
+		identity := ClientIdentity{
+			Issuer:  "https://cluster2.example.com",
+			Subject: "system:serviceaccount:default:controller",
+		}
+		if err := authorizer.Authorize(ctx, identity, []string{"app.cluster2.com"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("token from cluster3 cannot register either", func(t *testing.T) {
+		identity := ClientIdentity{
+			Issuer:  "https://cluster3.example.com",
+			Subject: "system:serviceaccount:default:controller",
+		}
+		if err := authorizer.Authorize(ctx, identity, []string{"app.cluster1.com"}); err == nil {
+			t.Fatal("expected error for cluster3 token")
+		}
+	})
+}

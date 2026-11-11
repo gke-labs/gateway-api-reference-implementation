@@ -176,4 +176,53 @@ func TestFrontendCLI_JWTFlags(t *testing.T) {
 			t.Fatalf("expected bare jwks file with multiple issuers to fail, got: %v", err)
 		}
 	})
+
+	t.Run("Issuer-less rule fails when multiple issuers configured", func(t *testing.T) {
+		badArgs := []string{
+			"--listen=" + listenAddr,
+			"--server-cert=" + serverCertPath,
+			"--server-key=" + serverKeyPath,
+			"--jwt-issuer=https://issuer1.example.com",
+			"--jwt-issuer=https://issuer2.example.com",
+			"--jwt-jwks-file=https://issuer1.example.com=" + jwksPath,
+			"--jwt-jwks-file=https://issuer2.example.com=" + jwksPath,
+			"--client-subject=system:serviceaccount:default:*=*.example.com",
+		}
+		err := run(t.Context(), badArgs)
+		if err == nil || !strings.Contains(err.Error(), "has no issuer") {
+			t.Fatalf("expected error for issuer-less rule with multiple issuers, got: %v", err)
+		}
+	})
+
+	t.Run("Scoped rules succeed when multiple issuers configured", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		goodArgs := []string{
+			"--listen=" + listenAddr,
+			"--server-cert=" + serverCertPath,
+			"--server-key=" + serverKeyPath,
+			"--jwt-issuer=https://issuer1.example.com",
+			"--jwt-issuer=https://issuer2.example.com",
+			"--jwt-jwks-file=https://issuer1.example.com=" + jwksPath,
+			"--jwt-jwks-file=https://issuer2.example.com=" + jwksPath,
+			"--client-subject=https://issuer1.example.com|system:serviceaccount:default:*=*.example.com",
+			"--client-subject=https://issuer2.example.com|system:serviceaccount:prod:*=*.prod.com",
+		}
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- run(ctx, goodArgs)
+		}()
+
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil && err != context.Canceled {
+				t.Fatalf("run returned error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for server shutdown")
+		}
+	})
 }

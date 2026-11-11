@@ -704,3 +704,150 @@ func TestJWT_TokensNeverAppearInLogsOrErrors(t *testing.T) {
 		t.Fatalf("token leaked in HTTP error response body: %s", string(body))
 	}
 }
+
+func TestJWT_TwoIssuersSubjectScoping(t *testing.T) {
+	rsaKey1, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaKey2, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issuer1 := "https://cluster-1.svc"
+	issuer2 := "https://cluster-2.svc"
+
+	tmpDir := t.TempDir()
+	jwks1File := filepath.Join(tmpDir, "jwks1.json")
+	jwks2File := filepath.Join(tmpDir, "jwks2.json")
+
+	jwks1JSON, _ := json.Marshal(map[string]any{
+		"keys": []any{exportJWK(&rsaKey1.PublicKey, "key-1")},
+	})
+	jwks2JSON, _ := json.Marshal(map[string]any{
+		"keys": []any{exportJWK(&rsaKey2.PublicKey, "key-2")},
+	})
+	if err := os.WriteFile(jwks1File, jwks1JSON, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jwks2File, jwks2JSON, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	jwksCache, err := jwt.NewJWKSCache([]jwt.IssuerConfig{
+		{IssuerURL: issuer1, JWKSFile: jwks1File},
+		{IssuerURL: issuer2, JWKSFile: jwks2File},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jwksCache.Close()
+
+	verifier := jwt.NewVerifier(jwksCache, jwt.WithAudience("snigateway"))
+
+	// rule1 authorizes controller in cluster1 for *.cluster1.example.com
+	rule1, err := ParseSubjectRule(issuer1 + "|system:serviceaccount:default:controller=*.cluster1.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// rule2 authorizes controller in cluster2 for *.cluster2.example.com
+	rule2, err := ParseSubjectRule(issuer2 + "|system:serviceaccount:default:controller=*.cluster2.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizer := NewSubjectAuthorizer([]SubjectRule{rule1, rule2})
+
+	generated, err := certs.GenerateAll("snigateway.internal", "unused-client")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTLS.ClientAuth = tls.VerifyClientCertIfGiven
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := NewServer(ServerConfig{
+		ListenAddrs:      []string{ln.Addr().String()},
+		InternalHostname: "snigateway.internal",
+		ServerTLSConfig:  serverTLS,
+		Authorizer:       authorizer,
+		JWTVerifier:      verifier,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, nil, nil, "snigateway.internal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	expFuture := now.Add(1 * time.Hour)
+	subject := "system:serviceaccount:default:controller"
+
+	// Token from issuer2 for the same subject named in issuer1's rule
+	tokenIssuer2 := testSignRS256(t, issuer2, subject, []string{"snigateway"}, &expFuture, nil, &now, rsaKey2, "key-2")
+	client2 := client.NewClient(ln.Addr().String(), clientTLS, client.WithTokenProvider(func() (string, error) {
+		return tokenIssuer2, nil
+	}))
+
+	sessID2, _, err := client2.StartSession(t.Context())
+	if err != nil {
+		t.Fatalf("StartSession with token from issuer2 failed: %v", err)
+	}
+
+	// Token from second issuer can't register rule 1's hostnames
+	_, err = client2.Register(t.Context(), sessID2, []string{"app.cluster1.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "disallowed hostnames") {
+		t.Fatalf("expected disallowed hostnames when issuer2 token tries to register issuer1 hostname, got: %v", err)
+	}
+
+	// Token from second issuer CAN register rule 2's hostnames
+	resp2, err := client2.Register(t.Context(), sessID2, []string{"app.cluster2.example.com"})
+	if err != nil {
+		t.Fatalf("expected issuer2 token to register issuer2 hostname, got: %v", err)
+	}
+	if resp2.Status != "registered" {
+		t.Fatalf("expected registered, got %s", resp2.Status)
+	}
+
+	// Token from issuer1 for the same subject
+	tokenIssuer1 := testSignRS256(t, issuer1, subject, []string{"snigateway"}, &expFuture, nil, &now, rsaKey1, "key-1")
+	client1 := client.NewClient(ln.Addr().String(), clientTLS, client.WithTokenProvider(func() (string, error) {
+		return tokenIssuer1, nil
+	}))
+
+	sessID1, _, err := client1.StartSession(t.Context())
+	if err != nil {
+		t.Fatalf("StartSession with token from issuer1 failed: %v", err)
+	}
+
+	// Token from first issuer CAN register rule 1's hostnames
+	resp1, err := client1.Register(t.Context(), sessID1, []string{"app.cluster1.example.com"})
+	if err != nil {
+		t.Fatalf("expected issuer1 token to register issuer1 hostname, got: %v", err)
+	}
+	if resp1.Status != "registered" {
+		t.Fatalf("expected registered, got %s", resp1.Status)
+	}
+
+	// Token from first issuer can't register rule 2's hostnames
+	_, err = client1.Register(t.Context(), sessID1, []string{"app.cluster2.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "disallowed hostnames") {
+		t.Fatalf("expected disallowed hostnames when issuer1 token tries to register issuer2 hostname, got: %v", err)
+	}
+}

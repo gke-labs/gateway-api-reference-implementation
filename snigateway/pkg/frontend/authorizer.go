@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
 )
 
 // ClientIdentity represents the authenticated identity of a connecting client.
@@ -127,17 +129,27 @@ func (a *CAAuthorizer) Authorize(ctx context.Context, identity ClientIdentity, h
 
 // SubjectRule grants hostname registration permissions to a Kubernetes ServiceAccount subject.
 type SubjectRule struct {
+	Issuer         string   // Issuer URL (optional during parse if not specified)
 	Namespace      string   // Namespace (e.g. "default")
 	ServiceAccount string   // ServiceAccount name (e.g. "my-sa") or "*" for any SA in Namespace
 	Patterns       []string // Allowed hostname patterns
 }
 
-// ParseSubjectRule parses an entry in the format "system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...]".
+// ParseSubjectRule parses an entry in the format "[<issuer>|]system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...]".
 // "<ns>:*" is allowed for the service account part to authorize any ServiceAccount in that namespace.
 func ParseSubjectRule(entry string) (SubjectRule, error) {
 	subjectPattern, patternsStr, ok := strings.Cut(entry, "=")
 	if !ok || subjectPattern == "" || patternsStr == "" {
-		return SubjectRule{}, fmt.Errorf("invalid format %q: expected system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...]", entry)
+		return SubjectRule{}, fmt.Errorf("invalid format %q: expected [<issuer>|]system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...]", entry)
+	}
+
+	var issuer string
+	if iss, rest, hasIssuer := strings.Cut(subjectPattern, "|"); hasIssuer {
+		issuer = strings.TrimSpace(iss)
+		if issuer == "" {
+			return SubjectRule{}, fmt.Errorf("invalid format %q: issuer cannot be empty", entry)
+		}
+		subjectPattern = rest
 	}
 
 	const prefix = "system:serviceaccount:"
@@ -163,6 +175,7 @@ func ParseSubjectRule(entry string) (SubjectRule, error) {
 	}
 
 	return SubjectRule{
+		Issuer:         issuer,
 		Namespace:      ns,
 		ServiceAccount: sa,
 		Patterns:       patterns,
@@ -186,6 +199,7 @@ func NewSubjectAuthorizer(rules []SubjectRule) *SubjectAuthorizer {
 		}
 		if len(patterns) > 0 {
 			cleanRules = append(cleanRules, SubjectRule{
+				Issuer:         jwt.NormalizeIssuer(r.Issuer),
 				Namespace:      strings.TrimSpace(r.Namespace),
 				ServiceAccount: strings.TrimSpace(r.ServiceAccount),
 				Patterns:       patterns,
@@ -208,8 +222,13 @@ func (a *SubjectAuthorizer) Authorize(ctx context.Context, identity ClientIdenti
 		return fmt.Errorf("disallowed hostnames: %s", strings.Join(hostnames, ", "))
 	}
 
+	identityIssuer := jwt.NormalizeIssuer(identity.Issuer)
+
 	var allowedPatterns []string
 	for _, rule := range a.rules {
+		if rule.Issuer != "" && rule.Issuer != identityIssuer {
+			continue
+		}
 		if rule.Namespace == tokenNS && (rule.ServiceAccount == "*" || rule.ServiceAccount == tokenSA) {
 			allowedPatterns = append(allowedPatterns, rule.Patterns...)
 		}

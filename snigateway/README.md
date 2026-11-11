@@ -156,7 +156,7 @@ snigateway-frontend \
   --server-key certs/server.key \
   --jwt-issuer "https://container.googleapis.com/v1/projects/PROJECT/locations/LOCATION/clusters/CLUSTER" \
   --jwt-audience "snigateway" \
-  --client-subject "system:serviceaccount:default:snigateway-controller=*.example.com"
+  --client-subject "https://container.googleapis.com/v1/projects/PROJECT/locations/LOCATION/clusters/CLUSTER|system:serviceaccount:default:snigateway-controller=*.example.com"
 ```
 
 ##### Non-GKE Clusters (Static JWKS File)
@@ -170,10 +170,10 @@ snigateway-frontend \
   --jwt-issuer "https://kubernetes.default.svc" \
   --jwt-jwks-file "/etc/snigateway/cluster-jwks.json" \
   --jwt-audience "snigateway" \
-  --client-subject "system:serviceaccount:prod:*=*.prod.example.com"
+  --client-subject "https://kubernetes.default.svc|system:serviceaccount:prod:*=*.prod.example.com"
 ```
 
-> **Note**: In `--client-subject`, `<ns>:*` can be used to authorize any ServiceAccount in that namespace.
+> **Note**: In `--client-subject`, `<issuer>|system:serviceaccount:<ns>:<sa>=<hostnames>` scopes the rule to a specific issuer. When exactly one `--jwt-issuer` is configured, `<issuer>|` may be omitted. `<ns>:*` can be used to authorize any ServiceAccount in that namespace.
 
 #### 2. Pod Spec with Projected ServiceAccount Token
 

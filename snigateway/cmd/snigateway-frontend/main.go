@@ -86,7 +86,7 @@ func run(ctx context.Context, args []string) error {
 	fs.Var(&jwtJWKSFiles, "jwt-jwks-file", "Path to JWKS file per issuer in format [<issuer>=]<path> (repeatable)")
 	jwtAudience := fs.String("jwt-audience", jwt.DefaultAudience, "Required audience for ServiceAccount tokens")
 	var clientSubjects stringSliceFlag
-	fs.Var(&clientSubjects, "client-subject", "Client subject allowlist in format system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...] (repeatable, <ns>:* allowed)")
+	fs.Var(&clientSubjects, "client-subject", "Client subject allowlist in format [<issuer>|]system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...] (repeatable, <ns>:* allowed)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -100,6 +100,7 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	var jwtVerifier jwt.TokenVerifier
+	var configuredIssuers []string
 	if len(jwtIssuers) > 0 || len(jwtJWKSFiles) > 0 {
 		var issuerConfigs []jwt.IssuerConfig
 		jwksFileMap := make(map[string]string)
@@ -131,6 +132,15 @@ func run(ctx context.Context, args []string) error {
 			})
 		}
 
+		seenIssuers := make(map[string]bool)
+		for _, cfg := range issuerConfigs {
+			norm := jwt.NormalizeIssuer(cfg.IssuerURL)
+			if !seenIssuers[norm] && norm != "" {
+				seenIssuers[norm] = true
+				configuredIssuers = append(configuredIssuers, cfg.IssuerURL)
+			}
+		}
+
 		jwksCache, err := jwt.NewJWKSCache(issuerConfigs)
 		if err != nil {
 			return fmt.Errorf("initializing JWKS cache: %w", err)
@@ -145,6 +155,16 @@ func run(ctx context.Context, args []string) error {
 			rule, err := frontend.ParseSubjectRule(entry)
 			if err != nil {
 				return fmt.Errorf("invalid --client-subject flag: %w", err)
+			}
+			if rule.Issuer == "" {
+				switch len(configuredIssuers) {
+				case 1:
+					rule.Issuer = configuredIssuers[0]
+				case 0:
+					return fmt.Errorf("invalid --client-subject flag: rule %q has no issuer and no --jwt-issuer is configured", entry)
+				default:
+					return fmt.Errorf("invalid --client-subject flag: rule %q has no issuer; specify <issuer>|system:serviceaccount:<ns>:<sa>=<pattern> when multiple issuers are configured", entry)
+				}
 			}
 			subjectRules = append(subjectRules, rule)
 		}
