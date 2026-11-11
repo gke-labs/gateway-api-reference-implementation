@@ -1051,6 +1051,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, bestRule.Error.HTTPMessage, bestRule.Error.HTTPStatusCode)
 			return
 		}
+
+		// Invariant: client-controlled Connection tokens must never remove headers that
+		// the gateway or route filters add.
+		// The proxy strips all headers listed in the client's Connection header before
+		// RequestHeaderModifier filters and setForwardedHeaders run. This prevents a client
+		// from using Connection to strip headers that the gateway or route filters configure.
+		stripClientConnectionHeaders(r.Header)
+
 		if bestRule.Rewrite != nil {
 			r = p.rewrite(r, *bestRule.Rewrite, bestMatch)
 		}
@@ -1378,22 +1386,41 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
-func removeHopByHopHeaders(h http.Header) {
-	for _, k := range hopByHopHeaders {
-		if k == "Te" && strings.EqualFold(h.Get("Te"), "trailers") {
+func removeConnectionTokens(header http.Header) {
+	for _, connectionValue := range header.Values("Connection") {
+		for _, token := range strings.Split(connectionValue, ",") {
+			token = strings.TrimSpace(token)
+			if token == "" {
+				continue
+			}
+			if strings.EqualFold(token, "Te") && strings.EqualFold(header.Get("Te"), "trailers") {
+				continue
+			}
+			if strings.EqualFold(token, "upgrade") && strings.EqualFold(header.Get("Upgrade"), "websocket") {
+				continue
+			}
+			header.Del(token)
+		}
+	}
+}
+
+func removeHopByHopHeaders(header http.Header) {
+	removeConnectionTokens(header)
+	for _, name := range hopByHopHeaders {
+		if name == "Te" && strings.EqualFold(header.Get("Te"), "trailers") {
 			continue
 		}
-		h.Del(k)
+		header.Del(name)
 	}
-	if c := h.Get("Connection"); c != "" {
-		for _, f := range strings.Split(c, ",") {
-			if f = strings.TrimSpace(f); f != "" {
-				if strings.EqualFold(f, "Te") && strings.EqualFold(h.Get("Te"), "trailers") {
-					continue
-				}
-				h.Del(f)
-			}
-		}
+}
+
+func stripClientConnectionHeaders(header http.Header) {
+	isWebSocket := strings.EqualFold(header.Get("Upgrade"), "websocket") && containsToken(header.Get("Connection"), "upgrade")
+	removeConnectionTokens(header)
+	if isWebSocket {
+		header.Set("Connection", "Upgrade")
+	} else {
+		header.Del("Connection")
 	}
 }
 
