@@ -104,7 +104,7 @@ func (o *OSFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 }
 
 func (o *OSFS) Create(name string) (File, error) {
-	return o.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	return o.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, StoreFileMode)
 }
 
 func (o *OSFS) Open(name string) (File, error) {
@@ -308,7 +308,7 @@ func (m *MemFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) 
 }
 
 func (m *MemFS) Create(name string) (File, error) {
-	return m.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	return m.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, StoreFileMode)
 }
 
 func (m *MemFS) Open(name string) (File, error) {
@@ -373,7 +373,7 @@ type memFileInfo memDirEntry
 
 func (i memFileInfo) Name() string       { return i.name }
 func (i memFileInfo) Size() int64        { return i.size }
-func (i memFileInfo) Mode() os.FileMode  { return 0644 }
+func (i memFileInfo) Mode() os.FileMode  { return StoreFileMode }
 func (i memFileInfo) ModTime() time.Time { return time.Time{} }
 func (i memFileInfo) IsDir() bool        { return i.isDir }
 func (i memFileInfo) Sys() any           { return nil }

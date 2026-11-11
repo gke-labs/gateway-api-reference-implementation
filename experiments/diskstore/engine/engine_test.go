@@ -1983,3 +1983,331 @@ func TestEngine_EncryptionMismatchRejection(t *testing.T) {
 		}
 	})
 }
+
+func TestStore_FileAndDirectoryPermissions(t *testing.T) {
+	tempDir := t.TempDir()
+	storeDir := filepath.Join(tempDir, "store")
+
+	store, err := Open(WithDir(storeDir), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// Write oversize payload (> 2 MiB) to create an oversize file
+	oversizeVal := bytes.Repeat([]byte("secret-payload-data"), 150000)
+	if err := store.Put("Secrets", "token", oversizeVal); err != nil {
+		t.Fatalf("Put oversize failed: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	walDir := filepath.Join(storeDir, "wal")
+	oversizeDir := filepath.Join(storeDir, "oversize")
+
+	// Create an uncommitted oversize file past WAL max LSN to trigger lost+found creation
+	uncommittedQKey := qualifyKey("Secrets", "future-secret")
+	uncommittedFile := filepath.Join(oversizeDir, oversizeFileName(uncommittedQKey))
+	uncommittedPayload := append([]byte("uncommitted-future-data"), make([]byte, 2100*1024)...)
+	uncommittedPayload[0] = byte(CodecNone)
+	encoded := encodeOversizeFile(uncommittedQKey, 999999, uncommittedPayload)
+	if err := os.WriteFile(uncommittedFile, encoded, StoreFileMode); err != nil {
+		t.Fatalf("WriteFile uncommitted oversize failed: %v", err)
+	}
+
+	// Reopen to quarantine the uncommitted file to lost+found
+	store2, err := Open(WithDir(storeDir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	if err := store2.Close(); err != nil {
+		t.Fatalf("Close store2 failed: %v", err)
+	}
+
+	lostDir := filepath.Join(oversizeDir, "lost+found")
+
+	checkPerm := func(p string, want os.FileMode, isDir bool) {
+		t.Helper()
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("Stat(%s) failed: %v", p, err)
+		}
+		if info.IsDir() != isDir {
+			t.Fatalf("%s isDir = %v, want %v", p, info.IsDir(), isDir)
+		}
+		if perm := info.Mode().Perm(); perm != want {
+			t.Errorf("%s mode = %o, want %o", p, perm, want)
+		}
+	}
+
+	// Check directories (0700)
+	checkPerm(storeDir, StoreDirMode, true)
+	checkPerm(walDir, StoreDirMode, true)
+	checkPerm(oversizeDir, StoreDirMode, true)
+	checkPerm(lostDir, StoreDirMode, true)
+
+	// Check store files (0600)
+	checkPerm(filepath.Join(storeDir, "meta.db"), StoreFileMode, false)
+	checkPerm(filepath.Join(storeDir, "heap.db"), StoreFileMode, false)
+
+	// Check WAL segment (0600)
+	walEntries, err := os.ReadDir(walDir)
+	if err != nil {
+		t.Fatalf("ReadDir wal failed: %v", err)
+	}
+	foundWAL := false
+	for _, e := range walEntries {
+		if strings.HasSuffix(e.Name(), ".wal") {
+			foundWAL = true
+			checkPerm(filepath.Join(walDir, e.Name()), StoreFileMode, false)
+		}
+	}
+	if !foundWAL {
+		t.Fatalf("no WAL segment found in %s", walDir)
+	}
+
+	// Check oversize file (0600)
+	oversizeEntries, err := os.ReadDir(oversizeDir)
+	if err != nil {
+		t.Fatalf("ReadDir oversize failed: %v", err)
+	}
+	foundOversize := false
+	for _, e := range oversizeEntries {
+		if strings.HasSuffix(e.Name(), ".obj") {
+			foundOversize = true
+			checkPerm(filepath.Join(oversizeDir, e.Name()), StoreFileMode, false)
+		}
+	}
+	if !foundOversize {
+		t.Fatalf("no oversize file found in %s", oversizeDir)
+	}
+
+	// Check quarantined file in lost+found (0600)
+	lostEntries, err := os.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir lost+found failed: %v", err)
+	}
+	if len(lostEntries) == 0 {
+		t.Fatalf("no quarantined file found in %s", lostDir)
+	}
+	for _, e := range lostEntries {
+		checkPerm(filepath.Join(lostDir, e.Name()), StoreFileMode, false)
+	}
+}
+
+func TestLostFound_QuarantineBound(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_lost_found_bound"
+
+	// Open with bound of 2 quarantined files
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "durableKey", []byte("val")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	oversizeDir := filepath.Join(dir, "oversize")
+	lostDir := filepath.Join(oversizeDir, "lost+found")
+
+	writeUncommitted := func(key string, lsn uint64) string {
+		qKey := qualifyKey("ConfigMap", key)
+		payload := append([]byte("uncommitted-data"), make([]byte, 2100*1024)...)
+		payload[0] = byte(CodecNone)
+		encoded := encodeOversizeFile(qKey, lsn, payload)
+		fileName := oversizeFileName(qKey)
+		filePath := filepath.Join(oversizeDir, fileName)
+		f, err := memFS.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		if _, err := f.WriteAt(encoded, 0); err != nil {
+			t.Fatalf("WriteAt failed: %v", err)
+		}
+		_ = f.Close()
+		return fileName
+	}
+
+	// 1. First uncommitted file quarantined
+	f1 := writeUncommitted("key1", 101)
+	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
+	if err != nil {
+		t.Fatalf("Open 1 failed: %v", err)
+	}
+	_ = s1.Close()
+
+	// 2. Second uncommitted file quarantined
+	f2 := writeUncommitted("key2", 102)
+	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
+	if err != nil {
+		t.Fatalf("Open 2 failed: %v", err)
+	}
+	_ = s2.Close()
+
+	// 3. Third uncommitted file quarantined (exceeds bound of 2)
+	f3 := writeUncommitted("key3", 103)
+	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
+	if err != nil {
+		t.Fatalf("Open 3 failed: %v", err)
+	}
+	defer s3.Close()
+
+	// Verify that lost+found contains exactly 2 files and oldest (f1) was removed
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir lost+found failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 files in lost+found, got %d", len(entries))
+	}
+
+	// f1 was the oldest quarantined file; it should have been deleted
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), f1) {
+			t.Fatalf("oldest file %s was not removed from lost+found", f1)
+		}
+	}
+
+	// Newer files f2 and f3 should remain
+	var found2, found3 bool
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), f2) {
+			found2 = true
+		}
+		if strings.HasPrefix(e.Name(), f3) {
+			found3 = true
+		}
+	}
+	if !found2 || !found3 {
+		t.Fatalf("expected newer files %s and %s in lost+found; found2=%v, found3=%v", f2, f3, found2, found3)
+	}
+}
+
+func TestLostFound_MinRetentionProtected(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_lost_found_retention"
+
+	// Open with bound of 2 quarantined files and default 7d retention
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "durableKey", []byte("val")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	oversizeDir := filepath.Join(dir, "oversize")
+	lostDir := filepath.Join(oversizeDir, "lost+found")
+
+	writeUncommitted := func(key string, lsn uint64) string {
+		qKey := qualifyKey("ConfigMap", key)
+		payload := append([]byte("uncommitted-data"), make([]byte, 2100*1024)...)
+		payload[0] = byte(CodecNone)
+		encoded := encodeOversizeFile(qKey, lsn, payload)
+		fileName := oversizeFileName(qKey)
+		filePath := filepath.Join(oversizeDir, fileName)
+		f, err := memFS.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		if _, err := f.WriteAt(encoded, 0); err != nil {
+			t.Fatalf("WriteAt failed: %v", err)
+		}
+		_ = f.Close()
+		return fileName
+	}
+
+	// Quarantine 3 files under default 7-day retention
+	writeUncommitted("key1", 101)
+	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	if err != nil {
+		t.Fatalf("Open 1 failed: %v", err)
+	}
+	_ = s1.Close()
+
+	writeUncommitted("key2", 102)
+	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	if err != nil {
+		t.Fatalf("Open 2 failed: %v", err)
+	}
+	_ = s2.Close()
+
+	writeUncommitted("key3", 103)
+	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	if err != nil {
+		t.Fatalf("Open 3 failed: %v", err)
+	}
+	_ = s3.Close()
+
+	// Verify all 3 files are retained because they are younger than 7 days
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected all 3 quarantined files retained under 7d retention, got %d", len(entries))
+	}
+
+	// Prune with clock advanced 8 days into the future: oldest should now be removed
+	err = pruneLostFound(memFS, QuarantineOptions{
+		Dir:                     lostDir,
+		MaxQuarantinedFiles:     2,
+		MinQuarantinedRetention: 7 * 24 * time.Hour,
+		Now: func() time.Time {
+			return time.Now().Add(8 * 24 * time.Hour)
+		},
+	})
+	if err != nil {
+		t.Fatalf("pruneLostFound failed: %v", err)
+	}
+
+	entriesAfter, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir after pruning failed: %v", err)
+	}
+	if len(entriesAfter) != 2 {
+		t.Fatalf("expected 2 files remaining after retention expired, got %d", len(entriesAfter))
+	}
+}
+
+func TestLostFound_UnparseableTimestampIgnored(t *testing.T) {
+	memFS := NewMemFS()
+	lostDir := "test_unparseable_lost_found"
+	if err := memFS.MkdirAll(lostDir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	// Create an unparseable file in lost+found
+	unparseableFile := filepath.Join(lostDir, "corrupted_file_without_timestamp")
+	f, err := memFS.OpenFile(unparseableFile, os.O_CREATE|os.O_WRONLY, StoreFileMode)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	_ = f.Close()
+
+	// Prune with max files = 1
+	err = pruneLostFound(memFS, QuarantineOptions{
+		Dir:                 lostDir,
+		MaxQuarantinedFiles: 1,
+	})
+	if err != nil {
+		t.Fatalf("pruneLostFound failed: %v", err)
+	}
+
+	// Verify unparseable file was not removed
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "corrupted_file_without_timestamp" {
+		t.Fatalf("expected unparseable file preserved, got %v", entries)
+	}
+}
