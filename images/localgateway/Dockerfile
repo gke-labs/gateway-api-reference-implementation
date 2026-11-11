@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM docker.io/library/golang:1.27.3 AS builder
+FROM docker.io/library/golang:1.27.4 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 

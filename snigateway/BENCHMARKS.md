@@ -59,7 +59,7 @@ Previous benchmarks compared a hand-rolled raw QUIC loop against an `http.Server
 
 ## 3. Benchmark Results
 
-Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27.3, commit 90a731b plus this change):
+Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27.4, commit 90a731b plus this change):
 
 ### 3.1 Loopback Saturation Baseline (Comparable Transport Data)
 

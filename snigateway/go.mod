@@ -2,7 +2,7 @@ module github.com/gke-labs/gateway-api-reference-implementation/snigateway
 
 go 1.27.2
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261024134123-7373c0c33da0
