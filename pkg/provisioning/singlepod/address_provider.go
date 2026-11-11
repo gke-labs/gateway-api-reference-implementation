@@ -94,7 +94,7 @@ const (
 	// DataPlaneHealthProbePort is the container port for health probes and metrics.
 	DataPlaneHealthProbePort = state.DataPlaneHealthProbePort
 
-	defaultPollInterval = 500 * time.Millisecond
+	defaultPollInterval = 2 * time.Second
 	defaultProbeTimeout = 2 * time.Second
 
 	// DefaultACMEChallengeAudience is the token audience expected by certserver for ACME HTTP-01 challenge forwarding.
@@ -189,8 +189,8 @@ func WithAPIReader(reader client.Reader) Option {
 //
 // Readiness: reports ready when addresses are assigned, the per-Gateway Deployment has available replicas,
 // and every ready data-plane replica reports that it has applied the Gateway's current configuration revision.
-// Singlepod discovers data-plane endpoints from the Service's EndpointSlices and polls each ready endpoint's
-// applied-revision endpoint (/_gari/applied) until all replicas converge on the current revision.
+// A single background prober continuously mirrors each ready endpoint's applied revisions from /_gari/applied,
+// and readiness checks that in-memory mirror.
 type AddressProvider struct {
 	client                        client.Client
 	apiReader                     client.Reader
@@ -1175,6 +1175,30 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 	return nil
 }
 
+// readyEndpointAddresses extracts unique IP addresses for endpoints that are ready and not terminating.
+func readyEndpointAddresses(slices []discoveryv1.EndpointSlice) []string {
+	var readyEndpoints []string
+	seen := make(map[string]bool)
+	for _, sl := range slices {
+		for _, ep := range sl.Endpoints {
+			isReady := ep.Conditions.Ready == nil || *ep.Conditions.Ready
+			if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+				isReady = false
+			}
+			if !isReady {
+				continue
+			}
+			for _, addr := range ep.Addresses {
+				if addr != "" && !seen[addr] {
+					seen[addr] = true
+					readyEndpoints = append(readyEndpoints, addr)
+				}
+			}
+		}
+	}
+	return readyEndpoints
+}
+
 func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey types.NamespacedName, name string, addresses []gatewayv1.GatewayStatusAddress) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	currentRev := p.currentRevisionForGateway(gwKey)
 	if currentRev == "" {
@@ -1192,26 +1216,7 @@ func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey t
 		return nil, state.GatewayReadiness{}, err
 	}
 
-	var readyEndpoints []string
-	seen := make(map[string]bool)
-	for _, sl := range slicesList.Items {
-		for _, ep := range sl.Endpoints {
-			isReady := ep.Conditions.Ready == nil || *ep.Conditions.Ready
-			if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
-				isReady = false
-			}
-			if !isReady {
-				continue
-			}
-			for _, addr := range ep.Addresses {
-				if addr != "" && !seen[addr] {
-					seen[addr] = true
-					readyEndpoints = append(readyEndpoints, addr)
-				}
-			}
-		}
-	}
-
+	readyEndpoints := readyEndpointAddresses(slicesList.Items)
 	if len(readyEndpoints) == 0 {
 		return addresses, state.GatewayReadiness{
 			Ready:   false,
@@ -1272,6 +1277,20 @@ func (p *AddressProvider) runProber(ctx context.Context) error {
 	}
 }
 
+type probeTarget struct {
+	gwKey types.NamespacedName
+	addr  string
+}
+
+type probeResult struct {
+	gwKey types.NamespacedName
+	addr  string
+	revs  []string
+	err   error
+}
+
+const maxProbeWorkers = 8
+
 func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 	if p.client == nil {
 		return
@@ -1283,10 +1302,7 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 		return
 	}
 
-	newApplied := make(map[string][]string)
-	newGateways := make(map[string]types.NamespacedName)
-	changedGateways := make(map[types.NamespacedName]bool)
-
+	var targets []probeTarget
 	for _, svc := range svcList.Items {
 		gwName := svc.Labels[LabelGatewayName]
 		if gwName == "" {
@@ -1302,38 +1318,60 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 			continue
 		}
 
-		for _, sl := range slicesList.Items {
-			for _, ep := range sl.Endpoints {
-				isReady := ep.Conditions.Ready == nil || *ep.Conditions.Ready
-				if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
-					isReady = false
-				}
-				if !isReady {
-					continue
-				}
-				for _, addr := range ep.Addresses {
-					if addr == "" {
-						continue
-					}
-					targetURL := p.appliedURL(addr)
-					revs, err := p.probeEndpoint(ctx, targetURL)
-					p.endpointMu.Lock()
-					oldRevs, hadOld := p.appliedRevisions[addr]
-					p.endpointMu.Unlock()
+		for _, addr := range readyEndpointAddresses(slicesList.Items) {
+			targets = append(targets, probeTarget{gwKey: gwKey, addr: addr})
+		}
+	}
 
-					if err != nil {
-						klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, gwKey, err)
-						if hadOld {
-							changedGateways[gwKey] = true
-						}
-					} else {
-						newApplied[addr] = revs
-						newGateways[addr] = gwKey
-						if !hadOld || !slices.Equal(oldRevs, revs) {
-							changedGateways[gwKey] = true
-						}
+	results := make([]probeResult, len(targets))
+	if len(targets) > 0 {
+		numWorkers := min(maxProbeWorkers, len(targets))
+		var wg sync.WaitGroup
+		jobs := make(chan int, len(targets))
+		for i := 0; i < numWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range jobs {
+					target := targets[idx]
+					targetURL := p.appliedURL(target.addr)
+					revs, err := p.probeEndpoint(ctx, targetURL)
+					results[idx] = probeResult{
+						gwKey: target.gwKey,
+						addr:  target.addr,
+						revs:  revs,
+						err:   err,
 					}
 				}
+			}()
+		}
+		for i := range targets {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+	}
+
+	newApplied := make(map[string][]string)
+	newGateways := make(map[string]types.NamespacedName)
+	changedGateways := make(map[types.NamespacedName]bool)
+
+	for _, res := range results {
+		p.endpointMu.Lock()
+		oldRevs, hadOld := p.appliedRevisions[res.addr]
+		p.endpointMu.Unlock()
+
+		if res.err != nil {
+			targetURL := p.appliedURL(res.addr)
+			klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, res.gwKey, res.err)
+			if hadOld {
+				changedGateways[res.gwKey] = true
+			}
+		} else {
+			newApplied[res.addr] = res.revs
+			newGateways[res.addr] = res.gwKey
+			if !hadOld || !slices.Equal(oldRevs, res.revs) {
+				changedGateways[res.gwKey] = true
 			}
 		}
 	}
