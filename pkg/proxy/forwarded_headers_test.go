@@ -234,6 +234,83 @@ func TestForwardedFor(t *testing.T) {
 	}
 }
 
+func TestForwarded(t *testing.T) {
+	tests := []struct {
+		name              string
+		mode              ForwardedForMode
+		remoteAddr        string
+		host              string
+		tls               *tls.ConnectionState
+		existingForwarded []string
+		expectedForwarded string
+	}{
+		{
+			name:              "replace mode: client Forwarded is dropped and replaced with gateway values",
+			mode:              ForwardedForModeReplace,
+			remoteAddr:        "192.0.2.1:54321",
+			host:              "example.com",
+			existingForwarded: []string{"for=1.1.1.1;host=other"},
+			expectedForwarded: "for=192.0.2.1;proto=http;host=example.com",
+		},
+		{
+			name:              "append mode: client element is kept and gateway element is appended",
+			mode:              ForwardedForModeAppend,
+			remoteAddr:        "192.0.2.1:54321",
+			host:              "example.com",
+			existingForwarded: []string{"for=1.1.1.1;host=other"},
+			expectedForwarded: "for=1.1.1.1;host=other, for=192.0.2.1;proto=http;host=example.com",
+		},
+		{
+			name:              "append mode: no prior Forwarded header",
+			mode:              ForwardedForModeAppend,
+			remoteAddr:        "192.0.2.1:54321",
+			host:              "example.com",
+			expectedForwarded: "for=192.0.2.1;proto=http;host=example.com",
+		},
+		{
+			name:              "append mode: IPv6 remote address is quoted and bracketed",
+			mode:              ForwardedForModeAppend,
+			remoteAddr:        "[2001:db8::1]:54321",
+			host:              "example.com",
+			existingForwarded: []string{"for=1.1.1.1;host=other"},
+			expectedForwarded: "for=1.1.1.1;host=other, for=\"[2001:db8::1]\";proto=http;host=example.com",
+		},
+		{
+			name:              "replace mode: TLS connection sets proto=https",
+			mode:              ForwardedForModeReplace,
+			remoteAddr:        "192.0.2.1:54321",
+			host:              "example.com",
+			tls:               &tls.ConnectionState{},
+			existingForwarded: []string{"for=1.1.1.1;host=other"},
+			expectedForwarded: "for=192.0.2.1;proto=https;host=example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewProxy()
+			p.SetForwardedForMode(tt.mode)
+
+			inReq := httptest.NewRequest("GET", "http://"+tt.host+"/api", nil)
+			inReq.Host = tt.host
+			inReq.RemoteAddr = tt.remoteAddr
+			inReq.TLS = tt.tls
+			for _, fwd := range tt.existingForwarded {
+				inReq.Header.Add("Forwarded", fwd)
+			}
+
+			outReq, _, err := p.buildBackendRequest(t.Context(), inReq, state.InternalBackend{Host: "backend.local", Port: 8080}, nil)
+			if err != nil {
+				t.Fatalf("buildBackendRequest failed: %v", err)
+			}
+
+			if got := outReq.Header.Get("Forwarded"); got != tt.expectedForwarded {
+				t.Errorf("expected Forwarded %q, got %q", tt.expectedForwarded, got)
+			}
+		})
+	}
+}
+
 func TestForwardedHeaders_AllPathsProduceSameHeaders(t *testing.T) {
 	type capturedHeaders struct {
 		xfp  string
