@@ -4031,6 +4031,121 @@ func TestRemoveHopByHopHeaders_TETrailers(t *testing.T) {
 	if got := hConnTe.Get("Te"); got != "" {
 		t.Errorf("expected TE listed in Connection to be removed, got %q", got)
 	}
+
+	hCustom := http.Header{
+		"Connection": []string{"X-Custom"},
+		"X-Custom":   []string{"v"},
+	}
+	removeHopByHopHeaders(hCustom)
+	if got := hCustom.Get("X-Custom"); got != "" {
+		t.Errorf("expected header listed in Connection to be removed, got %q", got)
+	}
+}
+
+func TestProxy_BackendResponseConnectionHeaderRemoved(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "X-Custom")
+		w.Header().Set("X-Custom", "v")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backendServer.Close()
+
+	u, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend server url: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	recorder := httptest.NewRecorder()
+
+	p.ServeHTTP(recorder, req)
+
+	resp := recorder.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Custom"); got != "" {
+		t.Errorf("expected X-Custom to be removed from response, got %q", got)
+	}
+	if got := resp.Header.Get("Connection"); got != "" {
+		t.Errorf("expected Connection to be removed from response, got %q", got)
+	}
+}
+
+func TestProxy_ClientConnectionHeaderCannotStripFilterAddedHeader(t *testing.T) {
+	var receivedHeaders http.Header
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backendServer.Close()
+
+	u, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend server url: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
+					},
+					RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+						Set: []gatewayv1.HTTPHeader{
+							{Name: "X-Added", Value: "gateway-value"},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	req.Header.Set("Connection", "X-Added")
+	recorder := httptest.NewRecorder()
+
+	p.ServeHTTP(recorder, req)
+
+	resp := recorder.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	if got := receivedHeaders.Get("X-Added"); got != "gateway-value" {
+		t.Errorf("expected backend to receive X-Added: gateway-value, got %q", got)
+	}
+	if got := receivedHeaders.Get("Connection"); got != "" {
+		t.Errorf("expected Connection header to be stripped, got %q", got)
+	}
 }
 
 func TestProxy_BackendConnectionReuse(t *testing.T) {
