@@ -17,8 +17,6 @@
 package main
 
 import (
-	"flag"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -79,44 +77,34 @@ func TestRun(t *testing.T) {
 	}{
 		{
 			name:        "missing socket",
-			args:        []string{"keycustodian", "--socket="},
+			args:        []string{"--socket="},
 			errContains: "--socket is required",
 		},
 		{
 			name:        "invalid allowed-uids",
-			args:        []string{"keycustodian", "--allowed-uids=abc"},
-			errContains: "Invalid --allowed-uids",
+			args:        []string{"--allowed-uids=abc"},
+			errContains: "invalid --allowed-uids",
 		},
 		{
 			name:        "invalid allowed-gids",
-			args:        []string{"keycustodian", "--allowed-gids=xyz"},
-			errContains: "Invalid --allowed-gids",
+			args:        []string{"--allowed-gids=xyz"},
+			errContains: "invalid --allowed-gids",
 		},
 		{
 			name:        "no allowed uids or gids",
-			args:        []string{"keycustodian"},
+			args:        nil,
 			errContains: "at least one of --allowed-uids or --allowed-gids must be specified",
 		},
 		{
 			name:        "invalid keys directory",
-			args:        []string{"keycustodian", "--allowed-uids=1000", "--keys-dir=/nonexistent/dir/that/does/not/exist"},
-			errContains: "Failed to initialize custodian server",
+			args:        []string{"--allowed-uids=1000", "--keys-dir=/nonexistent/dir/that/does/not/exist"},
+			errContains: "failed to initialize custodian server",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			oldCommandLine := flag.CommandLine
-			oldArgs := os.Args
-			defer func() {
-				flag.CommandLine = oldCommandLine
-				os.Args = oldArgs
-			}()
-
-			flag.CommandLine = flag.NewFlagSet(tc.args[0], flag.ContinueOnError)
-			os.Args = tc.args
-
-			err := run()
+			err := run(tc.args)
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.errContains)
 			}

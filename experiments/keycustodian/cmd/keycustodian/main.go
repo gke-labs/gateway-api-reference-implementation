@@ -17,6 +17,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -51,7 +52,9 @@ func parseIDList(input string) ([]uint32, error) {
 	return results, nil
 }
 
-func run() error {
+func run(args []string) error {
+	fs := flag.NewFlagSet("keycustodian", flag.ContinueOnError)
+
 	var (
 		socketPath     string
 		keysDirectory  string
@@ -59,45 +62,48 @@ func run() error {
 		allowedGIDsRaw string
 	)
 
-	flag.StringVar(&socketPath, "socket", "/var/run/keycustodian/keycustodian.sock", "Path to the Unix domain socket")
-	flag.StringVar(&keysDirectory, "keys-dir", "", "Directory containing PEM private keys and certificates")
-	flag.StringVar(&allowedUIDsRaw, "allowed-uids", "", "Comma-separated list of allowed caller UIDs")
-	flag.StringVar(&allowedGIDsRaw, "allowed-gids", "", "Comma-separated list of allowed caller primary GIDs")
-	flag.Parse()
+	fs.StringVar(&socketPath, "socket", "/var/run/keycustodian/keycustodian.sock", "Path to the Unix domain socket")
+	fs.StringVar(&keysDirectory, "keys-dir", "", "Directory containing PEM private keys and certificates")
+	fs.StringVar(&allowedUIDsRaw, "allowed-uids", "", "Comma-separated list of allowed caller UIDs")
+	fs.StringVar(&allowedGIDsRaw, "allowed-gids", "", "Comma-separated list of allowed caller primary GIDs")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	if socketPath == "" {
-		return fmt.Errorf("--socket is required")
+		return errors.New("--socket is required")
 	}
 
 	allowedUIDs, err := parseIDList(allowedUIDsRaw)
 	if err != nil {
-		return fmt.Errorf("Invalid --allowed-uids: %w", err)
+		return fmt.Errorf("invalid --allowed-uids: %w", err)
 	}
 
 	allowedGIDs, err := parseIDList(allowedGIDsRaw)
 	if err != nil {
-		return fmt.Errorf("Invalid --allowed-gids: %w", err)
+		return fmt.Errorf("invalid --allowed-gids: %w", err)
 	}
 
 	if len(allowedUIDs) == 0 && len(allowedGIDs) == 0 {
-		return fmt.Errorf("at least one of --allowed-uids or --allowed-gids must be specified")
+		return errors.New("at least one of --allowed-uids or --allowed-gids must be specified")
 	}
 
 	custodianServer, err := custodian.NewServer(keysDirectory)
 	if err != nil {
-		return fmt.Errorf("Failed to initialize custodian server: %w", err)
+		return fmt.Errorf("failed to initialize custodian server: %w", err)
 	}
 
 	listener, err := custodian.ListenUnix(socketPath)
 	if err != nil {
-		return fmt.Errorf("Failed to listen on unix socket %s: %w", socketPath, err)
+		return fmt.Errorf("failed to listen on unix socket %s: %w", socketPath, err)
 	}
 	defer func() {
 		if closeErr := listener.Close(); closeErr != nil {
-			log.Printf("Failed to close listener: %v", closeErr)
+			log.Printf("failed to close listener: %v", closeErr)
 		}
 		if removeErr := os.Remove(socketPath); removeErr != nil && !os.IsNotExist(removeErr) {
-			log.Printf("Failed to remove socket: %v", removeErr)
+			log.Printf("failed to remove socket: %v", removeErr)
 		}
 	}()
 
@@ -116,13 +122,13 @@ func run() error {
 
 	log.Printf("keycustodian daemon listening on %s (mode 0660)", socketPath)
 	if serveErr := grpcServer.Serve(listener); serveErr != nil {
-		return fmt.Errorf("gRPC server error: %w", serveErr)
+		return fmt.Errorf("grpc server error: %w", serveErr)
 	}
 	return nil
 }
 
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		log.Fatalf("%v", err)
 	}
 }
