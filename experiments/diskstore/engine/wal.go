@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -107,13 +108,13 @@ type WAL struct {
 	appendOff  int64 // physical file offset in active segment where next record appends
 	flushedOff int64 // physical file offset in active segment up to which data has been written to disk
 
-	nextLSN         uint64 // Next monotonic LSN to allocate under mu
-	lastAppendedLSN uint64 // Highest LSN successfully written to buffer
-	maxLSN          atomic.Uint64
-	fsyncedLSN      atomic.Uint64 // Highest LSN covered by fdatasync
-	maxSegSize      int64
+	nextLSN             uint64 // Next monotonic LSN to allocate under mu
+	lastAppendedLSN     uint64 // Highest LSN successfully written to buffer
+	maxLSN              atomic.Uint64
+	fsyncedLSN          atomic.Uint64 // Highest LSN covered by fdatasync
+	maxSegSize          int64
 	maxQuarantinedFiles int
-	createdLSNs     map[uint64]bool // Asserts never reuse/recycle segment file names
+	createdLSNs         map[uint64]bool // Asserts never reuse/recycle segment file names
 
 	writing   bool
 	writeCond *sync.Cond
@@ -141,7 +142,6 @@ type WALOptions struct {
 	TickInterval        time.Duration
 	BufferSize          int
 	MaxQuarantinedFiles int
-	MaxLostFoundFiles   int
 }
 
 // OpenWAL opens or creates a WAL in the given directory.
@@ -165,8 +165,6 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		}
 		if opts[0].MaxQuarantinedFiles > 0 {
 			maxQuarantined = opts[0].MaxQuarantinedFiles
-		} else if opts[0].MaxLostFoundFiles > 0 {
-			maxQuarantined = opts[0].MaxLostFoundFiles
 		}
 		if opts[0].BufferSize > 0 {
 			bufSize = opts[0].BufferSize
@@ -261,48 +259,49 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	return w, nil
 }
 
-var lastQuarantineNano atomic.Int64
+var quarantineCounter atomic.Uint64
 
 func uniqueQuarantinePath(lostDir, segName string) string {
-	now := time.Now().UnixNano()
-	for {
-		last := lastQuarantineNano.Load()
-		if now <= last {
-			now = last + 1
-		}
-		if lastQuarantineNano.CompareAndSwap(last, now) {
-			break
-		}
-	}
-	return filepath.Join(lostDir, fmt.Sprintf("%s.%d.%d", segName, now, os.Getpid()))
+	return filepath.Join(lostDir, fmt.Sprintf("%s.%d.%d.%d", segName, time.Now().UnixNano(), os.Getpid(), quarantineCounter.Add(1)))
 }
 
-func parseQuarantineNano(name string) int64 {
+func parseQuarantineTimestamp(name string) (int64, uint64, error) {
 	parts := strings.Split(name, ".")
-	if len(parts) >= 3 {
-		ts, err := strconv.ParseInt(parts[len(parts)-2], 10, 64)
+	if len(parts) >= 4 {
+		nano, err := strconv.ParseInt(parts[len(parts)-3], 10, 64)
 		if err != nil {
-			return 0
+			return 0, 0, fmt.Errorf("invalid quarantine timestamp in %s: %w", name, err)
 		}
-		return ts
+		counter, err := strconv.ParseUint(parts[len(parts)-1], 10, 64)
+		if err != nil {
+			return nano, 0, nil
+		}
+		return nano, counter, nil
 	}
-	return 0
+	if len(parts) >= 3 {
+		nano, err := strconv.ParseInt(parts[len(parts)-2], 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid quarantine timestamp in %s: %w", name, err)
+		}
+		return nano, 0, nil
+	}
+	return 0, 0, fmt.Errorf("invalid quarantine file name: %s", name)
 }
 
 type lostFile struct {
 	path    string
 	name    string
-	modTime time.Time
 	nano    int64
+	counter uint64
 }
 
-func pruneLostFound(fs FS, lostDir string, maxFiles int) error {
+func pruneLostFound(storeFS FS, lostDir string, maxFiles int) error {
 	if maxFiles <= 0 {
 		maxFiles = DefaultMaxQuarantinedFiles
 	}
-	entries, err := fs.ReadDir(lostDir)
+	entries, err := storeFS.ReadDir(lostDir)
 	if err != nil {
-		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 		return err
@@ -313,18 +312,15 @@ func pruneLostFound(fs FS, lostDir string, maxFiles int) error {
 		if entry.IsDir() {
 			continue
 		}
-		var mt time.Time
-		info, err := entry.Info()
-		if err != nil {
-			// Failed to stat entry; proceed with zero modTime.
-		} else {
-			mt = info.ModTime()
+		nano, counter, parseErr := parseQuarantineTimestamp(entry.Name())
+		if parseErr != nil {
+			slog.Warn("diskstore: cannot parse quarantine timestamp", "file", entry.Name(), "error", parseErr)
 		}
 		files = append(files, lostFile{
 			path:    filepath.Join(lostDir, entry.Name()),
 			name:    entry.Name(),
-			modTime: mt,
-			nano:    parseQuarantineNano(entry.Name()),
+			nano:    nano,
+			counter: counter,
 		})
 	}
 
@@ -332,25 +328,25 @@ func pruneLostFound(fs FS, lostDir string, maxFiles int) error {
 		return nil
 	}
 
-	// Sort oldest first
+	// Sort oldest first by nanosecond timestamp and per-process counter
 	sort.Slice(files, func(i, j int) bool {
-		if !files[i].modTime.IsZero() && !files[j].modTime.IsZero() && !files[i].modTime.Equal(files[j].modTime) {
-			return files[i].modTime.Before(files[j].modTime)
-		}
 		if files[i].nano != files[j].nano {
 			return files[i].nano < files[j].nano
+		}
+		if files[i].counter != files[j].counter {
+			return files[i].counter < files[j].counter
 		}
 		return files[i].name < files[j].name
 	})
 
 	toDelete := files[:len(files)-maxFiles]
 	for _, f := range toDelete {
-		if err := fs.Remove(f.path); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+		if err := storeFS.Remove(f.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("failed to remove excess quarantined file %s: %w", f.path, err)
 		}
 		slog.Warn("diskstore: deleted oldest quarantined file exceeding lost+found bound", "file", f.path)
 	}
-	return fs.SyncDir(lostDir)
+	return storeFS.SyncDir(lostDir)
 }
 
 type segmentMeta struct {

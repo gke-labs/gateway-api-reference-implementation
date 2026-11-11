@@ -82,7 +82,6 @@ type Options struct {
 	// lost+found directory. When exceeded, the oldest files are removed.
 	// If <= 0, DefaultMaxQuarantinedFiles is used.
 	MaxQuarantinedFiles int
-	MaxLostFoundFiles   int
 
 	compressionCodecSet bool
 }
@@ -183,16 +182,6 @@ func WithAutoDelete(autoDelete bool) Option {
 // If n <= 0, DefaultMaxQuarantinedFiles is used.
 func WithMaxQuarantinedFiles(n int) Option {
 	return func(o *Options) {
-		o.MaxQuarantinedFiles = n
-	}
-}
-
-// WithMaxLostFoundFiles sets the maximum number of quarantined files kept in each
-// lost+found directory. When the bound is exceeded, the oldest quarantined files are deleted.
-// If n <= 0, DefaultMaxQuarantinedFiles is used.
-func WithMaxLostFoundFiles(n int) Option {
-	return func(o *Options) {
-		o.MaxLostFoundFiles = n
 		o.MaxQuarantinedFiles = n
 	}
 }
@@ -413,11 +402,7 @@ func Open(opts ...Option) (*Engine, error) {
 		options.MaxObjectSize = DefaultMaxObjectSize
 	}
 	if options.MaxQuarantinedFiles <= 0 {
-		if options.MaxLostFoundFiles > 0 {
-			options.MaxQuarantinedFiles = options.MaxLostFoundFiles
-		} else {
-			options.MaxQuarantinedFiles = DefaultMaxQuarantinedFiles
-		}
+		options.MaxQuarantinedFiles = DefaultMaxQuarantinedFiles
 	}
 
 	dir := options.Dir
