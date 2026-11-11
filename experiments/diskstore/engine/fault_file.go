@@ -159,7 +159,7 @@ func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error
 }
 
 func (f *FaultFS) Create(name string) (File, error) {
-	return f.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	return f.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, StoreFileMode)
 }
 
 func (f *FaultFS) Open(name string) (File, error) {

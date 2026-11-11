@@ -78,6 +78,12 @@ type Options struct {
 	CompressionCodec CompressionCodec
 	MaxObjectSize    int
 
+	// MaxQuarantinedFiles is the maximum number of quarantined files kept in each
+	// lost+found directory. When exceeded, the oldest files are removed.
+	// If <= 0, DefaultMaxQuarantinedFiles is used.
+	MaxQuarantinedFiles int
+	MaxLostFoundFiles   int
+
 	compressionCodecSet bool
 }
 
@@ -172,6 +178,25 @@ func WithAutoDelete(autoDelete bool) Option {
 	}
 }
 
+// WithMaxQuarantinedFiles sets the maximum number of quarantined files kept in each
+// lost+found directory. When the bound is exceeded, the oldest quarantined files are deleted.
+// If n <= 0, DefaultMaxQuarantinedFiles is used.
+func WithMaxQuarantinedFiles(n int) Option {
+	return func(o *Options) {
+		o.MaxQuarantinedFiles = n
+	}
+}
+
+// WithMaxLostFoundFiles sets the maximum number of quarantined files kept in each
+// lost+found directory. When the bound is exceeded, the oldest quarantined files are deleted.
+// If n <= 0, DefaultMaxQuarantinedFiles is used.
+func WithMaxLostFoundFiles(n int) Option {
+	return func(o *Options) {
+		o.MaxLostFoundFiles = n
+		o.MaxQuarantinedFiles = n
+	}
+}
+
 // emptyPageTracker manages free logical page identifiers. It maintains a slice for LIFO
 // reuse order and a set for O(1) membership checks to prevent duplicate additions.
 type emptyPageTracker struct {
@@ -227,6 +252,8 @@ type Engine struct {
 	cipher           Cipher
 	compressionCodec CompressionCodec
 	maxObjectSize    int
+
+	maxQuarantinedFiles int
 
 	heapFile File
 	wal      *WAL
@@ -329,6 +356,18 @@ var (
 )
 
 const (
+	// StoreFileMode is the file mode used when creating store files (0600).
+	// Store files can hold Secret payloads, unencrypted when no cipher is configured,
+	// so other users on the node should not be able to read them.
+	StoreFileMode os.FileMode = 0600
+
+	// StoreDirMode is the directory mode used when creating store directories, including lost+found (0700).
+	StoreDirMode os.FileMode = 0700
+
+	// DefaultMaxQuarantinedFiles is the default maximum number of quarantined files
+	// kept in each lost+found directory (100).
+	DefaultMaxQuarantinedFiles = 100
+
 	// StoreFormatVersion is the format version recorded in meta.db.
 	// Version 1 did not record a version and stored uncompressed values without a codec byte.
 	// Version 2 records this version in meta.db and prefixes each stored value with a codec byte.
@@ -356,12 +395,13 @@ func isEncrypted(c Cipher) bool {
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (*Engine, error) {
 	options := Options{
-		FS:               NewOSFS(),
-		Cipher:           NoopCipher{},
-		NumPoolBlocks:    DefaultBlockPoolBlocks,
-		AutoDelete:       false,
-		CompressionCodec: CodecZstd,
-		MaxObjectSize:    DefaultMaxObjectSize,
+		FS:                  NewOSFS(),
+		Cipher:              NoopCipher{},
+		NumPoolBlocks:       DefaultBlockPoolBlocks,
+		AutoDelete:          false,
+		CompressionCodec:    CodecZstd,
+		MaxObjectSize:       DefaultMaxObjectSize,
+		MaxQuarantinedFiles: DefaultMaxQuarantinedFiles,
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -371,6 +411,13 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 	if options.MaxObjectSize <= 0 {
 		options.MaxObjectSize = DefaultMaxObjectSize
+	}
+	if options.MaxQuarantinedFiles <= 0 {
+		if options.MaxLostFoundFiles > 0 {
+			options.MaxQuarantinedFiles = options.MaxLostFoundFiles
+		} else {
+			options.MaxQuarantinedFiles = DefaultMaxQuarantinedFiles
+		}
 	}
 
 	dir := options.Dir
@@ -414,7 +461,7 @@ func Open(opts ...Option) (*Engine, error) {
 		isNewStore = true
 	} else {
 		// Read or generate database ID and verify store format version
-		metaFile, err := options.FS.OpenFile(metaPath, os.O_RDWR, 0644)
+		metaFile, err := options.FS.OpenFile(metaPath, os.O_RDWR, StoreFileMode)
 		if err != nil {
 			if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
 				// meta.db does not exist. Check if orphaned store files exist (heap.db, wal/, or oversize/)
@@ -521,7 +568,7 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 
 	if options.Create || wiped {
-		if err := options.FS.MkdirAll(dir, 0755); err != nil {
+		if err := options.FS.MkdirAll(dir, StoreDirMode); err != nil {
 			return nil, fmt.Errorf("failed to create store dir: %w", err)
 		}
 		if err := options.FS.SyncDir(dir); err != nil {
@@ -529,7 +576,7 @@ func Open(opts ...Option) (*Engine, error) {
 		}
 	}
 
-	if err := options.FS.MkdirAll(oversizeDir, 0755); err != nil {
+	if err := options.FS.MkdirAll(oversizeDir, StoreDirMode); err != nil {
 		return nil, fmt.Errorf("failed to create oversize directory: %w", err)
 	}
 
@@ -562,13 +609,13 @@ func Open(opts ...Option) (*Engine, error) {
 
 	// Open heap file with direct I/O flag
 	openFlags := os.O_RDWR | os.O_CREATE | DirectIOOpenFlag()
-	heapFile, err := options.FS.OpenFile(heapPath, openFlags, 0644)
+	heapFile, err := options.FS.OpenFile(heapPath, openFlags, StoreFileMode)
 	if err != nil {
 		if DirectIOOpenFlag() != 0 {
 			GlobalMetrics.DirectIOFallbackCount.Add(1)
 		}
 		// Fallback without O_DIRECT if filesystem doesn't support it (e.g. tmpfs)
-		heapFile, err = options.FS.OpenFile(heapPath, os.O_RDWR|os.O_CREATE, 0644)
+		heapFile, err = options.FS.OpenFile(heapPath, os.O_RDWR|os.O_CREATE, StoreFileMode)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open heap file: %w", err)
 		}
@@ -594,28 +641,30 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 
 	s := &Engine{
-		fs:               options.FS,
-		dir:              dir,
-		dbID:             dbID,
-		isTemp:           isTemp,
-		autoDelete:       options.AutoDelete,
-		cipher:           options.Cipher,
-		compressionCodec: options.CompressionCodec,
-		maxObjectSize:    options.MaxObjectSize,
-		heapFile:         heapFile,
-		keyIndex:         make(map[string]KeyIndexEntry),
-		oversizeObjects:  make(map[string][]byte),
-		emptyPages:       newEmptyPageTracker(nil),
-		failedCh:         make(chan struct{}),
-		closedCh:         make(chan struct{}),
-		wiped:            wiped,
-		nextLogicalPage:  1,
+		fs:                  options.FS,
+		dir:                 dir,
+		dbID:                dbID,
+		isTemp:              isTemp,
+		autoDelete:          options.AutoDelete,
+		cipher:              options.Cipher,
+		compressionCodec:    options.CompressionCodec,
+		maxObjectSize:       options.MaxObjectSize,
+		maxQuarantinedFiles: options.MaxQuarantinedFiles,
+		heapFile:            heapFile,
+		keyIndex:            make(map[string]KeyIndexEntry),
+		oversizeObjects:     make(map[string][]byte),
+		emptyPages:          newEmptyPageTracker(nil),
+		failedCh:            make(chan struct{}),
+		closedCh:            make(chan struct{}),
+		wiped:               wiped,
+		nextLogicalPage:     1,
 	}
 
 	if isNewStore {
 		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{
-			OnFailure: s.setFailed,
-			Clock:     options.Clock,
+			OnFailure:           s.setFailed,
+			Clock:               options.Clock,
+			MaxQuarantinedFiles: options.MaxQuarantinedFiles,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -647,8 +696,9 @@ func Open(opts ...Option) (*Engine, error) {
 
 		// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
 		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{
-			OnFailure: s.setFailed,
-			Clock:     options.Clock,
+			OnFailure:           s.setFailed,
+			Clock:               options.Clock,
+			MaxQuarantinedFiles: options.MaxQuarantinedFiles,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -764,7 +814,7 @@ func decodeOversizeFile(data []byte) (string, uint64, []byte, error) {
 
 func writeOversizeFileWithTemp(fs FS, storeDir string, qualifiedKey string, lsn uint64, payload []byte) error {
 	dir := filepath.Join(storeDir, "oversize")
-	if err := fs.MkdirAll(dir, 0755); err != nil {
+	if err := fs.MkdirAll(dir, StoreDirMode); err != nil {
 		return fmt.Errorf("failed to create oversize dir: %w", err)
 	}
 
@@ -775,7 +825,7 @@ func writeOversizeFileWithTemp(fs FS, storeDir string, qualifiedKey string, lsn 
 	tempName := fmt.Sprintf(".tmp-%x-%d", sha256.Sum256([]byte(qualifiedKey)), lsn)
 	tempPath := filepath.Join(dir, tempName)
 
-	tempFile, err := fs.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	tempFile, err := fs.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
 	if err != nil {
 		return fmt.Errorf("failed to create temp oversize file: %w", err)
 	}
@@ -883,7 +933,7 @@ func (s *Engine) loadOversizeObjects() error {
 		// Do not load oversize files from future uncommitted writes beyond recovered WAL LSN.
 		// Quarantine to lost+found for optional offline recovery/reconstruction.
 		if s.wal != nil && lsn > s.wal.MaxLSN() {
-			if err := s.fs.MkdirAll(lostDir, 0755); err != nil {
+			if err := s.fs.MkdirAll(lostDir, StoreDirMode); err != nil {
 				return fmt.Errorf("failed to create oversize lost+found dir: %w", err)
 			}
 			dest := uniqueQuarantinePath(lostDir, name)
@@ -917,7 +967,13 @@ func (s *Engine) loadOversizeObjects() error {
 		s.oversizeObjects[qKey] = bytes.Clone(payload)
 		GlobalMetrics.OversizeObjectsCount.Add(1)
 	}
+	if err := pruneLostFound(s.fs, lostDir, s.maxQuarantinedFiles); err != nil {
+		return fmt.Errorf("failed to prune oversize lost+found dir: %w", err)
+	}
 	if movedUncommitted {
+		if err := s.fs.SyncDir(lostDir); err != nil {
+			return fmt.Errorf("failed to sync oversize lost+found dir: %w", err)
+		}
 		if err := s.fs.SyncDir(oversizeDir); err != nil {
 			return fmt.Errorf("failed to sync oversize dir after moving uncommitted files: %w", err)
 		}
@@ -943,7 +999,7 @@ func (s *Engine) setFailed(err error) {
 
 func (s *Engine) writeFailureMarker(err error) error {
 	markerPath := filepath.Join(s.dir, "FAILED")
-	f, openErr := s.fs.OpenFile(markerPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, openErr := s.fs.OpenFile(markerPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
 	if openErr != nil {
 		return openErr
 	}

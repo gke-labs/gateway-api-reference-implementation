@@ -439,7 +439,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	removeOversizeFileIfOlder := func(qKey string, recordLSN uint64) error {
 		oversizeDir := filepath.Join(storeDir, "oversize")
 		oversizePath := filepath.Join(oversizeDir, oversizeFileName(qKey))
-		file, openErr := fs.OpenFile(oversizePath, os.O_RDONLY, 0644)
+		file, openErr := fs.OpenFile(oversizePath, os.O_RDONLY, StoreFileMode)
 		if openErr != nil {
 			if errors.Is(openErr, os.ErrNotExist) {
 				return nil

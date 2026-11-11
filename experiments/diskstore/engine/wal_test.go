@@ -1094,3 +1094,62 @@ func TestRegression_WALZeroPaddingRecovery(t *testing.T) {
 		t.Fatalf("expected record 2 LSN %d, got %d", secondLSN, secondReadRecord.LSN)
 	}
 }
+
+func TestWAL_LostFoundQuarantineBound(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("wal-bound-test-1"))
+	walDir := "wal"
+	if err := memFS.MkdirAll(walDir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	writeSeg := func(startLSN uint64) string {
+		name := segmentFileName(startLSN)
+		p := filepath.Join(walDir, name)
+		f, err := memFS.OpenFile(p, os.O_CREATE|os.O_RDWR, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+		return name
+	}
+
+	seg2 := writeSeg(2)
+	seg3 := writeSeg(3)
+	seg4 := writeSeg(4)
+
+	wal, err := OpenWAL(memFS, walDir, dbID, 1, WALOptions{MaxQuarantinedFiles: 2})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	lostDir := filepath.Join(walDir, "lost+found")
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 quarantined files in lost+found, got %d", len(entries))
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), seg2) {
+			t.Fatalf("oldest segment %s was not removed from lost+found", seg2)
+		}
+	}
+	var found3, found4 bool
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), seg3) {
+			found3 = true
+		}
+		if strings.HasPrefix(e.Name(), seg4) {
+			found4 = true
+		}
+	}
+	if !found3 || !found4 {
+		t.Fatalf("expected segments %s and %s in lost+found, found3=%v, found4=%v", seg3, seg4, found3, found4)
+	}
+}

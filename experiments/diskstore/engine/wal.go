@@ -112,6 +112,7 @@ type WAL struct {
 	maxLSN          atomic.Uint64
 	fsyncedLSN      atomic.Uint64 // Highest LSN covered by fdatasync
 	maxSegSize      int64
+	maxQuarantinedFiles int
 	createdLSNs     map[uint64]bool // Asserts never reuse/recycle segment file names
 
 	writing   bool
@@ -134,16 +135,18 @@ type WAL struct {
 
 // WALOptions configures a WAL instance.
 type WALOptions struct {
-	MaxSegmentSize int64
-	OnFailure      func(error)
-	Clock          Clock
-	TickInterval   time.Duration
-	BufferSize     int
+	MaxSegmentSize      int64
+	OnFailure           func(error)
+	Clock               Clock
+	TickInterval        time.Duration
+	BufferSize          int
+	MaxQuarantinedFiles int
+	MaxLostFoundFiles   int
 }
 
 // OpenWAL opens or creates a WAL in the given directory.
 func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOptions) (*WAL, error) {
-	if err := fs.MkdirAll(dir, 0755); err != nil {
+	if err := fs.MkdirAll(dir, StoreDirMode); err != nil {
 		return nil, fmt.Errorf("failed to create WAL directory: %w", err)
 	}
 	if err := fs.SyncDir(dir); err != nil {
@@ -152,12 +155,18 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 
 	maxSegSize := int64(DefaultMaxSegmentSize)
 	bufSize := DefaultWALBufferSize
+	maxQuarantined := DefaultMaxQuarantinedFiles
 	var onFailure func(error)
 	var clock Clock = realClock{}
 	var tickInterval time.Duration
 	if len(opts) > 0 {
 		if opts[0].MaxSegmentSize > 0 {
 			maxSegSize = opts[0].MaxSegmentSize
+		}
+		if opts[0].MaxQuarantinedFiles > 0 {
+			maxQuarantined = opts[0].MaxQuarantinedFiles
+		} else if opts[0].MaxLostFoundFiles > 0 {
+			maxQuarantined = opts[0].MaxLostFoundFiles
 		}
 		if opts[0].BufferSize > 0 {
 			bufSize = opts[0].BufferSize
@@ -178,21 +187,22 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	}
 
 	w := &WAL{
-		fs:              fs,
-		dir:             dir,
-		dbID:            dbID,
-		bufSize:         bufSize,
-		bufs:            [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
-		maxSegSize:      maxSegSize,
-		createdLSNs:     make(map[uint64]bool),
-		nextLSN:         initialLSN + 1,
-		lastAppendedLSN: initialLSN,
-		clock:           clock,
-		tickInterval:    tickInterval,
-		wakeCh:          make(chan struct{}, 1),
-		bgStop:          make(chan struct{}),
-		bgDone:          make(chan struct{}),
-		onFailure:       onFailure,
+		fs:                  fs,
+		dir:                 dir,
+		dbID:                dbID,
+		bufSize:             bufSize,
+		bufs:                [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
+		maxSegSize:          maxSegSize,
+		maxQuarantinedFiles: maxQuarantined,
+		createdLSNs:         make(map[uint64]bool),
+		nextLSN:             initialLSN + 1,
+		lastAppendedLSN:     initialLSN,
+		clock:               clock,
+		tickInterval:        tickInterval,
+		wakeCh:              make(chan struct{}, 1),
+		bgStop:              make(chan struct{}),
+		bgDone:              make(chan struct{}),
+		onFailure:           onFailure,
 	}
 	w.syncCond = sync.NewCond(&w.mu)
 	w.writeCond = sync.NewCond(&w.mu)
@@ -209,7 +219,7 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		if seg.startLSN > initialLSN {
 			// Abandoned segment from uncommitted rotation past recovered LSN.
 			// Quarantine to lost+found for optional offline recovery/reconstruction.
-			if err := w.fs.MkdirAll(lostDir, 0755); err != nil {
+			if err := w.fs.MkdirAll(lostDir, StoreDirMode); err != nil {
 				return nil, fmt.Errorf("failed to create lost+found dir: %w", err)
 			}
 			dest := uniqueQuarantinePath(lostDir, seg.name)
@@ -225,6 +235,9 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 			continue
 		}
 		w.createdLSNs[seg.startLSN] = true
+	}
+	if err := pruneLostFound(w.fs, lostDir, w.maxQuarantinedFiles); err != nil {
+		return nil, fmt.Errorf("failed to prune lost+found dir: %w", err)
 	}
 	if movedAbandoned {
 		// A rename across directories changes two directory entries.
@@ -248,8 +261,96 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	return w, nil
 }
 
+var lastQuarantineNano atomic.Int64
+
 func uniqueQuarantinePath(lostDir, segName string) string {
-	return filepath.Join(lostDir, fmt.Sprintf("%s.%d.%d", segName, time.Now().UnixNano(), os.Getpid()))
+	now := time.Now().UnixNano()
+	for {
+		last := lastQuarantineNano.Load()
+		if now <= last {
+			now = last + 1
+		}
+		if lastQuarantineNano.CompareAndSwap(last, now) {
+			break
+		}
+	}
+	return filepath.Join(lostDir, fmt.Sprintf("%s.%d.%d", segName, now, os.Getpid()))
+}
+
+func parseQuarantineNano(name string) int64 {
+	parts := strings.Split(name, ".")
+	if len(parts) >= 3 {
+		ts, err := strconv.ParseInt(parts[len(parts)-2], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return ts
+	}
+	return 0
+}
+
+type lostFile struct {
+	path    string
+	name    string
+	modTime time.Time
+	nano    int64
+}
+
+func pruneLostFound(fs FS, lostDir string, maxFiles int) error {
+	if maxFiles <= 0 {
+		maxFiles = DefaultMaxQuarantinedFiles
+	}
+	entries, err := fs.ReadDir(lostDir)
+	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	var files []lostFile
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		var mt time.Time
+		info, err := entry.Info()
+		if err != nil {
+			// Failed to stat entry; proceed with zero modTime.
+		} else {
+			mt = info.ModTime()
+		}
+		files = append(files, lostFile{
+			path:    filepath.Join(lostDir, entry.Name()),
+			name:    entry.Name(),
+			modTime: mt,
+			nano:    parseQuarantineNano(entry.Name()),
+		})
+	}
+
+	if len(files) <= maxFiles {
+		return nil
+	}
+
+	// Sort oldest first
+	sort.Slice(files, func(i, j int) bool {
+		if !files[i].modTime.IsZero() && !files[j].modTime.IsZero() && !files[i].modTime.Equal(files[j].modTime) {
+			return files[i].modTime.Before(files[j].modTime)
+		}
+		if files[i].nano != files[j].nano {
+			return files[i].nano < files[j].nano
+		}
+		return files[i].name < files[j].name
+	})
+
+	toDelete := files[:len(files)-maxFiles]
+	for _, f := range toDelete {
+		if err := fs.Remove(f.path); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to remove excess quarantined file %s: %w", f.path, err)
+		}
+		slog.Warn("diskstore: deleted oldest quarantined file exceeding lost+found bound", "file", f.path)
+	}
+	return fs.SyncDir(lostDir)
 }
 
 type segmentMeta struct {
@@ -562,13 +663,13 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 	path := filepath.Join(w.dir, name)
 
 	openFlags := os.O_RDWR | os.O_CREATE | DirectIOOpenFlag()
-	f, err := w.fs.OpenFile(path, openFlags, 0644)
+	f, err := w.fs.OpenFile(path, openFlags, StoreFileMode)
 	if err != nil {
 		if DirectIOOpenFlag() != 0 {
 			GlobalMetrics.DirectIOFallbackCount.Add(1)
 		}
 		// Fallback without DirectIOOpenFlag if not supported by FS
-		f, err = w.fs.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+		f, err = w.fs.OpenFile(path, os.O_RDWR|os.O_CREATE, StoreFileMode)
 		if err != nil {
 			return fmt.Errorf("failed to create WAL segment %s: %w", name, err)
 		}
