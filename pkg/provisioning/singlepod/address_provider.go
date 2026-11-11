@@ -1122,14 +1122,8 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		return nil
 	}
 	p.revMu.Lock()
-	oldRev, exists := p.currentRevisions[gwKey]
-	revChanged := !exists || oldRev != config.Revision
 	p.currentRevisions[gwKey] = config.Revision
 	p.revMu.Unlock()
-
-	if revChanged {
-		p.triggerReconcile(ctx, gwKey)
-	}
 
 	name := ResourceNameForGateway(gw.Name)
 
@@ -1202,6 +1196,7 @@ func readyEndpointAddresses(slices []discoveryv1.EndpointSlice) []string {
 func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey types.NamespacedName, name string, addresses []gatewayv1.GatewayStatusAddress) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	currentRev := p.currentRevisionForGateway(gwKey)
 	if currentRev == "" {
+		klog.V(2).Infof("Gateway %s readiness is Pending: waiting for data-plane configuration to be published (expected revision is empty)", gwKey)
 		return addresses, state.GatewayReadiness{
 			Ready:   false,
 			Reason:  string(gatewayv1.GatewayReasonPending),
@@ -1213,11 +1208,17 @@ func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey t
 	if err := p.client.List(ctx, &slicesList, client.InNamespace(gwKey.Namespace), client.MatchingLabels{
 		discoveryv1.LabelServiceName: name,
 	}); err != nil {
-		return nil, state.GatewayReadiness{}, err
+		klog.V(2).Infof("Gateway %s readiness is Pending: error listing EndpointSlices for Service %s/%s: %v", gwKey, gwKey.Namespace, name, err)
+		return addresses, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonPending),
+			Message: "Waiting for data-plane replicas to apply current configuration",
+		}, nil
 	}
 
 	readyEndpoints := readyEndpointAddresses(slicesList.Items)
 	if len(readyEndpoints) == 0 {
+		klog.V(2).Infof("Gateway %s readiness is Pending: no ready endpoints found in EndpointSlices (expected revision %s)", gwKey, currentRev)
 		return addresses, state.GatewayReadiness{
 			Ready:   false,
 			Reason:  string(gatewayv1.GatewayReasonPending),
@@ -1227,15 +1228,27 @@ func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey t
 
 	p.endpointMu.Lock()
 	defer p.endpointMu.Unlock()
+	pending := false
 	for _, addr := range readyEndpoints {
 		applied := p.appliedRevisions[addr]
 		if !slices.Contains(applied, currentRev) {
-			return addresses, state.GatewayReadiness{
-				Ready:   false,
-				Reason:  string(gatewayv1.GatewayReasonPending),
-				Message: "Waiting for data-plane replicas to apply current configuration",
-			}, nil
+			pending = true
+			break
 		}
+	}
+
+	if pending {
+		endpointSummaries := make([]string, 0, len(readyEndpoints))
+		for _, addr := range readyEndpoints {
+			endpointSummaries = append(endpointSummaries, fmt.Sprintf("%s=%v", addr, p.appliedRevisions[addr]))
+		}
+		klog.V(2).Infof("Gateway %s readiness is Pending: expected revision %s, endpoints: [%s]",
+			gwKey, currentRev, strings.Join(endpointSummaries, ", "))
+		return addresses, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonPending),
+			Message: "Waiting for data-plane replicas to apply current configuration",
+		}, nil
 	}
 
 	return addresses, state.GatewayReadiness{
@@ -1352,38 +1365,36 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 		wg.Wait()
 	}
 
-	newApplied := make(map[string][]string)
-	newGateways := make(map[string]types.NamespacedName)
+	liveEndpoints := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		liveEndpoints[target.addr] = true
+	}
+
 	changedGateways := make(map[types.NamespacedName]bool)
 
-	for _, res := range results {
-		p.endpointMu.Lock()
-		oldRevs, hadOld := p.appliedRevisions[res.addr]
-		p.endpointMu.Unlock()
+	p.endpointMu.Lock()
+	// Endpoints that disappeared from EndpointSlices drop out of the map.
+	for addr, oldGwKey := range p.endpointGateways {
+		if !liveEndpoints[addr] {
+			delete(p.appliedRevisions, addr)
+			delete(p.endpointGateways, addr)
+			changedGateways[oldGwKey] = true
+		}
+	}
 
+	for _, res := range results {
+		oldRevs, hadOld := p.appliedRevisions[res.addr]
 		if res.err != nil {
 			targetURL := p.appliedURL(res.addr)
 			klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, res.gwKey, res.err)
-			if hadOld {
-				changedGateways[res.gwKey] = true
-			}
 		} else {
-			newApplied[res.addr] = res.revs
-			newGateways[res.addr] = res.gwKey
+			p.appliedRevisions[res.addr] = res.revs
+			p.endpointGateways[res.addr] = res.gwKey
 			if !hadOld || !slices.Equal(oldRevs, res.revs) {
 				changedGateways[res.gwKey] = true
 			}
 		}
 	}
-
-	p.endpointMu.Lock()
-	for addr, oldGwKey := range p.endpointGateways {
-		if _, stillPresent := newApplied[addr]; !stillPresent {
-			changedGateways[oldGwKey] = true
-		}
-	}
-	p.appliedRevisions = newApplied
-	p.endpointGateways = newGateways
 	p.endpointMu.Unlock()
 
 	for gwKey := range changedGateways {
