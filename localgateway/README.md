@@ -22,6 +22,7 @@ It is purpose-built to serve single-label `.local` hostnames (such as `grafana.l
   - **Lifecycle Management:** Sends unsolicited mDNS announcements when claiming a name, re-announces when interface addresses change, and sends goodbye (TTL 0) packets when a listener or Gateway is deleted and during graceful shutdown.
   - **Status Reporting:** Provides a `Published` condition on each listener indicating whether its hostname is published, probing, in conflict, or rejected.
 - **Privileged Port 80 on hostNetwork:** The container image has `cap_net_bind_service=+ep` set on the binary, allowing non-root UID 65532 to bind port 80 when the container spec includes capability `NET_BIND_SERVICE`. If running in environments where the container runtime does not grant file capabilities, running as root (`runAsUser: 0`) is also supported.
+- **Auxiliary Port (8999):** The auxiliary port (8999 by default) exposes readiness and Prometheus metrics without authentication, so on a shared LAN restrict it with a host firewall rule (it exposes no configuration or secrets).
 
 ---
 
@@ -116,6 +117,6 @@ curl -v -H "Host: grafana.local" http://<NODE_LAN_IP>/
 | `--mdns-port` | `5353` | UDP port for mDNS responder |
 | `--interface` | `""` | Network interface to read LAN IP(s) from (e.g. `eth0`). If unset, node addresses are used. |
 | `--node-name` | `$NODE_NAME` | Kubernetes node name for resolving fallback LAN addresses |
-| `--metrics-bind-address` | `:8080` | Address for Prometheus metrics |
-| `--health-probe-bind-address` | `:8081` | Address for `/readyz` and `/healthz` health probes |
+| `--metrics-bind-address` | `:8999` | Address for Prometheus metrics |
+| `--health-probe-bind-address` | `:8999` | Address for `/readyz` and `/healthz` health probes |
 | `--leader-elect` | `false` | Enable leader election |

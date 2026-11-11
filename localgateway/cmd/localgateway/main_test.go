@@ -56,6 +56,12 @@ func TestBuildOptions(t *testing.T) {
 		if opts.LeaderElectionID != "localgateway-controller" {
 			t.Errorf("expected LeaderElectionID 'localgateway-controller', got %q", opts.LeaderElectionID)
 		}
+		if opts.MetricsAddr != ":8999" {
+			t.Errorf("expected MetricsAddr :8999, got %q", opts.MetricsAddr)
+		}
+		if opts.HealthProbeBindAddress != ":8999" {
+			t.Errorf("expected HealthProbeBindAddress :8999, got %q", opts.HealthProbeBindAddress)
+		}
 		if cfg.Interface != "" {
 			t.Errorf("expected empty cfg.Interface, got %q", cfg.Interface)
 		}
