@@ -158,6 +158,14 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 		m.opts.BindingStore.Prune(now, 30*24*time.Hour)
 	}
 
+	m.inFlightMu.Lock()
+	for revalKey, nextAllowed := range m.failedRevalidations {
+		if now.After(nextAllowed) || now.Equal(nextAllowed) {
+			delete(m.failedRevalidations, revalKey)
+		}
+	}
+	m.inFlightMu.Unlock()
+
 	m.mu.Lock()
 
 	type dueTask struct {

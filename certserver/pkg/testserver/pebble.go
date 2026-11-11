@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/letsencrypt/pebble/v2/ca"
@@ -52,6 +53,7 @@ type Server struct {
 	dnsServer       *dns.Server
 	dnsListener     net.Listener
 	pebbleServer    *httptest.Server
+	orderCount      *atomic.Int64
 
 	// mu guards closed state to prevent concurrent or duplicate server shutdown.
 	mu     sync.Mutex
@@ -134,7 +136,15 @@ func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 	pebbleVA := va.New(logger, challengePort, 0, false, dnsAddr, memDB)
 	pebbleWFE := wfe.New(logger, memDB, pebbleVA, pebbleCA, []string{"pebble.letsencrypt.org"}, false, eabRequired, 0, 0)
 
-	pebbleSrv := httptest.NewTLSServer(pebbleWFE.Handler())
+	orderCount := &atomic.Int64{}
+	pebbleHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/order-plz" && r.Method == http.MethodPost {
+			orderCount.Add(1)
+		}
+		pebbleWFE.Handler().ServeHTTP(w, r)
+	})
+
+	pebbleSrv := httptest.NewTLSServer(pebbleHandler)
 	dirURL := fmt.Sprintf("%s%s", pebbleSrv.URL, wfe.DirectoryPath)
 
 	srv := &Server{
@@ -145,6 +155,7 @@ func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 		dnsServer:       dnsSrv,
 		dnsListener:     dnsListener,
 		pebbleServer:    pebbleSrv,
+		orderCount:      orderCount,
 	}
 
 	t.Cleanup(func() {
@@ -152,6 +163,14 @@ func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 	})
 
 	return srv
+}
+
+// OrderCount returns the number of ACME orders received by Pebble.
+func (s *Server) OrderCount() int {
+	if s.orderCount == nil {
+		return 0
+	}
+	return int(s.orderCount.Load())
 }
 
 // Close shuts down the in-process test servers.

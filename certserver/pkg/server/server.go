@@ -50,6 +50,7 @@ type Options struct {
 	MaxHostnameLength int        // Maximum length of a single hostname (e.g. 253)
 	RateLimitQPS      rate.Limit // Per-identity rate limit (queries per second)
 	RateLimitBurst    int        // Per-identity burst size
+	LookupIP          func(ctx context.Context, host string) ([]net.IP, error)
 }
 
 // Server implements certserverv1.CertificateServiceServer.
@@ -96,6 +97,11 @@ func NewServer(
 	}
 	if opts.MaxHostnameLength <= 0 {
 		opts.MaxHostnameLength = 253
+	}
+	if opts.LookupIP == nil {
+		opts.LookupIP = func(ctx context.Context, host string) ([]net.IP, error) {
+			return net.DefaultResolver.LookupIP(ctx, "ip", host)
+		}
 	}
 
 	limiter := registry.NewIdentityRateLimiter(opts.RateLimitQPS, opts.RateLimitBurst)
@@ -264,7 +270,6 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 		return nil, status.Errorf(codes.PermissionDenied, "hostname policy refused: %v", err)
 	}
 
-	// 7. Record Gateway binding mapping
 	requester := challenge.Requester{
 		ClusterID:               cluster.ClusterID,
 		Gateway:                 gateway,
@@ -272,29 +277,44 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 		HostnamesKey:            hostnamesKey,
 	}
 
-	s.bindingStore.RecordBinding(registry.Binding{
-		ClusterID:               cluster.ClusterID,
-		Gateway:                 gateway,
-		DataPlaneServiceAccount: dataPlaneSA,
-		Hostnames:               normalized,
-		RecordedAt:              time.Now(),
-	})
-
-	// 8. Check certificate cache via manager interface
+	// 7. Check certificate cache via manager interface
 	now := time.Now()
 	certData, err := s.mgr.GetCertificate(hostnamesKey, s.opts.ReleaseMode)
 	if err == nil && certData != nil {
 		// Cache hit! Check if this Gateway has passed its own binding check for these hostnames
 		if s.bindingStore.HasValidatedBinding(cluster.ClusterID, gateway, hostnamesKey, now) {
+			s.bindingStore.RecordBinding(registry.Binding{
+				ClusterID:               cluster.ClusterID,
+				Gateway:                 gateway,
+				DataPlaneServiceAccount: dataPlaneSA,
+				Hostnames:               normalized,
+				RecordedAt:              now,
+			})
+
 			audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionAllowed, "certificate returned from cache")
 
 			return &certserverv1.GetCertificateResponse{
 				CertificateChain: certData.CertificateChain,
 				PrivateKey:       certData.PrivateKey,
+				Challenges:       s.mgr.GetPendingChallenges(ctx, requester),
 			}, nil
 		}
 
 		// Second requester / unvalidated gateway attempting to access cached certificate
+		// Run address check before RecordBinding so that requests failing the check leave no binding behind.
+		if err := s.checkAttestedAddresses(ctx, normalized, req.GetAddresses()); err != nil {
+			audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionRefused, fmt.Sprintf("address check failed: %v", err))
+			return nil, status.Errorf(codes.FailedPrecondition, "address check failed: %v", err)
+		}
+
+		s.bindingStore.RecordBinding(registry.Binding{
+			ClusterID:               cluster.ClusterID,
+			Gateway:                 gateway,
+			DataPlaneServiceAccount: dataPlaneSA,
+			Hostnames:               normalized,
+			RecordedAt:              now,
+		})
+
 		audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionRefused, "cached certificate requires binding validation for this gateway")
 
 		// Trigger revalidation for this requester to validate its domain control
@@ -313,7 +333,14 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 		return nil, status.Errorf(codes.Internal, "internal error retrieving certificate")
 	}
 
-	// 9. Cache miss: start issuance only if none in flight, passing requester binding info
+	// 8. Cache miss: record Gateway binding and start issuance only if none in flight, passing requester binding info
+	s.bindingStore.RecordBinding(registry.Binding{
+		ClusterID:               cluster.ClusterID,
+		Gateway:                 gateway,
+		DataPlaneServiceAccount: dataPlaneSA,
+		Hostnames:               normalized,
+		RecordedAt:              now,
+	})
 	if _, err := s.mgr.EnsureIssuance(ctx, normalized, requester); err != nil {
 		log.Printf("certserver: failed to initiate issuance for %s: %v", hostnamesKey, err)
 	}
@@ -323,4 +350,57 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 	return &certserverv1.GetCertificateResponse{
 		Challenges: s.mgr.GetPendingChallenges(ctx, requester),
 	}, nil
+}
+
+// maxAttestedAddresses is the maximum number of attested addresses accepted in a request.
+// Bounding the addresses prevents excessive DNS lookups and comparisons.
+const maxAttestedAddresses = 16
+
+// checkAttestedAddresses resolves each requested hostname through public DNS and verifies that at
+// least one resolved IP is among the Gateway's attested addresses from the request.
+// Because the addresses come from the requester, this check filters requests early and the probe is the proof.
+func (s *Server) checkAttestedAddresses(ctx context.Context, hostnames []string, attestedAddresses []string) error {
+	if len(attestedAddresses) == 0 {
+		return errors.New("no attested addresses provided in request")
+	}
+	if len(attestedAddresses) > maxAttestedAddresses {
+		return fmt.Errorf("attested addresses count %d exceeds maximum allowed (%d)", len(attestedAddresses), maxAttestedAddresses)
+	}
+
+	attestedIPs := make([]net.IP, 0, len(attestedAddresses))
+	for _, address := range attestedAddresses {
+		if ip := net.ParseIP(strings.TrimSpace(address)); ip != nil {
+			attestedIPs = append(attestedIPs, ip)
+		}
+	}
+	if len(attestedIPs) == 0 {
+		return errors.New("no valid IP addresses in attested addresses")
+	}
+
+	for _, hostname := range hostnames {
+		resolvedIPs, err := s.opts.LookupIP(ctx, hostname)
+		if err != nil {
+			return fmt.Errorf("resolving hostname %q: %w", hostname, err)
+		}
+		if len(resolvedIPs) == 0 {
+			return fmt.Errorf("hostname %q did not resolve to any addresses", hostname)
+		}
+
+		var matched bool
+		for _, resolved := range resolvedIPs {
+			for _, attested := range attestedIPs {
+				if resolved.Equal(attested) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("hostname %q does not resolve to any attested Gateway address", hostname)
+		}
+	}
+	return nil
 }
