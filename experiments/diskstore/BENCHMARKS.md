@@ -7,7 +7,7 @@ This document records comparative benchmark measurements between the in-memory I
 - **Date:** 2026-11-10
 - **Commit:** commit 17a3ca2 plus this change
 - **Machine:** AMD EPYC 9B14 (60 vCPUs, 235 GiB RAM, Linux 6.12.110+ x86_64)
-- **Go Version:** `go1.27.4 linux/amd64`
+- **Go Version:** `go1.27.3 linux/amd64`
 
 ---
 
