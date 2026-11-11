@@ -2154,6 +2154,201 @@ func TestProxyRequestBodyStreaming(t *testing.T) {
 	})
 }
 
+func TestProxy_RequestTimeout_SlowBody(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	u, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		t.Fatalf("failed to split host and port: %v", err)
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Timeouts: &state.InternalTimeouts{
+						Request: state.Ptr(1 * time.Second),
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	proxyServer := httptest.NewServer(p)
+	defer proxyServer.Close()
+
+	pipeReader, pipeWriter := io.Pipe()
+	go func() {
+		defer pipeWriter.Close()
+		for {
+			if _, writeErr := pipeWriter.Write([]byte("x")); writeErr != nil {
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
+
+	start := time.Now()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxyServer.URL+"/test", pipeReader)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	duration := time.Since(start)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("expected status 504 Gateway Timeout, got %d", resp.StatusCode)
+	}
+	if duration > 4*time.Second {
+		t.Fatalf("expected timeout within a few seconds, took %v", duration)
+	}
+}
+
+func TestProxy_BodyReadDeadline(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer backendServer.Close()
+
+	u, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		t.Fatalf("failed to split host and port: %v", err)
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	t.Run("client that stalls longer than deadline is disconnected", func(t *testing.T) {
+		p := NewProxy()
+		p.SetBodyReadTimeout(150 * time.Millisecond)
+		p.UpdateRoutes([]state.InternalRoute{
+			{
+				Rules: []state.InternalRule{
+					{
+						Backends: []state.InternalBackend{
+							{Host: host, Port: int32(port), Weight: 1},
+						},
+					},
+				},
+			},
+		})
+
+		proxyServer := httptest.NewServer(p)
+		defer proxyServer.Close()
+
+		conn, err := net.DialTimeout("tcp", proxyServer.Listener.Addr().String(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("failed to dial: %v", err)
+		}
+		defer conn.Close()
+
+		// Send headers with Content-Length: 100, then send only 5 bytes and stall
+		reqHeaders := fmt.Sprintf("POST /test HTTP/1.1\r\nHost: %s\r\nContent-Length: 100\r\n\r\nhello", proxyServer.Listener.Addr().String())
+		if _, err := conn.Write([]byte(reqHeaders)); err != nil {
+			t.Fatalf("failed to write headers: %v", err)
+		}
+
+		// Read from connection until it is disconnected (closed) by server
+		start := time.Now()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 1024)
+		for {
+			_, rerr := conn.Read(buf)
+			if rerr != nil {
+				break
+			}
+		}
+		elapsed := time.Since(start)
+
+		if elapsed < 80*time.Millisecond || elapsed > 1500*time.Millisecond {
+			t.Errorf("expected connection to be disconnected around 150ms, elapsed %v", elapsed)
+		}
+	})
+
+	t.Run("client that sends steadily for longer than deadline completes", func(t *testing.T) {
+		p := NewProxy()
+		p.SetBodyReadTimeout(150 * time.Millisecond)
+		p.UpdateRoutes([]state.InternalRoute{
+			{
+				Rules: []state.InternalRule{
+					{
+						Backends: []state.InternalBackend{
+							{Host: host, Port: int32(port), Weight: 1},
+						},
+					},
+				},
+			},
+		})
+
+		proxyServer := httptest.NewServer(p)
+		defer proxyServer.Close()
+
+		pipeReader, pipeWriter := io.Pipe()
+		totalChunks := 8
+		go func() {
+			defer pipeWriter.Close()
+			for i := 0; i < totalChunks; i++ {
+				if _, err := pipeWriter.Write([]byte(fmt.Sprintf("chunk-%d\n", i))); err != nil {
+					return
+				}
+				time.Sleep(40 * time.Millisecond)
+			}
+		}()
+
+		start := time.Now()
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxyServer.URL+"/test", pipeReader)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		duration := time.Since(start)
+		if err != nil {
+			t.Fatalf("expected request to succeed, got error: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200 OK, got %d", resp.StatusCode)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("failed to read response body: %v", err)
+		}
+		if duration < 250*time.Millisecond {
+			t.Errorf("expected transfer to take longer than deadline (150ms), took %v", duration)
+		}
+		expectedPrefix := "chunk-0\n"
+		if !strings.HasPrefix(string(body), expectedPrefix) {
+			t.Errorf("expected response body to contain %q, got %q", expectedPrefix, string(body))
+		}
+	})
+}
+
 func TestProxyWebSocket(t *testing.T) {
 	// Backend server that supports HTTP 101 Switching Protocols
 	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

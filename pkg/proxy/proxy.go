@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,6 +74,9 @@ const (
 	// DefaultTCPMaxConnections is the default maximum number of concurrent TCP connections per listener.
 	DefaultTCPMaxConnections = 10000
 
+	// DefaultBodyReadTimeout is the default duration allowed between read progress while reading a request body (5 minutes).
+	DefaultBodyReadTimeout = 5 * time.Minute
+
 	// MaxBufferedBodySize is the maximum request body size buffered in memory for mirroring or retry replay.
 	MaxBufferedBodySize = 8 * 1024 * 1024
 )
@@ -96,6 +100,7 @@ type Proxy struct {
 	tcpMaxConnections int
 	listenFunc        func(network, addr string) (net.Listener, error)
 	dialFunc          func(network, addr string) (net.Conn, error)
+	bodyReadTimeout   time.Duration
 
 	udpListeners     map[gatewayv1.PortNumber]*udpPortListener
 	udpBindHost      string
@@ -154,6 +159,7 @@ func NewProxy() *Proxy {
 		tcpListeners:       make(map[gatewayv1.PortNumber]*tcpPortListener),
 		tcpIdleTimeout:     DefaultTCPIdleTimeout,
 		tcpMaxConnections:  DefaultTCPMaxConnections,
+		bodyReadTimeout:    DefaultBodyReadTimeout,
 		udpListeners:       make(map[gatewayv1.PortNumber]*udpPortListener),
 		udpIdleTimeout:     DefaultUDPIdleTimeout,
 		udpMaxSessions:     DefaultUDPMaxSessions,
@@ -213,6 +219,25 @@ func (p *Proxy) getTCPMaxConnections() int {
 		return DefaultTCPMaxConnections
 	}
 	return p.tcpMaxConnections
+}
+
+// SetBodyReadTimeout sets the maximum duration allowed between read progress while reading a request body.
+func (p *Proxy) SetBodyReadTimeout(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.bodyReadTimeout = d
+}
+
+func (p *Proxy) getBodyReadTimeout() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.bodyReadTimeout < 0 {
+		return 0
+	}
+	if p.bodyReadTimeout == 0 {
+		return DefaultBodyReadTimeout
+	}
+	return p.bodyReadTimeout
 }
 
 func (p *Proxy) SetUDPBindHost(host string) {
@@ -2091,6 +2116,71 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 	<-errc
 }
 
+type bodyDeadlineReader struct {
+	rc          *http.ResponseController
+	body        io.ReadCloser
+	timeout     time.Duration
+	reqCtx      context.Context
+	reqDeadline time.Time
+	timedOut    bool
+}
+
+func (r *bodyDeadlineReader) calcDeadline() time.Time {
+	var deadline time.Time
+	if r.timeout > 0 {
+		deadline = time.Now().Add(r.timeout)
+	}
+	if !r.reqDeadline.IsZero() {
+		if deadline.IsZero() || r.reqDeadline.Before(deadline) {
+			deadline = r.reqDeadline
+		}
+	}
+	return deadline
+}
+
+func (r *bodyDeadlineReader) refresh() {
+	if dl := r.calcDeadline(); !dl.IsZero() {
+		_ = r.rc.SetReadDeadline(dl)
+	}
+}
+
+func (r *bodyDeadlineReader) Read(p []byte) (int, error) {
+	if r.reqCtx != nil && r.reqCtx.Err() != nil {
+		return 0, r.reqCtx.Err()
+	}
+	r.refresh()
+	n, err := r.body.Read(p)
+	if n > 0 {
+		r.refresh()
+	}
+	if err != nil {
+		if !r.reqDeadline.IsZero() && !time.Now().Before(r.reqDeadline) {
+			return n, context.DeadlineExceeded
+		}
+		var netErr net.Error
+		if errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+			r.timedOut = true
+			if c, _, err := r.rc.Hijack(); err == nil {
+				_ = c.Close()
+			}
+		} else {
+			_ = r.rc.SetReadDeadline(time.Time{})
+		}
+		return n, err
+	}
+	if r.reqCtx != nil && r.reqCtx.Err() != nil {
+		return n, r.reqCtx.Err()
+	}
+	return n, nil
+}
+
+func (r *bodyDeadlineReader) Close() error {
+	if !r.timedOut {
+		_ = r.rc.SetReadDeadline(time.Time{})
+	}
+	return r.body.Close()
+}
+
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter, timeouts *state.InternalTimeouts, retry *state.CompiledHTTPRouteRetry) {
 	if backendMissingClientCert(backend) {
 		klog.Errorf("backend %s:%d specifies ClientCertID %q but has no resolved client certificate", backend.Host, backend.Port, backend.TLSConfig.ClientCertID)
@@ -2109,11 +2199,29 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		return
 	}
 
+	rc := http.NewResponseController(w)
+
 	reqCtx := r.Context()
+	var reqDeadline time.Time
 	if timeouts != nil && timeouts.Request != nil && *timeouts.Request > 0 {
 		var cancel context.CancelFunc
 		reqCtx, cancel = context.WithTimeout(reqCtx, *timeouts.Request)
 		defer cancel()
+		reqDeadline = time.Now().Add(*timeouts.Request)
+	}
+
+	var bdr *bodyDeadlineReader
+	bodyReadTimeout := p.getBodyReadTimeout()
+	if r.Body != nil && r.Body != http.NoBody && (bodyReadTimeout > 0 || !reqDeadline.IsZero()) {
+		bdr = &bodyDeadlineReader{
+			rc:          rc,
+			body:        r.Body,
+			timeout:     bodyReadTimeout,
+			reqCtx:      reqCtx,
+			reqDeadline: reqDeadline,
+		}
+		bdr.refresh()
+		r.Body = bdr
 	}
 
 	scheme := "http"
@@ -2156,6 +2264,20 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				limitedReader := io.LimitReader(r.Body, MaxBufferedBodySize+1)
 				buffered, readErr := io.ReadAll(limitedReader)
 				if readErr != nil {
+					if errors.Is(reqCtx.Err(), context.DeadlineExceeded) || errors.Is(readErr, context.DeadlineExceeded) {
+						_ = rc.SetReadDeadline(time.Now())
+						http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+						return
+					}
+					if bdr != nil && bdr.timedOut {
+						panic(http.ErrAbortHandler)
+					}
+					var netErr net.Error
+					if errors.As(readErr, &netErr) && netErr.Timeout() {
+						_ = rc.SetReadDeadline(time.Now())
+						http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+						return
+					}
 					http.Error(w, "Bad Request", http.StatusBadRequest)
 					return
 				}
@@ -2193,6 +2315,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				modifyHeaders(w.Header(), *respHeaderModifier)
 			}
 			if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+				_ = rc.SetReadDeadline(time.Now())
 				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 			} else {
 				http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -2217,6 +2340,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				if respHeaderModifier != nil {
 					modifyHeaders(w.Header(), *respHeaderModifier)
 				}
+				_ = rc.SetReadDeadline(time.Now())
 				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 				return
 			}
@@ -2290,12 +2414,17 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 			if respHeaderModifier != nil {
 				modifyHeaders(w.Header(), *respHeaderModifier)
 			}
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(backendCtx.Err(), context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(backendCtx.Err(), context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) || (!reqDeadline.IsZero() && !time.Now().Before(reqDeadline)) {
+				_ = rc.SetReadDeadline(time.Now())
 				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 				return
 			}
+			if bdr != nil && bdr.timedOut {
+				panic(http.ErrAbortHandler)
+			}
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
+				_ = rc.SetReadDeadline(time.Now())
 				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 				return
 			}
