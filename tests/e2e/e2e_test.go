@@ -46,11 +46,7 @@ func TestGatewayAPI(t *testing.T) {
 
 	h := NewHarness(t, clusterName)
 	h.Setup()
-	t.Cleanup(func() {
-		if t.Failed() {
-			h.DumpDiagnostics()
-		}
-	})
+	h.SetupDiagnosticsCleanup()
 
 	// 1. Install Gateway API CRDs
 	h.InstallGatewayAPI(gatewayconsts.BundleVersion)

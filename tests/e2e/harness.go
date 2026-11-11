@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -470,6 +471,38 @@ func (h *Harness) DumpDiagnostics() {
 		appliedLogs := h.GetPodLogs(diagPodName)
 		h.T.Logf("Pod %s/%s (%s) /_gari/applied: %s", ns, podName, podIP, appliedLogs)
 		h.DeletePod(diagPodName)
+	}
+}
+
+// SetupDiagnosticsCleanup sets up failure cleanup and a pre-timeout timer to dump diagnostics.
+// If the test has a deadline, a timer fires ~1 minute before the test binary's timeout panic,
+// ensuring controller logs and pod applied revisions are captured before the test terminates.
+func (h *Harness) SetupDiagnosticsCleanup() {
+	var dumpOnce sync.Once
+	runDump := func() {
+		dumpOnce.Do(func() {
+			h.DumpDiagnostics()
+		})
+	}
+
+	h.T.Cleanup(func() {
+		if h.T.Failed() {
+			runDump()
+		}
+	})
+
+	if deadline, ok := h.T.Deadline(); ok {
+		timeRemaining := time.Until(deadline)
+		fireIn := timeRemaining - 1*time.Minute
+		if fireIn > 0 {
+			timer := time.AfterFunc(fireIn, func() {
+				h.T.Log("=== PRE-TIMEOUT DIAGNOSTIC DUMP (firing ~1m before test deadline) ===")
+				runDump()
+			})
+			h.T.Cleanup(func() {
+				timer.Stop()
+			})
+		}
 	}
 }
 

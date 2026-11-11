@@ -1112,7 +1112,7 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 }
 
 // PublishDataplaneConfig writes the Gateway's compiled data-plane config to its per-Gateway Secret.
-func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
+func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) (retErr error) {
 	if p.client == nil || gw == nil {
 		return nil
 	}
@@ -1124,6 +1124,11 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		p.revMu.Unlock()
 		return nil
 	}
+	defer func() {
+		if retErr != nil {
+			klog.Errorf("failed to publish dataplane config revision %s for Gateway %s: %v", config.Revision, gwKey, retErr)
+		}
+	}()
 
 	name := ResourceNameForGateway(gw.Name)
 
