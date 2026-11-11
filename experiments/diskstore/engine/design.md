@@ -275,3 +275,11 @@ The engine separates synchronization across four distinct layers to prevent dead
 2. **Block Pool vs. Page Data:** The block pool separates pool management from page content access. Callers acquire pool synchronization only to look up, pin, or unpin a page descriptor. Callers release pool synchronization before acquiring a per-page latch to read or modify page bytes. Callers never acquire pool synchronization while holding a per-page latch. This allows concurrent operations to access distinct pages in memory without contending on the pool.
 3. **Flushing and Direct I/O:** Page flushing marks descriptors in-flight and releases pool synchronization before copying data into the staging buffer and writing to disk. Direct I/O writes to the heap file proceed without blocking access to other resident pages in the pool.
 4. **WAL Appends and Syncing:** The WAL serializes incoming records to preserve strictly monotonic LSN assignment. Log buffer management and background flushes operate independently from page table latches.
+
+## What Encryption Covers
+
+The engine encrypts each value's bytes, bound to its bucket and key through the AEAD associated data. Keys, bucket names, record sizes, LSNs and page structure stay in plaintext. Oversize file names derive from the stored bytes, which are the ciphertext when a cipher is configured, so they reveal nothing about the plaintext.
+
+The associated data is `bucket + "/" + key`, which is ambiguous for names containing `/`. kubecache produces no such names. The associated data also binds no version. Someone who can write the store's files while the process runs could replace a value with an older ciphertext of the same key, and the engine would accept it. kubecache's key is ephemeral per process, which limits this to one process lifetime.
+
+Block-level encryption is the planned replacement for this scheme.
