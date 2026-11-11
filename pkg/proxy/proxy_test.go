@@ -2095,7 +2095,7 @@ func TestProxyRequestBodyStreaming(t *testing.T) {
 		runtime.GC()
 		runtime.ReadMemStats(&memoryBefore)
 
-		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxyServer.URL+"/stream", pipeReader)
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxyServer.URL+"/stream", pipeReader)
 		if err != nil {
 			t.Fatalf("failed to create request: %v", err)
 		}
@@ -2206,7 +2206,7 @@ func TestProxy_RequestTimeout_SlowBody(t *testing.T) {
 	}()
 
 	start := time.Now()
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxyServer.URL+"/test", pipeReader)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxyServer.URL+"/test", pipeReader)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
 	}
@@ -2290,6 +2290,62 @@ func TestProxy_BodyReadDeadline(t *testing.T) {
 		}
 	})
 
+	t.Run("client that stalls longer than deadline with mirror is disconnected", func(t *testing.T) {
+		p := NewProxy()
+		p.SetBodyReadTimeout(150 * time.Millisecond)
+		p.UpdateRoutes([]state.InternalRoute{
+			{
+				Rules: []state.InternalRule{
+					{
+						Backends: []state.InternalBackend{
+							{Host: host, Port: int32(port), Weight: 1},
+						},
+						Mirrors: []state.InternalMirror{
+							{
+								Backend: state.InternalBackend{
+									Host:   host,
+									Port:   int32(port),
+									Weight: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+
+		proxyServer := httptest.NewServer(p)
+		defer proxyServer.Close()
+
+		conn, err := net.DialTimeout("tcp", proxyServer.Listener.Addr().String(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("failed to dial: %v", err)
+		}
+		defer conn.Close()
+
+		// Send headers with Content-Length: 100, then send only 5 bytes and stall on mirrored route
+		reqHeaders := fmt.Sprintf("POST /test HTTP/1.1\r\nHost: %s\r\nContent-Length: 100\r\n\r\nhello", proxyServer.Listener.Addr().String())
+		if _, err := conn.Write([]byte(reqHeaders)); err != nil {
+			t.Fatalf("failed to write headers: %v", err)
+		}
+
+		// Read from connection until it is disconnected (closed) by server
+		start := time.Now()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 1024)
+		for {
+			_, rerr := conn.Read(buf)
+			if rerr != nil {
+				break
+			}
+		}
+		elapsed := time.Since(start)
+
+		if elapsed < 80*time.Millisecond || elapsed > 1500*time.Millisecond {
+			t.Errorf("expected connection to be disconnected around 150ms, elapsed %v", elapsed)
+		}
+	})
+
 	t.Run("client that sends steadily for longer than deadline completes", func(t *testing.T) {
 		p := NewProxy()
 		p.SetBodyReadTimeout(150 * time.Millisecond)
@@ -2321,7 +2377,7 @@ func TestProxy_BodyReadDeadline(t *testing.T) {
 		}()
 
 		start := time.Now()
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, proxyServer.URL+"/test", pipeReader)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxyServer.URL+"/test", pipeReader)
 		if err != nil {
 			t.Fatalf("failed to create request: %v", err)
 		}

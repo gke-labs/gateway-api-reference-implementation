@@ -343,9 +343,6 @@ func (o *Options) complete() error {
 	if o.UDPMaxSessions <= 0 {
 		o.UDPMaxSessions = proxy.DefaultUDPMaxSessions
 	}
-	if o.BodyReadTimeout <= 0 {
-		o.BodyReadTimeout = proxy.DefaultBodyReadTimeout
-	}
 	if o.ReadHeaderTimeout == 0 {
 		o.ReadHeaderTimeout = 10 * time.Second
 	}
@@ -505,9 +502,7 @@ func New(opts Options) (*Server, error) {
 	if opts.TCPMaxConnections > 0 {
 		p.SetTCPMaxConnections(opts.TCPMaxConnections)
 	}
-	if opts.BodyReadTimeout != 0 {
-		p.SetBodyReadTimeout(opts.BodyReadTimeout)
-	}
+	p.SetBodyReadTimeout(opts.BodyReadTimeout)
 	if opts.ForwardedForMode != "" {
 		p.SetForwardedForMode(opts.ForwardedForMode)
 	}
