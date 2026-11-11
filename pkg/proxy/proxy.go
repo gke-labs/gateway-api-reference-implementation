@@ -1155,17 +1155,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				var readErr error
 				bodyBytes, readErr = io.ReadAll(limitedReader)
 				if readErr != nil {
-					if deadlineReader != nil && deadlineReader.timedOut.Load() {
+					switch classifyBodyReadError(readErr, deadlineReader) {
+					case bodyFailureTimeout:
+						p.respondGatewayTimeout(w, responseController)
+						return
+					case bodyFailureAbort:
 						panic(http.ErrAbortHandler)
-					}
-					if errors.Is(reqCtx.Err(), context.DeadlineExceeded) || errors.Is(readErr, context.DeadlineExceeded) || (!requestDeadline.IsZero() && !time.Now().Before(requestDeadline)) {
-						p.respondGatewayTimeout(w, responseController)
-						return
-					}
-					var netErr net.Error
-					if errors.As(readErr, &netErr) && netErr.Timeout() {
-						p.respondGatewayTimeout(w, responseController)
-						return
 					}
 					errs = append(errs, readErr)
 				}
@@ -1219,7 +1214,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if backend.RequestHeaderModifier != nil {
 				p.modifyHeaders(r, *backend.RequestHeaderModifier)
 			}
-			p.forward(w, r, backend, bestRule.ResponseHeaderModifier, bestRule.CORS, bestRule.Timeouts, bestRule.Retry, responseController, deadlineReader, requestDeadline)
+			p.forward(w, r, backend, bestRule.ResponseHeaderModifier, bestRule.CORS, bestRule.Timeouts, bestRule.Retry, deadlineReader)
 			return
 		}
 
@@ -2165,6 +2160,10 @@ type bodyDeadlineReader struct {
 	loggedErr          bool
 }
 
+// calcDeadline computes the earliest deadline between the progress-refreshing bodyReadTimeout
+// and the route's request timeout.
+// The reader folds the route request deadline into the socket read deadline because the
+// mirror and retry paths block in Read, which a context cannot interrupt.
 func (r *bodyDeadlineReader) calcDeadline() time.Time {
 	var deadline time.Time
 	if r.timeout > 0 {
@@ -2207,7 +2206,7 @@ func (r *bodyDeadlineReader) Read(p []byte) (int, error) {
 	r.refresh()
 	n, err := r.body.Read(p)
 	if err != nil {
-		if !r.requestDeadline.IsZero() && !time.Now().Before(r.requestDeadline) {
+		if errors.Is(err, context.DeadlineExceeded) || (r.requestContext != nil && errors.Is(r.requestContext.Err(), context.DeadlineExceeded)) || (!r.requestDeadline.IsZero() && !time.Now().Before(r.requestDeadline)) {
 			return n, context.DeadlineExceeded
 		}
 		var netErr net.Error
@@ -2231,6 +2230,34 @@ func (r *bodyDeadlineReader) Close() error {
 	return r.body.Close()
 }
 
+// bodyFailureAction represents the outcome of inspecting a body read or forwarding failure.
+type bodyFailureAction int
+
+const (
+	bodyFailureNone bodyFailureAction = iota
+	bodyFailureTimeout
+	bodyFailureAbort
+)
+
+// classifyBodyReadError determines whether a body read or forwarding error should respond
+// with an HTTP 504 Gateway Timeout (the route's request timeout passed), abort the connection
+// (the client stalled and body made no progress), or proceed with default error handling.
+func classifyBodyReadError(err error, deadlineReader *bodyDeadlineReader) bodyFailureAction {
+	if errors.Is(err, context.DeadlineExceeded) ||
+		(deadlineReader != nil && deadlineReader.requestContext != nil && errors.Is(deadlineReader.requestContext.Err(), context.DeadlineExceeded)) ||
+		(deadlineReader != nil && !deadlineReader.requestDeadline.IsZero() && !time.Now().Before(deadlineReader.requestDeadline)) {
+		return bodyFailureTimeout
+	}
+	if deadlineReader != nil && deadlineReader.timedOut.Load() {
+		return bodyFailureAbort
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return bodyFailureTimeout
+	}
+	return bodyFailureNone
+}
+
 // respondGatewayTimeout writes an HTTP 504 Gateway Timeout response. It sets an
 // expired read deadline on the client connection first because Go's net/http server
 // drains the unread request body before it writes the response, so without the deadline
@@ -2242,7 +2269,7 @@ func (p *Proxy) respondGatewayTimeout(w http.ResponseWriter, responseController 
 	http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter, timeouts *state.InternalTimeouts, retry *state.CompiledHTTPRouteRetry, responseController *http.ResponseController, deadlineReader *bodyDeadlineReader, requestDeadline time.Time) {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter, timeouts *state.InternalTimeouts, retry *state.CompiledHTTPRouteRetry, deadlineReader *bodyDeadlineReader) {
 	if backendMissingClientCert(backend) {
 		klog.Errorf("backend %s:%d specifies ClientCertID %q but has no resolved client certificate", backend.Host, backend.Port, backend.TLSConfig.ClientCertID)
 		if backend.ResponseHeaderModifier != nil {
@@ -2258,6 +2285,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	if isWebSocketRequest(r) {
 		p.forwardWebSocket(w, r, backend, respHeaderModifier, timeouts)
 		return
+	}
+
+	responseController := http.NewResponseController(w)
+	if deadlineReader != nil && deadlineReader.responseController != nil {
+		responseController = deadlineReader.responseController
 	}
 
 	reqCtx := r.Context()
@@ -2302,17 +2334,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				limitedReader := io.LimitReader(r.Body, MaxBufferedBodySize+1)
 				buffered, readErr := io.ReadAll(limitedReader)
 				if readErr != nil {
-					if errors.Is(reqCtx.Err(), context.DeadlineExceeded) || errors.Is(readErr, context.DeadlineExceeded) || (!requestDeadline.IsZero() && !time.Now().Before(requestDeadline)) {
+					switch classifyBodyReadError(readErr, deadlineReader) {
+					case bodyFailureTimeout:
 						p.respondGatewayTimeout(w, responseController)
 						return
-					}
-					if deadlineReader != nil && deadlineReader.timedOut.Load() {
+					case bodyFailureAbort:
 						panic(http.ErrAbortHandler)
-					}
-					var netErr net.Error
-					if errors.As(readErr, &netErr) && netErr.Timeout() {
-						p.respondGatewayTimeout(w, responseController)
-						return
 					}
 					http.Error(w, "Bad Request", http.StatusBadRequest)
 					return
@@ -2350,7 +2377,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 			if respHeaderModifier != nil {
 				modifyHeaders(w.Header(), *respHeaderModifier)
 			}
-			if errors.Is(reqCtx.Err(), context.DeadlineExceeded) || (!requestDeadline.IsZero() && !time.Now().Before(requestDeadline)) {
+			if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
 				p.respondGatewayTimeout(w, responseController)
 			} else {
 				http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -2448,17 +2475,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 			if respHeaderModifier != nil {
 				modifyHeaders(w.Header(), *respHeaderModifier)
 			}
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(backendCtx.Err(), context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) || (!requestDeadline.IsZero() && !time.Now().Before(requestDeadline)) {
+			switch classifyBodyReadError(err, deadlineReader) {
+			case bodyFailureTimeout:
 				p.respondGatewayTimeout(w, responseController)
 				return
-			}
-			if deadlineReader != nil && deadlineReader.timedOut.Load() {
+			case bodyFailureAbort:
 				panic(http.ErrAbortHandler)
-			}
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				p.respondGatewayTimeout(w, responseController)
-				return
 			}
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 			return

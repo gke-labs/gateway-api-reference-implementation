@@ -110,7 +110,7 @@ See [docs/singlepod-parameters.md](docs/singlepod-parameters.md) for details and
 | `--health-probe-bind-address` | `:8999` | Address the health probe endpoint binds to (if configured to the same port as `--metrics-bind-address`, probes and metrics share a single listener). |
 | `--read-header-timeout` | `10s` | Maximum duration allowed to read request headers and complete TLS handshakes on HTTP and HTTPS servers. |
 | `--idle-timeout` | `60s` | Maximum duration to wait for the next request on keep-alive connections (and QUIC `MaxIdleTimeout` for HTTP/3). |
-| `--body-read-timeout` | `5m0s` | Maximum duration allowed between read progress while reading a request body. |
+| `--body-read-timeout` | `5m0s` | Maximum duration allowed between read progress while reading a request body (0 disables). |
 | `--read-timeout` | `0s` (disabled) | Maximum duration for reading the entire request, including body. |
 | `--write-timeout` | `0s` (disabled) | Maximum duration before timing out response writes. |
 | `--tcp-max-connections` | `10000` | Maximum number of concurrent TCP connections per listener. |
