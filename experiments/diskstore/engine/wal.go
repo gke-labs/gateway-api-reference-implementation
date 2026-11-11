@@ -113,7 +113,7 @@ type WAL struct {
 	maxLSN          atomic.Uint64
 	fsyncedLSN      atomic.Uint64 // Highest LSN covered by fdatasync
 	maxSegSize      int64
-	quarantineOpts  QuarantineOptions
+	quarantine      QuarantineOptions
 	createdLSNs     map[uint64]bool // Asserts never reuse/recycle segment file names
 
 	writing   bool
@@ -136,14 +136,12 @@ type WAL struct {
 
 // WALOptions configures a WAL instance.
 type WALOptions struct {
-	MaxSegmentSize          int64
-	OnFailure               func(error)
-	Clock                   Clock
-	TickInterval            time.Duration
-	BufferSize              int
-	MaxQuarantinedFiles     int
-	MinQuarantinedRetention time.Duration
-	Quarantine              QuarantineOptions
+	MaxSegmentSize int64
+	OnFailure      func(error)
+	Clock          Clock
+	TickInterval   time.Duration
+	BufferSize     int
+	Quarantine     QuarantineOptions
 }
 
 // OpenWAL opens or creates a WAL in the given directory.
@@ -157,9 +155,7 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 
 	maxSegSize := int64(DefaultMaxSegmentSize)
 	bufSize := DefaultWALBufferSize
-	maxQuarantined := DefaultMaxQuarantinedFiles
-	minRetention := DefaultMinQuarantinedRetention
-	var qNow func() time.Time
+	var qOpts QuarantineOptions
 	var onFailure func(error)
 	var clock Clock = realClock{}
 	var tickInterval time.Duration
@@ -167,19 +163,7 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		if opts[0].MaxSegmentSize > 0 {
 			maxSegSize = opts[0].MaxSegmentSize
 		}
-		if opts[0].MaxQuarantinedFiles > 0 {
-			maxQuarantined = opts[0].MaxQuarantinedFiles
-		} else if opts[0].Quarantine.MaxQuarantinedFiles > 0 {
-			maxQuarantined = opts[0].Quarantine.MaxQuarantinedFiles
-		}
-		if opts[0].MinQuarantinedRetention != 0 {
-			minRetention = opts[0].MinQuarantinedRetention
-		} else if opts[0].Quarantine.MinQuarantinedRetention != 0 {
-			minRetention = opts[0].Quarantine.MinQuarantinedRetention
-		}
-		if opts[0].Quarantine.Now != nil {
-			qNow = opts[0].Quarantine.Now
-		}
+		qOpts = opts[0].Quarantine
 		if opts[0].BufferSize > 0 {
 			bufSize = opts[0].BufferSize
 			if bufSize < WALBlockSize {
@@ -199,11 +183,8 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	}
 
 	lostDir := filepath.Join(dir, "lost+found")
-	qOpts := QuarantineOptions{
-		Dir:                     lostDir,
-		MaxQuarantinedFiles:     maxQuarantined,
-		MinQuarantinedRetention: minRetention,
-		Now:                     qNow,
+	if qOpts.Dir == "" {
+		qOpts.Dir = lostDir
 	}
 
 	w := &WAL{
@@ -213,7 +194,7 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		bufSize:         bufSize,
 		bufs:            [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
 		maxSegSize:      maxSegSize,
-		quarantineOpts:  qOpts,
+		quarantine:      qOpts,
 		createdLSNs:     make(map[uint64]bool),
 		nextLSN:         initialLSN + 1,
 		lastAppendedLSN: initialLSN,
@@ -255,7 +236,7 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		}
 		w.createdLSNs[seg.startLSN] = true
 	}
-	if err := pruneLostFound(w.fs, w.quarantineOpts); err != nil {
+	if err := pruneLostFound(w.fs, w.quarantine); err != nil {
 		return nil, fmt.Errorf("failed to prune lost+found dir: %w", err)
 	}
 	if movedAbandoned {
@@ -285,17 +266,12 @@ type QuarantineOptions struct {
 	// Dir is the lost+found directory path.
 	Dir string
 
-	// Directory is an alias for Dir.
-	Directory string
-
 	// MaxQuarantinedFiles is the maximum number of quarantined files kept in the directory.
 	// When exceeded, files older than MinQuarantinedRetention are removed.
-	// If <= 0, DefaultMaxQuarantinedFiles is used.
 	MaxQuarantinedFiles int
 
 	// MinQuarantinedRetention is the minimum duration a quarantined file is kept.
 	// Files younger than this retention are not deleted even when MaxQuarantinedFiles is exceeded.
-	// If == 0, DefaultMinQuarantinedRetention (7 days) is used. If < 0, minimum retention is disabled.
 	MinQuarantinedRetention time.Duration
 
 	// Now returns the current time for retention checks. If nil, time.Now is used.
@@ -310,25 +286,21 @@ func uniqueQuarantinePath(lostDir, segName string) string {
 
 func parseQuarantineTimestamp(name string) (int64, uint64, error) {
 	parts := strings.Split(name, ".")
-	if len(parts) >= 4 {
-		nano, err := strconv.ParseInt(parts[len(parts)-3], 10, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("invalid quarantine timestamp in %s: %w", name, err)
-		}
-		counter, err := strconv.ParseUint(parts[len(parts)-1], 10, 64)
-		if err != nil {
-			return nano, 0, nil
-		}
-		return nano, counter, nil
+	if len(parts) < 4 {
+		return 0, 0, fmt.Errorf("invalid quarantine file name: %s", name)
 	}
-	if len(parts) >= 3 {
-		nano, err := strconv.ParseInt(parts[len(parts)-2], 10, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("invalid quarantine timestamp in %s: %w", name, err)
-		}
-		return nano, 0, nil
+	nano, err := strconv.ParseInt(parts[len(parts)-3], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid quarantine timestamp in %s: %w", name, err)
 	}
-	return 0, 0, fmt.Errorf("invalid quarantine file name: %s", name)
+	if _, err := strconv.Atoi(parts[len(parts)-2]); err != nil {
+		return 0, 0, fmt.Errorf("invalid quarantine pid in %s: %w", name, err)
+	}
+	counter, err := strconv.ParseUint(parts[len(parts)-1], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid quarantine counter in %s: %w", name, err)
+	}
+	return nano, counter, nil
 }
 
 type lostFile struct {
@@ -339,26 +311,11 @@ type lostFile struct {
 }
 
 func pruneLostFound(storeFS FS, opts QuarantineOptions) error {
-	maxFiles := opts.MaxQuarantinedFiles
-	if maxFiles <= 0 {
-		maxFiles = DefaultMaxQuarantinedFiles
-	}
-	minRetention := opts.MinQuarantinedRetention
-	if minRetention == 0 {
-		minRetention = DefaultMinQuarantinedRetention
-	} else if minRetention < 0 {
-		minRetention = 0
-	}
-
-	lostDir := opts.Dir
-	if lostDir == "" {
-		lostDir = opts.Directory
-	}
-	if lostDir == "" {
+	if opts.MaxQuarantinedFiles <= 0 || opts.Dir == "" {
 		return nil
 	}
 
-	entries, err := storeFS.ReadDir(lostDir)
+	entries, err := storeFS.ReadDir(opts.Dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -373,17 +330,18 @@ func pruneLostFound(storeFS FS, opts QuarantineOptions) error {
 		}
 		nano, counter, parseErr := parseQuarantineTimestamp(entry.Name())
 		if parseErr != nil {
-			slog.Warn("diskstore: cannot parse quarantine timestamp", "file", entry.Name(), "error", parseErr)
+			slog.Warn("diskstore: ignoring quarantined file with unparseable timestamp", "file", entry.Name(), "error", parseErr)
+			continue
 		}
 		files = append(files, lostFile{
-			path:    filepath.Join(lostDir, entry.Name()),
+			path:    filepath.Join(opts.Dir, entry.Name()),
 			name:    entry.Name(),
 			nano:    nano,
 			counter: counter,
 		})
 	}
 
-	if len(files) <= maxFiles {
+	if len(files) <= opts.MaxQuarantinedFiles {
 		return nil
 	}
 
@@ -403,13 +361,13 @@ func pruneLostFound(storeFS FS, opts QuarantineOptions) error {
 		now = opts.Now()
 	}
 
-	excess := len(files) - maxFiles
+	excess := len(files) - opts.MaxQuarantinedFiles
 	var toDelete []lostFile
 	for i := 0; i < excess; i++ {
 		f := files[i]
-		if minRetention > 0 && f.nano > 0 {
+		if opts.MinQuarantinedRetention > 0 {
 			fileTime := time.Unix(0, f.nano)
-			if now.Sub(fileTime) < minRetention {
+			if now.Sub(fileTime) < opts.MinQuarantinedRetention {
 				// Younger than minimum retention; do not delete even though over maximum.
 				break
 			}
@@ -424,15 +382,9 @@ func pruneLostFound(storeFS FS, opts QuarantineOptions) error {
 		slog.Warn("diskstore: deleted oldest quarantined file exceeding lost+found bound", "file", f.path)
 	}
 	if len(toDelete) > 0 {
-		return storeFS.SyncDir(lostDir)
+		return storeFS.SyncDir(opts.Dir)
 	}
 	return nil
-}
-
-// PruneLostFound removes quarantined files exceeding MaxQuarantinedFiles in the directory,
-// respecting MinQuarantinedRetention.
-func PruneLostFound(storeFS FS, opts QuarantineOptions) error {
-	return pruneLostFound(storeFS, opts)
 }
 
 type segmentMeta struct {

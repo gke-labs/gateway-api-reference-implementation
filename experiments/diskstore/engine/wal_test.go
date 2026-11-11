@@ -1122,8 +1122,9 @@ func TestWAL_LostFoundQuarantineBound(t *testing.T) {
 	seg4 := writeSeg(4)
 
 	wal, err := OpenWAL(memFS, walDir, dbID, 1, WALOptions{
-		MaxQuarantinedFiles:     2,
-		MinQuarantinedRetention: -1,
+		Quarantine: QuarantineOptions{
+			MaxQuarantinedFiles: 2,
+		},
 	})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
@@ -1185,7 +1186,10 @@ func TestWAL_LostFoundMinRetention(t *testing.T) {
 
 	// Open with default 7d retention: all 3 should be kept
 	wal, err := OpenWAL(memFS, walDir, dbID, 1, WALOptions{
-		MaxQuarantinedFiles: 2,
+		Quarantine: QuarantineOptions{
+			MaxQuarantinedFiles:     2,
+			MinQuarantinedRetention: 7 * 24 * time.Hour,
+		},
 	})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
@@ -1202,7 +1206,7 @@ func TestWAL_LostFoundMinRetention(t *testing.T) {
 	}
 
 	// Prune with clock advanced 8 days: oldest should be removed
-	err = PruneLostFound(memFS, QuarantineOptions{
+	err = pruneLostFound(memFS, QuarantineOptions{
 		Dir:                     lostDir,
 		MaxQuarantinedFiles:     2,
 		MinQuarantinedRetention: 7 * 24 * time.Hour,
@@ -1211,7 +1215,7 @@ func TestWAL_LostFoundMinRetention(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("PruneLostFound failed: %v", err)
+		t.Fatalf("pruneLostFound failed: %v", err)
 	}
 
 	entriesAfter, err := memFS.ReadDir(lostDir)

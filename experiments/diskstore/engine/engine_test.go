@@ -2257,7 +2257,7 @@ func TestLostFound_MinRetentionProtected(t *testing.T) {
 	}
 
 	// Prune with clock advanced 8 days into the future: oldest should now be removed
-	err = PruneLostFound(memFS, QuarantineOptions{
+	err = pruneLostFound(memFS, QuarantineOptions{
 		Dir:                     lostDir,
 		MaxQuarantinedFiles:     2,
 		MinQuarantinedRetention: 7 * 24 * time.Hour,
@@ -2266,7 +2266,7 @@ func TestLostFound_MinRetentionProtected(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("PruneLostFound failed: %v", err)
+		t.Fatalf("pruneLostFound failed: %v", err)
 	}
 
 	entriesAfter, err := memFS.ReadDir(lostDir)
@@ -2275,5 +2275,39 @@ func TestLostFound_MinRetentionProtected(t *testing.T) {
 	}
 	if len(entriesAfter) != 2 {
 		t.Fatalf("expected 2 files remaining after retention expired, got %d", len(entriesAfter))
+	}
+}
+
+func TestLostFound_UnparseableTimestampIgnored(t *testing.T) {
+	memFS := NewMemFS()
+	lostDir := "test_unparseable_lost_found"
+	if err := memFS.MkdirAll(lostDir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	// Create an unparseable file in lost+found
+	unparseableFile := filepath.Join(lostDir, "corrupted_file_without_timestamp")
+	f, err := memFS.OpenFile(unparseableFile, os.O_CREATE|os.O_WRONLY, StoreFileMode)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	_ = f.Close()
+
+	// Prune with max files = 1
+	err = pruneLostFound(memFS, QuarantineOptions{
+		Dir:                 lostDir,
+		MaxQuarantinedFiles: 1,
+	})
+	if err != nil {
+		t.Fatalf("pruneLostFound failed: %v", err)
+	}
+
+	// Verify unparseable file was not removed
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "corrupted_file_without_timestamp" {
+		t.Fatalf("expected unparseable file preserved, got %v", entries)
 	}
 }

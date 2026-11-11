@@ -257,8 +257,7 @@ type Engine struct {
 	compressionCodec CompressionCodec
 	maxObjectSize    int
 
-	maxQuarantinedFiles     int
-	minQuarantinedRetention time.Duration
+	quarantine QuarantineOptions
 
 	heapFile File
 	wal      *WAL
@@ -651,32 +650,36 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 
 	s := &Engine{
-		fs:                      options.FS,
-		dir:                     dir,
-		dbID:                    dbID,
-		isTemp:                  isTemp,
-		autoDelete:              options.AutoDelete,
-		cipher:                  options.Cipher,
-		compressionCodec:        options.CompressionCodec,
-		maxObjectSize:           options.MaxObjectSize,
-		maxQuarantinedFiles:     options.MaxQuarantinedFiles,
-		minQuarantinedRetention: options.MinQuarantinedRetention,
-		heapFile:                heapFile,
-		keyIndex:                make(map[string]KeyIndexEntry),
-		oversizeObjects:         make(map[string][]byte),
-		emptyPages:              newEmptyPageTracker(nil),
-		failedCh:                make(chan struct{}),
-		closedCh:                make(chan struct{}),
-		wiped:                   wiped,
-		nextLogicalPage:         1,
+		fs:               options.FS,
+		dir:              dir,
+		dbID:             dbID,
+		isTemp:           isTemp,
+		autoDelete:       options.AutoDelete,
+		cipher:           options.Cipher,
+		compressionCodec: options.CompressionCodec,
+		maxObjectSize:    options.MaxObjectSize,
+		quarantine: QuarantineOptions{
+			MaxQuarantinedFiles:     options.MaxQuarantinedFiles,
+			MinQuarantinedRetention: options.MinQuarantinedRetention,
+		},
+		heapFile:        heapFile,
+		keyIndex:        make(map[string]KeyIndexEntry),
+		oversizeObjects: make(map[string][]byte),
+		emptyPages:      newEmptyPageTracker(nil),
+		failedCh:        make(chan struct{}),
+		closedCh:        make(chan struct{}),
+		wiped:           wiped,
+		nextLogicalPage: 1,
 	}
+
+	walQuarantine := s.quarantine
+	walQuarantine.Dir = filepath.Join(walDir, "lost+found")
 
 	if isNewStore {
 		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{
-			OnFailure:               s.setFailed,
-			Clock:                   options.Clock,
-			MaxQuarantinedFiles:     options.MaxQuarantinedFiles,
-			MinQuarantinedRetention: options.MinQuarantinedRetention,
+			OnFailure:  s.setFailed,
+			Clock:      options.Clock,
+			Quarantine: walQuarantine,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -708,10 +711,9 @@ func Open(opts ...Option) (*Engine, error) {
 
 		// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
 		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{
-			OnFailure:               s.setFailed,
-			Clock:                   options.Clock,
-			MaxQuarantinedFiles:     options.MaxQuarantinedFiles,
-			MinQuarantinedRetention: options.MinQuarantinedRetention,
+			OnFailure:  s.setFailed,
+			Clock:      options.Clock,
+			Quarantine: walQuarantine,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -980,11 +982,9 @@ func (s *Engine) loadOversizeObjects() error {
 		s.oversizeObjects[qKey] = bytes.Clone(payload)
 		GlobalMetrics.OversizeObjectsCount.Add(1)
 	}
-	if err := pruneLostFound(s.fs, QuarantineOptions{
-		Dir:                     lostDir,
-		MaxQuarantinedFiles:     s.maxQuarantinedFiles,
-		MinQuarantinedRetention: s.minQuarantinedRetention,
-	}); err != nil {
+	qOpts := s.quarantine
+	qOpts.Dir = lostDir
+	if err := pruneLostFound(s.fs, qOpts); err != nil {
 		return fmt.Errorf("failed to prune oversize lost+found dir: %w", err)
 	}
 	if movedUncommitted {
