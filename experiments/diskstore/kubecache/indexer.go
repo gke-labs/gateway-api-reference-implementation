@@ -89,12 +89,12 @@ func WithIndexerCodec(codec ObjectCodec) IndexerOption {
 // Each watch is stored in one engine table named after the watch.
 // It implements a fail-fast error policy via an OnFatal callback.
 type Indexer struct {
-	eng        *engine.Engine
-	watchName  string
-	example    k8sruntime.Object
-	keyFunc    toolscache.KeyFunc
-	codec      ObjectCodec
-	onFatal    func(error)
+	eng       *engine.Engine
+	watchName string
+	example   k8sruntime.Object
+	keyFunc   toolscache.KeyFunc
+	codec     ObjectCodec
+	onFatal   func(error)
 
 	fatalMu   sync.RWMutex
 	fatalOnce sync.Once
