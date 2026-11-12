@@ -528,6 +528,101 @@ func TestAuthorization(t *testing.T) {
 	})
 }
 
+func TestValidateControllerServiceAccount(t *testing.T) {
+	// A bare controllerServiceAccount without controllerNamespace must fail validation.
+	bareConfig := ClusterConfig{
+		ClusterID:                "cluster-1",
+		IssuerURL:                "https://issuer.example.com",
+		ControllerServiceAccount: "gari-controller",
+	}
+	err := bareConfig.Validate()
+	if err == nil {
+		t.Fatal("expected bare controllerServiceAccount without controllerNamespace to fail validation")
+	}
+	errorMessage := err.Error()
+	if !strings.Contains(errorMessage, "controllerServiceAccount") || !strings.Contains(errorMessage, "controllerNamespace") {
+		t.Errorf("expected error to name both controllerServiceAccount and controllerNamespace, got: %v", errorMessage)
+	}
+
+	invalidServiceAccounts := []string{
+		"system:serviceaccount:gateway-system:",
+		"system:serviceaccount::gari-controller",
+		"/gari-controller",
+		"gateway-system/",
+	}
+	for _, invalidServiceAccount := range invalidServiceAccounts {
+		invalidConfig := ClusterConfig{
+			ClusterID:                "cluster-1",
+			IssuerURL:                "https://issuer.example.com",
+			ControllerServiceAccount: invalidServiceAccount,
+		}
+		if err := invalidConfig.Validate(); err == nil {
+			t.Errorf("expected malformed controllerServiceAccount %q without controllerNamespace to fail validation", invalidServiceAccount)
+		}
+	}
+
+	// Qualified forms must validate and authorize only the named namespace.
+	testCases := []struct {
+		name                     string
+		controllerServiceAccount string
+		controllerNamespace      string
+		expectedNamespace        string
+		expectedServiceAccount   string
+	}{
+		{
+			name:                     "slash-qualified form",
+			controllerServiceAccount: "gateway-system/gari-controller",
+			expectedNamespace:        "gateway-system",
+			expectedServiceAccount:   "gari-controller",
+		},
+		{
+			name:                     "system:serviceaccount-qualified form",
+			controllerServiceAccount: "system:serviceaccount:gateway-system:gari-controller",
+			expectedNamespace:        "gateway-system",
+			expectedServiceAccount:   "gari-controller",
+		},
+		{
+			name:                     "bare form with explicit namespace",
+			controllerServiceAccount: "gari-controller",
+			controllerNamespace:      "gateway-system",
+			expectedNamespace:        "gateway-system",
+			expectedServiceAccount:   "gari-controller",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			clusterConfig := ClusterConfig{
+				ClusterID:                "cluster-1",
+				IssuerURL:                "https://issuer.example.com",
+				ControllerServiceAccount: testCase.controllerServiceAccount,
+				ControllerNamespace:      testCase.controllerNamespace,
+			}
+			if err := clusterConfig.Validate(); err != nil {
+				t.Fatalf("expected config to validate, got: %v", err)
+			}
+
+			authorizedCaller := CallerIdentity{
+				ClusterID:      "cluster-1",
+				Namespace:      testCase.expectedNamespace,
+				ServiceAccount: testCase.expectedServiceAccount,
+			}
+			if !IsAuthorizedController(&clusterConfig, authorizedCaller) {
+				t.Errorf("expected caller %v to be authorized", authorizedCaller)
+			}
+
+			unauthorizedCaller := CallerIdentity{
+				ClusterID:      "cluster-1",
+				Namespace:      "other-namespace",
+				ServiceAccount: testCase.expectedServiceAccount,
+			}
+			if IsAuthorizedController(&clusterConfig, unauthorizedCaller) {
+				t.Errorf("expected caller %v in different namespace to be rejected", unauthorizedCaller)
+			}
+		})
+	}
+}
+
 // TestAuditLogger tests that the audit log outputs single structured JSON lines
 // and never includes sensitive tokens or key material.
 func TestAuditLogger(t *testing.T) {

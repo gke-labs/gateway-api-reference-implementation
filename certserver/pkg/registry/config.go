@@ -89,6 +89,22 @@ func ValidateClusterID(clusterID string) error {
 	return nil
 }
 
+// isNamespaceQualified reports whether serviceAccount is qualified with a namespace,
+// matching "<namespace>/<name>" or "system:serviceaccount:<namespace>:<name>".
+func isNamespaceQualified(serviceAccount string) bool {
+	serviceAccount = strings.TrimSpace(serviceAccount)
+	if strings.HasPrefix(serviceAccount, "system:serviceaccount:") {
+		rest := strings.TrimPrefix(serviceAccount, "system:serviceaccount:")
+		namespace, name, ok := strings.Cut(rest, ":")
+		return ok && namespace != "" && name != ""
+	}
+	if strings.Contains(serviceAccount, "/") {
+		namespace, name, ok := strings.Cut(serviceAccount, "/")
+		return ok && namespace != "" && name != ""
+	}
+	return false
+}
+
 // Validate validates the cluster configuration entry.
 func (c *ClusterConfig) Validate() error {
 	if err := ValidateClusterID(c.ClusterID); err != nil {
@@ -102,6 +118,12 @@ func (c *ClusterConfig) Validate() error {
 	}
 	if c.JWKSURL != "" && !strings.HasPrefix(c.JWKSURL, "https://") {
 		return fmt.Errorf("cluster %q: jwksURL must use HTTPS: %q", c.ClusterID, c.JWKSURL)
+	}
+
+	if strings.TrimSpace(c.ControllerServiceAccount) != "" && strings.TrimSpace(c.ControllerNamespace) == "" {
+		if !isNamespaceQualified(c.ControllerServiceAccount) {
+			return fmt.Errorf("cluster %q: controllerServiceAccount requires controllerNamespace unless namespace-qualified", c.ClusterID)
+		}
 	}
 
 	for _, pattern := range c.AllowedHostnames {
