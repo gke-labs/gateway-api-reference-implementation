@@ -310,10 +310,10 @@ func TestRegression_Item17_OversizeObjectPersistence(t *testing.T) {
 	}
 }
 
-// TestRegression_Item19_BucketIsolation asserts keys in different buckets with same name do not collide.
-func TestRegression_Item19_BucketIsolation(t *testing.T) {
+// TestRegression_Item19_TableIsolation asserts keys in different tables with same name do not collide.
+func TestRegression_Item19_TableIsolation(t *testing.T) {
 	memFS := NewMemFS()
-	dir := "test_bucket_isolation"
+	dir := "test_table_isolation"
 
 	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
 	if err != nil {
@@ -321,7 +321,7 @@ func TestRegression_Item19_BucketIsolation(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Put "default/my-name" into ConfigMap and Secret buckets with different values
+	// Put "default/my-name" into ConfigMap and Secret tables with different values
 	_ = store.Put("ConfigMap", "default/my-name", []byte("cm-data"))
 	_ = store.Put("Secret", "default/my-name", []byte("secret-data"))
 
@@ -347,7 +347,7 @@ func TestRegression_Item19_BucketIsolation(t *testing.T) {
 	}
 }
 
-// TestRegression_Item20_EngineScanConsistent asserts that Scan provides consistent bucket views.
+// TestRegression_Item20_EngineScanConsistent asserts that Scan provides consistent table views.
 func TestRegression_Item20_EngineScanConsistent(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_scan_rebuild"
@@ -547,11 +547,11 @@ func TestKeyBoundaries_TableTest(t *testing.T) {
 		{"Key65535B", strings.Repeat("e", 65535)},
 	}
 
-	bucket := "b"
+	table := "b"
 
 	for _, tc := range keys {
 		t.Run(tc.name, func(t *testing.T) {
-			qKey := qualifyKey(bucket, tc.key)
+			qKey := qualifyKey(table, tc.key)
 			qKeyLen := len(qKey)
 
 			// Collect boundary payload sizes
@@ -605,7 +605,7 @@ func TestKeyBoundaries_TableTest(t *testing.T) {
 						payload[i] = byte((i*37 + 11) % 256)
 					}
 
-					putErr := store.Put(bucket, tc.key, payload)
+					putErr := store.Put(table, tc.key, payload)
 					if putErr != nil {
 						// Must be a non-sticky "too large" error
 						if !errors.Is(putErr, ErrObjectOversize) {
@@ -617,10 +617,10 @@ func TestKeyBoundaries_TableTest(t *testing.T) {
 
 						// Subsequent operations must succeed
 						probeVal := []byte("probe-value")
-						if err := store.Put(bucket, "probe", probeVal); err != nil {
+						if err := store.Put(table, "probe", probeVal); err != nil {
 							t.Fatalf("Put after non-sticky error failed: %v", err)
 						}
-						got, exists, err := store.Get(bucket, "probe")
+						got, exists, err := store.Get(table, "probe")
 						if err != nil || !exists || !bytes.Equal(got, probeVal) {
 							t.Fatalf("Get after non-sticky error failed: exists=%v, err=%v", exists, err)
 						}
@@ -634,7 +634,7 @@ func TestKeyBoundaries_TableTest(t *testing.T) {
 						_ = store2.Close()
 					} else {
 						// Must round-trip through Get
-						got, exists, err := store.Get(bucket, tc.key)
+						got, exists, err := store.Get(table, tc.key)
 						if err != nil || !exists {
 							t.Fatalf("Get failed: exists=%v, err=%v", exists, err)
 						}
@@ -652,7 +652,7 @@ func TestKeyBoundaries_TableTest(t *testing.T) {
 						}
 						defer store2.Close()
 
-						got2, exists2, err := store2.Get(bucket, tc.key)
+						got2, exists2, err := store2.Get(table, tc.key)
 						if err != nil || !exists2 {
 							t.Fatalf("Get after reopen failed: exists=%v, err=%v", exists2, err)
 						}
@@ -759,9 +759,9 @@ func TestMultiBlockPage_RecordSizesBetweenSlottedAndBlockLimitRoundTrip(t *testi
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	bucket := "b"
+	table := "b"
 	key := "k"
-	qKey := qualifyKey(bucket, key)
+	qKey := qualifyKey(table, key)
 	overhead := PageRecordHeaderSize + len(qKey) // 14 + 3 = 17 bytes
 
 	// Record sizes 4053 and 4064 fall between the max slotted record limit (4052)
@@ -779,19 +779,19 @@ func TestMultiBlockPage_RecordSizesBetweenSlottedAndBlockLimitRoundTrip(t *testi
 		payloads[recSize] = payload
 
 		k := fmt.Sprintf("k-%d", recSize)
-		if err := store.Put(bucket, k, payload); err != nil {
+		if err := store.Put(table, k, payload); err != nil {
 			t.Fatalf("Put for record size %d failed: %v", recSize, err)
 		}
 
 		// Verify keyIndex entry has NumBlocks == 2
 		store.keyMu.RLock()
-		entry, ok := store.keyIndex[qualifyKey(bucket, k)]
+		entry, ok := store.keyIndex[qualifyKey(table, k)]
 		store.keyMu.RUnlock()
 		if !ok || entry.NumBlocks != 2 {
 			t.Fatalf("expected NumBlocks == 2 for record size %d, got ok=%v, numBlocks=%d", recSize, ok, entry.NumBlocks)
 		}
 
-		got, exists, err := store.Get(bucket, k)
+		got, exists, err := store.Get(table, k)
 		if err != nil || !exists || !bytes.Equal(got, payload) {
 			t.Fatalf("Get for record size %d failed: exists=%v, err=%v", recSize, exists, err)
 		}
@@ -810,7 +810,7 @@ func TestMultiBlockPage_RecordSizesBetweenSlottedAndBlockLimitRoundTrip(t *testi
 
 	for _, recSize := range recordSizes {
 		k := fmt.Sprintf("k-%d", recSize)
-		got, exists, err := store2.Get(bucket, k)
+		got, exists, err := store2.Get(table, k)
 		if err != nil || !exists || !bytes.Equal(got, payloads[recSize]) {
 			t.Fatalf("Get after reopen for record size %d failed: exists=%v, err=%v", recSize, exists, err)
 		}
@@ -833,27 +833,27 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 	type transitionCase struct {
 		name       string
 		codec      CompressionCodec
-		setup      func(t *testing.T, store *Engine, bucket string)
+		setup      func(t *testing.T, store *Engine, table string)
 		val1       []byte
 		val2       []byte
-		verifyPost func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry)
+		verifyPost func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry)
 	}
 
 	cases := []transitionCase{
 		{
 			name:  "slotted_to_slotted_another_page",
 			codec: CodecNone,
-			setup: func(t *testing.T, store *Engine, bucket string) {
+			setup: func(t *testing.T, store *Engine, table string) {
 				// Fill active slotted page mostly full with a sibling record
-				if err := store.Put(bucket, "sibling", makeIncompressible(3500)); err != nil {
+				if err := store.Put(table, "sibling", makeIncompressible(3500)); err != nil {
 					t.Fatalf("Put sibling failed: %v", err)
 				}
 			},
 			val1: makeIncompressible(400),
 			val2: makeIncompressible(800), // cannot fit in page 1 with sibling, must allocate page 2
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if newEntry.LogicalPage == oldEntry.LogicalPage {
 					t.Fatalf("expected record to move to another page, but stayed on %d", newEntry.LogicalPage)
@@ -877,9 +877,9 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecNone,
 			val1:  makeIncompressible(500),
 			val2:  makeIncompressible(10 * 1024),
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if newEntry.NumBlocks <= 1 {
 					t.Fatalf("expected multi-block page, got NumBlocks=%d", newEntry.NumBlocks)
@@ -895,9 +895,9 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecNone,
 			val1:  makeIncompressible(20 * 1024),
 			val2:  makeIncompressible(500),
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if newEntry.NumBlocks != 1 {
 					t.Fatalf("expected slotted page (NumBlocks=1), got %d", newEntry.NumBlocks)
@@ -912,9 +912,9 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecNone,
 			val1:  makeIncompressible(25 * 1024), // 8 blocks
 			val2:  makeIncompressible(6 * 1024),  // 2 blocks
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if newEntry.NumBlocks >= oldEntry.NumBlocks {
 					t.Fatalf("expected block count to shrink: old=%d, new=%d", oldEntry.NumBlocks, newEntry.NumBlocks)
@@ -929,9 +929,9 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecNone,
 			val1:  makeIncompressible(6 * 1024),  // 2 blocks
 			val2:  makeIncompressible(25 * 1024), // 8 blocks
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if newEntry.NumBlocks <= oldEntry.NumBlocks {
 					t.Fatalf("expected block count to grow: old=%d, new=%d", oldEntry.NumBlocks, newEntry.NumBlocks)
@@ -946,9 +946,9 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecNone,
 			val1:  makeIncompressible(500),
 			val2:  makeIncompressible(MaxPayloadCapacity + 1024),
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if !newEntry.IsOversize {
 					t.Fatalf("expected oversize object")
@@ -963,9 +963,9 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecNone,
 			val1:  makeIncompressible(20 * 1024),
 			val2:  makeIncompressible(MaxPayloadCapacity + 1024),
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if !newEntry.IsOversize {
 					t.Fatalf("expected oversize object")
@@ -980,15 +980,15 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecNone,
 			val1:  makeIncompressible(MaxPayloadCapacity + 1024),
 			val2:  makeIncompressible(500),
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if newEntry.IsOversize || newEntry.NumBlocks != 1 {
 					t.Fatalf("expected slotted object, got isOversize=%v, numBlocks=%d", newEntry.IsOversize, newEntry.NumBlocks)
 				}
 				// Verify oversize file was removed
-				p := store.oversizeFilePath(qualifyKey(bucket, key))
+				p := store.oversizeFilePath(qualifyKey(table, key))
 				if f, err := store.fs.Open(p); err == nil {
 					_ = f.Close()
 					t.Fatalf("expected oversize file %s to be removed, but still exists", p)
@@ -1002,15 +1002,15 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecNone,
 			val1:  makeIncompressible(MaxPayloadCapacity + 1024),
 			val2:  makeIncompressible(20 * 1024),
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if newEntry.IsOversize || newEntry.NumBlocks <= 1 {
 					t.Fatalf("expected multi-block object, got isOversize=%v, numBlocks=%d", newEntry.IsOversize, newEntry.NumBlocks)
 				}
 				// Verify oversize file was removed
-				p := store.oversizeFilePath(qualifyKey(bucket, key))
+				p := store.oversizeFilePath(qualifyKey(table, key))
 				if f, err := store.fs.Open(p); err == nil {
 					_ = f.Close()
 					t.Fatalf("expected oversize file %s to be removed, but still exists", p)
@@ -1024,9 +1024,9 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 			codec: CodecZstd,
 			val1:  makeIncompressible(20 * 1024), // incompressible -> multi-block
 			val2:  make([]byte, 20*1024),         // all zeros -> compressible to ~50 B -> slotted
-			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+			verifyPost: func(t *testing.T, store *Engine, table, key string, oldEntry KeyIndexEntry) {
 				store.keyMu.RLock()
-				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				newEntry := store.keyIndex[qualifyKey(table, key)]
 				store.keyMu.RUnlock()
 				if oldEntry.NumBlocks <= 1 {
 					t.Fatalf("expected incompressible payload to be multi-block, got %d", oldEntry.NumBlocks)
@@ -1063,15 +1063,15 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 						t.Fatalf("Open failed: %v", err)
 					}
 
-					bucket := "testb"
+					table := "testb"
 					key := "target-key"
 
 					if tc.setup != nil {
-						tc.setup(t, store, bucket)
+						tc.setup(t, store, table)
 					}
 
 					// 1. Put val1
-					if err := store.Put(bucket, key, tc.val1); err != nil {
+					if err := store.Put(table, key, tc.val1); err != nil {
 						t.Fatalf("Put val1 failed: %v", err)
 					}
 
@@ -1082,27 +1082,27 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 
 					// Capture location of val1
 					store.keyMu.RLock()
-					oldEntry := store.keyIndex[qualifyKey(bucket, key)]
+					oldEntry := store.keyIndex[qualifyKey(table, key)]
 					store.keyMu.RUnlock()
 
 					// 2. Put val2 (transition)
-					if err := store.Put(bucket, key, tc.val2); err != nil {
+					if err := store.Put(table, key, tc.val2); err != nil {
 						t.Fatalf("Put val2 failed: %v", err)
 					}
 
 					// Verify val2 is readable
-					gotVal2, exists, err := store.Get(bucket, key)
+					gotVal2, exists, err := store.Get(table, key)
 					if err != nil || !exists || !bytes.Equal(gotVal2, tc.val2) {
 						t.Fatalf("Get after Put val2 failed: exists=%v, err=%v", exists, err)
 					}
 
 					// Run verifyPost on old location
 					if tc.verifyPost != nil {
-						tc.verifyPost(t, store, bucket, key, oldEntry)
+						tc.verifyPost(t, store, table, key, oldEntry)
 					}
 
 					// 3. Delete key
-					if err := store.Delete(bucket, key); err != nil {
+					if err := store.Delete(table, key); err != nil {
 						t.Fatalf("Delete failed: %v", err)
 					}
 
@@ -1133,7 +1133,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 					defer store2.Close()
 
 					// 5. Verify deleted key does NOT resurrect
-					resVal, found, err := store2.Get(bucket, key)
+					resVal, found, err := store2.Get(table, key)
 					if err != nil {
 						t.Fatalf("Get after reopen failed: %v", err)
 					}
@@ -1143,7 +1143,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 
 					// If sibling existed, verify sibling is still intact
 					if tc.setup != nil {
-						sVal, sFound, getErr := store2.Get(bucket, "sibling")
+						sVal, sFound, getErr := store2.Get(table, "sibling")
 						if getErr != nil || !sFound {
 							t.Fatalf("sibling key missing after reopen: found=%v, err=%v", sFound, getErr)
 						}
@@ -1166,16 +1166,16 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	bucket := "test"
+	table := "test"
 	key := "mb-key"
 	val := makeIncompressible(20 * 1024)
 
-	if err := store.Put(bucket, key, val); err != nil {
+	if err := store.Put(table, key, val); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
 	store.keyMu.RLock()
-	entry1 := store.keyIndex[qualifyKey(bucket, key)]
+	entry1 := store.keyIndex[qualifyKey(table, key)]
 	store.keyMu.RUnlock()
 
 	// Flush the multi-block page to the heap file so the heap already reflects the write,
@@ -1202,7 +1202,7 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 		t.Fatalf("Reopen 1 failed: %v", err)
 	}
 	store2.keyMu.RLock()
-	entry2 := store2.keyIndex[qualifyKey(bucket, key)]
+	entry2 := store2.keyIndex[qualifyKey(table, key)]
 	store2.keyMu.RUnlock()
 
 	if entry2.LogicalPage != entry1.LogicalPage {
@@ -1226,7 +1226,7 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 	defer store3.Close()
 
 	store3.keyMu.RLock()
-	entry3 := store3.keyIndex[qualifyKey(bucket, key)]
+	entry3 := store3.keyIndex[qualifyKey(table, key)]
 	store3.keyMu.RUnlock()
 
 	if entry3.LogicalPage != entry1.LogicalPage {
@@ -1245,7 +1245,7 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 		t.Fatalf("expected exactly 1 allocated buddy block run, got %d", numAllocated)
 	}
 
-	got, found, err := store3.Get(bucket, key)
+	got, found, err := store3.Get(table, key)
 	if err != nil || !found || !bytes.Equal(got, val) {
 		t.Fatalf("Get after reopens failed: found=%v, err=%v", found, err)
 	}
@@ -1273,7 +1273,7 @@ func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
 
 		for i := 0; i < objectCount; i++ {
 			key := fmt.Sprintf("bench-key-%05d", i)
-			if err := store.Put("bench-bucket", key, payload); err != nil {
+			if err := store.Put("bench-table", key, payload); err != nil {
 				b.Fatalf("Put failed at %d: %v", i, err)
 			}
 		}
@@ -1299,12 +1299,12 @@ func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 	defer store.Close()
 
 	const numKeys = 10
-	bucket := "StressBucket"
+	table := "StressTable"
 
 	// Seed keys
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("k-%d", i)
-		if err := store.Put(bucket, key, []byte("initial")); err != nil {
+		if err := store.Put(table, key, []byte("initial")); err != nil {
 			t.Fatalf("initial Put failed: %v", err)
 		}
 	}
@@ -1325,7 +1325,7 @@ func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 				default:
 					key := fmt.Sprintf("k-%d", step%numKeys)
 					val := fmt.Sprintf("w%d-%d", writerID, step)
-					_ = store.Put(bucket, key, []byte(val))
+					_ = store.Put(table, key, []byte(val))
 					step++
 				}
 			}
@@ -1358,7 +1358,7 @@ func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 					return
 				default:
 					key := fmt.Sprintf("k-%d", mathrand.Intn(numKeys))
-					val, exists, err := store.Get(bucket, key)
+					val, exists, err := store.Get(table, key)
 					if err != nil {
 						t.Errorf("concurrent Get failed: %v", err)
 						return
@@ -1387,22 +1387,22 @@ func TestGet_MissingOversizeObjectReturnsNotFound(t *testing.T) {
 	}
 	defer store.Close()
 
-	bucket := "TestBucket"
+	table := "TestTable"
 	key := "oversize-key"
 	payload := makeIncompressible(MaxPayloadCapacity + 1024)
 
-	if err := store.Put(bucket, key, payload); err != nil {
+	if err := store.Put(table, key, payload); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
 	// Remove from in-memory oversizeObjects map while leaving keyIndex entry
-	qKey := qualifyKey(bucket, key)
+	qKey := qualifyKey(table, key)
 	store.keyMu.Lock()
 	delete(store.oversizeObjects, qKey)
 	store.keyMu.Unlock()
 
 	// Get should return not found (exists=false, err=nil) without failing the engine
-	val, exists, err := store.Get(bucket, key)
+	val, exists, err := store.Get(table, key)
 	if err != nil {
 		t.Fatalf("expected nil error on missing oversize object, got: %v", err)
 	}
@@ -1424,13 +1424,13 @@ func TestGet_PinPageFailurePreservesCause(t *testing.T) {
 	}
 	defer store.Close()
 
-	bucket := "TestBucket"
+	table := "TestTable"
 	key := "pin-fail-key"
-	if err := store.Put(bucket, key, []byte("val")); err != nil {
+	if err := store.Put(table, key, []byte("val")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
-	qKey := qualifyKey(bucket, key)
+	qKey := qualifyKey(table, key)
 	store.keyMu.RLock()
 	entry := store.keyIndex[qKey]
 	store.keyMu.RUnlock()
@@ -1440,7 +1440,7 @@ func TestGet_PinPageFailurePreservesCause(t *testing.T) {
 	delete(store.bp.pageTable, entry.LogicalPage)
 	store.bp.mu.Unlock()
 
-	_, _, err = store.Get(bucket, key)
+	_, _, err = store.Get(table, key)
 	if err == nil {
 		t.Fatalf("expected error when PinPage fails")
 	}
@@ -1853,14 +1853,14 @@ func TestRegression_OversizeWriteAheadRule(t *testing.T) {
 	var store *Engine
 
 	const (
-		bucket = "ConfigMap"
-		key    = "largeKey"
+		table = "ConfigMap"
+		key   = "largeKey"
 	)
 
 	hookedFS := &renameHookFS{
 		FS: memFS,
 		beforeRename: func(oldpath, newpath string) {
-			if store != nil && newpath == store.oversizeFilePath(qualifyKey(bucket, key)) {
+			if store != nil && newpath == store.oversizeFilePath(qualifyKey(table, key)) {
 				renamed = true
 				if store.wal.FsyncedLSN() < store.wal.MaxLSN() {
 					t.Fatalf("write-ahead rule violation: oversize file renamed before WAL fsynced (fsynced=%d, max=%d)",
@@ -1882,7 +1882,7 @@ func TestRegression_OversizeWriteAheadRule(t *testing.T) {
 	}()
 
 	oversizePayload := make([]byte, 2100*1024)
-	if err := store.Put(bucket, key, oversizePayload); err != nil {
+	if err := store.Put(table, key, oversizePayload); err != nil {
 		t.Fatalf("Put oversize failed: %v", err)
 	}
 	if !renamed {

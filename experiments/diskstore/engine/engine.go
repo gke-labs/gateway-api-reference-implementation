@@ -53,8 +53,8 @@ var TestHookFail = func(e *Engine, err error) {
 	e.setFailed(err)
 }
 
-func qualifyKey(bucketName, key string) string {
-	return bucketName + "\x00" + key
+func qualifyKey(tableName, key string) string {
+	return tableName + "\x00" + key
 }
 
 func unqualifyKey(qualified string) (string, string) {
@@ -268,8 +268,8 @@ type Engine struct {
 	writerMu sync.RWMutex // Single writer: serializes Put, Delete; RLock for point-in-time Scan/List
 
 	keyMu           sync.RWMutex
-	keyIndex        map[string]KeyIndexEntry // bucketQualifiedKey -> KeyIndexEntry
-	oversizeObjects map[string][]byte        // bucketQualifiedKey -> payload
+	keyIndex        map[string]KeyIndexEntry // tableQualifiedKey -> KeyIndexEntry
+	oversizeObjects map[string][]byte        // tableQualifiedKey -> payload
 
 	// Free logical page allocations and tracking; guarded by writerMu
 	emptyPages        *emptyPageTracker
@@ -1199,7 +1199,7 @@ func (s *Engine) decompress(data []byte) ([]byte, error) {
 }
 
 // Put writes an object to the engine, encrypting if a cipher is configured.
-func (s *Engine) Put(bucketName, key string, payload []byte) error {
+func (s *Engine) Put(tableName, key string, payload []byte) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
@@ -1207,7 +1207,7 @@ func (s *Engine) Put(bucketName, key string, payload []byte) error {
 	s.writerMu.Lock()
 	defer s.writerMu.Unlock()
 
-	qKey := qualifyKey(bucketName, key)
+	qKey := qualifyKey(tableName, key)
 
 	// Compress payload
 	compressed, err := s.compress(payload)
@@ -1219,7 +1219,7 @@ func (s *Engine) Put(bucketName, key string, payload []byte) error {
 	// Encrypt payload if cipher is configured
 	toStore := compressed
 	if s.cipher != nil {
-		ad := AdditionalData(bucketName, key)
+		ad := AdditionalData(tableName, key)
 		encrypted, err := s.cipher.Encrypt(compressed, ad)
 		if err != nil {
 			s.setFailed(err)
@@ -1538,13 +1538,13 @@ func (s *Engine) clearLogicalPageLocked(logicalPage uint64, lsn uint64) error {
 	return nil
 }
 
-// Get retrieves an object by bucket and key, decrypting if a cipher is configured.
-func (s *Engine) Get(bucketName, key string) ([]byte, bool, error) {
+// Get retrieves an object by table and key, decrypting if a cipher is configured.
+func (s *Engine) Get(tableName, key string) ([]byte, bool, error) {
 	if s.isFailed() {
 		return nil, false, s.failErr()
 	}
 
-	qKey := qualifyKey(bucketName, key)
+	qKey := qualifyKey(tableName, key)
 
 	for attempt := 0; attempt < 4; attempt++ {
 		s.keyMu.RLock()
@@ -1555,7 +1555,7 @@ func (s *Engine) Get(bucketName, key string) ([]byte, bool, error) {
 			return nil, false, nil
 		}
 
-		val, matched, err := s.readIndexEntry(bucketName, key, qKey, entry)
+		val, matched, err := s.readIndexEntry(tableName, key, qKey, entry)
 		if matched {
 			return val, true, nil
 		}
@@ -1586,18 +1586,18 @@ func (s *Engine) Get(bucketName, key string) ([]byte, bool, error) {
 	// always make progress.
 	s.writerMu.RLock()
 	defer s.writerMu.RUnlock()
-	return s.getLocked(bucketName, key)
+	return s.getLocked(tableName, key)
 }
 
 // getLocked retrieves an object assuming s.writerMu.RLock() is held by the caller.
 // Under writerMu.RLock(), concurrent writes and deletes are excluded, ensuring that
 // the key index and page records cannot be invalidated during the read.
-func (s *Engine) getLocked(bucketName, key string) ([]byte, bool, error) {
+func (s *Engine) getLocked(tableName, key string) ([]byte, bool, error) {
 	if s.isFailed() {
 		return nil, false, s.failErr()
 	}
 
-	qKey := qualifyKey(bucketName, key)
+	qKey := qualifyKey(tableName, key)
 
 	s.keyMu.RLock()
 	entry, exists := s.keyIndex[qKey]
@@ -1607,7 +1607,7 @@ func (s *Engine) getLocked(bucketName, key string) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 
-	val, matched, err := s.readIndexEntry(bucketName, key, qKey, entry)
+	val, matched, err := s.readIndexEntry(tableName, key, qKey, entry)
 	if err != nil {
 		if errors.Is(err, ErrDecrypt) {
 			return nil, false, err
@@ -1630,7 +1630,7 @@ func (s *Engine) getLocked(bucketName, key string) ([]byte, bool, error) {
 // and decrypts/decompresses the payload. It returns matched=true when the record
 // was found and matched entry, or matched=false if the record did not match or could
 // not be read due to page conflict.
-func (s *Engine) readIndexEntry(bucketName, key, qKey string, entry KeyIndexEntry) ([]byte, bool, error) {
+func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry) ([]byte, bool, error) {
 	if entry.IsOversize {
 		s.keyMu.RLock()
 		data, ok := s.oversizeObjects[qKey]
@@ -1640,7 +1640,7 @@ func (s *Engine) readIndexEntry(bucketName, key, qKey string, entry KeyIndexEntr
 		}
 		res := bytes.Clone(data)
 		if s.cipher != nil {
-			ad := AdditionalData(bucketName, key)
+			ad := AdditionalData(tableName, key)
 			decrypted, err := s.cipher.Decrypt(res, ad)
 			if err != nil {
 				return nil, false, fmt.Errorf("%w: %v", ErrDecrypt, err)
@@ -1691,7 +1691,7 @@ func (s *Engine) readIndexEntry(bucketName, key, qKey string, entry KeyIndexEntr
 	}
 
 	if s.cipher != nil {
-		ad := AdditionalData(bucketName, key)
+		ad := AdditionalData(tableName, key)
 		decrypted, err := s.cipher.Decrypt(recPayload, ad)
 		if err != nil {
 			return nil, false, fmt.Errorf("%w: %v", ErrDecrypt, err)
@@ -1709,7 +1709,7 @@ func (s *Engine) readIndexEntry(bucketName, key, qKey string, entry KeyIndexEntr
 }
 
 // Delete removes an object by key.
-func (s *Engine) Delete(bucketName, key string) error {
+func (s *Engine) Delete(tableName, key string) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
@@ -1717,7 +1717,7 @@ func (s *Engine) Delete(bucketName, key string) error {
 	s.writerMu.Lock()
 	defer s.writerMu.Unlock()
 
-	qKey := qualifyKey(bucketName, key)
+	qKey := qualifyKey(tableName, key)
 
 	s.keyMu.Lock()
 	entry, exists := s.keyIndex[qKey]
@@ -1764,10 +1764,10 @@ func (s *Engine) Delete(bucketName, key string) error {
 	return nil
 }
 
-// Scan provides a point-in-time consistent iteration of all objects in a bucket.
+// Scan provides a point-in-time consistent iteration of all objects in a table.
 // It acquires writerMu.RLock() so concurrent writes/deletes do not mutate the view.
 // Plaintext bytes are supplied to fn; if fn returns an error (or ErrStopScan), scanning stops.
-func (s *Engine) Scan(bucket string, fn func(key string, value []byte) error) error {
+func (s *Engine) Scan(tableName string, fn func(key string, value []byte) error) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
@@ -1776,7 +1776,7 @@ func (s *Engine) Scan(bucket string, fn func(key string, value []byte) error) er
 	defer s.writerMu.RUnlock()
 
 	s.keyMu.RLock()
-	prefix := bucket + "\x00"
+	prefix := tableName + "\x00"
 	var keys []string
 	for qKey := range s.keyIndex {
 		if strings.HasPrefix(qKey, prefix) {
@@ -1789,7 +1789,7 @@ func (s *Engine) Scan(bucket string, fn func(key string, value []byte) error) er
 	sort.Strings(keys)
 
 	for _, userKey := range keys {
-		val, exists, err := s.getLocked(bucket, userKey)
+		val, exists, err := s.getLocked(tableName, userKey)
 		if err != nil {
 			return err
 		}
@@ -1806,8 +1806,8 @@ func (s *Engine) Scan(bucket string, fn func(key string, value []byte) error) er
 	return nil
 }
 
-// ListKeys returns all keys currently present in the key index for a specific bucket (or all buckets if omitted).
-func (s *Engine) ListKeys(bucketName ...string) []string {
+// ListKeys returns all keys currently present in the key index for a specific table (or all tables if omitted).
+func (s *Engine) ListKeys(tableName ...string) []string {
 	if s.isFailed() {
 		return nil
 	}
@@ -1816,8 +1816,8 @@ func (s *Engine) ListKeys(bucketName ...string) []string {
 	defer s.keyMu.RUnlock()
 
 	var prefix string
-	if len(bucketName) > 0 && bucketName[0] != "" {
-		prefix = bucketName[0] + "\x00"
+	if len(tableName) > 0 && tableName[0] != "" {
+		prefix = tableName[0] + "\x00"
 	}
 
 	keys := make([]string, 0, len(s.keyIndex))
@@ -1837,10 +1837,10 @@ type RecordItem struct {
 	Payload []byte
 }
 
-// List returns a point-in-time consistent view of all objects in the bucket.
-func (s *Engine) List(bucketName string) ([]RecordItem, error) {
+// List returns a point-in-time consistent view of all objects in the table.
+func (s *Engine) List(tableName string) ([]RecordItem, error) {
 	var items []RecordItem
-	err := s.Scan(bucketName, func(k string, v []byte) error {
+	err := s.Scan(tableName, func(k string, v []byte) error {
 		items = append(items, RecordItem{Key: k, Payload: v})
 		return nil
 	})

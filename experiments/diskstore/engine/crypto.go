@@ -24,16 +24,16 @@ import (
 )
 
 // Cipher defines an interface for authenticated symmetric payload encryption and decryption.
-// Additional authenticated data (additionalData) binds the ciphertext to its bucket and key
+// Additional authenticated data (additionalData) binds the ciphertext to its table and key
 // so a ciphertext cannot be transplanted or read under a different key.
 type Cipher interface {
 	Encrypt(plaintext []byte, additionalData []byte) ([]byte, error)
 	Decrypt(ciphertext []byte, additionalData []byte) ([]byte, error)
 }
 
-// AdditionalData formats the AEAD additional authenticated data from bucket name and object key.
-func AdditionalData(bucketName, key string) []byte {
-	return []byte(bucketName + "/" + key)
+// AdditionalData formats the AEAD additional authenticated data from table name and object key.
+func AdditionalData(tableName, key string) []byte {
+	return []byte(tableName + "/" + key)
 }
 
 // NoopCipher passes data through without encryption.
