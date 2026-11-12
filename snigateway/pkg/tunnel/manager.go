@@ -18,17 +18,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/ecdh"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -42,9 +37,6 @@ import (
 	"github.com/quic-go/quic-go"
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/tun/netstack"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -61,8 +53,6 @@ const (
 	TransportModeTCP = "tcp"
 	// TransportModeH2 only uses HTTP/2 CONNECT multiplexed tunnel transport.
 	TransportModeH2 = "h2"
-	// TransportModeWireGuard only uses WireGuard tunnel transport.
-	TransportModeWireGuard = "wireguard"
 )
 
 // ManagerOption configures a Manager.
@@ -84,42 +74,15 @@ func WithPoolSize(size int) ManagerOption {
 	}
 }
 
-// WithTransport sets the transport mode (auto, quic, tcp, h2, wireguard).
+// WithTransport sets the transport mode (auto, quic, tcp, h2).
 func WithTransport(mode string) ManagerOption {
 	return func(m *Manager) {
 		switch mode {
-		case TransportModeAuto, TransportModeQUIC, TransportModeTCP, TransportModeH2, TransportModeWireGuard:
+		case TransportModeAuto, TransportModeQUIC, TransportModeTCP, TransportModeH2:
 			m.transportMode = mode
 		default:
 			m.transportMode = TransportModeAuto
 		}
-	}
-}
-
-// WithWireGuardHandshakeTimeout sets the timeout for establishing the initial WireGuard handshake.
-func WithWireGuardHandshakeTimeout(d time.Duration) ManagerOption {
-	return func(m *Manager) {
-		if d > 0 {
-			m.wireguardHandshakeTimeout = d
-		}
-	}
-}
-
-// WithWireGuardHandshakeMaxAge sets the maximum age of the last WireGuard handshake before tearing down.
-func WithWireGuardHandshakeMaxAge(d time.Duration) ManagerOption {
-	return func(m *Manager) {
-		if d > 0 {
-			m.wireguardHandshakeMaxAge = d
-		}
-	}
-}
-
-// WithWireGuardBind sets a custom conn.Bind for the controller's WireGuard device.
-// The Manager opens and closes the bind once per WireGuard session, so the bind
-// must support Open again after Close.
-func WithWireGuardBind(bind conn.Bind) ManagerOption {
-	return func(m *Manager) {
-		m.wireguardBind = bind
 	}
 }
 
@@ -184,21 +147,18 @@ func WithBackoff(min, max time.Duration) ManagerOption {
 // Manager manages communication with the snigateway frontend, maintaining a QUIC tunnel
 // or a warm pool of pre-dialed reverse tunnel connections and announcing SNI hostnames.
 type Manager struct {
-	client                    *client.Client
-	listener                  *Listener
-	transportMode             string
-	poolSize                  int
-	dialTimeout               time.Duration
-	quicDialTimeout           time.Duration
-	quicProbeInterval         time.Duration
-	registerTimeout           time.Duration
-	h2PingInterval            time.Duration
-	h2DrainTimeout            time.Duration
-	wireguardHandshakeTimeout time.Duration
-	wireguardHandshakeMaxAge  time.Duration
-	wireguardBind             conn.Bind
-	backoffMin                time.Duration
-	backoffMax                time.Duration
+	client            *client.Client
+	listener          *Listener
+	transportMode     string
+	poolSize          int
+	dialTimeout       time.Duration
+	quicDialTimeout   time.Duration
+	quicProbeInterval time.Duration
+	registerTimeout   time.Duration
+	h2PingInterval    time.Duration
+	h2DrainTimeout    time.Duration
+	backoffMin        time.Duration
+	backoffMax        time.Duration
 
 	mu          sync.Mutex
 	hostnames   []string
@@ -221,21 +181,19 @@ type Manager struct {
 // NewManager creates a new Manager using the given client.
 func NewManager(c *client.Client, opts ...ManagerOption) *Manager {
 	m := &Manager{
-		client:                    c,
-		listener:                  NewListener(),
-		transportMode:             TransportModeAuto,
-		poolSize:                  DefaultPoolSize,
-		dialTimeout:               10 * time.Second,
-		quicDialTimeout:           3 * time.Second,
-		quicProbeInterval:         30 * time.Second,
-		registerTimeout:           5 * time.Second,
-		h2PingInterval:            api.DefaultH2PingInterval,
-		h2DrainTimeout:            api.DefaultH2DrainTimeout,
-		wireguardHandshakeTimeout: 10 * time.Second,
-		wireguardHandshakeMaxAge:  180 * time.Second,
-		backoffMin:                200 * time.Millisecond,
-		backoffMax:                5 * time.Second,
-		updateCh:                  make(chan struct{}, 1),
+		client:            c,
+		listener:          NewListener(),
+		transportMode:     TransportModeAuto,
+		poolSize:          DefaultPoolSize,
+		dialTimeout:       10 * time.Second,
+		quicDialTimeout:   3 * time.Second,
+		quicProbeInterval: 30 * time.Second,
+		registerTimeout:   5 * time.Second,
+		h2PingInterval:    api.DefaultH2PingInterval,
+		h2DrainTimeout:    api.DefaultH2DrainTimeout,
+		backoffMin:        200 * time.Millisecond,
+		backoffMax:        5 * time.Second,
+		updateCh:          make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -597,9 +555,6 @@ func (m *Manager) Run(ctx context.Context) error {
 
 			case TransportModeH2:
 				m.runH2SessionWithBackoff(ctx, &backoff)
-
-			case TransportModeWireGuard:
-				m.runWireGuardSessionWithBackoff(ctx, &backoff)
 
 			case TransportModeAuto:
 				// Try QUIC first
@@ -1628,280 +1583,4 @@ func closeQUICConn(c *quic.Conn, code quic.ApplicationErrorCode, msg string) {
 	if err := c.CloseWithError(code, msg); err != nil && !errors.Is(err, net.ErrClosed) {
 		klog.V(2).Infof("failed to close QUIC connection: %v", err)
 	}
-}
-
-func (m *Manager) runWireGuardSessionWithBackoff(ctx context.Context, backoff *time.Duration) {
-	sessCtx, sessCancel := context.WithCancel(ctx)
-	defer sessCancel()
-
-	sessID, sessErrCh, err := m.client.StartSession(sessCtx)
-	if err != nil {
-		sessCancel()
-		if ctx.Err() != nil {
-			return
-		}
-		klog.Warningf("Failed to start session with frontend for WireGuard: %v. Reconnecting in %v...", err, *backoff)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(*backoff):
-		}
-		*backoff = min(*backoff*2, m.backoffMax)
-		return
-	}
-
-	privKey, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		sessCancel()
-		klog.Errorf("Failed to generate ephemeral WireGuard key: %v", err)
-		return
-	}
-	pubKeyBase64 := base64.StdEncoding.EncodeToString(privKey.PublicKey().Bytes())
-
-	wgResp, err := m.client.WireGuardExchange(sessCtx, sessID, pubKeyBase64)
-	if err != nil {
-		sessCancel()
-		if ctx.Err() != nil {
-			return
-		}
-		klog.Warningf("Failed WireGuard key exchange with frontend: %v. Reconnecting in %v...", err, *backoff)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(*backoff):
-		}
-		*backoff = min(*backoff*2, m.backoffMax)
-		return
-	}
-
-	peerIPStr := strings.TrimSuffix(wgResp.PeerAddress, "/128")
-	peerIP, err := netip.ParseAddr(peerIPStr)
-	if err != nil {
-		sessCancel()
-		klog.Errorf("Invalid peer address in WireGuard exchange response: %v", err)
-		return
-	}
-
-	fePubBytes, err := base64.StdEncoding.DecodeString(wgResp.FrontendPublicKey)
-	if err != nil || len(fePubBytes) != 32 {
-		sessCancel()
-		klog.Errorf("Invalid frontend public key in WireGuard exchange response: %v", err)
-		return
-	}
-	fePubHex := hex.EncodeToString(fePubBytes)
-
-	frontendAddress := wgResp.FrontendAddress
-	if !strings.Contains(frontendAddress, "/") {
-		frontendAddress += "/128"
-	}
-
-	mtu := wgResp.MTU
-	if mtu <= 0 {
-		mtu = api.DefaultWireGuardMTU
-	}
-
-	tunDev, netstackNet, err := netstack.CreateNetTUN([]netip.Addr{peerIP}, nil, mtu)
-	if err != nil {
-		sessCancel()
-		klog.Errorf("Failed to create WireGuard netstack TUN device: %v", err)
-		return
-	}
-
-	bind := m.wireguardBind
-	if bind == nil {
-		bind = conn.NewDefaultBind()
-	}
-	dev := device.NewDevice(tunDev, bind, device.NewLogger(device.LogLevelSilent, ""))
-	defer dev.Close()
-
-	endpoint := wgResp.Endpoint
-	epHost, epPort, err := net.SplitHostPort(endpoint)
-	if err != nil {
-		epPort = strings.TrimPrefix(endpoint, ":")
-		epHost = ""
-	}
-
-	if epHost == "" || epHost == "0.0.0.0" || epHost == "::" {
-		feHost := ParseFrontendHost(m.client.ServerAddr())
-		if feHost == "" {
-			feHost = "127.0.0.1"
-		}
-		endpoint = net.JoinHostPort(feHost, epPort)
-	}
-
-	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
-	if err != nil {
-		klog.V(2).Infof("Could not resolve UDP endpoint %s: %v", endpoint, err)
-	} else {
-		endpoint = udpAddr.String()
-	}
-
-	uapiConf := fmt.Sprintf("private_key=%s\nlisten_port=0\npublic_key=%s\nendpoint=%s\nallowed_ip=%s\npersistent_keepalive_interval=25\n",
-		hex.EncodeToString(privKey.Bytes()), fePubHex, endpoint, frontendAddress)
-	if err := dev.IpcSet(uapiConf); err != nil {
-		sessCancel()
-		klog.Errorf("Failed to configure controller WireGuard device: %v", err)
-		return
-	}
-
-	if err := dev.Up(); err != nil {
-		sessCancel()
-		klog.Errorf("Failed to bring up controller WireGuard device: %v", err)
-		return
-	}
-
-	tcpAddr := &net.TCPAddr{
-		IP:   net.ParseIP(peerIP.String()),
-		Port: api.DefaultWireGuardTunnelPort,
-	}
-	lis, err := netstackNet.ListenTCP(tcpAddr)
-	if err != nil {
-		sessCancel()
-		klog.Errorf("Failed to start netstack TCP listener: %v", err)
-		return
-	}
-	defer func() {
-		if err := lis.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			klog.V(2).Infof("Failed to close netstack TCP listener: %v", err)
-		}
-	}()
-
-	go func() {
-		for {
-			c, err := lis.Accept()
-			if err != nil {
-				return
-			}
-			go func(conn net.Conn) {
-				if err := m.handleTunnelConn(conn); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
-					klog.V(2).Infof("Failed to handle tunnel connection: %v", err)
-				}
-			}(c)
-		}
-	}()
-
-	handshakeTimeout := m.wireguardHandshakeTimeout
-	if handshakeTimeout <= 0 {
-		handshakeTimeout = 10 * time.Second
-	}
-	handshakeDeadline := time.Now().Add(handshakeTimeout)
-	var handshakeSuccess bool
-	for time.Now().Before(handshakeDeadline) {
-		if ctx.Err() != nil || sessCtx.Err() != nil {
-			return
-		}
-		hsTime, err := getPeerLastHandshake(dev, fePubHex)
-		if err == nil && !hsTime.IsZero() {
-			handshakeSuccess = true
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	if !handshakeSuccess {
-		klog.Warningf("WireGuard first handshake timed out after %v for session %s (endpoint: %s)", handshakeTimeout, sessID, wgResp.Endpoint)
-		sessCancel()
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(*backoff):
-		}
-		*backoff = min(*backoff*2, m.backoffMax)
-		return
-	}
-
-	*backoff = m.backoffMin
-
-	m.mu.Lock()
-	m.connected = true
-	m.isQUIC = false
-	m.sessionID = sessID
-	m.generation++
-	m.mu.Unlock()
-	m.notifyListeners()
-
-	klog.Infof("Established WireGuard session %s with frontend", sessID)
-	m.triggerRegistration()
-
-	maxHandshakeAge := m.wireguardHandshakeMaxAge
-	if maxHandshakeAge <= 0 {
-		maxHandshakeAge = 180 * time.Second
-	}
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			m.mu.Lock()
-			m.connected = false
-			m.sessionID = ""
-			m.mu.Unlock()
-			m.notifyListeners()
-			return
-		case <-sessCtx.Done():
-			m.mu.Lock()
-			m.connected = false
-			m.sessionID = ""
-			m.mu.Unlock()
-			m.notifyListeners()
-			return
-		case err := <-sessErrCh:
-			m.mu.Lock()
-			m.connected = false
-			m.sessionID = ""
-			m.mu.Unlock()
-			m.notifyListeners()
-			klog.Warningf("WireGuard management session %s ended (%v). Reconnecting in %v...", sessID, err, *backoff)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(*backoff):
-			}
-			return
-		case <-ticker.C:
-			hsTime, err := getPeerLastHandshake(dev, fePubHex)
-			if err == nil && !hsTime.IsZero() && time.Since(hsTime) > maxHandshakeAge {
-				klog.Warningf("WireGuard handshake age (%v) exceeded %v for session %s, tearing down peer", time.Since(hsTime), maxHandshakeAge, sessID)
-				sessCancel()
-				m.mu.Lock()
-				m.connected = false
-				m.sessionID = ""
-				m.mu.Unlock()
-				m.notifyListeners()
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(*backoff):
-				}
-				return
-			}
-		}
-	}
-}
-
-func getPeerLastHandshake(d *device.Device, peerPubKeyHex string) (time.Time, error) {
-	out, err := d.IpcGet()
-	if err != nil {
-		return time.Time{}, err
-	}
-	lines := strings.Split(out, "\n")
-	var inPeer bool
-	for _, line := range lines {
-		if strings.HasPrefix(line, "public_key=") {
-			pk := strings.TrimPrefix(line, "public_key=")
-			inPeer = strings.EqualFold(pk, peerPubKeyHex)
-		} else if inPeer && strings.HasPrefix(line, "last_handshake_time_sec=") {
-			var sec int64
-			_, err := fmt.Sscanf(line, "last_handshake_time_sec=%d", &sec)
-			if err != nil {
-				return time.Time{}, err
-			}
-			if sec == 0 {
-				return time.Time{}, nil
-			}
-			return time.Unix(sec, 0), nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("peer not found in ipc output")
 }

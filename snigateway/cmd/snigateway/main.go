@@ -87,7 +87,7 @@ func BindFlags(fs *flag.FlagSet, opts *gari.Options, cfg *Config) {
 	fs.StringVar(&cfg.TokenFilePath, "token-file", cfg.TokenFilePath, "Path to ServiceAccount token file for authentication.")
 	fs.StringVar(&cfg.InternalHostname, "internal-hostname", cfg.InternalHostname, "TLS ServerName for the snigateway-frontend mTLS management API.")
 	fs.StringVar(&opts.ControllerName, "controller-name", opts.ControllerName, "The GatewayClass controller name managed by this instance.")
-	fs.StringVar(&cfg.TunnelTransport, "tunnel-transport", cfg.TunnelTransport, "Tunnel transport to use (auto, quic, tcp, h2, wireguard).")
+	fs.StringVar(&cfg.TunnelTransport, "tunnel-transport", cfg.TunnelTransport, "Tunnel transport to use (auto, quic, tcp, h2).")
 	fs.IntVar(&cfg.TunnelPoolSize, "tunnel-pool-size", cfg.TunnelPoolSize, "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend when using TCP pool or H2 transport.")
 	fs.DurationVar(&cfg.QUICDialTimeout, "quic-dial-timeout", cfg.QUICDialTimeout, "Timeout for dialing QUIC connections.")
 	fs.DurationVar(&cfg.QUICProbeInterval, "quic-probe-interval", cfg.QUICProbeInterval, "Interval for probing QUIC availability when in TCP fallback.")

@@ -61,6 +61,8 @@ Previous benchmarks compared a hand-rolled raw QUIC loop against an `http.Server
 
 Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27.3, commit 90a731b plus this change):
 
+The WireGuard transport was removed after these measurements were recorded.
+
 ### 3.1 Loopback Saturation Baseline (Comparable Transport Data)
 
 Measured using standalone harness benchmarks: `BenchmarkLatency_*` for TTFB and connection setup allocations, `BenchmarkThroughput_*` for single-stream throughput and allocations, `BenchmarkThroughput_Concurrent_*` for 8-stream aggregate throughput, and `TestBenchmark_SeparateProcessCPU` for frontend and backend process CPU at saturation in separate processes:

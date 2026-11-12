@@ -46,7 +46,7 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "quic-probe-interval", DefValue: "30s", Usage: "Interval for probing QUIC availability when in TCP fallback."},
 		{Name: "token-file", DefValue: "", Usage: "Path to ServiceAccount token file for authentication."},
 		{Name: "tunnel-pool-size", DefValue: "4", Usage: "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend when using TCP pool or H2 transport."},
-		{Name: "tunnel-transport", DefValue: "auto", Usage: "Tunnel transport to use (auto, quic, tcp, h2, wireguard)."},
+		{Name: "tunnel-transport", DefValue: "auto", Usage: "Tunnel transport to use (auto, quic, tcp, h2)."},
 	}
 
 	cfg := DefaultConfig()

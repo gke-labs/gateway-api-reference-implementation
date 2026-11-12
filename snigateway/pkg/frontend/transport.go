@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/quic-go/quic-go"
@@ -351,15 +350,14 @@ func (q *QUICTransport) Close() error {
 	return nil
 }
 
-// CompositeTransport combines PoolTransport (TCP), QUICTransport (QUIC), H2Transport (HTTP/2),
-// and WireGuardTransport (WireGuard) behind the unified Transport interface.
+// CompositeTransport combines PoolTransport (TCP), QUICTransport (QUIC), and H2Transport (HTTP/2)
+// behind the unified Transport interface.
 type CompositeTransport struct {
-	mu        sync.Mutex
-	pool      *PoolTransport
-	quic      *QUICTransport
-	h2        *H2Transport
-	wireguard *WireGuardTransport
-	closed    bool
+	mu     sync.Mutex
+	pool   *PoolTransport
+	quic   *QUICTransport
+	h2     *H2Transport
+	closed bool
 }
 
 // NewCompositeTransport creates a new CompositeTransport wrapping pool, quic, and h2 transports.
@@ -395,25 +393,13 @@ func (c *CompositeTransport) H2() *H2Transport {
 	return c.h2
 }
 
-// WireGuard returns the underlying WireGuardTransport, if configured.
-func (c *CompositeTransport) WireGuard() *WireGuardTransport {
-	return c.wireguard
-}
-
-// SetWireGuard configures the WireGuardTransport on the composite transport.
-func (c *CompositeTransport) SetWireGuard(wg *WireGuardTransport) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.wireguard = wg
-}
-
 // GetConn retrieves a connection for sessionID from whichever transport hosts the session.
 func (c *CompositeTransport) GetConn(ctx context.Context, sessionID string) (net.Conn, error) {
 	conn, _, err := c.GetConnForSessions(ctx, []string{sessionID})
 	return conn, err
 }
 
-// GetConnForSessions searches candidate sessions in order across QUIC, WireGuard, H2, and TCP pool transports.
+// GetConnForSessions searches candidate sessions in order across QUIC, H2, and TCP pool transports.
 // It snapshots all notification channels BEFORE checking sessions to guarantee no lost wakeups.
 func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs []string) (net.Conn, string, error) {
 	for {
@@ -437,12 +423,6 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 		h2Notify := c.h2.notifyCh
 		c.h2.mu.Unlock()
 
-		var wgNotify <-chan struct{}
-		if c.wireguard != nil {
-			wgNotify = c.wireguard.Notify()
-		}
-
-		var hasRetryableDial bool
 		for _, sid := range sessionIDs {
 			// Check QUIC transport first with non-blocking TryGetConn
 			if c.quic.HasSession(sid) {
@@ -452,23 +432,6 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 						return nil, "", ctx.Err()
 					}
 					// Dead stream or error on this session; try next candidate
-					continue
-				}
-				if conn != nil {
-					return conn, sid, nil
-				}
-			}
-
-			// Check WireGuard transport next
-			if c.wireguard != nil && c.wireguard.HasSession(sid) {
-				conn, err := c.wireguard.TryGetConn(ctx, sid)
-				if err != nil {
-					if ctx.Err() != nil {
-						return nil, "", ctx.Err()
-					}
-					if errors.Is(err, ErrDialFailed) {
-						hasRetryableDial = true
-					}
 					continue
 				}
 				if conn != nil {
@@ -497,36 +460,12 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 			}
 		}
 
-		var retryCh <-chan time.Time
-		var retryTimer *time.Timer
-		if hasRetryableDial {
-			retryTimer = time.NewTimer(100 * time.Millisecond)
-			retryCh = retryTimer.C
-		}
-
 		select {
 		case <-ctx.Done():
-			if retryTimer != nil {
-				retryTimer.Stop()
-			}
 			return nil, "", ctx.Err()
-		case <-retryCh:
 		case <-poolNotify:
-			if retryTimer != nil {
-				retryTimer.Stop()
-			}
 		case <-quicNotify:
-			if retryTimer != nil {
-				retryTimer.Stop()
-			}
 		case <-h2Notify:
-			if retryTimer != nil {
-				retryTimer.Stop()
-			}
-		case <-wgNotify:
-			if retryTimer != nil {
-				retryTimer.Stop()
-			}
 		}
 	}
 }
@@ -550,11 +489,6 @@ func (c *CompositeTransport) Close() error {
 	}
 	if err := c.h2.Close(); err != nil {
 		errs = append(errs, err)
-	}
-	if c.wireguard != nil {
-		if err := c.wireguard.Close(); err != nil {
-			errs = append(errs, err)
-		}
 	}
 	return errors.Join(errs...)
 }

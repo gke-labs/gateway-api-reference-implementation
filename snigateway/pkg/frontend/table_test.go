@@ -15,8 +15,6 @@
 package frontend
 
 import (
-	"fmt"
-	"net/netip"
 	"testing"
 	"time"
 )
@@ -210,78 +208,4 @@ func TestRegistrationTable_Lease(t *testing.T) {
 	if _, ok := tbl.Match("foo.example.com"); ok {
 		t.Fatal("expected foo.example.com to no longer match after lease expired")
 	}
-}
-
-func TestRegistrationTable_WireGuardAddresses(t *testing.T) {
-	tbl := NewRegistrationTable()
-	prefix := netip.MustParsePrefix("fd00::/64")
-
-	// 1. Assign address to session 1
-	addr1, err := tbl.AssignWireGuardAddress("sess-1", prefix)
-	if err != nil {
-		t.Fatalf("unexpected error assigning address: %v", err)
-	}
-	if !prefix.Contains(addr1) {
-		t.Fatalf("assigned address %v not in prefix %v", addr1, prefix)
-	}
-
-	// 2. Calling again returns the exact same address
-	addr1Repeat, err := tbl.AssignWireGuardAddress("sess-1", prefix)
-	if err != nil {
-		t.Fatalf("unexpected error assigning address: %v", err)
-	}
-	if addr1 != addr1Repeat {
-		t.Fatalf("expected idempotent address %v, got %v", addr1, addr1Repeat)
-	}
-
-	// 3. Query via GetWireGuardAddress
-	queried, ok := tbl.GetWireGuardAddress("sess-1")
-	if !ok || queried != addr1 {
-		t.Fatalf("expected %v, got %v (ok=%v)", addr1, queried, ok)
-	}
-
-	// 4. Assign 100 different sessions and verify no collisions
-	seen := make(map[netip.Addr]string)
-	seen[addr1] = "sess-1"
-
-	for i := 2; i <= 100; i++ {
-		sid := fmt.Sprintf("sess-%d", i)
-		addr, err := tbl.AssignWireGuardAddress(sid, prefix)
-		if err != nil {
-			t.Fatalf("assigning address for %s failed: %v", sid, err)
-		}
-		if other, exists := seen[addr]; exists {
-			t.Fatalf("address collision between %s and %s: %v", sid, other, addr)
-		}
-		seen[addr] = sid
-	}
-
-	// 5. Unregister frees address
-	tbl.Unregister("sess-1")
-	if _, ok := tbl.GetWireGuardAddress("sess-1"); ok {
-		t.Fatalf("expected sess-1 address to be freed after unregister")
-	}
-
-	// 6. Re-assigning to a new session after unregister succeeds
-	_, err = tbl.AssignWireGuardAddress("sess-new", prefix)
-	if err != nil {
-		t.Fatalf("assigning address after unregister failed: %v", err)
-	}
-
-	// 7. Lease expiration releases address
-	now := time.Now()
-	tbl.RegisterWithLease("sess-lease", []string{"lease.example.com"}, now.Add(10*time.Second))
-	leaseAddr, err := tbl.AssignWireGuardAddress("sess-lease", prefix)
-	if err != nil {
-		t.Fatalf("assigning address for sess-lease failed: %v", err)
-	}
-	if _, ok := tbl.GetWireGuardAddress("sess-lease"); !ok {
-		t.Fatal("expected sess-lease address to exist")
-	}
-
-	tbl.DropExpiredLeases(now.Add(15 * time.Second))
-	if _, ok := tbl.GetWireGuardAddress("sess-lease"); ok {
-		t.Fatal("expected sess-lease address to be released after lease dropped")
-	}
-	_ = leaseAddr
 }
