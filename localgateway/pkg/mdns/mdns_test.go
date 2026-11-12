@@ -679,16 +679,63 @@ func TestMDNSConflictStopsClaim(t *testing.T) {
 	defer rawConn.Close()
 	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
 
+	// Prepare conflicting response packet for conflict.local ahead of time
+	bConflict := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		Response:      true,
+		Authoritative: true,
+	})
+	bConflict.EnableCompression()
+	_ = bConflict.StartAnswers()
+	_ = bConflict.AResource(
+		dnsmessage.ResourceHeader{
+			Name:  dnsmessage.MustNewName("conflict.local."),
+			Type:  dnsmessage.TypeA,
+			Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | CacheFlushBit),
+			TTL:   120,
+		},
+		dnsmessage.AResource{A: [4]byte{10, 0, 0, 99}},
+	)
+	respData, err := bConflict.Finish()
+	if err != nil {
+		t.Fatalf("building conflicting response: %v", err)
+	}
+
+	sender, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to create sender: %v", err)
+	}
+	defer sender.Close()
+	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: ephemeralPort}
+
+	var injectOnce sync.Once
 	pub, err := NewPublisher(PublisherOptions{
 		Interface:             "lo",
 		Port:                  ephemeralPort,
 		IPv4Conn:              rawConn,
 		DisableIPv6:           true,
 		TTL:                   120,
-		ProbeInterval:         50 * time.Millisecond,
+		ProbeInterval:         500 * time.Millisecond,
 		ProbeCount:            3,
 		ConflictRetryInterval: 1 * time.Second,
 		AnnounceInterval:      50 * time.Millisecond,
+		MulticastTap: func(raw []byte) {
+			// Hook into probe transmission to inject conflicting response before probe interval elapses.
+			var p dnsmessage.Parser
+			if _, err := p.Start(raw); err != nil {
+				return
+			}
+			q, err := p.Question()
+			if err != nil {
+				return
+			}
+			if strings.EqualFold(q.Name.String(), "conflict.local.") {
+				injectOnce.Do(func() {
+					if _, err := sender.WriteTo(respData, dst); err != nil {
+						t.Errorf("failed to send conflicting response: %v", err)
+					}
+				})
+			}
+		},
 		EnqueueGateway: func(req types.NamespacedName) {
 			reconcileCh <- req
 		},
@@ -720,41 +767,8 @@ func TestMDNSConflictStopsClaim(t *testing.T) {
 		},
 	}
 
-	// Start data plane push
+	// Start data plane push; MulticastTap will inject the conflict immediately when probe is sent
 	pub.OnGatewaysUpdate([]*gatewayv1.Gateway{gw})
-
-	// Inject a conflicting response packet for conflict.local directly into the publisher
-	bConflict := dnsmessage.NewBuilder(nil, dnsmessage.Header{
-		Response:      true,
-		Authoritative: true,
-	})
-	bConflict.EnableCompression()
-	_ = bConflict.StartAnswers()
-	_ = bConflict.AResource(
-		dnsmessage.ResourceHeader{
-			Name:  dnsmessage.MustNewName("conflict.local."),
-			Type:  dnsmessage.TypeA,
-			Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | CacheFlushBit),
-			TTL:   120,
-		},
-		dnsmessage.AResource{A: [4]byte{10, 0, 0, 99}},
-	)
-	respData, err := bConflict.Finish()
-	if err != nil {
-		t.Fatalf("building conflicting response: %v", err)
-	}
-
-	sender, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		t.Fatalf("failed to create sender: %v", err)
-	}
-	defer sender.Close()
-
-	// Send conflicting response to publisher's port
-	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: ephemeralPort}
-	if _, err := sender.WriteTo(respData, dst); err != nil {
-		t.Fatalf("failed to send conflicting response: %v", err)
-	}
 
 	// Wait for conflict detection to enqueue reconcile
 	select {
