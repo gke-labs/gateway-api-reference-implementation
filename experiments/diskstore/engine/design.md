@@ -41,7 +41,12 @@ The database metadata file (`meta.db`) is a fixed-size 4 KiB (4096-byte) record 
 |                          Flags (8B)                           |
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Reserved (4060B)                        |
+|                     KeyCheckToken (32B)                       |
+|                                                               |
+|                                                               |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Reserved (4028B)                        |
 |                              ...                              |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                          CRC32C (4B)                          |
@@ -53,7 +58,8 @@ The fields contain the following values:
 - **StoreFormatVersion (4 bytes):** The store format version recorded by the engine (`StoreFormatVersion`).
 - **Database ID (16 bytes):** Unique 16-byte identifier for the database instance.
 - **Flags (8 bytes):** Store flags. Bit 0 indicates whether the store was created with an encryption cipher (`metaFlagEncrypted`). Bits 1 through 63 are reserved and must be zero.
-- **Reserved (4060 bytes):** Reserved space written as zeroes. New fields take reserved bytes and bump `StoreFormatVersion`. Reserved bytes that aren't zero under the current version are rejected as an error.
+- **KeyCheckToken (32 bytes):** An HMAC-SHA256 of the database ID computed using a key derived from the master key with context `"diskstore/keycheck"`. In an unencrypted store, this field is zero. Adding this field takes 32 reserved bytes and bumps `StoreFormatVersion`.
+- **Reserved (4028 bytes):** Reserved space written as zeroes. New fields take reserved bytes and bump `StoreFormatVersion`. Reserved bytes that aren't zero under the current version are rejected as an error.
 - **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the full 4096-byte block with the CRC field zeroed.
 
 ### Block Header
@@ -135,10 +141,10 @@ The format distributes the record across the block run:
 
 ### Oversize Values
 
-For records exceeding 512 blocks (about 2 MiB after compression and encryption), only the value bytes live in a dedicated file in the `oversize/` directory. The heap stores each oversize key's pointer as a small record in the heap pages, in place of the value:
+For records exceeding 512 blocks (about 2 MiB after compression), only the value bytes live in a dedicated file in the `oversize/` directory. The heap stores each oversize key's pointer as a small record in the heap pages, in place of the value:
 
-- **Value file first.** The engine writes the value payload to a file in the `oversize/` directory before acquiring the writer lock. The file name is the SHA-256 hash of the key combined with the value payload. Hashing the key together with the value ensures that two keys holding identical values do not share a file. Because the file name is the hash of the content, it doubles as the checksum. The engine skips writing only when the key's current durable pointer already names this file, because that file was verified when it was written or during recovery. Finding an unreferenced file on disk with that name is not sufficient to skip writing, because a crash could have left a torn orphan that was never fully written or fsynced. In every other case, the engine writes the value through a temporary file, fsyncs the file, renames it into place over any existing file, and fsyncs the `oversize/` directory before taking the writer lock. Atomic rename guarantees that any torn orphan with the same name is replaced. Writing and syncing the value file outside the writer lock keeps large disk transfers off the critical path for other writes.
-- **Pointer record.** The heap stores the pointer as a small record in the heap pages, in place of the value. The record holds the value file name and the value length. Checkpointing preserves pointers because they are heap records. Checkpoints, WAL replay, and compaction handle the pointer like any other small record. The WAL record for an oversize `Put` carries the same pointer instead of the value payload, so redo replay can rebuild the heap record if the engine crashes before flushing the heap page. Because the file name is the SHA-256 hash of the key and value, it also serves as the value checksum. This avoids carrying multi-megabyte payloads in the WAL, and the engine writes the payload once instead of twice.
+- **Value file first.** The engine writes the value payload to a file in the `oversize/` directory before acquiring the writer lock. In an unencrypted store, the file name is the SHA-256 hash of the key combined with the stored (compressed) value bytes. In an encrypted store, the engine names each oversize file with a random identifier. The engine encrypts the value in 4 KiB units using AES-256-XTS with the unit index as the tweak and a key derived for that file. XTS requires whole 16-byte cipher blocks, so the engine pads the final 4 KiB unit with zeros to a 4 KiB boundary. The unpadded value length resides in the pointer record. Using a random identifier avoids leaking hashes of plaintext contents to callers who can list directory entries. Because each write generates a fresh random identifier, the skip-identical-rewrite rule does not apply to encrypted stores; every oversize write creates and fsyncs a new file. In an unencrypted store, the engine skips writing only when the key's current durable pointer already names this file, because that file was verified when it was written or during recovery. Finding an unreferenced file on disk with that name is not sufficient to skip writing, because a crash could have left a torn orphan that was never fully written or fsynced. In every other case, the engine writes the value through a temporary file, fsyncs the file, renames it into place over any existing file, and fsyncs the `oversize/` directory before taking the writer lock. Atomic rename ensures that any torn orphan with the same name is replaced. Writing and syncing the value file outside the writer lock keeps large disk transfers off the critical path for other writes.
+- **Pointer record.** The heap stores the pointer as a small record in the heap pages, in place of the value. The record holds the value file name, the unpadded value length, and a 32-byte SHA-256 checksum of the stored (compressed) value bytes. Checkpointing preserves pointers because they are heap records. Checkpoints, WAL replay, and compaction handle the pointer like any other small record. The WAL record for an oversize `Put` carries the same pointer instead of the value payload, so redo replay can rebuild the heap record if the engine crashes before flushing the heap page. The pointer record format changes to include the 32-byte checksum field in all stores. In an unencrypted store, the file name already reflects that checksum. In an encrypted store, the checksum in the pointer record verifies the decrypted file contents during reads and recovery, because XTS does not authenticate ciphertext. This avoids carrying multi-megabyte payloads in the WAL, and the engine writes the payload once instead of twice.
 - **Old-version retention.** When a key is updated with a different value, the engine deletes the previous version's file only after the new pointer record is durable in the WAL. This mirrors the heap's reuse rule. If a crash interrupts the write before the new pointer is fsynced, recovery still relies on the previous version's file. When rewritten with an identical value, the existing file is retained and never deleted, provided the key's current durable pointer already names this file; otherwise, the engine writes a replacement file through a temporary file and renames it into place.
 - **Recovery.** Recovery decides which files are live from the pointers in the recovered heap plus the replayed WAL, and deletes only files that neither references. Recovery verifies the length and checksum of every referenced file. A missing or corrupt file that a durable pointer references indicates store corruption.
 - **Periodic garbage collection.** A long-running store cannot rely on the next restart to remove orphan files. A background sweep lists the `oversize/` directory periodically, such as during checkpointing, and deletes files that no live record points to. The sweep must never delete a file whose pointer record has not yet been appended to the WAL. A `Put` adds the file name (and any temporary file name) to an in-memory in-flight registry before creating the file, and removes it after the pointer record is appended or the `Put` fails. This registry also covers replacement writes when an unverified orphan file already exists. The sweep inspects this registry under the writer lock before deleting any unreferenced file. Registering before creation prevents a sweep from running between file creation and registration. Relying on an explicit registry rather than a minimum file age ensures that correctness does not depend on timing. Each sweep costs one directory listing.
@@ -150,13 +156,13 @@ The engine stores each record in one of three locations based on the full record
 
 - **Slotted page:** A record goes into a slotted page if it fits in an empty one (up to 4052 bytes of usable record space).
 - **Multi-block page:** Otherwise, if the record fits across 512 blocks (up to 2 MiB), it goes into a power-of-two multi-block page spanning 2 to 512 blocks. A 1-block multi-block page is not allowed because recovery treats any block with a block count of 1 as a slotted page.
-- **Oversize store:** Otherwise, for records exceeding 512 blocks, value bytes reside in individual files named by SHA-256 under the `oversize/` directory, while heap pages and WAL records hold pointer records to them.
+- **Oversize store:** Otherwise, for records exceeding 512 blocks, value bytes reside in individual files under the `oversize/` directory, while heap pages and WAL records hold pointer records to them.
 
-Record placement depends on the stored size after compression and payload encryption. An update to an existing key may compress differently or change payload size, allowing the record to move between page types or into the oversize store. When a key moves to a different page type or storage location on an update, the engine must clear its previous location (deleting the old slot, writing an empty page tombstone, or deleting the old oversize file once the replacement record is durable) to prevent stale data from lingering or resurrecting.
+Record placement depends on the stored size after compression. An update to an existing key may compress differently or change payload size, allowing the record to move between page types or into the oversize store. When a key moves to a different page type or storage location on an update, the engine must clear its previous location (deleting the old slot, writing an empty page tombstone, or deleting the old oversize file once the replacement record is durable) to prevent stale data from lingering or resurrecting.
 
 ### WAL Segment Header
 
-Every WAL segment file begins with a 32-byte header:
+Every WAL segment file begins with a 32-byte header in plaintext:
 
 ```
 +---------------+---------------+---------------+---------------------------------------+
@@ -170,6 +176,8 @@ The header contains:
 - **Version (4 bytes):** The integer `1`.
 - **Reserved (8 bytes):** Zero padding for alignment.
 - **Database ID (16 bytes):** The unique 128-bit identifier of the store.
+
+The segment header remains in plaintext in all stores. Recovery reads the segment header before reading log records, extracting the database ID to derive the WAL encryption key.
 
 ### WAL Record
 
@@ -197,6 +205,70 @@ The record fields contain:
 - **PayloadLen (4 bytes):** Length of the payload in bytes.
 - **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the record header and body with the CRC field zeroed.
 - **Body:** The key bytes and payload bytes.
+
+## Block-Level Encryption
+
+A copy of the store's files reveals no keys, values, or table names without the encryption key. The design protects data at rest against offline exposure, such as copied backups and disk snapshots. File modes (0600 for files and 0700 for directories) remain the first protection on the host, and encryption covers copies that file modes do not reach. The design does not detect deliberate modification of the files by an attacker with write access to storage.
+
+The engine executes encryption and decryption at the block I/O boundary in the block pool. The pool encrypts each full 4 KiB block with AES-256-XTS when flushing it to disk, and decrypts the full 4 KiB block when reading it into the pool. Because AES-XTS transforms fixed-size blocks without ciphertext expansion, encrypted stores use the exact same block layout as unencrypted stores (`BlockUsableSize = 4064`). Nothing in a block stays in plaintext. The cipher transforms all 4096 bytes, including the page header, logical page number, LSN, and CRC32C. Layers above the block pool—such as slotted pages, multi-block pages, the key index, `Get`, and `Put`—operate on plaintext in memory and do not manage ciphers or keys. This block-level scheme replaces the previous per-value cipher, per-value nonces, and per-record associated data.
+
+### Key Derivation
+
+The caller provides a 32-byte master key. The engine derives separate 512-bit keys (two 256-bit keys for AES-256-XTS) using HKDF-SHA256. The HKDF derivation uses the store's 16-byte database ID as the salt, the caller's 32-byte master key as the secret input key material, and a domain separation string as the context info:
+- **Heap key:** Derived with context string `"diskstore/heap"`.
+- **WAL segment keys:** Derived per segment with context string `"diskstore/wal/" + segmentStartLSN`.
+- **Oversize keys:** Derived per file with context string `"diskstore/oversize/" + filename`.
+- **Key check key:** A 256-bit key derived with context string `"diskstore/keycheck"`, used to compute the HMAC-SHA256 token in `meta.db`.
+
+Deriving separate keys for each container file and segment ensures that the same tweak in two files or segments never shares an encryption key, because every derivation context string is unique across the store.
+
+### Tweaks and Positional Binding
+
+AES-XTS requires a 128-bit tweak for each 4 KiB block. The engine assigns tweaks from block positions:
+- **Heap blocks:** The tweak is the 64-bit physical block number in the heap file.
+- **WAL blocks:** The tweak is the block index within the segment: `BlockOffset / BlockSize`.
+- **Oversize files:** The tweak is the 4 KiB unit index within the oversize file.
+
+Because each file or segment uses a distinct derived key and positions within each file are distinct, every `(key, tweak)` pair names exactly one position in the store.
+
+### Execution Boundaries
+
+The crypto transform runs at the direct I/O boundary:
+- **Heap blocks:** The pool decrypts 4 KiB heap blocks during read before inserting them into pool descriptors, and encrypts them from the staging buffer during flushes.
+- **WAL blocks:** The engine encrypts each whole 4 KiB WAL block before writing to disk and decrypts each block when reading segments during recovery. Direct I/O pads the log buffer to a 4 KiB boundary only on sync. The WAL has no per-block header.
+- **Oversize value files:** The engine encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak and the file's derived key. The engine pads the final unit with zeros to a 4 KiB boundary, and the pointer record stores the exact value length. The engine generates a random identifier for the file name, preventing directory listings from revealing guessed values. The skip-identical-rewrite rule does not apply to encrypted oversize files.
+
+### Startup and Key Verification
+
+`meta.db` records whether the creator encrypted the store. If a caller provides a cipher for a store written without one, `Open` fails closed and returns `ErrStoreNotEncrypted`. If a caller opens an encrypted store without providing a cipher, `Open` fails closed and returns `ErrStoreEncrypted`. For an encrypted store, `meta.db` stores an HMAC-SHA256 token of the database ID under the key-check key. `Open` computes the expected HMAC-SHA256 token and verifies it before recovery reads any block from disk. If key verification fails, `Open` returns `ErrInvalidKey`. The caller's `WithEraseOnError` option decides the next action. For kubecache, which generates an ephemeral key per process, a key mismatch is the normal condition across restarts, triggering store erasure and cache reconstruction from the API server.
+
+### Integrity
+
+The Castagnoli CRC32C checksum in the plaintext page header provides the sole integrity check for heap blocks. If a block is moved to a different physical position, torn during a crash, or changed on disk, AES-XTS decrypts the block into unpredictable bytes that fail the CRC32C check. This check detects storage corruption and torn writes; it is not cryptographic authentication. The WAL maintains its existing per-record CRC32C checksums and torn-tail rule. For oversize files, the SHA-256 checksum recorded in the heap pointer record validates the decrypted file contents.
+
+### Recovery
+
+Recovery scans physical heap blocks sequentially and decrypts each block using its physical block number as the tweak before inspecting its header. Callers must provide the cipher key to `Open` before recovery starts. The engine verifies the key against the token in `meta.db` before recovery begins, ensuring that a wrong key fails `Open` immediately rather than causing recovery to misinterpret corrupted blocks as torn writes, open an empty store, and overwrite older durable data. Once the key is verified, recovery treats any block that fails CRC32C verification as a torn write and discards it. The heap file grows by extending file size, so it can contain unwritten blocks of zeros. In an encrypted store, decrypting a block of zeros produces pseudorandom bytes that fail the magic, version, and CRC32C checks; recovery treats never-written zero blocks like torn blocks and discards them. The torn-write and newest-copy-wins rules then operate on decrypted candidate blocks with valid checksums. For WAL blocks, an invalid record checksum in the active segment ends the log as a torn tail, whereas an invalid checksum in a closed segment indicates corruption. Any trailing zero padding at the end of an extended WAL segment similarly decrypts to invalid record bytes that end the log under the torn-tail rule.
+
+### Memory Residency
+
+The block pool holds decrypted plaintext pages in memory. Anyone who can inspect process memory can read cached values, just as they can read the encryption key today. The engine protects data at rest on disk, not against local process memory inspection.
+
+### What an Observer Can Learn
+
+Block-level encryption protects record keys, values, table names, slotted-page headers, and internal page LSNs on disk. However, several storage properties remain visible:
+- **File names:** WAL segment file names reveal segment start LSNs.
+- **File sizes:** The size of the heap file, WAL segments, and oversize value files remain visible. An oversize file's size closely reflects its value payload size.
+- **Changed pieces:** AES-XTS is deterministic. Someone who reads the files at two times learns which 16-byte pieces of a block changed.
+- **Block tampering:** Someone who can write the files can restore an older copy of a block, or scramble a block, which the CRC32C check then rejects during read or recovery.
+
+### Cost and Measurement
+
+Every block pool miss decrypts a 4 KiB block, and every flush encrypts one. AES-XTS performance in Go is currently unmeasured on this storage engine. When the implementation lands, the existing benchmark suite `TestDiskStore_Versus_BBolt_MeasurementSuite` in `experiments/diskstore/kubecache/bench_test.go` will measure write throughput, read latency, and recovery time under AES-XTS block-level encryption.
+
+### Future Work: Authenticated Encryption
+
+Authenticated block encryption requires storing a cryptographic nonce and authentication tag for each block. These fields can live inside each block, which reduces `BlockUsableSize`, or outside the blocks, such as next to each page's entry in a page map. Authenticated encryption remains future work and is not part of this design.
 
 ## Invariants
 
@@ -256,7 +328,7 @@ To prevent resurrection, deleting all records from a page writes an empty page c
 
 The engine deletes the file holding an older version of an oversize value only after a WAL fsync confirms that the replacement pointer record is durable.
 
-This rule mirrors the heap's reuse rule (Invariant 2). When an update changes a value, the SHA-256 file name changes and the engine writes a new file. If the system crashes before the engine fsyncs the new pointer record to the WAL, crash recovery relies on the previous durable pointer and its backing value file. Deleting the previous file before the new pointer record is durable risks data loss across a crash. The engine skips writing and retains the existing file only when the key's current durable pointer already names that file. In every other case—even if a file with that name already exists, such as an unfsynced or torn orphan from an earlier crash—the write path writes the value through a temporary file, fsyncs it, and renames it into place so the orphan is replaced.
+This rule mirrors the heap's reuse rule (Invariant 2). When an update changes a value, the file name changes and the engine writes a new file. If the system crashes before the engine fsyncs the new pointer record to the WAL, crash recovery relies on the previous durable pointer and its backing value file. Deleting the previous file before the new pointer record is durable risks data loss across a crash. The engine skips writing and retains the existing file only when the key's current durable pointer already names that file. In every other case—even if a file with that name already exists, such as an unfsynced or torn orphan from an earlier crash—the write path writes the value through a temporary file, fsyncs it, and renames it into place so the orphan is replaced.
 
 ### 7. In-Flight Protection for Oversize Garbage Collection
 
@@ -270,11 +342,23 @@ The engine stores each oversize value's pointer record in a heap page, never sol
 
 Checkpoints truncate WAL segments based on dirty heap pages. As checkpoints advance, the engine discards older WAL records. Storing the pointer record in the heap ensures that checkpointing preserves the pointer, because the pointer is a heap record. Checkpointing, page flushing, and compaction handle the pointer like any other small record. The WAL record for an oversize `Put` carries the same pointer, so redo replay can rebuild the heap record if a crash occurs before the page flushes.
 
+### 9. The Block-Binding Rule
+
+The engine binds every encrypted block to its container file and physical location by using the block position as the AES-XTS tweak and verifying the plaintext CRC32C checksum.
+
+When the block pool flushes a heap block, it encrypts the block using the physical block number as the tweak under the heap key derived from the database ID. When writing a WAL block, the engine encrypts the block using its block index within the segment as the tweak under the segment key derived from the database ID and segment start LSN. When writing an oversize file unit, the engine encrypts the unit using the unit index as the tweak under the file's derived key. The read path decrypts the block with the same derived key and tweak, then validates the plaintext CRC32C checksum. If a block is moved to a different offset or file, the tweak mismatch causes AES-XTS to decrypt the block into unpredictable bytes that fail the CRC32C check. This rule detects accidental block displacement and corruption across the store.
+
+### 10. The Fail-Closed Rule
+
+The engine refuses to open a store if the configured cipher conflicts with the store's recorded encryption state or fails key verification, and treats corrupted blocks as torn.
+
+During `Open`, the engine reads the encryption flag recorded in `meta.db`. If a caller provides a cipher for an unencrypted store, `Open` returns `ErrStoreNotEncrypted`. If a caller opens an encrypted store without providing a cipher, `Open` returns `ErrStoreEncrypted`. For an encrypted store, `meta.db` stores an HMAC-SHA256 key-check token. `Open` computes and verifies this token under the derived key-check key before recovery reads any block. If verification fails, `Open` returns `ErrInvalidKey`. This prevents a wrong key from causing recovery to treat all encrypted blocks as torn and opening an empty store that overwrites existing data. The configured `WithEraseOnError` option determines whether the caller receives `ErrInvalidKey` or erases the store (the expected restart behavior for kubecache's ephemeral per-process keys). During recovery with a verified key, a checksum failure in a closed WAL segment represents corruption, and `Open` fails as well. The engine treats invalid heap blocks and active WAL segment tail blocks as torn writes and discards them. During steady-state reads, any block that fails CRC32C verification returns an error and transitions the engine into its sticky failed state. The CRC32C check detects storage corruption, accidental block displacement, and torn writes with an error detection probability of roughly $1 - 2^{-32}$.
+
 ## Recovery
 
 Recovery reconstructs database state after a restart or crash by scanning the self-describing heap file and replaying recent WAL records:
 
-- **Self-describing block scan:** Because every heap block header carries its logical page number, block index, total block count, LSN, and CRC checksum, recovery does not depend on a central catalog or page table on disk. Recovery scans the heap file sequentially to discover all valid block runs.
+- **Self-describing block scan:** Because every heap block header carries its logical page number, block index, total block count, LSN, and CRC checksum, recovery does not depend on a central catalog or page table on disk. In an encrypted store, recovery decrypts each 4 KiB block using its physical block number as the tweak before inspecting the header. If a block fails CRC32C verification, recovery treats it as torn. Recovery scans the heap file sequentially to discover all valid block runs.
 - **Newest valid copy wins:** When out-of-place writes or power failures leave multiple copies of a logical page on disk, recovery checks block integrity and checksums across the entire run. Any torn, partial, or corrupt writes are discarded. For each logical page number, the valid candidate run with the highest LSN wins. Stale and torn copies are harmless because the reuse rule ensures the previous durable copy remains intact on disk until a newer write has completed and fsynced.
 - **Allocator and index reconstruction:** Once the winning block runs are selected, the engine reconstructs the buddy allocator state by marking all winning blocks as allocated. All remaining blocks in the file become free for new allocations. The engine then populates the in-memory key index from the active records in the winning pages and restores empty logical page numbers to the empty list.
 - **Idempotent WAL redo replay:** Recovery locates the most recent checkpoint in the WAL to determine the redo starting LSN. Redo replays log records forward from that point. For each record, recovery compares the record's LSN against the recovered page's LSN. If the page already reflects an LSN equal to or greater than the log record, the engine skips the record. This per-page LSN check makes redo idempotent, safely handling crashes that occurred mid-checkpoint or mid-flush.
@@ -288,6 +372,8 @@ Recovery relies on the core invariants to guarantee consistency:
 - **Immutability of fsynced WAL blocks** ensures that acknowledged log records remain intact across crashes.
 - **Retention of logical page numbers** ensures that empty page records supersede older on-disk copies and prevent deleted records from resurrecting.
 - The **old-version rule**, **in-flight protection**, and **heap pointer storage** ensure that valid oversize value files remain intact across crashes, checkpoints, and background sweeps.
+- The **block-binding rule** (Invariant 9) ensures that blocks moved to different physical positions decrypt to pseudorandom bytes and fail checksum verification.
+- The **fail-closed rule** (Invariant 10) ensures that mismatched cipher configurations, key verification failures, and checksum failures in closed WAL segments abort startup.
 
 ## Concurrency
 
@@ -314,11 +400,3 @@ The engine separates synchronization across four distinct layers to prevent dead
 2. **Block Pool vs. Page Data:** The block pool separates pool management from page content access. Callers acquire pool synchronization only to look up, pin, or unpin a page descriptor. Callers release pool synchronization before acquiring a per-page latch to read or modify page bytes. Callers never acquire pool synchronization while holding a per-page latch. This allows concurrent operations to access distinct pages in memory without contending on the pool.
 3. **Flushing and Direct I/O:** Page flushing marks descriptors in-flight and releases pool synchronization before copying data into the staging buffer and writing to disk. Direct I/O writes to the heap file proceed without blocking access to other resident pages in the pool.
 4. **WAL Appends and Syncing:** The WAL serializes incoming records to preserve strictly monotonic LSN assignment. Log buffer management and background flushes operate independently from page table latches.
-
-## What Encryption Covers
-
-The engine encrypts each value's bytes, bound to its bucket and key through the AEAD associated data. Keys, bucket names, record sizes, LSNs and page structure stay in plaintext. Oversize file names derive from the stored bytes, which are the ciphertext when a cipher is configured, so they reveal nothing about the plaintext.
-
-The associated data is `bucket + "/" + key`, which is ambiguous for names containing `/`. kubecache produces no such names. The associated data also binds no version. Someone who can write the store's files while the process runs could replace a value with an older ciphertext of the same key, and the engine would accept it. kubecache's key is ephemeral per process, which limits this to one process lifetime.
-
-Block-level encryption is the planned replacement for this scheme.
