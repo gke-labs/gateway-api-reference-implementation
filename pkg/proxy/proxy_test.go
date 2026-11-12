@@ -2195,15 +2195,22 @@ func TestProxy_RequestTimeout_SlowBody(t *testing.T) {
 	defer proxyServer.Close()
 
 	pipeReader, pipeWriter := io.Pipe()
+	stopWriter := make(chan struct{})
 	go func() {
 		defer pipeWriter.Close()
 		for {
+			select {
+			case <-stopWriter:
+				return
+			default:
+			}
 			if _, writeErr := pipeWriter.Write([]byte("x")); writeErr != nil {
 				return
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
 	}()
+	defer close(stopWriter)
 
 	start := time.Now()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxyServer.URL+"/test", pipeReader)
@@ -2274,11 +2281,15 @@ func TestProxy_BodyReadDeadline(t *testing.T) {
 		}
 
 		// Read from connection until it is disconnected (closed) by server
+		var responseBytes []byte
 		start := time.Now()
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		buf := make([]byte, 1024)
 		for {
-			_, rerr := conn.Read(buf)
+			n, rerr := conn.Read(buf)
+			if n > 0 {
+				responseBytes = append(responseBytes, buf[:n]...)
+			}
 			if rerr != nil {
 				break
 			}
@@ -2287,6 +2298,9 @@ func TestProxy_BodyReadDeadline(t *testing.T) {
 
 		if elapsed < 80*time.Millisecond || elapsed > 1500*time.Millisecond {
 			t.Errorf("expected connection to be disconnected around 150ms, elapsed %v", elapsed)
+		}
+		if !strings.Contains(string(responseBytes), "408") {
+			t.Errorf("expected 408 Request Timeout response, got: %s", string(responseBytes))
 		}
 	})
 
@@ -2330,11 +2344,15 @@ func TestProxy_BodyReadDeadline(t *testing.T) {
 		}
 
 		// Read from connection until it is disconnected (closed) by server
+		var mirrorResponseBytes []byte
 		start := time.Now()
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		buf := make([]byte, 1024)
 		for {
-			_, rerr := conn.Read(buf)
+			n, rerr := conn.Read(buf)
+			if n > 0 {
+				mirrorResponseBytes = append(mirrorResponseBytes, buf[:n]...)
+			}
 			if rerr != nil {
 				break
 			}
@@ -2343,6 +2361,9 @@ func TestProxy_BodyReadDeadline(t *testing.T) {
 
 		if elapsed < 80*time.Millisecond || elapsed > 1500*time.Millisecond {
 			t.Errorf("expected connection to be disconnected around 150ms, elapsed %v", elapsed)
+		}
+		if !strings.Contains(string(mirrorResponseBytes), "408") {
+			t.Errorf("expected 408 Request Timeout response, got: %s", string(mirrorResponseBytes))
 		}
 	})
 

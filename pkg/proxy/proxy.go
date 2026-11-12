@@ -1156,11 +1156,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				bodyBytes, readErr = io.ReadAll(limitedReader)
 				if readErr != nil {
 					switch classifyBodyReadError(readErr, deadlineReader) {
-					case bodyFailureTimeout:
+					case bodyFailureGatewayTimeout:
 						p.respondGatewayTimeout(w, responseController)
 						return
-					case bodyFailureAbort:
-						panic(http.ErrAbortHandler)
+					case bodyFailureRequestTimeout:
+						p.respondRequestTimeout(w, responseController)
+						return
 					}
 					errs = append(errs, readErr)
 				}
@@ -2193,26 +2194,55 @@ func (r *bodyDeadlineReader) setReadDeadline(deadline time.Time) {
 	}
 }
 
-func (r *bodyDeadlineReader) refresh() {
+// updateDeadlines recalculates and resets the read deadline on the underlying connection.
+// Deadlines in net/http and net.Conn are absolute points in time (wall-clock timestamps),
+// not relative durations or per-read timeouts. Therefore, the deadline must be recalculated
+// and reset before each read so that ongoing progress extends the deadline into the future.
+func (r *bodyDeadlineReader) updateDeadlines() {
+	if r.timedOut.Load() {
+		return
+	}
 	if deadline := r.calcDeadline(); !deadline.IsZero() {
 		r.setReadDeadline(deadline)
 	}
 }
 
 func (r *bodyDeadlineReader) Read(p []byte) (int, error) {
+	if r.timedOut.Load() {
+		return 0, os.ErrDeadlineExceeded
+	}
 	if r.requestContext != nil && r.requestContext.Err() != nil {
 		return 0, r.requestContext.Err()
 	}
-	r.refresh()
+	r.updateDeadlines()
 	n, err := r.body.Read(p)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || (r.requestContext != nil && errors.Is(r.requestContext.Err(), context.DeadlineExceeded)) || (!r.requestDeadline.IsZero() && !time.Now().Before(r.requestDeadline)) {
+		// Case 1: The underlying read returned a context deadline exceeded error directly.
+		// The route's request timeout passed; signal timeout to caller.
+		if errors.Is(err, context.DeadlineExceeded) {
 			return n, context.DeadlineExceeded
 		}
+
+		// Case 2: The route's request context expired while reading the body.
+		// The route's request timeout passed; return context.DeadlineExceeded.
+		if r.requestContext != nil && errors.Is(r.requestContext.Err(), context.DeadlineExceeded) {
+			return n, context.DeadlineExceeded
+		}
+
+		// Case 3: The route's request timeout deadline has passed wall-clock time.
+		// The route's request timeout passed; return context.DeadlineExceeded.
+		if !r.requestDeadline.IsZero() && !time.Now().Before(r.requestDeadline) {
+			return n, context.DeadlineExceeded
+		}
+
+		// Case 4: The underlying socket read timed out (os.ErrDeadlineExceeded or net.Error timeout).
+		// The client stalled and made no progress within the body read deadline.
 		var netErr net.Error
 		if errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
 			r.timedOut.Store(true)
+			r.setReadDeadline(time.Now())
 		} else {
+			// Case 5: Other read errors (such as EOF or connection closed); clear the read deadline.
 			r.setReadDeadline(time.Time{})
 		}
 		return n, err
@@ -2234,27 +2264,54 @@ func (r *bodyDeadlineReader) Close() error {
 type bodyFailureAction int
 
 const (
+	// bodyFailureNone indicates the error is not a body timeout or stall; standard error handling applies.
 	bodyFailureNone bodyFailureAction = iota
-	bodyFailureTimeout
-	bodyFailureAbort
+
+	// bodyFailureGatewayTimeout indicates the route's overall request timeout expired (timeouts.request).
+	// The proxy responds with HTTP 504 Gateway Timeout.
+	bodyFailureGatewayTimeout
+
+	// bodyFailureRequestTimeout indicates the client stalled and made no progress within the body read deadline.
+	// The proxy responds with HTTP 408 Request Timeout and closes the connection.
+	bodyFailureRequestTimeout
 )
 
 // classifyBodyReadError determines whether a body read or forwarding error should respond
-// with an HTTP 504 Gateway Timeout (the route's request timeout passed), abort the connection
+// with an HTTP 504 Gateway Timeout (the route's request timeout passed), an HTTP 408 Request Timeout
 // (the client stalled and body made no progress), or proceed with default error handling.
 func classifyBodyReadError(err error, deadlineReader *bodyDeadlineReader) bodyFailureAction {
-	if errors.Is(err, context.DeadlineExceeded) ||
-		(deadlineReader != nil && deadlineReader.requestContext != nil && errors.Is(deadlineReader.requestContext.Err(), context.DeadlineExceeded)) ||
-		(deadlineReader != nil && !deadlineReader.requestDeadline.IsZero() && !time.Now().Before(deadlineReader.requestDeadline)) {
-		return bodyFailureTimeout
+	// Case 1: The error itself is context.DeadlineExceeded from a cancelled round-trip or interrupted read.
+	// The route's request timeout passed; return HTTP 504 Gateway Timeout.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return bodyFailureGatewayTimeout
 	}
+
+	// Case 2: The route's request context expired while transferring the request body.
+	// The route's request timeout passed; return HTTP 504 Gateway Timeout.
+	if deadlineReader != nil && deadlineReader.requestContext != nil && errors.Is(deadlineReader.requestContext.Err(), context.DeadlineExceeded) {
+		return bodyFailureGatewayTimeout
+	}
+
+	// Case 3: The route's request deadline has passed wall-clock time.
+	// The route's request timeout passed; return HTTP 504 Gateway Timeout.
+	if deadlineReader != nil && !deadlineReader.requestDeadline.IsZero() && !time.Now().Before(deadlineReader.requestDeadline) {
+		return bodyFailureGatewayTimeout
+	}
+
+	// Case 4: The client made no progress and exceeded the body read deadline.
+	// The client stalled; return HTTP 408 Request Timeout and close the connection.
 	if deadlineReader != nil && deadlineReader.timedOut.Load() {
-		return bodyFailureAbort
+		return bodyFailureRequestTimeout
 	}
+
+	// Case 5: The read failed due to an I/O network timeout on the underlying socket.
+	// The route's request timeout or socket deadline passed; return HTTP 504 Gateway Timeout.
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return bodyFailureTimeout
+		return bodyFailureGatewayTimeout
 	}
+
+	// Case 6: Not a timeout or stall error (e.g. backend error, payload too large, EOF); proceed with default handling.
 	return bodyFailureNone
 }
 
@@ -2267,6 +2324,18 @@ func (p *Proxy) respondGatewayTimeout(w http.ResponseWriter, responseController 
 		klog.V(2).Infof("failed to set read deadline for timeout response: %v", err)
 	}
 	http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+}
+
+// respondRequestTimeout writes an HTTP 408 Request Timeout response. It sets an
+// expired read deadline on the client connection and sends "Connection: close" so
+// Go's net/http server immediately closes the connection without attempting to drain
+// the unread request body from the stalled client.
+func (p *Proxy) respondRequestTimeout(w http.ResponseWriter, responseController *http.ResponseController) {
+	if err := responseController.SetReadDeadline(time.Now()); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		klog.V(2).Infof("failed to set read deadline for timeout response: %v", err)
+	}
+	w.Header().Set("Connection", "close")
+	http.Error(w, "Request Timeout", http.StatusRequestTimeout)
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter, timeouts *state.InternalTimeouts, retry *state.CompiledHTTPRouteRetry, deadlineReader *bodyDeadlineReader) {
@@ -2335,11 +2404,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				buffered, readErr := io.ReadAll(limitedReader)
 				if readErr != nil {
 					switch classifyBodyReadError(readErr, deadlineReader) {
-					case bodyFailureTimeout:
+					case bodyFailureGatewayTimeout:
 						p.respondGatewayTimeout(w, responseController)
 						return
-					case bodyFailureAbort:
-						panic(http.ErrAbortHandler)
+					case bodyFailureRequestTimeout:
+						p.respondRequestTimeout(w, responseController)
+						return
 					}
 					http.Error(w, "Bad Request", http.StatusBadRequest)
 					return
@@ -2476,11 +2546,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				modifyHeaders(w.Header(), *respHeaderModifier)
 			}
 			switch classifyBodyReadError(err, deadlineReader) {
-			case bodyFailureTimeout:
+			case bodyFailureGatewayTimeout:
 				p.respondGatewayTimeout(w, responseController)
 				return
-			case bodyFailureAbort:
-				panic(http.ErrAbortHandler)
+			case bodyFailureRequestTimeout:
+				p.respondRequestTimeout(w, responseController)
+				return
 			}
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 			return
