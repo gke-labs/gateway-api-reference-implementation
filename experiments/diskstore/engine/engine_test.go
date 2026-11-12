@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	mathrand "math/rand"
 	"os"
 	"path/filepath"
@@ -1501,9 +1502,10 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 
 	t.Run("VersionMismatch", func(t *testing.T) {
 		testWipe(t, func(dir string) {
-			buf := make([]byte, metaFileSize)
-			binary.BigEndian.PutUint32(buf[16:20], StoreFormatVersion+99)
-			if err := os.WriteFile(filepath.Join(dir, "meta.db"), buf, 0644); err != nil {
+			buffer := encodeMetaRecord(metaRecord{
+				version: StoreFormatVersion + 99,
+			})
+			if err := os.WriteFile(filepath.Join(dir, "meta.db"), buffer, 0644); err != nil {
 				t.Fatalf("failed to write incompatible version: %v", err)
 			}
 		})
@@ -2310,4 +2312,232 @@ func TestLostFound_UnparseableTimestampIgnored(t *testing.T) {
 	if len(entries) != 1 || entries[0].Name() != "corrupted_file_without_timestamp" {
 		t.Fatalf("expected unparseable file preserved, got %v", entries)
 	}
+}
+
+func createStoreAndReadMeta(t *testing.T, filesystem FS, directory string) []byte {
+	t.Helper()
+	store, err := Open(WithFS(filesystem), WithDir(directory), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("Table1", "k1", []byte("val1")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	metaFile, err := filesystem.Open(filepath.Join(directory, "meta.db"))
+	if err != nil {
+		t.Fatalf("Open meta.db failed: %v", err)
+	}
+	metaBytes := make([]byte, metaFileSize)
+	if _, err := metaFile.ReadAt(metaBytes, 0); err != nil {
+		t.Fatalf("ReadAt meta.db failed: %v", err)
+	}
+	if err := metaFile.Close(); err != nil {
+		t.Fatalf("Close meta.db failed: %v", err)
+	}
+	return metaBytes
+}
+
+func TestEngine_MetaDBChecksumAndValidation(t *testing.T) {
+	t.Run("FlippedByteAnywhereFailsWithCorruptMetaError", func(t *testing.T) {
+		filesystem := NewMemFS()
+		directory := "test_meta_bitflip"
+		metaBytes := createStoreAndReadMeta(t, filesystem, directory)
+		metaPath := filepath.Join(directory, "meta.db")
+
+		for i := 0; i < metaFileSize; i++ {
+			corrupt := make([]byte, metaFileSize)
+			copy(corrupt, metaBytes)
+			corrupt[i] ^= 0x01
+
+			file, err := filesystem.Create(metaPath)
+			if err != nil {
+				t.Fatalf("Create meta.db failed at byte %d: %v", i, err)
+			}
+			if _, err := file.WriteAt(corrupt, 0); err != nil {
+				t.Fatalf("WriteAt meta.db failed at byte %d: %v", i, err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatalf("Close meta.db failed at byte %d: %v", i, err)
+			}
+
+			_, err = Open(WithFS(filesystem), WithDir(directory))
+			if err == nil {
+				t.Fatalf("expected Open without WithEraseOnError to fail when byte %d is flipped", i)
+			}
+			if !strings.Contains(err.Error(), "outdated or corrupt meta file") {
+				t.Fatalf("expected corrupt meta error at byte %d, got: %v", i, err)
+			}
+		}
+
+		// Restore original uncorrupted meta.db and verify store reopens cleanly
+		file, err := filesystem.Create(metaPath)
+		if err != nil {
+			t.Fatalf("Create meta.db failed: %v", err)
+		}
+		if _, err := file.WriteAt(metaBytes, 0); err != nil {
+			t.Fatalf("WriteAt meta.db failed: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("Close meta.db failed: %v", err)
+		}
+
+		reopened, err := Open(WithFS(filesystem), WithDir(directory))
+		if err != nil {
+			t.Fatalf("Open after restoring uncorrupted meta.db failed: %v", err)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("Close reopened store failed: %v", err)
+		}
+	})
+
+	t.Run("CorruptionCases", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			mutate func(metaBytes []byte)
+		}{
+			{
+				name: "FlipMagicByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetMagic] ^= 0x01
+				},
+			},
+			{
+				name: "FlipVersionByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetVersion] ^= 0x01
+				},
+			},
+			{
+				name: "FlipDBIDByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetDBID] ^= 0x01
+				},
+			},
+			{
+				name: "FlipFlagsByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetFlags] ^= 0x01
+				},
+			},
+			{
+				name: "FlipReservedStartByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetReserved] ^= 0x01
+				},
+			},
+			{
+				name: "FlipReservedMiddleByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetReserved+1000] ^= 0x01
+				},
+			},
+			{
+				name: "FlipReservedEndByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetCRC-1] ^= 0x01
+				},
+			},
+			{
+				name: "FlipCRCByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetCRC] ^= 0x01
+				},
+			},
+			{
+				name: "FlipLastCRCByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaFileSize-1] ^= 0x01
+				},
+			},
+			{
+				name: "NonZeroReservedBytesWithValidCRC",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetReserved+50] = 0xff
+					metaBytes[metaOffsetCRC] = 0
+					metaBytes[metaOffsetCRC+1] = 0
+					metaBytes[metaOffsetCRC+2] = 0
+					metaBytes[metaOffsetCRC+3] = 0
+					crc := crc32.Checksum(metaBytes, castagnoliTable)
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
+				},
+			},
+			{
+				name: "InvalidMagicWithValidCRC",
+				mutate: func(metaBytes []byte) {
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetMagic:metaOffsetVersion], 0x12345678)
+					metaBytes[metaOffsetCRC] = 0
+					metaBytes[metaOffsetCRC+1] = 0
+					metaBytes[metaOffsetCRC+2] = 0
+					metaBytes[metaOffsetCRC+3] = 0
+					crc := crc32.Checksum(metaBytes, castagnoliTable)
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
+				},
+			},
+			{
+				name: "UnknownFlagsWithValidCRC",
+				mutate: func(metaBytes []byte) {
+					binary.BigEndian.PutUint64(metaBytes[metaOffsetFlags:metaOffsetReserved], 1<<2)
+					metaBytes[metaOffsetCRC] = 0
+					metaBytes[metaOffsetCRC+1] = 0
+					metaBytes[metaOffsetCRC+2] = 0
+					metaBytes[metaOffsetCRC+3] = 0
+					crc := crc32.Checksum(metaBytes, castagnoliTable)
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
+				},
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				filesystem := NewMemFS()
+				directory := "test_meta_corrupt_" + tc.name
+				metaBytes := createStoreAndReadMeta(t, filesystem, directory)
+				tc.mutate(metaBytes)
+
+				metaPath := filepath.Join(directory, "meta.db")
+				file, err := filesystem.Create(metaPath)
+				if err != nil {
+					t.Fatalf("Create meta.db failed: %v", err)
+				}
+				if _, err := file.WriteAt(metaBytes, 0); err != nil {
+					t.Fatalf("WriteAt meta.db failed: %v", err)
+				}
+				if err := file.Close(); err != nil {
+					t.Fatalf("Close meta.db failed: %v", err)
+				}
+
+				// 1. Without WithEraseOnError, Open must fail with corrupt meta error
+				_, err = Open(WithFS(filesystem), WithDir(directory))
+				if err == nil {
+					t.Fatalf("expected Open without WithEraseOnError to fail on %s", tc.name)
+				}
+				if !strings.Contains(err.Error(), "outdated or corrupt meta file") {
+					t.Fatalf("expected error containing 'outdated or corrupt meta file', got: %v", err)
+				}
+
+				// 2. With WithEraseOnError, Open must erase the store and initialize a fresh database
+				storeWiped, err := Open(WithFS(filesystem), WithDir(directory), WithEraseOnError())
+				if err != nil {
+					t.Fatalf("Open with WithEraseOnError failed on %s: %v", tc.name, err)
+				}
+				if !storeWiped.Wiped() {
+					t.Fatalf("expected Wiped() == true on %s", tc.name)
+				}
+				if err := storeWiped.Put("Table1", "fresh-key", []byte("fresh-val")); err != nil {
+					t.Fatalf("Put on wiped store failed: %v", err)
+				}
+				value, exists, err := storeWiped.Get("Table1", "fresh-key")
+				if err != nil || !exists || string(value) != "fresh-val" {
+					t.Fatalf("Get on wiped store mismatch: %v", err)
+				}
+				if err := storeWiped.Close(); err != nil {
+					t.Fatalf("Close storeWiped failed: %v", err)
+				}
+			})
+		}
+	})
 }
