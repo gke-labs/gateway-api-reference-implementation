@@ -368,15 +368,6 @@ const (
 	// StoreDirMode is the directory mode used when creating store directories, including lost+found (0700).
 	StoreDirMode os.FileMode = 0700
 
-	// DefaultMaxQuarantinedFiles is the default maximum number of quarantined files
-	// kept in each lost+found directory (100).
-	DefaultMaxQuarantinedFiles = 100
-
-	// DefaultMinQuarantinedRetention is the default minimum retention duration
-	// for quarantined files in lost+found (7 days). Files younger than this retention
-	// are not deleted even if the file count exceeds MaxQuarantinedFiles.
-	DefaultMinQuarantinedRetention = 7 * 24 * time.Hour
-
 	// metaMagic identifies valid meta.db files ("META").
 	metaMagic uint32 = 0x4D455441
 
