@@ -80,3 +80,20 @@ The future gateway integration must fail closed:
 
 - If the custodian daemon is down, unresponsive, or the Unix socket disappears, the gateway must fail TLS handshakes and report itself unready.
 - The gateway must never fall back to an in-memory or locally cached private key.
+
+## End-to-End Testing
+
+The daemon end-to-end test builds the real `keycustodian` binary, runs it on a Unix domain socket, and calls it from a separate process to verify allowed callers (UID and GID), unauthorized caller rejection with `PermissionDenied` before key lookup, and refusal to start with empty allow lists:
+
+```bash
+cd experiments/keycustodian
+go test -v ./cmd/keycustodian
+```
+
+Exercising the denied caller case as a distinct UID requires privileges to change process credentials (root or a user namespace):
+
+```bash
+sudo go test -v -run TestDaemonE2E ./cmd/keycustodian
+```
+
+When run in environments without permission to switch UIDs, the distinct-UID test case is skipped explicitly, while the allowed callers, startup refusal with empty allow lists, and disallowed UID caller rejection cases run and pass.
