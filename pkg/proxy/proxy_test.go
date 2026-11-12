@@ -2558,10 +2558,12 @@ func TestProxy_BodyReadDeadline(t *testing.T) {
 
 		proxyURL := "http://" + proxyLn.Addr().String()
 
+		var dialCount atomic.Int32
 		client := &http.Client{
 			Transport: &http2.Transport{
 				AllowHTTP: true,
 				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+					dialCount.Add(1)
 					var d net.Dialer
 					return d.DialContext(ctx, network, addr)
 				},
@@ -2611,6 +2613,9 @@ func TestProxy_BodyReadDeadline(t *testing.T) {
 		body2, _ := io.ReadAll(resp2.Body)
 		if string(body2) != "healthy-body" {
 			t.Errorf("expected body %q, got %q", "healthy-body", string(body2))
+		}
+		if got := dialCount.Load(); got != 1 {
+			t.Errorf("expected exactly 1 dial (connection reused across streams), got %d", got)
 		}
 	})
 
