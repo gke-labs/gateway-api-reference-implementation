@@ -339,7 +339,7 @@ func TestRegression_Item20_SecondaryIndexesRebuiltOnReopen(t *testing.T) {
 
 	cmExample := &corev1.ConfigMap{}
 	indexer, err := New(store, cmExample, testOnFatal(t),
-		WithBucketName("ConfigMap"),
+		WithWatchName("ConfigMap"),
 		WithIndexers(toolscache.Indexers{
 			"namespace": toolscache.MetaNamespaceIndexFunc,
 		}),
@@ -368,7 +368,7 @@ func TestRegression_Item20_SecondaryIndexesRebuiltOnReopen(t *testing.T) {
 	defer store2.Close()
 
 	indexer2, err := New(store2, cmExample, testOnFatal(t),
-		WithBucketName("ConfigMap"),
+		WithWatchName("ConfigMap"),
 		WithIndexers(toolscache.Indexers{
 			"namespace": toolscache.MetaNamespaceIndexFunc,
 		}),
@@ -399,7 +399,7 @@ func TestRegression_Item21_ReplaceAsDiff(t *testing.T) {
 	}
 	defer store.Close()
 
-	indexer, _ := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	indexer, _ := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithWatchName("ConfigMap"))
 	defer indexer.Close()
 
 	cmA := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "a", ResourceVersion: "1"}}
@@ -440,7 +440,7 @@ func TestRegression_Item21_ReplaceAsDiff(t *testing.T) {
 	}
 }
 
-// TestRegression_Round2_Item5_BookmarkNoFakeObject asserts that bookmarks do not store fake objects in buckets.
+// TestRegression_Round2_Item5_BookmarkNoFakeObject asserts that bookmarks do not store fake objects in watches.
 func TestRegression_Round2_Item5_BookmarkNoFakeObject(t *testing.T) {
 	memFS := engine.NewMemFS()
 	dir := "test_bookmark_fake_obj"
@@ -451,7 +451,7 @@ func TestRegression_Round2_Item5_BookmarkNoFakeObject(t *testing.T) {
 	}
 	defer store.Close()
 
-	indexer, _ := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	indexer, _ := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithWatchName("ConfigMap"))
 	defer indexer.Close()
 
 	// Record bookmark
@@ -484,18 +484,18 @@ func TestRegression_Round2_Item5_BookmarkNoFakeObject(t *testing.T) {
 	}
 }
 
-// TestRegression_Round2_Item6_ResourceVersionPerBucket asserts resourceVersions are isolated per bucket.
-func TestRegression_Round2_Item6_ResourceVersionPerBucket(t *testing.T) {
+// TestRegression_Round2_Item6_ResourceVersionPerWatch asserts resourceVersions are isolated per watch.
+func TestRegression_Round2_Item6_ResourceVersionPerWatch(t *testing.T) {
 	memFS := engine.NewMemFS()
-	dir := "test_rv_per_bucket"
+	dir := "test_rv_per_watch"
 
 	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	cmIndexer, _ := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
-	secretIndexer, _ := New(store, &corev1.Secret{}, testOnFatal(t), WithBucketName("Secret"))
+	cmIndexer, _ := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithWatchName("ConfigMap"))
+	secretIndexer, _ := New(store, &corev1.Secret{}, testOnFatal(t), WithWatchName("Secret"))
 	defer cmIndexer.Close()
 	defer secretIndexer.Close()
 
@@ -525,8 +525,8 @@ func TestRegression_Round2_Item6_ResourceVersionPerBucket(t *testing.T) {
 	}
 	defer store2.Close()
 
-	cmIndexer2, _ := New(store2, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
-	secretIndexer2, _ := New(store2, &corev1.Secret{}, testOnFatal(t), WithBucketName("Secret"))
+	cmIndexer2, _ := New(store2, &corev1.ConfigMap{}, testOnFatal(t), WithWatchName("ConfigMap"))
+	secretIndexer2, _ := New(store2, &corev1.Secret{}, testOnFatal(t), WithWatchName("Secret"))
 	defer cmIndexer2.Close()
 	defer secretIndexer2.Close()
 
@@ -598,23 +598,23 @@ func openTestStoreAndIndexer(t *testing.T, dir string, opts ...engine.Option) (*
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	idx, err := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	idx, err := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithWatchName("ConfigMap"))
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
 	return store, idx, memFS
 }
 
-func TestNew_RejectsReservedBucketName(t *testing.T) {
+func TestNew_RejectsReservedWatchName(t *testing.T) {
 	memFS := engine.NewMemFS()
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("test_reserved_bucket"), engine.WithCreate())
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("test_reserved_watch"), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
-	if _, err := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName(reservedResourceVersionWatch)); err == nil {
-		t.Fatalf("expected New with reserved bucket name to fail")
+	if _, err := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithWatchName(reservedResourceVersionTable)); err == nil {
+		t.Fatalf("expected New with reserved watch name to fail")
 	}
 }
 
@@ -630,10 +630,10 @@ func TestIndexer_ReplaceResourceVersionAtomicity(t *testing.T) {
 
 	var checkedDuringReplace bool
 	idx, err := New(store, &corev1.ConfigMap{}, testOnFatal(t),
-		WithBucketName("ConfigMap"),
+		WithWatchName("ConfigMap"),
 		WithIndexers(toolscache.Indexers{
 			"check": func(obj any) ([]string, error) {
-				payload, exists, err := store.Get(reservedResourceVersionWatch, "ConfigMap")
+				payload, exists, err := store.Get(reservedResourceVersionTable, "ConfigMap")
 				if err == nil && exists {
 					checkedDuringReplace = true
 					if string(payload) != "100" {
@@ -653,7 +653,7 @@ func TestIndexer_ReplaceResourceVersionAtomicity(t *testing.T) {
 		t.Fatalf("Add failed: %v", err)
 	}
 
-	payload, exists, err := store.Get(reservedResourceVersionWatch, "ConfigMap")
+	payload, exists, err := store.Get(reservedResourceVersionTable, "ConfigMap")
 	if err != nil || !exists || string(payload) != "100" {
 		t.Fatalf("expected initial persisted RV '100', got %q", string(payload))
 	}
@@ -672,7 +672,7 @@ func TestIndexer_ReplaceResourceVersionAtomicity(t *testing.T) {
 		t.Fatalf("expected check to run during Replace")
 	}
 
-	payload, exists, err = store.Get(reservedResourceVersionWatch, "ConfigMap")
+	payload, exists, err = store.Get(reservedResourceVersionTable, "ConfigMap")
 	if err != nil || !exists || string(payload) != "600" {
 		t.Fatalf("expected persisted RV to equal list RV '600', got %q", string(payload))
 	}
@@ -712,7 +712,7 @@ func TestIndexer_CrashBeforeLazyResourceVersionWrite(t *testing.T) {
 	}
 	defer store2.Close()
 
-	idx2, err := New(store2, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	idx2, err := New(store2, &corev1.ConfigMap{}, testOnFatal(t), WithWatchName("ConfigMap"))
 	if err != nil {
 		t.Fatalf("New reopened failed: %v", err)
 	}
@@ -745,7 +745,7 @@ func TestIndexer_ResourceVersionSurvivesCheckpointTruncation(t *testing.T) {
 	putPads := func(start, end int) {
 		pad := bytes.Repeat([]byte("p"), 30*1024)
 		for i := start; i < end; i++ {
-			if err := store.Put("PaddingBucket", fmt.Sprintf("pad-%d", i), pad); err != nil {
+			if err := store.Put("PaddingTable", fmt.Sprintf("pad-%d", i), pad); err != nil {
 				t.Fatalf("Put pad %d failed: %v", i, err)
 			}
 		}
@@ -779,7 +779,7 @@ func TestIndexer_ResourceVersionSurvivesCheckpointTruncation(t *testing.T) {
 	}
 	defer store2.Close()
 
-	idx2, err := New(store2, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	idx2, err := New(store2, &corev1.ConfigMap{}, testOnFatal(t), WithWatchName("ConfigMap"))
 	if err != nil {
 		t.Fatalf("New reopened failed: %v", err)
 	}

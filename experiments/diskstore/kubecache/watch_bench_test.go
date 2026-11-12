@@ -270,7 +270,7 @@ func runKubecacheWatch(t *testing.T, count int, tmpDir string) WatchBenchResult 
 	defer eng.Close()
 
 	idx, err := New(eng, &corev1.ConfigMap{}, testOnFatal(t),
-		WithBucketName("ConfigMap"), WithIndexerCodec(NewHybridCodec()))
+		WithWatchName("ConfigMap"), WithIndexerCodec(NewHybridCodec()))
 	if err != nil {
 		t.Fatalf("New indexer failed: %v", err)
 	}

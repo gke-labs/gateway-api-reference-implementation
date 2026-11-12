@@ -210,10 +210,10 @@ func TestAdapterFailure_DecodeFailure(t *testing.T) {
 		t.Fatalf("Add failed: %v", err)
 	}
 
-	// Put corrupted non-decodable bytes directly into engine for this bucket
-	bucketName := fmt.Sprintf("%T", &corev1.ConfigMap{})
+	// Put corrupted non-decodable bytes directly into engine for this watch
+	watchName := fmt.Sprintf("%T", &corev1.ConfigMap{})
 	corruptBytes := []byte("this is corrupt raw non-protobuf non-json data")
-	if err := eng.Put(bucketName, "default/cm-corrupt", corruptBytes); err != nil {
+	if err := eng.Put(watchName, "default/cm-corrupt", corruptBytes); err != nil {
 		t.Fatalf("eng.Put corrupt failed: %v", err)
 	}
 
