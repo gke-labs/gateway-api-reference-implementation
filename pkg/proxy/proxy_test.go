@@ -4969,3 +4969,151 @@ func TestProxy_UnmatchedResponses_GenericByDefaultAndDebugFlag(t *testing.T) {
 		}
 	})
 }
+
+func TestServeHTTP_NormalizeRequestPath(t *testing.T) {
+	newBackend := func(name string) (*httptest.Server, state.InternalBackend) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Backend", name)
+			w.Header().Set("X-Backend-URI", r.RequestURI)
+			w.Header().Set("X-Backend-Path", r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		}))
+		parsedURL, err := url.Parse(server.URL)
+		if err != nil {
+			t.Fatalf("parse URL: %v", err)
+		}
+		host, portStr, err := net.SplitHostPort(parsedURL.Host)
+		if err != nil {
+			t.Fatalf("split host port: %v", err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			t.Fatalf("parse port: %v", err)
+		}
+		return server, state.InternalBackend{Host: host, Port: int32(port), Weight: 1}
+	}
+
+	publicServer, publicBackend := newBackend("public")
+	defer publicServer.Close()
+	adminServer, adminBackend := newBackend("admin")
+	defer adminServer.Close()
+
+	redirectScheme := "https"
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{Matches: []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/admin"}}}, Backends: []state.InternalBackend{adminBackend}},
+				{Matches: []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/Admin"}}}, Backends: []state.InternalBackend{adminBackend}},
+				{Matches: []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/public"}}}, Backends: []state.InternalBackend{publicBackend}},
+				{Matches: []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/a"}}}, Backends: []state.InternalBackend{publicBackend}},
+				{Matches: []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/discount"}}}, Backends: []state.InternalBackend{publicBackend}},
+				{Matches: []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/redirect"}}}, Redirect: &state.InternalRedirect{Scheme: &redirectScheme}},
+				{Matches: []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}}, Backends: []state.InternalBackend{publicBackend}},
+			},
+		},
+	})
+
+	proxyServer := httptest.NewServer(p)
+	defer proxyServer.Close()
+
+	tests := []struct {
+		name         string
+		method       string
+		path         string
+		wantStatus   int
+		wantBackend  string
+		wantPath     string
+		wantRawURI   string
+		wantLocation string
+	}{
+		// RFC 3986 dot-segment removal (§5.2.4)
+		{name: "dot_dot_traversal", path: "/public/../admin", wantStatus: http.StatusOK, wantBackend: "admin", wantPath: "/admin"},
+		{name: "encoded_dot_dot_traversal", path: "/public/%2e%2e/admin", wantStatus: http.StatusOK, wantBackend: "admin", wantPath: "/admin"},
+		{name: "dot_dot_traversal_trailing_slash", path: "/public/../admin/", wantStatus: http.StatusOK, wantBackend: "admin", wantPath: "/admin/"},
+		{name: "merged_slashes", path: "//admin", wantStatus: http.StatusOK, wantBackend: "admin", wantPath: "/admin"},
+		{name: "leading_dot_segment", path: "/./admin", wantStatus: http.StatusOK, wantBackend: "admin", wantPath: "/admin"},
+		{name: "leading_dot_segment_trailing_slash", path: "/./admin/", wantStatus: http.StatusOK, wantBackend: "admin", wantPath: "/admin/"},
+		{name: "dot_dot_above_root", path: "/../admin", wantStatus: http.StatusOK, wantBackend: "admin", wantPath: "/admin"},
+		{name: "dot_inside_segment_preserved", path: "/public/a.b/c..d", wantStatus: http.StatusOK, wantBackend: "public", wantPath: "/public/a.b/c..d"},
+		{name: "dot_segment_in_public", path: "/public/./admin/", wantStatus: http.StatusOK, wantBackend: "public", wantPath: "/public/admin/"},
+
+		// RFC 3986 percent-encoding normalization (§6.2.2.1 & §6.2.2.2)
+		{name: "encoded_slash_uppercase_preserved", path: "/a%2Fb", wantStatus: http.StatusOK, wantBackend: "public", wantRawURI: "/a%2Fb", wantPath: "/a/b"},
+		{name: "encoded_slash_lowercase_to_uppercase", path: "/a%2fb", wantStatus: http.StatusOK, wantBackend: "public", wantRawURI: "/a%2Fb", wantPath: "/a/b"},
+		{name: "percent_sign_preserved", path: "/discount/100%25off", wantStatus: http.StatusOK, wantBackend: "public", wantRawURI: "/discount/100%25off", wantPath: "/discount/100%off"},
+		{name: "unreserved_character_decoded", path: "/%41dmin", wantStatus: http.StatusOK, wantBackend: "admin", wantPath: "/Admin"},
+
+		// Origin-form vs asterisk-form: OPTIONS * is unchanged
+		{name: "asterisk_options_unchanged", method: http.MethodOptions, path: "*", wantStatus: http.StatusOK, wantBackend: "public", wantPath: "*", wantRawURI: "*"},
+
+		// Redirect normalization
+		{name: "redirect_normalized", path: "/public/../redirect", wantStatus: http.StatusFound, wantLocation: "https://example.com/redirect"},
+
+		// ACME challenge path
+		{name: "acme_challenge_preserved", path: "/.well-known/acme-challenge/x", wantStatus: http.StatusOK, wantBackend: "public", wantPath: "/.well-known/acme-challenge/x"},
+		{name: "acme_challenge_slashes_merged", path: "//.well-known/acme-challenge/x", wantStatus: http.StatusOK, wantBackend: "public", wantPath: "/.well-known/acme-challenge/x"},
+
+		// Malformed percent-encoding returns 400
+		{name: "malformed_percent_incomplete", path: "/public/%2", wantStatus: http.StatusBadRequest},
+		{name: "malformed_percent_invalid_hex", path: "/public/%zz", wantStatus: http.StatusBadRequest},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			method := http.MethodGet
+			if tc.method != "" {
+				method = tc.method
+			}
+
+			var resp *http.Response
+			var err error
+			if tc.path == "*" {
+				req := httptest.NewRequest(method, "*", nil)
+				rec := httptest.NewRecorder()
+				p.ServeHTTP(rec, req)
+				if req.URL.Path != "*" {
+					t.Errorf("URL.Path = %q, want *", req.URL.Path)
+				}
+				if rec.Code != tc.wantStatus {
+					t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
+				}
+				return
+			} else if strings.Contains(tc.path, "%") || tc.wantStatus == http.StatusFound {
+				conn, dialErr := net.Dial("tcp", proxyServer.Listener.Addr().String())
+				if dialErr != nil {
+					t.Fatalf("failed to dial: %v", dialErr)
+				}
+				defer conn.Close()
+				fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n", method, tc.path)
+				resp, err = http.ReadResponse(bufio.NewReader(conn), nil)
+			} else {
+				req, reqErr := http.NewRequest(method, proxyServer.URL+tc.path, nil)
+				if reqErr != nil {
+					t.Fatalf("new request: %v", reqErr)
+				}
+				resp, err = http.DefaultClient.Do(req)
+			}
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			if tc.wantBackend != "" && resp.Header.Get("X-Backend") != tc.wantBackend {
+				t.Errorf("backend = %q, want %q", resp.Header.Get("X-Backend"), tc.wantBackend)
+			}
+			if tc.wantPath != "" && resp.Header.Get("X-Backend-Path") != tc.wantPath {
+				t.Errorf("path = %q, want %q", resp.Header.Get("X-Backend-Path"), tc.wantPath)
+			}
+			if tc.wantRawURI != "" && resp.Header.Get("X-Backend-URI") != tc.wantRawURI {
+				t.Errorf("URI = %q, want %q", resp.Header.Get("X-Backend-URI"), tc.wantRawURI)
+			}
+			if tc.wantLocation != "" && resp.Header.Get("Location") != tc.wantLocation {
+				t.Errorf("Location = %q, want %q", resp.Header.Get("Location"), tc.wantLocation)
+			}
+		})
+	}
+}
