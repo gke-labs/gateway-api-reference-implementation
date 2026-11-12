@@ -1502,10 +1502,10 @@ func TestRegression_OversizePutAfterWipe(t *testing.T) {
 
 	t.Run("VersionMismatch", func(t *testing.T) {
 		testWipe(t, func(dir string) {
-			buf := encodeMetaRecord(metaRecord{
+			buffer := encodeMetaRecord(metaRecord{
 				version: StoreFormatVersion + 99,
 			})
-			if err := os.WriteFile(filepath.Join(dir, "meta.db"), buf, 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, "meta.db"), buffer, 0644); err != nil {
 				t.Fatalf("failed to write incompatible version: %v", err)
 			}
 		})
@@ -2314,84 +2314,57 @@ func TestLostFound_UnparseableTimestampIgnored(t *testing.T) {
 	}
 }
 
+func createStoreAndReadMeta(t *testing.T, filesystem FS, directory string) []byte {
+	t.Helper()
+	store, err := Open(WithFS(filesystem), WithDir(directory), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("Table1", "k1", []byte("val1")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	metaFile, err := filesystem.Open(filepath.Join(directory, "meta.db"))
+	if err != nil {
+		t.Fatalf("Open meta.db failed: %v", err)
+	}
+	metaBytes := make([]byte, metaFileSize)
+	if _, err := metaFile.ReadAt(metaBytes, 0); err != nil {
+		t.Fatalf("ReadAt meta.db failed: %v", err)
+	}
+	if err := metaFile.Close(); err != nil {
+		t.Fatalf("Close meta.db failed: %v", err)
+	}
+	return metaBytes
+}
+
 func TestEngine_MetaDBChecksumAndValidation(t *testing.T) {
-	t.Run("ReopenValidStore", func(t *testing.T) {
-		memFS := NewMemFS()
-		dir := "test_meta_reopen"
-
-		store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
-		if err := store.Put("Table1", "k1", []byte("val1")); err != nil {
-			t.Fatalf("Put failed: %v", err)
-		}
-		origDBID := store.DBID()
-		if err := store.Close(); err != nil {
-			t.Fatalf("Close failed: %v", err)
-		}
-
-		// Reopen store
-		store2, err := Open(WithFS(memFS), WithDir(dir))
-		if err != nil {
-			t.Fatalf("Reopen failed: %v", err)
-		}
-		defer store2.Close()
-
-		if store2.Wiped() {
-			t.Fatalf("expected Wiped() == false on clean reopen")
-		}
-		if store2.DBID() != origDBID {
-			t.Fatalf("DB ID changed after reopen: orig=%x, new=%x", origDBID, store2.DBID())
-		}
-		val, exists, err := store2.Get("Table1", "k1")
-		if err != nil || !exists || string(val) != "val1" {
-			t.Fatalf("data mismatch on clean reopen: val=%s exists=%v err=%v", string(val), exists, err)
-		}
-	})
-
 	t.Run("FlippedByteAnywhereFailsWithCorruptMetaError", func(t *testing.T) {
-		memFS := NewMemFS()
-		dir := "test_meta_bitflip"
+		filesystem := NewMemFS()
+		directory := "test_meta_bitflip"
+		metaBytes := createStoreAndReadMeta(t, filesystem, directory)
+		metaPath := filepath.Join(directory, "meta.db")
 
-		store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
-		if err := store.Put("Table1", "k1", []byte("val1")); err != nil {
-			t.Fatalf("Put failed: %v", err)
-		}
-		if err := store.Close(); err != nil {
-			t.Fatalf("Close failed: %v", err)
-		}
-
-		metaPath := filepath.Join(dir, "meta.db")
-		mf, err := memFS.Open(metaPath)
-		if err != nil {
-			t.Fatalf("Open meta.db failed: %v", err)
-		}
-		metaBytes := make([]byte, metaFileSize)
-		if _, err := mf.ReadAt(metaBytes, 0); err != nil {
-			t.Fatalf("ReadAt meta.db failed: %v", err)
-		}
-		_ = mf.Close()
-
-		// Test every single byte offset in the 4 KiB meta.db block
 		for i := 0; i < metaFileSize; i++ {
 			corrupt := make([]byte, metaFileSize)
 			copy(corrupt, metaBytes)
-			corrupt[i] ^= 0x01 // flip one bit
+			corrupt[i] ^= 0x01
 
-			wmf, err := memFS.Create(metaPath)
+			file, err := filesystem.Create(metaPath)
 			if err != nil {
 				t.Fatalf("Create meta.db failed at byte %d: %v", i, err)
 			}
-			if _, err := wmf.WriteAt(corrupt, 0); err != nil {
+			if _, err := file.WriteAt(corrupt, 0); err != nil {
 				t.Fatalf("WriteAt meta.db failed at byte %d: %v", i, err)
 			}
-			_ = wmf.Close()
+			if err := file.Close(); err != nil {
+				t.Fatalf("Close meta.db failed at byte %d: %v", i, err)
+			}
 
-			_, err = Open(WithFS(memFS), WithDir(dir))
+			_, err = Open(WithFS(filesystem), WithDir(directory))
 			if err == nil {
 				t.Fatalf("expected Open without WithEraseOnError to fail when byte %d is flipped", i)
 			}
@@ -2401,196 +2374,170 @@ func TestEngine_MetaDBChecksumAndValidation(t *testing.T) {
 		}
 
 		// Restore original uncorrupted meta.db and verify store reopens cleanly
-		wmf, err := memFS.Create(metaPath)
+		file, err := filesystem.Create(metaPath)
 		if err != nil {
 			t.Fatalf("Create meta.db failed: %v", err)
 		}
-		if _, err := wmf.WriteAt(metaBytes, 0); err != nil {
+		if _, err := file.WriteAt(metaBytes, 0); err != nil {
 			t.Fatalf("WriteAt meta.db failed: %v", err)
 		}
-		_ = wmf.Close()
+		if err := file.Close(); err != nil {
+			t.Fatalf("Close meta.db failed: %v", err)
+		}
 
-		reopened, err := Open(WithFS(memFS), WithDir(dir))
+		reopened, err := Open(WithFS(filesystem), WithDir(directory))
 		if err != nil {
 			t.Fatalf("Open after restoring uncorrupted meta.db failed: %v", err)
 		}
-		_ = reopened.Close()
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("Close reopened store failed: %v", err)
+		}
 	})
 
-	t.Run("FlippedByteWithEraseOnErrorErasesStore", func(t *testing.T) {
-		offsets := []int{
-			0,                // Magic byte
-			4,                // Version byte
-			12,               // DB ID byte
-			24,               // Flags byte
-			32,               // Reserved start byte
-			1000,             // Reserved middle byte
-			4091,             // Reserved end byte
-			4092,             // CRC byte
-			metaFileSize - 1, // Last CRC byte
+	t.Run("CorruptionCases", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			mutate func(metaBytes []byte)
+		}{
+			{
+				name: "FlipMagicByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetMagic] ^= 0x01
+				},
+			},
+			{
+				name: "FlipVersionByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetVersion] ^= 0x01
+				},
+			},
+			{
+				name: "FlipDBIDByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetDBID] ^= 0x01
+				},
+			},
+			{
+				name: "FlipFlagsByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetFlags] ^= 0x01
+				},
+			},
+			{
+				name: "FlipReservedStartByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetReserved] ^= 0x01
+				},
+			},
+			{
+				name: "FlipReservedMiddleByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetReserved+1000] ^= 0x01
+				},
+			},
+			{
+				name: "FlipReservedEndByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetCRC-1] ^= 0x01
+				},
+			},
+			{
+				name: "FlipCRCByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetCRC] ^= 0x01
+				},
+			},
+			{
+				name: "FlipLastCRCByte",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaFileSize-1] ^= 0x01
+				},
+			},
+			{
+				name: "NonZeroReservedBytesWithValidCRC",
+				mutate: func(metaBytes []byte) {
+					metaBytes[metaOffsetReserved+50] = 0xff
+					metaBytes[metaOffsetCRC] = 0
+					metaBytes[metaOffsetCRC+1] = 0
+					metaBytes[metaOffsetCRC+2] = 0
+					metaBytes[metaOffsetCRC+3] = 0
+					crc := crc32.Checksum(metaBytes, castagnoliTable)
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
+				},
+			},
+			{
+				name: "InvalidMagicWithValidCRC",
+				mutate: func(metaBytes []byte) {
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetMagic:metaOffsetVersion], 0x12345678)
+					metaBytes[metaOffsetCRC] = 0
+					metaBytes[metaOffsetCRC+1] = 0
+					metaBytes[metaOffsetCRC+2] = 0
+					metaBytes[metaOffsetCRC+3] = 0
+					crc := crc32.Checksum(metaBytes, castagnoliTable)
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
+				},
+			},
+			{
+				name: "UnknownFlagsWithValidCRC",
+				mutate: func(metaBytes []byte) {
+					binary.BigEndian.PutUint64(metaBytes[metaOffsetFlags:metaOffsetReserved], 1<<2)
+					metaBytes[metaOffsetCRC] = 0
+					metaBytes[metaOffsetCRC+1] = 0
+					metaBytes[metaOffsetCRC+2] = 0
+					metaBytes[metaOffsetCRC+3] = 0
+					crc := crc32.Checksum(metaBytes, castagnoliTable)
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
+				},
+			},
 		}
 
-		for _, offset := range offsets {
-			t.Run(fmt.Sprintf("offset_%d", offset), func(t *testing.T) {
-				memFS := NewMemFS()
-				dir := fmt.Sprintf("test_meta_erase_%d", offset)
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				filesystem := NewMemFS()
+				directory := "test_meta_corrupt_" + tc.name
+				metaBytes := createStoreAndReadMeta(t, filesystem, directory)
+				tc.mutate(metaBytes)
 
-				store, err := Open(WithFS(memFS), WithDir(dir), WithCreate())
+				metaPath := filepath.Join(directory, "meta.db")
+				file, err := filesystem.Create(metaPath)
 				if err != nil {
-					t.Fatalf("Open failed: %v", err)
+					t.Fatalf("Create meta.db failed: %v", err)
 				}
-				if err := store.Put("Table1", "k1", []byte("val1")); err != nil {
-					t.Fatalf("Put failed: %v", err)
+				if _, err := file.WriteAt(metaBytes, 0); err != nil {
+					t.Fatalf("WriteAt meta.db failed: %v", err)
 				}
-				if err := store.Close(); err != nil {
-					t.Fatalf("Close failed: %v", err)
+				if err := file.Close(); err != nil {
+					t.Fatalf("Close meta.db failed: %v", err)
 				}
 
-				metaPath := filepath.Join(dir, "meta.db")
-				mf, err := memFS.Open(metaPath)
+				// 1. Without WithEraseOnError, Open must fail with corrupt meta error
+				_, err = Open(WithFS(filesystem), WithDir(directory))
+				if err == nil {
+					t.Fatalf("expected Open without WithEraseOnError to fail on %s", tc.name)
+				}
+				if !strings.Contains(err.Error(), "outdated or corrupt meta file") {
+					t.Fatalf("expected error containing 'outdated or corrupt meta file', got: %v", err)
+				}
+
+				// 2. With WithEraseOnError, Open must erase the store and initialize a fresh database
+				storeWiped, err := Open(WithFS(filesystem), WithDir(directory), WithEraseOnError())
 				if err != nil {
-					t.Fatalf("Open meta.db failed: %v", err)
+					t.Fatalf("Open with WithEraseOnError failed on %s: %v", tc.name, err)
 				}
-				metaBytes := make([]byte, metaFileSize)
-				if _, err := mf.ReadAt(metaBytes, 0); err != nil {
-					t.Fatalf("ReadAt meta.db failed: %v", err)
-				}
-				_ = mf.Close()
-
-				metaBytes[offset] ^= 0x01
-
-				wmf, err := memFS.Create(metaPath)
-				if err != nil {
-					t.Fatalf("Create meta.db failed at offset %d: %v", offset, err)
-				}
-				if _, err := wmf.WriteAt(metaBytes, 0); err != nil {
-					t.Fatalf("WriteAt meta.db failed at offset %d: %v", offset, err)
-				}
-				_ = wmf.Close()
-
-				// With WithEraseOnError, the store must be erased and recreated
-				storeWiped, err := Open(WithFS(memFS), WithDir(dir), WithEraseOnError())
-				if err != nil {
-					t.Fatalf("Open with WithEraseOnError failed at offset %d: %v", offset, err)
-				}
-				defer storeWiped.Close()
-
 				if !storeWiped.Wiped() {
-					t.Fatalf("expected Wiped() == true at offset %d", offset)
+					t.Fatalf("expected Wiped() == true on %s", tc.name)
 				}
 				if err := storeWiped.Put("Table1", "fresh-key", []byte("fresh-val")); err != nil {
 					t.Fatalf("Put on wiped store failed: %v", err)
 				}
-				val, exists, err := storeWiped.Get("Table1", "fresh-key")
-				if err != nil || !exists || string(val) != "fresh-val" {
+				value, exists, err := storeWiped.Get("Table1", "fresh-key")
+				if err != nil || !exists || string(value) != "fresh-val" {
 					t.Fatalf("Get on wiped store mismatch: %v", err)
 				}
+				if err := storeWiped.Close(); err != nil {
+					t.Fatalf("Close storeWiped failed: %v", err)
+				}
 			})
-		}
-	})
-
-	t.Run("NonZeroReservedBytesRejected", func(t *testing.T) {
-		memFS := NewMemFS()
-		dir := "test_meta_reserved_nonzero"
-
-		if err := memFS.MkdirAll(dir, StoreDirMode); err != nil {
-			t.Fatalf("MkdirAll failed: %v", err)
-		}
-
-		// Construct meta buffer with valid magic, version, flags, valid CRC, but non-zero reserved byte
-		buf := make([]byte, metaFileSize)
-		binary.BigEndian.PutUint32(buf[0:4], metaMagic)
-		binary.BigEndian.PutUint32(buf[4:8], StoreFormatVersion)
-		copy(buf[8:24], []byte("0123456789abcdef"))
-		buf[50] = 0xff // non-zero in reserved region (bytes 32..4092)
-
-		crc := crc32.Checksum(buf, castagnoliTable)
-		binary.BigEndian.PutUint32(buf[4092:4096], crc)
-
-		metaPath := filepath.Join(dir, "meta.db")
-		mf, err := memFS.Create(metaPath)
-		if err != nil {
-			t.Fatalf("Create meta.db failed: %v", err)
-		}
-		if _, err := mf.WriteAt(buf, 0); err != nil {
-			t.Fatalf("WriteAt failed: %v", err)
-		}
-		_ = mf.Close()
-
-		// Write dummy heap file
-		hf, err := memFS.Create(filepath.Join(dir, "heap.db"))
-		if err != nil {
-			t.Fatalf("Create heap.db failed: %v", err)
-		}
-		_ = hf.Close()
-
-		// 1. Without WithEraseOnError, must fail with corrupt meta error
-		_, err = Open(WithFS(memFS), WithDir(dir))
-		if err == nil {
-			t.Fatalf("expected Open without WithEraseOnError to fail on non-zero reserved bytes")
-		}
-		if !strings.Contains(err.Error(), "outdated or corrupt meta file") {
-			t.Fatalf("expected error containing 'outdated or corrupt meta file', got: %v", err)
-		}
-
-		// 2. With WithEraseOnError, must wipe the store
-		store, err := Open(WithFS(memFS), WithDir(dir), WithEraseOnError())
-		if err != nil {
-			t.Fatalf("Open with WithEraseOnError failed: %v", err)
-		}
-		defer store.Close()
-		if !store.Wiped() {
-			t.Fatalf("expected Wiped() == true on non-zero reserved bytes with WithEraseOnError")
-		}
-	})
-
-	t.Run("InvalidMagicRejected", func(t *testing.T) {
-		memFS := NewMemFS()
-		dir := "test_meta_invalid_magic"
-
-		if err := memFS.MkdirAll(dir, StoreDirMode); err != nil {
-			t.Fatalf("MkdirAll failed: %v", err)
-		}
-
-		buf := make([]byte, metaFileSize)
-		binary.BigEndian.PutUint32(buf[0:4], 0x12345678) // invalid magic
-		binary.BigEndian.PutUint32(buf[4:8], StoreFormatVersion)
-		copy(buf[8:24], []byte("0123456789abcdef"))
-
-		crc := crc32.Checksum(buf, castagnoliTable)
-		binary.BigEndian.PutUint32(buf[4092:4096], crc)
-
-		metaPath := filepath.Join(dir, "meta.db")
-		mf, err := memFS.Create(metaPath)
-		if err != nil {
-			t.Fatalf("Create meta.db failed: %v", err)
-		}
-		if _, err := mf.WriteAt(buf, 0); err != nil {
-			t.Fatalf("WriteAt failed: %v", err)
-		}
-		_ = mf.Close()
-
-		hf, err := memFS.Create(filepath.Join(dir, "heap.db"))
-		if err != nil {
-			t.Fatalf("Create heap.db failed: %v", err)
-		}
-		_ = hf.Close()
-
-		_, err = Open(WithFS(memFS), WithDir(dir))
-		if err == nil {
-			t.Fatalf("expected Open without WithEraseOnError to fail on invalid magic")
-		}
-		if !strings.Contains(err.Error(), "outdated or corrupt meta file") {
-			t.Fatalf("expected error containing 'outdated or corrupt meta file', got: %v", err)
-		}
-
-		store, err := Open(WithFS(memFS), WithDir(dir), WithEraseOnError())
-		if err != nil {
-			t.Fatalf("Open with WithEraseOnError failed: %v", err)
-		}
-		defer store.Close()
-		if !store.Wiped() {
-			t.Fatalf("expected Wiped() == true on invalid magic with WithEraseOnError")
 		}
 	})
 }

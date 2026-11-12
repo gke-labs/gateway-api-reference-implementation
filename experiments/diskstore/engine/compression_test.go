@@ -342,23 +342,30 @@ func TestEngine_OldFormatVersion_WipedOnOpen(t *testing.T) {
 	}
 
 	// Verify meta.db has been rewritten with metaFileSize bytes containing StoreFormatVersion
-	metaF, err := memFS.Open(metaPath)
+	metaFile, err := memFS.Open(metaPath)
 	if err != nil {
 		t.Fatalf("Open meta.db failed: %v", err)
 	}
-	sz, _ := metaF.Size()
-	if sz != int64(metaFileSize) {
-		t.Fatalf("expected meta.db size %d after wipe, got %d", metaFileSize, sz)
+	size, err := metaFile.Size()
+	if err != nil {
+		t.Fatalf("Size failed: %v", err)
 	}
-	buf := make([]byte, metaFileSize)
-	_, _ = metaF.ReadAt(buf, 0)
-	_ = metaF.Close()
-	rec, err := decodeMetaRecord(buf)
+	if size != int64(metaFileSize) {
+		t.Fatalf("expected meta.db size %d after wipe, got %d", metaFileSize, size)
+	}
+	buffer := make([]byte, metaFileSize)
+	if _, err := metaFile.ReadAt(buffer, 0); err != nil {
+		t.Fatalf("ReadAt meta.db failed: %v", err)
+	}
+	if err := metaFile.Close(); err != nil {
+		t.Fatalf("Close meta.db failed: %v", err)
+	}
+	record, err := decodeMetaRecord(buffer)
 	if err != nil {
 		t.Fatalf("decodeMetaRecord failed: %v", err)
 	}
-	if rec.version != StoreFormatVersion {
-		t.Fatalf("expected StoreFormatVersion %d, got %d", StoreFormatVersion, rec.version)
+	if record.version != StoreFormatVersion {
+		t.Fatalf("expected StoreFormatVersion %d, got %d", StoreFormatVersion, record.version)
 	}
 
 	// Verify fresh store can write and read normally

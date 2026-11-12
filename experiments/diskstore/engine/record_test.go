@@ -109,32 +109,32 @@ func TestEngine_RejectsOldStoreFormatVersion(t *testing.T) {
 
 	// Create meta.db with previous StoreFormatVersion (version 4)
 	metaPath := filepath.Join(dir, "meta.db")
-	mf, err := memFS.Create(metaPath)
+	metaFile, err := memFS.Create(metaPath)
 	if err != nil {
 		t.Fatalf("Create meta.db failed: %v", err)
 	}
 	var oldDBID [16]byte
 	copy(oldDBID[:], []byte("old-db-id-000001"))
-	metaBuf := encodeMetaRecord(metaRecord{
+	metaBuffer := encodeMetaRecord(metaRecord{
 		dbID:    oldDBID,
 		version: StoreFormatVersion - 1, // previous StoreFormatVersion
 	})
-	if _, err := mf.WriteAt(metaBuf, 0); err != nil {
+	if _, err := metaFile.WriteAt(metaBuffer, 0); err != nil {
 		t.Fatalf("WriteAt meta.db failed: %v", err)
 	}
-	if err := mf.Close(); err != nil {
+	if err := metaFile.Close(); err != nil {
 		t.Fatalf("Close meta.db failed: %v", err)
 	}
 
 	// Write dummy heap file to simulate existing database
-	hf, err := memFS.Create(filepath.Join(dir, "heap.db"))
+	heapFile, err := memFS.Create(filepath.Join(dir, "heap.db"))
 	if err != nil {
 		t.Fatalf("Create heap.db failed: %v", err)
 	}
-	if _, err := hf.WriteAt([]byte("dummy old heap data"), 0); err != nil {
+	if _, err := heapFile.WriteAt([]byte("dummy old heap data"), 0); err != nil {
 		t.Fatalf("WriteAt heap.db failed: %v", err)
 	}
-	if err := hf.Close(); err != nil {
+	if err := heapFile.Close(); err != nil {
 		t.Fatalf("Close heap.db failed: %v", err)
 	}
 
@@ -163,24 +163,24 @@ func TestEngine_RejectsOldStoreFormatVersion(t *testing.T) {
 	}
 
 	// Verify meta.db has been rewritten with current StoreFormatVersion
-	metaF, err := memFS.Open(metaPath)
+	readMetaFile, err := memFS.Open(metaPath)
 	if err != nil {
 		t.Fatalf("Open meta.db failed: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := metaF.Close(); err != nil {
-			t.Errorf("metaF.Close failed: %v", err)
+		if err := readMetaFile.Close(); err != nil {
+			t.Errorf("readMetaFile.Close failed: %v", err)
 		}
 	})
-	var readBuf [metaFileSize]byte
-	if _, err := metaF.ReadAt(readBuf[:], 0); err != nil {
+	var readBuffer [metaFileSize]byte
+	if _, err := readMetaFile.ReadAt(readBuffer[:], 0); err != nil {
 		t.Fatalf("ReadAt meta.db failed: %v", err)
 	}
-	rec, err := decodeMetaRecord(readBuf[:])
+	record, err := decodeMetaRecord(readBuffer[:])
 	if err != nil {
 		t.Fatalf("decodeMetaRecord failed: %v", err)
 	}
-	if rec.version != StoreFormatVersion {
-		t.Fatalf("expected StoreFormatVersion %d after wipe, got %d", StoreFormatVersion, rec.version)
+	if record.version != StoreFormatVersion {
+		t.Fatalf("expected StoreFormatVersion %d after wipe, got %d", StoreFormatVersion, record.version)
 	}
 }

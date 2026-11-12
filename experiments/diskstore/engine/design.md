@@ -50,7 +50,7 @@ The database metadata file (`meta.db`) is a fixed-size 4 KiB (4096-byte) record 
 
 The fields contain the following values:
 - **Magic (4 bytes):** The constant `0x4D455441` (ASCII `"META"`).
-- **StoreFormatVersion (4 bytes):** The store format version (currently `5`).
+- **StoreFormatVersion (4 bytes):** The store format version recorded by the engine (`StoreFormatVersion`).
 - **Database ID (16 bytes):** Unique 16-byte identifier for the database instance.
 - **Flags (8 bytes):** Store flags. Bit 0 indicates whether the store was created with an encryption cipher (`metaFlagEncrypted`). Bits 1 through 63 are reserved and must be zero.
 - **Reserved (4060 bytes):** Reserved space written as zeroes. New fields take reserved bytes and bump `StoreFormatVersion`. Reserved bytes that aren't zero under the current version are rejected as an error.
