@@ -377,16 +377,97 @@ const (
 	// are not deleted even if the file count exceeds MaxQuarantinedFiles.
 	DefaultMinQuarantinedRetention = 7 * 24 * time.Hour
 
+	// metaMagic identifies valid meta.db files ("META").
+	metaMagic uint32 = 0x4D455441
+
+	// metaFlagEncrypted indicates that the store was created with an active encryption cipher.
+	metaFlagEncrypted uint64 = 1 << 0
+
 	// StoreFormatVersion is the format version recorded in meta.db.
 	// Version 1 did not record a version and stored uncompressed values without a codec byte.
 	// Version 2 records this version in meta.db and prefixes each stored value with a codec byte.
 	// Version 3 removes resourceVersion (token) handling from WAL records and the engine.
 	// Version 4 records whether the store was created with a cipher in meta.db.
-	StoreFormatVersion uint32 = 4
+	// Version 5 makes meta.db a 4 KiB checksummed record with room for new fields.
+	StoreFormatVersion uint32 = 5
 
-	// metaFileSize is 16 bytes DB ID + 4 bytes StoreFormatVersion + 1 byte encrypted flag.
-	metaFileSize = 21
+	// metaFileSize is the fixed size of meta.db (one 4 KiB block).
+	metaFileSize = BlockSize
 )
+
+// metaRecord represents the decoded contents of meta.db.
+type metaRecord struct {
+	dbID      [16]byte
+	version   uint32
+	encrypted bool
+}
+
+// Layout of meta.db (4096 bytes / one 4 KiB block):
+//   - Bytes 0..4:     Magic (0x4D455441, "META")
+//   - Bytes 4..8:     StoreFormatVersion (uint32)
+//   - Bytes 8..24:    Database ID (16 bytes)
+//   - Bytes 24..32:   Flags (uint64, bit 0: encrypted flag)
+//   - Bytes 32..4092: Reserved bytes (must be zero under current version)
+//   - Bytes 4092..4096: CRC32C (uint32 over full 4096-byte block with CRC field zeroed)
+//
+// New fields take reserved bytes and bump StoreFormatVersion.
+
+func encodeMetaRecord(rec metaRecord) []byte {
+	buf := make([]byte, metaFileSize)
+	binary.BigEndian.PutUint32(buf[0:4], metaMagic)
+	binary.BigEndian.PutUint32(buf[4:8], rec.version)
+	copy(buf[8:24], rec.dbID[:])
+	var flags uint64
+	if rec.encrypted {
+		flags |= metaFlagEncrypted
+	}
+	binary.BigEndian.PutUint64(buf[24:32], flags)
+
+	crc := crc32.Checksum(buf, castagnoliTable)
+	binary.BigEndian.PutUint32(buf[4092:4096], crc)
+	return buf
+}
+
+func decodeMetaRecord(buf []byte) (metaRecord, error) {
+	if len(buf) != metaFileSize {
+		return metaRecord{}, errors.New("invalid meta file size")
+	}
+
+	storedCRC := binary.BigEndian.Uint32(buf[4092:4096])
+	var zeroCRC [4]byte
+	crc := crc32.Update(0, castagnoliTable, buf[:4092])
+	actualCRC := crc32.Update(crc, castagnoliTable, zeroCRC[:])
+	if storedCRC != actualCRC {
+		return metaRecord{}, errors.New("meta file CRC mismatch")
+	}
+
+	magic := binary.BigEndian.Uint32(buf[0:4])
+	if magic != metaMagic {
+		return metaRecord{}, errors.New("invalid meta file magic")
+	}
+
+	ver := binary.BigEndian.Uint32(buf[4:8])
+	if ver != StoreFormatVersion {
+		return metaRecord{}, fmt.Errorf("unsupported store format version: %d", ver)
+	}
+
+	flags := binary.BigEndian.Uint64(buf[24:32])
+	if flags&^metaFlagEncrypted != 0 {
+		return metaRecord{}, errors.New("unknown meta flags")
+	}
+
+	for _, b := range buf[32:4092] {
+		if b != 0 {
+			return metaRecord{}, errors.New("non-zero reserved bytes in meta file")
+		}
+	}
+
+	var rec metaRecord
+	copy(rec.dbID[:], buf[8:24])
+	rec.version = ver
+	rec.encrypted = (flags & metaFlagEncrypted) != 0
+	return rec, nil
+}
 
 // isEncrypted reports whether c represents an active encryption cipher.
 func isEncrypted(c Cipher) bool {
@@ -520,35 +601,41 @@ func Open(opts ...Option) (*Engine, error) {
 			// meta.db exists. Read dbID and store format version.
 			metaBuf := make([]byte, metaFileSize)
 			n, readErr := metaFile.ReadAt(metaBuf, 0)
+			sz, sizeErr := metaFile.Size()
 			if closeErr := metaFile.Close(); closeErr != nil {
 				return nil, fmt.Errorf("failed to close meta file: %w", closeErr)
 			}
-			if readErr != nil && !errors.Is(readErr, io.EOF) {
+			if (readErr != nil && !errors.Is(readErr, io.EOF)) || sizeErr != nil {
+				err := readErr
+				if err == nil || errors.Is(err, io.EOF) {
+					err = sizeErr
+				}
 				if !options.EraseOnError {
-					return nil, fmt.Errorf("failed to read meta file: %w", readErr)
+					return nil, fmt.Errorf("failed to read meta file: %w", err)
 				}
 				needsErase = true
 				eraseReason = "unreadable meta file"
 				isNewStore = true
 			} else {
-				validVersion := false
-				if n >= metaFileSize {
-					version := binary.BigEndian.Uint32(metaBuf[16:20])
-					encryptedFlag := metaBuf[20]
-					if version == StoreFormatVersion && (encryptedFlag == 0 || encryptedFlag == 1) {
-						validVersion = true
-						copy(dbID[:], metaBuf[:16])
+				validMeta := false
+				var rec metaRecord
+				if sz == int64(metaFileSize) && n == metaFileSize {
+					var decodeErr error
+					rec, decodeErr = decodeMetaRecord(metaBuf)
+					if decodeErr == nil {
+						validMeta = true
+						copy(dbID[:], rec.dbID[:])
 					}
 				}
 
-				if !validVersion {
-					// Missing format version (e.g. 16-byte version 1 meta.db) or version mismatch:
+				if !validMeta {
+					// Missing format version, outdated version, or corrupt meta file:
 					// wipe the store and initialize a fresh database.
 					needsErase = true
 					eraseReason = "outdated or corrupt meta file"
 					isNewStore = true
 				} else {
-					storeEncrypted := metaBuf[20] == 1
+					storeEncrypted := rec.encrypted
 					optEncrypted := isEncrypted(options.Cipher)
 					if storeEncrypted && !optEncrypted {
 						return nil, ErrStoreEncrypted
@@ -597,12 +684,11 @@ func Open(opts ...Option) (*Engine, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create meta file: %w", err)
 		}
-		metaBuf := make([]byte, metaFileSize)
-		copy(metaBuf[:16], dbID[:])
-		binary.BigEndian.PutUint32(metaBuf[16:20], StoreFormatVersion)
-		if isEncrypted(options.Cipher) {
-			metaBuf[20] = 1
-		}
+		metaBuf := encodeMetaRecord(metaRecord{
+			dbID:      dbID,
+			version:   StoreFormatVersion,
+			encrypted: isEncrypted(options.Cipher),
+		})
 		if _, writeErr := metaFile.WriteAt(metaBuf, 0); writeErr != nil {
 			closeErr := metaFile.Close()
 			return nil, errors.Join(writeErr, closeErr)

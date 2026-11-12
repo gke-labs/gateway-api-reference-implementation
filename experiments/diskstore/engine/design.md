@@ -21,7 +21,40 @@ The engine uses the following terms:
 
 ## On-Disk Formats
 
-The engine defines binary layouts for heap blocks, slotted pages, multi-block pages, WAL segment headers, and WAL records. All multi-byte integers use big-endian encoding.
+The engine defines binary layouts for database metadata (`meta.db`), heap blocks, slotted pages, multi-block pages, WAL segment headers, and WAL records. All multi-byte integers use big-endian encoding.
+
+### Database Metadata (`meta.db`)
+
+The database metadata file (`meta.db`) is a fixed-size 4 KiB (4096-byte) record initialized when a store is created:
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Magic (4B)           |      StoreFormatVersion (4B)  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Database ID (16B)                       |
+|                                                               |
+|                                                               |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          Flags (8B)                           |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Reserved (4060B)                        |
+|                              ...                              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          CRC32C (4B)                          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The fields contain the following values:
+- **Magic (4 bytes):** The constant `0x4D455441` (ASCII `"META"`).
+- **StoreFormatVersion (4 bytes):** The store format version (currently `5`).
+- **Database ID (16 bytes):** Unique 16-byte identifier for the database instance.
+- **Flags (8 bytes):** Store flags. Bit 0 indicates whether the store was created with an encryption cipher (`metaFlagEncrypted`). Bits 1 through 63 are reserved and must be zero.
+- **Reserved (4060 bytes):** Reserved space written as zeroes. New fields take reserved bytes and bump `StoreFormatVersion`. Reserved bytes that aren't zero under the current version are rejected as an error.
+- **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the full 4096-byte block with the CRC field zeroed.
 
 ### Block Header
 

@@ -16,7 +16,6 @@ package engine
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -108,16 +107,19 @@ func TestEngine_RejectsOldStoreFormatVersion(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
-	// Create meta.db with previous StoreFormatVersion (version 3)
+	// Create meta.db with previous StoreFormatVersion (version 4)
 	metaPath := filepath.Join(dir, "meta.db")
 	mf, err := memFS.Create(metaPath)
 	if err != nil {
 		t.Fatalf("Create meta.db failed: %v", err)
 	}
-	var metaBuf [metaFileSize]byte
-	copy(metaBuf[:16], []byte("old-db-id-000001"))
-	binary.BigEndian.PutUint32(metaBuf[16:20], StoreFormatVersion-1) // previous StoreFormatVersion
-	if _, err := mf.WriteAt(metaBuf[:], 0); err != nil {
+	var oldDBID [16]byte
+	copy(oldDBID[:], []byte("old-db-id-000001"))
+	metaBuf := encodeMetaRecord(metaRecord{
+		dbID:    oldDBID,
+		version: StoreFormatVersion - 1, // previous StoreFormatVersion
+	})
+	if _, err := mf.WriteAt(metaBuf, 0); err != nil {
 		t.Fatalf("WriteAt meta.db failed: %v", err)
 	}
 	if err := mf.Close(); err != nil {
@@ -174,8 +176,11 @@ func TestEngine_RejectsOldStoreFormatVersion(t *testing.T) {
 	if _, err := metaF.ReadAt(readBuf[:], 0); err != nil {
 		t.Fatalf("ReadAt meta.db failed: %v", err)
 	}
-	ver := binary.BigEndian.Uint32(readBuf[16:20])
-	if ver != StoreFormatVersion {
-		t.Fatalf("expected StoreFormatVersion %d after wipe, got %d", StoreFormatVersion, ver)
+	rec, err := decodeMetaRecord(readBuf[:])
+	if err != nil {
+		t.Fatalf("decodeMetaRecord failed: %v", err)
+	}
+	if rec.version != StoreFormatVersion {
+		t.Fatalf("expected StoreFormatVersion %d after wipe, got %d", StoreFormatVersion, rec.version)
 	}
 }

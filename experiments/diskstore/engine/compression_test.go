@@ -353,9 +353,12 @@ func TestEngine_OldFormatVersion_WipedOnOpen(t *testing.T) {
 	buf := make([]byte, metaFileSize)
 	_, _ = metaF.ReadAt(buf, 0)
 	_ = metaF.Close()
-	ver := binary.BigEndian.Uint32(buf[16:20])
-	if ver != StoreFormatVersion {
-		t.Fatalf("expected StoreFormatVersion %d, got %d", StoreFormatVersion, ver)
+	rec, err := decodeMetaRecord(buf)
+	if err != nil {
+		t.Fatalf("decodeMetaRecord failed: %v", err)
+	}
+	if rec.version != StoreFormatVersion {
+		t.Fatalf("expected StoreFormatVersion %d, got %d", StoreFormatVersion, rec.version)
 	}
 
 	// Verify fresh store can write and read normally
