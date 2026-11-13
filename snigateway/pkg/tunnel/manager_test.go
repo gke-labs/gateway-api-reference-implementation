@@ -259,7 +259,7 @@ func listenTCPAndUDP(t *testing.T) (net.Listener, net.PacketConn) {
 }
 
 func TestManager_Transports(t *testing.T) {
-	for _, mode := range []string{TransportModeQUIC, TransportModeTCP, TransportModeAuto, TransportModeH2, TransportModeWireGuard} {
+	for _, mode := range []string{TransportModeQUIC, TransportModeTCP, TransportModeAuto, TransportModeH2} {
 		t.Run("Mode_"+mode, func(t *testing.T) {
 			tempDir, err := os.MkdirTemp("", "snigateway-mgr-transports-*")
 			if err != nil {
@@ -285,17 +285,11 @@ func TestManager_Transports(t *testing.T) {
 			ln, pc := listenTCPAndUDP(t)
 			serverAddr := ln.Addr().String()
 
-			var wgListen string
-			if mode == TransportModeWireGuard {
-				wgListen = "127.0.0.1:0"
-			}
-
 			srv, err := frontend.NewServer(frontend.ServerConfig{
-				ServerTLSConfig:     serverTLS,
-				InternalHostname:    "snigateway.internal",
-				ConnectTimeout:      5 * time.Second,
-				ReadSNITimeout:      2 * time.Second,
-				WireGuardListenAddr: wgListen,
+				ServerTLSConfig:  serverTLS,
+				InternalHostname: "snigateway.internal",
+				ConnectTimeout:   5 * time.Second,
+				ReadSNITimeout:   2 * time.Second,
 			})
 			if err != nil {
 				t.Fatalf("NewServer failed: %v", err)

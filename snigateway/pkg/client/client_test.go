@@ -17,10 +17,8 @@ package client
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"net"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -159,97 +157,4 @@ func TestTLSSessionResumption_TunnelDial(t *testing.T) {
 		t.Errorf("dial 2 expected DidResume=true, got false")
 	}
 	conn2.Close()
-}
-
-func TestClient_WireGuardExchange(t *testing.T) {
-	generated, err := certs.GenerateAll("snigateway.internal", "client-test")
-	if err != nil {
-		t.Fatalf("GenerateAll failed: %v", err)
-	}
-
-	otherGen, err := certs.GenerateAll("snigateway.internal", "other-client")
-	if err != nil {
-		t.Fatalf("GenerateAll other failed: %v", err)
-	}
-
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(generated.CA.CertPEM)
-	caPool.AppendCertsFromPEM(otherGen.CA.CertPEM)
-
-	serverTLS, err := certs.NewServerTLSConfigWithCertPool(caPool, generated.Server.CertPEM, generated.Server.KeyPEM)
-	if err != nil {
-		t.Fatalf("NewServerTLSConfigWithCertPool failed: %v", err)
-	}
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen failed: %v", err)
-	}
-	defer ln.Close()
-
-	srv, err := frontend.NewServer(frontend.ServerConfig{
-		ServerTLSConfig:     serverTLS,
-		WireGuardListenAddr: "127.0.0.1:0",
-		WireGuardPrefix:     "fd00::/64",
-	})
-	if err != nil {
-		t.Fatalf("NewServer failed: %v", err)
-	}
-	defer srv.Close()
-
-	go func() {
-		_ = srv.Serve(ln)
-	}()
-
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
-	if err != nil {
-		t.Fatalf("NewClientTLSConfig failed: %v", err)
-	}
-
-	c := NewClient(ln.Addr().String(), clientTLS)
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-
-	sessID, _, err := c.StartSession(ctx)
-	if err != nil {
-		t.Fatalf("c.StartSession failed: %v", err)
-	}
-
-	// Fake client WireGuard public key (32 bytes base64)
-	clientPubKey := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-	resp, err := c.WireGuardExchange(ctx, sessID, clientPubKey)
-	if err != nil {
-		t.Fatalf("WireGuardExchange failed: %v", err)
-	}
-
-	if resp.FrontendPublicKey == "" {
-		t.Error("expected non-empty FrontendPublicKey")
-	}
-	if resp.Endpoint == "" {
-		t.Error("expected non-empty Endpoint")
-	}
-	if resp.PeerAddress == "" {
-		t.Error("expected non-empty PeerAddress")
-	}
-	if resp.FrontendAddress == "" {
-		t.Error("expected non-empty FrontendAddress")
-	}
-	if resp.MTU != 1280 {
-		t.Errorf("expected MTU 1280, got %d", resp.MTU)
-	}
-
-	// Key exchange with another client identity gets 403 Forbidden
-	otherTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, otherGen.Client.CertPEM, otherGen.Client.KeyPEM, "snigateway.internal")
-	if err != nil {
-		t.Fatalf("NewClientTLSConfig other failed: %v", err)
-	}
-	otherClient := NewClient(ln.Addr().String(), otherTLS)
-	_, err = otherClient.WireGuardExchange(ctx, sessID, clientPubKey)
-	if err == nil {
-		t.Fatal("expected error for mismatched identity, got nil")
-	}
-	if !strings.Contains(err.Error(), "403") {
-		t.Fatalf("expected 403 Forbidden for mismatched identity, got %v", err)
-	}
 }

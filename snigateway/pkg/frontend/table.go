@@ -15,11 +15,7 @@
 package frontend
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"fmt"
 	"net"
-	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -33,8 +29,6 @@ type RegistrationTable struct {
 	sessionHosts    map[string][]string       // sessionID -> registered host patterns
 	sessionIdentity map[string]ClientIdentity // sessionID -> client identity
 	sessionLease    map[string]time.Time      // sessionID -> lease expiration time
-	sessionAddress  map[string]netip.Addr     // sessionID -> allocated WireGuard peer address
-	addressSession  map[netip.Addr]string     // allocated WireGuard peer address -> sessionID
 	exact           map[string][]string       // normalized exact hostname -> slice of sessionIDs
 	wildcard        map[string][]string       // normalized wildcard pattern (*.example.com) -> slice of sessionIDs
 	exactRR         map[string]int            // round-robin counter per exact hostname
@@ -47,8 +41,6 @@ func NewRegistrationTable() *RegistrationTable {
 		sessionHosts:    make(map[string][]string),
 		sessionIdentity: make(map[string]ClientIdentity),
 		sessionLease:    make(map[string]time.Time),
-		sessionAddress:  make(map[string]netip.Addr),
-		addressSession:  make(map[netip.Addr]string),
 		exact:           make(map[string][]string),
 		wildcard:        make(map[string][]string),
 		exactRR:         make(map[string]int),
@@ -137,7 +129,6 @@ func (t *RegistrationTable) DropExpiredLeases(now time.Time) []string {
 	for sessID, exp := range t.sessionLease {
 		if !exp.IsZero() && !now.Before(exp) {
 			t.unregisterLocked(sessID)
-			t.releaseWireGuardAddressLocked(sessID)
 			delete(t.sessionLease, sessID)
 			expiredSessions = append(expiredSessions, sessID)
 		}
@@ -150,97 +141,8 @@ func (t *RegistrationTable) Unregister(sessionID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.unregisterLocked(sessionID)
-	t.releaseWireGuardAddressLocked(sessionID)
 	delete(t.sessionIdentity, sessionID)
 	delete(t.sessionLease, sessionID)
-}
-
-// AssignWireGuardAddress assigns a unique IPv6 peer address for sessionID within prefix.
-// If sessionID already has an assigned address, it returns that address.
-// Uniqueness is strictly enforced across active sessions in the table.
-func (t *RegistrationTable) AssignWireGuardAddress(sessionID string, prefix netip.Prefix) (netip.Addr, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if addr, exists := t.sessionAddress[sessionID]; exists {
-		return addr, nil
-	}
-
-	if !prefix.IsValid() || !prefix.Addr().Is6() {
-		return netip.Addr{}, fmt.Errorf("invalid IPv6 prefix: %v", prefix)
-	}
-
-	prefixBits := prefix.Bits()
-	if prefixBits < 0 || prefixBits > 120 {
-		return netip.Addr{}, fmt.Errorf("prefix length /%d invalid (must be <= 120)", prefixBits)
-	}
-
-	baseBytes := prefix.Addr().As16()
-	frontendAddr := netip.AddrFrom16(baseBytes)
-	frontendBytes := baseBytes
-	frontendBytes[15] = 1
-	frontendReserved := netip.AddrFrom16(frontendBytes)
-
-	// First attempt: deterministic derivation from sessionID
-	h := sha256.Sum256([]byte(sessionID))
-	candidateBytes := baseBytes
-	for i := prefixBits / 8; i < 16; i++ {
-		candidateBytes[i] = h[i]
-	}
-	if candidateBytes[15] <= 1 && prefixBits <= 120 {
-		candidateBytes[15] = 2
-	}
-	candidate := netip.AddrFrom16(candidateBytes)
-
-	if candidate != frontendReserved && candidate != frontendAddr && t.addressSession[candidate] == "" {
-		t.sessionAddress[sessionID] = candidate
-		t.addressSession[candidate] = sessionID
-		return candidate, nil
-	}
-
-	// Collision resolution: generate random host portion until unique
-	for attempts := 0; attempts < 1000; attempts++ {
-		var randBytes [16]byte
-		if _, err := rand.Read(randBytes[:]); err != nil {
-			return netip.Addr{}, fmt.Errorf("generating random address: %w", err)
-		}
-		for i := prefixBits / 8; i < 16; i++ {
-			candidateBytes[i] = randBytes[i]
-		}
-		if candidateBytes[15] <= 1 && prefixBits <= 120 {
-			candidateBytes[15] = 2
-		}
-		candidate = netip.AddrFrom16(candidateBytes)
-		if candidate != frontendReserved && candidate != frontendAddr && t.addressSession[candidate] == "" {
-			t.sessionAddress[sessionID] = candidate
-			t.addressSession[candidate] = sessionID
-			return candidate, nil
-		}
-	}
-
-	return netip.Addr{}, fmt.Errorf("failed to allocate unique address in prefix %v", prefix)
-}
-
-// GetWireGuardAddress returns the WireGuard peer address assigned to sessionID, if any.
-func (t *RegistrationTable) GetWireGuardAddress(sessionID string) (netip.Addr, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	addr, ok := t.sessionAddress[sessionID]
-	return addr, ok
-}
-
-// ReleaseWireGuardAddress frees any WireGuard peer address associated with sessionID.
-func (t *RegistrationTable) ReleaseWireGuardAddress(sessionID string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.releaseWireGuardAddressLocked(sessionID)
-}
-
-func (t *RegistrationTable) releaseWireGuardAddressLocked(sessionID string) {
-	if addr, ok := t.sessionAddress[sessionID]; ok {
-		delete(t.addressSession, addr)
-		delete(t.sessionAddress, sessionID)
-	}
 }
 
 func removeFromSlice(slice []string, val string) []string {

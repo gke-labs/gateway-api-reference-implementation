@@ -21,7 +21,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,12 +70,7 @@ type ServerConfig struct {
 	JWTVerifier              jwt.TokenVerifier
 	LeaseReaperInterval      time.Duration
 	// TimeNow overrides time.Now for deterministic testing of lease expiration.
-	TimeNow                        func() time.Time
-	WireGuardListenAddr            string
-	WireGuardPrefix                string
-	WireGuardEndpoint              string
-	WireGuardDisabled              bool
-	WireGuardHandshakeSyncInterval time.Duration
+	TimeNow func() time.Time
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -88,7 +82,6 @@ type Server struct {
 	pool       *PoolTransport
 	quic       *QUICTransport
 	h2         *H2Transport
-	wireguard  *WireGuardTransport
 
 	internalListener *chanListener
 	httpServer       *http.Server
@@ -153,27 +146,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		timeNow = time.Now
 	}
 
-	var wgTr *WireGuardTransport
-	if !cfg.WireGuardDisabled && (cfg.WireGuardListenAddr != "" || comp.WireGuard() != nil) {
-		if comp.WireGuard() != nil {
-			wgTr = comp.WireGuard()
-		} else {
-			var err error
-			wgTr, err = NewWireGuardTransport(WireGuardTransportConfig{
-				ListenAddr:            cfg.WireGuardListenAddr,
-				Prefix:                cfg.WireGuardPrefix,
-				Endpoint:              cfg.WireGuardEndpoint,
-				PerAttemptTimeout:     cfg.PerAttemptTimeout,
-				HandshakeSyncInterval: cfg.WireGuardHandshakeSyncInterval,
-				Now:                   timeNow,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("initializing wireguard transport: %w", err)
-			}
-			comp.SetWireGuard(wgTr)
-		}
-	}
-
 	s := &Server{
 		config:           cfg,
 		authorizer:       auth,
@@ -182,7 +154,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		pool:             comp.Pool(),
 		quic:             comp.QUIC(),
 		h2:               comp.H2(),
-		wireguard:        wgTr,
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
 		jwtVerifier:      cfg.JWTVerifier,
@@ -196,7 +167,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	mux.HandleFunc("/v1/connections", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/connections/", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/tunnel", s.handleConnectionUpgrade)
-	mux.HandleFunc("PUT /v1/sessions/{id}/wireguard", s.handleWireGuardExchange)
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -223,11 +193,6 @@ func (s *Server) PoolTransport() *PoolTransport {
 // QUICTransport returns the server's QUIC transport.
 func (s *Server) QUICTransport() *QUICTransport {
 	return s.quic
-}
-
-// WireGuardTransport returns the server's WireGuard transport.
-func (s *Server) WireGuardTransport() *WireGuardTransport {
-	return s.wireguard
 }
 
 // H2Transport returns the server's HTTP/2 transport.
@@ -415,9 +380,8 @@ func (s *Server) runLeaseReaper() {
 }
 
 type frontendSession struct {
-	cancel              context.CancelFunc // HTTP sessions only
-	closers             []func()
-	wireguardRegistered bool
+	cancel  context.CancelFunc // HTTP sessions only
+	closers []func()
 }
 
 func (s *Server) createSession(sessionID string, cancel context.CancelFunc, closer func()) {
@@ -430,26 +394,6 @@ func (s *Server) createSession(sessionID string, cancel context.CancelFunc, clos
 		sess.closers = append(sess.closers, closer)
 	}
 	s.sessions[sessionID] = sess
-}
-
-func (s *Server) registerWireGuardSessionCloser(sessionID string) bool {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	sess, ok := s.sessions[sessionID]
-	if !ok {
-		return false
-	}
-	if sess.wireguardRegistered {
-		return true
-	}
-	sess.wireguardRegistered = true
-	sess.closers = append(sess.closers, func() {
-		if s.wireguard != nil {
-			s.wireguard.UnregisterSession(sessionID)
-		}
-		s.table.ReleaseWireGuardAddress(sessionID)
-	})
-	return true
 }
 
 // CloseSession closes an active backend session and any associated connections.
@@ -467,9 +411,6 @@ func (s *Server) CloseSession(sessionID string) {
 	s.pool.UnregisterSession(sessionID)
 	s.h2.UnregisterSession(sessionID)
 	s.quic.UnregisterSession(sessionID)
-	if s.wireguard != nil {
-		s.wireguard.UnregisterSession(sessionID)
-	}
 
 	if sess.cancel != nil {
 		sess.cancel()
@@ -877,119 +818,13 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 		return
 	}
 
-	// Read and process RegistrationRequests and WireGuardExchangeRequests from control stream
+	// Read and process RegistrationRequests from control stream
 	for {
 		line, err := api.ReadControlLine(reader)
 		if err != nil {
 			return
 		}
 		trimmed := bytes.TrimSpace(line)
-
-		// Check if this is a WireGuard key exchange request
-		var wgReq api.WireGuardExchangeRequest
-		if err := json.Unmarshal(trimmed, &wgReq); err == nil && wgReq.Type == "wireguard" {
-			if s.wireguard == nil {
-				errResp, merr := json.Marshal(api.WireGuardExchangeResponse{
-					Status: "error: wireguard transport not enabled",
-				})
-				if merr != nil {
-					log.Printf("Frontend: failed to marshal wireguard error: %v", merr)
-					continue
-				}
-				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
-					log.Printf("Frontend: failed to write wireguard error: %v", werr)
-				}
-				continue
-			}
-			pubKeyBytes, err := base64.StdEncoding.DecodeString(wgReq.PublicKey)
-			if err != nil || len(pubKeyBytes) != 32 {
-				errResp, merr := json.Marshal(api.WireGuardExchangeResponse{
-					Status: "error: invalid base64 publicKey",
-				})
-				if merr != nil {
-					log.Printf("Frontend: failed to marshal wireguard error: %v", merr)
-					continue
-				}
-				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
-					log.Printf("Frontend: failed to write wireguard error: %v", werr)
-				}
-				continue
-			}
-			var clientPubKey [32]byte
-			copy(clientPubKey[:], pubKeyBytes)
-
-			peerAddr, err := s.table.AssignWireGuardAddress(sessionID, s.wireguard.Prefix())
-			if err != nil {
-				errResp, merr := json.Marshal(api.WireGuardExchangeResponse{
-					Status: "error: failed to assign wireguard address",
-				})
-				if merr != nil {
-					log.Printf("Frontend: failed to marshal wireguard error: %v", merr)
-					continue
-				}
-				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
-					log.Printf("Frontend: failed to write wireguard error: %v", werr)
-				}
-				continue
-			}
-
-			if err := s.wireguard.RegisterPeer(sessionID, clientPubKey, peerAddr); err != nil {
-				s.table.ReleaseWireGuardAddress(sessionID)
-				errResp, merr := json.Marshal(api.WireGuardExchangeResponse{
-					Status: fmt.Sprintf("error: %v", err),
-				})
-				if merr != nil {
-					log.Printf("Frontend: failed to marshal wireguard error: %v", merr)
-					continue
-				}
-				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
-					log.Printf("Frontend: failed to write wireguard error: %v", werr)
-				}
-				continue
-			}
-
-			if !s.registerWireGuardSessionCloser(sessionID) {
-				if s.wireguard != nil {
-					s.wireguard.UnregisterSession(sessionID)
-				}
-				s.table.ReleaseWireGuardAddress(sessionID)
-				errResp, merr := json.Marshal(api.WireGuardExchangeResponse{
-					Status: "error: session closed",
-				})
-				if merr != nil {
-					log.Printf("Frontend: failed to marshal wireguard error: %v", merr)
-					continue
-				}
-				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
-					log.Printf("Frontend: failed to write wireguard error: %v", werr)
-				}
-				continue
-			}
-
-			endpoint := s.wireguard.AdvertisedEndpoint()
-			if endpoint == "" {
-				endpoint = fmt.Sprintf(":%d", s.wireguard.ActualPort())
-			}
-
-			fePub := s.wireguard.PublicKey()
-			resp := api.WireGuardExchangeResponse{
-				FrontendPublicKey: base64.StdEncoding.EncodeToString(fePub[:]),
-				Endpoint:          endpoint,
-				PeerAddress:       fmt.Sprintf("%s/128", peerAddr.String()),
-				FrontendAddress:   fmt.Sprintf("%s/128", s.wireguard.FrontendAddress().String()),
-				MTU:               s.wireguard.MTU(),
-				Status:            "ok",
-			}
-			respBytes, err := json.Marshal(resp)
-			if err != nil {
-				log.Printf("Frontend: failed to marshal wireguard response: %v", err)
-				continue
-			}
-			if _, err := ctrlStream.Write(append(respBytes, '\n')); err != nil {
-				log.Printf("Frontend: failed to write wireguard response: %v", err)
-			}
-			continue
-		}
 
 		var regReq api.RegistrationRequest
 		if err := json.Unmarshal(trimmed, &regReq); err != nil {
@@ -1437,128 +1272,5 @@ func closeQUICConn(c *quic.Conn, code quic.ApplicationErrorCode, msg string) {
 	}
 	if err := c.CloseWithError(code, msg); err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Printf("Frontend: failed to close QUIC connection: %v", err)
-	}
-}
-
-func (s *Server) handleWireGuardExchange(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	sessionID := r.PathValue("id")
-	if sessionID == "" {
-		path := strings.TrimPrefix(r.URL.Path, "/v1/sessions/")
-		sessionID = strings.TrimSuffix(path, "/wireguard")
-		sessionID = strings.Trim(sessionID, "/")
-	}
-	if sessionID == "" {
-		sessionID = r.Header.Get(api.HeaderSessionID)
-	}
-	if sessionID == "" {
-		http.Error(w, "missing session ID", http.StatusBadRequest)
-		return
-	}
-
-	clientIdentity, err := s.extractClientIdentity(r)
-	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	sessIdentity, ok := s.table.GetSessionIdentity(sessionID)
-	if !ok {
-		http.Error(w, "session not found or expired", http.StatusNotFound)
-		return
-	}
-
-	if sessIdentity.ID != clientIdentity.ID {
-		http.Error(w, "session identity mismatch", http.StatusForbidden)
-		return
-	}
-
-	if s.wireguard == nil {
-		http.Error(w, "wireguard transport is not enabled", http.StatusNotImplemented)
-		return
-	}
-
-	if r.ContentLength > s.config.MaxRegistrationBodyBytes {
-		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-
-	var req api.WireGuardExchangeRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, s.config.MaxRegistrationBodyBytes)).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if clientIdentity.Issuer != "" && req.Token != "" {
-		regClaims, err := s.jwtVerifier.Verify(r.Context(), req.Token)
-		if err != nil {
-			http.Error(w, "token verification failed: "+err.Error(), http.StatusUnauthorized)
-			return
-		}
-		if regClaims.Issuer != clientIdentity.Issuer || regClaims.Subject != clientIdentity.Subject {
-			http.Error(w, "session identity mismatch", http.StatusForbidden)
-			return
-		}
-		clientIdentity.TokenExpiry = regClaims.Expiry
-	}
-
-	if req.PublicKey == "" {
-		http.Error(w, "missing publicKey", http.StatusBadRequest)
-		return
-	}
-
-	pubKeyBytes, err := base64.StdEncoding.DecodeString(req.PublicKey)
-	if err != nil || len(pubKeyBytes) != 32 {
-		http.Error(w, "invalid base64 publicKey (must be 32 bytes)", http.StatusBadRequest)
-		return
-	}
-	var clientPubKey [32]byte
-	copy(clientPubKey[:], pubKeyBytes)
-
-	peerAddr, err := s.table.AssignWireGuardAddress(sessionID, s.wireguard.Prefix())
-	if err != nil {
-		log.Printf("Frontend: failed to assign wireguard address for session %s: %v", sessionID, err)
-		http.Error(w, "failed to assign wireguard address", http.StatusInternalServerError)
-		return
-	}
-
-	if err := s.wireguard.RegisterPeer(sessionID, clientPubKey, peerAddr); err != nil {
-		log.Printf("Frontend: failed to register wireguard peer for session %s: %v", sessionID, err)
-		s.table.ReleaseWireGuardAddress(sessionID)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if !s.registerWireGuardSessionCloser(sessionID) {
-		if s.wireguard != nil {
-			s.wireguard.UnregisterSession(sessionID)
-		}
-		s.table.ReleaseWireGuardAddress(sessionID)
-		http.Error(w, "session closed", http.StatusGone)
-		return
-	}
-
-	endpoint := s.wireguard.AdvertisedEndpoint()
-	if endpoint == "" {
-		endpoint = fmt.Sprintf(":%d", s.wireguard.ActualPort())
-	}
-
-	fePub := s.wireguard.PublicKey()
-	resp := api.WireGuardExchangeResponse{
-		FrontendPublicKey: base64.StdEncoding.EncodeToString(fePub[:]),
-		Endpoint:          endpoint,
-		PeerAddress:       fmt.Sprintf("%s/128", peerAddr.String()),
-		FrontendAddress:   fmt.Sprintf("%s/128", s.wireguard.FrontendAddress().String()),
-		MTU:               s.wireguard.MTU(),
-		Status:            "ok",
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("Frontend: failed to encode wireguard exchange response: %v", err)
 	}
 }

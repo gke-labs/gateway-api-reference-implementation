@@ -76,9 +76,6 @@ func run(ctx context.Context, args []string) error {
 	maxConnections := fs.Int("tcp-max-connections", 10000, "Maximum number of concurrent client connections per listener")
 	idleTimeout := fs.Duration("tcp-idle-timeout", 0, "Idle timeout for spliced client connections (disabled by default)")
 	maxHostnames := fs.Int("max-hostnames-per-session", frontend.DefaultMaxHostnamesPerSession, "Maximum number of hostnames a session may register")
-	wireguardListen := fs.String("wireguard-listen", "", "UDP address to listen on for WireGuard tunnel (disabled by default, e.g. :51820)")
-	wireguardPrefix := fs.String("wireguard-prefix", api.DefaultWireGuardPrefix, "IPv6 prefix for WireGuard tunnel addresses (default fd00::/64)")
-	wireguardEndpoint := fs.String("wireguard-endpoint", "", "External WireGuard endpoint (<host:port>) advertised to clients. Defaults to port only, combined with client server address.")
 
 	var jwtIssuers stringSliceFlag
 	fs.Var(&jwtIssuers, "jwt-issuer", "JWT issuer URL for ServiceAccount token verification (repeatable)")
@@ -254,9 +251,6 @@ func run(ctx context.Context, args []string) error {
 		IdleTimeout:            *idleTimeout,
 		MaxHostnamesPerSession: *maxHostnames,
 		JWTVerifier:            jwtVerifier,
-		WireGuardListenAddr:    *wireguardListen,
-		WireGuardPrefix:        *wireguardPrefix,
-		WireGuardEndpoint:      *wireguardEndpoint,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing frontend server: %w", err)

@@ -29,18 +29,6 @@ const (
 
 	// TunnelALPN is the ALPN identifier used for QUIC reverse tunnels.
 	TunnelALPN = "snigateway-tunnel/1"
-
-	// DefaultWireGuardPrefix is the default IPv6 ULA prefix for WireGuard tunnels.
-	DefaultWireGuardPrefix = "fd00::/64"
-
-	// DefaultWireGuardListenPort is the default UDP port for the frontend WireGuard device.
-	DefaultWireGuardListenPort = 51820
-
-	// DefaultWireGuardTunnelPort is the fixed TCP port backend listeners bind to inside the netstack tunnel.
-	DefaultWireGuardTunnelPort = 51821
-
-	// DefaultWireGuardMTU is the inner MTU for WireGuard tunnels.
-	DefaultWireGuardMTU = 1280
 )
 
 // SessionInitRequest is the initial message sent on the QUIC control stream.
@@ -66,21 +54,4 @@ type RegistrationRequest struct {
 type RegistrationResponse struct {
 	Status    string   `json:"status"`
 	Hostnames []string `json:"hostnames"`
-}
-
-// WireGuardExchangeRequest is sent to initiate WireGuard key exchange for a session.
-type WireGuardExchangeRequest struct {
-	Type      string `json:"type,omitempty"`
-	PublicKey string `json:"publicKey"`
-	Token     string `json:"token,omitempty"`
-}
-
-// WireGuardExchangeResponse contains frontend WireGuard configuration for the session.
-type WireGuardExchangeResponse struct {
-	FrontendPublicKey string `json:"frontendPublicKey"`
-	Endpoint          string `json:"endpoint"`
-	PeerAddress       string `json:"peerAddress"`
-	FrontendAddress   string `json:"frontendAddress"`
-	MTU               int    `json:"mtu"`
-	Status            string `json:"status,omitempty"`
 }
