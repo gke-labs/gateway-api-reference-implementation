@@ -1,6 +1,6 @@
 # Design: Disk-Store Engine
 
-This document describes the architecture, terminology, on-disk formats, storage invariants, recovery process, and concurrency model of the disk-store engine (`experiments/diskstore/engine`).
+This document describes the architecture, terminology, on-disk formats, storage invariants, recovery process, concurrency model, and value representation of the disk-store engine (`experiments/diskstore/engine`).
 For benchmark results and performance measurements, see [diskstore-experiment.md](../../../docs/diskstore-experiment.md).
 
 ## Terminology
@@ -402,3 +402,57 @@ The engine separates synchronization across four distinct layers to prevent dead
 2. **Block Pool vs. Page Data:** The block pool separates pool management from page content access. Callers acquire pool synchronization only to look up, pin, or unpin a page descriptor. Callers release pool synchronization before acquiring a per-page latch to read or modify page bytes. Callers never acquire pool synchronization while holding a per-page latch. This allows concurrent operations to access distinct pages in memory without contending on the pool.
 3. **Flushing and Direct I/O:** Page flushing marks descriptors in-flight and releases pool synchronization before copying data into the staging buffer and writing to disk. Direct I/O writes to the heap file proceed without blocking access to other resident pages in the pool.
 4. **WAL Appends and Syncing:** The WAL serializes incoming records to preserve strictly monotonic LSN assignment. Log buffer management and background flushes operate independently from page table latches.
+
+## File-Backed Values: ByteString
+
+In a planned change, `Engine.Get` will return a `ByteString` value rather than a `[]byte` slice so that oversize values can remain on disk instead of being read entirely into memory. A `ByteString` represents an immutable sequence of bytes. Memory-backed values hold an in-memory byte slice, and oversize values hold an open file handle to a file in the `oversize/` directory.
+
+### Contract
+
+- **Immutability:** The caller must not modify the bytes. The type does not enforce immutability at runtime. The engine documents immutability because the type may share bytes between callers later, and a file-backed value cannot be modified at all. For small values, `Get` copies the record payload out of the page under the page latch and decompresses it into a new slice, so the caller receives its own memory allocation today.
+- **Resource release:** The caller must call `Release()` when finished with a `ByteString`. For a memory-backed value, `Release()` is a no-op. For a file-backed value, `Release()` closes the underlying file descriptor. Calling `Release()` multiple times is idempotent. Operations on a closed `ByteString` return an error.
+- **Access model:** `ByteString` provides sequential streaming access through `io.Reader` and bulk conversion through `Bytes()`. For oversize values, streaming reads from the file through a decompressor without loading the full payload into memory.
+
+### Lifetime
+
+The engine keeps the backing file open inside the `ByteString`, and the caller must call `Release()` to close it.
+
+Under Invariant 6 (Old-Version Retention for Oversize Values), the engine deletes an older oversize file only after the replacement pointer record is durable in the WAL. When a concurrent `Put` replaces a key, it unlinks the older file. Similarly, planned periodic garbage collection will sweep and delete unreferenced files while the store runs. The engine relies on an unlinked file staying readable through an open descriptor, which holds on Linux and macOS, the two platforms the engine builds for.
+
+`Get` opens the file during its optimistic read attempt. If the open fails or the index entry changed concurrently, `Get` closes the descriptor from the abandoned attempt and retries through the existing recheck loop, falling back to `writerMu.RLock` under contention.
+
+The type does not register a runtime finalizer. If the caller does not call `Release()`, the descriptor stays open until the process exits. If the file was unlinked, its disk space is not reclaimed until the descriptor closes. Each outstanding file-backed value holds one descriptor, so the number of values a caller can hold open at once is bounded by the process descriptor limit (`RLIMIT_NOFILE`). The engine leaves this bound to the caller.
+
+### Integrity
+
+The choice between upfront verification during `Get` and streaming verification during read is open for the maintainer; we recommend verifying as the caller reads.
+
+The pointer record's checksum covers the stored (compressed) bytes, and an unencrypted file name derives from that hash. Verification while reading therefore runs over the compressed stream below the decompressor, and the caller sees decompressed bytes before the check completes.
+
+- **Upfront verification:** `Get` reads the file through a streaming hasher and checks the checksum before returning the `ByteString`. A damaged file returns an error from `Get`. This prevents the caller from seeing damaged data, but reads the file twice from disk: once to hash, and once as the caller reads.
+- **Streaming verification:** `Get` returns the `ByteString` immediately. A hashing reader checks the checksum as bytes are read, returning an error on the last `Read`. If the compressed stream is damaged, the decompressor can also fail first with a decompression error. This needs only one read pass over the file, but reports damage only at the end of the stream.
+
+### Compression
+
+The type is a sequential stream, and oversize values remain compressed on disk.
+
+The engine supports two compression codecs: none and zstd. Because zstd blocks decompress into variable amounts of data, a reader cannot seek to an arbitrary uncompressed offset without decompressing earlier blocks.
+
+Storing oversize values uncompressed would allow random access, but would alter the storage format:
+- The oversize threshold (512 blocks) is measured on stored size. Storing uncompressed values would evaluate the threshold on uncompressed data, moving more records into the oversize store.
+- The file name and the skip-identical-rewrite rule use the SHA-256 hash of the stored bytes. Storing uncompressed data would change the hash input and file names.
+- Oversize values would forgo compression savings on disk.
+
+Making `ByteString` a sequential stream keeps the stored format, threshold, and file naming unchanged while bounding memory use during reads to the decompressor buffer.
+
+### Encryption
+
+Block encryption replaces per-value encryption and allows direct reads from any 4 KiB offset.
+
+`Get` today decrypts an oversize value with the per-value cipher before it decompresses. Until planned block-level encryption lands, a file-backed value cannot be served for a store that uses the per-value cipher without loading the full ciphertext into memory to decrypt it; such stores must fall back to memory-backed values. Under the planned block encryption, the engine encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak. The streaming `ByteString` reads 4 KiB units sequentially, decrypts each unit, and feeds the decrypted stream into the decompressor.
+
+### Callers
+
+Callers that stream data benefit from file-backed values, whereas kubecache does not:
+- **kubecache:** Kubecache decodes each value in full into a Kubernetes API Go struct via `d.codec.Decode`. Because decoding allocates the struct on the heap, the object materializes in memory regardless of whether the raw bytes were file-backed. A file-backed `ByteString` avoids holding raw serialized bytes alongside the decoded struct if a streaming decoder is used, but does not reduce the struct's heap footprint.
+- **Network streaming:** Callers that copy a value directly to a network response (such as an HTTP or gRPC response body) benefit directly. They stream data from disk through decompression into the network connection without holding the full uncompressed value in memory.
