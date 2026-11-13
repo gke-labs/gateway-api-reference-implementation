@@ -2298,7 +2298,8 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 			if !isNormalClose(err) {
 				log.Log.Error(err, "Failed to copy websocket response body")
 			}
-			panic(http.ErrAbortHandler)
+			abortFailedResponse(w, r)
+			return
 		}
 		return
 	}
@@ -2832,7 +2833,8 @@ func writeHTTPResponse(w http.ResponseWriter, r *http.Request, resp *http.Respon
 		if !isNormalClose(err) {
 			log.Log.Error(err, "Failed to copy response body")
 		}
-		panic(http.ErrAbortHandler)
+		abortFailedResponse(w, r)
+		return
 	}
 	closeConn(resp.Body)
 
@@ -2841,6 +2843,37 @@ func writeHTTPResponse(w http.ResponseWriter, r *http.Request, resp *http.Respon
 			w.Header().Add(http.TrailerPrefix+k, v)
 		}
 	}
+}
+
+// abortFailedResponse aborts a response after headers have already been written.
+// The client must observe a response that fails, never a short response that
+// looks complete.
+//
+// On HTTP/1, the proxy avoids panicking by hijacking the connection (via
+// http.ResponseController or http.Hijacker) and closing it. The client then sees
+// the connection close before the declared length or the final chunk. If hijacking
+// fails, the proxy logs the error and falls back to panic(http.ErrAbortHandler)
+// because the client must still see a failed response.
+//
+// On HTTP/2, multiplexed streams share a single TCP connection and cannot be hijacked.
+// The Go HTTP/2 server provides no mechanism to reset an individual stream from a
+// handler other than panicking with http.ErrAbortHandler. The proxy panics with
+// http.ErrAbortHandler for HTTP/2, which causes the HTTP/2 server to send a
+// RST_STREAM to the client without terminating the connection or logging a stack trace.
+func abortFailedResponse(w http.ResponseWriter, r *http.Request) {
+	if r == nil || r.ProtoMajor < 2 {
+		rc := http.NewResponseController(w)
+		conn, _, err := rc.Hijack()
+		if err == nil {
+			closeConn(conn)
+			return
+		}
+		log.Log.Error(err, "Failed to hijack HTTP/1 connection to abort response")
+	}
+
+	// The client must still see a failed response, and the Go HTTP/2 server
+	// (or an unhijackable HTTP/1 handler) requires http.ErrAbortHandler to abort.
+	panic(http.ErrAbortHandler)
 }
 
 func matchOrigin(allowedOrigins []gatewayv1.CORSOrigin, reqOrigin string) bool {

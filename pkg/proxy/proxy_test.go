@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -5958,6 +5959,269 @@ func TestProxy_ListenerIsolation_RealSockets(t *testing.T) {
 		defer resp9999.Body.Close()
 		if resp9999.StatusCode != http.StatusOK {
 			t.Fatalf("expected 200 OK for non-matching port routed by hostname, got %d", resp9999.StatusCode)
+		}
+	})
+}
+
+func newAbortBackend(t *testing.T, handler http.HandlerFunc) state.InternalBackend {
+	t.Helper()
+	backend := httptest.NewServer(handler)
+	t.Cleanup(backend.Close)
+
+	u, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		t.Fatalf("failed to split host port: %v", err)
+	}
+	port, _ := strconv.Atoi(portStr)
+	return state.InternalBackend{Host: host, Port: int32(port), Weight: 1}
+}
+
+func newAbortHTTP1TestServer(t *testing.T, handler http.HandlerFunc) (string, *atomic.Bool, *bytes.Buffer) {
+	t.Helper()
+	backend := newAbortBackend(t, handler)
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Backends: []state.InternalBackend{backend},
+				},
+			},
+		},
+	})
+
+	var panicked atomic.Bool
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				panicked.Store(true)
+				panic(rec)
+			}
+		}()
+		p.ServeHTTP(w, r)
+	})
+
+	var serverLog bytes.Buffer
+	proxyServer := httptest.NewUnstartedServer(wrapped)
+	proxyServer.Config.ErrorLog = log.New(&serverLog, "", 0)
+	proxyServer.Start()
+	t.Cleanup(proxyServer.Close)
+
+	return proxyServer.URL, &panicked, &serverLog
+}
+
+func TestProxy_AbortFailedResponseBody(t *testing.T) {
+	t.Run("HTTP/1 with Content-Length", func(t *testing.T) {
+		proxyURL, panicked, serverLog := newAbortHTTP1TestServer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("short"))
+			rc := http.NewResponseController(w)
+			_ = rc.Flush()
+			conn, _, err := rc.Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		})
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyURL+"/test", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr == nil {
+				t.Fatalf("expected error reading aborted response body, got body: %q", string(body))
+			}
+		}
+		if panicked.Load() {
+			t.Errorf("expected no panic on HTTP/1, but handler panicked")
+		}
+		if strings.Contains(serverLog.String(), "panic") {
+			t.Errorf("server logged panic stack trace: %s", serverLog.String())
+		}
+	})
+
+	t.Run("HTTP/1 chunked", func(t *testing.T) {
+		proxyURL, panicked, serverLog := newAbortHTTP1TestServer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("chunked-partway"))
+			rc := http.NewResponseController(w)
+			_ = rc.Flush()
+			conn, _, err := rc.Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		})
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyURL+"/test", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr == nil {
+				t.Fatalf("expected error reading aborted chunked body, got body: %q", string(body))
+			}
+		}
+		if panicked.Load() {
+			t.Errorf("expected no panic on HTTP/1, but handler panicked")
+		}
+		if strings.Contains(serverLog.String(), "panic") {
+			t.Errorf("server logged panic stack trace: %s", serverLog.String())
+		}
+	})
+
+	t.Run("WebSocket non-101", func(t *testing.T) {
+		proxyURL, panicked, serverLog := newAbortHTTP1TestServer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ws-non-101-partway"))
+			rc := http.NewResponseController(w)
+			_ = rc.Flush()
+			conn, _, err := rc.Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		})
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyURL+"/ws", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "websocket")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr == nil {
+				t.Fatalf("expected error reading aborted websocket body, got body: %q", string(body))
+			}
+		}
+		if panicked.Load() {
+			t.Errorf("expected no panic on HTTP/1, but handler panicked")
+		}
+		if strings.Contains(serverLog.String(), "panic") {
+			t.Errorf("server logged panic stack trace: %s", serverLog.String())
+		}
+	})
+
+	t.Run("HTTP/2", func(t *testing.T) {
+		backendFail := newAbortBackend(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("h2-partway"))
+			rc := http.NewResponseController(w)
+			_ = rc.Flush()
+			conn, _, err := rc.Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		})
+
+		backendHealthy := newAbortBackend(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("healthy-response"))
+		})
+
+		failPath := "/fail"
+		healthyPath := "/healthy"
+		p := NewProxy()
+		p.UpdateRoutes([]state.InternalRoute{
+			{
+				Rules: []state.InternalRule{
+					{
+						Matches: []state.InternalMatch{
+							{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: failPath}},
+						},
+						Backends: []state.InternalBackend{backendFail},
+					},
+					{
+						Matches: []state.InternalMatch{
+							{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: healthyPath}},
+						},
+						Backends: []state.InternalBackend{backendHealthy},
+					},
+				},
+			},
+		})
+
+		var serverLog bytes.Buffer
+		proxyH2cHandler := h2c.NewHandler(p, &http2.Server{})
+		proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen for proxy: %v", err)
+		}
+		defer proxyLn.Close()
+
+		proxySrv := &http.Server{
+			Handler:  proxyH2cHandler,
+			ErrorLog: log.New(&serverLog, "", 0),
+		}
+		go proxySrv.Serve(proxyLn)
+		defer proxySrv.Close()
+
+		proxyURL := "http://" + proxyLn.Addr().String()
+
+		var dialCount atomic.Int32
+		client := &http.Client{
+			Transport: &http2.Transport{
+				AllowHTTP: true,
+				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+					dialCount.Add(1)
+					var d net.Dialer
+					return d.DialContext(ctx, network, addr)
+				},
+			},
+		}
+
+		// First stream: fails partway through response body
+		reqFail, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyURL+"/fail", nil)
+		if err != nil {
+			t.Fatalf("failed to create fail request: %v", err)
+		}
+		respFail, err := client.Do(reqFail)
+		if err == nil {
+			defer respFail.Body.Close()
+			body, readErr := io.ReadAll(respFail.Body)
+			if readErr == nil {
+				t.Fatalf("expected error on failed stream, got complete body: %q", string(body))
+			}
+		}
+
+		// Second stream on the same HTTP/2 connection: healthy request succeeds
+		reqHealthy, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyURL+"/healthy", nil)
+		if err != nil {
+			t.Fatalf("failed to create healthy request: %v", err)
+		}
+		respHealthy, err := client.Do(reqHealthy)
+		if err != nil {
+			t.Fatalf("healthy request failed on shared HTTP/2 connection: %v", err)
+		}
+		defer respHealthy.Body.Close()
+		bodyHealthy, err := io.ReadAll(respHealthy.Body)
+		if err != nil {
+			t.Fatalf("failed to read healthy response body: %v", err)
+		}
+		if string(bodyHealthy) != "healthy-response" {
+			t.Errorf("expected healthy body %q, got %q", "healthy-response", string(bodyHealthy))
+		}
+
+		if got := dialCount.Load(); got != 1 {
+			t.Errorf("expected exactly 1 dial (HTTP/2 connection reused across streams), got %d", got)
+		}
+		if strings.Contains(serverLog.String(), "panic") {
+			t.Errorf("server logged panic stack trace: %s", serverLog.String())
 		}
 	})
 }
