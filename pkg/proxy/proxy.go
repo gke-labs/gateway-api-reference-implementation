@@ -44,13 +44,13 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-// ForwardedForMode specifies how the X-Forwarded-For header should be handled.
+// ForwardedForMode specifies how forwarded headers (X-Forwarded-For and RFC 7239 Forwarded) should be handled.
 type ForwardedForMode string
 
 const (
-	// ForwardedForModeAppend appends the client IP to any existing X-Forwarded-For header.
+	// ForwardedForModeAppend appends the client connection info to any existing forwarded headers.
 	ForwardedForModeAppend ForwardedForMode = "append"
-	// ForwardedForModeReplace replaces any existing X-Forwarded-For header with the client IP.
+	// ForwardedForModeReplace replaces any existing forwarded headers with the client connection info.
 	ForwardedForModeReplace ForwardedForMode = "replace"
 )
 
@@ -1700,8 +1700,8 @@ func containsToken(header, token string) bool {
 	return false
 }
 
-// setForwardedHeaders stamps X-Forwarded-For, X-Forwarded-Proto, and X-Forwarded-Host
-// headers on outbound requests forwarded to backends.
+// setForwardedHeaders stamps X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host,
+// and Forwarded headers on outbound requests forwarded to backends.
 //
 // Forwarded Headers Trust Policy:
 // 1. X-Forwarded-For:
@@ -1726,6 +1726,13 @@ func containsToken(header, token string) bool {
 //     X-Forwarded-Host is removed) because the outbound Host header already carries the
 //     authoritative client Host.
 //   - Any client-supplied X-Forwarded-Host header is untrusted and dropped/replaced.
+//
+// 4. Forwarded (RFC 7239):
+//   - Kept consistent with the X-Forwarded-* header family.
+//   - append mode (default): Appends a new Forwarded element with for=, proto=, and host=
+//     derived from the connection to any existing Forwarded header(s).
+//   - replace mode (--forwarded-for-mode=replace): Drops any client-supplied Forwarded header
+//     and sets Forwarded solely to the element with for=, proto=, and host= derived from the connection.
 func (p *Proxy) setForwardedHeaders(outReq *http.Request, inReq *http.Request) {
 	// 1. X-Forwarded-For
 	var clientIP string
@@ -1769,6 +1776,44 @@ func (p *Proxy) setForwardedHeaders(outReq *http.Request, inReq *http.Request) {
 		outReq.Header.Set("X-Forwarded-Host", origHost)
 	} else {
 		outReq.Header.Del("X-Forwarded-Host")
+	}
+
+	// 4. Forwarded (RFC 7239)
+	// Keep the two header families consistent: in replace mode, drop any client-supplied
+	// Forwarded header and set for=, proto=, and host= from the connection; in append mode,
+	// append an element.
+	var forwardedParams []string
+	if clientIP != "" {
+		forVal := clientIP
+		if strings.Contains(clientIP, ":") {
+			forVal = fmt.Sprintf("\"[%s]\"", strings.Trim(clientIP, "[]\""))
+		}
+		forwardedParams = append(forwardedParams, "for="+forVal)
+	}
+	if proto != "" {
+		forwardedParams = append(forwardedParams, "proto="+proto)
+	}
+	if origHost != "" {
+		hostVal := origHost
+		if strings.ContainsAny(origHost, ":,;=\" ") {
+			hostVal = fmt.Sprintf("%q", origHost)
+		}
+		forwardedParams = append(forwardedParams, "host="+hostVal)
+	}
+	if len(forwardedParams) > 0 {
+		forwardedElem := strings.Join(forwardedParams, ";")
+		if mode == ForwardedForModeReplace {
+			outReq.Header.Set("Forwarded", forwardedElem)
+		} else {
+			priors := outReq.Header.Values("Forwarded")
+			if len(priors) > 0 {
+				outReq.Header.Set("Forwarded", strings.Join(priors, ", ")+", "+forwardedElem)
+			} else {
+				outReq.Header.Set("Forwarded", forwardedElem)
+			}
+		}
+	} else if mode == ForwardedForModeReplace {
+		outReq.Header.Del("Forwarded")
 	}
 }
 
