@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,9 @@ type Harness struct {
 	T *testing.T
 	// ClusterName is the kind cluster name. Exported so embedding test harnesses can access it.
 	ClusterName string
+
+	setupDiagnosticsOnce sync.Once
+	dumpOnce             sync.Once
 }
 
 func NewHarness(t *testing.T, clusterName string) *Harness {
@@ -82,6 +86,8 @@ func (h *Harness) Setup() {
 			}
 		})
 	}
+
+	h.SetupDiagnosticsCleanup()
 
 	// Ensure we are using the correct context and namespace
 	contextName := "kind-" + h.ClusterName
@@ -436,6 +442,81 @@ func (h *Harness) DeployController() {
 	h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--dataplane-image","gari-controller:e2e","--enable-h2c"]}]}}}}`)
 	h.RunCmd("kubectl", "rollout", "restart", "deployment/gari-controller", "--namespace=default")
 	h.RunCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
+}
+
+// DumpDiagnostics dumps cluster diagnostics on test failure: the Gateways with their status,
+// the data-plane Deployments and Pods, recent events, and the controller's log tail.
+func (h *Harness) DumpDiagnostics() {
+	h.T.Log("=== DUMPING GATEWAYS ===")
+	if out, err := h.RunCommand("kubectl", "get", "gateways", "-A", "-o", "yaml"); err != nil {
+		h.T.Logf("Failed to get gateways: %v", err)
+	} else if strings.TrimSpace(out) != "" {
+		h.T.Logf("Gateways:\n%s", out)
+	}
+
+	h.T.Log("=== DUMPING DATA-PLANE DEPLOYMENTS AND PODS ===")
+	if out, err := h.RunCommand("kubectl", "get", "deployments,pods", "-A", "-l", "gateway.networking.k8s.io/gateway-name", "-o", "wide"); err != nil {
+		h.T.Logf("Failed to get data-plane deployments and pods: %v", err)
+	} else if strings.TrimSpace(out) != "" {
+		h.T.Logf("Data-plane Deployments and Pods:\n%s", out)
+	}
+
+	h.T.Log("=== DUMPING RECENT EVENTS ===")
+	if out, err := h.RunCommand("kubectl", "get", "events", "-A", "--sort-by=.metadata.creationTimestamp"); err != nil {
+		h.T.Logf("Failed to get events: %v", err)
+	} else if strings.TrimSpace(out) != "" {
+		h.T.Logf("Recent events:\n%s", out)
+	}
+
+	h.T.Log("=== DUMPING CONTROLLER LOGS ===")
+	logs, err := h.RunCommand("kubectl", "logs", "deployment/gari-controller", "--namespace=default", "--tail=2000")
+	if err != nil {
+		if sniLogs, sniErr := h.RunCommand("kubectl", "logs", "deployment/snigateway-controller", "--namespace=default", "--tail=2000"); sniErr == nil && strings.TrimSpace(sniLogs) != "" {
+			logs = sniLogs
+			err = nil
+		}
+	}
+	if err != nil {
+		h.T.Logf("Failed to get controller logs: %v", err)
+	} else if strings.TrimSpace(logs) != "" {
+		h.T.Logf("Controller logs:\n%s", logs)
+	}
+}
+
+// SetupDiagnosticsCleanup sets up failure cleanup and a pre-timeout timer to dump diagnostics.
+// If the test has a deadline, a timer fires ~1 minute before the test binary's timeout panic,
+// ensuring cluster diagnostics and controller logs are captured before the test terminates.
+func (h *Harness) SetupDiagnosticsCleanup() {
+	h.setupDiagnosticsOnce.Do(func() {
+		runDump := func() {
+			h.dumpOnce.Do(func() {
+				h.DumpDiagnostics()
+			})
+		}
+
+		h.T.Cleanup(func() {
+			if h.T.Failed() {
+				runDump()
+			}
+		})
+
+		if deadline, ok := h.T.Deadline(); ok {
+			timeRemaining := time.Until(deadline)
+			fireIn := timeRemaining - 1*time.Minute
+			if fireIn <= 0 && timeRemaining > 0 {
+				fireIn = timeRemaining / 2
+			}
+			if fireIn > 0 {
+				timer := time.AfterFunc(fireIn, func() {
+					h.T.Log("=== PRE-TIMEOUT DIAGNOSTIC DUMP (firing ~1m before test deadline) ===")
+					runDump()
+				})
+				h.T.Cleanup(func() {
+					timer.Stop()
+				})
+			}
+		}
+	})
 }
 
 func (h *Harness) BackendManifest() string {
