@@ -154,6 +154,7 @@ func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error
 		f.files[cleaned] = ff
 	} else {
 		ff.underlying = file
+		ff.closed = false
 	}
 	return ff, nil
 }
@@ -228,6 +229,7 @@ type FaultFile struct {
 
 	isHeapFile bool
 	isWALFile  bool
+	closed     bool
 }
 
 func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error) {
@@ -498,6 +500,10 @@ func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.closed {
+		return nil
+	}
+
 	if dropUnsynced {
 		// Discard pending writes; revert to durable data
 		f.pendingData = bytes.Clone(f.durableData)
@@ -549,6 +555,9 @@ func (f *FaultFile) Truncate(size int64) error {
 }
 
 func (f *FaultFile) Close() error {
+	f.mu.Lock()
+	f.closed = true
+	f.mu.Unlock()
 	return f.underlying.Close()
 }
 
