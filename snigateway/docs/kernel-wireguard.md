@@ -78,7 +78,7 @@ An intermediate architectural option couples `wireguard-go` with a Linux kernel 
 
 ## 5. Measurement Plan
 
-To evaluate kernel WireGuard and the TUN option against existing transports (TCP pool, HTTP/2), benchmarks must run using the established harness in `snigateway/pkg/frontend/benchmark_test.go`:
+To evaluate kernel WireGuard and the TUN option against the TCP pool, benchmarks must run using the established harness in `snigateway/pkg/frontend/benchmark_test.go`:
 
 - **Execution Environment (By Hand)**:
   - Kernel WireGuard and TUN devices require elevated privileges and host network manipulation that are disallowed in standard unprivileged CI runners.
