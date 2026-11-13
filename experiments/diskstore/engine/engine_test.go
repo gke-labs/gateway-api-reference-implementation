@@ -1395,12 +1395,11 @@ func TestGet_MissingOversizeObjectReturnsCorruptionError(t *testing.T) {
 		t.Fatalf("Put failed: %v", err)
 	}
 
-	// Remove from in-memory oversizeObjects map and disk while leaving keyIndex entry
+	// Remove backing oversize file from disk while leaving keyIndex entry
 	qKey := qualifyKey(table, key)
-	store.keyMu.Lock()
-	delete(store.oversizeObjects, qKey)
+	store.keyMu.RLock()
 	p := store.oversizeFilePath(store.keyIndex[qKey].OversizeFileName)
-	store.keyMu.Unlock()
+	store.keyMu.RUnlock()
 	_ = store.fs.Remove(p)
 
 	// Get must return ErrCorruptStore on missing oversize file

@@ -20,7 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -625,5 +627,156 @@ func TestOversize_CipherOutputStartingWithMagic_ReadsBackCorrectly(t *testing.T)
 	}
 	if !bytes.Equal(got, plainVal) {
 		t.Fatalf("value mismatch: want %q, got %q", string(plainVal), string(got))
+	}
+}
+
+// TestOversize_ReopenHeapUseDoesNotGrowWithTotalSize verifies that after Open on a store
+// with oversize values, heap usage does not grow with their total size.
+func TestOversize_ReopenHeapUseDoesNotGrowWithTotalSize(t *testing.T) {
+	dirEmpty := t.TempDir()
+	dirOversize := t.TempDir()
+
+	// Store without oversize values
+	sEmpty, err := Open(WithDir(dirEmpty), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open empty store failed: %v", err)
+	}
+	if err := sEmpty.Close(); err != nil {
+		t.Fatalf("Close empty store failed: %v", err)
+	}
+
+	// Store with several oversize values
+	sOversize, err := Open(WithDir(dirOversize), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open oversize store failed: %v", err)
+	}
+	table := "TestTable"
+	numValues := 4
+	valSize := 2500 * 1024 // 2.5 MiB each, > 2 MiB threshold
+	totalSize := numValues * valSize
+
+	for i := 0; i < numValues; i++ {
+		key := fmt.Sprintf("large-key-%d", i)
+		val := makeIncompressible(valSize)
+		if err := sOversize.Put(table, key, val); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+	if _, err := sOversize.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	if err := sOversize.Close(); err != nil {
+		t.Fatalf("Close oversize store failed: %v", err)
+	}
+
+	// Reopen store without oversize values and measure heap
+	runtime.GC()
+	reopenedEmpty, err := Open(WithDir(dirEmpty), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen empty store failed: %v", err)
+	}
+	runtime.GC()
+	var msEmpty runtime.MemStats
+	runtime.ReadMemStats(&msEmpty)
+	_ = reopenedEmpty.Close()
+
+	// Reopen store with oversize values and measure heap
+	runtime.GC()
+	reopenedOversize, err := Open(WithDir(dirOversize), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen oversize store failed: %v", err)
+	}
+	runtime.GC()
+	var msOversize runtime.MemStats
+	runtime.ReadMemStats(&msOversize)
+	_ = reopenedOversize.Close()
+
+	// HeapAlloc must not grow with total size of oversize values (10 MiB).
+	// Loose bound: heap growth must be well below total size (e.g. less than half the total size).
+	diff := int64(msOversize.HeapAlloc) - int64(msEmpty.HeapAlloc)
+	bound := int64(totalSize / 2)
+	if diff > bound {
+		t.Fatalf("heap grew by %d bytes after Open on store with %d bytes of oversize values (bound %d)", diff, totalSize, bound)
+	}
+}
+
+// TestOversize_ReopenGetAndAlteredFileReturnsCorruption verifies that Get returns the right value
+// after reopening, and returns ErrCorruptStore if the backing oversize file was altered.
+func TestOversize_ReopenGetAndAlteredFileReturnsCorruption(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := Open(WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	table := "TestTable"
+	key := "my-oversize-key"
+	val := makeIncompressible(2500 * 1024)
+
+	if err := store.Put(table, key, val); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	store.keyMu.RLock()
+	fileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
+	store.keyMu.RUnlock()
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 1. Reopen and verify Get returns the right value
+	store2, err := Open(WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+
+	got, exists, err := store2.Get(table, key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected key to exist")
+	}
+	if !bytes.Equal(got, val) {
+		t.Fatalf("Get payload mismatch")
+	}
+
+	// 2. Alter the backing oversize file on disk
+	oversizeFilePath := filepath.Join(dir, "oversize", fileName)
+	data, err := os.ReadFile(oversizeFilePath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	data[len(data)/2] ^= 0xff
+	if err := os.WriteFile(oversizeFilePath, data, 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// 3. Verify Get returns corruption error on altered file
+	_, _, err = store2.Get(table, key)
+	if err == nil {
+		t.Fatalf("expected ErrCorruptStore on altered oversize file, got nil")
+	}
+	if !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("expected ErrCorruptStore on altered oversize file, got: %v", err)
+	}
+	_ = store2.Close()
+
+	// 4. Also verify after reopening with altered file
+	store3, err := Open(WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen store3 failed: %v", err)
+	}
+	defer store3.Close()
+
+	_, _, err = store3.Get(table, key)
+	if err == nil {
+		t.Fatalf("expected ErrCorruptStore after reopen on altered oversize file, got nil")
+	}
+	if !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("expected ErrCorruptStore after reopen on altered oversize file, got: %v", err)
 	}
 }

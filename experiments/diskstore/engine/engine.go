@@ -271,7 +271,6 @@ type Engine struct {
 
 	keyMu           sync.RWMutex
 	keyIndex        map[string]KeyIndexEntry // tableQualifiedKey -> KeyIndexEntry
-	oversizeObjects map[string][]byte        // tableQualifiedKey -> payload
 
 	inFlightMu       sync.Mutex
 	inFlightOversize map[string]int
@@ -749,7 +748,6 @@ func Open(opts ...Option) (*Engine, error) {
 		},
 		heapFile:         heapFile,
 		keyIndex:         make(map[string]KeyIndexEntry),
-		oversizeObjects:  make(map[string][]byte),
 		inFlightOversize: make(map[string]int),
 		emptyPages:       newEmptyPageTracker(nil),
 		failedCh:         make(chan struct{}),
@@ -1237,7 +1235,6 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 			IsOversize:       true,
 			OversizeFileName: fileName,
 		}
-		s.oversizeObjects[qKey] = bytes.Clone(toStore)
 		if !wasOversize {
 			GlobalMetrics.OversizeObjectsCount.Add(1)
 		}
@@ -1289,7 +1286,6 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 	// Transition from oversize to standard page
 	if oldOversizeFile != "" {
 		s.keyMu.Lock()
-		delete(s.oversizeObjects, qKey)
 		GlobalMetrics.OversizeObjectsCount.Add(-1)
 		s.keyMu.Unlock()
 	}
@@ -1538,73 +1534,64 @@ func (s *Engine) getLocked(tableName, key string) ([]byte, bool, error) {
 // not be read due to page conflict.
 func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry) ([]byte, bool, error) {
 	if entry.IsOversize {
-		s.keyMu.RLock()
-		data, ok := s.oversizeObjects[qKey]
-		s.keyMu.RUnlock()
-		if !ok {
-			handle, err := s.bp.PinPage(entry.LogicalPage)
-			if err != nil {
-				return nil, false, fmt.Errorf("failed to pin page %d for key %s: %w", entry.LogicalPage, key, err)
-			}
-			handle.Desc.Mu.RLock()
-			var rawPtr []byte
-			var isSlotOversize bool
-			slotted, wrapErr := WrapSlottedPage(handle.Block(0))
-			if wrapErr == nil {
-				var raw []byte
-				_, raw, _, isSlotOversize, err = slotted.GetWithFlag(entry.Slot)
-				if err == nil {
-					rawPtr = bytes.Clone(raw)
-				}
-			} else {
-				err = wrapErr
-			}
-			handle.Desc.Mu.RUnlock()
-			handle.Unpin()
-
-			if err != nil || !isSlotOversize {
-				return nil, false, fmt.Errorf("%w: missing or invalid oversize slot %d on page %d: %v", ErrCorruptStore, entry.Slot, entry.LogicalPage, err)
-			}
-
-			expectedLen, expectedChecksum, fileName, decodeErr := DecodeOversizePointer(rawPtr)
-			if decodeErr != nil {
-				return nil, false, fmt.Errorf("%w: failed to decode oversize pointer: %v", ErrCorruptStore, decodeErr)
-			}
-
-			p := filepath.Join(s.dir, "oversize", fileName)
-			f, openErr := s.fs.Open(p)
-			if openErr != nil {
-				return nil, false, fmt.Errorf("%w: missing oversize file %s: %v", ErrCorruptStore, fileName, openErr)
-			}
-			sz, sizeErr := f.Size()
-			if sizeErr != nil {
-				closeErr := f.Close()
-				return nil, false, fmt.Errorf("%w: failed to get size of oversize file %s: %v", ErrCorruptStore, fileName, errors.Join(sizeErr, closeErr))
-			}
-			if uint64(sz) != expectedLen {
-				closeErr := f.Close()
-				return nil, false, errors.Join(fmt.Errorf("%w: oversize file %s size mismatch (want %d, got %d)", ErrCorruptStore, fileName, expectedLen, sz), closeErr)
-			}
-			fileData := make([]byte, sz)
-			if _, readErr := f.ReadAt(fileData, 0); readErr != nil && !errors.Is(readErr, io.EOF) {
-				closeErr := f.Close()
-				return nil, false, fmt.Errorf("%w: failed to read oversize file %s: %v", ErrCorruptStore, fileName, errors.Join(readErr, closeErr))
-			}
-			if closeErr := f.Close(); closeErr != nil {
-				return nil, false, fmt.Errorf("%w: failed to close oversize file %s: %v", ErrCorruptStore, fileName, closeErr)
-			}
-
-			actualChecksum := OversizeHash(qKey, fileData)
-			if actualChecksum != expectedChecksum {
-				return nil, false, fmt.Errorf("%w: corrupt oversize file %s (checksum mismatch)", ErrCorruptStore, fileName)
-			}
-
-			data = fileData
-			s.keyMu.Lock()
-			s.oversizeObjects[qKey] = bytes.Clone(data)
-			s.keyMu.Unlock()
+		handle, err := s.bp.PinPage(entry.LogicalPage)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to pin page %d for key %s: %w", entry.LogicalPage, key, err)
 		}
-		res := bytes.Clone(data)
+		handle.Desc.Mu.RLock()
+		var rawPtr []byte
+		var isSlotOversize bool
+		slotted, wrapErr := WrapSlottedPage(handle.Block(0))
+		if wrapErr == nil {
+			var raw []byte
+			_, raw, _, isSlotOversize, err = slotted.GetWithFlag(entry.Slot)
+			if err == nil {
+				rawPtr = bytes.Clone(raw)
+			}
+		} else {
+			err = wrapErr
+		}
+		handle.Desc.Mu.RUnlock()
+		handle.Unpin()
+
+		if err != nil || !isSlotOversize {
+			return nil, false, fmt.Errorf("%w: missing or invalid oversize slot %d on page %d: %v", ErrCorruptStore, entry.Slot, entry.LogicalPage, err)
+		}
+
+		expectedLen, expectedChecksum, fileName, decodeErr := DecodeOversizePointer(rawPtr)
+		if decodeErr != nil {
+			return nil, false, fmt.Errorf("%w: failed to decode oversize pointer: %v", ErrCorruptStore, decodeErr)
+		}
+
+		p := filepath.Join(s.dir, "oversize", fileName)
+		f, openErr := s.fs.Open(p)
+		if openErr != nil {
+			return nil, false, fmt.Errorf("%w: missing oversize file %s: %v", ErrCorruptStore, fileName, openErr)
+		}
+		sz, sizeErr := f.Size()
+		if sizeErr != nil {
+			closeErr := f.Close()
+			return nil, false, fmt.Errorf("%w: failed to get size of oversize file %s: %v", ErrCorruptStore, fileName, errors.Join(sizeErr, closeErr))
+		}
+		if uint64(sz) != expectedLen {
+			closeErr := f.Close()
+			return nil, false, errors.Join(fmt.Errorf("%w: oversize file %s size mismatch (want %d, got %d)", ErrCorruptStore, fileName, expectedLen, sz), closeErr)
+		}
+		fileData := make([]byte, sz)
+		if _, readErr := f.ReadAt(fileData, 0); readErr != nil && !errors.Is(readErr, io.EOF) {
+			closeErr := f.Close()
+			return nil, false, fmt.Errorf("%w: failed to read oversize file %s: %v", ErrCorruptStore, fileName, errors.Join(readErr, closeErr))
+		}
+		if closeErr := f.Close(); closeErr != nil {
+			return nil, false, fmt.Errorf("%w: failed to close oversize file %s: %v", ErrCorruptStore, fileName, closeErr)
+		}
+
+		actualChecksum := OversizeHash(qKey, fileData)
+		if actualChecksum != expectedChecksum {
+			return nil, false, fmt.Errorf("%w: corrupt oversize file %s (checksum mismatch)", ErrCorruptStore, fileName)
+		}
+
+		res := fileData
 		if s.cipher != nil {
 			ad := AdditionalData(tableName, key)
 			decrypted, err := s.cipher.Decrypt(res, ad)
@@ -1693,7 +1680,6 @@ func (s *Engine) Delete(tableName, key string) error {
 	}
 	delete(s.keyIndex, qKey)
 	if entry.IsOversize {
-		delete(s.oversizeObjects, qKey)
 		GlobalMetrics.OversizeObjectsCount.Add(-1)
 	}
 	s.keyMu.Unlock()

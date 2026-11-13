@@ -25,7 +25,7 @@ type Metrics struct {
 // GlobalMetrics holds the shared store metrics instance.
 var GlobalMetrics = &Metrics{}
 
-// OversizeCount returns the current count of active oversize objects kept in memory.
+// OversizeCount returns the current count of active oversize objects.
 func OversizeCount() int64 {
 	return GlobalMetrics.OversizeObjectsCount.Load()
 }
