@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"reflect"
 	"sort"
 	"sync"
@@ -111,8 +110,14 @@ func newDataplaneQueue() workqueue.TypedRateLimitingInterface[types.NamespacedNa
 	)
 }
 
+// gatewayDataplaneState holds the data-plane state for a single Gateway.
+type gatewayDataplaneState struct {
+	acceptedConfig []byte
+	lastPublishErr error
+}
+
 type State struct {
-	mu sync.RWMutex // guards inputs, outputs, listeners, routes, and dataplaneCache
+	mu sync.RWMutex // guards inputs, outputs, listeners, routes, and dataplaneState
 
 	recomputeMu sync.Mutex // serializes Recompute executions
 
@@ -149,8 +154,7 @@ type State struct {
 
 	dataplanePublisher DataplanePublisher
 	dataplaneQueue     workqueue.TypedRateLimitingInterface[types.NamespacedName]
-	dataplaneCache     map[types.NamespacedName][]byte   // holds the last config that each Gateway's data plane accepted; guarded by mu
-	publishConflicts   map[types.NamespacedName]struct{} // guarded by mu
+	dataplaneState     map[types.NamespacedName]gatewayDataplaneState // holds the data-plane state for each Gateway; guarded by mu
 
 	previousOutputs *Outputs
 
@@ -200,8 +204,7 @@ func NewState() *State {
 		backendTLSPolicySource: NewEventSource(),
 		gatewayClassSource:     NewEventSource(),
 		dataplaneQueue:         newDataplaneQueue(),
-		dataplaneCache:         make(map[types.NamespacedName][]byte),
-		publishConflicts:       make(map[types.NamespacedName]struct{}),
+		dataplaneState:         make(map[types.NamespacedName]gatewayDataplaneState),
 		notifyCh:               make(chan struct{}, 1),
 		synced:                 true,
 		running:                false,
@@ -305,8 +308,7 @@ func (s *State) SetDataplanePublisher(p DataplanePublisher) {
 		return
 	}
 	s.dataplanePublisher = p
-	s.dataplaneCache = make(map[types.NamespacedName][]byte)
-	clear(s.publishConflicts)
+	s.dataplaneState = make(map[types.NamespacedName]gatewayDataplaneState)
 	if p != nil && s.dataplaneQueue != nil && s.previousOutputs != nil && s.previousOutputs.DataplaneConfigs != nil {
 		for gwKey := range s.previousOutputs.DataplaneConfigs {
 			s.dataplaneQueue.Forget(gwKey)
@@ -547,7 +549,7 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 			dpConfig = nil
 		}
 	}
-	cachedData := s.dataplaneCache[gwKey]
+	cachedData := s.dataplaneState[gwKey].acceptedConfig
 	publisher := s.dataplanePublisher
 	s.mu.RUnlock()
 
@@ -557,6 +559,9 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 
 	if dpConfig == nil || gw == nil {
 		if cachedData == nil {
+			s.mu.Lock()
+			delete(s.dataplaneState, gwKey)
+			s.mu.Unlock()
 			return nil
 		}
 
@@ -582,8 +587,7 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		}
 
 		s.mu.Lock()
-		delete(s.dataplaneCache, gwKey)
-		delete(s.publishConflicts, gwKey)
+		delete(s.dataplaneState, gwKey)
 		s.mu.Unlock()
 		return nil
 	}
@@ -610,32 +614,35 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		if commitErr := publisher.Commit(ctx); commitErr != nil {
 			klog.Errorf("failed to commit dataplane publish batch after publish error for %s: %v", gwKey, commitErr)
 		}
-		var conflictErr *OwnershipConflictError
-		if errors.As(err, &conflictErr) {
-			s.mu.Lock()
-			s.publishConflicts[gwKey] = struct{}{}
-			s.mu.Unlock()
-			s.SetGatewayProvisioningError(gwKey, conflictErr.Error())
-		}
+		s.recordPublishError(gwKey, err)
 		return err
 	}
 	if err := publisher.Commit(ctx); err != nil {
 		klog.Errorf("failed to commit dataplane publish batch: %v", err)
+		s.recordPublishError(gwKey, err)
 		return err
 	}
 
 	s.mu.Lock()
-	s.dataplaneCache[gwKey] = data
-	_, hadConflict := s.publishConflicts[gwKey]
-	if hadConflict {
-		delete(s.publishConflicts, gwKey)
+	prev := s.dataplaneState[gwKey]
+	s.dataplaneState[gwKey] = gatewayDataplaneState{
+		acceptedConfig: data,
 	}
 	s.mu.Unlock()
 
-	if hadConflict {
+	if prev.lastPublishErr != nil {
 		s.SetGatewayProvisioningError(gwKey, "")
 	}
 	return nil
+}
+
+func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
+	s.mu.Lock()
+	dp := s.dataplaneState[gwKey]
+	dp.lastPublishErr = err
+	s.dataplaneState[gwKey] = dp
+	s.mu.Unlock()
+	s.SetGatewayProvisioningError(gwKey, err.Error())
 }
 
 // enqueueChangedDataplaneConfigsLocked enqueues data-plane keys whose desired configuration changed.
@@ -1328,7 +1335,6 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 			delete(s.gatewayAddresses, key)
 			delete(s.gatewayReadiness, key)
 			delete(s.provisioningErrors, key)
-			delete(s.publishConflicts, key)
 			s.revision++
 			s.markDirtyLocked()
 		}
@@ -1356,7 +1362,6 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 		delete(s.gatewayAddresses, name)
 		delete(s.gatewayReadiness, name)
 		delete(s.provisioningErrors, name)
-		delete(s.publishConflicts, name)
 		s.revision++
 		s.markDirtyLocked()
 	}
