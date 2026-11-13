@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
 	"sync"
@@ -114,8 +115,33 @@ func newDataplaneQueue() workqueue.TypedRateLimitingInterface[types.NamespacedNa
 type gatewayDataplaneState struct {
 	// acceptedConfig is the last config that the Gateway's data plane accepted.
 	acceptedConfig []byte
-	// lastPublishError is the error from the most recent publish attempt, or nil after a success.
-	lastPublishError error
+}
+
+// gatewayProvisioningErrors holds per-Gateway provisioning errors from different sources.
+type gatewayProvisioningErrors struct {
+	// addressProvider holds the provisioning error reported by the address provider
+	// or Gateway reconciler, set by SetGatewayProvisioningError.
+	addressProvider error
+	// publish holds the error from the most recent data-plane publish attempt,
+	// set by recordPublishError.
+	publish error
+}
+
+// empty reports whether all provisioning error sources are clear.
+func (e gatewayProvisioningErrors) empty() bool {
+	return e.addressProvider == nil && e.publish == nil
+}
+
+// message returns the error message for the Gateway's Programmed condition.
+// The address provider's error is shown first, then the publish error.
+func (e gatewayProvisioningErrors) message() string {
+	if e.addressProvider != nil {
+		return e.addressProvider.Error()
+	}
+	if e.publish != nil {
+		return e.publish.Error()
+	}
+	return ""
 }
 
 type State struct {
@@ -130,7 +156,7 @@ type State struct {
 	gateways              map[types.NamespacedName]*GatewayState
 	gatewayAddresses      map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
 	gatewayReadiness      map[types.NamespacedName]GatewayReadiness
-	provisioningErrors    map[types.NamespacedName]string
+	provisioningErrors    map[types.NamespacedName]gatewayProvisioningErrors
 	supportedAddressTypes []gatewayv1.AddressType
 	listenerSets          map[types.NamespacedName]*ListenerSetState
 	httpRoutes            map[types.NamespacedName]*HTTPRouteState
@@ -183,7 +209,7 @@ func NewState() *State {
 		gateways:               make(map[types.NamespacedName]*GatewayState),
 		gatewayAddresses:       make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress),
 		gatewayReadiness:       make(map[types.NamespacedName]GatewayReadiness),
-		provisioningErrors:     make(map[types.NamespacedName]string),
+		provisioningErrors:     make(map[types.NamespacedName]gatewayProvisioningErrors),
 		listenerSets:           make(map[types.NamespacedName]*ListenerSetState),
 		httpRoutes:             make(map[types.NamespacedName]*HTTPRouteState),
 		tlsRoutes:              make(map[types.NamespacedName]*TLSRouteState),
@@ -560,12 +586,14 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	}
 
 	if dpConfig == nil || gw == nil {
+		s.mu.Lock()
+		s.clearPublishErrorLocked(gwKey)
 		if cachedData == nil {
-			s.mu.Lock()
 			delete(s.dataplaneState, gwKey)
 			s.mu.Unlock()
 			return nil
 		}
+		s.mu.Unlock()
 
 		if err := publisher.Begin(ctx); err != nil {
 			klog.Errorf("failed to begin dataplane publish batch: %v", err)
@@ -590,6 +618,7 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 
 		s.mu.Lock()
 		delete(s.dataplaneState, gwKey)
+		s.clearPublishErrorLocked(gwKey)
 		s.mu.Unlock()
 		return nil
 	}
@@ -626,27 +655,48 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	}
 
 	s.mu.Lock()
-	prev := s.dataplaneState[gwKey]
 	s.dataplaneState[gwKey] = gatewayDataplaneState{
 		acceptedConfig: data,
 	}
+	s.clearPublishErrorLocked(gwKey)
 	s.mu.Unlock()
 
-	if prev.lastPublishError != nil {
-		s.SetGatewayProvisioningError(gwKey, "")
-	}
 	return nil
 }
 
+// clearPublishErrorLocked clears the data-plane publish error for a Gateway.
+// It must be called with s.mu held.
+func (s *State) clearPublishErrorLocked(gwKey types.NamespacedName) {
+	if errs, ok := s.provisioningErrors[gwKey]; ok && errs.publish != nil {
+		errs.publish = nil
+		if errs.empty() {
+			delete(s.provisioningErrors, gwKey)
+		} else {
+			s.provisioningErrors[gwKey] = errs
+		}
+		s.revision++
+		s.markDirtyLocked()
+	}
+}
+
 // recordPublishError records the error from a failed data-plane publish attempt on the Gateway's
-// data-plane state and reports it as a Gateway provisioning error.
+// provisioning errors.
 func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
 	s.mu.Lock()
-	dp := s.dataplaneState[gwKey]
-	dp.lastPublishError = err
-	s.dataplaneState[gwKey] = dp
-	s.mu.Unlock()
-	s.SetGatewayProvisioningError(gwKey, err.Error())
+	defer s.mu.Unlock()
+
+	if _, ok := s.gateways[gwKey]; !ok {
+		return
+	}
+
+	errs := s.provisioningErrors[gwKey]
+	if errs.publish != nil && errs.publish.Error() == err.Error() {
+		return
+	}
+	errs.publish = err
+	s.provisioningErrors[gwKey] = errs
+	s.revision++
+	s.markDirtyLocked()
 }
 
 // enqueueChangedDataplaneConfigsLocked enqueues data-plane keys whose desired configuration changed.
@@ -720,7 +770,9 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 
 	gwProvErrs := make(map[types.NamespacedName]string)
 	for k, v := range s.provisioningErrors {
-		gwProvErrs[k] = v
+		if msg := v.message(); msg != "" {
+			gwProvErrs[k] = msg
+		}
 	}
 
 	var listenerSets []*gatewayv1.ListenerSet
@@ -1464,18 +1516,27 @@ func (s *State) SetGatewayReadiness(key types.NamespacedName, readiness GatewayR
 	s.markDirtyLocked()
 }
 
+// SetGatewayProvisioningError sets the address provider provisioning error only for a Gateway.
 func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if cur, ok := s.provisioningErrors[key]; ok && cur == provErr {
+	errs := s.provisioningErrors[key]
+	var newErr error
+	if provErr != "" {
+		newErr = errors.New(provErr)
+	}
+
+	if (errs.addressProvider == nil && newErr == nil) ||
+		(errs.addressProvider != nil && newErr != nil && errs.addressProvider.Error() == newErr.Error()) {
 		return
 	}
 
-	if provErr == "" {
+	errs.addressProvider = newErr
+	if errs.empty() {
 		delete(s.provisioningErrors, key)
 	} else {
-		s.provisioningErrors[key] = provErr
+		s.provisioningErrors[key] = errs
 	}
 	s.revision++
 	s.markDirtyLocked()

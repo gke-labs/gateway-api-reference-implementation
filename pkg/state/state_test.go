@@ -951,6 +951,234 @@ func TestState_PublishDataplaneConfig_PlainError(t *testing.T) {
 	}
 }
 
+func TestState_PublishAndProvisioningErrors_DoNotOverwriteOrClearEachOther(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	pubErr := errors.New("simulated publish failure")
+	mockPub := &mockDataplanePublisher{
+		publishErr: pubErr,
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// 1. Initial publish fails with pubErr. Gateway status shows Programmed=False with publish error.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == pubErr.Error()
+	})
+
+	// 2. Report a provisioning error from an address provider.
+	// Address provider's error is shown first in Gateway status.
+	addrErr := "conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw"
+	st.SetGatewayProvisioningError(gwKey, addrErr)
+
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == addrErr
+	})
+
+	// 3. Resolve the publish error: publisher succeeds.
+	mockPub.setPublishErr(nil)
+	// Mutate listener port to change DataplaneConfig and trigger republish.
+	gw.Spec.Listeners[0].Port = 8080
+	st.UpsertGateway(gw)
+
+	// Publish succeeds, but Gateway status must still show Programmed=False with the address provider error,
+	// verifying that clearing the publish error did not clear the address provider error.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == addrErr
+	})
+
+	// 4. Trigger publish error again while address provider error is still present.
+	mockPub.setPublishErr(pubErr)
+	gw.Spec.Listeners[0].Port = 8081
+	st.UpsertGateway(gw)
+
+	// Gateway status condition continues to show Programmed=False with address error.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == addrErr
+	})
+
+	// 5. Clear the address provider provisioning error (address provider succeeds).
+	st.SetGatewayProvisioningError(gwKey, "")
+
+	// Verify that clearing addressProvider error reveals the still-failing publish error
+	// (not Programmed=True), proving publish error was not overwritten or cleared.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == pubErr.Error()
+	})
+
+	// 6. Finally, resolve the publish error as well.
+	mockPub.setPublishErr(nil)
+	gw.Spec.Listeners[0].Port = 8082
+	st.UpsertGateway(gw)
+
+	// Both errors resolved: Programmed=True is restored.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionTrue && progCond.Reason == string(gatewayv1.GatewayReasonProgrammed)
+	})
+
+	// 7. Deleting the Gateway removes its status.
+	st.DeleteGateway(gwKey)
+	pollUntil(t, 2*time.Second, func() bool {
+		_, ok := st.GetDesiredGatewayStatus(gwKey)
+		return !ok
+	})
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestState_PublishError_ClearedOnGatewayDeleteAndRecreate(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	pubErr := errors.New("simulated publish failure")
+	mockPub := &mockDataplanePublisher{
+		publishErr: pubErr,
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// 1. Initial publish fails with pubErr. Wait for Programmed=False with pubErr.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == pubErr.Error()
+	})
+
+	// 2. Delete the Gateway while publish is failing.
+	st.DeleteGateway(gwKey)
+
+	// Verify Gateway status is gone.
+	pollUntil(t, 2*time.Second, func() bool {
+		_, ok := st.GetDesiredGatewayStatus(gwKey)
+		return !ok
+	})
+
+	// 3. Make publisher succeed, then recreate a Gateway with the same name.
+	mockPub.setPublishErr(nil)
+
+	recreatedGW := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(recreatedGW)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// 4. Assert that its status never shows the old publish error, and reaches Programmed=True.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		if progCond != nil && progCond.Message == pubErr.Error() {
+			t.Fatalf("recreated Gateway status showed old publish error: %s", progCond.Message)
+		}
+		return progCond != nil && progCond.Status == metav1.ConditionTrue && progCond.Reason == string(gatewayv1.GatewayReasonProgrammed)
+	})
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
 type retryTestPublisher struct {
 	mu                sync.Mutex
 	failCount         int
