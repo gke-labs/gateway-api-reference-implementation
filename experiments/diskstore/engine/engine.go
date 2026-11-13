@@ -1206,10 +1206,12 @@ func (s *Engine) putRecordIntoSlottedPageLocked(qKey string, payload []byte, lsn
 //   - isOversize indicates whether payload represents an oversize pointer.
 //
 // Guarantees:
-//   - The record is written to a slotted page or multi-block page sequence.
-//   - Any superseded heap location (slotted slot or multi-block page) for qKey is cleaned up.
-//   - s.keyIndex is updated with the new location, LSN, and metadata under s.keyMu.
-//   - GlobalMetrics.OversizeObjectsCount is adjusted if the oversize status changed.
+//   - applyPutLocked writes the record to a slotted page or multi-block page sequence.
+//   - It clears the record's old location (slotted slot or multi-block page) if replacing an existing record.
+//   - It stores the new location in the key index under keyMu, along with its LSN and metadata.
+//   - It adjusts GlobalMetrics.OversizeObjectsCount if the oversize status changed.
+//   - The function doesn't append to the WAL.
+//   - It doesn't create, read or delete oversize value files.
 func (s *Engine) applyPutLocked(qKey string, payload []byte, lsn uint64, isOversize bool) error {
 	s.keyMu.RLock()
 	existing, inIndex := s.keyIndex[qKey]
@@ -1217,11 +1219,11 @@ func (s *Engine) applyPutLocked(qKey string, payload []byte, lsn uint64, isOvers
 
 	var fileName string
 	if isOversize {
-		_, _, fName, decodeErr := DecodeOversizePointer(payload)
+		var decodeErr error
+		_, _, fileName, decodeErr = DecodeOversizePointer(payload)
 		if decodeErr != nil {
 			return fmt.Errorf("%w: failed to decode oversize pointer: %v", ErrCorruptStore, decodeErr)
 		}
-		fileName = fName
 	}
 
 	if isOversize || CanFitInSlottedPage(len(qKey), len(payload)) {
@@ -1262,10 +1264,8 @@ func (s *Engine) applyPutLocked(qKey string, payload []byte, lsn uint64, isOvers
 	// If replacing an existing slotted or multi-block record, clean up old location (Item 15)
 	if inIndex {
 		if existing.NumBlocks == 1 {
-			if existing.LogicalPage != 0 {
-				if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
-					return err
-				}
+			if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
+				return err
 			}
 		} else if existing.NumBlocks > 1 {
 			if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
@@ -1434,6 +1434,9 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 	}
 
 	if err := s.applyPutLocked(qKey, rec.Payload, lsn, isOversize); err != nil {
+		if errors.Is(err, ErrObjectOversize) {
+			return err
+		}
 		s.setFailed(err)
 		return s.failErr()
 	}
@@ -1731,10 +1734,12 @@ func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry
 //   - lsn is the WAL log sequence number assigned to this delete record.
 //
 // Guarantees:
-//   - If qKey exists in s.keyIndex, its entry is removed under s.keyMu.
-//   - Its superseded heap location (slotted slot or multi-block page) is deleted or cleared.
-//   - GlobalMetrics.OversizeObjectsCount is decremented if the deleted object was oversize.
-//   - If qKey does not exist in s.keyIndex, it is a no-op and returns nil.
+//   - applyDeleteLocked removes the record's entry from the key index under keyMu.
+//   - It clears the record's old location (slotted slot or multi-block page).
+//   - It decrements GlobalMetrics.OversizeObjectsCount if the deleted object was oversize.
+//   - If qKey does not exist in the key index, it is a no-op and returns nil.
+//   - The function doesn't append to the WAL.
+//   - It doesn't create, read or delete oversize value files.
 func (s *Engine) applyDeleteLocked(qKey string, lsn uint64) error {
 	s.keyMu.Lock()
 	entry, exists := s.keyIndex[qKey]
@@ -1748,15 +1753,21 @@ func (s *Engine) applyDeleteLocked(qKey string, lsn uint64) error {
 	}
 	s.keyMu.Unlock()
 
-	if entry.NumBlocks == 1 {
-		if entry.LogicalPage != 0 {
+	if entry.IsOversize {
+		if entry.NumBlocks == 1 && entry.LogicalPage != 0 {
 			if err := s.deleteSlotFromPageLocked(entry.LogicalPage, entry.Slot, lsn); err != nil {
 				return err
 			}
 		}
-	} else if entry.NumBlocks > 1 {
-		if err := s.clearLogicalPageLocked(entry.LogicalPage, lsn); err != nil {
-			return err
+	} else {
+		if entry.NumBlocks == 1 {
+			if err := s.deleteSlotFromPageLocked(entry.LogicalPage, entry.Slot, lsn); err != nil {
+				return err
+			}
+		} else {
+			if err := s.clearLogicalPageLocked(entry.LogicalPage, lsn); err != nil {
+				return err
+			}
 		}
 	}
 
