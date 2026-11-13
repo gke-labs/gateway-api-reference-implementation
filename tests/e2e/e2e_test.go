@@ -16,6 +16,8 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,6 +25,10 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
@@ -315,6 +321,127 @@ spec:
 	h.RunCmd("kubectl", "delete", "configmap", "live-switch-params", "--namespace=default")
 	h.WaitForResourceDeletion("svc", liveResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", liveResName, "default", 30*time.Second)
+
+	// 11. Verify Config Change Updates Applied Revision on Replicas
+	t.Log("Verifying config change updates applied revision on replicas")
+	secName := singlepod.ResourceNameForGateway("reference-gateway")
+	var oldRevision string
+	secData := runCmdAllowError(h, "kubectl", "get", "secret", secName, "--namespace=default", "-o", "jsonpath={.data.config\\.json}")
+	if secData != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(secData)); err == nil {
+			var cfg map[string]any
+			if err := json.Unmarshal(decoded, &cfg); err == nil {
+				if rev, ok := cfg["revision"].(string); ok {
+					oldRevision = rev
+				}
+			}
+		}
+	}
+
+	// Apply real change to HTTPRoute
+	updatedRouteManifest := `
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: test-route
+  namespace: default
+spec:
+  parentRefs:
+  - name: reference-gateway
+  hostnames: ["example.com"]
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /updated-e2e
+    backendRefs:
+    - name: backend
+      port: 8080
+`
+	h.KubectlApplyContent(updatedRouteManifest)
+
+	// Wait for Secret to update with new revision
+	var newRevision string
+	deadline := time.Now().Add(1 * time.Minute)
+	for time.Now().Before(deadline) {
+		curSecData := h.RunCmd("kubectl", "get", "secret", secName, "--namespace=default", "-o", "jsonpath={.data.config\\.json}")
+		if curSecData != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(curSecData)); err == nil {
+				var cfg map[string]any
+				if err := json.Unmarshal(decoded, &cfg); err == nil {
+					if rev, ok := cfg["revision"].(string); ok && rev != "" && rev != oldRevision {
+						newRevision = rev
+						break
+					}
+				}
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if newRevision == "" {
+		t.Fatalf("timed out waiting for config Secret %s to update with new revision (old was %q)", secName, oldRevision)
+	}
+
+	// Verify Gateway reaches Programmed=True
+	dynClient, err := dynamic.NewForConfig(h.RESTConfig())
+	if err != nil {
+		t.Fatalf("Failed to create dynamic client: %v", err)
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "gateway.networking.k8s.io",
+		Version:  "v1",
+		Resource: "gateways",
+	}
+
+	isProgrammed := false
+	for time.Now().Before(deadline) {
+		gw, err := dynClient.Resource(gvr).Namespace("default").Get(t.Context(), "reference-gateway", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get Gateway: %v", err)
+		}
+		conds, found, err := unstructured.NestedSlice(gw.Object, "status", "conditions")
+		if err != nil {
+			t.Fatalf("Failed reading conditions from Gateway: %v", err)
+		}
+		if found {
+			for _, c := range conds {
+				cm, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				if cm["type"] == "Programmed" && cm["status"] == "True" {
+					isProgrammed = true
+					break
+				}
+			}
+		}
+		if isProgrammed {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !isProgrammed {
+		t.Fatalf("Gateway reference-gateway failed to reach Programmed=True after config update")
+	}
+
+	// Verify each replica reports the new revision via /_gari/applied
+	podIPsStr := strings.TrimSpace(h.RunCmd("kubectl", "get", "pods", "--namespace=default", "-l", "gateway.networking.k8s.io/gateway-name=reference-gateway", "-o", "jsonpath={.items[*].status.podIP}"))
+	podIPs := strings.Fields(podIPsStr)
+	if len(podIPs) == 0 {
+		t.Fatalf("No data-plane pods found for reference-gateway")
+	}
+
+	for idx, podIP := range podIPs {
+		checkPodName := fmt.Sprintf("check-applied-%d", idx)
+		h.DeletePod(checkPodName)
+		h.KubectlApplyContent(h.ClientManifestWithArgs(checkPodName, fmt.Sprintf("http://%s:%d/_gari/applied", podIP, singlepod.DataPlaneHealthProbePort)))
+		h.WaitForPodSuccess(checkPodName, 1*time.Minute)
+		logs := h.GetPodLogs(checkPodName)
+		if !strings.Contains(logs, newRevision) {
+			t.Errorf("Expected replica %s /_gari/applied to contain revision %s, got: %s", podIP, newRevision, logs)
+		}
+		h.DeletePod(checkPodName)
+	}
 }
 
 func runCmdAllowError(h *Harness, name string, args ...string) string {

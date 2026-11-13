@@ -20,14 +20,20 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -39,11 +45,15 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -83,6 +93,9 @@ const (
 
 	// DataPlaneHealthProbePort is the container port for health probes and metrics.
 	DataPlaneHealthProbePort = state.DataPlaneHealthProbePort
+
+	defaultPollInterval = 2 * time.Second
+	defaultProbeTimeout = 2 * time.Second
 
 	// DefaultACMEChallengeAudience is the token audience expected by certserver for ACME HTTP-01 challenge forwarding.
 	DefaultACMEChallengeAudience = "certserver"
@@ -172,15 +185,26 @@ func WithAPIReader(reader client.Reader) Option {
 	}
 }
 
+// gatewayMirror holds the mirrored data-plane endpoint and revision state for a Gateway.
+type gatewayMirror struct {
+	// readyEndpoints lists the ready and non-terminating endpoint addresses for the Gateway's Service.
+	readyEndpoints []string
+	// appliedRevisions maps each endpoint address to the configuration revisions reported by /_gari/applied.
+	appliedRevisions map[string][]string
+	// lastReady is the readiness state last evaluated or reported for this Gateway.
+	lastReady bool
+}
+
 // AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
 //
-// Readiness approximation: reports ready when the per-Gateway Deployment has at least one ready/available
-// replica and addresses are assigned. Because data-plane pods only pass readiness probes after applying a
-// configuration Secret, ready guarantees a replica has applied a config.
-//
-// Gap: ready means "a replica has applied a config", not necessarily "the current configuration applied". The Secret-based
-// config distribution path has no acknowledgement channel carrying the applied configuration revision back from
-// data-plane replicas to the controller, so the provider cannot verify that the latest config is actively being served.
+// Beyond the Gateway API specification: the Gateway API specification states that Programmed
+// indicates whether the Gateway has been configured by the controller, but leaves open whether
+// Programmed requires every data-plane replica to have applied that configuration. This implementation
+// requires every ready data-plane replica to report the current configuration revision before reporting
+// Programmed=True. This ensures clients do not observe Programmed=True while replicas still serve
+// stale configuration. See tracking issue #1096.
+// A single background prober continuously mirrors each ready endpoint's applied revisions from /_gari/applied,
+// and readiness checks that in-memory mirror.
 type AddressProvider struct {
 	client                        client.Client
 	apiReader                     client.Reader
@@ -199,6 +223,17 @@ type AddressProvider struct {
 	acmeChallengeTokenPath        string
 	acmeChallengeAudience         string
 	acmeChallengeTokenExpiration  int64
+
+	// mirrorMu guards mirrors.
+	mirrorMu sync.Mutex
+	// mirrors maps each Gateway to its mirrored data-plane replica state.
+	mirrors map[types.NamespacedName]*gatewayMirror
+
+	pollInterval time.Duration
+	probeTimeout time.Duration
+	httpClient   *http.Client
+
+	eventCh chan event.GenericEvent
 }
 
 // WithACMEChallengeUpstreamURL configures the upstream certificate server URL for forwarding ACME HTTP-01 challenges.
@@ -298,6 +333,11 @@ func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
 	p := &AddressProvider{
 		client:         c,
 		dataplaneImage: DefaultDataplaneImage,
+		eventCh:        make(chan event.GenericEvent, 50),
+		mirrors:        make(map[types.NamespacedName]*gatewayMirror),
+		pollInterval:   defaultPollInterval,
+		probeTimeout:   defaultProbeTimeout,
+		httpClient:     &http.Client{},
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -932,11 +972,8 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			}, nil
 		}
 
-		return addresses, state.GatewayReadiness{
-			Ready:   true,
-			Reason:  string(gatewayv1.GatewayReasonProgrammed),
-			Message: "Gateway programmed by reference implementation",
-		}, nil
+		gatewayKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+		return addresses, p.gatewayReadiness(gatewayKey), nil
 	}
 
 	var addresses []gatewayv1.GatewayStatusAddress
@@ -1023,11 +1060,8 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}, nil
 	}
 
-	return addresses, state.GatewayReadiness{
-		Ready:   true,
-		Reason:  string(gatewayv1.GatewayReasonProgrammed),
-		Message: "Gateway programmed by reference implementation",
-	}, nil
+	gatewayKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	return addresses, p.gatewayReadiness(gatewayKey), nil
 }
 
 // GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
@@ -1060,6 +1094,10 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 		p.apiReader = mgr.GetAPIReader()
 		scheme = mgr.GetScheme()
 		mapper = mgr.GetRESTMapper()
+
+		if err := mgr.Add(manager.RunnableFunc(p.runProber)); err != nil {
+			return fmt.Errorf("failed to register prober with manager: %w", err)
+		}
 	} else if p.client != nil {
 		scheme = p.client.Scheme()
 		mapper = p.client.RESTMapper()
@@ -1074,15 +1112,29 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 
 	bldr.Watches(&corev1.Service{}, ownerHandler, builder.WithPredicates(pred))
 	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
+	bldr.WatchesRawSource(source.Channel(p.eventCh, &handler.EnqueueRequestForObject{}))
 
 	return nil
 }
 
 // PublishDataplaneConfig writes the Gateway's compiled data-plane config to its per-Gateway Secret.
-func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
-	if p.client == nil || gw == nil || config == nil {
+//
+// The provider reports a Gateway ready only when every ready endpoint reports the revision of
+// the state's current config for that Gateway. While a publish has not yet succeeded, no endpoint
+// can report that revision, so the Gateway stays Pending, and the state's publish retry delivers it.
+func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) (retErr error) {
+	if p.client == nil || gw == nil {
 		return nil
 	}
+	if config == nil {
+		return nil
+	}
+	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	defer func() {
+		if retErr != nil {
+			klog.Errorf("failed to publish dataplane config revision %s for Gateway %s: %v", config.Revision, gwKey, retErr)
+		}
+	}()
 
 	name := ResourceNameForGateway(gw.Name)
 
@@ -1125,7 +1177,298 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 	if err := p.client.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
+
 	return nil
+}
+
+// readyEndpointAddresses extracts unique IP addresses for endpoints that are ready and not terminating.
+func readyEndpointAddresses(slices []discoveryv1.EndpointSlice) []string {
+	var readyEndpoints []string
+	seen := make(map[string]bool)
+	for _, sl := range slices {
+		for _, ep := range sl.Endpoints {
+			isReady := ep.Conditions.Ready == nil || *ep.Conditions.Ready
+			if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+				isReady = false
+			}
+			if !isReady {
+				continue
+			}
+			for _, addr := range ep.Addresses {
+				if addr != "" && !seen[addr] {
+					seen[addr] = true
+					readyEndpoints = append(readyEndpoints, addr)
+				}
+			}
+		}
+	}
+	return readyEndpoints
+}
+
+func pendingReadiness(message string) state.GatewayReadiness {
+	return state.GatewayReadiness{
+		Ready:   false,
+		Reason:  string(gatewayv1.GatewayReasonPending),
+		Message: message,
+	}
+}
+
+func (p *AddressProvider) gatewayReadiness(gatewayKey types.NamespacedName) state.GatewayReadiness {
+	p.mirrorMu.Lock()
+	defer p.mirrorMu.Unlock()
+	readiness := p.evaluateGatewayReadinessLocked(gatewayKey)
+	if mirror := p.mirrors[gatewayKey]; mirror != nil {
+		mirror.lastReady = readiness.Ready
+	}
+	return readiness
+}
+
+func (p *AddressProvider) currentRevisionForGateway(gatewayKey types.NamespacedName) string {
+	if p.state == nil {
+		return ""
+	}
+	config := p.state.GetDataplaneConfig(gatewayKey)
+	if config == nil {
+		return ""
+	}
+	return config.Revision
+}
+
+// Beyond the Gateway API specification: the Gateway API specification states that Programmed
+// indicates whether the Gateway has been configured by the controller, but leaves open whether
+// Programmed requires every data-plane replica to have applied that configuration. This implementation
+// requires every ready data-plane replica to report the current configuration revision before reporting
+// Programmed=True. This ensures clients do not observe Programmed=True while replicas still serve
+// stale configuration. See tracking issue #1096.
+//
+// Caller must hold mirrorMu.
+func (p *AddressProvider) evaluateGatewayReadinessLocked(gatewayKey types.NamespacedName) state.GatewayReadiness {
+	currentRevision := p.currentRevisionForGateway(gatewayKey)
+	if currentRevision == "" {
+		klog.V(2).Infof("Gateway %s readiness is Pending: waiting for data-plane configuration to be published (expected revision is empty)", gatewayKey)
+		return pendingReadiness("Waiting for data-plane configuration to be published")
+	}
+
+	mirror, ok := p.mirrors[gatewayKey]
+	if !ok || len(mirror.readyEndpoints) == 0 {
+		klog.V(2).Infof("Gateway %s readiness is Pending: no ready endpoints found in EndpointSlices (expected revision %s)", gatewayKey, currentRevision)
+		return pendingReadiness("Waiting for data-plane replicas to apply current configuration")
+	}
+
+	for _, address := range mirror.readyEndpoints {
+		if !slices.Contains(mirror.appliedRevisions[address], currentRevision) {
+			endpointSummaries := make([]string, 0, len(mirror.readyEndpoints))
+			for _, a := range mirror.readyEndpoints {
+				endpointSummaries = append(endpointSummaries, fmt.Sprintf("%s=%v", a, mirror.appliedRevisions[a]))
+			}
+			klog.V(2).Infof("Gateway %s readiness is Pending: expected revision %s, endpoints: [%s]",
+				gatewayKey, currentRevision, strings.Join(endpointSummaries, ", "))
+			return pendingReadiness("Waiting for data-plane replicas to apply current configuration")
+		}
+	}
+
+	return state.GatewayReadiness{
+		Ready:   true,
+		Reason:  string(gatewayv1.GatewayReasonProgrammed),
+		Message: "Gateway programmed by reference implementation",
+	}
+}
+
+func (p *AddressProvider) triggerReconcile(ctx context.Context, key types.NamespacedName) {
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: key.Namespace,
+			Name:      key.Name,
+		},
+	}
+	select {
+	case p.eventCh <- event.GenericEvent{Object: gateway}:
+	case <-ctx.Done():
+	}
+}
+
+func (p *AddressProvider) runProber(ctx context.Context) error {
+	ticker := time.NewTicker(p.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			p.probeEndpoints(ctx)
+		}
+	}
+}
+
+type probeTarget struct {
+	gatewayKey types.NamespacedName
+	address    string
+}
+
+type probeResult struct {
+	gatewayKey types.NamespacedName
+	address    string
+	revisions  []string
+	err        error
+}
+
+const maxProbeWorkers = 8
+
+func (p *AddressProvider) probeEndpoints(ctx context.Context) {
+	if p.client == nil {
+		return
+	}
+
+	var serviceList corev1.ServiceList
+	if err := p.client.List(ctx, &serviceList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
+		klog.Warningf("error listing provisioned Services for probing: %v", err)
+		return
+	}
+
+	var targets []probeTarget
+	gatewayEndpoints := make(map[types.NamespacedName][]string)
+	for _, service := range serviceList.Items {
+		gatewayName := service.Labels[LabelGatewayName]
+		if ref := metav1.GetControllerOf(&service); ref != nil && ref.Kind == "Gateway" {
+			gatewayName = ref.Name
+		}
+		if gatewayName == "" {
+			continue
+		}
+		gatewayKey := types.NamespacedName{Namespace: service.Namespace, Name: gatewayName}
+
+		var slicesList discoveryv1.EndpointSliceList
+		if err := p.client.List(ctx, &slicesList, client.InNamespace(service.Namespace), client.MatchingLabels{
+			discoveryv1.LabelServiceName: service.Name,
+		}); err != nil {
+			klog.Warningf("error listing EndpointSlices for Service %s/%s (Gateway %s): %v", service.Namespace, service.Name, gatewayKey, err)
+			continue
+		}
+
+		readyAddresses := readyEndpointAddresses(slicesList.Items)
+		gatewayEndpoints[gatewayKey] = readyAddresses
+		for _, address := range readyAddresses {
+			targets = append(targets, probeTarget{gatewayKey: gatewayKey, address: address})
+		}
+	}
+
+	results := make([]probeResult, len(targets))
+	if len(targets) > 0 {
+		numWorkers := min(maxProbeWorkers, len(targets))
+		var wg sync.WaitGroup
+		jobs := make(chan int, len(targets))
+		for i := 0; i < numWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range jobs {
+					target := targets[idx]
+					targetURL := p.appliedURL(target.address)
+					revisions, err := p.probeEndpoint(ctx, targetURL)
+					results[idx] = probeResult{
+						gatewayKey: target.gatewayKey,
+						address:    target.address,
+						revisions:  revisions,
+						err:        err,
+					}
+				}
+			}()
+		}
+		for i := range targets {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+	}
+
+	resultsByAddress := make(map[string]probeResult, len(results))
+	for _, result := range results {
+		resultsByAddress[result.address] = result
+	}
+
+	changedGateways := make(map[types.NamespacedName]bool)
+
+	p.mirrorMu.Lock()
+	for gatewayKey := range p.mirrors {
+		if _, ok := gatewayEndpoints[gatewayKey]; !ok {
+			delete(p.mirrors, gatewayKey)
+		}
+	}
+
+	for gatewayKey, endpoints := range gatewayEndpoints {
+		mirror, ok := p.mirrors[gatewayKey]
+		if !ok {
+			mirror = &gatewayMirror{
+				appliedRevisions: make(map[string][]string),
+			}
+			p.mirrors[gatewayKey] = mirror
+		}
+		mirror.readyEndpoints = endpoints
+
+		liveAddresses := make(map[string]bool, len(endpoints))
+		for _, address := range endpoints {
+			liveAddresses[address] = true
+		}
+		for address := range mirror.appliedRevisions {
+			if !liveAddresses[address] {
+				delete(mirror.appliedRevisions, address)
+			}
+		}
+
+		for _, address := range endpoints {
+			result := resultsByAddress[address]
+			if result.err != nil {
+				targetURL := p.appliedURL(address)
+				klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, gatewayKey, result.err)
+			} else {
+				mirror.appliedRevisions[address] = result.revisions
+			}
+		}
+
+		readiness := p.evaluateGatewayReadinessLocked(gatewayKey)
+		if mirror.lastReady != readiness.Ready {
+			mirror.lastReady = readiness.Ready
+			changedGateways[gatewayKey] = true
+		}
+	}
+	p.mirrorMu.Unlock()
+
+	for gatewayKey := range changedGateways {
+		p.triggerReconcile(ctx, gatewayKey)
+	}
+}
+
+func (p *AddressProvider) appliedURL(addr string) string {
+	return fmt.Sprintf("http://%s/_gari/applied", net.JoinHostPort(addr, fmt.Sprintf("%d", DataPlaneHealthProbePort)))
+}
+
+func (p *AddressProvider) probeEndpoint(ctx context.Context, targetURL string) ([]string, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, p.probeTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP GET: %w", err)
+	}
+	defer func() {
+		// Closing a response body on an HTTP GET to an in-cluster endpoint only frees
+		// transport buffers; logging at V(4) is sufficient if close fails.
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			klog.V(4).Infof("failed closing applied revision response body: %v", closeErr)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var revisions []string
+	if err := json.NewDecoder(resp.Body).Decode(&revisions); err != nil {
+		return nil, fmt.Errorf("decoding JSON: %w", err)
+	}
+	return revisions, nil
 }
 
 // Begin implements state.DataplanePublisher.
