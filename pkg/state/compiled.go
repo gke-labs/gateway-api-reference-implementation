@@ -1761,6 +1761,8 @@ func isBetterClaim(candidate, best tlsHostnameClaim) bool {
 	candidateIsExact, candidateLen := hostnameSpecificity(candidate.originalHostname)
 	bestIsExact, bestLen := hostnameSpecificity(best.originalHostname)
 
+	// The Gateway API specification requires precedence by hostname specificity,
+	// using the route's original hostnames (TLSRoute.spec.hostnames).
 	// 1. Exact before wildcard
 	if candidateIsExact != bestIsExact {
 		return candidateIsExact
@@ -1771,6 +1773,11 @@ func isBetterClaim(candidate, best tlsHostnameClaim) bool {
 		return candidateLen > bestLen
 	}
 
+	// Beyond the Gateway API specification: the specification does not define
+	// a tie-break when two TLSRoutes claim identical hostnames on one listener,
+	// leaving the case open for TLSRoute. This controller chooses the older route
+	// by creation timestamp, then breaks ties alphabetically by namespace and name,
+	// following the HTTPRoute rule. See tracking issue #1211.
 	// 3. Oldest route by CreationTimestamp
 	if !candidate.creationTimestamp.Equal(&best.creationTimestamp) {
 		return candidate.creationTimestamp.Before(&best.creationTimestamp)
@@ -1798,9 +1805,16 @@ func isTLSRouteCompatible(el *EffectiveListener) bool {
 //
 // Invariant: each effective hostname on a listener has exactly one owning TLSRoute.
 // Precedence order:
-// 1. More specific route hostname first (exact match, then the longer wildcard).
-// 2. Oldest route by CreationTimestamp.
-// 3. Alphabetically by namespace, then name.
+//  1. More specific route hostname first (exact match, then the longer wildcard).
+//     The Gateway API specification requires precedence by hostname specificity,
+//     using the route's original hostnames (TLSRoute.spec.hostnames).
+//  2. Oldest route by CreationTimestamp.
+//  3. Alphabetically by namespace, then name.
+//     Beyond the Gateway API specification: the specification does not define
+//     a tie-break when two TLSRoutes claim identical hostnames on one listener,
+//     leaving the case open for TLSRoute. This controller chooses the older route
+//     by creation timestamp, then breaks ties alphabetically by namespace and name,
+//     following the HTTPRoute rule. See tracking issue #1211.
 //
 // This runs before binding because one route can win one hostname and lose another on the same listener.
 func resolveTLSRouteHostnameClaims(
@@ -1835,6 +1849,8 @@ func resolveTLSRouteHostnameClaims(
 				routeHostnames := IntersectRouteHostnames(hostnames, string(ValueOf(el.Hostname)))
 				for _, rh := range routeHostnames {
 					effectiveHostname := rh.Hostname
+					// The Gateway API specification requires evaluating precedence using the
+					// route's original hostnames (TLSRoute.spec.hostnames).
 					claim := tlsHostnameClaim{
 						routeKey:          routeKey,
 						originalHostname:  rh.OriginalHostname,
@@ -2669,6 +2685,12 @@ func bindTLSRouteParentRef(
 					available = append(available, rh)
 				}
 				if len(available) == 0 && len(routeHostnames) > 0 {
+					// Beyond the Gateway API specification: the specification does not define
+					// what condition a TLSRoute reports when another route holds all matching hostnames
+					// on a parent listener, leaving the condition unspecified for a route that holds
+					// no hostname on a parent. This controller reports Accepted=False with the reason
+					// AnotherRouteHoldsHostname so that operators can diagnose why the route did not bind.
+					// See tracking issue #1211.
 					cond := NewCondition(
 						string(gatewayv1.RouteConditionAccepted),
 						metav1.ConditionFalse,
