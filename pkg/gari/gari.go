@@ -240,6 +240,10 @@ type Options struct {
 	// Defaults to 0 (disabled).
 	ReadTimeout time.Duration
 
+	// BodyReadTimeout is the maximum duration allowed between read progress while reading a request body.
+	// Defaults to 5m (proxy.DefaultBodyReadTimeout).
+	BodyReadTimeout time.Duration
+
 	// WriteTimeout is the maximum duration before timing out writes of the response.
 	// Defaults to 0 (disabled).
 	WriteTimeout time.Duration
@@ -313,6 +317,7 @@ func DefaultOptions() Options {
 		LeaderElectionID:       "gateway-api-reference-implementation",
 		UDPIdleTimeout:         proxy.DefaultUDPIdleTimeout,
 		UDPMaxSessions:         proxy.DefaultUDPMaxSessions,
+		BodyReadTimeout:        proxy.DefaultBodyReadTimeout,
 		ReadHeaderTimeout:      10 * time.Second,
 		IdleTimeout:            60 * time.Second,
 		TCPIdleTimeout:         proxy.DefaultTCPIdleTimeout,
@@ -497,6 +502,7 @@ func New(opts Options) (*Server, error) {
 	if opts.TCPMaxConnections > 0 {
 		p.SetTCPMaxConnections(opts.TCPMaxConnections)
 	}
+	p.SetBodyReadTimeout(opts.BodyReadTimeout)
 	if opts.ForwardedForMode != "" {
 		p.SetForwardedForMode(opts.ForwardedForMode)
 	}

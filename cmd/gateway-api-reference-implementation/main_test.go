@@ -177,6 +177,7 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "acme-challenge-token-path", DefValue: "", Usage: "Path to the projected service-account token file for data-plane identity."},
 		{Name: "acme-challenge-upstream-url", DefValue: "", Usage: "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to."},
 		{Name: "allowed-source-cidrs", DefValue: "", Usage: "Comma-separated list of CIDRs permitted to connect to HTTP/HTTPS listeners."},
+		{Name: "body-read-timeout", DefValue: "5m0s", Usage: "The maximum duration allowed between read progress while reading a request body; the proxy responds 408 Request Timeout and closes the connection (0 disables)."},
 		{Name: "certserver-address", DefValue: "", Usage: "Address of the certserver gRPC service"},
 		{Name: "certserver-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify certserver TLS"},
 		{Name: "certserver-token-path", DefValue: "", Usage: "Path to the projected service-account token file for controller identity"},

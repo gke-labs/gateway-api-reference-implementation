@@ -38,6 +38,7 @@ When HTTP/3 is enabled, HTTPS (TCP) responses automatically include an `Alt-Svc:
 - **Slow and Idle Client Bounds**:
   - `ReadHeaderTimeout` (default: 10s, configurable via `--read-header-timeout`): Bounds the time allowed to read HTTP request headers and bounds TLS handshakes. Protects against slowloris attacks and stalled TLS handshakes.
   - `IdleTimeout` (default: 60s, configurable via `--idle-timeout`): Maximum amount of time to wait for the next request when keep-alives are enabled. Also sets QUIC `MaxIdleTimeout` for HTTP/3 when not explicitly specified in `HTTP3QUICConfig`.
+  - `BodyReadTimeout` (default: 5m, configurable via `--body-read-timeout`): Maximum duration allowed between read progress while reading a request body. Refreshes on progress via `http.ResponseController.SetReadDeadline`, so active uploads proceed indefinitely while the proxy responds `408 Request Timeout` and closes the connection for stalled clients (0 disables).
   - `ReadTimeout` / `WriteTimeout` (default: 0 / disabled, configurable via `--read-timeout` / `--write-timeout`): Unset by default to preserve long-lived streams and slow-progressing response bodies.
 - **Forwarded Headers and Trust Policy**:
   Outbound requests across all HTTP forwarding paths (standard forwarding, WebSocket upgrades, and request mirrors) are stamped with consistent forwarded headers:
@@ -109,6 +110,7 @@ See [docs/singlepod-parameters.md](docs/singlepod-parameters.md) for details and
 | `--health-probe-bind-address` | `:8999` | Address the health probe endpoint binds to (if configured to the same port as `--metrics-bind-address`, probes and metrics share a single listener). |
 | `--read-header-timeout` | `10s` | Maximum duration allowed to read request headers and complete TLS handshakes on HTTP and HTTPS servers. |
 | `--idle-timeout` | `60s` | Maximum duration to wait for the next request on keep-alive connections (and QUIC `MaxIdleTimeout` for HTTP/3). |
+| `--body-read-timeout` | `5m0s` | Maximum duration allowed between read progress while reading a request body; the proxy responds 408 Request Timeout and closes the connection (0 disables). |
 | `--read-timeout` | `0s` (disabled) | Maximum duration for reading the entire request, including body. |
 | `--write-timeout` | `0s` (disabled) | Maximum duration before timing out response writes. |
 | `--tcp-max-connections` | `10000` | Maximum number of concurrent TCP connections per listener. |

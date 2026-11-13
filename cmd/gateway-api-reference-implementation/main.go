@@ -72,6 +72,7 @@ func BindFlags(fs *flag.FlagSet, opts *gari.Options, cfg *Config) {
 	fs.DurationVar(&opts.ReadHeaderTimeout, "read-header-timeout", opts.ReadHeaderTimeout, "The amount of time allowed to read request headers on HTTP and HTTPS servers.")
 	fs.DurationVar(&opts.IdleTimeout, "idle-timeout", opts.IdleTimeout, "The maximum amount of time to wait for the next request when keep-alives are enabled.")
 	fs.DurationVar(&opts.ReadTimeout, "read-timeout", opts.ReadTimeout, "The maximum duration for reading the entire request, including the body (disabled by default).")
+	fs.DurationVar(&opts.BodyReadTimeout, "body-read-timeout", opts.BodyReadTimeout, "The maximum duration allowed between read progress while reading a request body; the proxy responds 408 Request Timeout and closes the connection (0 disables).")
 	fs.DurationVar(&opts.WriteTimeout, "write-timeout", opts.WriteTimeout, "The maximum duration before timing out writes of the response (disabled by default).")
 	fs.DurationVar(&opts.TCPIdleTimeout, "tcp-idle-timeout", opts.TCPIdleTimeout, "The idle timeout for TCP connections on spliced listeners (disabled by default).")
 	fs.IntVar(&opts.TCPMaxConnections, "tcp-max-connections", opts.TCPMaxConnections, "The maximum number of concurrent TCP connections per listener.")
