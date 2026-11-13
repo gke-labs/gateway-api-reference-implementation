@@ -141,7 +141,7 @@ Instead of provisioning client certificates and private keys, you can authentica
 
 #### 1. Configure `snigateway-frontend`
 
-Run `snigateway-frontend` with `--jwt-issuer` and `--client-subject`:
+Run `snigateway-frontend` with `--jwt-issuer` and `--client-subject` (only one `--jwt-issuer` is supported):
 
 ##### GKE Clusters (Public OIDC Discovery)
 On GKE, the cluster issuer serves `/.well-known/openid-configuration` and JWKS publicly:
@@ -170,7 +170,7 @@ snigateway-frontend \
   --client-subject "system:serviceaccount:prod:*=*.prod.example.com"
 ```
 
-> **Note**: In `--client-subject`, `<ns>:*` can be used to authorize any ServiceAccount in that namespace.
+> **Note**: `snigateway-frontend` supports only one `--jwt-issuer`. In `--client-subject`, `<ns>:*` can be used to authorize any ServiceAccount in that namespace.
 
 #### 2. Pod Spec with Projected ServiceAccount Token
 
