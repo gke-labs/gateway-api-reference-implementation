@@ -918,6 +918,7 @@ type WALIterator struct {
 	currSegIdx  int
 	currFile    File
 	currOffset  int64
+	currSegSize int64 // Cached size of currFile; a segment's size doesn't change while recovery reads it.
 	startLSN    uint64
 	expectedLSN uint64
 	done        bool
@@ -989,6 +990,7 @@ func (it *WALIterator) nextSegment() error {
 			return err
 		}
 		it.currFile = nil
+		it.currSegSize = 0
 	}
 
 	it.currSegIdx++
@@ -1042,8 +1044,16 @@ func (it *WALIterator) nextSegment() error {
 		return io.EOF
 	}
 
+	size, sizeErr := file.Size()
+	if sizeErr != nil {
+		closeErr := file.Close()
+		it.done = true
+		return errors.Join(fmt.Errorf("read error getting segment size in %s: %w", seg.name, sizeErr), closeErr)
+	}
+
 	it.currFile = file
 	it.currOffset = int64(SegmentHeaderSize)
+	it.currSegSize = size
 	return nil
 }
 
@@ -1083,8 +1093,7 @@ func (it *WALIterator) Next() (Record, error) {
 		if n > 0 && hdr[0] == 0 {
 			// Skip zero padding to next 4 KiB block boundary within this segment
 			nextBlock := ((it.currOffset / WALBlockSize) + 1) * WALBlockSize
-			size, sizeErr := it.currFile.Size()
-			if sizeErr == nil && nextBlock < size {
+			if nextBlock < it.currSegSize {
 				it.currOffset = nextBlock
 				continue
 			}
@@ -1118,12 +1127,7 @@ func (it *WALIterator) Next() (Record, error) {
 
 		totalRecordLen := RecordHeaderSize + int(keyLen) + int(payloadLen)
 
-		size, sizeErr := it.currFile.Size()
-		if sizeErr != nil {
-			it.done = true
-			return Record{}, fmt.Errorf("read error getting segment size at offset %d: %w", it.currOffset, sizeErr)
-		}
-		if int64(totalRecordLen) > size-it.currOffset {
+		if int64(totalRecordLen) > it.currSegSize-it.currOffset {
 			it.done = true
 			if !it.isLastSegment() {
 				// Not the last segment, so this is corruption; see WALIterator.
@@ -1220,6 +1224,7 @@ func (it *WALIterator) Close() error {
 	if it.currFile != nil {
 		err := it.currFile.Close()
 		it.currFile = nil
+		it.currSegSize = 0
 		return err
 	}
 	return nil
