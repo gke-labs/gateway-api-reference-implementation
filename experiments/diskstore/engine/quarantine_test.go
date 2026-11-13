@@ -15,6 +15,8 @@
 package engine
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -429,5 +431,147 @@ func TestEngine_WithQuarantineDefaults(t *testing.T) {
 	expectedWALDir4 := filepath.Join("d4", "wal", "lost+found")
 	if store4.wal.quarantine.Dir != expectedWALDir4 {
 		t.Errorf("expected WAL quarantine Dir %s, got %s", expectedWALDir4, store4.wal.quarantine.Dir)
+	}
+}
+
+func TestQuarantineFiles_EmptyList(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_empty_quarantine"
+	if err := memFS.MkdirAll(dir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	err := quarantineFiles(memFS, dir, nil, QuarantineOptions{})
+	if err != nil {
+		t.Fatalf("quarantineFiles with empty list failed: %v", err)
+	}
+
+	lostDir := filepath.Join(dir, "lost+found")
+	// Creating a file in lostDir must fail because lostDir was not created
+	if _, err := memFS.OpenFile(filepath.Join(lostDir, "probe"), os.O_CREATE|os.O_WRONLY, StoreFileMode); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected lost+found directory not to be created, but OpenFile returned err: %v", err)
+	}
+	if c := memFS.DirSyncCount(dir); c != 0 {
+		t.Fatalf("expected 0 dir syncs, got %d", c)
+	}
+}
+
+func TestQuarantineFiles_MovesFilesAndSyncsBothDirs(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_quarantine_moves"
+	if err := memFS.MkdirAll(dir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	for _, name := range []string{"file1.bin", "file2.bin"} {
+		f, err := memFS.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		_ = f.Close()
+	}
+
+	err := quarantineFiles(memFS, dir, []string{"file1.bin", "file2.bin"}, QuarantineOptions{})
+	if err != nil {
+		t.Fatalf("quarantineFiles failed: %v", err)
+	}
+
+	// Verify original files no longer exist in dir
+	for _, name := range []string{"file1.bin", "file2.bin"} {
+		if _, err := memFS.Open(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected %s to be moved out of %s", name, dir)
+		}
+	}
+
+	lostDir := filepath.Join(dir, "lost+found")
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir lost+found failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 files in lost+found, got %d", len(entries))
+	}
+
+	// Verify both directories were synced
+	if c := memFS.DirSyncCount(lostDir); c < 1 {
+		t.Fatalf("expected lost+found to be synced, got count %d", c)
+	}
+	if c := memFS.DirSyncCount(dir); c < 1 {
+		t.Fatalf("expected parent dir to be synced, got count %d", c)
+	}
+}
+
+func TestQuarantineFiles_RenameError_ReturnsFirstErrorAndDeletesNothing(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_quarantine_err"
+	if err := memFS.MkdirAll(dir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	fileName := "orphan.dat"
+	filePath := filepath.Join(dir, fileName)
+	f, err := memFS.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, StoreFileMode)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	_ = f.Close()
+
+	injectedErr := errors.New("simulated rename failure")
+	hookFS := &oversizeHookFS{
+		FS: memFS,
+		renameErr: func(oldpath, newpath string) error {
+			return injectedErr
+		},
+	}
+
+	err = quarantineFiles(hookFS, dir, []string{fileName}, QuarantineOptions{})
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected injected error %v, got %v", injectedErr, err)
+	}
+
+	// File must still exist at original path (never deleted)
+	f, err = memFS.Open(filePath)
+	if err != nil {
+		t.Fatalf("expected file %s to still exist after rename failure: %v", filePath, err)
+	}
+	_ = f.Close()
+}
+
+func TestQuarantineFiles_PruningAndBoundsApplied(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_quarantine_prune"
+	if err := memFS.MkdirAll(dir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	var names []string
+	for i := 1; i <= 3; i++ {
+		name := fmt.Sprintf("file%d.bin", i)
+		names = append(names, name)
+		f, err := memFS.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		_ = f.Close()
+	}
+
+	err := quarantineFiles(memFS, dir, names, QuarantineOptions{
+		MaxQuarantinedFiles:     2,
+		MinQuarantinedRetention: -1,
+	})
+	if err != nil {
+		t.Fatalf("quarantineFiles failed: %v", err)
+	}
+
+	lostDir := filepath.Join(dir, "lost+found")
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir lost+found failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected exactly 2 files in lost+found after pruning, got %d", len(entries))
 	}
 }

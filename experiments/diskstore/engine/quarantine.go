@@ -164,3 +164,59 @@ func pruneLostFound(storeFS FS, opts QuarantineOptions) error {
 	}
 	return nil
 }
+
+// quarantineFiles moves a list of files from dir into that directory's lost+found
+// under the given QuarantineOptions.
+//
+// The engine moves a file that it cannot account for to quarantine and never deletes it,
+// preserving unreferenced or abandoned data for offline recovery, inspection, and forensic
+// reconstruction without risking permanent data loss.
+//
+// It creates lost+found once when moving files, renames each file to a unique quarantine path,
+// prunes lost+found, and fsyncs both directories when it moved anything.
+// It returns the first error encountered and deletes nothing on that path.
+func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOptions) error {
+	lostDir := filepath.Join(dir, "lost+found")
+	opts.Dir = lostDir
+
+	var moved int
+	if len(files) > 0 {
+		if err := storeFS.MkdirAll(lostDir, StoreDirMode); err != nil {
+			return fmt.Errorf("failed to create quarantine directory %s: %w", lostDir, err)
+		}
+		for _, file := range files {
+			name := filepath.Base(file)
+			if name == "." || name == "" {
+				continue
+			}
+			src := filepath.Join(dir, name)
+			dest := uniqueQuarantinePath(lostDir, name)
+			if err := storeFS.Rename(src, dest); err != nil {
+				return fmt.Errorf("failed to quarantine %s to %s: %w", src, dest, err)
+			}
+			slog.Warn("diskstore: moved file to quarantine", "from", src, "to", dest)
+			moved++
+		}
+	}
+
+	if err := pruneLostFound(storeFS, opts); err != nil {
+		return fmt.Errorf("failed to prune quarantine directory %s: %w", lostDir, err)
+	}
+
+	if moved > 0 {
+		// A rename across directories changes two directory entries.
+		// Syncing lost+found makes the new entry durable so a crash cannot leave the file
+		// in neither directory and lose offline recovery data.
+		if err := storeFS.SyncDir(lostDir); err != nil {
+			return fmt.Errorf("failed to sync quarantine directory %s: %w", lostDir, err)
+		}
+		// Syncing the parent directory makes the removal durable so the quarantined
+		// file cannot reappear after a subsequent crash.
+		if err := storeFS.SyncDir(dir); err != nil {
+			return fmt.Errorf("failed to sync directory %s after quarantine: %w", dir, err)
+		}
+		slog.Debug("diskstore: quarantined files", "dir", dir, "count", moved)
+	}
+
+	return nil
+}

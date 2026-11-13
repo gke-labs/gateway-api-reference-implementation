@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -730,48 +729,16 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 			}
 		}
 
-		lostDir := filepath.Join(oversizeDir, "lost+found")
-		quarantineOptions := options.Quarantine
-		quarantineOptions.Dir = lostDir
-
-		var createdLostDir bool
-		var quarantinedCount int
+		var unreferenced []string
 		for _, entry := range oversizeEntries {
 			if entry.IsDir() || referenced[entry.Name()] {
 				continue
 			}
-			if !createdLostDir {
-				if err := fs.MkdirAll(lostDir, StoreDirMode); err != nil {
-					return nil, fmt.Errorf("failed to create oversize lost+found dir: %w", err)
-				}
-				createdLostDir = true
-			}
-			filePath := filepath.Join(oversizeDir, entry.Name())
-			dest := uniqueQuarantinePath(lostDir, entry.Name())
-			if err := fs.Rename(filePath, dest); err != nil {
-				return nil, fmt.Errorf("failed to quarantine unreferenced oversize file %s to %s: %w", filePath, dest, err)
-			}
-			slog.Warn("diskstore: quarantined unreferenced oversize file", "from", filePath, "to", dest)
-			quarantinedCount++
+			unreferenced = append(unreferenced, entry.Name())
 		}
 
-		if err := pruneLostFound(fs, quarantineOptions); err != nil {
-			return nil, fmt.Errorf("failed to prune oversize lost+found dir: %w", err)
-		}
-
-		if quarantinedCount > 0 {
-			// A rename across directories changes two directory entries.
-			// Syncing lost+found makes the new entry durable so a crash cannot leave the file
-			// in neither directory and lose offline recovery data.
-			if err := fs.SyncDir(lostDir); err != nil {
-				return nil, fmt.Errorf("failed to fsync oversize lost+found directory after recovery: %w", err)
-			}
-			// Syncing the oversize directory makes the move durable so the unreferenced
-			// file cannot reappear in oversize/ after a subsequent crash.
-			if err := fs.SyncDir(oversizeDir); err != nil {
-				return nil, fmt.Errorf("failed to fsync oversize directory after recovery: %w", err)
-			}
-			slog.Debug("diskstore: quarantined unreferenced oversize files during recovery", "count", quarantinedCount)
+		if err := quarantineFiles(fs, oversizeDir, unreferenced, options.Quarantine); err != nil {
+			return nil, fmt.Errorf("failed to quarantine unreferenced oversize files: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("failed to read oversize directory during recovery: %w", err)
