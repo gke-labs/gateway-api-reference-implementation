@@ -43,6 +43,23 @@ as this:
 
 > ...preserving point-in-time consistency via `writerMu.RLock()` offers a balance of architectural simplicity, zero steady-state memory overhead, and data integrity...
 
+## Behaviour beyond the Gateway API specification
+
+Some behaviour in this project goes beyond the Gateway API specification. For example, the code may decide a case that the specification leaves open, or report a status condition that the specification does not request. Readers cannot distinguish those choices from required behaviour without comments, so they find the code hard to revisit when the specification changes.
+
+- Where code does more than the Gateway API specification requires, or decides a case that the specification leaves open, mark it with a comment that starts with `Beyond the Gateway API specification:`.
+- The comment says what the specification says or leaves unsaid, what this implementation does, and why.
+- Where a tracking issue exists for the gap, the comment names it.
+
+For example:
+
+```go
+// Beyond the Gateway API specification: the specification does not define
+// a tie-break when two TLSRoutes claim identical hostnames on one listener.
+// This controller chooses the older route by creation timestamp, following
+// the HTTPRoute rule. See tracking issue #1211.
+```
+
 ## Naming
 
 **Don't abbreviate identifiers.** Write `header`, not `hdr`, and `buffer`, not `buf`. An abbreviation saves the writer a few keystrokes and costs every reader a lookup. When naming an error from a specific operation, spell out the operation. For example, an error from `Remove` is `removeErr`, not `rErr`.
