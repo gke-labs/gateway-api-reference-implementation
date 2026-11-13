@@ -21,11 +21,15 @@ import (
 	"flag"
 	"fmt"
 	"maps"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +37,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -46,11 +51,14 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -4512,5 +4520,314 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 	}
 	if errs := validation.IsDNS1035Label(svc.Name); len(errs) > 0 {
 		t.Errorf("Service name %q is not a valid DNS-1035 label: %v", svc.Name, errs)
+	}
+}
+
+func TestSinglePodAddressProvider_AppliedRevisionMirror(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	if err := discoveryv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+			UID:       types.UID("test-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+		},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "test-gw"}
+	serviceName := ResourceNameForGateway("test-gw")
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: "default",
+			Labels: map[string]string{
+				LabelManagedBy:   ManagedByValue,
+				LabelGatewayName: "test-gw",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: gatewayv1.GroupVersion.String(),
+					Kind:       "Gateway",
+					Name:       gw.Name,
+					UID:        gw.UID,
+					Controller: state.Ptr(true),
+				},
+			},
+		},
+	}
+
+	endpointSlice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName + "-slice",
+			Namespace: "default",
+			Labels: map[string]string{
+				discoveryv1.LabelServiceName: serviceName,
+			},
+		},
+		Endpoints: []discoveryv1.Endpoint{
+			{
+				Addresses: []string{"10.0.0.1"},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: state.Ptr(true),
+				},
+			},
+			{
+				Addresses: []string{"10.0.0.2"},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: state.Ptr(true),
+				},
+			},
+		},
+	}
+
+	var p *AddressProvider
+
+	// Verify no lock is held across API calls.
+	var apiLockHeld atomic.Bool
+	interceptorFuncs := interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if p != nil && !p.mirrorMu.TryLock() {
+				apiLockHeld.Store(true)
+			} else if p != nil {
+				p.mirrorMu.Unlock()
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw, svc, endpointSlice).
+		WithInterceptorFuncs(interceptorFuncs).
+		Build()
+
+	var mu sync.Mutex
+	endpointResponses := map[string][]string{
+		"10.0.0.1": {"rev-1"},
+		"10.0.0.2": {"rev-1"},
+	}
+	failingEndpoints := map[string]bool{}
+	var httpLockHeld atomic.Bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if p != nil && !p.mirrorMu.TryLock() {
+			httpLockHeld.Store(true)
+		} else if p != nil {
+			p.mirrorMu.Unlock()
+		}
+
+		if r.URL.Path != "/_gari/applied" {
+			http.NotFound(w, r)
+			return
+		}
+		host, _, splitErr := net.SplitHostPort(r.Host)
+		if splitErr != nil {
+			host = r.Host
+		}
+
+		mu.Lock()
+		shouldFail := failingEndpoints[host]
+		revs, exists := endpointResponses[host]
+		mu.Unlock()
+
+		if shouldFail {
+			http.Error(w, "simulated error", http.StatusInternalServerError)
+			return
+		}
+		if !exists {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(revs)
+	}))
+	defer server.Close()
+
+	p = NewAddressProvider(cl)
+	p.probeTimeout = 1 * time.Second
+	p.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+			},
+		},
+	}
+
+	ctx := t.Context()
+
+	// 1. Initial probe: mirror records what each endpoint reports.
+	p.probeEndpoints(ctx)
+
+	if apiLockHeld.Load() {
+		t.Fatal("mirrorMu was held during Kubernetes API calls")
+	}
+	if httpLockHeld.Load() {
+		t.Fatal("mirrorMu was held during HTTP probes")
+	}
+
+	p.mirrorMu.Lock()
+	mirror, ok := p.mirrors[gwKey]
+	p.mirrorMu.Unlock()
+	if !ok || mirror == nil {
+		t.Fatalf("expected mirror for Gateway %s", gwKey)
+	}
+	if !slices.Equal(mirror.readyEndpoints, []string{"10.0.0.1", "10.0.0.2"}) {
+		t.Fatalf("expected readyEndpoints [10.0.0.1 10.0.0.2], got %v", mirror.readyEndpoints)
+	}
+	if !slices.Equal(mirror.appliedRevisions["10.0.0.1"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1] for 10.0.0.1, got %v", mirror.appliedRevisions["10.0.0.1"])
+	}
+	if !slices.Equal(mirror.appliedRevisions["10.0.0.2"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1] for 10.0.0.2, got %v", mirror.appliedRevisions["10.0.0.2"])
+	}
+
+	// 2. Follows a change: endpoint 10.0.0.1 reports a new revision.
+	mu.Lock()
+	endpointResponses["10.0.0.1"] = []string{"rev-1", "rev-2"}
+	mu.Unlock()
+
+	p.probeEndpoints(ctx)
+
+	p.mirrorMu.Lock()
+	mirror = p.mirrors[gwKey]
+	p.mirrorMu.Unlock()
+	if !slices.Equal(mirror.appliedRevisions["10.0.0.1"], []string{"rev-1", "rev-2"}) {
+		t.Fatalf("expected updated revisions [rev-1 rev-2] for 10.0.0.1, got %v", mirror.appliedRevisions["10.0.0.1"])
+	}
+	if !slices.Equal(mirror.appliedRevisions["10.0.0.2"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1] for 10.0.0.2, got %v", mirror.appliedRevisions["10.0.0.2"])
+	}
+
+	// 3. A failed probe keeps the endpoint's previous revisions.
+	mu.Lock()
+	failingEndpoints["10.0.0.1"] = true
+	mu.Unlock()
+
+	p.probeEndpoints(ctx)
+
+	p.mirrorMu.Lock()
+	mirror = p.mirrors[gwKey]
+	p.mirrorMu.Unlock()
+	if !slices.Equal(mirror.appliedRevisions["10.0.0.1"], []string{"rev-1", "rev-2"}) {
+		t.Fatalf("expected failed probe to keep previous revisions [rev-1 rev-2], got %v", mirror.appliedRevisions["10.0.0.1"])
+	}
+
+	mu.Lock()
+	failingEndpoints["10.0.0.1"] = false
+	mu.Unlock()
+
+	// 4. Drops an endpoint that disappears: 10.0.0.1 is removed from EndpointSlice.
+	endpointSlice.Endpoints = []discoveryv1.Endpoint{
+		{
+			Addresses: []string{"10.0.0.2"},
+			Conditions: discoveryv1.EndpointConditions{
+				Ready: state.Ptr(true),
+			},
+		},
+	}
+	if err := cl.Update(ctx, endpointSlice); err != nil {
+		t.Fatalf("failed to update EndpointSlice: %v", err)
+	}
+
+	p.probeEndpoints(ctx)
+
+	p.mirrorMu.Lock()
+	mirror = p.mirrors[gwKey]
+	p.mirrorMu.Unlock()
+	if !slices.Equal(mirror.readyEndpoints, []string{"10.0.0.2"}) {
+		t.Fatalf("expected readyEndpoints [10.0.0.2], got %v", mirror.readyEndpoints)
+	}
+	if _, exists := mirror.appliedRevisions["10.0.0.1"]; exists {
+		t.Fatalf("expected endpoint 10.0.0.1 to be dropped from mirror, but it was present")
+	}
+	if !slices.Equal(mirror.appliedRevisions["10.0.0.2"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1] for 10.0.0.2, got %v", mirror.appliedRevisions["10.0.0.2"])
+	}
+
+	// 5. Service deletion removes the Gateway from the mirror.
+	if err := cl.Delete(ctx, svc); err != nil {
+		t.Fatalf("failed to delete Service: %v", err)
+	}
+
+	p.probeEndpoints(ctx)
+
+	p.mirrorMu.Lock()
+	_, exists := p.mirrors[gwKey]
+	p.mirrorMu.Unlock()
+	if exists {
+		t.Fatalf("expected Gateway %s to be dropped from mirror after Service deleted", gwKey)
+	}
+}
+
+func TestSinglePodAddressProvider_ProberLifecycle(t *testing.T) {
+	cl := fake.NewClientBuilder().Build()
+	p := NewAddressProvider(cl)
+	p.pollInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- p.runProber(ctx)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("unexpected error from runProber: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for runProber to exit on context cancellation")
+	}
+}
+
+type fakeManager struct {
+	ctrl.Manager
+	scheme        *runtime.Scheme
+	mapper        meta.RESTMapper
+	addedRunnable manager.Runnable
+}
+
+func (m *fakeManager) Add(r manager.Runnable) error {
+	m.addedRunnable = r
+	return nil
+}
+
+func (m *fakeManager) GetClient() client.Client       { return nil }
+func (m *fakeManager) GetAPIReader() client.Reader    { return nil }
+func (m *fakeManager) GetScheme() *runtime.Scheme     { return m.scheme }
+func (m *fakeManager) GetRESTMapper() meta.RESTMapper { return m.mapper }
+
+func TestSinglePodAddressProvider_SetupWatches_RegistersProber(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+	groupVersion := schema.GroupVersion{Group: "gateway.networking.k8s.io", Version: "v1"}
+	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{groupVersion})
+	mapper.Add(groupVersion.WithKind("Gateway"), meta.RESTScopeRoot)
+
+	p := NewAddressProvider(nil)
+	mgr := &fakeManager{scheme: scheme, mapper: mapper}
+	bldr := &builder.Builder{}
+	if err := p.SetupWatches(mgr, bldr); err != nil {
+		t.Fatalf("SetupWatches failed: %v", err)
+	}
+	if mgr.addedRunnable == nil {
+		t.Fatal("expected prober Runnable to be registered with manager")
 	}
 }
