@@ -20,9 +20,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -92,9 +94,22 @@ const (
 	// DataPlaneHealthProbePort is the container port for health probes and metrics.
 	DataPlaneHealthProbePort = state.DataPlaneHealthProbePort
 
+	// defaultPollInterval is the interval between background applied revision probing cycles. Two seconds balances
+	// prompt detection of data-plane configuration convergence with low background CPU and network load.
 	defaultPollInterval = 2 * time.Second
+
+	// defaultProbeTimeout is the maximum duration for an individual applied revision HTTP probe. Two seconds allows
+	// healthy local pods sufficient time to respond under load while bounding how long unresponsive endpoints consume worker concurrency.
 	defaultProbeTimeout = 2 * time.Second
-	maxProbeWorkers     = 8
+
+	// maxProbeWorkers bounds the number of concurrent applied revision HTTP probes. Eight workers parallelize probing
+	// across multiple replicas while limiting open sockets and goroutines.
+	maxProbeWorkers = 8
+
+	// maxProbeResponseBytes bounds the response body size for /_gari/applied. The endpoint returns a JSON array
+	// of revision strings, which is typically under 1 KiB; 64 KiB allows thousands of active revisions while
+	// preventing unbounded memory consumption from misbehaving endpoints.
+	maxProbeResponseBytes = 64 * 1024
 
 	// DefaultACMEChallengeAudience is the token audience expected by certserver for ACME HTTP-01 challenge forwarding.
 	DefaultACMEChallengeAudience = "certserver"
@@ -202,6 +217,7 @@ type gatewayMirror struct {
 // config distribution path has no acknowledgement channel carrying the applied configuration revision back from
 // data-plane replicas to the controller, so the provider cannot verify that the latest config is actively being served.
 // A background prober continuously mirrors each ready endpoint's applied revisions from /_gari/applied.
+// The provider's reported readiness does not read the mirror yet.
 type AddressProvider struct {
 	client                        client.Client
 	apiReader                     client.Reader
@@ -224,10 +240,14 @@ type AddressProvider struct {
 	// mirrorMu guards mirrors.
 	mirrorMu sync.Mutex
 	// mirrors maps each Gateway key to its mirrored data-plane endpoint and revision state.
-	mirrors      map[types.NamespacedName]*gatewayMirror
+	mirrors map[types.NamespacedName]*gatewayMirror
+
+	// pollInterval is the interval between background applied revision probing cycles.
 	pollInterval time.Duration
+	// probeTimeout is the timeout applied to each individual HTTP probe request.
 	probeTimeout time.Duration
-	httpClient   *http.Client
+	// httpClient performs HTTP GET requests against data-plane applied revision endpoints.
+	httpClient *http.Client
 }
 
 // WithACMEChallengeUpstreamURL configures the upstream certificate server URL for forwarding ACME HTTP-01 challenges.
@@ -1166,6 +1186,7 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 	return nil
 }
 
+// runProber runs the background probing loop, periodically polling ready data-plane endpoints until ctx ends.
 func (p *AddressProvider) runProber(ctx context.Context) error {
 	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
@@ -1179,17 +1200,20 @@ func (p *AddressProvider) runProber(ctx context.Context) error {
 	}
 }
 
+// probeTarget identifies a specific data-plane endpoint to probe for a Gateway.
 type probeTarget struct {
 	gatewayKey types.NamespacedName
 	address    string
 }
 
+// probeResult holds the outcome of probing an individual data-plane endpoint.
 type probeResult struct {
 	target    probeTarget
 	revisions []string
 	err       error
 }
 
+// probeEndpoints discovers ready endpoints for managed Gateways, probes their applied revisions, and updates the in-memory mirror.
 func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 	if p.client == nil {
 		return
@@ -1203,6 +1227,7 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 
 	var targets []probeTarget
 	gatewayEndpoints := make(map[types.NamespacedName][]string)
+	failedGateways := make(map[types.NamespacedName]bool)
 	for _, service := range serviceList.Items {
 		gatewayName := service.Labels[LabelGatewayName]
 		if ref := metav1.GetControllerOf(&service); ref != nil && ref.Kind == "Gateway" {
@@ -1218,6 +1243,7 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 			discoveryv1.LabelServiceName: service.Name,
 		}); err != nil {
 			klog.Warningf("error listing EndpointSlices for Service %s/%s (Gateway %s): %v", service.Namespace, service.Name, gatewayKey, err)
+			failedGateways[gatewayKey] = true
 			continue
 		}
 
@@ -1239,17 +1265,14 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 			return nil
 		})
 	}
-	if err := group.Wait(); err != nil {
-		klog.V(4).Infof("unexpected error waiting for probe workers: %v", err)
-	}
-
-	resultsByTarget := make(map[probeTarget]probeResult, len(results))
-	for _, result := range results {
-		resultsByTarget[result.target] = result
-	}
+	// group.Wait cannot return an error because every worker function returns nil.
+	_ = group.Wait()
 
 	p.mirrorMu.Lock()
 	for gatewayKey := range p.mirrors {
+		if failedGateways[gatewayKey] {
+			continue
+		}
 		if _, ok := gatewayEndpoints[gatewayKey]; !ok {
 			delete(p.mirrors, gatewayKey)
 		}
@@ -1272,30 +1295,34 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 				delete(mirror.appliedRevisions, address)
 			}
 		}
+	}
 
-		for _, address := range endpoints {
-			target := probeTarget{gatewayKey: gatewayKey, address: address}
-			result := resultsByTarget[target]
-			if result.err != nil {
-				targetURL := p.appliedURL(address)
-				klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, gatewayKey, result.err)
-				// A failed probe keeps the endpoint's previous revisions rather than clearing them.
-				// Data-plane pods may experience transient probe timeouts or connection resets during
-				// reconfiguration or heavy network traffic. The provider can continue after a failed probe
-				// because endpoints leave the mirror only when Kubernetes removes them from EndpointSlices.
-				// Retaining the previous revisions prevents transient probe errors from flapping the mirror.
-			} else {
-				mirror.appliedRevisions[address] = result.revisions
-			}
+	for _, result := range results {
+		if result.err != nil {
+			targetURL := p.appliedURL(result.target.address)
+			klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, result.target.gatewayKey, result.err)
+			// A failed probe keeps the endpoint's previous revisions rather than clearing them.
+			// Data-plane pods may experience transient probe timeouts or connection resets during
+			// reconfiguration or heavy network traffic. The provider can continue after a failed probe
+			// because endpoints leave the mirror only when Kubernetes removes them from EndpointSlices.
+			// Retaining the previous revisions prevents transient probe errors from flapping the mirror.
+			// Trade-off: an endpoint that stops answering but stays ready in its EndpointSlice keeps
+			// its last reported revisions until a probe succeeds or the endpoint leaves.
+			continue
+		}
+		if mirror, ok := p.mirrors[result.target.gatewayKey]; ok {
+			mirror.appliedRevisions[result.target.address] = result.revisions
 		}
 	}
 	p.mirrorMu.Unlock()
 }
 
+// appliedURL constructs the HTTP URL for querying the /_gari/applied endpoint on the given endpoint address.
 func (p *AddressProvider) appliedURL(address string) string {
 	return fmt.Sprintf("http://%s/_gari/applied", net.JoinHostPort(address, fmt.Sprintf("%d", DataPlaneHealthProbePort)))
 }
 
+// probeEndpoint fetches and decodes the applied configuration revisions from targetURL.
 func (p *AddressProvider) probeEndpoint(ctx context.Context, targetURL string) ([]string, error) {
 	probeContext, cancel := context.WithTimeout(ctx, p.probeTimeout)
 	defer cancel()
@@ -1318,11 +1345,35 @@ func (p *AddressProvider) probeEndpoint(ctx context.Context, targetURL string) (
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status %d", response.StatusCode)
 	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(response.Body, maxProbeResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if int64(len(bodyBytes)) > maxProbeResponseBytes {
+		return nil, fmt.Errorf("response body exceeds %d bytes limit", maxProbeResponseBytes)
+	}
 	var revisions []string
-	if err := json.NewDecoder(response.Body).Decode(&revisions); err != nil {
+	if err := json.Unmarshal(bodyBytes, &revisions); err != nil {
 		return nil, fmt.Errorf("decoding JSON: %w", err)
 	}
 	return revisions, nil
+}
+
+// appliedRevisions returns a copy of the mirrored applied revisions for the given Gateway.
+// It returns nil if the Gateway has no entry in the mirror.
+func (p *AddressProvider) appliedRevisions(gatewayKey types.NamespacedName) map[string][]string {
+	p.mirrorMu.Lock()
+	defer p.mirrorMu.Unlock()
+
+	mirror, ok := p.mirrors[gatewayKey]
+	if !ok {
+		return nil
+	}
+	revisionsCopy := make(map[string][]string, len(mirror.appliedRevisions))
+	for address, revisions := range mirror.appliedRevisions {
+		revisionsCopy[address] = slices.Clone(revisions)
+	}
+	return revisionsCopy
 }
 
 // readyEndpointAddresses extracts unique IP addresses for endpoints that are ready and not terminating.
@@ -1362,4 +1413,5 @@ var (
 	_ controller.AddressReadinessProvider = (*AddressProvider)(nil)
 	_ controller.AddressTypeProvider      = (*AddressProvider)(nil)
 	_ state.DataplanePublisher            = (*AddressProvider)(nil)
+	_                                     = (*AddressProvider).appliedRevisions
 )

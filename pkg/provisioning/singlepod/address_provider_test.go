@@ -4678,20 +4678,15 @@ func TestSinglePodAddressProvider_AppliedRevisionMirror(t *testing.T) {
 		t.Fatal("mirrorMu was held during HTTP probes")
 	}
 
-	p.mirrorMu.Lock()
-	mirror, ok := p.mirrors[gwKey]
-	p.mirrorMu.Unlock()
-	if !ok || mirror == nil {
+	revisions := p.appliedRevisions(gwKey)
+	if revisions == nil {
 		t.Fatalf("expected mirror for Gateway %s", gwKey)
 	}
-	if !slices.Equal(mirror.readyEndpoints, []string{"10.0.0.1", "10.0.0.2"}) {
-		t.Fatalf("expected readyEndpoints [10.0.0.1 10.0.0.2], got %v", mirror.readyEndpoints)
+	if !slices.Equal(revisions["10.0.0.1"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1] for 10.0.0.1, got %v", revisions["10.0.0.1"])
 	}
-	if !slices.Equal(mirror.appliedRevisions["10.0.0.1"], []string{"rev-1"}) {
-		t.Fatalf("expected revisions [rev-1] for 10.0.0.1, got %v", mirror.appliedRevisions["10.0.0.1"])
-	}
-	if !slices.Equal(mirror.appliedRevisions["10.0.0.2"], []string{"rev-1"}) {
-		t.Fatalf("expected revisions [rev-1] for 10.0.0.2, got %v", mirror.appliedRevisions["10.0.0.2"])
+	if !slices.Equal(revisions["10.0.0.2"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1] for 10.0.0.2, got %v", revisions["10.0.0.2"])
 	}
 
 	// 2. Follows a change: endpoint 10.0.0.1 reports a new revision.
@@ -4701,14 +4696,12 @@ func TestSinglePodAddressProvider_AppliedRevisionMirror(t *testing.T) {
 
 	p.probeEndpoints(ctx)
 
-	p.mirrorMu.Lock()
-	mirror = p.mirrors[gwKey]
-	p.mirrorMu.Unlock()
-	if !slices.Equal(mirror.appliedRevisions["10.0.0.1"], []string{"rev-1", "rev-2"}) {
-		t.Fatalf("expected updated revisions [rev-1 rev-2] for 10.0.0.1, got %v", mirror.appliedRevisions["10.0.0.1"])
+	revisions = p.appliedRevisions(gwKey)
+	if !slices.Equal(revisions["10.0.0.1"], []string{"rev-1", "rev-2"}) {
+		t.Fatalf("expected updated revisions [rev-1 rev-2] for 10.0.0.1, got %v", revisions["10.0.0.1"])
 	}
-	if !slices.Equal(mirror.appliedRevisions["10.0.0.2"], []string{"rev-1"}) {
-		t.Fatalf("expected revisions [rev-1] for 10.0.0.2, got %v", mirror.appliedRevisions["10.0.0.2"])
+	if !slices.Equal(revisions["10.0.0.2"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1] for 10.0.0.2, got %v", revisions["10.0.0.2"])
 	}
 
 	// 3. A failed probe keeps the endpoint's previous revisions.
@@ -4718,11 +4711,9 @@ func TestSinglePodAddressProvider_AppliedRevisionMirror(t *testing.T) {
 
 	p.probeEndpoints(ctx)
 
-	p.mirrorMu.Lock()
-	mirror = p.mirrors[gwKey]
-	p.mirrorMu.Unlock()
-	if !slices.Equal(mirror.appliedRevisions["10.0.0.1"], []string{"rev-1", "rev-2"}) {
-		t.Fatalf("expected failed probe to keep previous revisions [rev-1 rev-2], got %v", mirror.appliedRevisions["10.0.0.1"])
+	revisions = p.appliedRevisions(gwKey)
+	if !slices.Equal(revisions["10.0.0.1"], []string{"rev-1", "rev-2"}) {
+		t.Fatalf("expected failed probe to keep previous revisions [rev-1 rev-2], got %v", revisions["10.0.0.1"])
 	}
 
 	mu.Lock()
@@ -4744,17 +4735,12 @@ func TestSinglePodAddressProvider_AppliedRevisionMirror(t *testing.T) {
 
 	p.probeEndpoints(ctx)
 
-	p.mirrorMu.Lock()
-	mirror = p.mirrors[gwKey]
-	p.mirrorMu.Unlock()
-	if !slices.Equal(mirror.readyEndpoints, []string{"10.0.0.2"}) {
-		t.Fatalf("expected readyEndpoints [10.0.0.2], got %v", mirror.readyEndpoints)
-	}
-	if _, exists := mirror.appliedRevisions["10.0.0.1"]; exists {
+	revisions = p.appliedRevisions(gwKey)
+	if _, exists := revisions["10.0.0.1"]; exists {
 		t.Fatalf("expected endpoint 10.0.0.1 to be dropped from mirror, but it was present")
 	}
-	if !slices.Equal(mirror.appliedRevisions["10.0.0.2"], []string{"rev-1"}) {
-		t.Fatalf("expected revisions [rev-1] for 10.0.0.2, got %v", mirror.appliedRevisions["10.0.0.2"])
+	if !slices.Equal(revisions["10.0.0.2"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1] for 10.0.0.2, got %v", revisions["10.0.0.2"])
 	}
 
 	// 5. Service deletion removes the Gateway from the mirror.
@@ -4764,10 +4750,7 @@ func TestSinglePodAddressProvider_AppliedRevisionMirror(t *testing.T) {
 
 	p.probeEndpoints(ctx)
 
-	p.mirrorMu.Lock()
-	_, exists := p.mirrors[gwKey]
-	p.mirrorMu.Unlock()
-	if exists {
+	if revisions = p.appliedRevisions(gwKey); revisions != nil {
 		t.Fatalf("expected Gateway %s to be dropped from mirror after Service deleted", gwKey)
 	}
 }
@@ -4829,5 +4812,155 @@ func TestSinglePodAddressProvider_SetupWatches_RegistersProber(t *testing.T) {
 	}
 	if mgr.addedRunnable == nil {
 		t.Fatal("expected prober Runnable to be registered with manager")
+	}
+}
+
+func TestSinglePodAddressProvider_EndpointSliceListFailureRetainsMirror(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	if err := discoveryv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+			UID:       types.UID("test-gw-uid"),
+		},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "test-gw"}
+	serviceName := ResourceNameForGateway("test-gw")
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: "default",
+			Labels: map[string]string{
+				LabelManagedBy:   ManagedByValue,
+				LabelGatewayName: "test-gw",
+			},
+		},
+	}
+
+	endpointSlice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName + "-slice",
+			Namespace: "default",
+			Labels: map[string]string{
+				discoveryv1.LabelServiceName: serviceName,
+			},
+		},
+		Endpoints: []discoveryv1.Endpoint{
+			{
+				Addresses: []string{"10.0.0.1"},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: state.Ptr(true),
+				},
+			},
+		},
+	}
+
+	var failEndpointSliceList atomic.Bool
+	interceptorFuncs := interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*discoveryv1.EndpointSliceList); ok && failEndpointSliceList.Load() {
+				return errors.New("simulated EndpointSlice list failure")
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw, svc, endpointSlice).
+		WithInterceptorFuncs(interceptorFuncs).
+		Build()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]string{"rev-1"})
+	}))
+	defer server.Close()
+
+	p := NewAddressProvider(cl)
+	p.probeTimeout = 1 * time.Second
+	p.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+			},
+		},
+	}
+
+	ctx := t.Context()
+
+	// Initial probe: records endpoint revision.
+	p.probeEndpoints(ctx)
+	revisions := p.appliedRevisions(gwKey)
+	if revisions == nil || !slices.Equal(revisions["10.0.0.1"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1], got %v", revisions)
+	}
+
+	// Next tick: EndpointSlice list fails once.
+	failEndpointSliceList.Store(true)
+	p.probeEndpoints(ctx)
+
+	// Verify the mirror was retained and not dropped.
+	revisions = p.appliedRevisions(gwKey)
+	if revisions == nil {
+		t.Fatal("expected Gateway mirror to be retained after EndpointSlice list failure, but got nil")
+	}
+	if !slices.Equal(revisions["10.0.0.1"], []string{"rev-1"}) {
+		t.Fatalf("expected retained revisions [rev-1], got %v", revisions["10.0.0.1"])
+	}
+
+	// Subsequent tick: EndpointSlice list recovers.
+	failEndpointSliceList.Store(false)
+	p.probeEndpoints(ctx)
+	revisions = p.appliedRevisions(gwKey)
+	if revisions == nil || !slices.Equal(revisions["10.0.0.1"], []string{"rev-1"}) {
+		t.Fatalf("expected revisions [rev-1] after recovery, got %v", revisions)
+	}
+}
+
+func TestSinglePodAddressProvider_ProbeResponseExceedsLimit(t *testing.T) {
+	// Server returns a response body that exceeds maxProbeResponseBytes.
+	oversizedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		payload := strings.Repeat("x", maxProbeResponseBytes+100)
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer oversizedServer.Close()
+
+	p := NewAddressProvider(nil)
+	p.probeTimeout = 1 * time.Second
+
+	_, err := p.probeEndpoint(t.Context(), oversizedServer.URL)
+	if err == nil {
+		t.Fatal("expected error for response body exceeding limit, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected error mentioning size limit, got: %v", err)
+	}
+
+	// Normal valid response within limit succeeds.
+	validServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]string{"rev-valid"})
+	}))
+	defer validServer.Close()
+
+	revisions, err := p.probeEndpoint(t.Context(), validServer.URL)
+	if err != nil {
+		t.Fatalf("unexpected error for valid response: %v", err)
+	}
+	if !slices.Equal(revisions, []string{"rev-valid"}) {
+		t.Fatalf("expected [rev-valid], got %v", revisions)
 	}
 }

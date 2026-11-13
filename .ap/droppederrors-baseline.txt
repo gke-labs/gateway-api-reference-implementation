@@ -1,3 +1,4 @@
 # Baseline for ap droppederrors ratchet.
 # Entries: <file>:<enclosing-function>[:<category>]:<callee>
 # Do not add entries manually; fix errors or run 'ap lint droppederrors --write-baseline' if approved.
+pkg/provisioning/singlepod/address_provider.go:(*AddressProvider).probeEndpoints:(*golang.org/x/sync/errgroup.Group).Wait
