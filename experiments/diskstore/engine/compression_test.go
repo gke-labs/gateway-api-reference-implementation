@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"testing"
 
@@ -666,9 +667,19 @@ func getStoredPayload(t *testing.T, store *Engine, table, key string) []byte {
 		t.Fatalf("key %s not found in keyIndex", qKey)
 	}
 	if entry.IsOversize {
-		store.keyMu.RLock()
-		data := bytes.Clone(store.oversizeObjects[qKey])
-		store.keyMu.RUnlock()
+		f, err := store.fs.Open(filepath.Join(store.dir, "oversize", entry.OversizeFileName))
+		if err != nil {
+			t.Fatalf("Open oversize file failed: %v", err)
+		}
+		defer f.Close()
+		sz, err := f.Size()
+		if err != nil {
+			t.Fatalf("Size failed: %v", err)
+		}
+		data := make([]byte, sz)
+		if _, err := f.ReadAt(data, 0); err != nil && !errors.Is(err, io.EOF) {
+			t.Fatalf("ReadAt failed: %v", err)
+		}
 		return data
 	}
 	h, err := store.bp.PinPage(entry.LogicalPage)

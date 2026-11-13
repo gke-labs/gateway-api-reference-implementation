@@ -20,7 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -626,4 +628,321 @@ func TestOversize_CipherOutputStartingWithMagic_ReadsBackCorrectly(t *testing.T)
 	if !bytes.Equal(got, plainVal) {
 		t.Fatalf("value mismatch: want %q, got %q", string(plainVal), string(got))
 	}
+}
+
+// TestOversize_ReopenHeapUseDoesNotGrowWithTotalSize verifies that after Put and Get
+// on a store with oversize values, heap usage does not grow with their total size.
+func TestOversize_ReopenHeapUseDoesNotGrowWithTotalSize(t *testing.T) {
+	dirEmpty := t.TempDir()
+	dirOversize := t.TempDir()
+
+	// Store without oversize values
+	sEmpty, err := Open(WithDir(dirEmpty), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open empty store failed: %v", err)
+	}
+
+	// Store with several oversize values: 8 values of 3 MiB = 24 MiB total
+	sOversize, err := Open(WithDir(dirOversize), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open oversize store failed: %v", err)
+	}
+	table := "TestTable"
+	numValues := 8
+	valSize := 3 * 1024 * 1024 // 3 MiB each
+	totalSize := numValues * valSize
+
+	for i := 0; i < numValues; i++ {
+		key := fmt.Sprintf("large-key-%d", i)
+		val := makeIncompressible(valSize)
+		if err := sOversize.Put(table, key, val); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+	// Get every oversize value on the active store
+	for i := 0; i < numValues; i++ {
+		key := fmt.Sprintf("large-key-%d", i)
+		got, exists, err := sOversize.Get(table, key)
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if !exists || len(got) != valSize {
+			t.Fatalf("Get returned invalid result: exists=%v, len=%d", exists, len(got))
+		}
+	}
+	if _, err := sOversize.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	if err := sOversize.Close(); err != nil {
+		t.Fatalf("Close oversize store failed: %v", err)
+	}
+
+	// Reopen store without oversize values and measure heap
+	runtime.GC()
+	reopenedEmpty, err := Open(WithDir(dirEmpty), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen empty store failed: %v", err)
+	}
+	runtime.GC()
+	var msEmpty runtime.MemStats
+	runtime.ReadMemStats(&msEmpty)
+	if err := reopenedEmpty.Close(); err != nil {
+		t.Fatalf("Close reopened empty store failed: %v", err)
+	}
+	if err := sEmpty.Close(); err != nil {
+		t.Fatalf("Close empty store failed: %v", err)
+	}
+
+	// Reopen store with oversize values, Get every oversize value, and measure heap
+	runtime.GC()
+	reopenedOversize, err := Open(WithDir(dirOversize), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen oversize store failed: %v", err)
+	}
+	for i := 0; i < numValues; i++ {
+		key := fmt.Sprintf("large-key-%d", i)
+		got, exists, err := reopenedOversize.Get(table, key)
+		if err != nil {
+			t.Fatalf("Get after reopen failed: %v", err)
+		}
+		if !exists || len(got) != valSize {
+			t.Fatalf("Get after reopen returned invalid result: exists=%v, len=%d", exists, len(got))
+		}
+	}
+	runtime.GC()
+	var msOversize runtime.MemStats
+	runtime.ReadMemStats(&msOversize)
+	if err := reopenedOversize.Close(); err != nil {
+		t.Fatalf("Close reopened oversize store failed: %v", err)
+	}
+
+	// HeapAlloc must not grow with total size of oversize values (24 MiB).
+	// Loose bound: heap growth must be well below total size (e.g. less than half the total size).
+	diff := int64(msOversize.HeapAlloc) - int64(msEmpty.HeapAlloc)
+	bound := int64(totalSize / 2)
+	if diff > bound {
+		t.Fatalf("heap grew by %d bytes after Put and Get of %d bytes of oversize values (bound %d)", diff, totalSize, bound)
+	}
+}
+
+// TestOversize_ReopenGetAndAlteredFileReturnsCorruption verifies that Get returns the right value
+// after reopening, and returns ErrCorruptStore if the backing oversize file was altered.
+func TestOversize_ReopenGetAndAlteredFileReturnsCorruption(t *testing.T) {
+	dir := t.TempDir()
+
+	store, err := Open(WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	table := "TestTable"
+	key := "my-oversize-key"
+	val := makeIncompressible(2500 * 1024)
+
+	if err := store.Put(table, key, val); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	// Also put a healthy small key to verify engine is not failed for healthy keys
+	if err := store.Put(table, "healthy-key", []byte("healthy-payload")); err != nil {
+		t.Fatalf("Put healthy key failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 1. Reopen and verify Get returns the right value
+	store2, err := Open(WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+
+	got, exists, err := store2.Get(table, key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected key to exist")
+	}
+	if !bytes.Equal(got, val) {
+		t.Fatalf("Get payload mismatch")
+	}
+
+	// 2. Find the backing oversize file by listing the oversize directory
+	entries, err := os.ReadDir(filepath.Join(dir, "oversize"))
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	var fileName string
+	for _, entry := range entries {
+		if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+			fileName = entry.Name()
+			break
+		}
+	}
+	if fileName == "" {
+		t.Fatalf("no oversize file found in oversize directory")
+	}
+
+	// Alter the backing oversize file on disk
+	oversizeFilePath := filepath.Join(dir, "oversize", fileName)
+	data, err := os.ReadFile(oversizeFilePath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	data[len(data)/2] ^= 0xff
+	if err := os.WriteFile(oversizeFilePath, data, 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// 3. Verify Get returns corruption error on altered file, but does not fail the engine
+	_, _, err = store2.Get(table, key)
+	if err == nil {
+		t.Fatalf("expected ErrCorruptStore on altered oversize file, got nil")
+	}
+	if !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("expected ErrCorruptStore on altered oversize file, got: %v", err)
+	}
+	if store2.isFailed() {
+		t.Fatalf("engine unexpectedly entered failed state for corrupted oversize file")
+	}
+
+	// Healthy key can still be retrieved
+	healthyVal, healthyExists, healthyErr := store2.Get(table, "healthy-key")
+	if healthyErr != nil || !healthyExists || string(healthyVal) != "healthy-payload" {
+		t.Fatalf("expected healthy key to still be readable, got exists=%v err=%v", healthyExists, healthyErr)
+	}
+
+	if err := store2.Close(); err != nil {
+		t.Fatalf("Close store2 failed: %v", err)
+	}
+
+	// 4. Also verify after reopening with altered file
+	store3, err := Open(WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen store3 failed: %v", err)
+	}
+
+	_, _, err = store3.Get(table, key)
+	if err == nil {
+		t.Fatalf("expected ErrCorruptStore after reopen on altered oversize file, got nil")
+	}
+	if !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("expected ErrCorruptStore after reopen on altered oversize file, got: %v", err)
+	}
+	if store3.isFailed() {
+		t.Fatalf("engine unexpectedly entered failed state on store3 for corrupted oversize file")
+	}
+
+	if err := store3.Close(); err != nil {
+		t.Fatalf("Close store3 failed: %v", err)
+	}
+}
+
+// TestOversize_ConcurrentReadersWriter_NoError verifies that concurrent readers
+// observe no errors while a writer replaces, deletes and re-puts, or alternates oversize values.
+func TestOversize_ConcurrentReadersWriter_NoError(t *testing.T) {
+	runTest := func(t *testing.T, writerFunc func(store *Engine, table, key string, stopCh <-chan struct{})) {
+		dir := t.TempDir()
+		store, err := Open(WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close failed: %v", err)
+			}
+		}()
+
+		table := "ConcurrentTable"
+		key := "target-key"
+
+		// Initial seed value: oversize
+		initialVal := makeIncompressible(2500 * 1024)
+		if err := store.Put(table, key, initialVal); err != nil {
+			t.Fatalf("initial Put failed: %v", err)
+		}
+
+		stopCh := make(chan struct{})
+		errCh := make(chan error, 100)
+		var wg sync.WaitGroup
+
+		// 4 concurrent readers
+		for r := 0; r < 4; r++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-stopCh:
+						return
+					default:
+						_, _, err := store.Get(table, key)
+						if err != nil {
+							select {
+							case errCh <- err:
+							default:
+							}
+							return
+						}
+					}
+				}
+			}()
+		}
+
+		// Run writer
+		writerFunc(store, table, key, stopCh)
+		close(stopCh)
+		wg.Wait()
+
+		close(errCh)
+		for readErr := range errCh {
+			t.Fatalf("reader observed error during concurrent writes: %v", readErr)
+		}
+	}
+
+	t.Run("ReplaceOversizeWithValue", func(t *testing.T) {
+		runTest(t, func(store *Engine, table, key string, stopCh <-chan struct{}) {
+			for i := 0; i < 50; i++ {
+				val := makeIncompressible((2100 + (i%5)*100) * 1024)
+				if err := store.Put(table, key, val); err != nil {
+					t.Fatalf("Put failed: %v", err)
+				}
+			}
+		})
+	})
+
+	t.Run("DeleteAndRePut", func(t *testing.T) {
+		runTest(t, func(store *Engine, table, key string, stopCh <-chan struct{}) {
+			val := makeIncompressible(2500 * 1024)
+			for i := 0; i < 50; i++ {
+				if err := store.Delete(table, key); err != nil {
+					t.Fatalf("Delete failed: %v", err)
+				}
+				if err := store.Put(table, key, val); err != nil {
+					t.Fatalf("Put failed: %v", err)
+				}
+			}
+		})
+	})
+
+	t.Run("AlternateOversizeAndSmall", func(t *testing.T) {
+		runTest(t, func(store *Engine, table, key string, stopCh <-chan struct{}) {
+			oversizeVal := makeIncompressible(2500 * 1024)
+			smallVal := []byte("small-slotted-payload")
+			for i := 0; i < 50; i++ {
+				var val []byte
+				if i%2 == 0 {
+					val = smallVal
+				} else {
+					val = oversizeVal
+				}
+				if err := store.Put(table, key, val); err != nil {
+					t.Fatalf("Put failed: %v", err)
+				}
+			}
+		})
+	})
 }
