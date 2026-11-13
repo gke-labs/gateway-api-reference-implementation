@@ -15,9 +15,12 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -698,6 +701,40 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 				return nil, fmt.Errorf("failed to free superseded block %d during redo: %w", loc, err)
 			}
 		}
+	}
+
+	// Step 7: Delete unreferenced oversize files
+	oversizeDir := filepath.Join(storeDir, "oversize")
+	oversizeEntries, err := fs.ReadDir(oversizeDir)
+	if err == nil {
+		referenced := make(map[string]bool)
+		for _, entry := range keyIndex {
+			if entry.IsOversize && entry.OversizeFileName != "" {
+				referenced[entry.OversizeFileName] = true
+			}
+		}
+
+		var removedCount int
+		for _, entry := range oversizeEntries {
+			if entry.IsDir() || referenced[entry.Name()] {
+				continue
+			}
+			p := filepath.Join(oversizeDir, entry.Name())
+			if err := fs.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("failed to remove unreferenced oversize file %s: %w", p, err)
+			}
+			removedCount++
+		}
+
+		if err := fs.SyncDir(oversizeDir); err != nil {
+			return nil, fmt.Errorf("failed to fsync oversize directory after recovery: %w", err)
+		}
+
+		if removedCount > 0 {
+			slog.Log(context.Background(), slog.Level(-2), "diskstore: removed unreferenced oversize files during recovery", "count", removedCount)
+		}
+	} else if !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("failed to read oversize directory during recovery: %w", err)
 	}
 
 	return &RecoveryResult{

@@ -946,3 +946,239 @@ func TestOversize_ConcurrentReadersWriter_NoError(t *testing.T) {
 		})
 	})
 }
+
+
+// A test through Open: write an oversize value, crash after the file is durable but before
+// its pointer record (fault-injecting filesystem), reopen. The orphan is gone, and the key
+// keeps its previous value.
+func TestOversize_Recovery_CrashBeforePointerRecord_DeletesOrphanAndPreservesPreviousValue(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	hookFS := &oversizeHookFS{FS: faultFS}
+	dir := "test_oversize_recovery_orphan"
+
+	store, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	table := "TestTable"
+	key := "targetKey"
+	prevVal := []byte("previous-durable-value")
+	if err := store.Put(table, key, prevVal); err != nil {
+		t.Fatalf("Put prevVal failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	oversizeVal := append([]byte("orphan-oversize-content"), make([]byte, 2100*1024)...)
+	oversizeDir := filepath.Join(dir, "oversize")
+
+	var crashed bool
+	var orphanFileName string
+	doneCh := make(chan struct{})
+	hookFS.onSyncDir = func(dirname string) {
+		if filepath.Clean(dirname) == filepath.Clean(oversizeDir) && !crashed {
+			crashed = true
+			entries, _ := memFS.ReadDir(oversizeDir)
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(e.Name(), ".obj") {
+					orphanFileName = e.Name()
+				}
+			}
+			_ = faultFS.Crash(true, 0)
+			close(doneCh)
+			runtime.Goexit()
+		}
+	}
+
+	go func() {
+		_ = store.Put(table, key, oversizeVal)
+	}()
+
+	<-doneCh
+
+	if orphanFileName == "" {
+		t.Fatalf("expected orphan file to have been created before crash")
+	}
+
+	// Stop the store without allowing new writes to complete
+	_ = store.Close()
+
+	orphanPath := filepath.Join(oversizeDir, orphanFileName)
+	if _, err := memFS.Open(orphanPath); err != nil {
+		t.Fatalf("expected orphan file %s to exist on disk before recovery: %v", orphanPath, err)
+	}
+
+	store2, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen after crash failed: %v", err)
+	}
+	defer store2.Close()
+
+	if _, err := memFS.Open(orphanPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expected orphan file %s to be deleted during recovery, got err: %v", orphanPath, err)
+	}
+
+	gotVal, exists, err := store2.Get(table, key)
+	if err != nil {
+		t.Fatalf("Get key failed: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected key %s to exist with previous value", key)
+	}
+	if !bytes.Equal(gotVal, prevVal) {
+		t.Fatalf("value mismatch: got %q, want %q", string(gotVal), string(prevVal))
+	}
+}
+
+// A test: a referenced file is never deleted by the startup pass.
+func TestOversize_Recovery_ReferencedFileNeverDeletedByStartupPass(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_oversize_referenced_not_deleted"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	table := "TestTable"
+	k1 := "key1"
+	v1 := append([]byte("oversize-data-1"), make([]byte, 2100*1024)...)
+	if err := store.Put(table, k1, v1); err != nil {
+		t.Fatalf("Put k1 failed: %v", err)
+	}
+
+	k2 := "key2"
+	v2 := append([]byte("oversize-data-2"), make([]byte, 2200*1024)...)
+	if err := store.Put(table, k2, v2); err != nil {
+		t.Fatalf("Put k2 failed: %v", err)
+	}
+
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	file1 := store.keyIndex[qualifyKey(table, k1)].OversizeFileName
+	file2 := store.keyIndex[qualifyKey(table, k2)].OversizeFileName
+	if file1 == "" || file2 == "" {
+		t.Fatalf("expected non-empty oversize file names in key index")
+	}
+
+	path1 := filepath.Join(dir, "oversize", file1)
+	path2 := filepath.Join(dir, "oversize", file2)
+
+	if _, err := memFS.Open(path1); err != nil {
+		t.Fatalf("expected file1 %s to exist: %v", path1, err)
+	}
+	if _, err := memFS.Open(path2); err != nil {
+		t.Fatalf("expected file2 %s to exist: %v", path2, err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	if _, err := memFS.Open(path1); err != nil {
+		t.Fatalf("referenced oversize file1 %s was deleted by recovery startup pass: %v", path1, err)
+	}
+	if _, err := memFS.Open(path2); err != nil {
+		t.Fatalf("referenced oversize file2 %s was deleted by recovery startup pass: %v", path2, err)
+	}
+
+	got1, exists1, err := store2.Get(table, k1)
+	if err != nil || !exists1 || !bytes.Equal(got1, v1) {
+		t.Fatalf("Get k1 failed or value mismatch: exists=%v, err=%v", exists1, err)
+	}
+	got2, exists2, err := store2.Get(table, k2)
+	if err != nil || !exists2 || !bytes.Equal(got2, v2) {
+		t.Fatalf("Get k2 failed or value mismatch: exists=%v, err=%v", exists2, err)
+	}
+}
+
+// Recovery startup pass deletes orphaned previous-version files and leftover temp files.
+func TestOversize_Recovery_DeletesOldVersionAndTempOrphans(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_oversize_old_and_temp_orphans"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	table := "TestTable"
+	key := "targetKey"
+	v1 := append([]byte("oversize-v1"), make([]byte, 2100*1024)...)
+	if err := store.Put(table, key, v1); err != nil {
+		t.Fatalf("Put v1 failed: %v", err)
+	}
+
+	oldFileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
+	oldFilePath := filepath.Join(dir, "oversize", oldFileName)
+
+	v2 := append([]byte("oversize-v2"), make([]byte, 2100*1024)...)
+	if err := store.Put(table, key, v2); err != nil {
+		t.Fatalf("Put v2 failed: %v", err)
+	}
+
+	newFileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
+	newFilePath := filepath.Join(dir, "oversize", newFileName)
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Recreate the old file on disk (simulating removal having been skipped or interrupted before deletion)
+	oldF, err := memFS.OpenFile(oldFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
+	if err != nil {
+		t.Fatalf("failed to create old file: %v", err)
+	}
+	_, _ = oldF.WriteAt(v1, 0)
+	_ = oldF.Sync()
+	_ = oldF.Close()
+
+	// Also create a leftover temp file in oversize dir
+	tempPath := filepath.Join(dir, "oversize", ".tmp-fake-orphan-12345")
+	tempF, err := memFS.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	_, _ = tempF.WriteAt([]byte("partial temp bytes"), 0)
+	_ = tempF.Sync()
+	_ = tempF.Close()
+
+	// Reopen store through Open
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	// Verify old file is gone
+	if _, err := memFS.Open(oldFilePath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expected old file %s to be deleted by recovery, got err: %v", oldFilePath, err)
+	}
+
+	// Verify temp file is gone
+	if _, err := memFS.Open(tempPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expected temp file %s to be deleted by recovery, got err: %v", tempPath, err)
+	}
+
+	// Verify new file is intact
+	if _, err := memFS.Open(newFilePath); err != nil {
+		t.Fatalf("expected new file %s to be intact, got err: %v", newFilePath, err)
+	}
+
+	// Verify value reads back as v2
+	gotVal, exists, err := store2.Get(table, key)
+	if err != nil || !exists || !bytes.Equal(gotVal, v2) {
+		t.Fatalf("Get key failed: exists=%v, err=%v", exists, err)
+	}
+}
