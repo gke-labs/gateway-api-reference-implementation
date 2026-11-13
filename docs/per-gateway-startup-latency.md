@@ -16,9 +16,9 @@ This document measures how long a Gateway takes to become usable and serve traff
 
 ## Measurements
 
-All durations are measured from $T_0$ (the moment the Gateway and HTTPRoute manifests are submitted to the Kubernetes API) until the respective milestone is reached.
+All durations are measured from time zero (the moment the Gateway and HTTPRoute manifests are submitted to the Kubernetes API) until the respective milestone is reached.
 
-| Step | Case 1: First Gateway (Cold) | Case 2: Later Gateway (Warm, Median) | Case 3: All-in-One Mode (Median) |
+| Step | Case 1: First Gateway (Cold, 1 run) | Case 2: Later Gateway (Warm, Median of 3 runs) | Case 3: All-in-One Mode (Median of 3 runs) |
 |---|---|---|---|
 | Deployment and Service exist | 0.50s | 0.24s (runs: 0.23s, 0.24s, 0.24s) | N/A |
 | Pod scheduled | 0.50s | 0.24s (runs: 0.24s, 0.24s, 0.24s) | N/A |

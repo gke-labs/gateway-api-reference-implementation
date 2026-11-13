@@ -1,5 +1,3 @@
-//go:build benchmark
-
 // Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build benchmark
+
 package e2e
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -94,6 +95,10 @@ spec:
 	resName := singlepod.ResourceNameForGateway(gwName)
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 
+	// A dedicated polling loop with a 20ms sleep interval is used instead of the
+	// harness's sequential wait helpers (which poll every 1s) because this benchmark
+	// measures multiple concurrent, overlapping lifecycle milestones from a single
+	// time zero and requires ~20ms measurement resolution.
 	for time.Since(t0) < 2*time.Minute {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 
@@ -225,14 +230,27 @@ func TestBenchmarkGatewayStartup(t *testing.T) {
 	}
 	defer func() {
 		if pfCmd.Process != nil {
-			_ = pfCmd.Process.Kill()
+			if err := pfCmd.Process.Kill(); err != nil {
+				t.Logf("failed to kill port-forward process: %v", err)
+			}
 		}
 	}()
 
-	_ = exec.Command("python3", "-c", "open('/etc/hosts', 'a').write('\\n127.0.0.1 backend.default.svc.cluster.local\\n')").Run()
+	// Map backend.default.svc.cluster.local directly to the port-forwarded address in the HTTP client
+	origTransport := http.DefaultTransport.(*http.Transport)
+	origDialContext := origTransport.DialContext
+	if origDialContext == nil {
+		origDialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
 	defer func() {
-		_ = exec.Command("python3", "-c", "lines = [l for l in open('/etc/hosts').readlines() if 'backend.default.svc.cluster.local' not in l]; open('/etc/hosts', 'w').writelines(lines)").Run()
+		origTransport.DialContext = origDialContext
 	}()
+	origTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if strings.HasPrefix(addr, "backend.default.svc.cluster.local:") {
+			addr = "127.0.0.1:8080"
+		}
+		return origDialContext(ctx, network, addr)
+	}
 
 	for attempt := 0; attempt < 50; attempt++ {
 		if resp, err := http.Get("http://127.0.0.1:8080/"); err == nil {
