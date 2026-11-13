@@ -887,10 +887,14 @@ func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
 }
 
 type retryTestPublisher struct {
-	mu           sync.Mutex
-	failCount    int
-	attemptTimes []time.Time
-	published    map[types.NamespacedName]*DataplaneConfig
+	mu                sync.Mutex
+	failCount         int
+	failKey           *types.NamespacedName
+	failDeletionCount int
+	attemptTimes      []time.Time
+	attemptsByKey     map[types.NamespacedName]int
+	deletionsByKey    map[types.NamespacedName]int
+	published         map[types.NamespacedName]*DataplaneConfig
 }
 
 func (m *retryTestPublisher) Begin(ctx context.Context) error  { return nil }
@@ -899,16 +903,38 @@ func (m *retryTestPublisher) PublishDataplaneConfig(ctx context.Context, gw *gat
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.attemptTimes = append(m.attemptTimes, time.Now())
-	if m.failCount > 0 {
+	var key types.NamespacedName
+	if gw != nil {
+		key = types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	}
+	if m.attemptsByKey == nil {
+		m.attemptsByKey = make(map[types.NamespacedName]int)
+	}
+	m.attemptsByKey[key]++
+
+	if config == nil {
+		if m.failDeletionCount > 0 {
+			m.failDeletionCount--
+			return errors.New("simulated deletion failure")
+		}
+		if m.deletionsByKey == nil {
+			m.deletionsByKey = make(map[types.NamespacedName]int)
+		}
+		m.deletionsByKey[key]++
+		delete(m.published, key)
+		return nil
+	}
+
+	if m.failKey != nil && *m.failKey != key {
+		// Only fail for the specified key
+	} else if m.failCount > 0 {
 		m.failCount--
 		return errors.New("simulated publish failure")
 	}
 	if m.published == nil {
 		m.published = make(map[types.NamespacedName]*DataplaneConfig)
 	}
-	if gw != nil {
-		m.published[types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}] = config
-	}
+	m.published[key] = config
 	return nil
 }
 
@@ -922,6 +948,18 @@ func (m *retryTestPublisher) attempts() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.attemptTimes)
+}
+
+func (m *retryTestPublisher) attemptsFor(key types.NamespacedName) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.attemptsByKey[key]
+}
+
+func (m *retryTestPublisher) deletionsFor(key types.NamespacedName) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.deletionsByKey[key]
 }
 
 func (m *retryTestPublisher) getAttemptTimes() []time.Time {
@@ -1042,16 +1080,16 @@ func TestState_PublishDataplaneConfig_RepeatedFailuresBackoff(t *testing.T) {
 	d2 := times[2].Sub(times[1])
 	d3 := times[3].Sub(times[2])
 
-	// Expected nominal backoffs are 50ms, 100ms, 200ms (+ 10ms coalesceDelay).
-	// Verify intervals are non-spinning (greater than minimum threshold) and increasing.
-	if d1 < 35*time.Millisecond {
-		t.Errorf("expected d1 >= 35ms (not spinning), got %v", d1)
+	// Expected nominal backoffs are 5ms, 10ms, 20ms from DefaultTypedControllerRateLimiter.
+	// Verify intervals are non-spinning and increasing.
+	if d1 < 3*time.Millisecond {
+		t.Errorf("expected d1 >= 3ms (not spinning), got %v", d1)
 	}
-	if d2 < 70*time.Millisecond {
-		t.Errorf("expected d2 >= 70ms (not spinning), got %v", d2)
+	if d2 < 6*time.Millisecond {
+		t.Errorf("expected d2 >= 6ms (not spinning), got %v", d2)
 	}
-	if d3 < 140*time.Millisecond {
-		t.Errorf("expected d3 >= 140ms (not spinning), got %v", d3)
+	if d3 < 12*time.Millisecond {
+		t.Errorf("expected d3 >= 12ms (not spinning), got %v", d3)
 	}
 	if d2 <= d1 {
 		t.Errorf("expected backoff interval d2 (%v) > d1 (%v)", d2, d1)
@@ -1066,12 +1104,92 @@ func TestState_PublishDataplaneConfig_RepeatedFailuresBackoff(t *testing.T) {
 	}
 }
 
+func TestState_PublishDataplaneConfig_UnrelatedChangesDoNotRetryFailingKey(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gwKeyA := types.NamespacedName{Namespace: "default", Name: "my-gw-a"}
+	mockPub := &retryTestPublisher{
+		failKey:   &gwKeyA,
+		failCount: 1, // fails once for gw-a
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwA := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw-a"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gwA)
+	st.SetGatewayAddresses(gwKeyA, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKeyA, GatewayReadiness{Ready: true})
+
+	// Wait for gw-a's initial failure so it is pending retry in the workqueue.
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.attemptsFor(gwKeyA) >= 1
+	})
+
+	// Make 20 unrelated Gateway changes in rapid succession.
+	for i := range 20 {
+		gwB := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "my-gw-b",
+				Annotations: map[string]string{
+					"change": fmt.Sprintf("%d", i),
+				},
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "my-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
+				},
+			},
+		}
+		st.UpsertGateway(gwB)
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Verify that gw-a was not retried 20 times due to unrelated changes,
+	// and that its config is published on its scheduled retry.
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.getPublished(gwKeyA) != nil
+	})
+
+	if got := mockPub.attemptsFor(gwKeyA); got != 2 {
+		t.Errorf("expected exactly 2 attempts for gw-a (1 initial failure + 1 retry), got %d", got)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
 func TestState_PublishDataplaneConfig_RetryCancelledOnGatewayDelete(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
 
 	mockPub := &retryTestPublisher{
-		failCount: 100,
+		failCount: 100, // always fail
 	}
 	st.SetDataplanePublisher(mockPub)
 
@@ -1111,14 +1229,80 @@ func TestState_PublishDataplaneConfig_RetryCancelledOnGatewayDelete(t *testing.T
 	// Delete Gateway
 	st.DeleteGateway(gwKey)
 
-	// Poll until recompute runs
-	time.Sleep(100 * time.Millisecond)
+	// Wait for delete reconcile to run
+	time.Sleep(50 * time.Millisecond)
 
-	st.mu.Lock()
-	retryCount := len(st.publishRetries)
-	st.mu.Unlock()
-	if retryCount != 0 {
-		t.Errorf("expected 0 pending retries after Gateway deletion, got %d", retryCount)
+	attemptsAfterDelete := mockPub.attempts()
+
+	// Assert behaviour: no further publish attempts arrive after the Gateway is deleted.
+	time.Sleep(100 * time.Millisecond)
+	if got := mockPub.attempts(); got > attemptsAfterDelete {
+		t.Errorf("expected no further publish attempts after Gateway deletion, got %d attempts (was %d)", got, attemptsAfterDelete)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestState_PublishDataplaneConfig_FailedDeletionRetried(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	mockPub := &retryTestPublisher{
+		failCount: 0,
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// Wait for successful initial publish
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.getPublished(gwKey) != nil
+	})
+
+	// Configure publisher to fail deletion once
+	mockPub.mu.Lock()
+	mockPub.failDeletionCount = 1
+	mockPub.mu.Unlock()
+
+	// Delete Gateway
+	st.DeleteGateway(gwKey)
+
+	// Wait for deletion to be retried and succeed
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.deletionsFor(gwKey) >= 1
+	})
+
+	if got := mockPub.deletionsFor(gwKey); got != 1 {
+		t.Errorf("expected exactly 1 successful deletion, got %d", got)
 	}
 
 	cancel()
