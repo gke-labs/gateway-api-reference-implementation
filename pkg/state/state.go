@@ -301,7 +301,18 @@ func (s *State) SetListenerValidator(v ListenerValidator) {
 func (s *State) SetDataplanePublisher(p DataplanePublisher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dataplanePublisher == p {
+		return
+	}
 	s.dataplanePublisher = p
+	s.dataplaneCache = make(map[types.NamespacedName][]byte)
+	clear(s.publishConflicts)
+	if p != nil && s.dataplaneQueue != nil && s.previousOutputs != nil && s.previousOutputs.DataplaneConfigs != nil {
+		for gwKey := range s.previousOutputs.DataplaneConfigs {
+			s.dataplaneQueue.Forget(gwKey)
+			s.dataplaneQueue.Add(gwKey)
+		}
+	}
 }
 
 func (s *State) GetDataplaneConfig(key types.NamespacedName) *DataplaneConfig {
