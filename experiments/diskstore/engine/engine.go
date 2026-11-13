@@ -833,7 +833,7 @@ func Open(opts ...Option) (*Engine, error) {
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 	} else {
 		// Existing store: perform crash recovery scan and WAL redo replay
-		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID)
+		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID, RecoveryOptions{Quarantine: options.Quarantine})
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("recovery failed: %w", err), closeErr)
