@@ -223,7 +223,7 @@ spec:
 	h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+namespace, "--timeout=2m")
 }
 
-func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, frontendAddr string, replicas int, transport ...string) {
+func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, frontendAddr string, replicas int) {
 	h.T.Logf("Deploying snigateway controller with %d replicas", replicas)
 	gitRoot := h.GetGitRoot()
 
@@ -234,16 +234,6 @@ func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, f
 	})
 
 	h.KubectlApplyFile(filepath.Join(gitRoot, "snigateway/k8s/controller.yaml"))
-
-	transportMode := "tcp"
-	if len(transport) > 0 && transport[0] != "" {
-		transportMode = transport[0]
-	}
-
-	extraArgs := ""
-	if len(transport) > 1 && transport[1] != "" {
-		extraArgs = fmt.Sprintf("\n        - %q", transport[1])
-	}
 
 	manifest := fmt.Sprintf(`
 apiVersion: apps/v1
@@ -269,10 +259,9 @@ spec:
         args:
         - "--controller-name=github.com/gke-labs/gateway-api-reference-implementation/snigateway"
         - "--frontend=%s"
-        - "--tunnel-transport=%s"
         - "--ca-cert=/etc/snigateway/certs/ca.crt"
         - "--client-cert=/etc/snigateway/certs/client.crt"
-        - "--client-key=/etc/snigateway/certs/client.key"%s
+        - "--client-key=/etc/snigateway/certs/client.key"
         volumeMounts:
         - name: client-certs
           mountPath: /etc/snigateway/certs
@@ -281,7 +270,7 @@ spec:
       - name: client-certs
         secret:
           secretName: snigateway-client-cert
-`, replicas, frontendAddr, transportMode, extraArgs)
+`, replicas, frontendAddr)
 
 	h.KubectlApplyContent(manifest)
 	h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-controller", "--namespace=default", "--timeout=2m")

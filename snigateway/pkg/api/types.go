@@ -21,9 +21,6 @@ const (
 	// UpgradeProtocol is the protocol value used in HTTP Upgrade for reverse tunnels.
 	UpgradeProtocol = "snigateway-tunnel"
 
-	// UpgradeProtocolH2 is the protocol value used in HTTP Upgrade for HTTP/2 multiplexed reverse tunnels.
-	UpgradeProtocolH2 = "snigateway-tunnel-h2"
-
 	// HeaderSessionID is the HTTP header used to identify the backend session.
 	HeaderSessionID = "X-Session-ID"
 )

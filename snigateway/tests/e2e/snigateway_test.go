@@ -303,16 +303,16 @@ func TestSNIGateway(t *testing.T) {
 		}
 	})
 
-	// Assertion 6: Deploy controller with explicit --tunnel-transport=tcp and verify connections succeed
-	t.Run("Controller with --tunnel-transport=tcp succeeds", func(t *testing.T) {
+	// Assertion 6: Deploy controller with 1 replica and verify connections succeed
+	t.Run("Controller with 1 replica succeeds", func(t *testing.T) {
 		t.Cleanup(func() { dumpLogsIfFailed(t) })
 
-		h.DeploySNIGatewayController(infraCerts, frontendAddr, 1, "tcp")
+		h.DeploySNIGatewayController(infraCerts, frontendAddr, 1)
 
 		ctrlLogs := h.WaitForControllerLog("Established TCP pool session", 30*time.Second)
-		t.Logf("Controller logs for TCP mode: %s", ctrlLogs)
+		t.Logf("Controller logs: %s", ctrlLogs)
 
-		clientPod := "sni-client-tcp-mode"
+		clientPod := "sni-client-1-replica"
 		h.DeletePod(clientPod)
 		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
 			"client",
@@ -323,36 +323,10 @@ func TestSNIGateway(t *testing.T) {
 		}))
 		h.WaitForPodSuccess(clientPod, 1*time.Minute)
 		logs := h.GetPodLogs(clientPod)
-		t.Logf("TCP mode client logs: %s", logs)
+		t.Logf("Client logs: %s", logs)
 
 		if !strings.Contains(logs, "Status: 200 OK") {
-			t.Errorf("Expected 200 OK for TCP mode, got: %s", logs)
-		}
-	})
-
-	// Assertion 7: Deploy controller with explicit --tunnel-transport=h2 and verify connections succeed
-	t.Run("Controller with --tunnel-transport=h2 succeeds", func(t *testing.T) {
-		t.Cleanup(func() { dumpLogsIfFailed(t) })
-
-		h.DeploySNIGatewayController(infraCerts, frontendAddr, 1, "h2")
-		ctrlLogsH2 := h.WaitForControllerLog("Established H2 session", 30*time.Second)
-		t.Logf("Controller logs for H2 mode: %s", ctrlLogsH2)
-
-		clientPod := "sni-client-h2-mode"
-		h.DeletePod(clientPod)
-		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
-			"client",
-			"--connect-to=" + frontendAddr,
-			"--sni=echo.snigateway.test",
-			"--insecure",
-			"https://echo.snigateway.test/",
-		}))
-		h.WaitForPodSuccess(clientPod, 1*time.Minute)
-		logs := h.GetPodLogs(clientPod)
-		t.Logf("H2 mode client logs: %s", logs)
-
-		if !strings.Contains(logs, "Status: 200 OK") {
-			t.Errorf("Expected 200 OK for H2 mode, got: %s", logs)
+			t.Errorf("Expected 200 OK, got: %s", logs)
 		}
 	})
 

@@ -48,7 +48,7 @@ Kernel WireGuard requires elevated privileges to create network links, assign ad
   - **Frontend**: Needs `CAP_NET_ADMIN` (or root) on the host or container network namespace to create `wg0` and manage peer routes via netlink.
 - **Kernel Requirements**: Linux kernel 5.6 or later (which includes in-tree WireGuard support), or earlier kernels with the out-of-tree `wireguard.ko` module loaded.
 - **Comparison with Existing Transports**:
-  - Today's transports (`tcp`, `h2`) run entirely in userspace with zero Linux capabilities. Controller pods run under the Kubernetes `restricted` Pod Security Standard as non-root (`runAsUser: 65532`).
+  - Today's TCP pool transport runs entirely in userspace with zero Linux capabilities. Controller pods run under the Kubernetes `restricted` Pod Security Standard as non-root (`runAsUser: 65532`).
 - **Pod Security Standards (PSS)**:
   - `CAP_NET_ADMIN` is disallowed by both the `restricted` and `baseline` PSS levels (baseline only permits default unprivileged capabilities plus `NET_BIND_SERVICE`). Running the controller pod with kernel WireGuard requires the namespace to be configured with the `privileged` PSS level, or granted an explicit namespace exemption.
 - **Scope of `CAP_NET_ADMIN`**:

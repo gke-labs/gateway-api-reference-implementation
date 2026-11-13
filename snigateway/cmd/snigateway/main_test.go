@@ -43,8 +43,7 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "metrics-bind-address", DefValue: ":8080", Usage: "The address the metric endpoint binds to."},
 		{Name: "proxy-bind-address", DefValue: "", Usage: "Optional HTTP proxy bind address. Disabled by default."},
 		{Name: "token-file", DefValue: "", Usage: "Path to ServiceAccount token file for authentication."},
-		{Name: "tunnel-pool-size", DefValue: "4", Usage: "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend when using TCP pool or H2 transport."},
-		{Name: "tunnel-transport", DefValue: "tcp", Usage: "Tunnel transport to use (tcp, h2)."},
+		{Name: "tunnel-pool-size", DefValue: "4", Usage: "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend."},
 	}
 
 	cfg := DefaultConfig()

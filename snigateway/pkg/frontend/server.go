@@ -58,7 +58,7 @@ type ServerConfig struct {
 	PerAttemptTimeout        time.Duration
 	ReadSNITimeout           time.Duration
 	Authorizer               Authorizer
-	CompositeTransport       *CompositeTransport
+	PoolTransport            *PoolTransport
 	MaxConnections           int
 	IdleTimeout              time.Duration
 	MaxHostnamesPerSession   int
@@ -74,9 +74,7 @@ type Server struct {
 	config     ServerConfig
 	authorizer Authorizer
 	table      *RegistrationTable
-	transport  Transport
 	pool       *PoolTransport
-	h2         *H2Transport
 
 	internalListener *chanListener
 	httpServer       *http.Server
@@ -129,9 +127,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		auth = &AllowAllAuthorizer{}
 	}
 
-	comp := cfg.CompositeTransport
-	if comp == nil {
-		comp = NewCompositeTransport(NewPoolTransport(), nil)
+	pool := cfg.PoolTransport
+	if pool == nil {
+		pool = NewPoolTransport()
 	}
 
 	timeNow := cfg.TimeNow
@@ -143,9 +141,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		config:           cfg,
 		authorizer:       auth,
 		table:            NewRegistrationTable(),
-		transport:        comp,
-		pool:             comp.Pool(),
-		h2:               comp.H2(),
+		pool:             pool,
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
 		jwtVerifier:      cfg.JWTVerifier,
@@ -172,19 +168,9 @@ func (s *Server) RegistrationTable() *RegistrationTable {
 	return s.table
 }
 
-// Transport returns the server's data-plane transport.
-func (s *Server) Transport() Transport {
-	return s.transport
-}
-
 // PoolTransport returns the server's TCP pool transport.
 func (s *Server) PoolTransport() *PoolTransport {
 	return s.pool
-}
-
-// H2Transport returns the server's HTTP/2 transport.
-func (s *Server) H2Transport() *H2Transport {
-	return s.h2
 }
 
 // ListenAndServe starts listening on all configured TCP addresses and serves traffic.
@@ -270,7 +256,7 @@ func (s *Server) Close() error {
 	s.listenersMu.Unlock()
 
 	closeCloser(s.internalListener)
-	closeCloser(s.transport)
+	closeCloser(s.pool)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
@@ -328,7 +314,6 @@ func (s *Server) CloseSession(sessionID string) {
 
 	s.table.Unregister(sessionID)
 	s.pool.UnregisterSession(sessionID)
-	s.h2.UnregisterSession(sessionID)
 
 	if sess.cancel != nil {
 		sess.cancel()
@@ -420,7 +405,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
-		tunnelConn, _, err := s.transport.GetConnForSessions(ctx, sessions)
+		tunnelConn, _, err := s.pool.GetConnForSessions(ctx, sessions)
 		cancel()
 
 		if err != nil {
@@ -678,7 +663,6 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 	s.table.RegisterSession(sessionID, clientIdentity)
 	s.pool.RegisterSession(sessionID)
-	s.h2.RegisterSession(sessionID)
 	log.Printf("Frontend: created session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
@@ -834,12 +818,6 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	isH2 := strings.EqualFold(r.Header.Get("Upgrade"), api.UpgradeProtocolH2)
-	respProto := api.UpgradeProtocol
-	if isH2 {
-		respProto = api.UpgradeProtocolH2
-	}
-
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
@@ -853,7 +831,7 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Send HTTP 101 Switching Protocols
-	resp := "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: " + respProto + "\r\n\r\n"
+	resp := "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: " + api.UpgradeProtocol + "\r\n\r\n"
 	if _, err := rawConn.Write([]byte(resp)); err != nil {
 		closeCloser(rawConn)
 		return
@@ -872,16 +850,9 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	if isH2 {
-		if err := s.h2.AddConn(sessionID, dialedConn); err != nil {
-			closeCloser(dialedConn)
-			return
-		}
-	} else {
-		if err := s.pool.AddConn(sessionID, dialedConn); err != nil {
-			closeCloser(dialedConn)
-			return
-		}
+	if err := s.pool.AddConn(sessionID, dialedConn); err != nil {
+		closeCloser(dialedConn)
+		return
 	}
 }
 

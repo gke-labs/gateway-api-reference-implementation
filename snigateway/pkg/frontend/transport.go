@@ -18,24 +18,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net"
 	"sync"
 )
 
-// Transport represents the data-plane connection provider between the frontend and backends.
-type Transport interface {
-	// GetConn retrieves or establishes a tunnel connection to the specified backend session.
-	GetConn(ctx context.Context, sessionID string) (net.Conn, error)
-	// GetConnForSessions retrieves a connection from one of the candidate sessions in order.
-	// Returns the connection and the sessionID it belongs to.
-	GetConnForSessions(ctx context.Context, sessionIDs []string) (net.Conn, string, error)
-	// Close closes the transport and any resources associated with it.
-	Close() error
-}
-
-// PoolTransport implements Transport using a warm pool of pre-dialed reverse tunnel connections.
+// PoolTransport implements a warm pool of pre-dialed reverse tunnel connections.
 type PoolTransport struct {
 	mu       sync.Mutex
 	pools    map[string][]net.Conn
@@ -195,116 +183,6 @@ func (p *PoolTransport) Close() error {
 		closeCloser(c)
 	}
 	return nil
-}
-
-// CompositeTransport combines PoolTransport (TCP) and H2Transport (HTTP/2)
-// behind the unified Transport interface.
-type CompositeTransport struct {
-	mu     sync.Mutex
-	pool   *PoolTransport
-	h2     *H2Transport
-	closed bool
-}
-
-// NewCompositeTransport creates a new CompositeTransport wrapping pool and h2 transports.
-func NewCompositeTransport(pool *PoolTransport, h2Tr *H2Transport) *CompositeTransport {
-	if pool == nil {
-		pool = NewPoolTransport()
-	}
-	if h2Tr == nil {
-		h2Tr = NewH2Transport()
-	}
-	return &CompositeTransport{
-		pool: pool,
-		h2:   h2Tr,
-	}
-}
-
-// Pool returns the underlying PoolTransport.
-func (c *CompositeTransport) Pool() *PoolTransport {
-	return c.pool
-}
-
-// H2 returns the underlying H2Transport.
-func (c *CompositeTransport) H2() *H2Transport {
-	return c.h2
-}
-
-// GetConn retrieves a connection for sessionID from whichever transport hosts the session.
-func (c *CompositeTransport) GetConn(ctx context.Context, sessionID string) (net.Conn, error) {
-	conn, _, err := c.GetConnForSessions(ctx, []string{sessionID})
-	return conn, err
-}
-
-// GetConnForSessions searches candidate sessions in order across H2 and TCP pool transports.
-// It snapshots all notification channels BEFORE checking sessions to guarantee no lost wakeups.
-func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs []string) (net.Conn, string, error) {
-	for {
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return nil, "", net.ErrClosed
-		}
-		c.mu.Unlock()
-
-		// Read notify channels before scanning to avoid missed notifications / lost wakeups
-		c.pool.mu.Lock()
-		poolNotify := c.pool.notifyCh
-		c.pool.mu.Unlock()
-
-		c.h2.mu.Lock()
-		h2Notify := c.h2.notifyCh
-		c.h2.mu.Unlock()
-
-		for _, sid := range sessionIDs {
-			// Check H2 transport first with non-blocking TryGetConn
-			if c.h2.HasSession(sid) {
-				conn, err := c.h2.TryGetConn(ctx, sid)
-				if err != nil {
-					if ctx.Err() != nil {
-						return nil, "", ctx.Err()
-					}
-					// Error on H2 for this session; continue checking TCP pool for this same session below
-				} else if conn != nil {
-					return conn, sid, nil
-				}
-			}
-
-			// Check TCP pool transport next with non-blocking TryGetConn
-			if conn, err := c.pool.TryGetConn(sid); err != nil {
-				return nil, "", err
-			} else if conn != nil {
-				return conn, sid, nil
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, "", ctx.Err()
-		case <-poolNotify:
-		case <-h2Notify:
-		}
-	}
-}
-
-// Close closes all underlying transports.
-func (c *CompositeTransport) Close() error {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return nil
-	}
-	c.closed = true
-	c.mu.Unlock()
-
-	var errs []error
-	if err := c.pool.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	if err := c.h2.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
 }
 
 func generateConnID() string {

@@ -20,18 +20,14 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/http"
-	"os"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
-	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -40,11 +36,6 @@ import (
 const (
 	// DefaultPoolSize is the default number of idle pooled reverse tunnel connections.
 	DefaultPoolSize = 4
-
-	// TransportModeTCP only uses TCP pool tunnel transport.
-	TransportModeTCP = "tcp"
-	// TransportModeH2 only uses HTTP/2 CONNECT multiplexed tunnel transport.
-	TransportModeH2 = "h2"
 )
 
 // ManagerOption configures a Manager.
@@ -62,36 +53,6 @@ func WithPoolSize(size int) ManagerOption {
 	return func(m *Manager) {
 		if size > 0 {
 			m.poolSize = size
-		}
-	}
-}
-
-// WithTransport sets the transport mode (tcp, h2).
-func WithTransport(mode string) ManagerOption {
-	return func(m *Manager) {
-		switch mode {
-		case TransportModeTCP, TransportModeH2:
-			m.transportMode = mode
-		default:
-			m.transportMode = TransportModeTCP
-		}
-	}
-}
-
-// WithH2PingInterval sets the interval for sending HTTP/2 PINGs on idle connections.
-func WithH2PingInterval(d time.Duration) ManagerOption {
-	return func(m *Manager) {
-		if d > 0 {
-			m.h2PingInterval = d
-		}
-	}
-}
-
-// WithH2DrainTimeout sets the timeout for draining in-flight streams on GOAWAY.
-func WithH2DrainTimeout(d time.Duration) ManagerOption {
-	return func(m *Manager) {
-		if d > 0 {
-			m.h2DrainTimeout = d
 		}
 	}
 }
@@ -123,12 +84,9 @@ func WithBackoff(min, max time.Duration) ManagerOption {
 type Manager struct {
 	client          *client.Client
 	listener        *Listener
-	transportMode   string
 	poolSize        int
 	dialTimeout     time.Duration
 	registerTimeout time.Duration
-	h2PingInterval  time.Duration
-	h2DrainTimeout  time.Duration
 	backoffMin      time.Duration
 	backoffMax      time.Duration
 
@@ -150,12 +108,9 @@ func NewManager(c *client.Client, opts ...ManagerOption) *Manager {
 	m := &Manager{
 		client:          c,
 		listener:        NewListener(),
-		transportMode:   TransportModeTCP,
 		poolSize:        DefaultPoolSize,
 		dialTimeout:     10 * time.Second,
 		registerTimeout: 5 * time.Second,
-		h2PingInterval:  api.DefaultH2PingInterval,
-		h2DrainTimeout:  api.DefaultH2DrainTimeout,
 		backoffMin:      200 * time.Millisecond,
 		backoffMax:      5 * time.Second,
 		updateCh:        make(chan struct{}, 1),
@@ -362,7 +317,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		}
 	})
 
-	// Main session loop managing TCP pool or H2
+	// Main session loop managing TCP pool
 	g.Go(func() error {
 		backoff := m.backoffMin
 
@@ -371,12 +326,7 @@ func (m *Manager) Run(ctx context.Context) error {
 				return nil
 			}
 
-			switch m.transportMode {
-			case TransportModeH2:
-				m.runH2SessionWithBackoff(ctx, &backoff)
-			default:
-				m.runTCPSessionWithBackoff(ctx, &backoff)
-			}
+			m.runTCPSessionWithBackoff(ctx, &backoff)
 		}
 	})
 
@@ -540,237 +490,6 @@ func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-cha
 	}
 }
 
-func (m *Manager) runH2SessionWithBackoff(ctx context.Context, backoff *time.Duration) {
-	// The session context outlives ctx so that when ctx is cancelled (e.g. on
-	// manager shutdown), the frontend session control stream stays alive while
-	// runH2Pool drains in-flight streams with GOAWAY. sessCancel is called when
-	// runH2Pool returns.
-	sessCtx, sessCancel := context.WithCancel(context.Background())
-	defer sessCancel()
-
-	sessID, sessErrCh, err := m.client.StartSession(sessCtx)
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		klog.Warningf("Failed to start H2 session with frontend: %v. Reconnecting in %v...", err, *backoff)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(*backoff):
-		}
-		*backoff = min(*backoff*2, m.backoffMax)
-		return
-	}
-
-	*backoff = m.backoffMin
-
-	m.mu.Lock()
-	m.connected = true
-	m.sessionID = sessID
-	m.generation++
-	m.mu.Unlock()
-	m.notifyListeners()
-
-	klog.Infof("Established H2 session %s with frontend", sessID)
-	m.triggerRegistration()
-
-	m.runH2Pool(ctx, sessID, sessErrCh)
-	sessCancel()
-
-	m.mu.Lock()
-	m.connected = false
-	m.sessionID = ""
-	m.mu.Unlock()
-	m.notifyListeners()
-
-	if ctx.Err() != nil {
-		return
-	}
-
-	klog.Warningf("H2 session %s ended. Reconnecting in %v...", sessID, *backoff)
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(*backoff):
-	}
-}
-
-func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-chan error) {
-	poolCtx, poolCancel := context.WithCancel(ctx)
-	defer poolCancel()
-
-	refillCh := make(chan struct{}, m.poolSize*2)
-	activeConnsMu := sync.Mutex{}
-	activeConns := 0
-
-	var connsWg sync.WaitGroup
-	var pooledConnsMu sync.Mutex
-	pooledConns := make(map[net.Conn]struct{})
-
-	h2Server := api.DefaultH2Server()
-	if m.h2PingInterval > 0 {
-		h2Server.ReadIdleTimeout = m.h2PingInterval
-	}
-	hs := &http.Server{}
-	if err := http2.ConfigureServer(hs, h2Server); err != nil {
-		klog.Errorf("Failed to configure HTTP/2 server: %v", err)
-	}
-
-	triggerRefill := func() {
-		select {
-		case refillCh <- struct{}{}:
-		default:
-		}
-	}
-
-	dialOne := func() {
-		activeConnsMu.Lock()
-		if poolCtx.Err() != nil || activeConns >= m.poolSize {
-			activeConnsMu.Unlock()
-			return
-		}
-		activeConns++
-		activeConnsMu.Unlock()
-
-		go func() {
-			dialCtx, cancel := context.WithTimeout(poolCtx, m.dialTimeout)
-			conn, err := m.client.DialH2Tunnel(dialCtx, sessionID)
-			cancel()
-
-			if err != nil {
-				activeConnsMu.Lock()
-				activeConns--
-				activeConnsMu.Unlock()
-
-				if poolCtx.Err() == nil {
-					klog.Errorf("Failed to dial H2 tunnel connection for session %s: %v", sessionID, err)
-					time.Sleep(200 * time.Millisecond)
-					triggerRefill()
-				}
-				return
-			}
-
-			if poolCtx.Err() != nil {
-				closeConn(conn)
-				activeConnsMu.Lock()
-				activeConns--
-				activeConnsMu.Unlock()
-				return
-			}
-
-			connsWg.Add(1)
-			defer connsWg.Done()
-
-			pooledConnsMu.Lock()
-			pooledConns[conn] = struct{}{}
-			pooledConnsMu.Unlock()
-
-			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodConnect {
-					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-					return
-				}
-
-				w.WriteHeader(http.StatusOK)
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
-
-				reqCtx, cancelReq := context.WithCancel(r.Context())
-				streamConn := newServerStreamConn(w, r.Body, cancelReq, conn)
-				defer func() {
-					closeConn(streamConn)
-					// Ensure all in-flight Writes have finished before handler returns!
-					streamConn.inFlight.Wait()
-				}()
-
-				go func() {
-					select {
-					case <-reqCtx.Done():
-						closeConn(streamConn)
-					case <-streamConn.Done():
-					}
-				}()
-
-				go func() {
-					if err := m.handleTunnelConn(streamConn); err != nil {
-						closeConn(streamConn)
-					}
-				}()
-
-				streamConn.RunDrainLoop()
-			})
-
-			h2Server.ServeConn(conn, &http2.ServeConnOpts{
-				Handler: handler,
-			})
-			closeConn(conn)
-
-			pooledConnsMu.Lock()
-			delete(pooledConns, conn)
-			pooledConnsMu.Unlock()
-
-			activeConnsMu.Lock()
-			activeConns--
-			activeConnsMu.Unlock()
-
-			if poolCtx.Err() == nil {
-				triggerRefill()
-			}
-		}()
-	}
-
-	// Initial fill of the pool
-	for i := 0; i < m.poolSize; i++ {
-		dialOne()
-	}
-
-	drain := func() {
-		poolCancel()
-
-		drainCtx, drainCancel := context.WithTimeout(context.Background(), m.h2DrainTimeout)
-		defer drainCancel()
-
-		if err := hs.Shutdown(drainCtx); err != nil {
-			klog.V(2).Infof("H2 server shutdown error: %v", err)
-		}
-
-		drainDone := make(chan struct{})
-		go func() {
-			connsWg.Wait()
-			close(drainDone)
-		}()
-
-		select {
-		case <-drainDone:
-		case <-drainCtx.Done():
-			pooledConnsMu.Lock()
-			for c := range pooledConns {
-				closeConn(c)
-			}
-			pooledConnsMu.Unlock()
-			<-drainDone
-		}
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			drain()
-			return
-		case err := <-sessErrCh:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				klog.Warningf("Session error from frontend: %v", err)
-			}
-			drain()
-			return
-		case <-refillCh:
-			dialOne()
-		}
-	}
-}
-
 type notifyFirstByteConn struct {
 	net.Conn
 	onFirstByte func()
@@ -783,302 +502,6 @@ func (c *notifyFirstByteConn) Read(b []byte) (int, error) {
 		c.once.Do(c.onFirstByte)
 	}
 	return n, err
-}
-
-var h2CopyBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 64*1024)
-		return &b
-	},
-}
-
-// ServerStreamConn implements net.Conn over an HTTP/2 CONNECT server stream.
-type ServerStreamConn struct {
-	w          http.ResponseWriter
-	flusher    http.Flusher
-	r          io.ReadCloser
-	cancelCtx  context.CancelFunc
-	underlying net.Conn
-	doneCh     chan struct{}
-	closeOnce  sync.Once
-	queue      *api.H2ChunkQueue
-	drainBuf   []byte
-
-	mu            sync.Mutex
-	closed        bool
-	inFlight      sync.WaitGroup
-	readDeadline  time.Time
-	writeDeadline time.Time
-	readTimer     *time.Timer
-	writeTimer    *time.Timer
-}
-
-type serverStreamConn = ServerStreamConn
-
-// NewServerStreamConn creates a new ServerStreamConn.
-func NewServerStreamConn(w http.ResponseWriter, r io.ReadCloser, cancelCtx context.CancelFunc, underlying net.Conn) *ServerStreamConn {
-	flusher, _ := w.(http.Flusher)
-	return &ServerStreamConn{
-		w:          w,
-		flusher:    flusher,
-		r:          r,
-		cancelCtx:  cancelCtx,
-		underlying: underlying,
-		doneCh:     make(chan struct{}),
-		queue:      api.NewH2ChunkQueue(api.DefaultH2StreamQueueBound),
-	}
-}
-
-func newServerStreamConn(w http.ResponseWriter, r io.ReadCloser, cancelCtx context.CancelFunc, underlying net.Conn) *ServerStreamConn {
-	return NewServerStreamConn(w, r, cancelCtx, underlying)
-}
-
-func (s *serverStreamConn) Done() <-chan struct{} {
-	return s.doneCh
-}
-
-// RunDrainLoop drains queued writes into w until the stream or queue is closed.
-// It is intended to run directly inside the HTTP/2 stream's handler goroutine.
-func (s *serverStreamConn) RunDrainLoop() {
-	for {
-		n, err := s.queue.TakeAll(&s.drainBuf)
-		if n > 0 {
-			s.inFlight.Add(1)
-			_, werr := s.w.Write(s.drainBuf)
-			if s.flusher != nil && n < 4096 {
-				s.flusher.Flush()
-			}
-			s.inFlight.Done()
-			if werr != nil {
-				closeConn(s)
-				return
-			}
-		}
-		if err != nil {
-			closeConn(s)
-			return
-		}
-	}
-}
-
-func (s *serverStreamConn) WriteTo(w io.Writer) (int64, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return 0, net.ErrClosed
-	}
-	s.mu.Unlock()
-
-	var first [4096]byte
-	nr, rerr := s.Read(first[:])
-	var written int64
-	if nr > 0 {
-		nw, werr := w.Write(first[:nr])
-		if nw > 0 {
-			written += int64(nw)
-		}
-		if werr != nil {
-			return written, werr
-		}
-		if nr != nw {
-			return written, io.ErrShortWrite
-		}
-	}
-	if rerr != nil {
-		if rerr == io.EOF {
-			rerr = nil
-		}
-		return written, rerr
-	}
-
-	bufPtr := h2CopyBufPool.Get().(*[]byte)
-	defer h2CopyBufPool.Put(bufPtr)
-	buf := *bufPtr
-
-	for {
-		nr, rerr := s.Read(buf)
-		if nr > 0 {
-			nw, werr := w.Write(buf[:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if werr != nil {
-				return written, werr
-			}
-			if nr != nw {
-				return written, io.ErrShortWrite
-			}
-		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				rerr = nil
-			}
-			return written, rerr
-		}
-	}
-}
-
-func (s *serverStreamConn) ReadFrom(r io.Reader) (int64, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return 0, net.ErrClosed
-	}
-	s.mu.Unlock()
-
-	var first [4096]byte
-	nr, rerr := r.Read(first[:])
-	var written int64
-	if nr > 0 {
-		nw, werr := s.Write(first[:nr])
-		if nw > 0 {
-			written += int64(nw)
-		}
-		if werr != nil {
-			return written, werr
-		}
-		if nr != nw {
-			return written, io.ErrShortWrite
-		}
-	}
-	if rerr != nil {
-		if rerr == io.EOF {
-			rerr = nil
-		}
-		return written, rerr
-	}
-
-	bufPtr := h2CopyBufPool.Get().(*[]byte)
-	defer h2CopyBufPool.Put(bufPtr)
-	buf := *bufPtr
-
-	for {
-		nr, rerr := r.Read(buf)
-		if nr > 0 {
-			nw, werr := s.Write(buf[:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if werr != nil {
-				return written, werr
-			}
-			if nr != nw {
-				return written, io.ErrShortWrite
-			}
-		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				rerr = nil
-			}
-			return written, rerr
-		}
-	}
-}
-
-func (s *serverStreamConn) Read(b []byte) (int, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return 0, net.ErrClosed
-	}
-	if !s.readDeadline.IsZero() && time.Now().After(s.readDeadline) {
-		s.mu.Unlock()
-		return 0, os.ErrDeadlineExceeded
-	}
-	s.mu.Unlock()
-
-	return s.r.Read(b)
-}
-
-func (s *serverStreamConn) Write(b []byte) (int, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return 0, net.ErrClosed
-	}
-	if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
-		s.mu.Unlock()
-		return 0, os.ErrDeadlineExceeded
-	}
-	s.mu.Unlock()
-
-	return s.queue.Write(b)
-}
-
-func (s *serverStreamConn) SetReadDeadline(t time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.readDeadline = t
-	if s.readTimer != nil {
-		s.readTimer.Stop()
-		s.readTimer = nil
-	}
-	if !t.IsZero() && time.Until(t) > 0 {
-		s.readTimer = time.AfterFunc(time.Until(t), func() {
-			closeConn(s.r)
-		})
-	}
-	return nil
-}
-
-func (s *serverStreamConn) SetWriteDeadline(t time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writeDeadline = t
-	s.queue.SetWriteDeadline(t)
-	if s.writeTimer != nil {
-		s.writeTimer.Stop()
-		s.writeTimer = nil
-	}
-	if !t.IsZero() && time.Until(t) > 0 {
-		s.writeTimer = time.AfterFunc(time.Until(t), func() {
-			s.queue.Wake()
-		})
-	}
-	return nil
-}
-
-func (s *serverStreamConn) SetDeadline(t time.Time) error {
-	if err := s.SetReadDeadline(t); err != nil {
-		return err
-	}
-	return s.SetWriteDeadline(t)
-}
-
-func (s *serverStreamConn) Close() error {
-	s.closeOnce.Do(func() {
-		s.mu.Lock()
-		s.closed = true
-		if s.readTimer != nil {
-			s.readTimer.Stop()
-		}
-		if s.writeTimer != nil {
-			s.writeTimer.Stop()
-		}
-		s.mu.Unlock()
-
-		if s.cancelCtx != nil {
-			s.cancelCtx()
-		}
-		closeConn(s.queue)
-		closeConn(s.r)
-		close(s.doneCh)
-	})
-	return nil
-}
-
-func (s *serverStreamConn) LocalAddr() net.Addr {
-	if s.underlying != nil {
-		return s.underlying.LocalAddr()
-	}
-	return nil
-}
-
-func (s *serverStreamConn) RemoteAddr() net.Addr {
-	if s.underlying != nil {
-		return s.underlying.RemoteAddr()
-	}
-	return nil
 }
 
 func closeConn(c io.Closer) {
