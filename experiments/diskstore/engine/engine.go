@@ -1049,12 +1049,9 @@ func (s *Engine) putRecordIntoSlottedPageLocked(qKey string, payload []byte, lsn
 		s.activeSlottedPage = targetPage
 	}
 
-	handle, err := s.bp.PinPage(targetPage)
+	handle, err := s.bp.PinOrAllocatePage(targetPage, 1, lsn)
 	if err != nil {
-		handle, err = s.bp.AllocateNewPage(targetPage, 1, lsn)
-		if err != nil {
-			return 0, 0, err
-		}
+		return 0, 0, err
 	}
 
 	handle.Desc.Mu.Lock()

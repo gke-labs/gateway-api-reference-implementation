@@ -441,6 +441,19 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 	return &PageHandle{pool: bp, Desc: desc}, nil
 }
 
+// PinOrAllocatePage returns the pinned page, allocating it when it doesn't exist,
+// and returns an error only for a real failure.
+func (bp *BlockPool) PinOrAllocatePage(logicalPage uint64, numBlocks int, lsn uint64) (*PageHandle, error) {
+	handle, err := bp.PinPage(logicalPage)
+	if err == nil {
+		return handle, nil
+	}
+	if errors.Is(err, ErrPageNotFound) {
+		return bp.AllocateNewPage(logicalPage, numBlocks, lsn)
+	}
+	return nil, err
+}
+
 // FreePage releases the pool blocks and disk locations for a discarded or cleared logical page.
 func (bp *BlockPool) FreePage(logicalPage uint64) {
 	bp.mu.Lock()

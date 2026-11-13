@@ -16,6 +16,7 @@ package engine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -821,5 +822,80 @@ func TestRegression_BlockPoolInFlightWait(t *testing.T) {
 		defer handle3.Unpin()
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for AllocateNewPage after flush completed")
+	}
+}
+
+type faultDirectIO struct {
+	base    DirectIO
+	readErr error
+}
+
+func (f *faultDirectIO) Readv(file File, off int64, iov [][]byte) error {
+	if f.readErr != nil {
+		return f.readErr
+	}
+	return f.base.Readv(file, off, iov)
+}
+
+func (f *faultDirectIO) Writev(file File, off int64, iov [][]byte) error {
+	return f.base.Writev(file, off, iov)
+}
+
+func (f *faultDirectIO) Write(file File, off int64, buffer []byte) error {
+	return f.base.Write(file, off, buffer)
+}
+
+func TestBlockPool_PinOrAllocatePage_ReadErrorDoesNotAllocate(t *testing.T) {
+	memFS := NewMemFS()
+	rawHeapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
+	defer rawHeapFile.Close()
+
+	buddy := NewBuddyAllocator(512)
+	var dbID [16]byte
+	bp := NewBlockPool(rawHeapFile, nil, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 4})
+	defer bp.Close()
+
+	injectedErr := errors.New("injected read I/O error")
+	bp.directIO = &faultDirectIO{base: bp.directIO, readErr: injectedErr}
+
+	// Register page 1 descriptor pretending it is on disk (evicted from memory).
+	bp.mu.Lock()
+	bp.pageTable[1] = &PageDesc{
+		LogicalPage:   1,
+		NumBlocks:     1,
+		PhysicalBlock: 0,
+		DurableLoc:    0,
+	}
+	bp.mu.Unlock()
+
+	// PinOrAllocatePage on page 1 must fail with the injected read error and must NOT allocate a new page.
+	handle, err := bp.PinOrAllocatePage(1, 1, 100)
+	if err == nil {
+		handle.Unpin()
+		t.Fatalf("expected error from PinOrAllocatePage, got nil")
+	}
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected error %v, got %v", injectedErr, err)
+	}
+
+	bp.mu.Lock()
+	desc := bp.pageTable[1]
+	if desc != nil && len(desc.PoolBlocks) > 0 {
+		bp.mu.Unlock()
+		t.Fatalf("page should not have been allocated after read failure")
+	}
+	bp.mu.Unlock()
+
+	// A non-existent page (e.g. page 2) must be allocated successfully.
+	h2, err := bp.PinOrAllocatePage(2, 1, 200)
+	if err != nil {
+		t.Fatalf("PinOrAllocatePage for non-existent page failed: %v", err)
+	}
+	defer h2.Unpin()
+	if h2.Desc.LogicalPage != 2 {
+		t.Fatalf("expected allocated page 2, got %d", h2.Desc.LogicalPage)
 	}
 }

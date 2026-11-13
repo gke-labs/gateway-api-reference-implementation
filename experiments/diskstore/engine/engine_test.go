@@ -1451,6 +1451,66 @@ func TestGet_PinPageFailurePreservesCause(t *testing.T) {
 	}
 }
 
+// TestPut_PinFailureDoesNotAllocate verifies that when pinning a page fails with an
+// injected I/O error, Put returns the error and does not allocate a new page.
+func TestPut_PinFailureDoesNotAllocate(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := Open(WithFS(memFS), WithDir("pin_fail_test"), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	table := "TestTable"
+	key := "k1"
+	if err := store.Put(table, key, []byte("val1")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	qKey := qualifyKey(table, key)
+	store.keyMu.RLock()
+	entry := store.keyIndex[qKey]
+	store.keyMu.RUnlock()
+
+	// Flush page to disk so it has a valid disk location
+	if err := store.bp.FlushPage(entry.LogicalPage); err != nil {
+		t.Fatalf("FlushPage failed: %v", err)
+	}
+	if err := store.heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := store.bp.PromoteFlushedToDurable(); err != nil {
+		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	}
+
+	// Evict page from memory pool blocks
+	store.bp.mu.Lock()
+	desc := store.bp.pageTable[entry.LogicalPage]
+	desc.PoolBlocks = nil
+	store.bp.mu.Unlock()
+
+	injectedErr := errors.New("injected disk read error")
+	store.bp.directIO = &faultDirectIO{base: store.bp.directIO, readErr: injectedErr}
+
+	err = store.Put(table, key, []byte("val2"))
+	if err == nil {
+		t.Fatalf("expected error from Put when pin fails with I/O error, got nil")
+	}
+	if !strings.Contains(err.Error(), injectedErr.Error()) {
+		t.Fatalf("expected error to contain %q, got: %v", injectedErr.Error(), err)
+	}
+
+	store.bp.mu.Lock()
+	if len(desc.PoolBlocks) > 0 {
+		store.bp.mu.Unlock()
+		t.Fatalf("page should not have been reallocated after pin failure")
+	}
+	store.bp.mu.Unlock()
+}
+
 func TestRegression_OversizePutAfterWipe(t *testing.T) {
 	oversizePayload := make([]byte, 3*1024*1024)
 	copy(oversizePayload, []byte("large-payload-after-wipe"))
