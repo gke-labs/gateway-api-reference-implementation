@@ -524,6 +524,65 @@ Recompute Latency Comparison:
 
 ---
 
+## Torture Testing (Randomized Crash, Fault, and Concurrency Testing)
+
+The `experiments/diskstore/engine` package includes an exhaustive torture-test suite to find subtle crash-consistency, concurrency, corruption, and I/O-error bugs.
+
+### 1. Test Architecture
+
+The suite is composed of seven specialized test categories:
+1. **Model-Based Randomized Workloads (`TestDiskStoreTorture`):** Generates seeded sequences of operations (`Put`, `Update` across page classes, `Delete`, indexer `Replace`, `Checkpoint`, clean reopen, and crash-recovery cycles) and asserts that after every crash and recovery, store contents and progress tokens match an authoritative `ReferenceModel` at an LSN between `lastDurableLSN` and `lastAckLSN`.
+2. **Crash Points at Every I/O Operation (`TestTorture_CrashPointsAtEveryIO`):** Runs the workload once in a dry-run to count intercepted I/O operations, then crashes at each operation in turn (or at a distributed sample in short mode) and verifies consistency upon recovery.
+3. **Crash Cycles During Critical Phases (`TestTorture_CrashCycles`):** Injects crash points during recovery redo page flushes, mid-checkpoint heap fsyncs, WAL segment rotation, and WAL truncation.
+4. **Rich Fault Models in `FaultFS`:**
+   - **512-Byte Sector Tearing & Reordering:** Partial sector-granularity persistence on power loss.
+   - **Device Volatile Write Cache:** Completed writes survive a process crash (in OS page cache) but are dropped on simulated power loss unless covered by fsync.
+   - **Lost Metadata:** File creations, renames, and removals in directories not confirmed by `SyncDir` are reverted on power loss.
+   - **I/O Errors & ENOSPC:** Read, write, and sync errors (both one-shot and sticky), short reads/writes, and `ENOSPC`.
+   - **Silent Corruption & Stale Reads:** Bit flips in block headers and WAL records detected by CRC32C; stale page versions detected and never served as valid data.
+5. **Concurrency Torture (`TestTorture_Concurrency`):** Multiple concurrent readers (`Get`), listers (`List`), a mutating writer, a checkpointer, and the background writer running simultaneously under `go test -race`. A progress `Watchdog` fails the test with a full goroutine stack trace if any lack of progress exceeds the timeout.
+6. **Structural Invariant Checks (`CheckStructuralInvariants`):** Deep audit verifying:
+   - No buffer-pool frame leaks and no duplicate frame assignments.
+   - Buddy allocator blocks never overlap, free lists are disjoint, and every allocated block corresponds to an active page location.
+   - Every registered key index entry can be successfully read.
+   - Storage invariants (Reuse Rule and Write-Ahead Rule) hold.
+7. **Self-Checks (`TestSelfCheck_*`):** Tests that break the store on purpose behind test hooks to prove the suite catches every fault model and invariant violation.
+8. **Real-Disk Mode (Linux):** Child process crash loop with `SIGKILL` (`TEST_REAL_DISK=1`), `dm-log-writes` power-loss simulation (`TEST_DM_LOG_WRITES=1`), and `dm-error` / `dm-flakey` (`TEST_DM_ERROR=1`).
+
+### 2. Running the Torture Tests
+
+- **Short Mode (CI Default):**
+  Runs bounded iterations of fixed seeds within ~30 seconds:
+  ```bash
+  go test -v -short -race ./experiments/diskstore/engine/
+  ```
+
+- **Long Mode (Configurable Duration and Seed):**
+  Configure duration and seeds via environment variables:
+  ```bash
+  # Run continuous randomized testing for 10 minutes
+  DISKSTORE_TORTURE_DURATION=10m go test -v ./experiments/diskstore/engine/ -run TestDiskStoreTorture
+
+  # Run concurrency torture for 30 seconds under -race
+  DISKSTORE_TORTURE_CONCURRENCY_DURATION=30s go test -v -race ./experiments/diskstore/engine/ -run TestTorture_Concurrency
+
+  # Enumerate and test all I/O crash points without sampling
+  TEST_TORTURE_CRASH_POINTS=all go test -v ./experiments/diskstore/engine/ -run TestTorture_CrashPointsAtEveryIO
+  ```
+
+- **Reproducing a Failure:**
+  Every failure message outputs the seed, operation number, and a copy-paste reproduction command:
+  ```bash
+  TEST_TORTURE_SEED=101 TEST_TORTURE_OP=17 go test -v -run TestDiskStoreTorture ./experiments/diskstore/engine/...
+  ```
+
+- **Real-Disk Mode (Linux):**
+  ```bash
+  TEST_REAL_DISK=1 go test -v ./experiments/diskstore/engine/ -run TestRealDisk_ProcessCrashLoop
+  ```
+
+---
+
 ## Conclusion
 
 The `DiskStore` prototype proves that a write-ahead log combined with a self-describing 4 KiB block heap file, value compression, and fixed-size direct I/O block pool successfully resolves the `mmap` and durability flaws of `bbolt`. It provides:
