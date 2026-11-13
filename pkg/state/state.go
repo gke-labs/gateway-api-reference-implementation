@@ -114,8 +114,26 @@ func newDataplaneQueue() workqueue.TypedRateLimitingInterface[types.NamespacedNa
 type gatewayDataplaneState struct {
 	// acceptedConfig is the last config that the Gateway's data plane accepted.
 	acceptedConfig []byte
-	// lastPublishError is the error from the most recent publish attempt, or nil after a success.
-	lastPublishError error
+}
+
+// gatewayProvisioningErrors holds per-Gateway provisioning errors from different sources.
+type gatewayProvisioningErrors struct {
+	addressProvider string
+	publish         error
+}
+
+func (e gatewayProvisioningErrors) empty() bool {
+	return e.addressProvider == "" && e.publish == nil
+}
+
+func (e gatewayProvisioningErrors) message() string {
+	if e.addressProvider != "" {
+		return e.addressProvider
+	}
+	if e.publish != nil {
+		return e.publish.Error()
+	}
+	return ""
 }
 
 type State struct {
@@ -130,7 +148,7 @@ type State struct {
 	gateways              map[types.NamespacedName]*GatewayState
 	gatewayAddresses      map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
 	gatewayReadiness      map[types.NamespacedName]GatewayReadiness
-	provisioningErrors    map[types.NamespacedName]string
+	provisioningErrors    map[types.NamespacedName]gatewayProvisioningErrors
 	supportedAddressTypes []gatewayv1.AddressType
 	listenerSets          map[types.NamespacedName]*ListenerSetState
 	httpRoutes            map[types.NamespacedName]*HTTPRouteState
@@ -183,7 +201,7 @@ func NewState() *State {
 		gateways:               make(map[types.NamespacedName]*GatewayState),
 		gatewayAddresses:       make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress),
 		gatewayReadiness:       make(map[types.NamespacedName]GatewayReadiness),
-		provisioningErrors:     make(map[types.NamespacedName]string),
+		provisioningErrors:     make(map[types.NamespacedName]gatewayProvisioningErrors),
 		listenerSets:           make(map[types.NamespacedName]*ListenerSetState),
 		httpRoutes:             make(map[types.NamespacedName]*HTTPRouteState),
 		tlsRoutes:              make(map[types.NamespacedName]*TLSRouteState),
@@ -626,27 +644,38 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	}
 
 	s.mu.Lock()
-	prev := s.dataplaneState[gwKey]
 	s.dataplaneState[gwKey] = gatewayDataplaneState{
 		acceptedConfig: data,
 	}
+	if errs, ok := s.provisioningErrors[gwKey]; ok && errs.publish != nil {
+		errs.publish = nil
+		if errs.empty() {
+			delete(s.provisioningErrors, gwKey)
+		} else {
+			s.provisioningErrors[gwKey] = errs
+		}
+		s.revision++
+		s.markDirtyLocked()
+	}
 	s.mu.Unlock()
 
-	if prev.lastPublishError != nil {
-		s.SetGatewayProvisioningError(gwKey, "")
-	}
 	return nil
 }
 
 // recordPublishError records the error from a failed data-plane publish attempt on the Gateway's
-// data-plane state and reports it as a Gateway provisioning error.
+// provisioning errors.
 func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
 	s.mu.Lock()
-	dp := s.dataplaneState[gwKey]
-	dp.lastPublishError = err
-	s.dataplaneState[gwKey] = dp
-	s.mu.Unlock()
-	s.SetGatewayProvisioningError(gwKey, err.Error())
+	defer s.mu.Unlock()
+
+	errs := s.provisioningErrors[gwKey]
+	if errs.publish != nil && errs.publish.Error() == err.Error() {
+		return
+	}
+	errs.publish = err
+	s.provisioningErrors[gwKey] = errs
+	s.revision++
+	s.markDirtyLocked()
 }
 
 // enqueueChangedDataplaneConfigsLocked enqueues data-plane keys whose desired configuration changed.
@@ -720,7 +749,9 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 
 	gwProvErrs := make(map[types.NamespacedName]string)
 	for k, v := range s.provisioningErrors {
-		gwProvErrs[k] = v
+		if msg := v.message(); msg != "" {
+			gwProvErrs[k] = msg
+		}
 	}
 
 	var listenerSets []*gatewayv1.ListenerSet
@@ -1468,14 +1499,16 @@ func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if cur, ok := s.provisioningErrors[key]; ok && cur == provErr {
+	errs := s.provisioningErrors[key]
+	if errs.addressProvider == provErr {
 		return
 	}
 
-	if provErr == "" {
+	errs.addressProvider = provErr
+	if errs.empty() {
 		delete(s.provisioningErrors, key)
 	} else {
-		s.provisioningErrors[key] = provErr
+		s.provisioningErrors[key] = errs
 	}
 	s.revision++
 	s.markDirtyLocked()
