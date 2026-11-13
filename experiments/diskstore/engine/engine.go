@@ -269,8 +269,8 @@ type Engine struct {
 
 	writerMu sync.RWMutex // Single writer: serializes Put, Delete; RLock for point-in-time Scan/List
 
-	keyMu           sync.RWMutex
-	keyIndex        map[string]KeyIndexEntry // tableQualifiedKey -> KeyIndexEntry
+	keyMu    sync.RWMutex
+	keyIndex map[string]KeyIndexEntry // tableQualifiedKey -> KeyIndexEntry
 
 	inFlightMu       sync.Mutex
 	inFlightOversize map[string]int
@@ -1461,12 +1461,6 @@ func (s *Engine) Get(tableName, key string) ([]byte, bool, error) {
 		if matched {
 			return val, true, nil
 		}
-		if entry.IsOversize {
-			if err != nil {
-				return nil, false, err
-			}
-			return nil, false, nil
-		}
 		if err != nil && (errors.Is(err, ErrDecrypt) || s.isFailed()) {
 			return nil, false, err
 		}
@@ -1475,7 +1469,7 @@ func (s *Engine) Get(tableName, key string) ([]byte, bool, error) {
 		s.keyMu.RLock()
 		curEntry, stillExists := s.keyIndex[qKey]
 		s.keyMu.RUnlock()
-		if !stillExists || curEntry.LSN != entry.LSN || curEntry.LogicalPage != entry.LogicalPage {
+		if !stillExists || curEntry != entry {
 			runtime.Gosched()
 			continue // Concurrent modification, retry!
 		}
@@ -1511,16 +1505,13 @@ func (s *Engine) getLocked(tableName, key string) ([]byte, bool, error) {
 
 	val, matched, err := s.readIndexEntry(tableName, key, qKey, entry)
 	if err != nil {
-		if errors.Is(err, ErrDecrypt) {
+		if errors.Is(err, ErrDecrypt) || errors.Is(err, ErrCorruptStore) {
 			return nil, false, err
 		}
 		s.setFailed(err)
 		return nil, false, s.failErr()
 	}
 	if !matched {
-		if entry.IsOversize {
-			return nil, false, nil
-		}
 		s.setFailed(fmt.Errorf("corruption/stale read detected for %s: expected LSN %d", key, entry.LSN))
 		return nil, false, s.failErr()
 	}
