@@ -81,6 +81,7 @@ func TestGatewayAPI(t *testing.T) {
 			t.Errorf("Expected hostname example.com in response body, got: %s", logs)
 		}
 	}
+	h.LogGatewayTiming("reference-gateway", "default", "first successful request")
 
 	// 7. Run Client Pod (HTTPS - verify Alt-Svc header and certificate)
 	httpsClientPodName := "test-client-https"
