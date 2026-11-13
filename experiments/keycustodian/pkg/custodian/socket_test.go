@@ -17,11 +17,15 @@
 package custodian_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,8 +38,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func startSocketDaemon(t *testing.T, keysDirectory string, allowedUIDs []uint32, allowedGIDs []uint32) (keycustodianv1alpha1.KeyCustodianServiceClient, string) {
+func startSocketDaemon(t *testing.T, keysDirectory string, allowedUIDs []uint32, allowedGIDs []uint32, auditLoggers ...*slog.Logger) (keycustodianv1alpha1.KeyCustodianServiceClient, string) {
 	t.Helper()
+	var auditLogger *slog.Logger
+	if len(auditLoggers) > 0 {
+		auditLogger = auditLoggers[0]
+	}
+
 	socketDir, err := os.MkdirTemp("", "kc")
 	if err != nil {
 		t.Fatalf("failed to create temporary socket directory: %v", err)
@@ -46,7 +55,12 @@ func startSocketDaemon(t *testing.T, keysDirectory string, allowedUIDs []uint32,
 
 	socketPath := filepath.Join(socketDir, "custodian.sock")
 
-	custodianServer, err := custodian.NewServer(keysDirectory)
+	var serverOptions []custodian.ServerOption
+	if auditLogger != nil {
+		serverOptions = append(serverOptions, custodian.WithAuditLogger(auditLogger))
+	}
+
+	custodianServer, err := custodian.NewServer(keysDirectory, serverOptions...)
 	if err != nil {
 		t.Fatalf("failed to create custodian server: %v", err)
 	}
@@ -57,8 +71,8 @@ func startSocketDaemon(t *testing.T, keysDirectory string, allowedUIDs []uint32,
 	}
 
 	grpcServer := grpc.NewServer(
-		grpc.UnaryInterceptor(custodian.UnaryAuthInterceptor(allowedUIDs, allowedGIDs)),
-		grpc.StreamInterceptor(custodian.StreamAuthInterceptor(allowedUIDs, allowedGIDs)),
+		grpc.UnaryInterceptor(custodian.UnaryAuthInterceptor(allowedUIDs, allowedGIDs, auditLogger)),
+		grpc.StreamInterceptor(custodian.StreamAuthInterceptor(allowedUIDs, allowedGIDs, auditLogger)),
 	)
 	keycustodianv1alpha1.RegisterKeyCustodianServiceServer(grpcServer, custodianServer)
 
@@ -202,7 +216,7 @@ func (stream *fakeServerStream) SendMsg(any) error            { return nil }
 func (stream *fakeServerStream) RecvMsg(any) error            { return nil }
 
 func TestStreamAuthInterceptor_RejectsUnauthorizedStream(t *testing.T) {
-	streamInterceptor := custodian.StreamAuthInterceptor([]uint32{1000}, nil)
+	streamInterceptor := custodian.StreamAuthInterceptor([]uint32{1000}, nil, nil)
 
 	// Stream with no peer credentials in context must be rejected
 	streamWithoutCreds := &fakeServerStream{streamContext: t.Context()}
@@ -217,5 +231,113 @@ func TestStreamAuthInterceptor_RejectsUnauthorizedStream(t *testing.T) {
 	}
 	if handlerCalled {
 		t.Fatal("stream handler should not have been called for unauthorized stream")
+	}
+}
+
+func TestSocket_AuditLogPeerCredentials(t *testing.T) {
+	keysDirectory := t.TempDir()
+	generateECDSAKeyAndCertificate(t, keysDirectory, "p256")
+
+	currentUID := uint32(os.Getuid())
+	currentPID := int32(os.Getpid())
+
+	var auditBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&auditBuf, nil))
+	client, _ := startSocketDaemon(t, keysDirectory, []uint32{currentUID}, nil, logger)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	digest := sha256.Sum256([]byte("peer creds audit test"))
+	_, err := client.Sign(ctx, &keycustodianv1alpha1.SignRequest{
+		Key:           "p256",
+		HashAlgorithm: keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA256,
+		Digest:        digest[:],
+	})
+	if err != nil {
+		t.Fatalf("Sign failed: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(auditBuf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 audit line, got %d:\n%s", len(lines), auditBuf.String())
+	}
+
+	var entry auditEntry
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("failed to unmarshal audit entry: %v", err)
+	}
+
+	if entry.CallerUID == nil {
+		t.Fatalf("expected CallerUID %d, got nil", currentUID)
+	} else if *entry.CallerUID != currentUID {
+		t.Fatalf("expected CallerUID %d, got %d", currentUID, *entry.CallerUID)
+	}
+	if entry.CallerPID == nil {
+		t.Fatalf("expected CallerPID %d, got nil", currentPID)
+	} else if *entry.CallerPID != currentPID {
+		t.Fatalf("expected CallerPID %d, got %d", currentPID, *entry.CallerPID)
+	}
+	if entry.Key != "p256" {
+		t.Fatalf("expected Key p256, got %q", entry.Key)
+	}
+	if entry.HashAlgorithm != "HASH_ALGORITHM_SHA256" {
+		t.Fatalf("expected HashAlgorithm HASH_ALGORITHM_SHA256, got %q", entry.HashAlgorithm)
+	}
+	if entry.Outcome != custodian.AuditOutcomeSuccess {
+		t.Fatalf("expected Outcome %q, got %q", custodian.AuditOutcomeSuccess, entry.Outcome)
+	}
+}
+
+func TestPeerCredentialCheck_AuditLogDenied(t *testing.T) {
+	keysDirectory := t.TempDir()
+	generateECDSAKeyAndCertificate(t, keysDirectory, "p256")
+
+	currentUID := uint32(os.Getuid())
+	currentPID := int32(os.Getpid())
+	disallowedUID := currentUID + 1
+
+	var auditBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&auditBuf, nil))
+	client, _ := startSocketDaemon(t, keysDirectory, []uint32{disallowedUID}, nil, logger)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	digest := sha256.Sum256([]byte("denied caller audit test"))
+	_, err := client.Sign(ctx, &keycustodianv1alpha1.SignRequest{
+		Key:           "p256",
+		HashAlgorithm: keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA256,
+		Digest:        digest[:],
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied, got: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(auditBuf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 audit line, got %d:\n%s", len(lines), auditBuf.String())
+	}
+
+	var entry auditEntry
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("failed to unmarshal audit entry: %v", err)
+	}
+
+	if entry.Outcome != custodian.AuditOutcomeDenied {
+		t.Fatalf("expected outcome %q, got %q", custodian.AuditOutcomeDenied, entry.Outcome)
+	}
+	if entry.Method != "/keycustodian.v1alpha1.KeyCustodianService/Sign" {
+		t.Fatalf("expected method /keycustodian.v1alpha1.KeyCustodianService/Sign, got %q", entry.Method)
+	}
+	if entry.CallerUID == nil {
+		t.Fatalf("expected CallerUID %d, got nil", currentUID)
+	} else if *entry.CallerUID != currentUID {
+		t.Fatalf("expected CallerUID %d, got %d", currentUID, *entry.CallerUID)
+	}
+	if entry.CallerPID == nil {
+		t.Fatalf("expected CallerPID %d, got nil", currentPID)
+	} else if *entry.CallerPID != currentPID {
+		t.Fatalf("expected CallerPID %d, got %d", currentPID, *entry.CallerPID)
 	}
 }

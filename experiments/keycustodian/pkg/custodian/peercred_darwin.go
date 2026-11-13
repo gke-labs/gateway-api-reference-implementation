@@ -34,8 +34,13 @@ func getPeerCred(conn net.Conn) (*PeerCred, error) {
 	}
 	var credentials *unix.Xucred
 	var socketOptionErr error
+	var peerPID int
 	controlErr := rawConnection.Control(func(fileDescriptor uintptr) {
 		credentials, socketOptionErr = unix.GetsockoptXucred(int(fileDescriptor), unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
+		if socketOptionErr != nil {
+			return
+		}
+		peerPID, socketOptionErr = unix.GetsockoptInt(int(fileDescriptor), unix.SOL_LOCAL, unix.LOCAL_PEERPID)
 	})
 	if controlErr != nil {
 		return nil, controlErr
@@ -50,5 +55,6 @@ func getPeerCred(conn net.Conn) (*PeerCred, error) {
 	return &PeerCred{
 		UID: credentials.Uid,
 		GID: primaryGID,
+		PID: int32(peerPID),
 	}, nil
 }

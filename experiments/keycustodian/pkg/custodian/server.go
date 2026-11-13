@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,6 +34,14 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// Audit log outcomes.
+const (
+	AuditOutcomeSuccess  = "success"
+	AuditOutcomeRejected = "rejected"
+	AuditOutcomeError    = "error"
+	AuditOutcomeDenied   = "denied"
+)
+
 type keyEntry struct {
 	signer           crypto.Signer
 	certificateChain []byte
@@ -41,11 +50,22 @@ type keyEntry struct {
 // Server implements keycustodianv1alpha1.KeyCustodianServiceServer.
 type Server struct {
 	keycustodianv1alpha1.UnimplementedKeyCustodianServiceServer
-	keys map[string]*keyEntry
+	keys        map[string]*keyEntry
+	auditLogger *slog.Logger
+}
+
+// ServerOption configures a Server instance.
+type ServerOption func(*Server)
+
+// WithAuditLogger configures the structured audit logger.
+func WithAuditLogger(logger *slog.Logger) ServerOption {
+	return func(server *Server) {
+		server.auditLogger = logger
+	}
 }
 
 // NewServer creates a new custodian server, loading keys and certificate chains from directory.
-func NewServer(directory string) (*Server, error) {
+func NewServer(directory string, options ...ServerOption) (*Server, error) {
 	keys := make(map[string]*keyEntry)
 	if directory != "" {
 		loadedKeys, err := loadPEMDirectory(directory)
@@ -54,7 +74,11 @@ func NewServer(directory string) (*Server, error) {
 		}
 		keys = loadedKeys
 	}
-	return &Server{keys: keys}, nil
+	server := &Server{keys: keys}
+	for _, option := range options {
+		option(server)
+	}
+	return server, nil
 }
 
 func parsePrivateKey(der []byte) (crypto.Signer, error) {
@@ -174,6 +198,18 @@ func (server *Server) GetCertificateChain(ctx context.Context, req *keycustodian
 
 // Sign performs a digital signature using the specified key and hash algorithm.
 func (server *Server) Sign(ctx context.Context, req *keycustodianv1alpha1.SignRequest) (*keycustodianv1alpha1.SignResponse, error) {
+	keyName := req.Key
+	hashAlgorithm := req.HashAlgorithm.String()
+	outcome := AuditOutcomeRejected
+
+	credentials, err := CredFromContext(ctx)
+	if err != nil {
+		credentials = nil
+	}
+	defer func() {
+		auditLog(ctx, server.auditLogger, credentials, keyName, hashAlgorithm, "", outcome)
+	}()
+
 	var expectedLength int
 	var cryptoHash crypto.Hash
 	switch req.HashAlgorithm {
@@ -209,7 +245,9 @@ func (server *Server) Sign(ctx context.Context, req *keycustodianv1alpha1.SignRe
 
 	signature, err := entry.signer.Sign(rand.Reader, req.Digest, signerOptions)
 	if err != nil {
+		outcome = AuditOutcomeError
 		return nil, status.Errorf(codes.Internal, "sign failed: %v", err)
 	}
+	outcome = AuditOutcomeSuccess
 	return &keycustodianv1alpha1.SignResponse{Signature: signature}, nil
 }

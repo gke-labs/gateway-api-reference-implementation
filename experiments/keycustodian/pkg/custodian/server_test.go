@@ -15,6 +15,7 @@
 package custodian_test
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -24,7 +25,11 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"net"
 	"os"
@@ -41,6 +46,18 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
+
+type auditEntry struct {
+	Time          time.Time `json:"time"`
+	Level         string    `json:"level"`
+	Msg           string    `json:"msg"`
+	Key           string    `json:"key,omitempty"`
+	CallerUID     *uint32   `json:"caller_uid,omitempty"`
+	CallerPID     *int32    `json:"caller_pid,omitempty"`
+	HashAlgorithm string    `json:"hash_algorithm,omitempty"`
+	Method        string    `json:"method,omitempty"`
+	Outcome       string    `json:"outcome"`
+}
 
 func generateECDSAKeyAndCertificate(t *testing.T, directory, name string) *ecdsa.PrivateKey {
 	t.Helper()
@@ -108,9 +125,9 @@ func generateRSAKeyAndCertificate(t *testing.T, directory, name string) *rsa.Pri
 	return privateKey
 }
 
-func startInProcessServer(t *testing.T, keysDirectory string) keycustodianv1alpha1.KeyCustodianServiceClient {
+func startInProcessServer(t *testing.T, keysDirectory string, options ...custodian.ServerOption) keycustodianv1alpha1.KeyCustodianServiceClient {
 	t.Helper()
-	custodianServer, err := custodian.NewServer(keysDirectory)
+	custodianServer, err := custodian.NewServer(keysDirectory, options...)
 	if err != nil {
 		t.Fatalf("failed to create custodian server: %v", err)
 	}
@@ -244,9 +261,9 @@ func TestServer_WrongDigestLength(t *testing.T) {
 	defer cancel()
 
 	testCases := []struct {
-		name         string
-		hashAlgo     keycustodianv1alpha1.HashAlgorithm
-		digestLength int
+		name          string
+		hashAlgorithm keycustodianv1alpha1.HashAlgorithm
+		digestLength  int
 	}{
 		{"sha256 short", keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA256, 31},
 		{"sha256 long", keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA256, 33},
@@ -260,11 +277,11 @@ func TestServer_WrongDigestLength(t *testing.T) {
 			digest := make([]byte, testCase.digestLength)
 			_, err := client.Sign(ctx, &keycustodianv1alpha1.SignRequest{
 				Key:           "p256",
-				HashAlgorithm: testCase.hashAlgo,
+				HashAlgorithm: testCase.hashAlgorithm,
 				Digest:        digest,
 			})
 			if status.Code(err) != codes.InvalidArgument {
-				t.Fatalf("expected InvalidArgument for digest len %d with algo %v, got: %v", testCase.digestLength, testCase.hashAlgo, err)
+				t.Fatalf("expected InvalidArgument for digest len %d with algorithm %v, got: %v", testCase.digestLength, testCase.hashAlgorithm, err)
 			}
 		})
 	}
@@ -406,4 +423,100 @@ func TestServer_LoadPEMDirectoryValidation(t *testing.T) {
 			t.Fatalf("unexpected keys: %v", response.Keys)
 		}
 	})
+}
+
+func TestServer_AuditLogOutcomes(t *testing.T) {
+	keysDirectory := t.TempDir()
+	ecKey := generateECDSAKeyAndCertificate(t, keysDirectory, "p256")
+	ecKeyDER, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		t.Fatalf("MarshalECPrivateKey failed: %v", err)
+	}
+
+	var auditBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&auditBuf, nil))
+	client := startInProcessServer(t, keysDirectory,
+		custodian.WithAuditLogger(logger),
+	)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	testDigest := sha256.Sum256([]byte("sensitive-super-secret-digest-bytes-value"))
+
+	// Outcome 1: success
+	_, err = client.Sign(ctx, &keycustodianv1alpha1.SignRequest{
+		Key:           "p256",
+		HashAlgorithm: keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA256,
+		Digest:        testDigest[:],
+	})
+	if err != nil {
+		t.Fatalf("Sign failed: %v", err)
+	}
+
+	// Outcome 2: rejected (invalid digest length)
+	_, _ = client.Sign(ctx, &keycustodianv1alpha1.SignRequest{
+		Key:           "p256",
+		HashAlgorithm: keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA256,
+		Digest:        testDigest[:10],
+	})
+
+	auditOutput := auditBuf.String()
+	auditLines := strings.Split(strings.TrimSpace(auditOutput), "\n")
+	if len(auditLines) != 2 {
+		t.Fatalf("expected 2 audit lines, got %d:\n%s", len(auditLines), auditOutput)
+	}
+
+	// Assert raw digest bytes do NOT appear in the audit log
+	if strings.Contains(auditOutput, string(testDigest[:])) {
+		t.Fatalf("audit log leaked raw digest bytes")
+	}
+
+	// Assert hex-encoded digest does NOT appear in the audit log
+	hexDigest := hex.EncodeToString(testDigest[:])
+	if strings.Contains(auditOutput, hexDigest) {
+		t.Fatalf("audit log leaked hex-encoded digest: %s", hexDigest)
+	}
+
+	// Assert base64-encoded digest does NOT appear in the audit log
+	b64Digest := base64.StdEncoding.EncodeToString(testDigest[:])
+	if strings.Contains(auditOutput, b64Digest) {
+		t.Fatalf("audit log leaked base64-encoded digest: %s", b64Digest)
+	}
+
+	// Assert private key DER or PEM material does NOT appear in the audit log
+	if strings.Contains(auditOutput, string(ecKeyDER)) {
+		t.Fatalf("audit log leaked raw private key DER bytes")
+	}
+	hexKeyDER := hex.EncodeToString(ecKeyDER)
+	if strings.Contains(auditOutput, hexKeyDER) {
+		t.Fatalf("audit log leaked hex-encoded private key DER bytes")
+	}
+	if strings.Contains(auditOutput, "PRIVATE KEY") {
+		t.Fatalf("audit log contains PRIVATE KEY string")
+	}
+
+	// Verify required audit fields and outcomes
+	expectedOutcomes := []string{
+		custodian.AuditOutcomeSuccess,
+		custodian.AuditOutcomeRejected,
+	}
+	for i, line := range auditLines {
+		var entry auditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("line %d is not valid JSON: %v", i, err)
+		}
+		if entry.Outcome != expectedOutcomes[i] {
+			t.Fatalf("line %d outcome = %q, expected %q", i, entry.Outcome, expectedOutcomes[i])
+		}
+		if entry.Key != "p256" {
+			t.Fatalf("line %d key = %q, expected p256", i, entry.Key)
+		}
+		if entry.HashAlgorithm != "HASH_ALGORITHM_SHA256" {
+			t.Fatalf("line %d hash_algorithm = %q, expected HASH_ALGORITHM_SHA256", i, entry.HashAlgorithm)
+		}
+		if entry.Time.IsZero() {
+			t.Fatalf("line %d time is zero", i)
+		}
+	}
 }
