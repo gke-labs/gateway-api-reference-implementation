@@ -4523,6 +4523,23 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 	}
 }
 
+// appliedRevisions returns a copy of the mirrored applied revisions for the given Gateway.
+// It returns nil if the Gateway has no entry in the mirror.
+func (p *AddressProvider) appliedRevisions(gatewayKey types.NamespacedName) map[string][]string {
+	p.mirrorMu.Lock()
+	defer p.mirrorMu.Unlock()
+
+	mirror, ok := p.mirrors[gatewayKey]
+	if !ok {
+		return nil
+	}
+	revisionsCopy := make(map[string][]string, len(mirror.appliedRevisions))
+	for address, revisions := range mirror.appliedRevisions {
+		revisionsCopy[address] = slices.Clone(revisions)
+	}
+	return revisionsCopy
+}
+
 func TestSinglePodAddressProvider_AppliedRevisionMirror(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {

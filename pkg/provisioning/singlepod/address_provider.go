@@ -24,7 +24,6 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1266,7 +1265,9 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 		})
 	}
 	// group.Wait cannot return an error because every worker function returns nil.
-	_ = group.Wait()
+	if err := group.Wait(); err != nil {
+		klog.Errorf("unexpected error waiting for probe workers: %v", err)
+	}
 
 	p.mirrorMu.Lock()
 	for gatewayKey := range p.mirrors {
@@ -1359,29 +1360,12 @@ func (p *AddressProvider) probeEndpoint(ctx context.Context, targetURL string) (
 	return revisions, nil
 }
 
-// appliedRevisions returns a copy of the mirrored applied revisions for the given Gateway.
-// It returns nil if the Gateway has no entry in the mirror.
-func (p *AddressProvider) appliedRevisions(gatewayKey types.NamespacedName) map[string][]string {
-	p.mirrorMu.Lock()
-	defer p.mirrorMu.Unlock()
-
-	mirror, ok := p.mirrors[gatewayKey]
-	if !ok {
-		return nil
-	}
-	revisionsCopy := make(map[string][]string, len(mirror.appliedRevisions))
-	for address, revisions := range mirror.appliedRevisions {
-		revisionsCopy[address] = slices.Clone(revisions)
-	}
-	return revisionsCopy
-}
-
 // readyEndpointAddresses extracts unique IP addresses for endpoints that are ready and not terminating.
-func readyEndpointAddresses(slices []discoveryv1.EndpointSlice) []string {
+func readyEndpointAddresses(endpointSlices []discoveryv1.EndpointSlice) []string {
 	var readyEndpoints []string
 	seen := make(map[string]bool)
-	for _, slice := range slices {
-		for _, endpoint := range slice.Endpoints {
+	for _, endpointSlice := range endpointSlices {
+		for _, endpoint := range endpointSlice.Endpoints {
 			if (endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready) || (endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating) {
 				continue
 			}
@@ -1413,5 +1397,4 @@ var (
 	_ controller.AddressReadinessProvider = (*AddressProvider)(nil)
 	_ controller.AddressTypeProvider      = (*AddressProvider)(nil)
 	_ state.DataplanePublisher            = (*AddressProvider)(nil)
-	_                                     = (*AddressProvider).appliedRevisions
 )
