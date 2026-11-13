@@ -968,6 +968,7 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
 	}
+	st.UpsertGateway(gw)
 	// Config with an unparseable certificate triggers an apply error in ApplyDataplaneConfig.
 	badConfig := &DataplaneConfig{
 		GatewayName: gwKey,
@@ -997,21 +998,24 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	}
 
 	st.mu.RLock()
-	recordedErr := st.dataplaneState[gwKey].lastPublishError
-	provErr := st.provisioningErrors[gwKey]
+	errs := st.provisioningErrors[gwKey]
+	result := st.dataplaneState[gwKey].lastPublishResult
 	st.mu.RUnlock()
 
-	if recordedErr == nil {
-		t.Fatalf("expected lastPublishError to be recorded on gateway dataplane state")
+	if errs.publish == nil {
+		t.Fatalf("expected publish error to be recorded on gateway provisioning errors")
 	}
-	if recordedErr.Error() != err.Error() {
-		t.Errorf("expected recorded error %q, got %q", err.Error(), recordedErr.Error())
+	if errs.publish.Error() != err.Error() {
+		t.Errorf("expected recorded error %q, got %q", err.Error(), errs.publish.Error())
 	}
-	if !strings.HasPrefix(recordedErr.Error(), "in-process: ") {
-		t.Errorf("expected recorded error to start with %q, got %q", "in-process: ", recordedErr.Error())
+	if msg := errs.message(); msg != err.Error() {
+		t.Errorf("expected provisioning error message %q, got %q", err.Error(), msg)
 	}
-	if provErr != err.Error() {
-		t.Errorf("expected provisioning error %q, got %q", err.Error(), provErr)
+	if len(result.Rejections) != 1 {
+		t.Fatalf("expected 1 rejection in result, got %d", len(result.Rejections))
+	}
+	if result.Rejections[0].Reason != errs.publish.Error() {
+		t.Errorf("expected rejection reason %q to match recorded error %q", result.Rejections[0].Reason, errs.publish.Error())
 	}
 
 	// When a valid config is subsequently reconciled, the recorded error is cleared.
@@ -1027,15 +1031,183 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	}
 
 	st.mu.RLock()
-	clearedRecordedErr := st.dataplaneState[gwKey].lastPublishError
-	clearedProvErr := st.provisioningErrors[gwKey]
+	clearedErrs := st.provisioningErrors[gwKey]
+	validPublishResult := st.dataplaneState[gwKey].lastPublishResult
 	st.mu.RUnlock()
 
-	if clearedRecordedErr != nil {
-		t.Errorf("expected lastPublishError to be cleared, got %v", clearedRecordedErr)
+	if clearedErrs.publish != nil {
+		t.Errorf("expected publish error to be cleared, got %v", clearedErrs.publish)
 	}
-	if clearedProvErr != "" {
-		t.Errorf("expected provisioning error to be cleared, got %q", clearedProvErr)
+	if msg := clearedErrs.message(); msg != "" {
+		t.Errorf("expected provisioning error to be cleared, got %q", msg)
+	}
+	if validPublishResult.Applied != 1 {
+		t.Errorf("expected Applied=1 after valid config, got %d", validPublishResult.Applied)
+	}
+	if len(validPublishResult.Rejections) != 0 {
+		t.Errorf("expected 0 rejections after valid config, got %d", len(validPublishResult.Rejections))
+	}
+}
+
+func TestState_PublishAndProvisioningErrors_DoNotOverwriteOrClearEachOther(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	pubErr := errors.New("simulated publish failure")
+	mockPub := &mockDataplanePublisher{
+		publishErr: pubErr,
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// 1. Initial publish fails with pubErr. Wait for it to be recorded.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == pubErr.Error()
+	})
+
+	st.mu.RLock()
+	errs := st.provisioningErrors[gwKey]
+	st.mu.RUnlock()
+	if errs.publish == nil || errs.publish.Error() != pubErr.Error() {
+		t.Fatalf("expected publish error %v, got %v", pubErr, errs.publish)
+	}
+	if errs.addressProvider != "" {
+		t.Fatalf("expected empty addressProvider error, got %q", errs.addressProvider)
+	}
+
+	// 2. Report a provisioning error from an address provider.
+	addrErr := "conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw"
+	st.SetGatewayProvisioningError(gwKey, addrErr)
+
+	// Verify both errors exist in the single record and neither overwrote the other.
+	st.mu.RLock()
+	errs = st.provisioningErrors[gwKey]
+	st.mu.RUnlock()
+	if errs.addressProvider != addrErr {
+		t.Errorf("expected addressProvider error %q, got %q", addrErr, errs.addressProvider)
+	}
+	if errs.publish == nil || errs.publish.Error() != pubErr.Error() {
+		t.Errorf("expected publish error %v to be preserved, got %v", pubErr, errs.publish)
+	}
+
+	// 3. Resolve the publish error: publisher succeeds.
+	mockPub.setPublishErr(nil)
+	// Mutate listener port to change DataplaneConfig and trigger republish.
+	gw.Spec.Listeners[0].Port = 8080
+	st.UpsertGateway(gw)
+
+	// Wait until publish succeeds and clears publish error; addressProvider error must NOT be cleared.
+	pollUntil(t, 2*time.Second, func() bool {
+		st.mu.RLock()
+		defer st.mu.RUnlock()
+		e := st.provisioningErrors[gwKey]
+		return e.publish == nil && e.addressProvider == addrErr
+	})
+
+	// Gateway status must show Programmed=False with the address provider error.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == addrErr
+	})
+
+	// 4. Trigger publish error again while address provider error is still present.
+	mockPub.setPublishErr(pubErr)
+	gw.Spec.Listeners[0].Port = 8081
+	st.UpsertGateway(gw)
+
+	pollUntil(t, 2*time.Second, func() bool {
+		st.mu.RLock()
+		defer st.mu.RUnlock()
+		e := st.provisioningErrors[gwKey]
+		return e.publish != nil && e.addressProvider == addrErr
+	})
+
+	// 5. Clear the address provider provisioning error (address provider succeeds).
+	st.SetGatewayProvisioningError(gwKey, "")
+
+	// Verify addressProvider error was cleared, but publish error was NOT cleared.
+	st.mu.RLock()
+	errs = st.provisioningErrors[gwKey]
+	st.mu.RUnlock()
+	if errs.addressProvider != "" {
+		t.Errorf("expected addressProvider error to be cleared, got %q", errs.addressProvider)
+	}
+	if errs.publish == nil || errs.publish.Error() != pubErr.Error() {
+		t.Errorf("expected publish error %v to remain, got %v", pubErr, errs.publish)
+	}
+
+	// Gateway status condition should now show Programmed=False with the publish error.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == pubErr.Error()
+	})
+
+	// 6. Finally, resolve the publish error as well.
+	mockPub.setPublishErr(nil)
+	gw.Spec.Listeners[0].Port = 8082
+	st.UpsertGateway(gw)
+
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionTrue && progCond.Reason == string(gatewayv1.GatewayReasonProgrammed)
+	})
+
+	// Deleting the Gateway removes its record.
+	st.DeleteGateway(gwKey)
+	st.mu.RLock()
+	_, exists := st.provisioningErrors[gwKey]
+	st.mu.RUnlock()
+	if exists {
+		t.Errorf("expected provisioningErrors record to be removed after Gateway delete")
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
 	}
 }
 
@@ -1112,10 +1284,11 @@ func TestState_PublishDataplaneConfig_NeverAnsweringPublisher(t *testing.T) {
 
 	st.mu.RLock()
 	dataplaneState := st.dataplaneState[gwKey]
+	errs := st.provisioningErrors[gwKey]
 	st.mu.RUnlock()
 
-	if dataplaneState.lastPublishError != nil {
-		t.Errorf("expected no publish error, got: %v", dataplaneState.lastPublishError)
+	if errs.publish != nil {
+		t.Errorf("expected no publish error, got: %v", errs.publish)
 	}
 	if dataplaneState.acceptedConfig == nil {
 		t.Errorf("expected acceptedConfig to be saved in dataplane state")
