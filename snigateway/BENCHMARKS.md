@@ -61,7 +61,7 @@ Previous benchmarks compared a hand-rolled raw QUIC loop against an `http.Server
 
 Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27.3, commit 90a731b plus this change):
 
-The WireGuard transport was removed after these measurements were recorded.
+The WireGuard transport was removed after these measurements were recorded. The QUIC transport was removed after these measurements were recorded.
 
 ### 3.1 Loopback Saturation Baseline (Comparable Transport Data)
 

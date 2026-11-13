@@ -42,11 +42,9 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "leader-election-id", DefValue: "snigateway-controller", Usage: "The ID used for leader election."},
 		{Name: "metrics-bind-address", DefValue: ":8080", Usage: "The address the metric endpoint binds to."},
 		{Name: "proxy-bind-address", DefValue: "", Usage: "Optional HTTP proxy bind address. Disabled by default."},
-		{Name: "quic-dial-timeout", DefValue: "3s", Usage: "Timeout for dialing QUIC connections."},
-		{Name: "quic-probe-interval", DefValue: "30s", Usage: "Interval for probing QUIC availability when in TCP fallback."},
 		{Name: "token-file", DefValue: "", Usage: "Path to ServiceAccount token file for authentication."},
 		{Name: "tunnel-pool-size", DefValue: "4", Usage: "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend when using TCP pool or H2 transport."},
-		{Name: "tunnel-transport", DefValue: "auto", Usage: "Tunnel transport to use (auto, quic, tcp, h2)."},
+		{Name: "tunnel-transport", DefValue: "tcp", Usage: "Tunnel transport to use (tcp, h2)."},
 	}
 
 	cfg := DefaultConfig()

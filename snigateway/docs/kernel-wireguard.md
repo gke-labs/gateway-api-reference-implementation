@@ -48,7 +48,7 @@ Kernel WireGuard requires elevated privileges to create network links, assign ad
   - **Frontend**: Needs `CAP_NET_ADMIN` (or root) on the host or container network namespace to create `wg0` and manage peer routes via netlink.
 - **Kernel Requirements**: Linux kernel 5.6 or later (which includes in-tree WireGuard support), or earlier kernels with the out-of-tree `wireguard.ko` module loaded.
 - **Comparison with Existing Transports**:
-  - Today's transports (`tcp`, `quic`, `h2`, and userspace `wireguard`) run entirely in userspace with zero Linux capabilities. Controller pods run under the Kubernetes `restricted` Pod Security Standard as non-root (`runAsUser: 65532`).
+  - Today's transports (`tcp`, `h2`) run entirely in userspace with zero Linux capabilities. Controller pods run under the Kubernetes `restricted` Pod Security Standard as non-root (`runAsUser: 65532`).
 - **Pod Security Standards (PSS)**:
   - `CAP_NET_ADMIN` is disallowed by both the `restricted` and `baseline` PSS levels (baseline only permits default unprivileged capabilities plus `NET_BIND_SERVICE`). Running the controller pod with kernel WireGuard requires the namespace to be configured with the `privileged` PSS level, or granted an explicit namespace exemption.
 - **Scope of `CAP_NET_ADMIN`**:
@@ -78,7 +78,7 @@ An intermediate architectural option couples `wireguard-go` with a Linux kernel 
 
 ## 5. Measurement Plan
 
-To evaluate kernel WireGuard and the TUN option against existing transports (TCP pool, QUIC, HTTP/2, and userspace WireGuard), benchmarks must run using the established harness in `snigateway/pkg/frontend/benchmark_test.go`:
+To evaluate kernel WireGuard and the TUN option against existing transports (TCP pool, HTTP/2), benchmarks must run using the established harness in `snigateway/pkg/frontend/benchmark_test.go`:
 
 - **Execution Environment (By Hand)**:
   - Kernel WireGuard and TUN devices require elevated privileges and host network manipulation that are disallowed in standard unprivileged CI runners.

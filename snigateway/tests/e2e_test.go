@@ -112,11 +112,6 @@ func TestE2ESmoke(t *testing.T) {
 	}
 	serverAddr := ln.Addr().String()
 
-	pc, err := net.ListenPacket("udp", serverAddr)
-	if err != nil {
-		t.Fatalf("net.ListenPacket failed: %v", err)
-	}
-
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
@@ -129,7 +124,7 @@ func TestE2ESmoke(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+		_ = srv.Serve(ln)
 	}()
 
 	// 3. Initialize client and tunnel Manager

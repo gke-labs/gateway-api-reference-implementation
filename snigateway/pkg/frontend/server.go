@@ -15,8 +15,6 @@
 package frontend
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -37,7 +35,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
-	"github.com/quic-go/quic-go"
 	"k8s.io/klog/v2"
 )
 
@@ -55,7 +52,6 @@ const (
 // ServerConfig holds configuration options for the frontend server.
 type ServerConfig struct {
 	ListenAddrs              []string
-	UDPListenAddrs           []string
 	InternalHostname         string
 	ServerTLSConfig          *tls.Config
 	ConnectTimeout           time.Duration
@@ -80,23 +76,20 @@ type Server struct {
 	table      *RegistrationTable
 	transport  Transport
 	pool       *PoolTransport
-	quic       *QUICTransport
 	h2         *H2Transport
 
 	internalListener *chanListener
 	httpServer       *http.Server
 
-	listenersMu   sync.Mutex
-	listeners     []net.Listener
-	udpListeners  []net.PacketConn
-	quicListeners []*quic.Listener
-	closed        bool
-	shutdownCh    chan struct{}
-	activeConns   atomic.Int64
-	jwtVerifier   jwt.TokenVerifier
-	sessionsMu    sync.Mutex
-	sessions      map[string]*frontendSession
-	timeNow       func() time.Time
+	listenersMu sync.Mutex
+	listeners   []net.Listener
+	closed      bool
+	shutdownCh  chan struct{}
+	activeConns atomic.Int64
+	jwtVerifier jwt.TokenVerifier
+	sessionsMu  sync.Mutex
+	sessions    map[string]*frontendSession
+	timeNow     func() time.Time
 }
 
 // NewServer creates a new frontend Server with the given configuration.
@@ -138,7 +131,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	comp := cfg.CompositeTransport
 	if comp == nil {
-		comp = NewCompositeTransport(NewPoolTransport(), NewQUICTransport(), nil)
+		comp = NewCompositeTransport(NewPoolTransport(), nil)
 	}
 
 	timeNow := cfg.TimeNow
@@ -152,7 +145,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		table:            NewRegistrationTable(),
 		transport:        comp,
 		pool:             comp.Pool(),
-		quic:             comp.QUIC(),
 		h2:               comp.H2(),
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
@@ -190,17 +182,12 @@ func (s *Server) PoolTransport() *PoolTransport {
 	return s.pool
 }
 
-// QUICTransport returns the server's QUIC transport.
-func (s *Server) QUICTransport() *QUICTransport {
-	return s.quic
-}
-
 // H2Transport returns the server's HTTP/2 transport.
 func (s *Server) H2Transport() *H2Transport {
 	return s.h2
 }
 
-// ListenAndServe starts listening on all configured TCP and UDP addresses and serves traffic.
+// ListenAndServe starts listening on all configured TCP addresses and serves traffic.
 func (s *Server) ListenAndServe() error {
 	var listeners []net.Listener
 	for _, addr := range s.config.ListenAddrs {
@@ -214,47 +201,17 @@ func (s *Server) ListenAndServe() error {
 		listeners = append(listeners, ln)
 	}
 
-	var udpConns []net.PacketConn
-	udpAddrs := s.config.UDPListenAddrs
-	if len(udpAddrs) == 0 {
-		udpAddrs = s.config.ListenAddrs
-	}
-	for _, addr := range udpAddrs {
-		pc, err := net.ListenPacket("udp", addr)
-		if err != nil {
-			for _, l := range listeners {
-				closeCloser(l)
-			}
-			for _, p := range udpConns {
-				closeCloser(p)
-			}
-			return fmt.Errorf("listening UDP on %s: %w", addr, err)
-		}
-		udpConns = append(udpConns, pc)
-	}
-
-	return s.ServeAll(listeners, udpConns)
+	return s.Serve(listeners...)
 }
 
 // Serve serves TCP traffic on the given pre-created listeners.
 func (s *Server) Serve(listeners ...net.Listener) error {
-	return s.ServeAll(listeners, nil)
-}
-
-// ServeUDP serves QUIC reverse-tunnel traffic on the given pre-created UDP packet connections.
-func (s *Server) ServeUDP(udpConns ...net.PacketConn) error {
-	return s.ServeAll(nil, udpConns)
-}
-
-// ServeAll serves both TCP client traffic and QUIC reverse tunnel connections.
-func (s *Server) ServeAll(listeners []net.Listener, udpConns []net.PacketConn) error {
 	s.listenersMu.Lock()
 	s.listeners = listeners
-	s.udpListeners = udpConns
 	s.listenersMu.Unlock()
 
 	// Start internal mTLS HTTP server
-	errCh := make(chan error, len(listeners)+len(udpConns)+1)
+	errCh := make(chan error, len(listeners)+1)
 	go func() {
 		if err := s.httpServer.Serve(s.internalListener); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			errCh <- fmt.Errorf("internal HTTP server: %w", err)
@@ -290,38 +247,6 @@ func (s *Server) ServeAll(listeners []net.Listener, udpConns []net.PacketConn) e
 		}(ln)
 	}
 
-	// Start QUIC listeners on each UDP packet connection
-	for _, pc := range udpConns {
-		quicTLS := s.config.ServerTLSConfig.Clone()
-		quicTLS.NextProtos = []string{api.TunnelALPN}
-		ql, err := quic.Listen(pc, quicTLS, api.DefaultQUICConfig())
-		if err != nil {
-			return fmt.Errorf("creating QUIC listener on %s: %w", pc.LocalAddr(), err)
-		}
-		s.listenersMu.Lock()
-		s.quicListeners = append(s.quicListeners, ql)
-		s.listenersMu.Unlock()
-
-		go func(l *quic.Listener) {
-			for {
-				qConn, err := l.Accept(context.Background())
-				if err != nil {
-					select {
-					case <-s.shutdownCh:
-						return
-					default:
-						if errors.Is(err, quic.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
-							return
-						}
-						log.Printf("Frontend: error accepting QUIC connection: %v", err)
-						continue
-					}
-				}
-				go s.handleQUICConnection(qConn)
-			}
-		}(ql)
-	}
-
 	select {
 	case <-s.shutdownCh:
 		return nil
@@ -341,12 +266,6 @@ func (s *Server) Close() error {
 	close(s.shutdownCh)
 	for _, ln := range s.listeners {
 		closeCloser(ln)
-	}
-	for _, ql := range s.quicListeners {
-		closeCloser(ql)
-	}
-	for _, pc := range s.udpListeners {
-		closeCloser(pc)
 	}
 	s.listenersMu.Unlock()
 
@@ -410,7 +329,6 @@ func (s *Server) CloseSession(sessionID string) {
 	s.table.Unregister(sessionID)
 	s.pool.UnregisterSession(sessionID)
 	s.h2.UnregisterSession(sessionID)
-	s.quic.UnregisterSession(sessionID)
 
 	if sess.cancel != nil {
 		sess.cancel()
@@ -715,211 +633,6 @@ func (s *Server) extractClientIdentity(r *http.Request) (ClientIdentity, error) 
 		Subject:     claims.Subject,
 		TokenExpiry: claims.Expiry,
 	}, nil
-}
-
-func (s *Server) handleQUICConnection(qConn *quic.Conn) {
-	var clientIdentity ClientIdentity
-	tlsState := qConn.ConnectionState().TLS
-	hasCert := len(tlsState.PeerCertificates) > 0
-
-	if hasCert {
-		var err error
-		clientIdentity, err = extractIdentityFromTLSState(tlsState)
-		if err != nil {
-			log.Printf("Frontend: rejecting QUIC connection: %v", err)
-			closeQUICConn(qConn, 1, "unauthorized")
-			return
-		}
-	} else if s.jwtVerifier == nil {
-		log.Printf("Frontend: rejecting QUIC connection: client certificate required")
-		closeQUICConn(qConn, 1, "unauthorized")
-		return
-	}
-
-	// 1. Enforce handshake deadline for accepting control stream and reading init message
-	handshakeCtx, handshakeCancel := context.WithTimeout(context.Background(), api.QUICHandshakeTimeout)
-	ctrlStream, err := qConn.AcceptStream(handshakeCtx)
-	if err != nil {
-		handshakeCancel()
-		log.Printf("Frontend: error accepting QUIC control stream (timeout or closed): %v", err)
-		closeQUICConn(qConn, 1, "control stream error")
-		return
-	}
-
-	reader := bufio.NewReader(ctrlStream)
-	// Read initial control stream ping/init line (bounded by MaxControlLineBytes)
-	if err := ctrlStream.SetReadDeadline(time.Now().Add(api.QUICHandshakeTimeout)); err != nil {
-		handshakeCancel()
-		log.Printf("Frontend: failed to set deadline on QUIC control stream: %v", err)
-		closeQUICConn(qConn, 1, "control stream deadline error")
-		return
-	}
-	initLine, err := api.ReadControlLine(reader)
-	if err != nil {
-		handshakeCancel()
-		log.Printf("Frontend: error reading initial line from QUIC control stream: %v", err)
-		closeQUICConn(qConn, 1, "control stream handshake failed")
-		return
-	}
-	if err := ctrlStream.SetDeadline(time.Time{}); err != nil {
-		handshakeCancel()
-		log.Printf("Frontend: failed to clear deadline on QUIC control stream: %v", err)
-		closeQUICConn(qConn, 1, "control stream deadline error")
-		return
-	}
-	handshakeCancel()
-
-	if !hasCert {
-		var initReq api.SessionInitRequest
-		if err := json.Unmarshal(bytes.TrimSpace(initLine), &initReq); err != nil || initReq.Token == "" {
-			log.Printf("Frontend: rejecting QUIC connection: missing or invalid session init token")
-			closeQUICConn(qConn, 1, "unauthorized")
-			return
-		}
-
-		claims, err := s.jwtVerifier.Verify(context.Background(), initReq.Token)
-		if err != nil {
-			log.Printf("Frontend: rejecting QUIC connection: token verification failed: %v", err)
-			closeQUICConn(qConn, 1, "unauthorized")
-			return
-		}
-
-		clientIdentity = ClientIdentity{
-			ID:          fmt.Sprintf("jwt/%s/%s", claims.Issuer, claims.Subject),
-			Issuer:      claims.Issuer,
-			Subject:     claims.Subject,
-			TokenExpiry: claims.Expiry,
-		}
-	}
-
-	sessionID := generateConnID()
-	s.createSession(sessionID, nil, func() {
-		closeQUICConn(qConn, 0, "session closed")
-	})
-	s.table.RegisterSession(sessionID, clientIdentity)
-	s.quic.RegisterSession(sessionID, qConn)
-	log.Printf("Frontend: created QUIC session %s for client %q", sessionID, clientIdentity.ID)
-
-	defer func() {
-		s.CloseSession(sessionID)
-		log.Printf("Frontend: QUIC session %s closed and unregistered for client %q", sessionID, clientIdentity.ID)
-	}()
-
-	// Send initial SessionResponse
-	sessResp := api.SessionResponse{
-		SessionID: sessionID,
-		Status:    "connected",
-	}
-	respBytes, err := json.Marshal(sessResp)
-	if err != nil {
-		return
-	}
-	if _, err := ctrlStream.Write(append(respBytes, '\n')); err != nil {
-		return
-	}
-
-	// Read and process RegistrationRequests from control stream
-	for {
-		line, err := api.ReadControlLine(reader)
-		if err != nil {
-			return
-		}
-		trimmed := bytes.TrimSpace(line)
-
-		var regReq api.RegistrationRequest
-		if err := json.Unmarshal(trimmed, &regReq); err != nil {
-			log.Printf("Frontend: failed to decode QUIC registration request from %s: %v", sessionID, err)
-			continue
-		}
-
-		if clientIdentity.Issuer != "" && regReq.Token != "" {
-			regClaims, err := s.jwtVerifier.Verify(context.Background(), regReq.Token)
-			if err != nil {
-				log.Printf("Frontend: token verification failed during QUIC registration for %s: %v", sessionID, err)
-				errResp, merr := json.Marshal(api.RegistrationResponse{
-					Status: fmt.Sprintf("error: token verification failed: %v", err),
-				})
-				if merr != nil {
-					log.Printf("Frontend: failed to marshal registration error: %v", merr)
-					continue
-				}
-				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
-					log.Printf("Frontend: failed to write error response: %v", werr)
-				}
-				continue
-			}
-			if regClaims.Issuer != clientIdentity.Issuer || regClaims.Subject != clientIdentity.Subject {
-				log.Printf("Frontend: session identity mismatch during QUIC registration for %s", sessionID)
-				errResp, merr := json.Marshal(api.RegistrationResponse{
-					Status: "error: session identity mismatch",
-				})
-				if merr != nil {
-					log.Printf("Frontend: failed to marshal registration error: %v", merr)
-					continue
-				}
-				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
-					log.Printf("Frontend: failed to write error response: %v", werr)
-				}
-				continue
-			}
-			clientIdentity.TokenExpiry = regClaims.Expiry
-		}
-
-		if err := validateRegistrationHostnames(regReq.Hostnames, s.config.MaxHostnamesPerSession); err != nil {
-			log.Printf("Frontend: validation failed for QUIC session %s (%s) registering hostnames: %v", sessionID, clientIdentity.ID, err)
-			errResp, err := json.Marshal(api.RegistrationResponse{
-				Status: fmt.Sprintf("error: %v", err),
-			})
-			if err != nil {
-				log.Printf("Frontend: failed to marshal registration error response: %v", err)
-				return
-			}
-			if _, err := ctrlStream.Write(append(errResp, '\n')); err != nil {
-				return
-			}
-			continue
-		}
-
-		if err := s.authorizer.Authorize(context.Background(), clientIdentity, regReq.Hostnames); err != nil {
-			log.Printf("Frontend: authorization failed for QUIC session %s (%s) registering %v: %v", sessionID, clientIdentity.ID, regReq.Hostnames, err)
-			errResp, err := json.Marshal(api.RegistrationResponse{
-				Status: fmt.Sprintf("error: %v", err),
-			})
-			if err != nil {
-				log.Printf("Frontend: failed to marshal registration error response: %v", err)
-				return
-			}
-			if _, err := ctrlStream.Write(append(errResp, '\n')); err != nil {
-				return
-			}
-			continue
-		}
-
-		var leaseExpiry time.Time
-		if clientIdentity.Issuer != "" {
-			leaseExpiry = clientIdentity.TokenExpiry
-			maxLease := s.timeNow().Add(24 * time.Hour)
-			if leaseExpiry.After(maxLease) {
-				leaseExpiry = maxLease
-			}
-		}
-
-		s.table.RegisterWithLease(sessionID, regReq.Hostnames, leaseExpiry)
-		registered := s.table.GetRegisteredHostnames(sessionID)
-		log.Printf("Frontend: QUIC session %s (client %q) registered hostnames: %v", sessionID, clientIdentity.ID, registered)
-
-		okResp, err := json.Marshal(api.RegistrationResponse{
-			Status:    "registered",
-			Hostnames: registered,
-		})
-		if err != nil {
-			log.Printf("Frontend: failed to marshal registration response: %v", err)
-			return
-		}
-		if _, err := ctrlStream.Write(append(okResp, '\n')); err != nil {
-			return
-		}
-	}
 }
 
 func validateRegistrationHostnames(hostnames []string, maxHostnames int) error {
@@ -1263,14 +976,5 @@ func closeCloser(c io.Closer) {
 	}
 	if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Printf("Frontend: failed to close: %v", err)
-	}
-}
-
-func closeQUICConn(c *quic.Conn, code quic.ApplicationErrorCode, msg string) {
-	if c == nil {
-		return
-	}
-	if err := c.CloseWithError(code, msg); err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Printf("Frontend: failed to close QUIC connection: %v", err)
 	}
 }

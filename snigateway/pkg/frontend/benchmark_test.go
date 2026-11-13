@@ -36,7 +36,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/tunnel"
-	"github.com/quic-go/quic-go"
 )
 
 func withBenchmarkServerSettings(config *ServerConfig) {
@@ -58,9 +57,8 @@ func checkSocketBufferSizes(t testing.TB) {
 	if errR == nil && errW == nil {
 		rVal, _ := strconv.Atoi(strings.TrimSpace(string(rmem)))
 		wVal, _ := strconv.Atoi(strings.TrimSpace(string(wmem)))
-		warned := rVal < 2500000 || wVal < 2500000
-		t.Logf("UDP Buffer Check: rmem_max=%d (%d kiB), wmem_max=%d (%d kiB), quic-go warning expected: %v",
-			rVal, rVal/1024, wVal, wVal/1024, warned)
+		t.Logf("Buffer Check: rmem_max=%d (%d kiB), wmem_max=%d (%d kiB)",
+			rVal, rVal/1024, wVal, wVal/1024)
 	}
 }
 
@@ -87,31 +85,16 @@ func setupBenchmarkBackend(b testing.TB, srv *Server, serverAddr string, generat
 
 	var clientOpts []client.ClientOption
 	if cfg.RTT > 0 || cfg.Loss > 0 {
-		if cfg.Transport == "quic" {
-			clientOpts = append(clientOpts, client.WithQUICDialFunc(func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error) {
-				packetConnection, err := net.ListenPacket("udp", "127.0.0.1:0")
-				if err != nil {
-					return nil, err
-				}
-				simulatedPacketConnection := newSimulatedPacketConn(packetConnection, cfg.RTT/2, cfg.Loss)
-				udpAddress, err := net.ResolveUDPAddr("udp", addr)
-				if err != nil {
-					return nil, err
-				}
-				return quic.Dial(ctx, simulatedPacketConnection, udpAddress, tlsConf, quicConf)
-			}))
-		} else {
-			clientOpts = append(clientOpts, client.WithDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
-				if cfg.RTT > 0 {
-					time.Sleep(cfg.RTT)
-				}
-				rawConn, err := (&net.Dialer{KeepAlive: 15 * time.Second}).DialContext(ctx, network, addr)
-				if err != nil {
-					return nil, err
-				}
-				return newSimulatedConn(rawConn, cfg.RTT/2, cfg.Loss), nil
-			}))
-		}
+		clientOpts = append(clientOpts, client.WithDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if cfg.RTT > 0 {
+				time.Sleep(cfg.RTT)
+			}
+			rawConn, err := (&net.Dialer{KeepAlive: 15 * time.Second}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return newSimulatedConn(rawConn, cfg.RTT/2, cfg.Loss), nil
+		}))
 	}
 
 	c := client.NewClient(serverAddr, clientTLS, clientOpts...)
@@ -375,10 +358,6 @@ func runConcurrentThroughputBenchmark(b *testing.B, cfg benchConfig, hostname st
 	}
 }
 
-func BenchmarkLatency_QUIC(b *testing.B) {
-	runLatencyBenchmark(b, benchConfig{Transport: "quic"}, "bench-quic.example.com")
-}
-
 func BenchmarkLatency_TCPPool(b *testing.B) {
 	runLatencyBenchmark(b, benchConfig{Transport: "tcp", PoolSize: 16}, "bench-tcp.example.com")
 }
@@ -387,20 +366,12 @@ func BenchmarkLatency_H2(b *testing.B) {
 	runLatencyBenchmark(b, benchConfig{Transport: "h2", PoolSize: 4}, "bench-h2.example.com")
 }
 
-func BenchmarkThroughput_QUIC(b *testing.B) {
-	runThroughputBenchmark(b, benchConfig{Transport: "quic"}, "tput-quic.example.com")
-}
-
 func BenchmarkThroughput_TCPPool(b *testing.B) {
 	runThroughputBenchmark(b, benchConfig{Transport: "tcp", PoolSize: 16}, "tput-tcp.example.com")
 }
 
 func BenchmarkThroughput_H2(b *testing.B) {
 	runThroughputBenchmark(b, benchConfig{Transport: "h2", PoolSize: 4}, "tput-h2.example.com")
-}
-
-func BenchmarkThroughput_Concurrent_QUIC(b *testing.B) {
-	runConcurrentThroughputBenchmark(b, benchConfig{Transport: "quic"}, "c-tput-quic.example.com", 8)
 }
 
 func BenchmarkThroughput_Concurrent_TCPPool(b *testing.B) {
@@ -416,12 +387,6 @@ func BenchmarkMatrix(b *testing.B) {
 		name string
 		cfg  benchConfig
 	}{
-		{"QUIC_RTT0ms_Loss0%", benchConfig{Transport: "quic", RTT: 0, Loss: 0}},
-		{"QUIC_RTT20ms_Loss0%", benchConfig{Transport: "quic", RTT: 20 * time.Millisecond, Loss: 0}},
-		{"QUIC_RTT50ms_Loss0%", benchConfig{Transport: "quic", RTT: 50 * time.Millisecond, Loss: 0}},
-		{"QUIC_RTT20ms_Loss1%", benchConfig{Transport: "quic", RTT: 20 * time.Millisecond, Loss: 0.01}},
-		{"QUIC_RTT50ms_Loss1%", benchConfig{Transport: "quic", RTT: 50 * time.Millisecond, Loss: 0.01}},
-
 		{"TCPPool_RTT0ms_Loss0%", benchConfig{Transport: "tcp", RTT: 0, Loss: 0, PoolSize: 16}},
 		{"TCPPool_RTT20ms_Loss0%", benchConfig{Transport: "tcp", RTT: 20 * time.Millisecond, Loss: 0, PoolSize: 16}},
 		{"TCPPool_RTT50ms_Loss0%", benchConfig{Transport: "tcp", RTT: 50 * time.Millisecond, Loss: 0, PoolSize: 16}},
@@ -512,14 +477,12 @@ func runBurstLatencyBenchmark(b *testing.B, cfg benchConfig, hostname string, bu
 }
 
 // BenchmarkLatency_Burst measures TTFB for a burst of new connections larger than the pool size,
-// showing the latency advantage of 0-RTT/1-RTT QUIC multiplexing over TCP pool exhaustion under WAN latency.
+// showing the latency behavior of stream multiplexing over TCP pool exhaustion under WAN latency.
 func BenchmarkLatency_Burst(b *testing.B) {
 	scenarios := []struct {
 		name string
 		cfg  benchConfig
 	}{
-		{"QUIC_RTT20ms", benchConfig{Transport: "quic", RTT: 20 * time.Millisecond}},
-		{"QUIC_RTT50ms", benchConfig{Transport: "quic", RTT: 50 * time.Millisecond}},
 		{"TCPPool_RTT20ms", benchConfig{Transport: "tcp", RTT: 20 * time.Millisecond, PoolSize: 8}},
 		{"TCPPool_RTT50ms", benchConfig{Transport: "tcp", RTT: 50 * time.Millisecond, PoolSize: 8}},
 		{"H2_RTT20ms", benchConfig{Transport: "h2", RTT: 20 * time.Millisecond, PoolSize: 4}},
@@ -543,7 +506,7 @@ func TestBenchmark_SeparateProcessCPU(t *testing.T) {
 
 	checkSocketBufferSizes(t)
 
-	for _, transport := range []string{"quic", "tcp", "h2"} {
+	for _, transport := range []string{"tcp", "h2"} {
 		t.Run(transport, func(t *testing.T) {
 			srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(t, withBenchmarkServerSettings)
 			defer cleanupSrv()

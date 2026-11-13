@@ -85,11 +85,6 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	}
 	frontendAddr := frontendListener.Addr().String()
 
-	frontendUDP, err := net.ListenPacket("udp", frontendAddr)
-	if err != nil {
-		t.Fatalf("net.ListenPacket failed: %v", err)
-	}
-
 	frontendServer, err := frontend.NewServer(frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
@@ -102,7 +97,7 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	defer frontendServer.Close()
 
 	go func() {
-		_ = frontendServer.ServeAll([]net.Listener{frontendListener}, []net.PacketConn{frontendUDP})
+		_ = frontendServer.Serve(frontendListener)
 	}()
 
 	// 3. Start tunnel Manager with client connecting to frontend
@@ -494,11 +489,6 @@ func TestTokenAuthentication_ProjectedVolumeAndRotationIntegration(t *testing.T)
 	}
 	frontendAddr := ln.Addr().String()
 
-	frontendUDP, err := net.ListenPacket("udp", frontendAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	frontendServer, err := frontend.NewServer(frontend.ServerConfig{
 		ServerTLSConfig:     serverTLS,
 		InternalHostname:    "snigateway.internal",
@@ -512,7 +502,7 @@ func TestTokenAuthentication_ProjectedVolumeAndRotationIntegration(t *testing.T)
 	defer frontendServer.Close()
 
 	go func() {
-		_ = frontendServer.ServeAll([]net.Listener{ln}, []net.PacketConn{frontendUDP})
+		_ = frontendServer.Serve(ln)
 	}()
 
 	// 3. Write initial token to projected token file

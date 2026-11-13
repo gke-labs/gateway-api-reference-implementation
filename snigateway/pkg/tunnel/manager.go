@@ -16,11 +16,8 @@ package tunnel
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -34,7 +31,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
-	"github.com/quic-go/quic-go"
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
@@ -45,10 +41,6 @@ const (
 	// DefaultPoolSize is the default number of idle pooled reverse tunnel connections.
 	DefaultPoolSize = 4
 
-	// TransportModeAuto attempts QUIC first and falls back to TCP pool.
-	TransportModeAuto = "auto"
-	// TransportModeQUIC only uses QUIC tunnel transport.
-	TransportModeQUIC = "quic"
 	// TransportModeTCP only uses TCP pool tunnel transport.
 	TransportModeTCP = "tcp"
 	// TransportModeH2 only uses HTTP/2 CONNECT multiplexed tunnel transport.
@@ -74,14 +66,14 @@ func WithPoolSize(size int) ManagerOption {
 	}
 }
 
-// WithTransport sets the transport mode (auto, quic, tcp, h2).
+// WithTransport sets the transport mode (tcp, h2).
 func WithTransport(mode string) ManagerOption {
 	return func(m *Manager) {
 		switch mode {
-		case TransportModeAuto, TransportModeQUIC, TransportModeTCP, TransportModeH2:
+		case TransportModeTCP, TransportModeH2:
 			m.transportMode = mode
 		default:
-			m.transportMode = TransportModeAuto
+			m.transportMode = TransportModeTCP
 		}
 	}
 }
@@ -100,24 +92,6 @@ func WithH2DrainTimeout(d time.Duration) ManagerOption {
 	return func(m *Manager) {
 		if d > 0 {
 			m.h2DrainTimeout = d
-		}
-	}
-}
-
-// WithQUICDialTimeout sets the timeout for dialing QUIC connections.
-func WithQUICDialTimeout(d time.Duration) ManagerOption {
-	return func(m *Manager) {
-		if d > 0 {
-			m.quicDialTimeout = d
-		}
-	}
-}
-
-// WithQUICProbeInterval sets the interval for probing QUIC availability when in TCP fallback.
-func WithQUICProbeInterval(d time.Duration) ManagerOption {
-	return func(m *Manager) {
-		if d > 0 {
-			m.quicProbeInterval = d
 		}
 	}
 }
@@ -144,33 +118,26 @@ func WithBackoff(min, max time.Duration) ManagerOption {
 	}
 }
 
-// Manager manages communication with the snigateway frontend, maintaining a QUIC tunnel
-// or a warm pool of pre-dialed reverse tunnel connections and announcing SNI hostnames.
+// Manager manages communication with the snigateway frontend, maintaining a warm pool
+// of pre-dialed reverse tunnel connections and announcing SNI hostnames.
 type Manager struct {
-	client            *client.Client
-	listener          *Listener
-	transportMode     string
-	poolSize          int
-	dialTimeout       time.Duration
-	quicDialTimeout   time.Duration
-	quicProbeInterval time.Duration
-	registerTimeout   time.Duration
-	h2PingInterval    time.Duration
-	h2DrainTimeout    time.Duration
-	backoffMin        time.Duration
-	backoffMax        time.Duration
+	client          *client.Client
+	listener        *Listener
+	transportMode   string
+	poolSize        int
+	dialTimeout     time.Duration
+	registerTimeout time.Duration
+	h2PingInterval  time.Duration
+	h2DrainTimeout  time.Duration
+	backoffMin      time.Duration
+	backoffMax      time.Duration
 
-	mu          sync.Mutex
-	hostnames   []string
-	sessionID   string
-	connected   bool
-	isQUIC      bool
-	ctrlStream  *quic.Stream
-	ctrlReader  *bufio.Reader
-	activeQConn *quic.Conn
-	generation  uint64
-	updateCh    chan struct{}
-	regWorkerMu sync.Mutex
+	mu         sync.Mutex
+	hostnames  []string
+	sessionID  string
+	connected  bool
+	generation uint64
+	updateCh   chan struct{}
 
 	registeredHostnames     []string
 	lastRegisteredSessionID string
@@ -181,19 +148,17 @@ type Manager struct {
 // NewManager creates a new Manager using the given client.
 func NewManager(c *client.Client, opts ...ManagerOption) *Manager {
 	m := &Manager{
-		client:            c,
-		listener:          NewListener(),
-		transportMode:     TransportModeAuto,
-		poolSize:          DefaultPoolSize,
-		dialTimeout:       10 * time.Second,
-		quicDialTimeout:   3 * time.Second,
-		quicProbeInterval: 30 * time.Second,
-		registerTimeout:   5 * time.Second,
-		h2PingInterval:    api.DefaultH2PingInterval,
-		h2DrainTimeout:    api.DefaultH2DrainTimeout,
-		backoffMin:        200 * time.Millisecond,
-		backoffMax:        5 * time.Second,
-		updateCh:          make(chan struct{}, 1),
+		client:          c,
+		listener:        NewListener(),
+		transportMode:   TransportModeTCP,
+		poolSize:        DefaultPoolSize,
+		dialTimeout:     10 * time.Second,
+		registerTimeout: 5 * time.Second,
+		h2PingInterval:  api.DefaultH2PingInterval,
+		h2DrainTimeout:  api.DefaultH2DrainTimeout,
+		backoffMin:      200 * time.Millisecond,
+		backoffMax:      5 * time.Second,
+		updateCh:        make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -247,13 +212,6 @@ func (m *Manager) notifyListeners() {
 	for _, l := range listeners {
 		l()
 	}
-}
-
-// IsQUIC returns whether the currently active tunnel session is using QUIC transport.
-func (m *Manager) IsQUIC() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.connected && m.isQUIC
 }
 
 // SessionID returns the currently active session ID, or empty string if not connected.
@@ -338,7 +296,7 @@ func (m *Manager) Run(ctx context.Context) error {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	// Background registration worker for both QUIC and TCP sessions
+	// Background registration worker for sessions
 	g.Go(func() error {
 		var lastRegistered []string
 		var lastGen uint64
@@ -352,13 +310,9 @@ func (m *Manager) Run(ctx context.Context) error {
 			case <-m.updateCh:
 				m.mu.Lock()
 				connected := m.connected
-				isQUIC := m.isQUIC
 				sessID := m.sessionID
 				gen := m.generation
 				curr := slices.Clone(m.hostnames)
-				ctrlStream := m.ctrlStream
-				ctrlReader := m.ctrlReader
-				activeQConn := m.activeQConn
 				m.mu.Unlock()
 
 				if !connected || sessID == "" {
@@ -369,89 +323,28 @@ func (m *Manager) Run(ctx context.Context) error {
 					continue
 				}
 
-				if isQUIC && ctrlStream != nil && ctrlReader != nil {
-					m.regWorkerMu.Lock()
-					token, err := m.client.GetToken()
-					if err != nil {
-						klog.V(2).Infof("Reading token for QUIC registration: %v", err)
-					}
-					reqBytes, err := json.Marshal(api.RegistrationRequest{
-						Hostnames: curr,
-						Token:     token,
-					})
-					if err != nil {
-						m.regWorkerMu.Unlock()
-						klog.Errorf("Failed to marshal registration request: %v", err)
-						continue
-					}
+				token, err := m.client.GetToken()
+				if err != nil {
+					klog.V(2).Infof("Reading token for registration: %v", err)
+				}
+				regCtx, cancel := context.WithTimeout(ctx, m.registerTimeout)
+				resp, err := m.client.Register(regCtx, sessID, curr)
+				cancel()
 
-					if err := ctrlStream.SetWriteDeadline(time.Now().Add(m.registerTimeout)); err != nil {
-						m.regWorkerMu.Unlock()
-						klog.Errorf("Failed to set write deadline on QUIC control stream (session %s): %v. Tearing down session.", sessID, err)
-						if activeQConn != nil {
-							closeQUICConn(activeQConn, 1, "control stream write deadline error")
-						}
-						continue
-					}
-					if _, err := ctrlStream.Write(append(reqBytes, '\n')); err != nil {
-						m.regWorkerMu.Unlock()
-						if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
-							klog.Errorf("Failed to write registration to QUIC control stream (session %s): %v. Tearing down session.", sessID, err)
-							if activeQConn != nil {
-								closeQUICConn(activeQConn, 1, "control stream write error")
-							}
-						}
-						continue
-					}
-
-					if err := ctrlStream.SetReadDeadline(time.Now().Add(m.registerTimeout)); err != nil {
-						m.regWorkerMu.Unlock()
-						klog.Errorf("Failed to set read deadline on QUIC control stream (session %s): %v. Tearing down session.", sessID, err)
-						if activeQConn != nil {
-							closeQUICConn(activeQConn, 1, "control stream read deadline error")
-						}
-						continue
-					}
-					respLine, err := api.ReadControlLine(ctrlReader)
-					if err != nil {
-						m.regWorkerMu.Unlock()
-						if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
-							klog.Errorf("Failed to read registration response from QUIC control stream (session %s): %v. Tearing down session.", sessID, err)
-							if activeQConn != nil {
-								closeQUICConn(activeQConn, 1, "control stream read error")
-							}
-						}
-						continue
-					}
-					if err := ctrlStream.SetDeadline(time.Time{}); err != nil {
-						m.regWorkerMu.Unlock()
-						klog.Errorf("Failed to clear deadline on QUIC control stream (session %s): %v. Tearing down session.", sessID, err)
-						if activeQConn != nil {
-							closeQUICConn(activeQConn, 1, "control stream deadline error")
-						}
-						continue
-					}
-					m.regWorkerMu.Unlock()
-
-					var regResp api.RegistrationResponse
-					if err := json.Unmarshal(bytes.TrimSpace(respLine), &regResp); err != nil {
-						klog.Errorf("Failed to decode registration response from QUIC control stream: %v. Tearing down session.", err)
-						if activeQConn != nil {
-							closeQUICConn(activeQConn, 1, "control stream decode error")
-						}
-						continue
-					}
-
-					if strings.HasPrefix(regResp.Status, "error:") || regResp.Status == "error" {
-						klog.Errorf("Registration error from frontend over QUIC (session %s): %s. Tearing down session.", sessID, regResp.Status)
-						if activeQConn != nil {
-							closeQUICConn(activeQConn, 1, regResp.Status)
-						}
+				if err != nil {
+					if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+						klog.Errorf("Failed to register hostnames %v with frontend (session %s): %v", curr, sessID, err)
 						m.notifyListeners()
-						continue
+						go func() {
+							select {
+							case <-ctx.Done():
+							case <-time.After(500 * time.Millisecond):
+								m.triggerRegistration()
+							}
+						}()
 					}
-
-					klog.Infof("Successfully registered hostnames over QUIC with frontend: %v (session: %s)", regResp.Hostnames, sessID)
+				} else {
+					klog.Infof("Successfully registered hostnames with frontend: %v (session: %s)", resp.Hostnames, sessID)
 					lastRegistered = curr
 					lastGen = gen
 					lastSession = sessID
@@ -464,48 +357,12 @@ func (m *Manager) Run(ctx context.Context) error {
 						m.scheduleTokenReRegistration(token)
 					}
 					m.notifyListeners()
-				} else if !isQUIC {
-					token, err := m.client.GetToken()
-					if err != nil {
-						klog.V(2).Infof("Reading token for registration: %v", err)
-					}
-					regCtx, cancel := context.WithTimeout(ctx, m.registerTimeout)
-					resp, err := m.client.Register(regCtx, sessID, curr)
-					cancel()
-
-					if err != nil {
-						if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
-							klog.Errorf("Failed to register hostnames %v with frontend (session %s): %v", curr, sessID, err)
-							m.notifyListeners()
-							go func() {
-								select {
-								case <-ctx.Done():
-								case <-time.After(500 * time.Millisecond):
-									m.triggerRegistration()
-								}
-							}()
-						}
-					} else {
-						klog.Infof("Successfully registered hostnames with frontend: %v (session: %s)", resp.Hostnames, sessID)
-						lastRegistered = curr
-						lastGen = gen
-						lastSession = sessID
-						hasRegistered = true
-						m.mu.Lock()
-						m.registeredHostnames = slices.Clone(curr)
-						m.lastRegisteredSessionID = sessID
-						m.mu.Unlock()
-						if token != "" {
-							m.scheduleTokenReRegistration(token)
-						}
-						m.notifyListeners()
-					}
 				}
 			}
 		}
 	})
 
-	// Main session loop managing QUIC, TCP pool, or auto-fallback
+	// Main session loop managing TCP pool or H2
 	g.Go(func() error {
 		backoff := m.backoffMin
 
@@ -515,75 +372,10 @@ func (m *Manager) Run(ctx context.Context) error {
 			}
 
 			switch m.transportMode {
-			case TransportModeQUIC:
-				sessCtx, sessCancel := context.WithCancel(ctx)
-				dialCtx, dialCancel := context.WithTimeout(sessCtx, m.dialTimeout)
-				qConn, err := m.client.DialQUIC(dialCtx)
-				dialCancel()
-
-				if err != nil {
-					sessCancel()
-					if ctx.Err() != nil {
-						return nil
-					}
-					klog.Warningf("Failed to dial QUIC to frontend: %v. Reconnecting in %v...", err, backoff)
-					select {
-					case <-ctx.Done():
-						return nil
-					case <-time.After(backoff):
-					}
-					backoff = min(backoff*2, m.backoffMax)
-					continue
-				}
-
-				backoff = m.backoffMin
-				err = m.runQUICSession(sessCtx, qConn)
-				sessCancel()
-
-				if ctx.Err() != nil {
-					return nil
-				}
-				klog.Warningf("QUIC session ended (%v). Reconnecting in %v...", err, backoff)
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-time.After(backoff):
-				}
-
-			case TransportModeTCP:
-				m.runTCPSessionWithBackoff(ctx, &backoff)
-
 			case TransportModeH2:
 				m.runH2SessionWithBackoff(ctx, &backoff)
-
-			case TransportModeAuto:
-				// Try QUIC first
-				dialCtx, dialCancel := context.WithTimeout(ctx, m.quicDialTimeout)
-				qConn, err := m.client.DialQUIC(dialCtx)
-				dialCancel()
-
-				if err == nil {
-					// QUIC connected!
-					backoff = m.backoffMin
-					sessCtx, sessCancel := context.WithCancel(ctx)
-					err = m.runQUICSession(sessCtx, qConn)
-					sessCancel()
-
-					if ctx.Err() != nil {
-						return nil
-					}
-					klog.Warningf("QUIC session ended (%v). Reconnecting in %v...", err, backoff)
-					select {
-					case <-ctx.Done():
-						return nil
-					case <-time.After(backoff):
-					}
-					continue
-				}
-
-				// QUIC failed; fall back to TCP pool with background QUIC probe (make-before-break)
-				klog.Warningf("QUIC dial failed (%v); falling back to TCP pool transport", err)
-				m.runTCPFallbackWithQUICProbe(ctx, &backoff)
+			default:
+				m.runTCPSessionWithBackoff(ctx, &backoff)
 			}
 		}
 	})
@@ -613,7 +405,6 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 
 	m.mu.Lock()
 	m.connected = true
-	m.isQUIC = false
 	m.sessionID = sessID
 	m.generation++
 	m.mu.Unlock()
@@ -643,273 +434,6 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 	}
 }
 
-func (m *Manager) runTCPFallbackWithQUICProbe(ctx context.Context, backoff *time.Duration) {
-	tcpCtx, tcpCancel := context.WithCancel(ctx)
-	defer tcpCancel()
-
-	sessID, sessErrCh, err := m.client.StartSession(tcpCtx)
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		klog.Warningf("Failed to start TCP fallback session: %v. Reconnecting in %v...", err, *backoff)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(*backoff):
-		}
-		*backoff = min(*backoff*2, m.backoffMax)
-		return
-	}
-
-	*backoff = m.backoffMin
-
-	m.mu.Lock()
-	m.connected = true
-	m.isQUIC = false
-	m.sessionID = sessID
-	m.generation++
-	m.mu.Unlock()
-	m.notifyListeners()
-
-	klog.Infof("Established TCP fallback session %s with frontend", sessID)
-	m.triggerRegistration()
-
-	// Make-before-break probe worker
-	var probeSession *quicSession
-	probeGroup, probeCtx := errgroup.WithContext(tcpCtx)
-
-	probeGroup.Go(func() error {
-		ticker := time.NewTicker(m.quicProbeInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-probeCtx.Done():
-				return nil
-			case <-ticker.C:
-				pCtx, pCancel := context.WithTimeout(probeCtx, m.quicDialTimeout)
-				qConn, err := m.client.DialQUIC(pCtx)
-				pCancel()
-
-				if err != nil {
-					klog.V(2).Infof("QUIC probe dial failed: %v", err)
-					continue
-				}
-
-				// Make-before-break: establish and register QUIC session BEFORE retiring TCP session
-				sess, err := m.handshakeQUICSession(probeCtx, qConn)
-				if err != nil {
-					klog.V(2).Infof("QUIC probe handshake failed: %v", err)
-					closeQUICConn(qConn, 1, err.Error())
-					continue
-				}
-
-				// QUIC session is fully established and registered! Now switch over
-				klog.Infof("QUIC probe succeeded; established and registered QUIC session %s. Switching from TCP pool to QUIC transport.", sess.sessionID)
-				probeSession = sess
-				tcpCancel() // Retires TCP session
-				return nil
-			}
-		}
-	})
-
-	probeGroup.Go(func() error {
-		m.runPool(tcpCtx, sessID, sessErrCh)
-		tcpCancel()
-		return nil
-	})
-
-	if err := probeGroup.Wait(); err != nil && !errors.Is(err, context.Canceled) {
-		klog.V(2).Infof("TCP fallback probe group ended: %v", err)
-	}
-
-	m.mu.Lock()
-	if probeSession == nil {
-		m.connected = false
-		m.sessionID = ""
-	}
-	m.mu.Unlock()
-	if probeSession == nil {
-		m.notifyListeners()
-	}
-
-	klog.Infof("TCP fallback session %s retired", sessID)
-
-	if probeSession != nil {
-		// Hand over directly to serveQUICSession using the connected QUIC session
-		sessCtx, sessCancel := context.WithCancel(ctx)
-		defer sessCancel()
-		err := m.serveQUICSession(sessCtx, probeSession)
-		if err != nil && ctx.Err() == nil {
-			klog.Warningf("QUIC session ended (%v). Reconnecting in %v...", err, *backoff)
-		}
-	}
-}
-
-type quicSession struct {
-	conn                *quic.Conn
-	sessionID           string
-	ctrlStream          *quic.Stream
-	ctrlReader          *bufio.Reader
-	registeredHostnames []string
-}
-
-func (m *Manager) handshakeQUICSession(ctx context.Context, qConn *quic.Conn) (*quicSession, error) {
-	// 1. Open control stream and send initial handshake line
-	ctrlStream, err := qConn.OpenStreamSync(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("opening QUIC control stream: %w", err)
-	}
-
-	if err := ctrlStream.SetWriteDeadline(time.Now().Add(m.registerTimeout)); err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("setting write deadline on QUIC control stream: %w", err)
-	}
-
-	token, err := m.client.GetToken()
-	if err != nil {
-		klog.V(2).Infof("Reading token for QUIC session handshake: %v", err)
-	}
-	initReq := api.SessionInitRequest{
-		Type:  "session",
-		Token: token,
-	}
-	initBytes, err := json.Marshal(initReq)
-	if err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("marshaling QUIC session init: %w", err)
-	}
-	if _, err := ctrlStream.Write(append(initBytes, '\n')); err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("initiating QUIC control stream: %w", err)
-	}
-
-	// 2. Read SessionResponse from ctrlStream (capped by MaxControlLineBytes)
-	reader := bufio.NewReader(ctrlStream)
-	if err := ctrlStream.SetReadDeadline(time.Now().Add(m.registerTimeout)); err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("setting read deadline on QUIC control stream: %w", err)
-	}
-	line, err := api.ReadControlLine(reader)
-	if err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("reading session response from QUIC control stream: %w", err)
-	}
-
-	var sessResp api.SessionResponse
-	if err := json.Unmarshal(bytes.TrimSpace(line), &sessResp); err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("decoding session response from QUIC control stream: %w", err)
-	}
-	if sessResp.SessionID == "" {
-		closeConn(ctrlStream)
-		return nil, errors.New("received empty session ID from frontend QUIC session")
-	}
-
-	// 3. First registration over QUIC control stream
-	m.mu.Lock()
-	currHostnames := slices.Clone(m.hostnames)
-	m.mu.Unlock()
-
-	reqBytes, err := json.Marshal(api.RegistrationRequest{Hostnames: currHostnames})
-	if err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("marshaling initial registration request: %w", err)
-	}
-
-	if err := ctrlStream.SetWriteDeadline(time.Now().Add(m.registerTimeout)); err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("setting write deadline for initial registration request: %w", err)
-	}
-	if _, err := ctrlStream.Write(append(reqBytes, '\n')); err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("writing initial registration request to QUIC control stream: %w", err)
-	}
-
-	if err := ctrlStream.SetReadDeadline(time.Now().Add(m.registerTimeout)); err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("setting read deadline for initial registration response: %w", err)
-	}
-	respLine, err := api.ReadControlLine(reader)
-	if err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("reading initial registration response from QUIC control stream: %w", err)
-	}
-	if err := ctrlStream.SetDeadline(time.Time{}); err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("clearing deadline on QUIC control stream: %w", err)
-	}
-
-	var regResp api.RegistrationResponse
-	if err := json.Unmarshal(bytes.TrimSpace(respLine), &regResp); err != nil {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("decoding initial registration response from QUIC control stream: %w", err)
-	}
-	if strings.HasPrefix(regResp.Status, "error:") || regResp.Status == "error" {
-		closeConn(ctrlStream)
-		return nil, fmt.Errorf("initial registration failed over QUIC control stream: %s", regResp.Status)
-	}
-
-	return &quicSession{
-		conn:                qConn,
-		sessionID:           sessResp.SessionID,
-		ctrlStream:          ctrlStream,
-		ctrlReader:          reader,
-		registeredHostnames: currHostnames,
-	}, nil
-}
-
-func (m *Manager) serveQUICSession(ctx context.Context, sess *quicSession) error {
-	defer closeQUICConn(sess.conn, 0, "session closed")
-	defer closeConn(sess.ctrlStream)
-
-	m.mu.Lock()
-	m.connected = true
-	m.isQUIC = true
-	m.sessionID = sess.sessionID
-	m.ctrlStream = sess.ctrlStream
-	m.ctrlReader = sess.ctrlReader
-	m.activeQConn = sess.conn
-	m.generation++
-	m.registeredHostnames = slices.Clone(sess.registeredHostnames)
-	m.lastRegisteredSessionID = sess.sessionID
-	m.mu.Unlock()
-	m.notifyListeners()
-
-	klog.Infof("Established QUIC session %s with frontend", sess.sessionID)
-	m.triggerRegistration()
-
-	defer func() {
-		m.mu.Lock()
-		m.connected = false
-		m.isQUIC = false
-		m.sessionID = ""
-		m.ctrlStream = nil
-		m.ctrlReader = nil
-		if m.activeQConn == sess.conn {
-			m.activeQConn = nil
-		}
-		m.mu.Unlock()
-		m.notifyListeners()
-	}()
-
-	// Accept incoming tunnel streams from frontend
-	for {
-		stream, err := sess.conn.AcceptStream(ctx)
-		if err != nil {
-			return err
-		}
-
-		go func(s *quic.Stream) {
-			streamConn := api.NewQUICStreamConn(s, sess.conn)
-			if err := m.handleTunnelConn(streamConn); err != nil {
-				klog.V(2).Infof("QUIC stream tunnel error: %v", err)
-			}
-		}(stream)
-	}
-}
-
 // handleTunnelConn decodes the PROXY v2 header from conn and enqueues the resulting
 // proxyproto.Conn into m.listener. It closes conn if decoding or enqueuing fails.
 // Returns an error if PROXY header decoding or reading remaining bytes fails.
@@ -936,15 +460,6 @@ func (m *Manager) handleTunnelConn(conn net.Conn) error {
 		return err
 	}
 	return nil
-}
-
-func (m *Manager) runQUICSession(ctx context.Context, qConn *quic.Conn) error {
-	sess, err := m.handshakeQUICSession(ctx, qConn)
-	if err != nil {
-		closeQUICConn(qConn, 1, err.Error())
-		return err
-	}
-	return m.serveQUICSession(ctx, sess)
 }
 
 func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-chan error) {
@@ -1052,7 +567,6 @@ func (m *Manager) runH2SessionWithBackoff(ctx context.Context, backoff *time.Dur
 
 	m.mu.Lock()
 	m.connected = true
-	m.isQUIC = false
 	m.sessionID = sessID
 	m.generation++
 	m.mu.Unlock()
@@ -1573,14 +1087,5 @@ func closeConn(c io.Closer) {
 	}
 	if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		klog.V(2).Infof("failed to close: %v", err)
-	}
-}
-
-func closeQUICConn(c *quic.Conn, code quic.ApplicationErrorCode, msg string) {
-	if c == nil {
-		return
-	}
-	if err := c.CloseWithError(code, msg); err != nil && !errors.Is(err, net.ErrClosed) {
-		klog.V(2).Infof("failed to close QUIC connection: %v", err)
 	}
 }

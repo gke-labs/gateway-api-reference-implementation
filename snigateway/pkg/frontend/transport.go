@@ -22,9 +22,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
-	"github.com/quic-go/quic-go"
 )
 
 // Transport represents the data-plane connection provider between the frontend and backends.
@@ -200,180 +197,25 @@ func (p *PoolTransport) Close() error {
 	return nil
 }
 
-// QUICTransport implements Transport for reverse tunnels over QUIC streams.
-type QUICTransport struct {
-	mu       sync.Mutex
-	sessions map[string]*quic.Conn
-	notifyCh chan struct{}
-	closed   bool
-}
-
-// NewQUICTransport creates a new QUICTransport.
-func NewQUICTransport() *QUICTransport {
-	return &QUICTransport{
-		sessions: make(map[string]*quic.Conn),
-		notifyCh: make(chan struct{}),
-	}
-}
-
-func (q *QUICTransport) broadcastLocked() {
-	close(q.notifyCh)
-	q.notifyCh = make(chan struct{})
-}
-
-// RegisterSession records a QUIC connection for a sessionID.
-func (q *QUICTransport) RegisterSession(sessionID string, conn *quic.Conn) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.closed {
-		closeQUICConn(conn, 0, "transport closed")
-		return
-	}
-	q.sessions[sessionID] = conn
-	q.broadcastLocked()
-}
-
-// UnregisterSession removes a session and closes its QUIC connection.
-func (q *QUICTransport) UnregisterSession(sessionID string) {
-	q.mu.Lock()
-	conn, exists := q.sessions[sessionID]
-	delete(q.sessions, sessionID)
-	if exists {
-		q.broadcastLocked()
-	}
-	q.mu.Unlock()
-
-	if exists && conn != nil {
-		closeQUICConn(conn, 0, "session unregistered")
-	}
-}
-
-// HasSession returns true if the session is currently registered in the QUIC transport.
-func (q *QUICTransport) HasSession(sessionID string) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	_, exists := q.sessions[sessionID]
-	return exists
-}
-
-// TryGetConn attempts to open a stream for sessionID immediately without blocking.
-// If the session exists, it opens a stream and returns a net.Conn. If the session doesn't exist, returns nil, nil.
-func (q *QUICTransport) TryGetConn(ctx context.Context, sessionID string) (net.Conn, error) {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
-		return nil, net.ErrClosed
-	}
-	sessConn, exists := q.sessions[sessionID]
-	q.mu.Unlock()
-
-	if !exists || sessConn == nil {
-		return nil, nil
-	}
-
-	stream, err := sessConn.OpenStreamSync(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return api.NewQUICStreamConn(stream, sessConn), nil
-}
-
-// GetConn opens a new bidirectional stream for sessionID.
-func (q *QUICTransport) GetConn(ctx context.Context, sessionID string) (net.Conn, error) {
-	conn, _, err := q.GetConnForSessions(ctx, []string{sessionID})
-	return conn, err
-}
-
-// GetConnForSessions attempts to open a stream on one of the candidate sessions in order.
-// If none are currently ready or available, it waits until a session registers or ctx is done.
-func (q *QUICTransport) GetConnForSessions(ctx context.Context, sessionIDs []string) (net.Conn, string, error) {
-	for {
-		q.mu.Lock()
-		if q.closed {
-			q.mu.Unlock()
-			return nil, "", net.ErrClosed
-		}
-
-		ch := q.notifyCh
-
-		var candidates []*quic.Conn
-		var candidateSIDs []string
-		for _, sid := range sessionIDs {
-			if sessConn, exists := q.sessions[sid]; exists {
-				candidates = append(candidates, sessConn)
-				candidateSIDs = append(candidateSIDs, sid)
-			}
-		}
-		q.mu.Unlock()
-
-		for i, sessConn := range candidates {
-			stream, err := sessConn.OpenStreamSync(ctx)
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil, "", ctx.Err()
-				}
-				// Stream opening failed on this session; try next candidate
-				continue
-			}
-			return api.NewQUICStreamConn(stream, sessConn), candidateSIDs[i], nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, "", ctx.Err()
-		case <-ch:
-			// Session registered/unregistered; retry under lock
-		}
-	}
-}
-
-// Close closes all QUIC sessions.
-func (q *QUICTransport) Close() error {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
-		return nil
-	}
-	q.closed = true
-	q.broadcastLocked()
-
-	var allConns []*quic.Conn
-	for sid, conn := range q.sessions {
-		allConns = append(allConns, conn)
-		delete(q.sessions, sid)
-	}
-	q.mu.Unlock()
-
-	for _, conn := range allConns {
-		closeQUICConn(conn, 0, "transport closed")
-	}
-	return nil
-}
-
-// CompositeTransport combines PoolTransport (TCP), QUICTransport (QUIC), and H2Transport (HTTP/2)
+// CompositeTransport combines PoolTransport (TCP) and H2Transport (HTTP/2)
 // behind the unified Transport interface.
 type CompositeTransport struct {
 	mu     sync.Mutex
 	pool   *PoolTransport
-	quic   *QUICTransport
 	h2     *H2Transport
 	closed bool
 }
 
-// NewCompositeTransport creates a new CompositeTransport wrapping pool, quic, and h2 transports.
-func NewCompositeTransport(pool *PoolTransport, quicTr *QUICTransport, h2Tr *H2Transport) *CompositeTransport {
+// NewCompositeTransport creates a new CompositeTransport wrapping pool and h2 transports.
+func NewCompositeTransport(pool *PoolTransport, h2Tr *H2Transport) *CompositeTransport {
 	if pool == nil {
 		pool = NewPoolTransport()
-	}
-	if quicTr == nil {
-		quicTr = NewQUICTransport()
 	}
 	if h2Tr == nil {
 		h2Tr = NewH2Transport()
 	}
 	return &CompositeTransport{
 		pool: pool,
-		quic: quicTr,
 		h2:   h2Tr,
 	}
 }
@@ -381,11 +223,6 @@ func NewCompositeTransport(pool *PoolTransport, quicTr *QUICTransport, h2Tr *H2T
 // Pool returns the underlying PoolTransport.
 func (c *CompositeTransport) Pool() *PoolTransport {
 	return c.pool
-}
-
-// QUIC returns the underlying QUICTransport.
-func (c *CompositeTransport) QUIC() *QUICTransport {
-	return c.quic
 }
 
 // H2 returns the underlying H2Transport.
@@ -399,7 +236,7 @@ func (c *CompositeTransport) GetConn(ctx context.Context, sessionID string) (net
 	return conn, err
 }
 
-// GetConnForSessions searches candidate sessions in order across QUIC, H2, and TCP pool transports.
+// GetConnForSessions searches candidate sessions in order across H2 and TCP pool transports.
 // It snapshots all notification channels BEFORE checking sessions to guarantee no lost wakeups.
 func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs []string) (net.Conn, string, error) {
 	for {
@@ -415,31 +252,12 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 		poolNotify := c.pool.notifyCh
 		c.pool.mu.Unlock()
 
-		c.quic.mu.Lock()
-		quicNotify := c.quic.notifyCh
-		c.quic.mu.Unlock()
-
 		c.h2.mu.Lock()
 		h2Notify := c.h2.notifyCh
 		c.h2.mu.Unlock()
 
 		for _, sid := range sessionIDs {
-			// Check QUIC transport first with non-blocking TryGetConn
-			if c.quic.HasSession(sid) {
-				conn, err := c.quic.TryGetConn(ctx, sid)
-				if err != nil {
-					if ctx.Err() != nil {
-						return nil, "", ctx.Err()
-					}
-					// Dead stream or error on this session; try next candidate
-					continue
-				}
-				if conn != nil {
-					return conn, sid, nil
-				}
-			}
-
-			// Check H2 transport next with non-blocking TryGetConn
+			// Check H2 transport first with non-blocking TryGetConn
 			if c.h2.HasSession(sid) {
 				conn, err := c.h2.TryGetConn(ctx, sid)
 				if err != nil {
@@ -464,7 +282,6 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 		case <-ctx.Done():
 			return nil, "", ctx.Err()
 		case <-poolNotify:
-		case <-quicNotify:
 		case <-h2Notify:
 		}
 	}
@@ -482,9 +299,6 @@ func (c *CompositeTransport) Close() error {
 
 	var errs []error
 	if err := c.pool.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	if err := c.quic.Close(); err != nil {
 		errs = append(errs, err)
 	}
 	if err := c.h2.Close(); err != nil {

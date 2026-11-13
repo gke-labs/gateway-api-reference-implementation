@@ -15,16 +15,12 @@
 package frontend
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"net"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 )
@@ -69,12 +65,6 @@ func setupTestServerForLeakTests(t *testing.T, clk *leakTestClock) (*Server, str
 	}
 	serverAddr := ln.Addr().String()
 
-	pc, err := net.ListenPacket("udp", serverAddr)
-	if err != nil {
-		ln.Close()
-		t.Fatalf("ListenPacket failed: %v", err)
-	}
-
 	cfg := ServerConfig{
 		ServerTLSConfig:     serverTLS,
 		InternalHostname:    "snigateway.internal",
@@ -90,12 +80,11 @@ func setupTestServerForLeakTests(t *testing.T, clk *leakTestClock) (*Server, str
 	srv, err := NewServer(cfg)
 	if err != nil {
 		ln.Close()
-		pc.Close()
 		t.Fatalf("NewServer failed: %v", err)
 	}
 
 	go func() {
-		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+		_ = srv.Serve(ln)
 	}()
 
 	cleanup := func() {
@@ -159,45 +148,6 @@ func TestSessionTeardown_MapCleanup_NormalEnd(t *testing.T) {
 		}
 		waitForEmptySessionMaps(t, srv)
 	})
-
-	t.Run("QUIC session", func(t *testing.T) {
-		for i := 0; i < nSessions; i++ {
-			sessCtx, cancel := context.WithCancel(t.Context())
-			qConn, err := c.DialQUIC(sessCtx)
-			if err != nil {
-				cancel()
-				t.Fatalf("session %d: DialQUIC failed: %v", i, err)
-			}
-			ctrlStream, err := qConn.OpenStreamSync(sessCtx)
-			if err != nil {
-				_ = qConn.CloseWithError(0, "error")
-				cancel()
-				t.Fatalf("session %d: OpenStreamSync failed: %v", i, err)
-			}
-			if _, err := ctrlStream.Write([]byte("{\"type\":\"session\"}\n")); err != nil {
-				_ = qConn.CloseWithError(0, "error")
-				cancel()
-				t.Fatalf("session %d: writing handshake failed: %v", i, err)
-			}
-			reader := bufio.NewReader(ctrlStream)
-			line, err := reader.ReadBytes('\n')
-			if err != nil {
-				_ = qConn.CloseWithError(0, "error")
-				cancel()
-				t.Fatalf("session %d: reading SessionResponse failed: %v", i, err)
-			}
-			var sessResp api.SessionResponse
-			if err := json.Unmarshal(bytes.TrimSpace(line), &sessResp); err != nil {
-				_ = qConn.CloseWithError(0, "error")
-				cancel()
-				t.Fatalf("session %d: unmarshal SessionResponse failed: %v", i, err)
-			}
-			_ = ctrlStream.Close()
-			_ = qConn.CloseWithError(0, "test done")
-			cancel()
-		}
-		waitForEmptySessionMaps(t, srv)
-	})
 }
 
 func TestSessionTeardown_LeaseReaperAndHandler(t *testing.T) {
@@ -246,65 +196,6 @@ func TestSessionTeardown_LeaseReaperAndHandler(t *testing.T) {
 
 		// Registration must be removed
 		if _, ok := srv.RegistrationTable().Match("reaper-http.example.com"); ok {
-			t.Fatal("expected hostname to be dropped from registration table")
-		}
-	})
-
-	t.Run("QUIC session closed by lease reaper then handler teardown", func(t *testing.T) {
-		sessCtx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-
-		qConn, err := c.DialQUIC(sessCtx)
-		if err != nil {
-			t.Fatalf("DialQUIC failed: %v", err)
-		}
-		defer qConn.CloseWithError(0, "test done")
-
-		ctrlStream, err := qConn.OpenStreamSync(sessCtx)
-		if err != nil {
-			t.Fatalf("OpenStreamSync failed: %v", err)
-		}
-		defer ctrlStream.Close()
-
-		if _, err := ctrlStream.Write([]byte("{\"type\":\"session\"}\n")); err != nil {
-			t.Fatalf("writing handshake failed: %v", err)
-		}
-
-		reader := bufio.NewReader(ctrlStream)
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			t.Fatalf("reading SessionResponse failed: %v", err)
-		}
-
-		var sessResp api.SessionResponse
-		if err := json.Unmarshal(bytes.TrimSpace(line), &sessResp); err != nil {
-			t.Fatalf("unmarshal SessionResponse failed: %v", err)
-		}
-		sessID := sessResp.SessionID
-		if sessID == "" {
-			t.Fatal("empty sessionID")
-		}
-
-		// Register a hostname with a lease expiring in 50ms from mock clock
-		leaseExp := clk.Now().Add(50 * time.Millisecond)
-		srv.RegistrationTable().RegisterWithLease(sessID, []string{"reaper-quic.example.com"}, leaseExp)
-
-		// Advance mock clock past lease expiration to trigger reaper
-		clk.Advance(1 * time.Second)
-
-		// The lease reaper calls CloseSession, which closes the QUIC connection.
-		// The QUIC connection will be closed.
-		select {
-		case <-qConn.Context().Done():
-		case <-time.After(3 * time.Second):
-			t.Fatal("timed out waiting for QUIC connection to close after lease expiration")
-		}
-
-		// Maps must be clean
-		waitForEmptySessionMaps(t, srv)
-
-		// Registration must be removed
-		if _, ok := srv.RegistrationTable().Match("reaper-quic.example.com"); ok {
 			t.Fatal("expected hostname to be dropped from registration table")
 		}
 	})
