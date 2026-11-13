@@ -71,8 +71,8 @@ The design separates caller authorization and key storage into two orthogonal la
 Neither axis prevents an authorized client from requesting signatures while compromised. The project plans three complementary mitigations to limit that exposure:
 
 1. **Short certificate lifetimes (provided by the issuing CA):** Frequent certificate rotation limits how long an attacker can exploit a compromised key or signature.
-2. **Per-key rate limits (provided by the custodian daemon):** A token bucket per key limits how many signatures a client can request over time, blunting mass-signing attacks.
-3. **Structured audit logging (provided by the custodian daemon):** The custodian logs every signature request with caller credentials and the key name, helping operators detect anomalous activity. The log omits digest contents and private key bytes.
+2. **Per-key rate limits:** The custodian daemon does not limit the rate of `Sign` calls, because any rate limit would cap the number of TLS handshakes the gateway can perform, and no specific limit value has an empirical basis yet.
+3. **Structured audit logging (provided by the custodian daemon):** The custodian logs one structured JSON line per `Sign` call or peer-credential denial recording key name, caller UID and PID (from peer credentials), hash algorithm or method, and outcome (`success`, `rejected`, `denied`, `error`) to standard output. The audit log omits digest contents and private key bytes.
 
 ## Fail-Closed Requirement
 

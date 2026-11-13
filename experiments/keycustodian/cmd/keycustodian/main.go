@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -89,7 +90,12 @@ func run(args []string) error {
 		return errors.New("at least one of --allowed-uids or --allowed-gids must be specified")
 	}
 
-	custodianServer, err := custodian.NewServer(keysDirectory)
+	auditLogger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	custodianServer, err := custodian.NewServer(
+		keysDirectory,
+		custodian.WithAuditLogger(auditLogger),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize custodian server: %w", err)
 	}
@@ -108,8 +114,8 @@ func run(args []string) error {
 	}()
 
 	grpcServer := grpc.NewServer(
-		grpc.UnaryInterceptor(custodian.UnaryAuthInterceptor(allowedUIDs, allowedGIDs)),
-		grpc.StreamInterceptor(custodian.StreamAuthInterceptor(allowedUIDs, allowedGIDs)),
+		grpc.UnaryInterceptor(custodian.UnaryAuthInterceptor(allowedUIDs, allowedGIDs, auditLogger)),
+		grpc.StreamInterceptor(custodian.StreamAuthInterceptor(allowedUIDs, allowedGIDs, auditLogger)),
 	)
 	keycustodianv1alpha1.RegisterKeyCustodianServiceServer(grpcServer, custodianServer)
 
