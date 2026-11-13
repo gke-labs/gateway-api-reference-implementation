@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -169,6 +170,67 @@ func TestSource_NamespaceQualifiedDataPlaneServiceAccount(t *testing.T) {
 	wantGateway := "traffic-system/web-gateway"
 	if got := capturedReq.GetGateway(); got != wantGateway {
 		t.Errorf("GetGateway() = %q, want %q", got, wantGateway)
+	}
+}
+
+func TestSource_GatewayIPAddresses(t *testing.T) {
+	reqCh := make(chan *certserverv1.GetCertificateRequest, 1)
+	mock := &mockCertClient{
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
+			select {
+			case reqCh <- req:
+			default:
+			}
+			return nil, status.Errorf(codes.Unavailable, "issuance in progress")
+		},
+	}
+
+	src := NewSource(mock, WithMinBackoff(10*time.Millisecond), WithMaxBackoff(50*time.Millisecond))
+	defer src.Close()
+
+	ipType := gatewayv1.IPAddressType
+	hostnameType := gatewayv1.HostnameAddressType
+
+	host := gatewayv1.Hostname("app.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "web-gateway",
+		},
+		Status: gatewayv1.GatewayStatus{
+			Addresses: []gatewayv1.GatewayStatusAddress{
+				{
+					Type:  &ipType,
+					Value: "198.51.100.1",
+				},
+				{
+					Type:  &hostnameType,
+					Value: "lb.example.com",
+				},
+				{
+					Type:  nil, // Defaults to IPAddress
+					Value: "2001:db8::1",
+				},
+			},
+		},
+	}
+	listener := &gatewayv1.Listener{Hostname: &host}
+
+	_, err := src.ResolveCertificates(gw, listener)
+	if err != nil {
+		t.Fatalf("unexpected error calling ResolveCertificates: %v", err)
+	}
+
+	var capturedReq *certserverv1.GetCertificateRequest
+	select {
+	case capturedReq = <-reqCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for GetCertificate request")
+	}
+
+	wantAddresses := []string{"198.51.100.1", "2001:db8::1"}
+	if !reflect.DeepEqual(capturedReq.GetAddresses(), wantAddresses) {
+		t.Errorf("GetAddresses() = %v, want %v", capturedReq.GetAddresses(), wantAddresses)
 	}
 }
 
