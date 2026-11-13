@@ -405,79 +405,54 @@ The engine separates synchronization across four distinct layers to prevent dead
 
 ## File-Backed Values: ByteString
 
-`Engine.Get` returns a `ByteString` value rather than a `[]byte` slice so that oversize values can remain on disk instead of being loaded into memory in their entirety. A `ByteString` represents an immutable sequence of bytes. The engine backs small values (stored in slotted pages or multi-block heap pages) with in-memory byte slices, and backs oversize values with open file handles pointing directly to value files in the `oversize/` directory.
+In a planned change, `Engine.Get` will return a `ByteString` value rather than a `[]byte` slice so that oversize values can remain on disk instead of being read entirely into memory. A `ByteString` represents an immutable sequence of bytes. Memory-backed values hold an in-memory byte slice, and oversize values hold an open file handle to a file in the `oversize/` directory.
 
-### Contract and Representation
+### Contract
 
-The contract defines the following rules in active voice:
-- **Immutability:** The caller must treat the byte sequence in a `ByteString` as immutable. The type does not enforce immutability at runtime and avoids defensive copying to eliminate allocation overhead. Callers must never mutate slices obtained from a `ByteString`.
-- **Resource release:** The caller must call `Release()` when finished with a `ByteString`. For memory-backed values, `Release()` is a no-op. For file-backed values, `Release()` closes the underlying file descriptor. Calling `Release()` multiple times is idempotent. Calling `Read()` or `WriteTo()` after `Release()` returns an error.
-- **Access model:** `ByteString` provides sequential streaming access through `io.Reader` (`Read`), bulk transfer through `io.WriterTo` (`WriteTo`), and slice materialization through `Bytes()`. For oversize values, streaming methods read directly from the backing file without loading the entire payload into the Go heap.
-
-```go
-type ByteString struct {
-	// unexported fields
-}
-
-func (b ByteString) Len() int64
-func (b ByteString) Read(p []byte) (n int, err error)
-func (b ByteString) WriteTo(w io.Writer) (n int64, err error)
-func (b ByteString) Bytes() ([]byte, error)
-func (b ByteString) Release() error
-```
-
-The type provides a uniform abstraction across both storage locations:
-- For small values, `ByteString` holds a direct slice referencing memory in the block pool or heap. Slice operations avoid allocations, and calling `Release()` is safe and cost-free.
-- For oversize values, `ByteString` encapsulates an open file handle, an offset cursor, and decompressor state. Calling `Bytes()` reads and allocates the entire payload into heap memory, which callers should avoid for large values unless full materialization is required.
-- Immutability protects store integrity and concurrent readers. Because memory-backed values reference internal buffers without defensive copies, mutating bytes in place would corrupt store state or race with other readers. Callers that require mutable buffers must make an explicit copy.
+- **Immutability:** The caller must not modify the bytes. The type does not enforce immutability at runtime. The engine documents immutability because the type may share bytes between callers later, and a file-backed value cannot be modified at all. For small values, `Get` copies the record payload out of the page under the page latch and decompresses it into a new slice, so the caller receives its own memory allocation today.
+- **Resource release:** The caller must call `Release()` when finished with a `ByteString`. For a memory-backed value, `Release()` is a no-op. For a file-backed value, `Release()` closes the underlying file descriptor. Calling `Release()` multiple times is idempotent. Operations on a closed `ByteString` return an error.
+- **Access model:** `ByteString` provides sequential streaming access through `io.Reader` and bulk conversion through `Bytes()`. For oversize values, streaming reads from the file through a decompressor without loading the full payload into memory.
 
 ### Lifetime
 
-The engine deletes an older oversize file only after the replacement pointer record is durable in the WAL (Invariant 6). When a concurrent `Put` replaces a key or a garbage collection sweep cleans an unreferenced file, the engine unlinks the file from the `oversize/` directory. To ensure that an in-flight reader can still access the data after unlinking, `Get` opens the oversize file and retains an open file descriptor inside the `ByteString` before returning to the caller.
+The engine keeps the backing file open inside the `ByteString`, and the caller must call `Release()` to close it.
 
-On Linux and POSIX filesystems, an unlinked file remains fully readable through existing open file descriptors. The kernel removes the directory entry immediately, but preserves the file's inode and data blocks on disk until all open descriptors referencing that inode close.
+Under Invariant 6 (Old-Version Retention for Oversize Values), the engine deletes an older oversize file only after the replacement pointer record is durable in the WAL. When a concurrent `Put` replaces a key, it unlinks the older file. Similarly, planned periodic garbage collection will sweep and delete unreferenced files while the store runs. The engine relies on an unlinked file staying readable through an open descriptor, which holds on Linux and macOS, the two platforms the engine builds for.
 
-The caller must call `Release()` on the `ByteString` when processing completes. If the caller fails to call `Release()`:
-- The open file descriptor leaks in the process file table until the Go garbage collector runs a finalizer or the process terminates.
-- If the engine unlinked the file concurrently, the operating system cannot reclaim the unlinked inode's disk blocks, causing a disk space leak that persists until the descriptor closes.
-- Sustained descriptor leaks under high read concurrency exhaust the process file descriptor table (`RLIMIT_NOFILE`), causing subsequent disk I/O, file opens, and network accepts to fail with `EMFILE`.
-- Registering a runtime finalizer (`runtime.SetFinalizer`) offers an emergency safety net, but Go's garbage collector provides no timeliness guarantees under load and cannot prevent descriptor exhaustion during bursts of read traffic.
+`Get` opens the file during its optimistic read attempt. If the open fails or the index entry changed concurrently, `Get` closes the descriptor from the abandoned attempt and retries through the existing recheck loop, falling back to `writerMu.RLock` under contention.
 
-*Trade-offs:* Requiring callers to invoke `Release()` introduces explicit resource management to all `Get` call sites (typically via `defer val.Release()`), departing from Go's garbage-collected memory model. In return, holding an open file descriptor guarantees safe, concurrent read isolation against unlinked files without copying multi-megabyte payloads into memory.
+The type does not register a runtime finalizer. If the caller does not call `Release()`, the descriptor stays open until the process exits. If the file was unlinked, its disk space is not reclaimed until the descriptor closes. Each outstanding file-backed value holds one descriptor, so the number of values a caller can hold open at once is bounded by the process descriptor limit (`RLIMIT_NOFILE`). The engine leaves this bound to the caller.
 
 ### Integrity
 
-Today, the engine verifies an oversize file against its SHA-256 checksum before returning the value. For a file-backed value, the engine can verify integrity at one of two points:
-1. **At open (`Get` time):** `Get` reads the entire file through a streaming hasher in small scratch buffers (such as 32 KiB) without holding the payload in memory, verifies the digest against the pointer record, and rewinds the file offset to zero before returning the `ByteString`.
-2. **At read time (streaming verification):** `Get` opens the file and returns the `ByteString` immediately without pre-reading disk blocks. A hashing reader calculates the SHA-256 digest incrementally as the caller consumes bytes, returning an integrity error (`ErrCorruptStore`) on the final `Read` call that encounters EOF.
+The choice between upfront verification during `Get` and streaming verification during read is open for the maintainer; we recommend verifying as the caller reads.
 
-*Trade-offs:* Upfront verification at open time guarantees fail-fast correctness: `Get` detects corruption immediately, ensuring callers never consume or act on corrupted bytes. However, upfront verification reads the file twice from disk—once to hash during `Get` and once when the caller reads the payload—doubling read I/O bandwidth on cold files. Streaming verification achieves single-pass I/O by reading disk blocks exactly once, but reports damage only at the end of the stream. Callers that forward output to external sinks (such as network sockets) risk transmitting corrupted bytes before discovering the failure, and callers that read only a prefix never trigger verification.
+The pointer record's checksum covers the stored (compressed) bytes, and an unencrypted file name derives from that hash. Verification while reading therefore runs over the compressed stream below the decompressor, and the caller sees decompressed bytes before the check completes.
+
+- **Upfront verification:** `Get` reads the file through a streaming hasher and checks the checksum before returning the `ByteString`. A damaged file returns an error from `Get`. This prevents the caller from seeing damaged data, but reads the file twice from disk: once to hash, and once as the caller reads.
+- **Streaming verification:** `Get` returns the `ByteString` immediately. A hashing reader checks the checksum as bytes are read, returning an error on the last `Read`. If the compressed stream is damaged, the decompressor can also fail first with a decompression error. This needs only one read pass over the file, but reports damage only at the end of the stream.
 
 ### Compression
 
-Stored oversize values are compressed with zstd or snappy. Because stream decompressors produce variable-length output from compressed frames, a reader cannot seek or perform random access to arbitrary uncompressed offsets without decompressing all preceding blocks from offset zero. The engine faces two choices:
-1. **Stream type:** `ByteString` acts as a sequential stream (`io.Reader`). Oversize values remain compressed on disk. As the caller reads, `ByteString` streams compressed blocks from disk through an in-memory decompressor using a small scratch buffer.
-2. **Uncompressed storage:** The engine disables compression for oversize values and stores raw uncompressed bytes on disk, allowing `ByteString` to support random access (`io.ReaderAt`).
+The type is a sequential stream, and oversize values remain compressed on disk.
 
-*Trade-offs:* Storing oversize values uncompressed enables true random access directly against the file descriptor without buffering. However, uncompressed storage drastically increases disk consumption and write I/O bandwidth (forfeiting the 50% to 80% compression savings typical for Kubernetes manifests). Making `ByteString` a sequential stream keeps oversize values compressed on disk, preserving storage efficiency while bounding memory consumption to a fixed decompressor window (tens of KiB).
+The engine supports two compression codecs: none and zstd. Because zstd blocks decompress into variable amounts of data, a reader cannot seek to an arbitrary uncompressed offset without decompressing earlier blocks.
+
+Storing oversize values uncompressed would allow random access, but would alter the storage format:
+- The oversize threshold (512 blocks) is measured on stored size. Storing uncompressed values would evaluate the threshold on uncompressed data, moving more records into the oversize store.
+- The file name and the skip-identical-rewrite rule use the SHA-256 hash of the stored bytes. Storing uncompressed data would change the hash input and file names.
+- Oversize values would forgo compression savings on disk.
+
+Making `ByteString` a sequential stream keeps the stored format, threshold, and file naming unchanged while bounding memory use during reads to the decompressor buffer.
 
 ### Encryption
 
-The planned block-level encryption scheme encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak and a derived per-file key. Because AES-XTS encrypts fixed 4 KiB blocks independently without ciphertext expansion, it allows reads from any 4 KiB-aligned offset.
+Block encryption replaces per-value encryption and allows direct reads from any 4 KiB offset.
 
-Block encryption fits both storage models:
-- If oversize values are uncompressed, a reader decrypts only the specific 4 KiB units that cover the requested byte range `[offset, offset+len)`, enabling efficient random-access reads directly from disk without decrypting unread blocks.
-- If oversize values are compressed, the streaming `ByteString` reads encrypted 4 KiB units sequentially, decrypts each unit with AES-XTS using its unit index tweak, and passes the decrypted plaintext into the decompressor.
-
-*Trade-offs:* AES-XTS unit encryption operates strictly at the direct I/O boundary. It decouples storage confidentiality from value representation, enabling random access to encrypted disk blocks while allowing higher-level consumers to stream through decompression pipelines.
+`Get` today decrypts an oversize value with the per-value cipher before it decompresses. Until planned block-level encryption lands, a file-backed value cannot be served for a store that uses the per-value cipher without loading the full ciphertext into memory to decrypt it; such stores must fall back to memory-backed values. Under the planned block encryption, the engine encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak. The streaming `ByteString` reads 4 KiB units sequentially, decrypts each unit, and feeds the decrypted stream into the decompressor.
 
 ### Callers
 
-Callers differ in how they process values returned by `Get`:
-- **kubecache:** Kubecache implements Kubernetes informer caching (`cache.Indexer`). When retrieving an object (`GetByKey` or `List`), kubecache immediately unmarshals the raw payload into a Go API struct (such as `v1.ConfigMap`) via `d.codec.Decode`. Because standard JSON and protobuf decoders allocate the entire object graph on the Go heap, kubecache materializes the decoded object in memory regardless of whether the raw bytes reside on disk. For kubecache, a file-backed `ByteString` avoids holding the raw serialized bytes in memory concurrently with the decoded object (when using a streaming decoder), but does not reduce the resident heap footprint of the decoded struct.
-- **Beneficiaries:** Callers that stream or forward raw payloads without deserializing them into Go structs benefit directly:
-  - Network and API gateways streaming large static assets, TLS certificate bundles, or container layers directly to HTTP or gRPC sockets using `io.Copy` or `sendfile`.
-  - Exporters and backup tools copying database records to secondary storage or remote object stores.
-  - Streaming parsers and hashers that process data in fixed-size chunks (such as 32 KiB buffers).
-
-*Trade-offs:* Callers that decode complete object graphs derive minimal memory savings from file-backed values because struct deserialization dominates memory usage. Callers that stream, copy, or hash raw payloads avoid multi-megabyte heap allocations entirely, maintaining flat $O(1)$ memory consumption and preventing garbage collection pauses under concurrent load.
+Callers that stream data benefit from file-backed values, whereas kubecache does not:
+- **kubecache:** Kubecache decodes each value in full into a Kubernetes API Go struct via `d.codec.Decode`. Because decoding allocates the struct on the heap, the object materializes in memory regardless of whether the raw bytes were file-backed. A file-backed `ByteString` avoids holding raw serialized bytes alongside the decoded struct if a streaming decoder is used, but does not reduce the struct's heap footprint.
+- **Network streaming:** Callers that copy a value directly to a network response (such as an HTTP or gRPC response body) benefit directly. They stream data from disk through decompression into the network connection without holding the full uncompressed value in memory.
