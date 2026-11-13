@@ -30,7 +30,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 var (
@@ -81,15 +80,8 @@ type Options struct {
 	CompressionCodec CompressionCodec
 	MaxObjectSize    int
 
-	// MaxQuarantinedFiles is the maximum number of quarantined files kept in each
-	// lost+found directory. When exceeded, the oldest files are removed.
-	// If <= 0, DefaultMaxQuarantinedFiles is used.
-	MaxQuarantinedFiles int
-
-	// MinQuarantinedRetention is the minimum retention duration for quarantined files.
-	// Files younger than this retention are not deleted even when MaxQuarantinedFiles is exceeded.
-	// If == 0, DefaultMinQuarantinedRetention (7 days) is used. If < 0, minimum retention is disabled.
-	MinQuarantinedRetention time.Duration
+	// Quarantine configures quarantine bounding and retention for lost+found directories.
+	Quarantine QuarantineOptions
 
 	compressionCodecSet bool
 }
@@ -185,21 +177,10 @@ func WithAutoDelete(autoDelete bool) Option {
 	}
 }
 
-// WithMaxQuarantinedFiles sets the maximum number of quarantined files kept in each
-// lost+found directory. When the bound is exceeded, the oldest quarantined files are deleted.
-// If n <= 0, DefaultMaxQuarantinedFiles is used.
-func WithMaxQuarantinedFiles(n int) Option {
+// WithQuarantine sets the quarantine bounding and retention options for lost+found directories.
+func WithQuarantine(q QuarantineOptions) Option {
 	return func(o *Options) {
-		o.MaxQuarantinedFiles = n
-	}
-}
-
-// WithMinQuarantinedRetention sets the minimum retention duration for quarantined files.
-// Files younger than this retention are not deleted even when MaxQuarantinedFiles is exceeded.
-// If d == 0, DefaultMinQuarantinedRetention is used. If d < 0, retention duration check is disabled.
-func WithMinQuarantinedRetention(d time.Duration) Option {
-	return func(o *Options) {
-		o.MinQuarantinedRetention = d
+		o.Quarantine = q
 	}
 }
 
@@ -494,14 +475,16 @@ func isEncrypted(c Cipher) bool {
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (*Engine, error) {
 	options := Options{
-		FS:                      NewOSFS(),
-		Cipher:                  NoopCipher{},
-		NumPoolBlocks:           DefaultBlockPoolBlocks,
-		AutoDelete:              false,
-		CompressionCodec:        CodecZstd,
-		MaxObjectSize:           DefaultMaxObjectSize,
-		MaxQuarantinedFiles:     DefaultMaxQuarantinedFiles,
-		MinQuarantinedRetention: DefaultMinQuarantinedRetention,
+		FS:               NewOSFS(),
+		Cipher:           NoopCipher{},
+		NumPoolBlocks:    DefaultBlockPoolBlocks,
+		AutoDelete:       false,
+		CompressionCodec: CodecZstd,
+		MaxObjectSize:    DefaultMaxObjectSize,
+		Quarantine: QuarantineOptions{
+			MaxQuarantinedFiles:     DefaultMaxQuarantinedFiles,
+			MinQuarantinedRetention: DefaultMinQuarantinedRetention,
+		},
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -512,11 +495,11 @@ func Open(opts ...Option) (*Engine, error) {
 	if options.MaxObjectSize <= 0 {
 		options.MaxObjectSize = DefaultMaxObjectSize
 	}
-	if options.MaxQuarantinedFiles <= 0 {
-		options.MaxQuarantinedFiles = DefaultMaxQuarantinedFiles
+	if options.Quarantine.MaxQuarantinedFiles <= 0 {
+		options.Quarantine.MaxQuarantinedFiles = DefaultMaxQuarantinedFiles
 	}
-	if options.MinQuarantinedRetention == 0 {
-		options.MinQuarantinedRetention = DefaultMinQuarantinedRetention
+	if options.Quarantine.MinQuarantinedRetention == 0 {
+		options.Quarantine.MinQuarantinedRetention = DefaultMinQuarantinedRetention
 	}
 
 	dir := options.Dir
@@ -743,10 +726,7 @@ func Open(opts ...Option) (*Engine, error) {
 		cipher:           options.Cipher,
 		compressionCodec: options.CompressionCodec,
 		maxObjectSize:    options.MaxObjectSize,
-		quarantine: QuarantineOptions{
-			MaxQuarantinedFiles:     options.MaxQuarantinedFiles,
-			MinQuarantinedRetention: options.MinQuarantinedRetention,
-		},
+		quarantine:       options.Quarantine,
 		heapFile:         heapFile,
 		keyIndex:         make(map[string]KeyIndexEntry),
 		oversizeObjects:  make(map[string][]byte),
