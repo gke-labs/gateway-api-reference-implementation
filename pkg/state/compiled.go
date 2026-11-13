@@ -332,29 +332,55 @@ func ListenerEntryToSpec(l gatewayv1.ListenerEntry) ListenerSpec {
 // EffectiveListener represents a single compiled listener on a Gateway,
 // originating either directly from the Gateway spec or attached via an allowed ListenerSet.
 type EffectiveListener struct {
-	Owner             ListenerOwner
-	ParentGateway     types.NamespacedName
-	Name              gatewayv1.SectionName
-	Port              gatewayv1.PortNumber
-	Protocol          gatewayv1.ProtocolType
-	Hostname          *gatewayv1.Hostname
-	TLS               *gatewayv1.ListenerTLSConfig
-	AllowedRoutes     *gatewayv1.AllowedRoutes
-	SupportedKinds    []gatewayv1.RouteGroupKind
-	Conditions        []metav1.Condition
-	AttachedRoutes    int32
-	Routes            []InternalRoute
-	TLSBackends       map[string][]InternalTLSBackend
-	TLSHostnameOwners map[string]types.NamespacedName
-	BoundTCPRoute     *types.NamespacedName
-	TCPBackends       []InternalTCPBackend
-	BoundUDPRoute     *types.NamespacedName
-	UDPBackends       []InternalUDPBackend
-	ClientValidation  *InternalClientValidation
-	Generation        int64
+	// Owner identifies the resource (Gateway or ListenerSet) that defines this listener.
+	Owner ListenerOwner
+	// ParentGateway is the namespaced name of the Gateway that hosts this listener.
+	ParentGateway types.NamespacedName
 
+	// Name is the listener's name within its defining resource.
+	Name gatewayv1.SectionName
+	// Port is the network port on which this listener receives traffic.
+	Port gatewayv1.PortNumber
+	// Protocol is the network protocol expected on this port (e.g. HTTP, HTTPS, TLS, TCP, UDP).
+	Protocol gatewayv1.ProtocolType
+	// Hostname is the optional virtual host name or wildcard pattern configured on the listener.
+	Hostname *gatewayv1.Hostname
+	// TLS contains the listener's TLS settings, such as mode and certificate references.
+	TLS *gatewayv1.ListenerTLSConfig
+	// AllowedRoutes defines constraints on routes permitted to attach to this listener.
+	AllowedRoutes *gatewayv1.AllowedRoutes
+	// SupportedKinds lists the route GroupKinds permitted by this listener's protocol and spec.
+	SupportedKinds []gatewayv1.RouteGroupKind
+
+	// Conditions tracks validation and programmed conditions reported in listener status.
+	Conditions []metav1.Condition
+	// AttachedRoutes is the count of routes bound to this listener, updated during compilation.
+	AttachedRoutes int32
+
+	// Routes holds compiled HTTP and gRPC routes attached to this listener.
+	Routes []InternalRoute
+	// TLSBackends maps SNI hostnames to backend destinations attached by TLSRoutes.
+	TLSBackends map[string][]InternalTLSBackend
+	// TLSHostnameOwners maps each hostname to the TLSRoute that won precedence on this listener.
+	TLSHostnameOwners map[string]types.NamespacedName
+	// BoundTCPRoute is the namespaced name of the single TCPRoute attached to this listener, if any.
+	BoundTCPRoute *types.NamespacedName
+	// TCPBackends holds backend destinations attached by the bound TCPRoute.
+	TCPBackends []InternalTCPBackend
+	// BoundUDPRoute is the namespaced name of the single UDPRoute attached to this listener, if any.
+	BoundUDPRoute *types.NamespacedName
+	// UDPBackends holds backend destinations attached by the bound UDPRoute.
+	UDPBackends []InternalUDPBackend
+	// ClientValidation specifies client certificate validation rules for mutual TLS, if configured.
+	ClientValidation *InternalClientValidation
+
+	// Generation is the observed generation of the defining resource at compile time.
+	Generation int64
+
+	// ResolvedCertificates holds TLS certificates resolved from Secret references or certificate sources.
 	ResolvedCertificates []*tls.Certificate
-	ResolvedCertificate  *tls.Certificate
+	// ResolvedCertificate holds the primary resolved certificate for this listener.
+	ResolvedCertificate *tls.Certificate
 }
 
 // IsAccepted returns true if the listener has an Accepted condition with status True.
@@ -712,33 +738,63 @@ type GatewayReadiness struct {
 
 // ModelInputs contains all inputs required to build a CompiledModel and ComputeOutputs.
 type ModelInputs struct {
-	Revision                uint64
-	Gateways                []*gatewayv1.Gateway
-	GatewayClasses          []*gatewayv1.GatewayClass
-	GatewayAddresses        map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
-	GatewayReadiness        map[types.NamespacedName]GatewayReadiness
-	ProvisioningErrors      map[types.NamespacedName]string
-	SupportedAddressTypes   []gatewayv1.AddressType
-	ListenerSets            []*gatewayv1.ListenerSet
-	HTTPRoutes              []*gatewayv1.HTTPRoute
-	TLSRoutes               []*gatewayv1.TLSRoute
-	GRPCRoutes              []*gatewayv1.GRPCRoute
-	TCPRoutes               []*gatewayv1.TCPRoute
-	UDPRoutes               []*gatewayv1.UDPRoute
-	Services                map[types.NamespacedName]*corev1.Service
-	BackendTLSPolicies      []*gatewayv1.BackendTLSPolicy
-	ConfigMaps              map[types.NamespacedName]*corev1.ConfigMap
-	Secrets                 map[types.NamespacedName]*corev1.Secret
-	Namespaces              map[string]*corev1.Namespace
-	ReferenceGrants         map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
-	RefValidator            ReferenceGrantValidator
-	ControllerName          string
-	AllInOneMode            bool
-	GatewayCRDBundleVersion *string
-	DisabledRouteKinds      map[gatewayv1.Kind]bool
+	// Revision is the monotonically increasing snapshot revision number for state computation.
+	Revision uint64
 
+	// Gateways is the list of Gateway resources to compile.
+	Gateways []*gatewayv1.Gateway
+	// GatewayClasses is the list of GatewayClass resources known to the controller.
+	GatewayClasses []*gatewayv1.GatewayClass
+	// GatewayAddresses provides infrastructure-assigned status addresses keyed by Gateway.
+	GatewayAddresses map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
+	// GatewayReadiness provides data-plane readiness state keyed by Gateway.
+	GatewayReadiness map[types.NamespacedName]GatewayReadiness
+	// ProvisioningErrors maps Gateway names to error messages from infrastructure provisioning.
+	ProvisioningErrors map[types.NamespacedName]string
+	// SupportedAddressTypes lists address types supported by the controller implementation.
+	SupportedAddressTypes []gatewayv1.AddressType
+
+	// ListenerSets is the list of ListenerSet resources that attach listeners to Gateways.
+	ListenerSets []*gatewayv1.ListenerSet
+	// HTTPRoutes is the list of HTTPRoute resources to bind to listeners.
+	HTTPRoutes []*gatewayv1.HTTPRoute
+	// TLSRoutes is the list of TLSRoute resources to bind to listeners.
+	TLSRoutes []*gatewayv1.TLSRoute
+	// GRPCRoutes is the list of GRPCRoute resources to bind to listeners.
+	GRPCRoutes []*gatewayv1.GRPCRoute
+	// TCPRoutes is the list of TCPRoute resources to bind to listeners.
+	TCPRoutes []*gatewayv1.TCPRoute
+	// UDPRoutes is the list of UDPRoute resources to bind to listeners.
+	UDPRoutes []*gatewayv1.UDPRoute
+
+	// Services provides backend Kubernetes Services keyed by namespaced name.
+	Services map[types.NamespacedName]*corev1.Service
+	// BackendTLSPolicies configures TLS settings for connections to backend services.
+	BackendTLSPolicies []*gatewayv1.BackendTLSPolicy
+	// ConfigMaps provides ConfigMap resources, such as CA bundles or parameters, by namespaced name.
+	ConfigMaps map[types.NamespacedName]*corev1.ConfigMap
+	// Secrets provides Secret resources, such as TLS certificates or client CAs, by namespaced name.
+	Secrets map[types.NamespacedName]*corev1.Secret
+	// Namespaces provides Namespace resources keyed by name for cross-namespace checks.
+	Namespaces map[string]*corev1.Namespace
+	// ReferenceGrants provides ReferenceGrant resources authorizing cross-namespace references.
+	ReferenceGrants map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+
+	// RefValidator checks whether cross-namespace references are permitted by ReferenceGrants.
+	RefValidator ReferenceGrantValidator
+	// ControllerName is the controller name used to match GatewayClasses and condition reporters.
+	ControllerName string
+	// AllInOneMode indicates whether Gateways share a single data-plane proxy instance.
+	AllInOneMode bool
+	// GatewayCRDBundleVersion is the detected Gateway API CRD release bundle version string.
+	GatewayCRDBundleVersion *string
+	// DisabledRouteKinds specifies route kinds that are administratively disabled.
+	DisabledRouteKinds map[gatewayv1.Kind]bool
+
+	// CertificateSources maps source names to pluggable external TLS certificate providers.
 	CertificateSources map[string]CertificateSource
 
+	// ListenerValidator is an optional callback to validate listener specifications against custom policies.
 	ListenerValidator ListenerValidator
 }
 
@@ -748,25 +804,47 @@ type ListenerValidator func(spec ListenerSpec, owner ListenerOwner, gw *gatewayv
 
 // Outputs represents all computed outputs produced by ComputeOutputs.
 type Outputs struct {
-	Revision                 uint64
-	GatewayStatuses          map[types.NamespacedName]gatewayv1.GatewayStatus
-	GatewayParameters        map[types.NamespacedName]*Parameters
-	GatewayParametersErrors  map[types.NamespacedName]error
-	HTTPRouteStatuses        map[types.NamespacedName]gatewayv1.HTTPRouteStatus
-	TLSRouteStatuses         map[types.NamespacedName]gatewayv1.TLSRouteStatus
-	GRPCRouteStatuses        map[types.NamespacedName]gatewayv1.GRPCRouteStatus
-	TCPRouteStatuses         map[types.NamespacedName]gatewayv1.TCPRouteStatus
-	UDPRouteStatuses         map[types.NamespacedName]gatewayv1.UDPRouteStatus
-	ListenerSetStatuses      map[types.NamespacedName]gatewayv1.ListenerSetStatus
+	// Revision is the snapshot revision number corresponding to the inputs used for computation.
+	Revision uint64
+
+	// GatewayStatuses holds the computed status to apply to each Gateway.
+	GatewayStatuses map[types.NamespacedName]gatewayv1.GatewayStatus
+	// GatewayParameters holds resolved configuration parameters for each Gateway.
+	GatewayParameters map[types.NamespacedName]*Parameters
+	// GatewayParametersErrors holds parameter resolution errors keyed by Gateway.
+	GatewayParametersErrors map[types.NamespacedName]error
+	// HTTPRouteStatuses holds the computed status to apply to each HTTPRoute.
+	HTTPRouteStatuses map[types.NamespacedName]gatewayv1.HTTPRouteStatus
+	// TLSRouteStatuses holds the computed status to apply to each TLSRoute.
+	TLSRouteStatuses map[types.NamespacedName]gatewayv1.TLSRouteStatus
+	// GRPCRouteStatuses holds the computed status to apply to each GRPCRoute.
+	GRPCRouteStatuses map[types.NamespacedName]gatewayv1.GRPCRouteStatus
+	// TCPRouteStatuses holds the computed status to apply to each TCPRoute.
+	TCPRouteStatuses map[types.NamespacedName]gatewayv1.TCPRouteStatus
+	// UDPRouteStatuses holds the computed status to apply to each UDPRoute.
+	UDPRouteStatuses map[types.NamespacedName]gatewayv1.UDPRouteStatus
+	// ListenerSetStatuses holds the computed status to apply to each ListenerSet.
+	ListenerSetStatuses map[types.NamespacedName]gatewayv1.ListenerSetStatus
+	// BackendTLSPolicyStatuses holds the computed status to apply to each BackendTLSPolicy.
 	BackendTLSPolicyStatuses map[types.NamespacedName]gatewayv1.PolicyStatus
-	GatewayClassStatuses     map[types.NamespacedName]gatewayv1.GatewayClassStatus
-	ProxyListeners           []InternalListener
-	ProxyRoutes              []InternalRoute
-	CertificatesMap          map[string]*tls.Certificate
-	DefaultCert              *tls.Certificate
-	ResolvedGateways         []*gatewayv1.Gateway
-	CompiledGateways         map[types.NamespacedName]*CompiledGateway
-	DataplaneConfigs         map[types.NamespacedName]*DataplaneConfig
+	// GatewayClassStatuses holds the computed status to apply to each GatewayClass.
+	GatewayClassStatuses map[types.NamespacedName]gatewayv1.GatewayClassStatus
+
+	// ProxyListeners holds internal listeners configured for the data-plane proxy engine.
+	ProxyListeners []InternalListener
+	// ProxyRoutes holds internal HTTP routes configured for the data-plane proxy engine.
+	ProxyRoutes []InternalRoute
+	// CertificatesMap indexes TLS certificates by hostname for SNI matching in the proxy.
+	CertificatesMap map[string]*tls.Certificate
+	// DefaultCert is the fallback TLS certificate used when no hostname matches.
+	DefaultCert *tls.Certificate
+
+	// ResolvedGateways holds deep copies of Gateways reflecting status updates.
+	ResolvedGateways []*gatewayv1.Gateway
+	// CompiledGateways maps Gateway names to their intermediate compiled representations.
+	CompiledGateways map[types.NamespacedName]*CompiledGateway
+	// DataplaneConfigs maps Gateway names to their serialized data-plane configurations.
+	DataplaneConfigs map[types.NamespacedName]*DataplaneConfig
 }
 
 func isSupportedProtocol(protocol gatewayv1.ProtocolType) bool {
