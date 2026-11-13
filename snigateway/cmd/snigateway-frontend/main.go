@@ -81,7 +81,7 @@ func run(ctx context.Context, args []string) error {
 	wireguardEndpoint := fs.String("wireguard-endpoint", "", "External WireGuard endpoint (<host:port>) advertised to clients. Defaults to port only, combined with client server address.")
 
 	var jwtIssuers stringSliceFlag
-	fs.Var(&jwtIssuers, "jwt-issuer", "JWT issuer URL for ServiceAccount token verification (repeatable)")
+	fs.Var(&jwtIssuers, "jwt-issuer", "JWT issuer URL for ServiceAccount token verification (only one issuer is supported)")
 	var jwtJWKSFiles stringSliceFlag
 	fs.Var(&jwtJWKSFiles, "jwt-jwks-file", "Path to JWKS file per issuer in format [<issuer>=]<path> (repeatable)")
 	jwtAudience := fs.String("jwt-audience", jwt.DefaultAudience, "Required audience for ServiceAccount tokens")
@@ -97,6 +97,10 @@ func run(ctx context.Context, args []string) error {
 	}
 	if len(tunnelListenUDP) == 0 {
 		tunnelListenUDP = listenAddrs
+	}
+
+	if len(jwtIssuers) > 1 {
+		return fmt.Errorf("snigateway-frontend supports only one issuer (got %d --jwt-issuer flags)", len(jwtIssuers))
 	}
 
 	var jwtVerifier jwt.TokenVerifier

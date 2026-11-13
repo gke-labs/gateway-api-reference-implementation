@@ -117,37 +117,53 @@ func TestFrontendCLI_JWTFlags(t *testing.T) {
 		t.Fatalf("writing jwks.json: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
 	listenAddr := "127.0.0.1:0"
 
-	args := []string{
-		"--listen=" + listenAddr,
-		"--server-cert=" + serverCertPath,
-		"--server-key=" + serverKeyPath,
-		"--jwt-issuer=https://kubernetes.default.svc",
-		"--jwt-jwks-file=" + jwksPath,
-		"--jwt-audience=snigateway",
-		"--client-subject=system:serviceaccount:default:*=*.example.com",
-	}
+	t.Run("Startup succeeds with one issuer", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- run(ctx, args)
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-
-	cancel()
-	select {
-	case err := <-errCh:
-		if err != nil && err != context.Canceled {
-			t.Fatalf("run returned error: %v", err)
+		args := []string{
+			"--listen=" + listenAddr,
+			"--server-cert=" + serverCertPath,
+			"--server-key=" + serverKeyPath,
+			"--jwt-issuer=https://kubernetes.default.svc",
+			"--jwt-jwks-file=" + jwksPath,
+			"--jwt-audience=snigateway",
+			"--client-subject=system:serviceaccount:default:*=*.example.com",
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for server shutdown")
-	}
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- run(ctx, args)
+		}()
+
+		time.Sleep(100 * time.Millisecond)
+
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil && err != context.Canceled {
+				t.Fatalf("run returned error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for server shutdown")
+		}
+	})
+
+	t.Run("Startup fails with two issuers", func(t *testing.T) {
+		badArgs := []string{
+			"--listen=" + listenAddr,
+			"--server-cert=" + serverCertPath,
+			"--server-key=" + serverKeyPath,
+			"--jwt-issuer=https://issuer1.example.com",
+			"--jwt-issuer=https://issuer2.example.com",
+		}
+		err := run(t.Context(), badArgs)
+		if err == nil || !strings.Contains(err.Error(), "supports only one issuer") {
+			t.Fatalf("expected startup with two issuers to fail, got: %v", err)
+		}
+	})
 
 	t.Run("Bare jwks file without issuer fails", func(t *testing.T) {
 		badArgs := []string{
@@ -159,21 +175,6 @@ func TestFrontendCLI_JWTFlags(t *testing.T) {
 		err := run(t.Context(), badArgs)
 		if err == nil || !strings.Contains(err.Error(), "only valid when exactly one --jwt-issuer is configured") {
 			t.Fatalf("expected bare jwks file without issuer to fail, got: %v", err)
-		}
-	})
-
-	t.Run("Bare jwks file with multiple issuers fails", func(t *testing.T) {
-		badArgs := []string{
-			"--listen=" + listenAddr,
-			"--server-cert=" + serverCertPath,
-			"--server-key=" + serverKeyPath,
-			"--jwt-issuer=https://issuer1.example.com",
-			"--jwt-issuer=https://issuer2.example.com",
-			"--jwt-jwks-file=" + jwksPath,
-		}
-		err := run(t.Context(), badArgs)
-		if err == nil || !strings.Contains(err.Error(), "only valid when exactly one --jwt-issuer is configured") {
-			t.Fatalf("expected bare jwks file with multiple issuers to fail, got: %v", err)
 		}
 	})
 }
