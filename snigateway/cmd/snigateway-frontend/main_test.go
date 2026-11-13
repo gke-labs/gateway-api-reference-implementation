@@ -165,6 +165,34 @@ func TestFrontendCLI_JWTFlags(t *testing.T) {
 		}
 	})
 
+	t.Run("Startup fails with two jwks-file issuers", func(t *testing.T) {
+		badArgs := []string{
+			"--listen=" + listenAddr,
+			"--server-cert=" + serverCertPath,
+			"--server-key=" + serverKeyPath,
+			"--jwt-jwks-file=https://issuer1.example.com=" + jwksPath,
+			"--jwt-jwks-file=https://issuer2.example.com=" + jwksPath,
+		}
+		err := run(t.Context(), badArgs)
+		if err == nil || !strings.Contains(err.Error(), "supports only one issuer") {
+			t.Fatalf("expected startup with two jwks-file issuers to fail, got: %v", err)
+		}
+	})
+
+	t.Run("Startup fails with jwt-issuer and different jwks-file issuer", func(t *testing.T) {
+		badArgs := []string{
+			"--listen=" + listenAddr,
+			"--server-cert=" + serverCertPath,
+			"--server-key=" + serverKeyPath,
+			"--jwt-issuer=https://issuer1.example.com",
+			"--jwt-jwks-file=https://issuer2.example.com=" + jwksPath,
+		}
+		err := run(t.Context(), badArgs)
+		if err == nil || !strings.Contains(err.Error(), "supports only one issuer") {
+			t.Fatalf("expected startup with jwt-issuer and different jwks-file issuer to fail, got: %v", err)
+		}
+	})
+
 	t.Run("Bare jwks file without issuer fails", func(t *testing.T) {
 		badArgs := []string{
 			"--listen=" + listenAddr,

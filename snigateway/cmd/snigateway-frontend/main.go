@@ -83,7 +83,7 @@ func run(ctx context.Context, args []string) error {
 	var jwtIssuers stringSliceFlag
 	fs.Var(&jwtIssuers, "jwt-issuer", "JWT issuer URL for ServiceAccount token verification (only one issuer is supported)")
 	var jwtJWKSFiles stringSliceFlag
-	fs.Var(&jwtJWKSFiles, "jwt-jwks-file", "Path to JWKS file per issuer in format [<issuer>=]<path> (repeatable)")
+	fs.Var(&jwtJWKSFiles, "jwt-jwks-file", "Path to JWKS file in format [<issuer>=]<path> (only one issuer is supported)")
 	jwtAudience := fs.String("jwt-audience", jwt.DefaultAudience, "Required audience for ServiceAccount tokens")
 	var clientSubjects stringSliceFlag
 	fs.Var(&clientSubjects, "client-subject", "Client subject allowlist in format system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...] (repeatable, <ns>:* allowed)")
@@ -97,10 +97,6 @@ func run(ctx context.Context, args []string) error {
 	}
 	if len(tunnelListenUDP) == 0 {
 		tunnelListenUDP = listenAddrs
-	}
-
-	if len(jwtIssuers) > 1 {
-		return fmt.Errorf("snigateway-frontend supports only one issuer (got %d --jwt-issuer flags)", len(jwtIssuers))
 	}
 
 	var jwtVerifier jwt.TokenVerifier
@@ -133,6 +129,10 @@ func run(ctx context.Context, args []string) error {
 				IssuerURL: iss,
 				JWKSFile:  filePath,
 			})
+		}
+
+		if len(issuerConfigs) > 1 {
+			return fmt.Errorf("snigateway-frontend supports only one issuer (got %d issuers configured)", len(issuerConfigs))
 		}
 
 		jwksCache, err := jwt.NewJWKSCache(issuerConfigs)
