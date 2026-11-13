@@ -159,7 +159,7 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 	dir := "test_lost_found_bound"
 
 	// Open with bound of 2 quarantined files
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone), WithQuarantine(QuarantineOptions{MaxQuarantinedFiles: 2}))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 
 	// 1. First uncommitted file quarantined
 	f1 := writeAbandoned(101)
-	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
+	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithQuarantine(QuarantineOptions{MaxQuarantinedFiles: 2, MinQuarantinedRetention: -1}))
 	if err != nil {
 		t.Fatalf("Open 1 failed: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 
 	// 2. Second uncommitted file quarantined
 	f2 := writeAbandoned(102)
-	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
+	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithQuarantine(QuarantineOptions{MaxQuarantinedFiles: 2, MinQuarantinedRetention: -1}))
 	if err != nil {
 		t.Fatalf("Open 2 failed: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 
 	// 3. Third uncommitted file quarantined (exceeds bound of 2)
 	f3 := writeAbandoned(103)
-	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
+	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithQuarantine(QuarantineOptions{MaxQuarantinedFiles: 2, MinQuarantinedRetention: -1}))
 	if err != nil {
 		t.Fatalf("Open 3 failed: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestLostFound_MinRetentionProtected(t *testing.T) {
 	dir := "test_lost_found_retention"
 
 	// Open with bound of 2 quarantined files and default 7d retention
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone), WithQuarantine(QuarantineOptions{MaxQuarantinedFiles: 2}))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -271,21 +271,21 @@ func TestLostFound_MinRetentionProtected(t *testing.T) {
 
 	// Quarantine 3 files under default 7-day retention
 	writeAbandoned(101)
-	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithQuarantine(QuarantineOptions{MaxQuarantinedFiles: 2}))
 	if err != nil {
 		t.Fatalf("Open 1 failed: %v", err)
 	}
 	_ = s1.Close()
 
 	writeAbandoned(102)
-	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithQuarantine(QuarantineOptions{MaxQuarantinedFiles: 2}))
 	if err != nil {
 		t.Fatalf("Open 2 failed: %v", err)
 	}
 	_ = s2.Close()
 
 	writeAbandoned(103)
-	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
+	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithQuarantine(QuarantineOptions{MaxQuarantinedFiles: 2}))
 	if err != nil {
 		t.Fatalf("Open 3 failed: %v", err)
 	}
@@ -353,5 +353,81 @@ func TestLostFound_UnparseableTimestampIgnored(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name() != "corrupted_file_without_timestamp" {
 		t.Fatalf("expected unparseable file preserved, got %v", entries)
+	}
+}
+
+func TestEngine_WithQuarantineDefaults(t *testing.T) {
+	memFS := NewMemFS()
+
+	// 1. Default Open without WithQuarantine
+	store1, err := Open(WithFS(memFS), WithDir("d1"), WithCreate())
+	if err != nil {
+		t.Fatalf("Open 1 failed: %v", err)
+	}
+	defer store1.Close()
+
+	if store1.quarantine.MaxQuarantinedFiles != DefaultMaxQuarantinedFiles {
+		t.Errorf("expected default MaxQuarantinedFiles %d, got %d", DefaultMaxQuarantinedFiles, store1.quarantine.MaxQuarantinedFiles)
+	}
+	if store1.quarantine.MinQuarantinedRetention != DefaultMinQuarantinedRetention {
+		t.Errorf("expected default MinQuarantinedRetention %v, got %v", DefaultMinQuarantinedRetention, store1.quarantine.MinQuarantinedRetention)
+	}
+	expectedWALDir1 := filepath.Join("d1", "wal", "lost+found")
+	if store1.wal.quarantine.Dir != expectedWALDir1 {
+		t.Errorf("expected WAL quarantine Dir %s, got %s", expectedWALDir1, store1.wal.quarantine.Dir)
+	}
+
+	// 2. Unset retention gets defaulted
+	store2, err := Open(WithFS(memFS), WithDir("d2"), WithCreate(), WithQuarantine(QuarantineOptions{
+		MaxQuarantinedFiles: 5,
+	}))
+	if err != nil {
+		t.Fatalf("Open 2 failed: %v", err)
+	}
+	defer store2.Close()
+
+	if store2.quarantine.MaxQuarantinedFiles != 5 {
+		t.Errorf("expected MaxQuarantinedFiles 5, got %d", store2.quarantine.MaxQuarantinedFiles)
+	}
+	if store2.quarantine.MinQuarantinedRetention != DefaultMinQuarantinedRetention {
+		t.Errorf("expected defaulted MinQuarantinedRetention %v, got %v", DefaultMinQuarantinedRetention, store2.quarantine.MinQuarantinedRetention)
+	}
+
+	// 3. Unset max files gets defaulted
+	store3, err := Open(WithFS(memFS), WithDir("d3"), WithCreate(), WithQuarantine(QuarantineOptions{
+		MinQuarantinedRetention: 12 * time.Hour,
+	}))
+	if err != nil {
+		t.Fatalf("Open 3 failed: %v", err)
+	}
+	defer store3.Close()
+
+	if store3.quarantine.MaxQuarantinedFiles != DefaultMaxQuarantinedFiles {
+		t.Errorf("expected defaulted MaxQuarantinedFiles %d, got %d", DefaultMaxQuarantinedFiles, store3.quarantine.MaxQuarantinedFiles)
+	}
+	if store3.quarantine.MinQuarantinedRetention != 12*time.Hour {
+		t.Errorf("expected MinQuarantinedRetention 12h, got %v", store3.quarantine.MinQuarantinedRetention)
+	}
+
+	// 4. Negative retention disabled check, caller-supplied Dir overridden per lost+found directory
+	store4, err := Open(WithFS(memFS), WithDir("d4"), WithCreate(), WithQuarantine(QuarantineOptions{
+		Dir:                     "caller/custom/dir",
+		MaxQuarantinedFiles:     3,
+		MinQuarantinedRetention: -1,
+	}))
+	if err != nil {
+		t.Fatalf("Open 4 failed: %v", err)
+	}
+	defer store4.Close()
+
+	if store4.quarantine.MaxQuarantinedFiles != 3 {
+		t.Errorf("expected MaxQuarantinedFiles 3, got %d", store4.quarantine.MaxQuarantinedFiles)
+	}
+	if store4.quarantine.MinQuarantinedRetention != -1 {
+		t.Errorf("expected MinQuarantinedRetention -1, got %v", store4.quarantine.MinQuarantinedRetention)
+	}
+	expectedWALDir4 := filepath.Join("d4", "wal", "lost+found")
+	if store4.wal.quarantine.Dir != expectedWALDir4 {
+		t.Errorf("expected WAL quarantine Dir %s, got %s", expectedWALDir4, store4.wal.quarantine.Dir)
 	}
 }
