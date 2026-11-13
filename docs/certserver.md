@@ -97,6 +97,20 @@ clusters:
 
 If both `--cluster-config-file` and `--cluster-dir` are provided, `certserver` merges the static clusters with directory-registered clusters. Any directory cluster attempting to duplicate a static cluster ID is rejected and audit-logged as refused.
 
+### Shared Front-End Groups
+
+Gateways in one group share a front end, so certserver treats a proof from one of them as covering the others. The cluster-level `SharedFrontEndGroup` (or `--shared-frontend-group`) puts every Gateway in the cluster into one group; an operator should set it only when all of the cluster's Gateways really share one front end.
+
+To assign groups per Gateway instead of cluster-wide, configure `gatewaySharedFrontEndGroups` in cluster config using the Gateway's full `namespace/name`:
+
+```yaml
+clusters:
+- clusterID: "cluster-prod-1"
+  # ...
+  gatewaySharedFrontEndGroups:
+    "default/prod-gw": "shared-fe-group"
+```
+
 ---
 
 ## 2. Controller Configuration and Manifests
