@@ -4534,6 +4534,11 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 
 func mockReadyEndpoints(t *testing.T, cl client.Client, p *AddressProvider, gw *gatewayv1.Gateway, rev string, podIPs ...string) {
 	t.Helper()
+	if p.state != nil {
+		if cfg := p.state.GetDataplaneConfig(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}); cfg != nil && cfg.Revision != "" {
+			rev = cfg.Revision
+		}
+	}
 	if rev == "" {
 		rev = "rev-1"
 	}
@@ -4894,5 +4899,195 @@ func TestSinglePodAddressProvider_ProberLifecycle(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for runProber to exit on context cancellation")
+	}
+}
+
+func TestSinglePodAddressProvider_PublishFailureRetryReadiness(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = discoveryv1.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-gw",
+			UID:       types.UID("gw-uid-1234"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	resName := ResourceNameForGateway(gw.Name)
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      resName + "-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				discoveryv1.LabelServiceName: resName,
+			},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{
+			{
+				Addresses: []string{"10.0.0.1"},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: state.Ptr(true),
+				},
+			},
+		},
+	}
+
+	var failSecretApply atomic.Bool
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw, slice).
+		WithStatusSubresource(gw).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(ctx context.Context, c client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+				if _, ok := obj.(*corev1ac.SecretApplyConfiguration); ok && failSecretApply.Load() {
+					return fmt.Errorf("simulated secret apply failure")
+				}
+				return ssaNoOpInterceptor().Apply(ctx, c, obj, opts...)
+			},
+		}).
+		Build()
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	p := NewAddressProvider(cl, WithState(st))
+	st.SetDataplanePublisher(p)
+	st.SetSupportedAddressTypes(p.SupportedAddressTypes())
+
+	var currentApplied atomic.Pointer[[]string]
+	initialRevs := []string{"initial-unrelated-rev"}
+	currentApplied.Store(&initialRevs)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(currentApplied.Load())
+	}))
+	t.Cleanup(server.Close)
+
+	p.httpClient = &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+			},
+		},
+	}
+
+	ctx := t.Context()
+	listeners := []*state.EffectiveListener{
+		{Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+	}
+
+	// 1. Initial reconcile creates Deployment and Service.
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Make Deployment ready and Service have LB ingress.
+	var deploy appsv1.Deployment
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	deploy.Status.AvailableReplicas = 1
+	deploy.Status.ReadyReplicas = 1
+	if err := cl.Status().Update(ctx, &deploy); err != nil {
+		t.Fatalf("failed to update Deployment status: %v", err)
+	}
+
+	var svc corev1.Service
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}}
+	if err := cl.Status().Update(ctx, &svc); err != nil {
+		t.Fatalf("failed to update Service status: %v", err)
+	}
+
+	// 2. Publish failure during config update leaves the Gateway Pending:
+	// Adding an HTTPRoute changes the Gateway's configuration revision.
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-route"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{Name: "test-gw"},
+				},
+			},
+		},
+	}
+	st.UpsertHTTPRoute(route)
+
+	// Set failSecretApply so PublishDataplaneConfig returns an error during Recompute.
+	failSecretApply.Store(true)
+	st.Recompute()
+
+	p.probeEndpoints(ctx)
+	_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Fatalf("expected readiness.Ready=false when publish fails")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Fatalf("expected reason Pending, got %s", readiness.Reason)
+	}
+
+	// 3. Retry succeeds: publish retry succeeds and Gateway becomes ready once replica applies config.
+	failSecretApply.Store(false)
+	st.Recompute()
+
+	dpCfg := st.GetDataplaneConfig(types.NamespacedName{Namespace: "default", Name: "test-gw"})
+	if dpCfg == nil || dpCfg.Revision == "" {
+		t.Fatalf("expected non-empty revision from state")
+	}
+
+	// Replica applies the new config revision from the published Secret
+	newRevs := []string{dpCfg.Revision}
+	currentApplied.Store(&newRevs)
+
+	p.probeEndpoints(ctx)
+
+	// Verify prober enqueued Gateway on convergence
+	select {
+	case evt := <-p.eventCh:
+		if evt.Object.GetName() != "test-gw" {
+			t.Fatalf("unexpected event object: %+v", evt.Object)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for prober to enqueue Gateway after retry convergence")
+	}
+
+	_, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !readiness.Ready {
+		t.Fatalf("expected readiness.Ready=true after publish retry succeeded and replica converged: reason=%s message=%s", readiness.Reason, readiness.Message)
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Fatalf("expected reason Programmed, got %s", readiness.Reason)
 	}
 }

@@ -185,6 +185,16 @@ func WithAPIReader(reader client.Reader) Option {
 	}
 }
 
+// gatewayMirror holds the mirrored data-plane endpoint and revision state for a Gateway.
+type gatewayMirror struct {
+	// readyEndpoints lists the ready and non-terminating endpoint addresses for the Gateway's Service.
+	readyEndpoints []string
+	// appliedRevisions maps each endpoint address to the configuration revisions reported by /_gari/applied.
+	appliedRevisions map[string][]string
+	// lastReady is the readiness state last evaluated or reported for this Gateway.
+	lastReady bool
+}
+
 // AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
 //
 // Readiness: reports ready when addresses are assigned, the per-Gateway Deployment has available replicas,
@@ -210,15 +220,10 @@ type AddressProvider struct {
 	acmeChallengeAudience         string
 	acmeChallengeTokenExpiration  int64
 
-	// revMu guards currentRevisions and gatewayReady.
-	revMu            sync.Mutex
-	currentRevisions map[types.NamespacedName]string
-	gatewayReady     map[types.NamespacedName]bool
-
-	// endpointMu guards appliedRevisions and endpointGateways.
-	endpointMu       sync.Mutex
-	appliedRevisions map[string][]string
-	endpointGateways map[string]types.NamespacedName
+	// mirrorMu guards mirrors.
+	mirrorMu sync.Mutex
+	// mirrors maps each Gateway to its mirrored data-plane replica state.
+	mirrors map[types.NamespacedName]*gatewayMirror
 
 	pollInterval time.Duration
 	probeTimeout time.Duration
@@ -322,16 +327,13 @@ func (p *AddressProvider) acmeTokenPath() string {
 // NewAddressProvider creates a new singlepod AddressProvider.
 func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
 	p := &AddressProvider{
-		client:           c,
-		dataplaneImage:   DefaultDataplaneImage,
-		eventCh:          make(chan event.GenericEvent, 50),
-		currentRevisions: make(map[types.NamespacedName]string),
-		gatewayReady:     make(map[types.NamespacedName]bool),
-		appliedRevisions: make(map[string][]string),
-		endpointGateways: make(map[string]types.NamespacedName),
-		pollInterval:     defaultPollInterval,
-		probeTimeout:     defaultProbeTimeout,
-		httpClient:       &http.Client{},
+		client:         c,
+		dataplaneImage: DefaultDataplaneImage,
+		eventCh:        make(chan event.GenericEvent, 50),
+		mirrors:        make(map[types.NamespacedName]*gatewayMirror),
+		pollInterval:   defaultPollInterval,
+		probeTimeout:   defaultProbeTimeout,
+		httpClient:     &http.Client{},
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -967,7 +969,13 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}
 
 		gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
-		return p.evaluateReplicasReadiness(ctx, gwKey, name, addresses)
+		p.mirrorMu.Lock()
+		readiness := p.evaluateGatewayReadinessLocked(gwKey)
+		if m := p.mirrors[gwKey]; m != nil {
+			m.lastReady = readiness.Ready
+		}
+		p.mirrorMu.Unlock()
+		return addresses, readiness, nil
 	}
 
 	var addresses []gatewayv1.GatewayStatusAddress
@@ -1055,7 +1063,13 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
-	return p.evaluateReplicasReadiness(ctx, gwKey, name, addresses)
+	p.mirrorMu.Lock()
+	readiness := p.evaluateGatewayReadinessLocked(gwKey)
+	if m := p.mirrors[gwKey]; m != nil {
+		m.lastReady = readiness.Ready
+	}
+	p.mirrorMu.Unlock()
+	return addresses, readiness, nil
 }
 
 // GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
@@ -1112,18 +1126,18 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 }
 
 // PublishDataplaneConfig writes the Gateway's compiled data-plane config to its per-Gateway Secret.
+//
+// The provider reports a Gateway ready only when every ready endpoint reports the revision of
+// the state's current config for that Gateway. While a publish has not yet succeeded, no endpoint
+// can report that revision, so the Gateway stays Pending, and the state's publish retry delivers it.
 func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) (retErr error) {
 	if p.client == nil || gw == nil {
 		return nil
 	}
-	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
 	if config == nil {
-		p.revMu.Lock()
-		delete(p.currentRevisions, gwKey)
-		delete(p.gatewayReady, gwKey)
-		p.revMu.Unlock()
 		return nil
 	}
+	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
 	defer func() {
 		if retErr != nil {
 			klog.Errorf("failed to publish dataplane config revision %s for Gateway %s: %v", config.Revision, gwKey, retErr)
@@ -1172,10 +1186,6 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		return fmt.Errorf("failed to apply config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
-	p.revMu.Lock()
-	p.currentRevisions[gwKey] = config.Revision
-	p.revMu.Unlock()
-
 	return nil
 }
 
@@ -1203,88 +1213,67 @@ func readyEndpointAddresses(slices []discoveryv1.EndpointSlice) []string {
 	return readyEndpoints
 }
 
-// allEndpointsAppliedLocked returns true if currentRev is non-empty, endpoints is non-empty,
-// and every endpoint in endpoints has currentRev in its mirrored applied revisions list.
-// Caller must hold endpointMu.
-func (p *AddressProvider) allEndpointsAppliedLocked(currentRev string, endpoints []string) bool {
-	if currentRev == "" || len(endpoints) == 0 {
-		return false
+func pendingReadiness(message string) state.GatewayReadiness {
+	return state.GatewayReadiness{
+		Ready:   false,
+		Reason:  string(gatewayv1.GatewayReasonPending),
+		Message: message,
 	}
-	for _, addr := range endpoints {
-		if !slices.Contains(p.appliedRevisions[addr], currentRev) {
-			return false
-		}
-	}
-	return true
-}
-
-func (p *AddressProvider) evaluateReplicasReadiness(ctx context.Context, gwKey types.NamespacedName, name string, addresses []gatewayv1.GatewayStatusAddress) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
-	currentRev := p.currentRevisionForGateway(gwKey)
-	if currentRev == "" {
-		klog.V(2).Infof("Gateway %s readiness is Pending: waiting for data-plane configuration to be published (expected revision is empty)", gwKey)
-		p.revMu.Lock()
-		p.gatewayReady[gwKey] = false
-		p.revMu.Unlock()
-		return addresses, state.GatewayReadiness{
-			Ready:   false,
-			Reason:  string(gatewayv1.GatewayReasonPending),
-			Message: "Waiting for data-plane configuration to be published",
-		}, nil
-	}
-
-	var slicesList discoveryv1.EndpointSliceList
-	if err := p.client.List(ctx, &slicesList, client.InNamespace(gwKey.Namespace), client.MatchingLabels{
-		discoveryv1.LabelServiceName: name,
-	}); err != nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("listing EndpointSlices for Service %s/%s: %w", gwKey.Namespace, name, err)
-	}
-
-	readyEndpoints := readyEndpointAddresses(slicesList.Items)
-	if len(readyEndpoints) == 0 {
-		klog.V(2).Infof("Gateway %s readiness is Pending: no ready endpoints found in EndpointSlices (expected revision %s)", gwKey, currentRev)
-		p.revMu.Lock()
-		p.gatewayReady[gwKey] = false
-		p.revMu.Unlock()
-		return addresses, state.GatewayReadiness{
-			Ready:   false,
-			Reason:  string(gatewayv1.GatewayReasonPending),
-			Message: "Waiting for data-plane replicas to apply current configuration",
-		}, nil
-	}
-
-	p.endpointMu.Lock()
-	defer p.endpointMu.Unlock()
-
-	ready := p.allEndpointsAppliedLocked(currentRev, readyEndpoints)
-	p.revMu.Lock()
-	p.gatewayReady[gwKey] = ready
-	p.revMu.Unlock()
-
-	if !ready {
-		endpointSummaries := make([]string, 0, len(readyEndpoints))
-		for _, addr := range readyEndpoints {
-			endpointSummaries = append(endpointSummaries, fmt.Sprintf("%s=%v", addr, p.appliedRevisions[addr]))
-		}
-		klog.V(2).Infof("Gateway %s readiness is Pending: expected revision %s, endpoints: [%s]",
-			gwKey, currentRev, strings.Join(endpointSummaries, ", "))
-		return addresses, state.GatewayReadiness{
-			Ready:   false,
-			Reason:  string(gatewayv1.GatewayReasonPending),
-			Message: "Waiting for data-plane replicas to apply current configuration",
-		}, nil
-	}
-
-	return addresses, state.GatewayReadiness{
-		Ready:   true,
-		Reason:  string(gatewayv1.GatewayReasonProgrammed),
-		Message: "Gateway programmed by reference implementation",
-	}, nil
 }
 
 func (p *AddressProvider) currentRevisionForGateway(gwKey types.NamespacedName) string {
-	p.revMu.Lock()
-	defer p.revMu.Unlock()
-	return p.currentRevisions[gwKey]
+	if p.state != nil {
+		if cfg := p.state.GetDataplaneConfig(gwKey); cfg != nil && cfg.Revision != "" {
+			return cfg.Revision
+		}
+	}
+	if p.client != nil {
+		var sec corev1.Secret
+		name := ResourceNameForGateway(gwKey.Name)
+		if err := p.client.Get(context.Background(), types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &sec); err == nil {
+			if data, ok := sec.Data[DataplaneSecretDataKey]; ok && len(data) > 0 {
+				var cfg state.DataplaneConfig
+				if err := json.Unmarshal(data, &cfg); err == nil && cfg.Revision != "" {
+					return cfg.Revision
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// evaluateGatewayReadinessLocked evaluates readiness for a Gateway from the in-memory mirror.
+// Caller must hold mirrorMu.
+func (p *AddressProvider) evaluateGatewayReadinessLocked(gwKey types.NamespacedName) state.GatewayReadiness {
+	currentRev := p.currentRevisionForGateway(gwKey)
+	if currentRev == "" {
+		klog.V(2).Infof("Gateway %s readiness is Pending: waiting for data-plane configuration to be published (expected revision is empty)", gwKey)
+		return pendingReadiness("Waiting for data-plane configuration to be published")
+	}
+
+	m, ok := p.mirrors[gwKey]
+	if !ok || len(m.readyEndpoints) == 0 {
+		klog.V(2).Infof("Gateway %s readiness is Pending: no ready endpoints found in EndpointSlices (expected revision %s)", gwKey, currentRev)
+		return pendingReadiness("Waiting for data-plane replicas to apply current configuration")
+	}
+
+	for _, addr := range m.readyEndpoints {
+		if !slices.Contains(m.appliedRevisions[addr], currentRev) {
+			endpointSummaries := make([]string, 0, len(m.readyEndpoints))
+			for _, a := range m.readyEndpoints {
+				endpointSummaries = append(endpointSummaries, fmt.Sprintf("%s=%v", a, m.appliedRevisions[a]))
+			}
+			klog.V(2).Infof("Gateway %s readiness is Pending: expected revision %s, endpoints: [%s]",
+				gwKey, currentRev, strings.Join(endpointSummaries, ", "))
+			return pendingReadiness("Waiting for data-plane replicas to apply current configuration")
+		}
+	}
+
+	return state.GatewayReadiness{
+		Ready:   true,
+		Reason:  string(gatewayv1.GatewayReasonProgrammed),
+		Message: "Gateway programmed by reference implementation",
+	}
 }
 
 func (p *AddressProvider) triggerReconcile(ctx context.Context, key types.NamespacedName) {
@@ -1342,6 +1331,9 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 	gatewayEndpoints := make(map[types.NamespacedName][]string)
 	for _, svc := range svcList.Items {
 		gwName := svc.Labels[LabelGatewayName]
+		if ref := metav1.GetControllerOf(&svc); ref != nil && ref.Kind == "Gateway" {
+			gwName = ref.Name
+		}
 		if gwName == "" {
 			continue
 		}
@@ -1391,56 +1383,60 @@ func (p *AddressProvider) probeEndpoints(ctx context.Context) {
 		wg.Wait()
 	}
 
-	liveEndpoints := make(map[string]bool, len(targets))
-	for _, target := range targets {
-		liveEndpoints[target.addr] = true
+	resultsByAddr := make(map[string]probeResult, len(results))
+	for _, res := range results {
+		resultsByAddr[res.addr] = res
 	}
 
 	changedGateways := make(map[types.NamespacedName]bool)
 
-	p.endpointMu.Lock()
-	// Endpoints that disappeared from EndpointSlices drop out of the map.
-	for addr, oldGwKey := range p.endpointGateways {
-		if !liveEndpoints[addr] {
-			delete(p.appliedRevisions, addr)
-			delete(p.endpointGateways, addr)
-			changedGateways[oldGwKey] = true
+	p.mirrorMu.Lock()
+	for gwKey := range p.mirrors {
+		if _, ok := gatewayEndpoints[gwKey]; !ok {
+			delete(p.mirrors, gwKey)
 		}
 	}
 
-	for _, res := range results {
-		oldRevs, hadOld := p.appliedRevisions[res.addr]
-		if res.err != nil {
-			targetURL := p.appliedURL(res.addr)
-			klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, res.gwKey, res.err)
-		} else {
-			p.appliedRevisions[res.addr] = res.revs
-			p.endpointGateways[res.addr] = res.gwKey
-			if !hadOld || !slices.Equal(oldRevs, res.revs) {
-				changedGateways[res.gwKey] = true
+	for gwKey, endpoints := range gatewayEndpoints {
+		m, ok := p.mirrors[gwKey]
+		if !ok {
+			m = &gatewayMirror{
+				appliedRevisions: make(map[string][]string),
+			}
+			p.mirrors[gwKey] = m
+		}
+		m.readyEndpoints = endpoints
+
+		liveAddrs := make(map[string]bool, len(endpoints))
+		for _, addr := range endpoints {
+			liveAddrs[addr] = true
+		}
+		for addr := range m.appliedRevisions {
+			if !liveAddrs[addr] {
+				delete(m.appliedRevisions, addr)
 			}
 		}
-	}
 
-	// Compare every Gateway's current revision with the mirror, and enqueue
-	// when its readiness would change in either direction.
-	for gwKey, endpoints := range gatewayEndpoints {
-		currentRev := p.currentRevisionForGateway(gwKey)
-		expectedReady := p.allEndpointsAppliedLocked(currentRev, endpoints)
-
-		p.revMu.Lock()
-		lastReady, known := p.gatewayReady[gwKey]
-		readinessChanged := !known || lastReady != expectedReady
-		if readinessChanged {
-			p.gatewayReady[gwKey] = expectedReady
+		for _, addr := range endpoints {
+			res := resultsByAddr[addr]
+			if res.err != nil {
+				targetURL := p.appliedURL(addr)
+				klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, gwKey, res.err)
+			} else {
+				m.appliedRevisions[addr] = res.revs
+			}
 		}
-		p.revMu.Unlock()
 
-		if readinessChanged {
+		readiness := p.evaluateGatewayReadinessLocked(gwKey)
+		if !m.lastReady && readiness.Ready {
+			m.lastReady = true
+			changedGateways[gwKey] = true
+		} else if m.lastReady && !readiness.Ready {
+			m.lastReady = false
 			changedGateways[gwKey] = true
 		}
 	}
-	p.endpointMu.Unlock()
+	p.mirrorMu.Unlock()
 
 	for gwKey := range changedGateways {
 		p.triggerReconcile(ctx, gwKey)
