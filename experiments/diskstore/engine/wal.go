@@ -1118,6 +1118,20 @@ func (it *WALIterator) Next() (Record, error) {
 
 		totalRecordLen := RecordHeaderSize + int(keyLen) + int(payloadLen)
 
+		size, sizeErr := it.currFile.Size()
+		if sizeErr != nil {
+			it.done = true
+			return Record{}, fmt.Errorf("read error getting segment size at offset %d: %w", it.currOffset, sizeErr)
+		}
+		if int64(totalRecordLen) > size-it.currOffset {
+			it.done = true
+			if !it.isLastSegment() {
+				// Not the last segment, so this is corruption; see WALIterator.
+				return Record{}, fmt.Errorf("%w: torn record body at offset %d in segment %s", ErrCorruptWAL, it.currOffset, it.segments[it.currSegIdx].name)
+			}
+			return Record{}, io.EOF
+		}
+
 		recordBytes := make([]byte, totalRecordLen)
 		n, err = it.currFile.ReadAt(recordBytes, it.currOffset)
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {

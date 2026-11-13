@@ -16,10 +16,12 @@ package engine
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -1023,4 +1025,99 @@ func TestRecovery_WALCrashAfterRotation_EmptySegment_SucceedsOpen(t *testing.T) 
 	if err != nil || !ok || string(val) != "val1" {
 		t.Fatalf("Get k1 mismatch: ok=%v, val=%q, err=%v", ok, string(val), err)
 	}
+}
+
+func TestRecovery_WALRecordLengthExceedsSegment_NoAllocation(t *testing.T) {
+	const excessiveLen = 40 * 1024 * 1024 // 40 MiB; passes MaxRecordFieldLength (64 MiB)
+
+	makeHeader := func(lsn uint64) []byte {
+		hdr := make([]byte, RecordHeaderSize)
+		hdr[0] = RecordMagic
+		hdr[1] = RecordFormatVersion
+		hdr[2] = byte(RecordTypePut)
+		hdr[3] = 0
+		binary.BigEndian.PutUint64(hdr[4:12], lsn)
+		binary.BigEndian.PutUint64(hdr[12:20], 0)
+		binary.BigEndian.PutUint32(hdr[20:24], 0)
+		binary.BigEndian.PutUint32(hdr[24:28], uint32(excessiveLen))
+		return hdr
+	}
+
+	t.Run("earlier segment", func(t *testing.T) {
+		dir := "test_wal_record_exceeds_segment_earlier"
+		fs, paths := setupWALSegments(t, dir, 2)
+
+		file, err := fs.OpenFile(paths[0], os.O_RDWR, 0644)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		size, err := file.Size()
+		if err != nil {
+			t.Fatalf("Size failed: %v", err)
+		}
+		if _, err := file.WriteAt(makeHeader(2), size); err != nil {
+			t.Fatalf("WriteAt failed: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		runtime.GC()
+		var memBefore, memAfter runtime.MemStats
+		runtime.ReadMemStats(&memBefore)
+
+		_, err = Open(WithFS(fs), WithDir(dir))
+
+		runtime.ReadMemStats(&memAfter)
+		alloc := memAfter.TotalAlloc - memBefore.TotalAlloc
+
+		if !errors.Is(err, ErrCorruptWAL) {
+			t.Fatalf("expected ErrCorruptWAL, got: %v", err)
+		}
+		if alloc >= excessiveLen {
+			t.Fatalf("recovery allocated %d bytes (>= %d), expected no buffer of that length", alloc, excessiveLen)
+		}
+	})
+
+	t.Run("last segment", func(t *testing.T) {
+		dir := "test_wal_record_exceeds_segment_last"
+		fs, paths := setupWALSegments(t, dir, 1)
+
+		file, err := fs.OpenFile(paths[0], os.O_RDWR, 0644)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		size, err := file.Size()
+		if err != nil {
+			t.Fatalf("Size failed: %v", err)
+		}
+		if _, err := file.WriteAt(makeHeader(2), size); err != nil {
+			t.Fatalf("WriteAt failed: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		runtime.GC()
+		var memBefore, memAfter runtime.MemStats
+		runtime.ReadMemStats(&memBefore)
+
+		store, err := Open(WithFS(fs), WithDir(dir))
+
+		runtime.ReadMemStats(&memAfter)
+		alloc := memAfter.TotalAlloc - memBefore.TotalAlloc
+
+		if err != nil {
+			t.Fatalf("expected Open to succeed, got: %v", err)
+		}
+		defer store.Close()
+
+		val, ok, err := store.Get("ConfigMap", "k1")
+		if err != nil || !ok || string(val) != "val1" {
+			t.Fatalf("Get k1 mismatch: ok=%v, val=%q, err=%v", ok, string(val), err)
+		}
+		if alloc >= excessiveLen {
+			t.Fatalf("recovery allocated %d bytes (>= %d), expected no buffer of that length", alloc, excessiveLen)
+		}
+	})
 }
