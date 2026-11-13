@@ -7,7 +7,6 @@ toolchain go1.27.4
 require (
 	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261024134123-7373c0c33da0
 	github.com/gke-labs/gateway-api-reference-implementation/certserver/api v0.0.0-00010101000000-000000000000
-	golang.org/x/net v0.61.0
 	golang.org/x/sync v0.24.0
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
@@ -61,6 +60,7 @@ require (
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/term v0.47.0 // indirect

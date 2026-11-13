@@ -9,12 +9,12 @@ The `snigateway` architecture consists of two main components:
    - Listens on TCP port `:443`.
    - Peeks at the TLS ClientHello of incoming connections to determine the requested SNI hostname without consuming stream bytes.
    - If the SNI hostname is `snigateway.internal`, it serves the mTLS management API.
-   - Manages session-scoped hostname registrations and routes across pooled TCP connections (or HTTP/2 multiplexed streams).
+   - Manages session-scoped hostname registrations and routes across pooled TCP connections.
    - Sends PROXY protocol v2 headers (with `PP2_TYPE_AUTHORITY` SNI TLV) on activated connections, carrying real client source/dest IPs.
    - Implements replay-until-first-byte health checking and failover across healthy backend replicas.
 2. **`snigateway` (Controller)**: Runs inside a Kubernetes cluster (e.g. home lab, edge site, private network):
    - Embeds GARI (`pkg/gari`) in-process.
-   - Connects to frontend via pre-dialed TCP pool (default, `--tunnel-transport=tcp` with `--tunnel-pool-size`) or HTTP/2 streams (`--tunnel-transport=h2`).
+   - Connects to frontend via a pre-dialed TCP pool (configured with `--tunnel-pool-size`).
    - Uses GARI's `OnGatewaysUpdate` hook to dynamically register SNI hostnames for its HTTPS/TLS listeners.
    - Feeds reverse-tunnelled connections to GARI's HTTPS proxy server via a custom tunnel `net.Listener`, parsing PROXY v2 headers to expose real client IPs.
 

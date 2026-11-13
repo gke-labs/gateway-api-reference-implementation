@@ -45,7 +45,6 @@ type Config struct {
 	ClientKeyPath    string
 	TokenFilePath    string
 	InternalHostname string
-	TunnelTransport  string
 	TunnelPoolSize   int
 }
 
@@ -54,7 +53,6 @@ func DefaultConfig() Config {
 	return Config{
 		FrontendAddr:     "127.0.0.1:443",
 		InternalHostname: "snigateway.internal",
-		TunnelTransport:  tunnel.TransportModeTCP,
 		TunnelPoolSize:   tunnel.DefaultPoolSize,
 	}
 }
@@ -82,8 +80,7 @@ func BindFlags(fs *flag.FlagSet, opts *gari.Options, cfg *Config) {
 	fs.StringVar(&cfg.TokenFilePath, "token-file", cfg.TokenFilePath, "Path to ServiceAccount token file for authentication.")
 	fs.StringVar(&cfg.InternalHostname, "internal-hostname", cfg.InternalHostname, "TLS ServerName for the snigateway-frontend mTLS management API.")
 	fs.StringVar(&opts.ControllerName, "controller-name", opts.ControllerName, "The GatewayClass controller name managed by this instance.")
-	fs.StringVar(&cfg.TunnelTransport, "tunnel-transport", cfg.TunnelTransport, "Tunnel transport to use (tcp, h2).")
-	fs.IntVar(&cfg.TunnelPoolSize, "tunnel-pool-size", cfg.TunnelPoolSize, "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend when using TCP pool or H2 transport.")
+	fs.IntVar(&cfg.TunnelPoolSize, "tunnel-pool-size", cfg.TunnelPoolSize, "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend.")
 	fs.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
 	fs.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
 	fs.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "Optional HTTP proxy bind address. Disabled by default.")
@@ -160,7 +157,6 @@ func main() {
 
 	snigatewayClient := client.NewClient(cfg.FrontendAddr, clientTLS, clientOpts...)
 	tunnelMgr := tunnel.NewManager(snigatewayClient,
-		tunnel.WithTransport(cfg.TunnelTransport),
 		tunnel.WithPoolSize(cfg.TunnelPoolSize),
 	)
 

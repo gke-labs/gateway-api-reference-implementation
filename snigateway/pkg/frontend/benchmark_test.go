@@ -100,10 +100,10 @@ func setupBenchmarkBackend(b testing.TB, srv *Server, serverAddr string, generat
 	c := client.NewClient(serverAddr, clientTLS, clientOpts...)
 	ctx, cancel := context.WithCancel(b.Context())
 
-	mgrOpts := []tunnel.ManagerOption{tunnel.WithTransport(cfg.Transport)}
+	var mgrOpts []tunnel.ManagerOption
 	if cfg.PoolSize > 0 {
 		mgrOpts = append(mgrOpts, tunnel.WithPoolSize(cfg.PoolSize))
-	} else if cfg.Transport == "tcp" || cfg.Transport == "h2" {
+	} else if cfg.Transport == "tcp" {
 		mgrOpts = append(mgrOpts, tunnel.WithPoolSize(16))
 	}
 
@@ -362,24 +362,12 @@ func BenchmarkLatency_TCPPool(b *testing.B) {
 	runLatencyBenchmark(b, benchConfig{Transport: "tcp", PoolSize: 16}, "bench-tcp.example.com")
 }
 
-func BenchmarkLatency_H2(b *testing.B) {
-	runLatencyBenchmark(b, benchConfig{Transport: "h2", PoolSize: 4}, "bench-h2.example.com")
-}
-
 func BenchmarkThroughput_TCPPool(b *testing.B) {
 	runThroughputBenchmark(b, benchConfig{Transport: "tcp", PoolSize: 16}, "tput-tcp.example.com")
 }
 
-func BenchmarkThroughput_H2(b *testing.B) {
-	runThroughputBenchmark(b, benchConfig{Transport: "h2", PoolSize: 4}, "tput-h2.example.com")
-}
-
 func BenchmarkThroughput_Concurrent_TCPPool(b *testing.B) {
 	runConcurrentThroughputBenchmark(b, benchConfig{Transport: "tcp", PoolSize: 16}, "c-tput-tcp.example.com", 8)
-}
-
-func BenchmarkThroughput_Concurrent_H2(b *testing.B) {
-	runConcurrentThroughputBenchmark(b, benchConfig{Transport: "h2", PoolSize: 4}, "c-tput-h2.example.com", 8)
 }
 
 func BenchmarkMatrix(b *testing.B) {
@@ -392,12 +380,6 @@ func BenchmarkMatrix(b *testing.B) {
 		{"TCPPool_RTT50ms_Loss0%", benchConfig{Transport: "tcp", RTT: 50 * time.Millisecond, Loss: 0, PoolSize: 16}},
 		{"TCPPool_RTT20ms_Loss1%", benchConfig{Transport: "tcp", RTT: 20 * time.Millisecond, Loss: 0.01, PoolSize: 16}},
 		{"TCPPool_RTT50ms_Loss1%", benchConfig{Transport: "tcp", RTT: 50 * time.Millisecond, Loss: 0.01, PoolSize: 16}},
-
-		{"H2_RTT0ms_Loss0%", benchConfig{Transport: "h2", RTT: 0, Loss: 0, PoolSize: 4}},
-		{"H2_RTT20ms_Loss0%", benchConfig{Transport: "h2", RTT: 20 * time.Millisecond, Loss: 0, PoolSize: 4}},
-		{"H2_RTT50ms_Loss0%", benchConfig{Transport: "h2", RTT: 50 * time.Millisecond, Loss: 0, PoolSize: 4}},
-		{"H2_RTT20ms_Loss1%", benchConfig{Transport: "h2", RTT: 20 * time.Millisecond, Loss: 0.01, PoolSize: 4}},
-		{"H2_RTT50ms_Loss1%", benchConfig{Transport: "h2", RTT: 50 * time.Millisecond, Loss: 0.01, PoolSize: 4}},
 	}
 
 	for _, sc := range scenarios {
@@ -485,8 +467,6 @@ func BenchmarkLatency_Burst(b *testing.B) {
 	}{
 		{"TCPPool_RTT20ms", benchConfig{Transport: "tcp", RTT: 20 * time.Millisecond, PoolSize: 8}},
 		{"TCPPool_RTT50ms", benchConfig{Transport: "tcp", RTT: 50 * time.Millisecond, PoolSize: 8}},
-		{"H2_RTT20ms", benchConfig{Transport: "h2", RTT: 20 * time.Millisecond, PoolSize: 4}},
-		{"H2_RTT50ms", benchConfig{Transport: "h2", RTT: 50 * time.Millisecond, PoolSize: 4}},
 	}
 
 	for _, sc := range scenarios {
@@ -506,7 +486,7 @@ func TestBenchmark_SeparateProcessCPU(t *testing.T) {
 
 	checkSocketBufferSizes(t)
 
-	for _, transport := range []string{"tcp", "h2"} {
+	for _, transport := range []string{"tcp"} {
 		t.Run(transport, func(t *testing.T) {
 			srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(t, withBenchmarkServerSettings)
 			defer cleanupSrv()
@@ -631,8 +611,8 @@ func runBenchmarkChildBackend(t *testing.T) {
 	ctx, cancel := signal.NotifyContext(t.Context(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	mgrOpts := []tunnel.ManagerOption{tunnel.WithTransport(transport)}
-	if transport == "tcp" || transport == "h2" {
+	var mgrOpts []tunnel.ManagerOption
+	if transport == "tcp" {
 		mgrOpts = append(mgrOpts, tunnel.WithPoolSize(16))
 	}
 
