@@ -20,14 +20,21 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"golang.org/x/sync/errgroup"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -39,10 +46,12 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -83,6 +92,23 @@ const (
 
 	// DataPlaneHealthProbePort is the container port for health probes and metrics.
 	DataPlaneHealthProbePort = state.DataPlaneHealthProbePort
+
+	// defaultPollInterval is the interval between background applied revision probing cycles. Two seconds balances
+	// prompt detection of data-plane configuration convergence with low background CPU and network load.
+	defaultPollInterval = 2 * time.Second
+
+	// defaultProbeTimeout is the maximum duration for an individual applied revision HTTP probe. Two seconds allows
+	// healthy local pods sufficient time to respond under load while bounding how long unresponsive endpoints consume worker concurrency.
+	defaultProbeTimeout = 2 * time.Second
+
+	// maxProbeWorkers bounds the number of concurrent applied revision HTTP probes. Eight workers parallelize probing
+	// across multiple replicas while limiting open sockets and goroutines.
+	maxProbeWorkers = 8
+
+	// maxProbeResponseBytes bounds the response body size for /_gari/applied. The endpoint returns a JSON array
+	// of revision strings, which is typically under 1 KiB; 64 KiB allows thousands of active revisions while
+	// preventing unbounded memory consumption from misbehaving endpoints.
+	maxProbeResponseBytes = 64 * 1024
 
 	// DefaultACMEChallengeAudience is the token audience expected by certserver for ACME HTTP-01 challenge forwarding.
 	DefaultACMEChallengeAudience = "certserver"
@@ -172,6 +198,14 @@ func WithAPIReader(reader client.Reader) Option {
 	}
 }
 
+// gatewayMirror holds the mirrored data-plane endpoint and revision state for a Gateway.
+type gatewayMirror struct {
+	// readyEndpoints lists the ready and non-terminating endpoint addresses for the Gateway's Service.
+	readyEndpoints []string
+	// appliedRevisions maps each endpoint address to the configuration revisions reported by /_gari/applied.
+	appliedRevisions map[string][]string
+}
+
 // AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
 //
 // Readiness approximation: reports ready when the per-Gateway Deployment has at least one ready/available
@@ -181,6 +215,8 @@ func WithAPIReader(reader client.Reader) Option {
 // Gap: ready means "a replica has applied a config", not necessarily "the current configuration applied". The Secret-based
 // config distribution path has no acknowledgement channel carrying the applied configuration revision back from
 // data-plane replicas to the controller, so the provider cannot verify that the latest config is actively being served.
+// A background prober continuously mirrors each ready endpoint's applied revisions from /_gari/applied.
+// The provider's reported readiness does not read the mirror yet.
 type AddressProvider struct {
 	client                        client.Client
 	apiReader                     client.Reader
@@ -199,6 +235,18 @@ type AddressProvider struct {
 	acmeChallengeTokenPath        string
 	acmeChallengeAudience         string
 	acmeChallengeTokenExpiration  int64
+
+	// mirrorMu guards mirrors.
+	mirrorMu sync.Mutex
+	// mirrors maps each Gateway key to its mirrored data-plane endpoint and revision state.
+	mirrors map[types.NamespacedName]*gatewayMirror
+
+	// pollInterval is the interval between background applied revision probing cycles.
+	pollInterval time.Duration
+	// probeTimeout is the timeout applied to each individual HTTP probe request.
+	probeTimeout time.Duration
+	// httpClient performs HTTP GET requests against data-plane applied revision endpoints.
+	httpClient *http.Client
 }
 
 // WithACMEChallengeUpstreamURL configures the upstream certificate server URL for forwarding ACME HTTP-01 challenges.
@@ -298,6 +346,10 @@ func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
 	p := &AddressProvider{
 		client:         c,
 		dataplaneImage: DefaultDataplaneImage,
+		mirrors:        make(map[types.NamespacedName]*gatewayMirror),
+		pollInterval:   defaultPollInterval,
+		probeTimeout:   defaultProbeTimeout,
+		httpClient:     &http.Client{},
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -1049,7 +1101,8 @@ func managedByPredicate() predicate.Predicate {
 	})
 }
 
-// SetupWatches registers watches on managed Services and Deployments.
+// SetupWatches registers watches on managed Services and Deployments,
+// and registers the background applied-revision prober when a manager is provided.
 func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error {
 	var scheme *runtime.Scheme
 	var mapper meta.RESTMapper
@@ -1060,6 +1113,10 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 		p.apiReader = mgr.GetAPIReader()
 		scheme = mgr.GetScheme()
 		mapper = mgr.GetRESTMapper()
+
+		if err := mgr.Add(manager.RunnableFunc(p.runProber)); err != nil {
+			return fmt.Errorf("failed to register prober with manager: %w", err)
+		}
 	} else if p.client != nil {
 		scheme = p.client.Scheme()
 		mapper = p.client.RESTMapper()
@@ -1126,6 +1183,202 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		return fmt.Errorf("failed to apply config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 	return nil
+}
+
+// runProber runs the background probing loop, periodically polling ready data-plane endpoints until ctx ends.
+func (p *AddressProvider) runProber(ctx context.Context) error {
+	ticker := time.NewTicker(p.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			p.probeEndpoints(ctx)
+		}
+	}
+}
+
+// probeTarget identifies a specific data-plane endpoint to probe for a Gateway.
+type probeTarget struct {
+	gatewayKey types.NamespacedName
+	address    string
+}
+
+// probeResult holds the outcome of probing an individual data-plane endpoint.
+type probeResult struct {
+	target    probeTarget
+	revisions []string
+	err       error
+}
+
+// probeEndpoints discovers ready endpoints for managed Gateways, probes their applied revisions, and updates the in-memory mirror.
+func (p *AddressProvider) probeEndpoints(ctx context.Context) {
+	if p.client == nil {
+		return
+	}
+
+	var serviceList corev1.ServiceList
+	if err := p.client.List(ctx, &serviceList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
+		klog.Warningf("error listing provisioned Services for probing: %v", err)
+		return
+	}
+
+	var targets []probeTarget
+	gatewayEndpoints := make(map[types.NamespacedName][]string)
+	failedGateways := make(map[types.NamespacedName]bool)
+	for _, service := range serviceList.Items {
+		gatewayName := service.Labels[LabelGatewayName]
+		if ref := metav1.GetControllerOf(&service); ref != nil && ref.Kind == "Gateway" {
+			gatewayName = ref.Name
+		}
+		if gatewayName == "" {
+			continue
+		}
+		gatewayKey := types.NamespacedName{Namespace: service.Namespace, Name: gatewayName}
+
+		var slicesList discoveryv1.EndpointSliceList
+		if err := p.client.List(ctx, &slicesList, client.InNamespace(service.Namespace), client.MatchingLabels{
+			discoveryv1.LabelServiceName: service.Name,
+		}); err != nil {
+			klog.Warningf("error listing EndpointSlices for Service %s/%s (Gateway %s): %v", service.Namespace, service.Name, gatewayKey, err)
+			failedGateways[gatewayKey] = true
+			continue
+		}
+
+		readyAddresses := readyEndpointAddresses(slicesList.Items)
+		gatewayEndpoints[gatewayKey] = readyAddresses
+		for _, address := range readyAddresses {
+			targets = append(targets, probeTarget{gatewayKey: gatewayKey, address: address})
+		}
+	}
+
+	results := make([]probeResult, len(targets))
+	var group errgroup.Group
+	group.SetLimit(maxProbeWorkers)
+	for index, target := range targets {
+		group.Go(func() error {
+			targetURL := p.appliedURL(target.address)
+			revisions, err := p.probeEndpoint(ctx, targetURL)
+			results[index] = probeResult{target: target, revisions: revisions, err: err}
+			return nil
+		})
+	}
+	// group.Wait cannot return an error because every worker function returns nil.
+	if err := group.Wait(); err != nil {
+		klog.Errorf("unexpected error waiting for probe workers: %v", err)
+	}
+
+	p.mirrorMu.Lock()
+	for gatewayKey := range p.mirrors {
+		if failedGateways[gatewayKey] {
+			continue
+		}
+		if _, ok := gatewayEndpoints[gatewayKey]; !ok {
+			delete(p.mirrors, gatewayKey)
+		}
+	}
+
+	for gatewayKey, endpoints := range gatewayEndpoints {
+		mirror, ok := p.mirrors[gatewayKey]
+		if !ok {
+			mirror = &gatewayMirror{appliedRevisions: make(map[string][]string)}
+			p.mirrors[gatewayKey] = mirror
+		}
+		mirror.readyEndpoints = endpoints
+
+		liveAddresses := make(map[string]bool, len(endpoints))
+		for _, address := range endpoints {
+			liveAddresses[address] = true
+		}
+		for address := range mirror.appliedRevisions {
+			if !liveAddresses[address] {
+				delete(mirror.appliedRevisions, address)
+			}
+		}
+	}
+
+	for _, result := range results {
+		if result.err != nil {
+			targetURL := p.appliedURL(result.target.address)
+			klog.V(2).Infof("applied revision probe failed for %s (Gateway %s): %v", targetURL, result.target.gatewayKey, result.err)
+			// A failed probe keeps the endpoint's previous revisions rather than clearing them.
+			// Data-plane pods may experience transient probe timeouts or connection resets during
+			// reconfiguration or heavy network traffic. The provider can continue after a failed probe
+			// because endpoints leave the mirror only when Kubernetes removes them from EndpointSlices.
+			// Retaining the previous revisions prevents transient probe errors from flapping the mirror.
+			// Trade-off: an endpoint that stops answering but stays ready in its EndpointSlice keeps
+			// its last reported revisions until a probe succeeds or the endpoint leaves.
+			continue
+		}
+		if mirror, ok := p.mirrors[result.target.gatewayKey]; ok {
+			mirror.appliedRevisions[result.target.address] = result.revisions
+		}
+	}
+	p.mirrorMu.Unlock()
+}
+
+// appliedURL constructs the HTTP URL for querying the /_gari/applied endpoint on the given endpoint address.
+func (p *AddressProvider) appliedURL(address string) string {
+	return fmt.Sprintf("http://%s/_gari/applied", net.JoinHostPort(address, fmt.Sprintf("%d", DataPlaneHealthProbePort)))
+}
+
+// probeEndpoint fetches and decodes the applied configuration revisions from targetURL.
+func (p *AddressProvider) probeEndpoint(ctx context.Context, targetURL string) ([]string, error) {
+	probeContext, cancel := context.WithTimeout(ctx, p.probeTimeout)
+	defer cancel()
+
+	request, err := http.NewRequestWithContext(probeContext, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	response, err := p.httpClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP GET: %w", err)
+	}
+	defer func() {
+		// Closing a response body on an HTTP GET to an in-cluster endpoint only frees
+		// transport buffers; logging at V(4) is sufficient if close fails.
+		if closeErr := response.Body.Close(); closeErr != nil {
+			klog.V(4).Infof("failed closing applied revision response body: %v", closeErr)
+		}
+	}()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", response.StatusCode)
+	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(response.Body, maxProbeResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if int64(len(bodyBytes)) > maxProbeResponseBytes {
+		return nil, fmt.Errorf("response body exceeds %d bytes limit", maxProbeResponseBytes)
+	}
+	var revisions []string
+	if err := json.Unmarshal(bodyBytes, &revisions); err != nil {
+		return nil, fmt.Errorf("decoding JSON: %w", err)
+	}
+	return revisions, nil
+}
+
+// readyEndpointAddresses extracts unique IP addresses for endpoints that are ready and not terminating.
+func readyEndpointAddresses(endpointSlices []discoveryv1.EndpointSlice) []string {
+	var readyEndpoints []string
+	seen := make(map[string]bool)
+	for _, endpointSlice := range endpointSlices {
+		for _, endpoint := range endpointSlice.Endpoints {
+			if (endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready) || (endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating) {
+				continue
+			}
+			for _, address := range endpoint.Addresses {
+				if address != "" && !seen[address] {
+					seen[address] = true
+					readyEndpoints = append(readyEndpoints, address)
+				}
+			}
+		}
+	}
+	sort.Strings(readyEndpoints)
+	return readyEndpoints
 }
 
 // Begin implements state.DataplanePublisher.
