@@ -56,6 +56,9 @@ const (
 var (
 	// ErrRecordTooLarge is returned when a record exceeds the WAL buffer capacity.
 	ErrRecordTooLarge = errors.New("record exceeds WAL buffer size")
+
+	// ErrCorruptWAL indicates corruption in a WAL segment outside the torn tail.
+	ErrCorruptWAL = errors.New("corrupt WAL")
 )
 
 // MonotonicTime represents an opaque monotonic timestamp in nanoseconds.
@@ -876,6 +879,38 @@ func (w *WAL) Close() error {
 }
 
 // WALIterator replays records across segment files starting from a given LSN.
+//
+// Invariants:
+//  1. The WAL appends records only to the last segment, and LSNs increase by one across segments.
+//  2. The engine acknowledges a Put only after it fsyncs the WAL through that record's LSN.
+//  3. The engine fsyncs a segment before it creates the next one (createSegmentLocked).
+//
+// The engine organizes the WAL as a sequence of segments and appends records only to the last one.
+// LSNs increase by one across segments without gaps.
+//
+// The engine acknowledges a Put only after it fsyncs the WAL through that record's LSN. After a
+// crash, the storage device may lose or corrupt records that the engine wrote after its last fsync.
+// That is the torn tail. The iterator safely drops that tail because the engine never acknowledged
+// those records to a caller.
+//
+// Before creating a new segment in createSegmentLocked, the engine flushes and fsyncs the active
+// segment. Therefore, the engine makes every segment except the last fully durable before it accepts
+// any subsequent writes, so only the last segment can hold a torn tail.
+//
+// Because the engine makes earlier segments durable before rotation, any bad record (torn data, CRC
+// failure, decode failure, implausible field length, or LSN gap) in an earlier segment indicates
+// corruption of acknowledged data. Similarly, a subsequent segment that does not start at the expected
+// LSN indicates missing acknowledged data. In either case, the iterator returns ErrCorruptWAL and halts
+// recovery. In the last segment, a bad record indicates an unacknowledged tail, so the iterator treats
+// it as the end of the log and returns io.EOF.
+//
+// In createSegmentLocked, the engine creates and fsyncs a new segment file before it flushes the
+// segment header. A crash during that window leaves an empty or headerless last segment on disk. The
+// iterator treats that empty or headerless file in the last segment as the end of the log, allowing
+// recovery to succeed and preserve acknowledged records.
+//
+// The limitation: the iterator cannot distinguish corruption inside the fsynced portion of the last
+// segment from a torn tail, so it drops that corrupted record and any records following it.
 type WALIterator struct {
 	fs          FS
 	segments    []segmentMeta
@@ -963,30 +998,58 @@ func (it *WALIterator) nextSegment() error {
 	}
 
 	seg := it.segments[it.currSegIdx]
-	f, err := it.fs.Open(seg.path)
+	file, err := it.fs.Open(seg.path)
 	if err != nil {
 		return err
 	}
 
 	// Read and verify segment header: Magic(4) + Version(4) + Reserved(8) + DBID(16)
 	header := make([]byte, SegmentHeaderSize)
-	if _, err := f.ReadAt(header, 0); err != nil {
-		return errors.Join(fmt.Errorf("corrupt segment header in %s: %w", seg.name, err), f.Close())
+	n, readErr := file.ReadAt(header, 0)
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		closeErr := file.Close()
+		it.done = true
+		return errors.Join(fmt.Errorf("read error reading segment header in %s: %w", seg.name, readErr), closeErr)
+	}
+
+	if n < SegmentHeaderSize {
+		closeErr := file.Close()
+		it.done = true
+		if !it.isLastSegment() {
+			// Not the last segment, so this is corruption; see WALIterator.
+			return errors.Join(fmt.Errorf("%w: corrupt segment header in %s", ErrCorruptWAL, seg.name), closeErr)
+		}
+		// A crash right after rotation can leave an empty or headerless last segment; see WALIterator.
+		if closeErr != nil {
+			return closeErr
+		}
+		return io.EOF
 	}
 
 	magic := binary.BigEndian.Uint32(header[0:4])
 	ver := binary.BigEndian.Uint32(header[4:8])
 	if magic != WALMagic || ver != WALVersion || !bytes.Equal(header[16:32], it.dbID[:]) {
-		return errors.Join(fmt.Errorf("foreign or invalid segment header in %s", seg.name), f.Close())
+		closeErr := file.Close()
+		it.done = true
+		if !it.isLastSegment() {
+			// Not the last segment, so this is corruption; see WALIterator.
+			return errors.Join(fmt.Errorf("%w: foreign or invalid segment header in %s", ErrCorruptWAL, seg.name), closeErr)
+		}
+		// An invalid header in the last segment ends the log; see WALIterator.
+		if closeErr != nil {
+			return closeErr
+		}
+		return io.EOF
 	}
 
-	it.currFile = f
+	it.currFile = file
 	it.currOffset = int64(SegmentHeaderSize)
 	return nil
 }
 
 // Next reads the next valid record in sequence.
-// Honors startLSN and properly handles torn tails when later segments exist.
+// Honors startLSN and drops unacknowledged torn tails in the last segment.
+// Returns ErrCorruptWAL on corruption in non-tail segments or segment LSN gaps.
 func (it *WALIterator) Next() (Record, error) {
 	if it.done {
 		return Record{}, io.EOF
@@ -1003,8 +1066,8 @@ func (it *WALIterator) Next() (Record, error) {
 
 		// Check if at clean EOF of segment
 		if err == io.EOF && n == 0 {
-			if segErr := it.nextSegment(); segErr != nil {
-				return Record{}, io.EOF
+			if advErr := it.advanceSegment(); advErr != nil {
+				return Record{}, advErr
 			}
 			continue
 		}
@@ -1025,34 +1088,34 @@ func (it *WALIterator) Next() (Record, error) {
 				it.currOffset = nextBlock
 				continue
 			}
-			// Reached end of blocks in this segment: check if next segment starts at expected LSN
-			if it.canAdvanceToNextSegment() {
-				if segErr := it.nextSegment(); segErr != nil {
-					it.done = true
-					return Record{}, io.EOF
-				}
-				continue
+			// Reached end of blocks in this segment
+			if advErr := it.advanceSegment(); advErr != nil {
+				return Record{}, advErr
 			}
-			it.done = true
-			return Record{}, io.EOF
+			continue
 		}
 
 		if n < RecordHeaderSize {
-			// Torn header: check if next segment starts at expected LSN
-			if it.canAdvanceToNextSegment() {
-				if segErr := it.nextSegment(); segErr != nil {
-					it.done = true
-					return Record{}, io.EOF
-				}
-				continue
-			}
-			// Otherwise, this is the true end of the log
 			it.done = true
+			if !it.isLastSegment() {
+				// Not the last segment, so this is corruption; see WALIterator.
+				return Record{}, fmt.Errorf("%w: torn record header at offset %d in segment %s", ErrCorruptWAL, it.currOffset, it.segments[it.currSegIdx].name)
+			}
 			return Record{}, io.EOF
 		}
 
 		keyLen := binary.BigEndian.Uint32(hdr[20:24])
 		payloadLen := binary.BigEndian.Uint32(hdr[24:28])
+		// Stop a corrupted length field from triggering a huge allocation.
+		if keyLen > MaxRecordFieldLength || payloadLen > MaxRecordFieldLength {
+			it.done = true
+			if !it.isLastSegment() {
+				// Not the last segment, so this is corruption; see WALIterator.
+				return Record{}, fmt.Errorf("%w: record field length exceeds limit at offset %d in segment %s", ErrCorruptWAL, it.currOffset, it.segments[it.currSegIdx].name)
+			}
+			return Record{}, io.EOF
+		}
+
 		totalRecordLen := RecordHeaderSize + int(keyLen) + int(payloadLen)
 
 		recordBytes := make([]byte, totalRecordLen)
@@ -1063,29 +1126,21 @@ func (it *WALIterator) Next() (Record, error) {
 		}
 
 		if n < totalRecordLen {
-			// Torn record body: check if next segment starts at expected LSN
-			if it.canAdvanceToNextSegment() {
-				if segErr := it.nextSegment(); segErr != nil {
-					it.done = true
-					return Record{}, io.EOF
-				}
-				continue
-			}
 			it.done = true
+			if !it.isLastSegment() {
+				// Not the last segment, so this is corruption; see WALIterator.
+				return Record{}, fmt.Errorf("%w: torn record body at offset %d in segment %s", ErrCorruptWAL, it.currOffset, it.segments[it.currSegIdx].name)
+			}
 			return Record{}, io.EOF
 		}
 
 		rec, decodeErr := DecodeRecord(bytes.NewReader(recordBytes))
 		if decodeErr != nil {
-			// Corrupt record or bad CRC: check if next segment starts at expected LSN
-			if it.canAdvanceToNextSegment() {
-				if segErr := it.nextSegment(); segErr != nil {
-					it.done = true
-					return Record{}, io.EOF
-				}
-				continue
-			}
 			it.done = true
+			if !it.isLastSegment() {
+				// Not the last segment, so this is corruption; see WALIterator.
+				return Record{}, fmt.Errorf("%w: decode record at offset %d in segment %s: %w", ErrCorruptWAL, it.currOffset, it.segments[it.currSegIdx].name, decodeErr)
+			}
 			return Record{}, io.EOF
 		}
 
@@ -1097,15 +1152,11 @@ func (it *WALIterator) Next() (Record, error) {
 
 		// Check LSN contiguity
 		if it.expectedLSN > 0 && rec.LSN != it.expectedLSN {
-			// LSN gap: check if next segment can continue
-			if it.canAdvanceToNextSegment() {
-				if segErr := it.nextSegment(); segErr != nil {
-					it.done = true
-					return Record{}, io.EOF
-				}
-				continue
-			}
 			it.done = true
+			if !it.isLastSegment() {
+				// Not the last segment, so this is corruption; see WALIterator.
+				return Record{}, fmt.Errorf("%w: LSN gap at offset %d in segment %s: expected %d, got %d", ErrCorruptWAL, it.currOffset, it.segments[it.currSegIdx].name, it.expectedLSN, rec.LSN)
+			}
 			return Record{}, io.EOF
 		}
 
@@ -1115,15 +1166,39 @@ func (it *WALIterator) Next() (Record, error) {
 	}
 }
 
-// canAdvanceToNextSegment checks if a later segment exists starting at expectedLSN.
-func (it *WALIterator) canAdvanceToNextSegment() bool {
-	if it.currSegIdx+1 < len(it.segments) {
-		nextSeg := it.segments[it.currSegIdx+1]
-		if it.expectedLSN == 0 || nextSeg.startLSN == it.expectedLSN {
-			return true
-		}
+// isLastSegment reports whether the current segment is the last segment in the log.
+func (it *WALIterator) isLastSegment() bool {
+	return it.currSegIdx >= len(it.segments)-1
+}
+
+// advanceSegment advances the iterator to the next segment file.
+// If no later segment exists, it marks the iterator done and returns io.EOF.
+// If a later segment exists but does not start at expectedLSN, it returns an error wrapping ErrCorruptWAL.
+func (it *WALIterator) advanceSegment() error {
+	if it.isLastSegment() {
+		it.done = true
+		return io.EOF
 	}
-	return false
+
+	nextSeg := it.segments[it.currSegIdx+1]
+	if err := it.nextSegment(); err != nil {
+		it.done = true
+		if errors.Is(err, io.EOF) {
+			return io.EOF
+		}
+		if errors.Is(err, ErrCorruptWAL) {
+			return err
+		}
+		return fmt.Errorf("%w: failed to advance to next segment %s: %w", ErrCorruptWAL, nextSeg.name, err)
+	}
+
+	if it.expectedLSN > 0 && nextSeg.startLSN != it.expectedLSN {
+		it.done = true
+		// Next segment does not start at expected LSN, so this is corruption; see WALIterator.
+		return fmt.Errorf("%w: segment %s starts at LSN %d, expected %d", ErrCorruptWAL, nextSeg.name, nextSeg.startLSN, it.expectedLSN)
+	}
+
+	return nil
 }
 
 // Close closes the iterator.
