@@ -17,6 +17,7 @@ package state
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -786,6 +787,7 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 }
 
 type mockDataplanePublisher struct {
+	mu         sync.Mutex
 	publishErr error
 	published  map[types.NamespacedName]*DataplaneConfig
 }
@@ -793,6 +795,8 @@ type mockDataplanePublisher struct {
 func (m *mockDataplanePublisher) Begin(ctx context.Context) error  { return nil }
 func (m *mockDataplanePublisher) Commit(ctx context.Context) error { return nil }
 func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.publishErr != nil {
 		return m.publishErr
 	}
@@ -805,16 +809,31 @@ func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw 
 	return nil
 }
 
+func (m *mockDataplanePublisher) setPublishErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.publishErr = err
+}
+
 func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
 
+	conflictErr := &OwnershipConflictError{
+		Message: "conflict: existing Secret default/my-gw-gari is not owned by Gateway my-gw",
+	}
 	mockPub := &mockDataplanePublisher{
-		publishErr: &OwnershipConflictError{
-			Message: "conflict: existing Secret default/my-gw-gari is not owned by Gateway my-gw",
-		},
+		publishErr: conflictErr,
 	}
 	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
 
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
@@ -837,51 +856,531 @@ func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
 	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. Initial recompute publishes config and encounters OwnershipConflictError,
-	// which records the provisioning error and marks state dirty.
-	st.Recompute()
-	// Next recompute folds the recorded conflict into Gateway status.
-	st.Recompute()
-
-	status, ok := st.GetDesiredGatewayStatus(gwKey)
-	if !ok {
-		t.Fatalf("expected desired status for gateway")
-	}
-	var progCond *metav1.Condition
-	for i := range status.Conditions {
-		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
-			progCond = &status.Conditions[i]
-			break
+	// which records the provisioning error. Wait for the condition to update.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
 		}
-	}
-	if progCond == nil {
-		t.Fatalf("expected Programmed condition")
-	}
-	if progCond.Status != metav1.ConditionFalse || progCond.Message != mockPub.publishErr.Error() {
-		t.Errorf("expected Programmed=False Message=%q, got Status=%s Message=%q", mockPub.publishErr.Error(), progCond.Status, progCond.Message)
-	}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == conflictErr.Error()
+	})
 
 	// 2. Conflict resolved: publisher succeeds, clearing the recorded error.
-	mockPub.publishErr = nil
-	st.Recompute()
-	// Next recompute folds the cleared error into Gateway status, restoring Programmed=True.
-	st.Recompute()
+	mockPub.setPublishErr(nil)
 
-	status, ok = st.GetDesiredGatewayStatus(gwKey)
-	if !ok {
-		t.Fatalf("expected desired status for gateway")
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionTrue && progCond.Reason == string(gatewayv1.GatewayReasonProgrammed)
+	})
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
 	}
-	progCond = nil
-	for i := range status.Conditions {
-		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
-			progCond = &status.Conditions[i]
+}
+
+type retryTestPublisher struct {
+	mu                sync.Mutex
+	failCount         int
+	failKey           *types.NamespacedName
+	failDeletionCount int
+	attemptTimes      []time.Time
+	attemptsByKey     map[types.NamespacedName]int
+	deletionsByKey    map[types.NamespacedName]int
+	published         map[types.NamespacedName]*DataplaneConfig
+}
+
+func (m *retryTestPublisher) Begin(ctx context.Context) error  { return nil }
+func (m *retryTestPublisher) Commit(ctx context.Context) error { return nil }
+func (m *retryTestPublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.attemptTimes = append(m.attemptTimes, time.Now())
+	var key types.NamespacedName
+	if gw != nil {
+		key = types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	}
+	if m.attemptsByKey == nil {
+		m.attemptsByKey = make(map[types.NamespacedName]int)
+	}
+	m.attemptsByKey[key]++
+
+	if config == nil {
+		if m.failDeletionCount > 0 {
+			m.failDeletionCount--
+			return errors.New("simulated deletion failure")
+		}
+		if m.deletionsByKey == nil {
+			m.deletionsByKey = make(map[types.NamespacedName]int)
+		}
+		m.deletionsByKey[key]++
+		delete(m.published, key)
+		return nil
+	}
+
+	if m.failKey != nil && *m.failKey != key {
+		// Only fail for the specified key
+	} else if m.failCount > 0 {
+		m.failCount--
+		return errors.New("simulated publish failure")
+	}
+	if m.published == nil {
+		m.published = make(map[types.NamespacedName]*DataplaneConfig)
+	}
+	m.published[key] = config
+	return nil
+}
+
+func (m *retryTestPublisher) getPublished(key types.NamespacedName) *DataplaneConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.published[key]
+}
+
+func (m *retryTestPublisher) attempts() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.attemptTimes)
+}
+
+func (m *retryTestPublisher) attemptsFor(key types.NamespacedName) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.attemptsByKey[key]
+}
+
+func (m *retryTestPublisher) deletionsFor(key types.NamespacedName) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.deletionsByKey[key]
+}
+
+func (m *retryTestPublisher) getAttemptTimes() []time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res := make([]time.Time, len(m.attemptTimes))
+	copy(res, m.attemptTimes)
+	return res
+}
+
+func TestState_PublishDataplaneConfig_RetryOnFailure(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	mockPub := &retryTestPublisher{
+		failCount: 1,
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// Wait for retry to publish without any other event.
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.getPublished(gwKey) != nil
+	})
+
+	published := mockPub.getPublished(gwKey)
+	if published == nil {
+		t.Fatalf("expected config to be published on retry with no other event")
+	}
+	if published.GatewayName != gwKey {
+		t.Errorf("expected GatewayName %v, got %v", gwKey, published.GatewayName)
+	}
+	if mockPub.attempts() != 2 {
+		t.Errorf("expected exactly 2 publish attempts (1 initial failure + 1 retry), got %d", mockPub.attempts())
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestState_PublishDataplaneConfig_RepeatedFailuresBackoff(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	mockPub := &retryTestPublisher{
+		failCount: 100, // always fail
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// Wait for at least 4 publish attempts without any other events.
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.attempts() >= 4
+	})
+
+	times := mockPub.getAttemptTimes()
+	if len(times) < 4 {
+		t.Fatalf("expected at least 4 attempts, got %d", len(times))
+	}
+
+	d1 := times[1].Sub(times[0])
+	d2 := times[2].Sub(times[1])
+	d3 := times[3].Sub(times[2])
+
+	// Expected nominal backoffs are 5ms, 10ms, 20ms from DefaultTypedControllerRateLimiter.
+	// Verify intervals are non-spinning and increasing.
+	if d1 < 3*time.Millisecond {
+		t.Errorf("expected d1 >= 3ms (not spinning), got %v", d1)
+	}
+	if d2 < 6*time.Millisecond {
+		t.Errorf("expected d2 >= 6ms (not spinning), got %v", d2)
+	}
+	if d3 < 12*time.Millisecond {
+		t.Errorf("expected d3 >= 12ms (not spinning), got %v", d3)
+	}
+	if d2 <= d1 {
+		t.Errorf("expected backoff interval d2 (%v) > d1 (%v)", d2, d1)
+	}
+	if d3 <= d2 {
+		t.Errorf("expected backoff interval d3 (%v) > d2 (%v)", d3, d2)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestState_PublishDataplaneConfig_UnrelatedChangesDoNotRetryFailingKey(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gwKeyA := types.NamespacedName{Namespace: "default", Name: "my-gw-a"}
+	mockPub := &retryTestPublisher{
+		failKey:   &gwKeyA,
+		failCount: 1000, // keep failing while the changes happen
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwA := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw-a"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gwA)
+	st.SetGatewayAddresses(gwKeyA, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKeyA, GatewayReadiness{Ready: true})
+
+	// Wait until gw-a has made about six attempts, so that its next retry is
+	// more than 150 milliseconds away (5ms -> 10ms -> 20ms -> 40ms -> 80ms -> 160ms).
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.attemptsFor(gwKeyA) >= 6
+	})
+
+	attemptsBefore := mockPub.attemptsFor(gwKeyA)
+
+	// Make an unrelated Gateway change and call Recompute() directly 20 times.
+	gwB := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "my-gw-b",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gwB)
+
+	for i := range 20 {
+		gwB.Annotations = map[string]string{"change": fmt.Sprintf("%d", i)}
+		st.UpsertGateway(gwB)
+		st.Recompute()
+	}
+
+	attemptsAfter := mockPub.attemptsFor(gwKeyA)
+	if attemptsAfter != attemptsBefore {
+		t.Errorf("expected failing key to make no further attempts during unrelated recomputes, got %d attempts (was %d)", attemptsAfter, attemptsBefore)
+	}
+
+	// Now let gw-a succeed and assert that the config arrives.
+	mockPub.mu.Lock()
+	mockPub.failCount = 0
+	mockPub.mu.Unlock()
+
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.getPublished(gwKeyA) != nil
+	})
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestState_SetDataplanePublisher_EnqueuesExistingConfigs(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// Wait for the state to perform the initial recompute with the Gateway config.
+	pollUntil(t, 2*time.Second, func() bool {
+		_, ok := st.GetDesiredGatewayStatus(gwKey)
+		return ok
+	})
+
+	// Set publisher after the initial recompute. It must receive the existing Gateway config.
+	mockPub := &retryTestPublisher{}
+	st.SetDataplanePublisher(mockPub)
+
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.getPublished(gwKey) != nil
+	})
+
+	published := mockPub.getPublished(gwKey)
+	if published == nil {
+		t.Fatalf("expected existing config to be published when publisher is set")
+	}
+	if published.GatewayName != gwKey {
+		t.Errorf("expected GatewayName %v, got %v", gwKey, published.GatewayName)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestState_PublishDataplaneConfig_RetryCancelledOnGatewayDelete(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	mockPub := &retryTestPublisher{
+		failCount: 100, // always fail
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// Wait for first failure
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.attempts() >= 1
+	})
+
+	// Delete Gateway
+	st.DeleteGateway(gwKey)
+
+	// Poll until the attempt count stays unchanged over a window longer than the next scheduled retry.
+	const stableWindow = 50 * time.Millisecond
+	deadline := time.Now().Add(2 * time.Second)
+	lastCount := mockPub.attempts()
+	lastChange := time.Now()
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		curCount := mockPub.attempts()
+		if curCount != lastCount {
+			lastCount = curCount
+			lastChange = time.Now()
+		} else if time.Since(lastChange) >= stableWindow {
 			break
 		}
 	}
-	if progCond == nil {
-		t.Fatalf("expected Programmed condition")
+	if time.Since(lastChange) < stableWindow {
+		t.Fatalf("attempts count never stabilized after Gateway deletion")
 	}
-	if progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Errorf("expected Programmed=True when conflict resolved, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestState_PublishDataplaneConfig_FailedDeletionRetried(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	mockPub := &retryTestPublisher{
+		failCount: 0,
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// Wait for successful initial publish
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.getPublished(gwKey) != nil
+	})
+
+	// Configure publisher to fail deletion once
+	mockPub.mu.Lock()
+	mockPub.failDeletionCount = 1
+	mockPub.mu.Unlock()
+
+	// Delete Gateway
+	st.DeleteGateway(gwKey)
+
+	// Wait for deletion to be retried and succeed
+	pollUntil(t, 2*time.Second, func() bool {
+		return mockPub.deletionsFor(gwKey) >= 1
+	})
+
+	if got := mockPub.deletionsFor(gwKey); got != 1 {
+		t.Errorf("expected exactly 1 successful deletion, got %d", got)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
 	}
 }
 

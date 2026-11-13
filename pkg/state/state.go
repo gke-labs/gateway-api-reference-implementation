@@ -94,10 +94,27 @@ func (s *EventSource) Enqueue(req reconcile.Request) {
 
 var _ source.TypedSource[reconcile.Request] = (*EventSource)(nil)
 
-type State struct {
-	mu sync.RWMutex
+const (
+	// dataplaneRetryBaseDelay is the initial backoff delay for retrying failed data-plane publishes.
+	dataplaneRetryBaseDelay = 5 * time.Millisecond
+	// dataplaneRetryMaxDelay caps the exponential backoff to bound the worst-case delay
+	// before a recovered data plane receives its updated configuration (e.g. after a temporary outage).
+	dataplaneRetryMaxDelay = 30 * time.Second
+)
 
-	recomputeMu sync.Mutex
+func newDataplaneQueue() workqueue.TypedRateLimitingInterface[types.NamespacedName] {
+	return workqueue.NewTypedRateLimitingQueue[types.NamespacedName](
+		workqueue.NewTypedItemExponentialFailureRateLimiter[types.NamespacedName](
+			dataplaneRetryBaseDelay,
+			dataplaneRetryMaxDelay,
+		),
+	)
+}
+
+type State struct {
+	mu sync.RWMutex // guards inputs, outputs, listeners, routes, and dataplaneCache
+
+	recomputeMu sync.Mutex // serializes Recompute executions
 
 	revision   uint64
 	recomputes uint64
@@ -131,8 +148,9 @@ type State struct {
 	listenerValidator       ListenerValidator
 
 	dataplanePublisher DataplanePublisher
-	lastWrittenConfigs map[types.NamespacedName][]byte
-	publishConflicts   map[types.NamespacedName]struct{}
+	dataplaneQueue     workqueue.TypedRateLimitingInterface[types.NamespacedName]
+	dataplaneCache     map[types.NamespacedName][]byte   // holds the last config that each Gateway's data plane accepted; guarded by mu
+	publishConflicts   map[types.NamespacedName]struct{} // guarded by mu
 
 	previousOutputs *Outputs
 
@@ -181,7 +199,8 @@ func NewState() *State {
 		listenerSetSource:      NewEventSource(),
 		backendTLSPolicySource: NewEventSource(),
 		gatewayClassSource:     NewEventSource(),
-		lastWrittenConfigs:     make(map[types.NamespacedName][]byte),
+		dataplaneQueue:         newDataplaneQueue(),
+		dataplaneCache:         make(map[types.NamespacedName][]byte),
 		publishConflicts:       make(map[types.NamespacedName]struct{}),
 		notifyCh:               make(chan struct{}, 1),
 		synced:                 true,
@@ -282,7 +301,18 @@ func (s *State) SetListenerValidator(v ListenerValidator) {
 func (s *State) SetDataplanePublisher(p DataplanePublisher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dataplanePublisher == p {
+		return
+	}
 	s.dataplanePublisher = p
+	s.dataplaneCache = make(map[types.NamespacedName][]byte)
+	clear(s.publishConflicts)
+	if p != nil && s.dataplaneQueue != nil && s.previousOutputs != nil && s.previousOutputs.DataplaneConfigs != nil {
+		for gwKey := range s.previousOutputs.DataplaneConfigs {
+			s.dataplaneQueue.Forget(gwKey)
+			s.dataplaneQueue.Add(gwKey)
+		}
+	}
 }
 
 func (s *State) GetDataplaneConfig(key types.NamespacedName) *DataplaneConfig {
@@ -373,15 +403,24 @@ func (s *State) markDirtyLocked() {
 // Start runs the background coalescing loop and recomputes outputs when inputs change.
 func (s *State) Start(ctx context.Context) error {
 	s.mu.Lock()
+	if s.dataplaneQueue == nil || s.dataplaneQueue.ShuttingDown() {
+		s.dataplaneQueue = newDataplaneQueue()
+	}
 	s.running = true
 	s.mu.Unlock()
+
+	defer func() {
+		s.dataplaneQueue.ShutDown()
+		s.mu.Lock()
+		s.running = false
+		s.mu.Unlock()
+	}()
+
+	go s.dataplaneWorker(ctx)
 
 	// Wait for all informer event handler registrations to be fully synced.
 	for _, reg := range s.registrations {
 		if !toolscache.WaitForCacheSync(ctx.Done(), reg.HasSynced) {
-			s.mu.Lock()
-			s.running = false
-			s.mu.Unlock()
 			return nil
 		}
 	}
@@ -394,18 +433,12 @@ func (s *State) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			s.mu.Lock()
-			s.running = false
-			s.mu.Unlock()
 			return nil
 		case <-s.notifyCh:
 			timer := time.NewTimer(coalesceDelay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				s.mu.Lock()
-				s.running = false
-				s.mu.Unlock()
 				return nil
 			case <-timer.C:
 			}
@@ -421,8 +454,27 @@ func (s *State) Start(ctx context.Context) error {
 	}
 }
 
+// dataplaneWorker runs the background worker loop that pulls keys from dataplaneQueue,
+// reconciles each key against the data-plane publisher, and schedules rate-limited retries on failure.
+func (s *State) dataplaneWorker(ctx context.Context) {
+	for {
+		key, shutdown := s.dataplaneQueue.Get()
+		if shutdown {
+			return
+		}
+
+		err := s.reconcileDataplaneKey(ctx, key)
+		if err != nil {
+			s.dataplaneQueue.AddRateLimited(key)
+		} else {
+			s.dataplaneQueue.Forget(key)
+		}
+		s.dataplaneQueue.Done(key)
+	}
+}
+
 // Recompute synchronously computes all outputs from recorded inputs, diffs against previous outputs,
-// sends events for changed objects, and updates the proxy.
+// sends events for changed objects, and enqueues changed data-plane keys for asynchronous publishing.
 func (s *State) Recompute() *Outputs {
 	s.recomputeMu.Lock()
 	defer s.recomputeMu.Unlock()
@@ -450,18 +502,14 @@ func (s *State) Recompute() *Outputs {
 	gatewaysChanged := prev == nil || !reflectGatewaysEqual(outputs.ResolvedGateways, prev.ResolvedGateways)
 
 	onGatewaysUpdate := s.onGatewaysUpdate
-	dpPublisher := s.dataplanePublisher
 
 	s.previousOutputs = outputs
+	s.enqueueChangedDataplaneConfigsLocked(prev, outputs)
 	s.mu.Unlock()
 
 	// Run callbacks outside the lock to prevent deadlocks and avoid blocking state mutations.
 	if gatewaysChanged && onGatewaysUpdate != nil {
 		onGatewaysUpdate(outputs.ResolvedGateways)
-	}
-
-	if dpPublisher != nil {
-		s.publishDataplaneConfigs(outputs, dpPublisher)
 	}
 
 	return outputs
@@ -476,96 +524,147 @@ func (e *OwnershipConflictError) Error() string {
 	return e.Message
 }
 
-// publishDataplaneConfigs iterates through compiled data-plane configs and pushes updates to the publisher.
-// TODO(#637): Publishing is currently synchronous inside Recompute; consider making it asynchronous
-// or streaming (e.g. xDS-like) if cluster size or write latency becomes an issue.
-func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePublisher) {
-	if outputs == nil || publisher == nil {
-		return
-	}
-
-	ctx := context.Background()
-	if err := publisher.Begin(ctx); err != nil {
-		klog.Errorf("failed to begin dataplane publish batch: %v", err)
-	}
-
-	for gwKey, dpConfig := range outputs.DataplaneConfigs {
-		cg := outputs.CompiledGateways[gwKey]
-		if cg == nil || cg.Gateway == nil {
-			continue
-		}
-		if s.gatewayFilter != nil && !s.gatewayFilter(cg.Gateway) {
-			continue
-		}
-
-		data, err := json.Marshal(dpConfig)
-		if err != nil {
-			klog.Errorf("failed to marshal dataplane config for %s: %v", gwKey, err)
-			continue
-		}
-
-		if len(data) > 1024*1024 {
-			klog.Errorf("dataplane config size for %s (%d bytes) exceeds 1MiB secret limit", gwKey, len(data))
-		}
-
-		s.mu.Lock()
-		lastData := s.lastWrittenConfigs[gwKey]
-		s.mu.Unlock()
-
-		if bytes.Equal(data, lastData) {
-			continue
-		}
-
-		if err := publisher.PublishDataplaneConfig(ctx, cg.Gateway, dpConfig); err != nil {
-			klog.Errorf("failed to publish dataplane config for %s: %v", gwKey, err)
-			var conflictErr *OwnershipConflictError
-			if errors.As(err, &conflictErr) {
-				s.mu.Lock()
-				s.publishConflicts[gwKey] = struct{}{}
-				s.mu.Unlock()
-				s.SetGatewayProvisioningError(gwKey, conflictErr.Error())
+// reconcileDataplaneKey reconciles the desired data-plane configuration for a single Gateway.
+// The worker updates the cache only after the publisher accepts the config.
+// Each key is processed as its own Begin/Commit batch. For the in-process publisher,
+// this means one proxy update for each changed Gateway (rather than a single batch update
+// across all Gateways), so the proxy can briefly serve a mix of old and new Gateway configs.
+func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.NamespacedName) error {
+	s.mu.RLock()
+	var (
+		dpConfig *DataplaneConfig
+		gw       *gatewayv1.Gateway
+	)
+	if s.previousOutputs != nil && s.previousOutputs.DataplaneConfigs != nil {
+		dpConfig = s.previousOutputs.DataplaneConfigs[gwKey]
+		if cg := s.previousOutputs.CompiledGateways[gwKey]; cg != nil && cg.Gateway != nil {
+			if s.gatewayFilter == nil || s.gatewayFilter(cg.Gateway) {
+				gw = cg.Gateway
+			} else {
+				dpConfig = nil
 			}
-			continue
-		}
-
-		s.mu.Lock()
-		s.lastWrittenConfigs[gwKey] = data
-		_, hadConflict := s.publishConflicts[gwKey]
-		if hadConflict {
-			delete(s.publishConflicts, gwKey)
-		}
-		s.mu.Unlock()
-
-		if hadConflict {
-			s.SetGatewayProvisioningError(gwKey, "")
+		} else {
+			dpConfig = nil
 		}
 	}
+	cachedData := s.dataplaneCache[gwKey]
+	publisher := s.dataplanePublisher
+	s.mu.RUnlock()
 
-	var removedKeys []types.NamespacedName
-	s.mu.Lock()
-	for gwKey := range s.lastWrittenConfigs {
-		if _, ok := outputs.DataplaneConfigs[gwKey]; !ok {
-			delete(s.lastWrittenConfigs, gwKey)
-			delete(s.publishConflicts, gwKey)
-			removedKeys = append(removedKeys, gwKey)
-		}
+	if publisher == nil {
+		return nil
 	}
-	s.mu.Unlock()
 
-	for _, gwKey := range removedKeys {
-		gw := &gatewayv1.Gateway{
+	if dpConfig == nil || gw == nil {
+		if cachedData == nil {
+			return nil
+		}
+
+		if err := publisher.Begin(ctx); err != nil {
+			klog.Errorf("failed to begin dataplane publish batch: %v", err)
+		}
+		deleteGW := &gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: gwKey.Namespace,
 				Name:      gwKey.Name,
 			},
 		}
-		if err := publisher.PublishDataplaneConfig(ctx, gw, nil); err != nil {
+		if err := publisher.PublishDataplaneConfig(ctx, deleteGW, nil); err != nil {
 			klog.Errorf("failed to publish deletion of dataplane config for %s: %v", gwKey, err)
+			if commitErr := publisher.Commit(ctx); commitErr != nil {
+				klog.Errorf("failed to commit dataplane publish batch after deletion error for %s: %v", gwKey, commitErr)
+			}
+			return err
 		}
+		if err := publisher.Commit(ctx); err != nil {
+			klog.Errorf("failed to commit dataplane publish batch: %v", err)
+			return err
+		}
+
+		s.mu.Lock()
+		delete(s.dataplaneCache, gwKey)
+		delete(s.publishConflicts, gwKey)
+		s.mu.Unlock()
+		return nil
 	}
 
+	data, err := json.Marshal(dpConfig)
+	if err != nil {
+		klog.Errorf("failed to marshal dataplane config for %s: %v", gwKey, err)
+		return err
+	}
+
+	if len(data) > 1024*1024 {
+		klog.Errorf("dataplane config size for %s (%d bytes) exceeds 1MiB secret limit", gwKey, len(data))
+	}
+
+	if bytes.Equal(data, cachedData) {
+		return nil
+	}
+
+	if err := publisher.Begin(ctx); err != nil {
+		klog.Errorf("failed to begin dataplane publish batch: %v", err)
+	}
+	if err := publisher.PublishDataplaneConfig(ctx, gw, dpConfig); err != nil {
+		klog.Errorf("failed to publish dataplane config for %s (revision %s): %v", gwKey, dpConfig.Revision, err)
+		if commitErr := publisher.Commit(ctx); commitErr != nil {
+			klog.Errorf("failed to commit dataplane publish batch after publish error for %s: %v", gwKey, commitErr)
+		}
+		var conflictErr *OwnershipConflictError
+		if errors.As(err, &conflictErr) {
+			s.mu.Lock()
+			s.publishConflicts[gwKey] = struct{}{}
+			s.mu.Unlock()
+			s.SetGatewayProvisioningError(gwKey, conflictErr.Error())
+		}
+		return err
+	}
 	if err := publisher.Commit(ctx); err != nil {
 		klog.Errorf("failed to commit dataplane publish batch: %v", err)
+		return err
+	}
+
+	s.mu.Lock()
+	s.dataplaneCache[gwKey] = data
+	_, hadConflict := s.publishConflicts[gwKey]
+	if hadConflict {
+		delete(s.publishConflicts, gwKey)
+	}
+	s.mu.Unlock()
+
+	if hadConflict {
+		s.SetGatewayProvisioningError(gwKey, "")
+	}
+	return nil
+}
+
+// enqueueChangedDataplaneConfigsLocked enqueues data-plane keys whose desired configuration changed.
+// Publishing is asynchronous: a worker goroutine started by Start pulls keys from
+// dataplaneQueue and applies them to the publisher.
+func (s *State) enqueueChangedDataplaneConfigsLocked(prev, cur *Outputs) {
+	if s.dataplaneQueue == nil {
+		return
+	}
+	if prev == nil || prev.DataplaneConfigs == nil {
+		for gwKey := range cur.DataplaneConfigs {
+			s.dataplaneQueue.Forget(gwKey)
+			s.dataplaneQueue.Add(gwKey)
+		}
+		return
+	}
+
+	for gwKey, curCfg := range cur.DataplaneConfigs {
+		prevCfg := prev.DataplaneConfigs[gwKey]
+		if prevCfg == nil || prevCfg.Revision != curCfg.Revision {
+			s.dataplaneQueue.Forget(gwKey)
+			s.dataplaneQueue.Add(gwKey)
+		}
+	}
+	for gwKey := range prev.DataplaneConfigs {
+		if _, ok := cur.DataplaneConfigs[gwKey]; !ok {
+			s.dataplaneQueue.Forget(gwKey)
+			s.dataplaneQueue.Add(gwKey)
+		}
 	}
 }
 

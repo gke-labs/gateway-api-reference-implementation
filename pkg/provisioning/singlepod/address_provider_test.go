@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -694,10 +695,17 @@ func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnershipConflict(t *te
 		t.Errorf("expected ownerReferences to remain unchanged, got %+v", fetchedSec.OwnerReferences)
 	}
 
-	// 3. Gateway reports Programmed=False with the conflict message when state recomputes and publishes
+	// 3. Gateway reports Programmed=False with the conflict message when state runs and publishes
 	st := state.NewState()
 	st.SetControllerName("test-controller")
 	st.SetDataplanePublisher(p)
+
+	stCtx, stCancel := context.WithCancel(ctx)
+	defer stCancel()
+	go func() {
+		_ = st.Start(stCtx)
+	}()
+
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
 		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
@@ -706,20 +714,25 @@ func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnershipConflict(t *te
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.Recompute()
-	st.Recompute()
 
-	status, ok := st.GetDesiredGatewayStatus(gwKey)
-	if !ok {
-		t.Fatalf("expected desired gateway status")
-	}
 	var progCond *metav1.Condition
-	for i := range status.Conditions {
-		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
-			progCond = &status.Conditions[i]
-			break
+	pollDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(pollDeadline) {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if ok {
+			for i := range status.Conditions {
+				if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+					progCond = &status.Conditions[i]
+					break
+				}
+			}
+			if progCond != nil && progCond.Status == metav1.ConditionFalse && strings.Contains(progCond.Message, conflictErr.Error()) {
+				break
+			}
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
+
 	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonPending) {
 		t.Fatalf("expected Programmed=False/Pending on conflict, got %+v", progCond)
 	}
@@ -727,24 +740,29 @@ func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnershipConflict(t *te
 		t.Errorf("expected conflict message in condition, got %s", progCond.Message)
 	}
 
-	// 4. Resolve conflict by deleting conflicting secret -> Recompute succeeds and restores Programmed=True
+	// 4. Resolve conflict by deleting conflicting secret -> publish succeeds and restores Programmed=True
 	if err := cl.Delete(ctx, &fetchedSec); err != nil {
 		t.Fatalf("failed to delete conflicting secret: %v", err)
 	}
-	st.Recompute()
-	st.Recompute()
 
-	status, ok = st.GetDesiredGatewayStatus(gwKey)
-	if !ok {
-		t.Fatalf("expected desired gateway status")
-	}
 	progCond = nil
-	for i := range status.Conditions {
-		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
-			progCond = &status.Conditions[i]
-			break
+	pollDeadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(pollDeadline) {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if ok {
+			for i := range status.Conditions {
+				if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+					progCond = &status.Conditions[i]
+					break
+				}
+			}
+			if progCond != nil && progCond.Status == metav1.ConditionTrue && progCond.Reason == string(gatewayv1.GatewayReasonProgrammed) {
+				break
+			}
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
+
 	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
 		t.Fatalf("expected Programmed=True when conflict resolved, got %+v", progCond)
 	}
