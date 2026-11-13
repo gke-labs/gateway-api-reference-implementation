@@ -112,8 +112,10 @@ func newDataplaneQueue() workqueue.TypedRateLimitingInterface[types.NamespacedNa
 
 // gatewayDataplaneState holds the data-plane state for a single Gateway.
 type gatewayDataplaneState struct {
+	// acceptedConfig is the last config that the Gateway's data plane accepted.
 	acceptedConfig []byte
-	lastPublishErr error
+	// lastPublishError is the error from the most recent publish attempt, or nil after a success.
+	lastPublishError error
 }
 
 type State struct {
@@ -630,16 +632,18 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	}
 	s.mu.Unlock()
 
-	if prev.lastPublishErr != nil {
+	if prev.lastPublishError != nil {
 		s.SetGatewayProvisioningError(gwKey, "")
 	}
 	return nil
 }
 
+// recordPublishError records the error from a failed data-plane publish attempt on the Gateway's
+// data-plane state and reports it as a Gateway provisioning error.
 func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
 	s.mu.Lock()
 	dp := s.dataplaneState[gwKey]
-	dp.lastPublishErr = err
+	dp.lastPublishError = err
 	s.dataplaneState[gwKey] = dp
 	s.mu.Unlock()
 	s.SetGatewayProvisioningError(gwKey, err.Error())
