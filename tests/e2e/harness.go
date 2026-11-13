@@ -36,6 +36,8 @@ import (
 
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 )
 
 type Harness struct {
@@ -455,7 +457,7 @@ func (h *Harness) DumpDiagnostics() {
 	}
 
 	h.T.Log("=== DUMPING DATA-PLANE DEPLOYMENTS AND PODS ===")
-	if out, err := h.RunCommand("kubectl", "get", "deployments,pods", "-A", "-l", "gateway.networking.k8s.io/gateway-name", "-o", "wide"); err != nil {
+	if out, err := h.RunCommand("kubectl", "get", "deployments,pods", "-A", "-l", singlepod.LabelGatewayName, "-o", "wide"); err != nil {
 		h.T.Logf("Failed to get data-plane deployments and pods: %v", err)
 	} else if strings.TrimSpace(out) != "" {
 		h.T.Logf("Data-plane Deployments and Pods:\n%s", out)
