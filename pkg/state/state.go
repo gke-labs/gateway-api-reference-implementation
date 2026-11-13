@@ -94,6 +94,23 @@ func (s *EventSource) Enqueue(req reconcile.Request) {
 
 var _ source.TypedSource[reconcile.Request] = (*EventSource)(nil)
 
+const (
+	// dataplaneRetryBaseDelay is the initial backoff delay for retrying failed data-plane publishes.
+	dataplaneRetryBaseDelay = 5 * time.Millisecond
+	// dataplaneRetryMaxDelay caps the exponential backoff to bound the worst-case delay
+	// before a recovered data plane receives its updated configuration (e.g. after a temporary outage).
+	dataplaneRetryMaxDelay = 30 * time.Second
+)
+
+func newDataplaneQueue() workqueue.TypedRateLimitingInterface[types.NamespacedName] {
+	return workqueue.NewTypedRateLimitingQueue[types.NamespacedName](
+		workqueue.NewTypedItemExponentialFailureRateLimiter[types.NamespacedName](
+			dataplaneRetryBaseDelay,
+			dataplaneRetryMaxDelay,
+		),
+	)
+}
+
 type State struct {
 	mu sync.RWMutex // guards inputs, outputs, listeners, routes, and dataplaneCache
 
@@ -182,7 +199,7 @@ func NewState() *State {
 		listenerSetSource:      NewEventSource(),
 		backendTLSPolicySource: NewEventSource(),
 		gatewayClassSource:     NewEventSource(),
-		dataplaneQueue:         workqueue.NewTypedRateLimitingQueue[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName]()),
+		dataplaneQueue:         newDataplaneQueue(),
 		dataplaneCache:         make(map[types.NamespacedName][]byte),
 		publishConflicts:       make(map[types.NamespacedName]struct{}),
 		notifyCh:               make(chan struct{}, 1),
@@ -376,9 +393,7 @@ func (s *State) markDirtyLocked() {
 func (s *State) Start(ctx context.Context) error {
 	s.mu.Lock()
 	if s.dataplaneQueue == nil || s.dataplaneQueue.ShuttingDown() {
-		s.dataplaneQueue = workqueue.NewTypedRateLimitingQueue[types.NamespacedName](
-			workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName](),
-		)
+		s.dataplaneQueue = newDataplaneQueue()
 	}
 	s.running = true
 	s.mu.Unlock()
@@ -428,6 +443,8 @@ func (s *State) Start(ctx context.Context) error {
 	}
 }
 
+// dataplaneWorker runs the background worker loop that pulls keys from dataplaneQueue,
+// reconciles each key against the data-plane publisher, and schedules rate-limited retries on failure.
 func (s *State) dataplaneWorker(ctx context.Context) {
 	for {
 		key, shutdown := s.dataplaneQueue.Get()
@@ -446,7 +463,7 @@ func (s *State) dataplaneWorker(ctx context.Context) {
 }
 
 // Recompute synchronously computes all outputs from recorded inputs, diffs against previous outputs,
-// sends events for changed objects, and updates the proxy.
+// sends events for changed objects, and enqueues changed data-plane keys for asynchronous publishing.
 func (s *State) Recompute() *Outputs {
 	s.recomputeMu.Lock()
 	defer s.recomputeMu.Unlock()
@@ -477,17 +494,11 @@ func (s *State) Recompute() *Outputs {
 
 	s.previousOutputs = outputs
 	s.enqueueChangedDataplaneConfigsLocked(prev, outputs)
-	running := s.running
-	dpPublisher := s.dataplanePublisher
 	s.mu.Unlock()
 
 	// Run callbacks outside the lock to prevent deadlocks and avoid blocking state mutations.
 	if gatewaysChanged && onGatewaysUpdate != nil {
 		onGatewaysUpdate(outputs.ResolvedGateways)
-	}
-
-	if !running && dpPublisher != nil {
-		s.drainDataplaneQueueSync(context.Background())
 	}
 
 	return outputs
@@ -504,6 +515,9 @@ func (e *OwnershipConflictError) Error() string {
 
 // reconcileDataplaneKey reconciles the desired data-plane configuration for a single Gateway.
 // The worker updates the cache only after the publisher accepts the config.
+// Each key is processed as its own Begin/Commit batch. For the in-process publisher,
+// this means one proxy update for each changed Gateway (rather than a single batch update
+// across all Gateways), so the proxy can briefly serve a mix of old and new Gateway configs.
 func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.NamespacedName) error {
 	s.mu.RLock()
 	var (
@@ -640,26 +654,6 @@ func (s *State) enqueueChangedDataplaneConfigsLocked(prev, cur *Outputs) {
 			s.dataplaneQueue.Forget(gwKey)
 			s.dataplaneQueue.Add(gwKey)
 		}
-	}
-	if !s.running {
-		for gwKey := range cur.DataplaneConfigs {
-			if s.dataplaneCache[gwKey] == nil {
-				s.dataplaneQueue.Add(gwKey)
-			}
-		}
-	}
-}
-
-func (s *State) drainDataplaneQueueSync(ctx context.Context) {
-	for s.dataplaneQueue.Len() > 0 {
-		key, shutdown := s.dataplaneQueue.Get()
-		if shutdown {
-			return
-		}
-		if err := s.reconcileDataplaneKey(ctx, key); err != nil {
-			klog.V(2).Infof("drainDataplaneQueueSync failed to reconcile %s: %v", key, err)
-		}
-		s.dataplaneQueue.Done(key)
 	}
 }
 

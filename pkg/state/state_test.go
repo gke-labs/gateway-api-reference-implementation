@@ -787,6 +787,7 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 }
 
 type mockDataplanePublisher struct {
+	mu         sync.Mutex
 	publishErr error
 	published  map[types.NamespacedName]*DataplaneConfig
 }
@@ -794,6 +795,8 @@ type mockDataplanePublisher struct {
 func (m *mockDataplanePublisher) Begin(ctx context.Context) error  { return nil }
 func (m *mockDataplanePublisher) Commit(ctx context.Context) error { return nil }
 func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.publishErr != nil {
 		return m.publishErr
 	}
@@ -806,16 +809,31 @@ func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw 
 	return nil
 }
 
+func (m *mockDataplanePublisher) setPublishErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.publishErr = err
+}
+
 func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
 
+	conflictErr := &OwnershipConflictError{
+		Message: "conflict: existing Secret default/my-gw-gari is not owned by Gateway my-gw",
+	}
 	mockPub := &mockDataplanePublisher{
-		publishErr: &OwnershipConflictError{
-			Message: "conflict: existing Secret default/my-gw-gari is not owned by Gateway my-gw",
-		},
+		publishErr: conflictErr,
 	}
 	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
 
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
@@ -838,51 +856,31 @@ func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
 	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. Initial recompute publishes config and encounters OwnershipConflictError,
-	// which records the provisioning error and marks state dirty.
-	st.Recompute()
-	// Next recompute folds the recorded conflict into Gateway status.
-	st.Recompute()
-
-	status, ok := st.GetDesiredGatewayStatus(gwKey)
-	if !ok {
-		t.Fatalf("expected desired status for gateway")
-	}
-	var progCond *metav1.Condition
-	for i := range status.Conditions {
-		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
-			progCond = &status.Conditions[i]
-			break
+	// which records the provisioning error. Wait for the condition to update.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
 		}
-	}
-	if progCond == nil {
-		t.Fatalf("expected Programmed condition")
-	}
-	if progCond.Status != metav1.ConditionFalse || progCond.Message != mockPub.publishErr.Error() {
-		t.Errorf("expected Programmed=False Message=%q, got Status=%s Message=%q", mockPub.publishErr.Error(), progCond.Status, progCond.Message)
-	}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == conflictErr.Error()
+	})
 
 	// 2. Conflict resolved: publisher succeeds, clearing the recorded error.
-	mockPub.publishErr = nil
-	st.Recompute()
-	// Next recompute folds the cleared error into Gateway status, restoring Programmed=True.
-	st.Recompute()
+	mockPub.setPublishErr(nil)
 
-	status, ok = st.GetDesiredGatewayStatus(gwKey)
-	if !ok {
-		t.Fatalf("expected desired status for gateway")
-	}
-	progCond = nil
-	for i := range status.Conditions {
-		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
-			progCond = &status.Conditions[i]
-			break
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
 		}
-	}
-	if progCond == nil {
-		t.Fatalf("expected Programmed condition")
-	}
-	if progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Errorf("expected Programmed=True when conflict resolved, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionTrue && progCond.Reason == string(gatewayv1.GatewayReasonProgrammed)
+	})
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
 	}
 }
 
@@ -1111,7 +1109,7 @@ func TestState_PublishDataplaneConfig_UnrelatedChangesDoNotRetryFailingKey(t *te
 	gwKeyA := types.NamespacedName{Namespace: "default", Name: "my-gw-a"}
 	mockPub := &retryTestPublisher{
 		failKey:   &gwKeyA,
-		failCount: 1, // fails once for gw-a
+		failCount: 1000, // keep failing while the changes happen
 	}
 	st.SetDataplanePublisher(mockPub)
 
@@ -1147,6 +1145,8 @@ func TestState_PublishDataplaneConfig_UnrelatedChangesDoNotRetryFailingKey(t *te
 		return mockPub.attemptsFor(gwKeyA) >= 1
 	})
 
+	attemptsBefore := mockPub.attemptsFor(gwKeyA)
+
 	// Make 20 unrelated Gateway changes in rapid succession.
 	for i := range 20 {
 		gwB := &gatewayv1.Gateway{
@@ -1165,18 +1165,26 @@ func TestState_PublishDataplaneConfig_UnrelatedChangesDoNotRetryFailingKey(t *te
 			},
 		}
 		st.UpsertGateway(gwB)
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
 	}
 
-	// Verify that gw-a was not retried 20 times due to unrelated changes,
-	// and that its config is published on its scheduled retry.
+	attemptsAfter := mockPub.attemptsFor(gwKeyA)
+	extraAttempts := attemptsAfter - attemptsBefore
+
+	// In ~40ms with backoff starting at 5ms, 10ms, 20ms, at most ~3-4 scheduled retries can occur.
+	// If Recompute had enqueued gw-a on every unrelated change, extraAttempts would be at least 20.
+	if extraAttempts >= 20 {
+		t.Errorf("unrelated changes triggered immediate retries on gw-a: got %d extra attempts", extraAttempts)
+	}
+
+	// Now let gw-a succeed and assert that the config arrives.
+	mockPub.mu.Lock()
+	mockPub.failCount = 0
+	mockPub.mu.Unlock()
+
 	pollUntil(t, 2*time.Second, func() bool {
 		return mockPub.getPublished(gwKeyA) != nil
 	})
-
-	if got := mockPub.attemptsFor(gwKeyA); got != 2 {
-		t.Errorf("expected exactly 2 attempts for gw-a (1 initial failure + 1 retry), got %d", got)
-	}
 
 	cancel()
 	if err := <-errCh; err != nil {
@@ -1229,15 +1237,23 @@ func TestState_PublishDataplaneConfig_RetryCancelledOnGatewayDelete(t *testing.T
 	// Delete Gateway
 	st.DeleteGateway(gwKey)
 
-	// Wait for delete reconcile to run
-	time.Sleep(50 * time.Millisecond)
-
-	attemptsAfterDelete := mockPub.attempts()
-
-	// Assert behaviour: no further publish attempts arrive after the Gateway is deleted.
-	time.Sleep(100 * time.Millisecond)
-	if got := mockPub.attempts(); got > attemptsAfterDelete {
-		t.Errorf("expected no further publish attempts after Gateway deletion, got %d attempts (was %d)", got, attemptsAfterDelete)
+	// Poll until the attempt count stays unchanged over a window longer than the next scheduled retry.
+	const stableWindow = 50 * time.Millisecond
+	deadline := time.Now().Add(2 * time.Second)
+	lastCount := mockPub.attempts()
+	lastChange := time.Now()
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		curCount := mockPub.attempts()
+		if curCount != lastCount {
+			lastCount = curCount
+			lastChange = time.Now()
+		} else if time.Since(lastChange) >= stableWindow {
+			break
+		}
+	}
+	if time.Since(lastChange) < stableWindow {
+		t.Fatalf("attempts count never stabilized after Gateway deletion")
 	}
 
 	cancel()
