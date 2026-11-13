@@ -40,8 +40,6 @@ import (
 
 const (
 	// RouteReasonAnotherRouteHoldsHostname is used when a TLSRoute cannot bind because another route holds the hostname.
-	//
-	// Beyond the Gateway API specification: see tracking issue #1211.
 	RouteReasonAnotherRouteHoldsHostname gatewayv1.RouteConditionReason = "AnotherRouteHoldsHostname"
 )
 
@@ -1807,16 +1805,16 @@ func isTLSRouteCompatible(el *EffectiveListener) bool {
 //
 // Invariant: each effective hostname on a listener has exactly one owning TLSRoute.
 // Precedence order:
-// 1. More specific route hostname first (exact match, then the longer wildcard).
-//    The Gateway API specification requires precedence by hostname specificity,
-//    using the route's original hostnames (TLSRoute.spec.hostnames).
-// 2. Oldest route by CreationTimestamp.
-// 3. Alphabetically by namespace, then name.
-//    Beyond the Gateway API specification: the specification does not define
-//    a tie-break when two TLSRoutes claim identical hostnames on one listener,
-//    leaving the case open for TLSRoute. This controller chooses the older route
-//    by creation timestamp, then breaks ties alphabetically by namespace and name,
-//    following the HTTPRoute rule. See tracking issue #1211.
+//  1. More specific route hostname first (exact match, then the longer wildcard).
+//     The Gateway API specification requires precedence by hostname specificity,
+//     using the route's original hostnames (TLSRoute.spec.hostnames).
+//  2. Oldest route by CreationTimestamp.
+//  3. Alphabetically by namespace, then name.
+//     Beyond the Gateway API specification: the specification does not define
+//     a tie-break when two TLSRoutes claim identical hostnames on one listener,
+//     leaving the case open for TLSRoute. This controller chooses the older route
+//     by creation timestamp, then breaks ties alphabetically by namespace and name,
+//     following the HTTPRoute rule. See tracking issue #1211.
 //
 // This runs before binding because one route can win one hostname and lose another on the same listener.
 func resolveTLSRouteHostnameClaims(
