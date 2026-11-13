@@ -99,6 +99,20 @@ func TestRecovery_InvalidMagicBlocks(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("rec-foreign-db01"))
 
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 5, Key: "k", Payload: []byte("v")}); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
 	heapFile, _ := faultFS.Create("heap.db")
 
 	// Write a valid block
@@ -213,33 +227,69 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	}
 
 	// Store real legitimate object first at LSN 5
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 5, Key: "legit-key", Payload: []byte("legit-val")})
-	h1, _ := bp.AllocateNewPage(1, 1, 5)
-	s1, _ := WrapSlottedPage(h1.Block(0))
-	_, _ = s1.Put("legit-key", []byte("legit-val"), 5)
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 5, Key: "legit-key", Payload: []byte("legit-val")}); err != nil {
+		t.Fatalf("Append legit failed: %v", err)
+	}
+	h1, err := bp.AllocateNewPage(1, 1, 5)
+	if err != nil {
+		t.Fatalf("AllocateNewPage 1 failed: %v", err)
+	}
+	s1, err := WrapSlottedPage(h1.Block(0))
+	if err != nil {
+		t.Fatalf("WrapSlottedPage 1 failed: %v", err)
+	}
+	if _, err := s1.Put("legit-key", []byte("legit-val"), 5); err != nil {
+		t.Fatalf("Put legit-key failed: %v", err)
+	}
 	s1.Finalize()
 	h1.Unpin()
-	_ = bp.FlushPage(1)
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("FlushPage(1) failed: %v", err)
+	}
 
-	// Now store the malicious object containing forged headers at LSN 10
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "malicious-key", Payload: maliciousPayload})
-	_ = wal.Sync()
-	mbPage, err := NewMultiBlockPage(2, 10, "malicious-key", maliciousPayload)
+	// Now store the malicious object containing forged headers at LSN 6
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 6, Key: "malicious-key", Payload: maliciousPayload}); err != nil {
+		t.Fatalf("Append malicious failed: %v", err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("wal.Sync failed: %v", err)
+	}
+	mbPage, err := NewMultiBlockPage(2, 6, "malicious-key", maliciousPayload)
 	if err != nil {
 		t.Fatalf("NewMultiBlockPage failed: %v", err)
 	}
 
-	loc2, _ := buddy.Allocate(CalculateOrder(len(mbPage.Blocks)))
-	_ = NewDirectIO().Writev(heapFile, int64(loc2*BlockSize), mbPage.Blocks)
-	_ = heapFile.Sync()
+	loc2, err := buddy.Allocate(CalculateOrder(len(mbPage.Blocks)))
+	if err != nil {
+		t.Fatalf("buddy.Allocate failed: %v", err)
+	}
+	if err := NewDirectIO().Writev(heapFile, int64(loc2*BlockSize), mbPage.Blocks); err != nil {
+		t.Fatalf("Writev failed: %v", err)
+	}
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
 
-	_ = bp.Close()
-	_ = heapFile.Close()
-	_ = wal.Close()
+	if err := bp.Close(); err != nil {
+		t.Fatalf("bp.Close failed: %v", err)
+	}
+	if err := heapFile.Close(); err != nil {
+		t.Fatalf("heapFile.Close failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("wal.Close failed: %v", err)
+	}
 
 	// Run Recovery
-	reopenedHeap, _ := faultFS.OpenFile("heap.db", 0, 0)
-	defer reopenedHeap.Close()
+	reopenedHeap, err := faultFS.OpenFile("heap.db", 0, 0)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db failed: %v", err)
+	}
+	defer func() {
+		if err := reopenedHeap.Close(); err != nil {
+			t.Errorf("Close reopenedHeap failed: %v", err)
+		}
+	}()
 
 	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
 	if err != nil {
@@ -460,34 +510,85 @@ func TestRegression_Item4_HighestLSNKeySelection(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("rec-highest-lsn-"))
 
-	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
-	heapFile, _ := faultFS.Create("heap.db")
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 1, Key: "target-key", Payload: []byte("older-val")}); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 2, Key: "target-key", Payload: []byte("newer-val")}); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	heapFile, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
 	buddy := NewBuddyAllocator(512)
 	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 
-	// Page 1: holds key at LSN 10
-	h1, _ := bp.AllocateNewPage(1, 1, 10)
-	s1, _ := WrapSlottedPage(h1.Block(0))
-	_, _ = s1.Put("target-key", []byte("older-val"), 10)
+	// Page 1: holds key at LSN 1
+	h1, err := bp.AllocateNewPage(1, 1, 1)
+	if err != nil {
+		t.Fatalf("AllocateNewPage 1 failed: %v", err)
+	}
+	s1, err := WrapSlottedPage(h1.Block(0))
+	if err != nil {
+		t.Fatalf("WrapSlottedPage 1 failed: %v", err)
+	}
+	if _, err := s1.Put("target-key", []byte("older-val"), 1); err != nil {
+		t.Fatalf("Put target-key older failed: %v", err)
+	}
 	s1.Finalize()
 	h1.Unpin()
-	_ = bp.FlushPage(1)
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("FlushPage(1) failed: %v", err)
+	}
 
-	// Page 2: holds key at LSN 20 (newer!)
-	h2, _ := bp.AllocateNewPage(2, 1, 20)
-	s2, _ := WrapSlottedPage(h2.Block(0))
-	_, _ = s2.Put("target-key", []byte("newer-val"), 20)
+	// Page 2: holds key at LSN 2 (newer!)
+	h2, err := bp.AllocateNewPage(2, 1, 2)
+	if err != nil {
+		t.Fatalf("AllocateNewPage 2 failed: %v", err)
+	}
+	s2, err := WrapSlottedPage(h2.Block(0))
+	if err != nil {
+		t.Fatalf("WrapSlottedPage 2 failed: %v", err)
+	}
+	if _, err := s2.Put("target-key", []byte("newer-val"), 2); err != nil {
+		t.Fatalf("Put target-key newer failed: %v", err)
+	}
 	s2.Finalize()
 	h2.Unpin()
-	_ = bp.FlushPage(2)
+	if err := bp.FlushPage(2); err != nil {
+		t.Fatalf("FlushPage(2) failed: %v", err)
+	}
 
-	_ = heapFile.Sync()
-	_ = bp.Close()
-	_ = heapFile.Close()
-	_ = wal.Close()
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := bp.Close(); err != nil {
+		t.Fatalf("bp.Close failed: %v", err)
+	}
+	if err := heapFile.Close(); err != nil {
+		t.Fatalf("heapFile.Close failed: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("wal.Close failed: %v", err)
+	}
 
-	reopenedHeap, _ := faultFS.OpenFile("heap.db", 0, 0)
-	defer reopenedHeap.Close()
+	reopenedHeap, err := faultFS.OpenFile("heap.db", 0, 0)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db failed: %v", err)
+	}
+	defer func() {
+		if err := reopenedHeap.Close(); err != nil {
+			t.Errorf("Close reopenedHeap failed: %v", err)
+		}
+	}()
 
 	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
 	if err != nil {
@@ -498,8 +599,8 @@ func TestRegression_Item4_HighestLSNKeySelection(t *testing.T) {
 	if !exists {
 		t.Fatalf("target-key missing from recovered index")
 	}
-	if entry.LSN != 20 {
-		t.Fatalf("recovery chose stale LSN %d instead of highest LSN 20", entry.LSN)
+	if entry.LSN != 2 {
+		t.Fatalf("recovery chose stale LSN %d instead of highest LSN 2", entry.LSN)
 	}
 }
 
@@ -599,8 +700,11 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	t.Logf("empty page %d has DurableLoc %d (v1 was at %d, v2 was at %d)", entryK1.LogicalPage, durLoc, v1Loc, v2Loc)
 
 	// Step 8: Reuse the emptied logical page in the block pool
-	_ = store.wal.Append(Record{Type: RecordTypePut, LSN: 50, Key: "new-key", Payload: []byte("new-val")})
-	hNew, err := store.bp.AllocateNewPage(entryK1.LogicalPage, 1, 50)
+	lsnNew := store.wal.NextLSN()
+	if err := store.wal.Append(Record{Type: RecordTypePut, LSN: lsnNew, Key: "new-key", Payload: []byte("new-val")}); err != nil {
+		t.Fatalf("Append new-key failed: %v", err)
+	}
+	hNew, err := store.bp.AllocateNewPage(entryK1.LogicalPage, 1, lsnNew)
 	if err != nil {
 		t.Fatalf("AllocateNewPage failed: %v", err)
 	}
@@ -608,8 +712,11 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 
 	// Step 9: Allocate a new page (filler) and flush it to disk.
 	// On main, AllocateNewPage freed durLoc (block 1), so filler page gets block 1 and overwrites it.
-	_ = store.wal.Append(Record{Type: RecordTypePut, LSN: 51, Key: "filler", Payload: []byte("filler-val")})
-	hFiller, err := store.bp.AllocateNewPage(99, 1, 51)
+	lsnFiller := store.wal.NextLSN()
+	if err := store.wal.Append(Record{Type: RecordTypePut, LSN: lsnFiller, Key: "filler", Payload: []byte("filler-val")}); err != nil {
+		t.Fatalf("Append filler failed: %v", err)
+	}
+	hFiller, err := store.bp.AllocateNewPage(99, 1, lsnFiller)
 	if err != nil {
 		t.Fatalf("AllocateNewPage 99 failed: %v", err)
 	}
@@ -617,10 +724,12 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WrapSlottedPage failed: %v", err)
 	}
-	_, _ = spFiller.Put("filler", []byte("filler-val"), 51)
+	if _, err := spFiller.Put("filler", []byte("filler-val"), lsnFiller); err != nil {
+		t.Fatalf("spFiller.Put failed: %v", err)
+	}
 	spFiller.Finalize()
 	hFiller.Unpin()
-	store.bp.MarkDirty(99, 51)
+	store.bp.MarkDirty(99, lsnFiller)
 	if err := store.bp.FlushPage(99); err != nil {
 		t.Fatalf("FlushPage(99) failed: %v", err)
 	}
@@ -637,20 +746,30 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	}
 
 	// Sync heap so filler write is durable
-	_ = store.heapFile.Sync()
+	if err := store.heapFile.Sync(); err != nil {
+		t.Fatalf("store.heapFile.Sync failed: %v", err)
+	}
 
 	// Step 10: Simulate crash BEFORE the page's new incarnation is flushed/fsynced
 	close(store.bp.bgStop)
 	<-store.bp.bgDone
-	_ = store.heapFile.Close()
-	_ = store.wal.Close()
+	if err := store.heapFile.Close(); err != nil {
+		t.Fatalf("store.heapFile.Close failed: %v", err)
+	}
+	if err := store.wal.Close(); err != nil {
+		t.Fatalf("store.wal.Close failed: %v", err)
+	}
 
 	// Step 11: Reopen store after crash
 	store2, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}
-	defer store2.Close()
+	defer func() {
+		if err := store2.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+	}()
 
 	store2.keyMu.RLock()
 	for k, entry := range store2.keyIndex {
@@ -1016,7 +1135,11 @@ func TestRecovery_WALCrashAfterRotation_EmptySegment_SucceedsOpen(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer store2.Close()
+	defer func() {
+		if err := store2.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+	}()
 
 	if store2.Wiped() {
 		t.Fatalf("expected store not to be wiped")
@@ -1120,4 +1243,136 @@ func TestRecovery_WALRecordLengthExceedsSegment_NoAllocation(t *testing.T) {
 			t.Fatalf("recovery allocated %d bytes (>= %d), expected no buffer of that length", alloc, excessiveLen)
 		}
 	})
+}
+
+func TestRecovery_WALCorruptBelowHeapLSN_FailsOpen(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_wal_corrupt_below_heap"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "k1", []byte("val1")); err != nil {
+		t.Fatalf("Put k1 failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Corrupt record 1 in the last segment below the heap page LSN.
+	segPath := filepath.Join(dir, "wal", segmentFileName(1))
+	file, err := memFS.OpenFile(segPath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	var b [1]byte
+	if _, err := file.ReadAt(b[:], int64(SegmentHeaderSize+10)); err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			t.Fatalf("ReadAt failed: %v (file.Close also failed: %v)", err, closeErr)
+		}
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	b[0] ^= 0xff
+	if _, err := file.WriteAt(b[:], int64(SegmentHeaderSize+10)); err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			t.Fatalf("WriteAt failed: %v (file.Close also failed: %v)", err, closeErr)
+		}
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err == nil {
+		if closeErr := store2.Close(); closeErr != nil {
+			t.Fatalf("expected ErrCorruptWAL, got nil error; Close also failed: %v", closeErr)
+		}
+		t.Fatalf("expected ErrCorruptWAL, got nil error")
+	}
+	if !errors.Is(err, ErrCorruptWAL) {
+		t.Fatalf("expected ErrCorruptWAL, got: %v", err)
+	}
+}
+
+func TestRecovery_WALTornTailAboveHeapLSN_SucceedsOpen(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	dir := "test_wal_torn_tail_above_heap"
+
+	store, err := Open(WithFS(faultFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "k1", []byte("val1")); err != nil {
+		t.Fatalf("Put k1 failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	// Write k2 (LSN > heap LSN) and sync to WAL
+	if err := store.Put("ConfigMap", "k2", []byte("val2")); err != nil {
+		t.Fatalf("Put k2 failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Simulate crash and abandon the engine without closing it
+	if err := faultFS.Crash(true, 0); err != nil {
+		t.Fatalf("Crash failed: %v", err)
+	}
+
+	// Append torn tail to the last WAL segment above the heap page LSN
+	segPath := filepath.Join(dir, "wal", segmentFileName(1))
+	file, err := faultFS.OpenFile(segPath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	size, err := file.Size()
+	if err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			t.Fatalf("Size failed: %v (file.Close also failed: %v)", err, closeErr)
+		}
+		t.Fatalf("Size failed: %v", err)
+	}
+	tornHeader := []byte{RecordMagic, RecordFormatVersion, byte(RecordTypePut), 0, 0, 0, 0, 10}
+	if _, err := file.WriteAt(tornHeader, size); err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			t.Fatalf("WriteAt failed: %v (file.Close also failed: %v)", err, closeErr)
+		}
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			t.Fatalf("Sync failed: %v (file.Close also failed: %v)", err, closeErr)
+		}
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	store2, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() {
+		if err := store2.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+	}()
+
+	val1, ok1, err := store2.Get("ConfigMap", "k1")
+	if err != nil || !ok1 || string(val1) != "val1" {
+		t.Fatalf("Get k1 mismatch: ok=%v, val=%q, err=%v", ok1, string(val1), err)
+	}
+	val2, ok2, err := store2.Get("ConfigMap", "k2")
+	if err != nil || !ok2 || string(val2) != "val2" {
+		t.Fatalf("Get k2 mismatch: ok=%v, val=%q, err=%v", ok2, string(val2), err)
+	}
 }

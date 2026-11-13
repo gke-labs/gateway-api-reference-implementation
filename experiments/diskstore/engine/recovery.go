@@ -220,8 +220,12 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	// Step 2: Mark blocks of winning candidates as allocated in the buddy allocator
 	pageDescs := make(map[uint64]*PageDesc)
 	var maxRecoveredLogicalPage uint64
+	var maxHeapLSN uint64
 
 	for logicalPage, cand := range bestCandidates {
+		if cand.lsn > maxHeapLSN {
+			maxHeapLSN = cand.lsn
+		}
 		order := 0
 		for (1 << order) < cand.numBlocks {
 			order++
@@ -334,25 +338,34 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	var maxWAL_LSN uint64
 
 	walScanIt, err := NewWALIterator(fs, walDir, dbID, 1)
-	if err == nil {
-		for {
-			rec, err := walScanIt.Next()
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if err != nil {
-				return nil, fmt.Errorf("error during WAL scan: %w", err)
-			}
-			if rec.LSN > maxWAL_LSN {
-				maxWAL_LSN = rec.LSN
-			}
-			if rec.Type == RecordTypeCheckpoint && rec.RedoStartLSN > 0 {
-				redoStartLSN = rec.RedoStartLSN
-			}
+	if err != nil {
+		return nil, fmt.Errorf("failed to create WAL scan iterator: %w", err)
+	}
+	for {
+		rec, err := walScanIt.Next()
+		if errors.Is(err, io.EOF) {
+			break
 		}
-		if closeErr := walScanIt.Close(); closeErr != nil {
-			return nil, fmt.Errorf("failed to close WAL scan iterator: %w", closeErr)
+		if err != nil {
+			return nil, fmt.Errorf("error during WAL scan: %w", err)
 		}
+		if rec.LSN > maxWAL_LSN {
+			maxWAL_LSN = rec.LSN
+		}
+		if rec.Type == RecordTypeCheckpoint && rec.RedoStartLSN > 0 {
+			redoStartLSN = rec.RedoStartLSN
+		}
+	}
+	if closeErr := walScanIt.Close(); closeErr != nil {
+		return nil, fmt.Errorf("failed to close WAL scan iterator: %w", closeErr)
+	}
+
+	// Under the write-ahead rule, a heap page with LSN L can only be on disk
+	// if the WAL was fsynced through L. If WAL replay ends below the highest
+	// page LSN found in the heap, records that the engine acknowledged are
+	// missing, which indicates provable corruption rather than an unacknowledged torn tail.
+	if maxWAL_LSN < maxHeapLSN {
+		return nil, fmt.Errorf("%w: WAL replay ended at LSN %d below highest heap page LSN %d", ErrCorruptWAL, maxWAL_LSN, maxHeapLSN)
 	}
 
 	// Step 5: Full Redo Replay from redoStartLSN (Item 3)
@@ -430,212 +443,213 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	}
 
 	walRedoIt, err := NewWALIterator(fs, walDir, dbID, redoStartLSN)
-	if err == nil {
-		for {
-			rec, err := walRedoIt.Next()
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if err != nil {
-				return nil, fmt.Errorf("error during WAL redo: %w", err)
-			}
-			if rec.LSN > maxWAL_LSN {
-				maxWAL_LSN = rec.LSN
+	if err != nil {
+		return nil, fmt.Errorf("failed to create WAL redo iterator: %w", err)
+	}
+	for {
+		rec, err := walRedoIt.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error during WAL redo: %w", err)
+		}
+		if rec.LSN > maxWAL_LSN {
+			maxWAL_LSN = rec.LSN
+		}
+
+		// Apply Put or PutPointer
+		if rec.Type == RecordTypePut || rec.Type == RecordTypePutPointer {
+			existing, inIndex := keyIndex[rec.Key]
+			if inIndex {
+				desc, inPages := pageDescs[existing.LogicalPage]
+				if inPages && desc != nil && desc.PageLSN.Load() >= rec.LSN {
+					continue // Target page already reflects this or newer write
+				}
 			}
 
-			// Apply Put or PutPointer
-			if rec.Type == RecordTypePut || rec.Type == RecordTypePutPointer {
-				existing, inIndex := keyIndex[rec.Key]
-				if inIndex {
-					desc, inPages := pageDescs[existing.LogicalPage]
-					if inPages && desc != nil && desc.PageLSN.Load() >= rec.LSN {
-						continue // Target page already reflects this or newer write
-					}
+			isPointer := rec.Type == RecordTypePutPointer
+			var oversizeFileName string
+			if isPointer {
+				_, _, fName, decodeErr := DecodeOversizePointer(rec.Payload)
+				if decodeErr != nil {
+					return nil, fmt.Errorf("%w: failed to decode oversize pointer: %v", ErrCorruptStore, decodeErr)
+				}
+				oversizeFileName = fName
+			}
+
+			// Apply mutation to page buffer
+			if CanFitInSlottedPage(len(rec.Key), len(rec.Payload)) {
+				// 1-block slotted page
+				var targetPage uint64
+				if inIndex && pageDescs[existing.LogicalPage] != nil && pageDescs[existing.LogicalPage].NumBlocks == 1 {
+					targetPage = existing.LogicalPage
+				} else if p, ok := emptyTracker.Pop(); ok {
+					targetPage = p
+				} else {
+					maxRecoveredLogicalPage++
+					targetPage = maxRecoveredLogicalPage
 				}
 
-				isPointer := rec.Type == RecordTypePutPointer
-				var oversizeFileName string
-				if isPointer {
-					_, _, fName, decodeErr := DecodeOversizePointer(rec.Payload)
-					if decodeErr != nil {
-						return nil, fmt.Errorf("%w: failed to decode oversize pointer: %v", ErrCorruptStore, decodeErr)
-					}
-					oversizeFileName = fName
-				}
-
-				// Apply mutation to page buffer
-				if CanFitInSlottedPage(len(rec.Key), len(rec.Payload)) {
-					// 1-block slotted page
-					var targetPage uint64
-					if inIndex && pageDescs[existing.LogicalPage] != nil && pageDescs[existing.LogicalPage].NumBlocks == 1 {
-						targetPage = existing.LogicalPage
-					} else if p, ok := emptyTracker.Pop(); ok {
-						targetPage = p
-					} else {
-						maxRecoveredLogicalPage++
-						targetPage = maxRecoveredLogicalPage
-					}
-
-					var pageBuf []byte
-					if buf, ok := redoPages[targetPage]; ok {
-						pageBuf = buf
-					} else if desc, ok := pageDescs[targetPage]; ok && desc.PhysicalBlock != NoBlock {
-						pageBuf = AllocateAlignedBlock(BlockSize)
-						if _, err := heapFile.ReadAt(pageBuf, int64(desc.PhysicalBlock*BlockSize)); err != nil {
-							return nil, fmt.Errorf("failed to read page %d for redo: %w", targetPage, err)
-						}
-					} else {
-						pageBuf = AllocateAlignedBlock(BlockSize)
-						hdr := BlockHeader{
-							LogicalPage: targetPage,
-							LSN:         rec.LSN,
-							NumBlocks:   1,
-						}
-						EncodeBlockHeader(hdr, pageBuf)
-					}
-
-					slotted, wrapErr := WrapSlottedPage(pageBuf)
-					if wrapErr != nil {
-						return nil, fmt.Errorf("failed to wrap page for redo: %w", wrapErr)
-					}
-					if inIndex && targetPage == existing.LogicalPage && existing.NumBlocks == 1 {
-						if delErr := slotted.Delete(existing.Slot, rec.LSN); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
-							return nil, fmt.Errorf("failed to delete slot for redo: %w", delErr)
-						}
-					}
-					slotIdx, err := slotted.PutWithFlag(rec.Key, rec.Payload, rec.LSN, isPointer)
-					if err != nil {
-						// Page full during redo: if old record was on targetPage, finalize old page
-						if inIndex && targetPage == existing.LogicalPage && existing.NumBlocks == 1 {
-							slotted.Finalize()
-							redoPages[targetPage] = pageBuf
-							delete(redoMBPages, targetPage)
-							dirtyLogicalPages[targetPage] = true
-							if desc, ok := pageDescs[targetPage]; ok && desc != nil {
-								desc.PageLSN.Store(rec.LSN)
-							}
-							if slotted.ActiveSlotsCount() == 0 {
-								emptyTracker.Add(targetPage)
-							}
-						}
-
-						// Allocate next page
-						var ok bool
-						if targetPage, ok = emptyTracker.Pop(); !ok {
-							maxRecoveredLogicalPage++
-							targetPage = maxRecoveredLogicalPage
-						}
-						pageBuf = AllocateAlignedBlock(BlockSize)
-						hdr := BlockHeader{LogicalPage: targetPage, LSN: rec.LSN, NumBlocks: 1}
-						EncodeBlockHeader(hdr, pageBuf)
-						slotted, wrapErr = WrapSlottedPage(pageBuf)
-						if wrapErr != nil {
-							return nil, fmt.Errorf("failed to wrap new page for redo: %w", wrapErr)
-						}
-						slotIdx, err = slotted.PutWithFlag(rec.Key, rec.Payload, rec.LSN, isPointer)
-						if err != nil {
-							return nil, fmt.Errorf("failed to put record into new page during redo: %w", err)
-						}
-					}
-					slotted.Finalize()
-
-					redoPages[targetPage] = pageBuf
-					delete(redoMBPages, targetPage)
-					dirtyLogicalPages[targetPage] = true
-
-					if inIndex && (targetPage != existing.LogicalPage || existing.NumBlocks > 1) {
-						if err := cleanOldLocationForRedo(existing, rec.Key, rec.LSN); err != nil {
-							return nil, err
-						}
-					}
-
-					keyIndex[rec.Key] = KeyIndexEntry{
-						LogicalPage:      targetPage,
-						Slot:             slotIdx,
-						LSN:              rec.LSN,
-						NumBlocks:        1,
-						IsOversize:       isPointer,
-						OversizeFileName: oversizeFileName,
-					}
-					if desc, ok := pageDescs[targetPage]; ok {
-						desc.PageLSN.Store(rec.LSN)
-						desc.NumBlocks = 1
-					} else {
-						d := &PageDesc{
-							LogicalPage:       targetPage,
-							NumBlocks:         1,
-							PhysicalBlock:     NoBlock,
-							FlushedLoc:        NoBlock,
-							FlushedBeforeSync: NoBlock,
-							DurableLoc:        NoBlock,
-						}
-						d.PageLSN.Store(rec.LSN)
-						pageDescs[targetPage] = d
+				var pageBuf []byte
+				if buf, ok := redoPages[targetPage]; ok {
+					pageBuf = buf
+				} else if desc, ok := pageDescs[targetPage]; ok && desc.PhysicalBlock != NoBlock {
+					pageBuf = AllocateAlignedBlock(BlockSize)
+					if _, err := heapFile.ReadAt(pageBuf, int64(desc.PhysicalBlock*BlockSize)); err != nil {
+						return nil, fmt.Errorf("failed to read page %d for redo: %w", targetPage, err)
 					}
 				} else {
-					// Multi-block page
-					if inIndex && !existing.IsOversize {
-						if err := cleanOldLocationForRedo(existing, rec.Key, rec.LSN); err != nil {
-							return nil, err
+					pageBuf = AllocateAlignedBlock(BlockSize)
+					hdr := BlockHeader{
+						LogicalPage: targetPage,
+						LSN:         rec.LSN,
+						NumBlocks:   1,
+					}
+					EncodeBlockHeader(hdr, pageBuf)
+				}
+
+				slotted, wrapErr := WrapSlottedPage(pageBuf)
+				if wrapErr != nil {
+					return nil, fmt.Errorf("failed to wrap page for redo: %w", wrapErr)
+				}
+				if inIndex && targetPage == existing.LogicalPage && existing.NumBlocks == 1 {
+					if delErr := slotted.Delete(existing.Slot, rec.LSN); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
+						return nil, fmt.Errorf("failed to delete slot for redo: %w", delErr)
+					}
+				}
+				slotIdx, err := slotted.PutWithFlag(rec.Key, rec.Payload, rec.LSN, isPointer)
+				if err != nil {
+					// Page full during redo: if old record was on targetPage, finalize old page
+					if inIndex && targetPage == existing.LogicalPage && existing.NumBlocks == 1 {
+						slotted.Finalize()
+						redoPages[targetPage] = pageBuf
+						delete(redoMBPages, targetPage)
+						dirtyLogicalPages[targetPage] = true
+						if desc, ok := pageDescs[targetPage]; ok && desc != nil {
+							desc.PageLSN.Store(rec.LSN)
+						}
+						if slotted.ActiveSlotsCount() == 0 {
+							emptyTracker.Add(targetPage)
 						}
 					}
 
-					var targetPage uint64
+					// Allocate next page
 					var ok bool
 					if targetPage, ok = emptyTracker.Pop(); !ok {
 						maxRecoveredLogicalPage++
 						targetPage = maxRecoveredLogicalPage
 					}
-
-					mb, err := NewMultiBlockPage(targetPage, rec.LSN, rec.Key, rec.Payload)
+					pageBuf = AllocateAlignedBlock(BlockSize)
+					hdr := BlockHeader{LogicalPage: targetPage, LSN: rec.LSN, NumBlocks: 1}
+					EncodeBlockHeader(hdr, pageBuf)
+					slotted, wrapErr = WrapSlottedPage(pageBuf)
+					if wrapErr != nil {
+						return nil, fmt.Errorf("failed to wrap new page for redo: %w", wrapErr)
+					}
+					slotIdx, err = slotted.PutWithFlag(rec.Key, rec.Payload, rec.LSN, isPointer)
 					if err != nil {
-						return nil, fmt.Errorf("failed to build multi-block page for redo: %w", err)
-					}
-					for _, b := range mb.Blocks {
-						FinalizeBlockCRC(b)
-					}
-					redoMBPages[targetPage] = mb.Blocks
-					delete(redoPages, targetPage)
-					dirtyLogicalPages[targetPage] = true
-
-					keyIndex[rec.Key] = KeyIndexEntry{
-						LogicalPage: targetPage,
-						Slot:        0,
-						LSN:         rec.LSN,
-						NumBlocks:   len(mb.Blocks),
-					}
-					if desc, ok := pageDescs[targetPage]; ok {
-						desc.PageLSN.Store(rec.LSN)
-						desc.NumBlocks = len(mb.Blocks)
-					} else {
-						d := &PageDesc{
-							LogicalPage:       targetPage,
-							NumBlocks:         len(mb.Blocks),
-							PhysicalBlock:     NoBlock,
-							FlushedLoc:        NoBlock,
-							FlushedBeforeSync: NoBlock,
-							DurableLoc:        NoBlock,
-						}
-						d.PageLSN.Store(rec.LSN)
-						pageDescs[targetPage] = d
+						return nil, fmt.Errorf("failed to put record into new page during redo: %w", err)
 					}
 				}
-			}
+				slotted.Finalize()
 
-			// Apply Delete
-			if rec.Type == RecordTypeDelete {
-				existing, inIndex := keyIndex[rec.Key]
-				if inIndex {
+				redoPages[targetPage] = pageBuf
+				delete(redoMBPages, targetPage)
+				dirtyLogicalPages[targetPage] = true
+
+				if inIndex && (targetPage != existing.LogicalPage || existing.NumBlocks > 1) {
 					if err := cleanOldLocationForRedo(existing, rec.Key, rec.LSN); err != nil {
 						return nil, err
 					}
-					delete(keyIndex, rec.Key)
+				}
+
+				keyIndex[rec.Key] = KeyIndexEntry{
+					LogicalPage:      targetPage,
+					Slot:             slotIdx,
+					LSN:              rec.LSN,
+					NumBlocks:        1,
+					IsOversize:       isPointer,
+					OversizeFileName: oversizeFileName,
+				}
+				if desc, ok := pageDescs[targetPage]; ok {
+					desc.PageLSN.Store(rec.LSN)
+					desc.NumBlocks = 1
+				} else {
+					d := &PageDesc{
+						LogicalPage:       targetPage,
+						NumBlocks:         1,
+						PhysicalBlock:     NoBlock,
+						FlushedLoc:        NoBlock,
+						FlushedBeforeSync: NoBlock,
+						DurableLoc:        NoBlock,
+					}
+					d.PageLSN.Store(rec.LSN)
+					pageDescs[targetPage] = d
+				}
+			} else {
+				// Multi-block page
+				if inIndex && !existing.IsOversize {
+					if err := cleanOldLocationForRedo(existing, rec.Key, rec.LSN); err != nil {
+						return nil, err
+					}
+				}
+
+				var targetPage uint64
+				var ok bool
+				if targetPage, ok = emptyTracker.Pop(); !ok {
+					maxRecoveredLogicalPage++
+					targetPage = maxRecoveredLogicalPage
+				}
+
+				mb, err := NewMultiBlockPage(targetPage, rec.LSN, rec.Key, rec.Payload)
+				if err != nil {
+					return nil, fmt.Errorf("failed to build multi-block page for redo: %w", err)
+				}
+				for _, b := range mb.Blocks {
+					FinalizeBlockCRC(b)
+				}
+				redoMBPages[targetPage] = mb.Blocks
+				delete(redoPages, targetPage)
+				dirtyLogicalPages[targetPage] = true
+
+				keyIndex[rec.Key] = KeyIndexEntry{
+					LogicalPage: targetPage,
+					Slot:        0,
+					LSN:         rec.LSN,
+					NumBlocks:   len(mb.Blocks),
+				}
+				if desc, ok := pageDescs[targetPage]; ok {
+					desc.PageLSN.Store(rec.LSN)
+					desc.NumBlocks = len(mb.Blocks)
+				} else {
+					d := &PageDesc{
+						LogicalPage:       targetPage,
+						NumBlocks:         len(mb.Blocks),
+						PhysicalBlock:     NoBlock,
+						FlushedLoc:        NoBlock,
+						FlushedBeforeSync: NoBlock,
+						DurableLoc:        NoBlock,
+					}
+					d.PageLSN.Store(rec.LSN)
+					pageDescs[targetPage] = d
 				}
 			}
 		}
-		if closeErr := walRedoIt.Close(); closeErr != nil {
-			return nil, fmt.Errorf("failed to close WAL redo iterator: %w", closeErr)
+
+		// Apply Delete
+		if rec.Type == RecordTypeDelete {
+			existing, inIndex := keyIndex[rec.Key]
+			if inIndex {
+				if err := cleanOldLocationForRedo(existing, rec.Key, rec.LSN); err != nil {
+					return nil, err
+				}
+				delete(keyIndex, rec.Key)
+			}
 		}
+	}
+	if closeErr := walRedoIt.Close(); closeErr != nil {
+		return nil, fmt.Errorf("failed to close WAL redo iterator: %w", closeErr)
 	}
 
 	// Step 6: Flush any pages modified by redo replay to heapFile and fsync
