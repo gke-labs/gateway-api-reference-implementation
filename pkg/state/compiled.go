@@ -2751,7 +2751,15 @@ func bindUDPRouteParentRef(
 // ExtractCertificates extracts TLS certificates once per effective listener across all compiled gateways.
 func ExtractCertificates(gateways []*CompiledGateway) (map[string]*tls.Certificate, *tls.Certificate) {
 	certsMap := make(map[string]*tls.Certificate)
+	listenerHosts := make(map[string]*EffectiveListener)
 	var defaultCert *tls.Certificate
+
+	type listenerCert struct {
+		el           *EffectiveListener
+		listenerHost string
+		cert         *tls.Certificate
+	}
+	var validCerts []listenerCert
 
 	for _, cg := range gateways {
 		if cg == nil {
@@ -2768,13 +2776,17 @@ func ExtractCertificates(gateways []*CompiledGateway) (map[string]*tls.Certifica
 				continue
 			}
 
-			certs := el.ResolvedCertificates
+			var listenerHost string
+			if el.Hostname != nil && string(*el.Hostname) != "" {
+				listenerHost = strings.ToLower(string(*el.Hostname))
+			}
 
-			for _, cert := range certs {
+			for _, cert := range el.ResolvedCertificates {
 				if cert == nil || len(cert.Certificate) == 0 {
 					continue
 				}
-				certCopy := *cert
+				certCopy := new(tls.Certificate)
+				*certCopy = *cert
 				leaf := certCopy.Leaf
 				if leaf == nil {
 					var err error
@@ -2784,25 +2796,75 @@ func ExtractCertificates(gateways []*CompiledGateway) (map[string]*tls.Certifica
 					}
 					certCopy.Leaf = leaf
 				}
-				if leaf != nil {
-					if leaf.Subject.CommonName != "" {
-						certsMap[strings.ToLower(leaf.Subject.CommonName)] = &certCopy
-					}
-					for _, dnsName := range leaf.DNSNames {
-						certsMap[strings.ToLower(dnsName)] = &certCopy
-					}
+
+				if el.Owner.Kind == "Gateway" && (listenerHost == "" || defaultCert == nil) {
+					defaultCert = certCopy
 				}
-				if el.Hostname != nil && string(*el.Hostname) != "" {
-					certsMap[strings.ToLower(string(*el.Hostname))] = &certCopy
-				}
-				if el.Owner.Kind == "Gateway" && (el.Hostname == nil || string(*el.Hostname) == "" || defaultCert == nil) {
-					defaultCert = &certCopy
-				}
+
+				validCerts = append(validCerts, listenerCert{
+					el:           el,
+					listenerHost: listenerHost,
+					cert:         certCopy,
+				})
 			}
 		}
 	}
 
+	// Pass 1: key every listener by its own hostname.
+	for _, lc := range validCerts {
+		if lc.listenerHost == "" {
+			continue
+		}
+		if prevListener, exists := listenerHosts[lc.listenerHost]; exists {
+			if prevListener != lc.el {
+				klog.V(2).Infof("listener %s certificate for hostname %q would overwrite existing certificate from listener %s, skipping", lc.el.Name, lc.listenerHost, prevListener.Name)
+			}
+			continue
+		}
+		listenerHosts[lc.listenerHost] = lc.el
+		certsMap[lc.listenerHost] = lc.cert
+	}
+
+	// Pass 2: add SAN-derived keys only where no listener hostname already owns the name.
+	for _, lc := range validCerts {
+		leaf := lc.cert.Leaf
+		if leaf == nil {
+			continue
+		}
+		var sans []string
+		if leaf.Subject.CommonName != "" {
+			sans = append(sans, leaf.Subject.CommonName)
+		}
+		sans = append(sans, leaf.DNSNames...)
+		for _, san := range sans {
+			cleanSAN := strings.ToLower(san)
+			if !sanFallsWithinListener(cleanSAN, lc.listenerHost) {
+				continue
+			}
+			if _, exists := listenerHosts[cleanSAN]; exists {
+				continue
+			}
+			if _, exists := certsMap[cleanSAN]; exists {
+				continue
+			}
+			certsMap[cleanSAN] = lc.cert
+		}
+	}
+
 	return certsMap, defaultCert
+}
+
+func sanFallsWithinListener(san, listenerHost string) bool {
+	if listenerHost == "" || listenerHost == "*" {
+		return true
+	}
+	if san == listenerHost {
+		return true
+	}
+	if strings.HasPrefix(listenerHost, "*.") && MatchesWildcard(listenerHost, san) {
+		return true
+	}
+	return false
 }
 
 // BuildProxyConfig constructs the proxy listeners and routes from compiled gateways.
