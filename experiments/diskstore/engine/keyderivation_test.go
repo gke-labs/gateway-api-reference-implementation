@@ -18,15 +18,16 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 )
 
 func TestKeyDerivation_FixedVectors(t *testing.T) {
-	var masterKey [32]byte
-	for i := range masterKey {
-		masterKey[i] = byte(i + 1)
+	var callerKey [32]byte
+	for i := range callerKey {
+		callerKey[i] = byte(i + 1)
 	}
 	var dbID [16]byte
 	for i := range dbID {
@@ -41,35 +42,35 @@ func TestKeyDerivation_FixedVectors(t *testing.T) {
 		{
 			name: "HeapKey",
 			derive: func() ([]byte, error) {
-				return DeriveHeapKey(masterKey[:], dbID)
+				return deriveHeapKey(callerKey[:], dbID)
 			},
 			expected: "0aef6cfacd3b790ac61edeb8b1d67cc1cc170a1fcd589ece0b7570a2bb1462444a8f180f5e673d68dd6d45d72ff672988641e6ee94edf664dfc9bf8bcee2ca64",
 		},
 		{
 			name: "WALKey_0",
 			derive: func() ([]byte, error) {
-				return DeriveWALKey(masterKey[:], dbID, 0)
+				return deriveWALKey(callerKey[:], dbID, 0)
 			},
 			expected: "02125f34fff64846c913267fb85b6c4a3fd74ee3d07fccd73f1eaddd2c4bf84a7d8c721cd3eddf7d9fbe1d63082d39d4d25c91554d514447607aae594fa35d35",
 		},
 		{
 			name: "WALKey_100",
 			derive: func() ([]byte, error) {
-				return DeriveWALKey(masterKey[:], dbID, 100)
+				return deriveWALKey(callerKey[:], dbID, 100)
 			},
 			expected: "e7c914c6ea008d5c219a54c494ea233c595b33fbc7bf52b9672ad0579703fdbef30497d774ba51b6b9fa4c2c54fb042dae254c148686cd59e3eaa79c5b2bbe3f",
 		},
 		{
 			name: "OversizeKey",
 			derive: func() ([]byte, error) {
-				return DeriveOversizeKey(masterKey[:], dbID, "testfile.ovs")
+				return deriveOversizeKey(callerKey[:], dbID, "testfile.ovs")
 			},
 			expected: "088c0c701c1803ed1d8c45ee4ba6948e4fb5c9490cbbdc96f8e2c9d10ac6065bf28238eb38c4c40bfa32199ec69a254513d43f7f9451598162e46dce1c44f030",
 		},
 		{
 			name: "KeyCheckKey",
 			derive: func() ([]byte, error) {
-				return DeriveKeyCheckKey(masterKey[:], dbID)
+				return deriveKeyCheckKey(callerKey[:], dbID)
 			},
 			expected: "8de1e536b4679526a4ca0c382e532d3b35c744efe7bbb459952b413b44e647d5",
 		},
@@ -89,33 +90,33 @@ func TestKeyDerivation_FixedVectors(t *testing.T) {
 	}
 
 	t.Run("KeyCheckToken", func(t *testing.T) {
-		token, err := ComputeKeyCheckToken(masterKey[:], dbID)
+		token, err := computeKeyCheckToken(callerKey[:], dbID)
 		if err != nil {
-			t.Fatalf("ComputeKeyCheckToken failed: %v", err)
+			t.Fatalf("computeKeyCheckToken failed: %v", err)
 		}
 		expectedTokenHex := "c55d592dc1bace383e80f485969048fce91bd5f66117138402e8937bca489ac0"
 		if hex.EncodeToString(token[:]) != expectedTokenHex {
 			t.Errorf("token mismatch:\n got: %s\nwant: %s", hex.EncodeToString(token[:]), expectedTokenHex)
 		}
 
-		// VerifyKeyCheckToken with correct key
-		if err := VerifyKeyCheckToken(masterKey[:], dbID, token); err != nil {
-			t.Errorf("VerifyKeyCheckToken failed for valid key: %v", err)
+		// verifyKeyCheckToken with correct key
+		if err := verifyKeyCheckToken(callerKey[:], dbID, token); err != nil {
+			t.Errorf("verifyKeyCheckToken failed for valid key: %v", err)
 		}
 
-		// VerifyKeyCheckToken with wrong key
+		// verifyKeyCheckToken with wrong key
 		var wrongKey [32]byte
-		copy(wrongKey[:], masterKey[:])
+		copy(wrongKey[:], callerKey[:])
 		wrongKey[0] ^= 0x01
-		if err := VerifyKeyCheckToken(wrongKey[:], dbID, token); !errors.Is(err, ErrInvalidKey) {
+		if err := verifyKeyCheckToken(wrongKey[:], dbID, token); !errors.Is(err, ErrInvalidKey) {
 			t.Errorf("expected ErrInvalidKey for wrong key, got: %v", err)
 		}
 
-		// VerifyKeyCheckToken with wrong token
+		// verifyKeyCheckToken with wrong token
 		var wrongToken [32]byte
 		copy(wrongToken[:], token[:])
 		wrongToken[0] ^= 0x01
-		if err := VerifyKeyCheckToken(masterKey[:], dbID, wrongToken); !errors.Is(err, ErrInvalidKey) {
+		if err := verifyKeyCheckToken(callerKey[:], dbID, wrongToken); !errors.Is(err, ErrInvalidKey) {
 			t.Errorf("expected ErrInvalidKey for wrong token, got: %v", err)
 		}
 	})
@@ -133,44 +134,49 @@ func TestKeyDerivation_InvalidKeyLengths(t *testing.T) {
 	}
 
 	for _, k := range invalidKeys {
-		if _, err := DeriveHeapKey(k, dbID); !errors.Is(err, ErrInvalidKey) {
-			t.Errorf("DeriveHeapKey: expected ErrInvalidKey for len=%d, got %v", len(k), err)
+		expectedErr := fmt.Sprintf("encryption key must be %d bytes, got %d", MasterKeySize, len(k))
+		checkErr := func(name string, err error) {
+			if err == nil {
+				t.Errorf("%s: expected error for len=%d, got nil", name, len(k))
+			} else if errors.Is(err, ErrInvalidKey) {
+				t.Errorf("%s: error must not wrap ErrInvalidKey, got %v", name, err)
+			} else if !strings.Contains(err.Error(), expectedErr) {
+				t.Errorf("%s: expected error containing %q, got %v", name, expectedErr, err)
+			}
 		}
-		if _, err := DeriveWALKey(k, dbID, 1); !errors.Is(err, ErrInvalidKey) {
-			t.Errorf("DeriveWALKey: expected ErrInvalidKey for len=%d, got %v", len(k), err)
-		}
-		if _, err := DeriveOversizeKey(k, dbID, "file"); !errors.Is(err, ErrInvalidKey) {
-			t.Errorf("DeriveOversizeKey: expected ErrInvalidKey for len=%d, got %v", len(k), err)
-		}
-		if _, err := DeriveKeyCheckKey(k, dbID); !errors.Is(err, ErrInvalidKey) {
-			t.Errorf("DeriveKeyCheckKey: expected ErrInvalidKey for len=%d, got %v", len(k), err)
-		}
-		if _, err := ComputeKeyCheckToken(k, dbID); !errors.Is(err, ErrInvalidKey) {
-			t.Errorf("ComputeKeyCheckToken: expected ErrInvalidKey for len=%d, got %v", len(k), err)
-		}
-		var token [32]byte
-		if err := VerifyKeyCheckToken(k, dbID, token); !errors.Is(err, ErrInvalidKey) {
-			t.Errorf("VerifyKeyCheckToken: expected ErrInvalidKey for len=%d, got %v", len(k), err)
-		}
+
+		_, err := deriveHeapKey(k, dbID)
+		checkErr("deriveHeapKey", err)
+		_, err = deriveWALKey(k, dbID, 1)
+		checkErr("deriveWALKey", err)
+		_, err = deriveOversizeKey(k, dbID, "file")
+		checkErr("deriveOversizeKey", err)
+		_, err = deriveKeyCheckKey(k, dbID)
+		checkErr("deriveKeyCheckKey", err)
+		_, err = computeKeyCheckToken(k, dbID)
+		checkErr("computeKeyCheckToken", err)
+		var token [keyCheckTokenSize]byte
+		err = verifyKeyCheckToken(k, dbID, token)
+		checkErr("verifyKeyCheckToken", err)
 	}
 }
 
 func TestKeyDerivation_ContextUniqueness(t *testing.T) {
-	masterKey := make([]byte, 32)
-	for i := range masterKey {
-		masterKey[i] = byte(i + 42)
+	callerKey := make([]byte, 32)
+	for i := range callerKey {
+		callerKey[i] = byte(i + 42)
 	}
 	var dbID [16]byte
 	for i := range dbID {
 		dbID[i] = byte(i + 7)
 	}
 
-	heapKey, _ := DeriveHeapKey(masterKey, dbID)
-	walKey1, _ := DeriveWALKey(masterKey, dbID, 1)
-	walKey2, _ := DeriveWALKey(masterKey, dbID, 2)
-	ovsKey1, _ := DeriveOversizeKey(masterKey, dbID, "file1")
-	ovsKey2, _ := DeriveOversizeKey(masterKey, dbID, "file2")
-	checkKey, _ := DeriveKeyCheckKey(masterKey, dbID)
+	heapKey, _ := deriveHeapKey(callerKey, dbID)
+	walKey1, _ := deriveWALKey(callerKey, dbID, 1)
+	walKey2, _ := deriveWALKey(callerKey, dbID, 2)
+	ovsKey1, _ := deriveOversizeKey(callerKey, dbID, "file1")
+	ovsKey2, _ := deriveOversizeKey(callerKey, dbID, "file2")
+	checkKey, _ := deriveKeyCheckKey(callerKey, dbID)
 
 	keys := map[string][]byte{
 		"heap":     heapKey,
@@ -439,9 +445,96 @@ func TestEngine_BlockEncryption_OpenKeyVerification(t *testing.T) {
 		for _, badLen := range []int{16, 24, 31, 33, 64} {
 			badKey := make([]byte, badLen)
 			_, err := Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(badKey), WithCreate())
-			if !errors.Is(err, ErrInvalidKey) {
-				t.Fatalf("expected ErrInvalidKey for key length %d, got: %v", badLen, err)
+			if err == nil {
+				t.Fatalf("expected error for key length %d, got nil", badLen)
 			}
+			if errors.Is(err, ErrInvalidKey) {
+				t.Fatalf("error must not wrap ErrInvalidKey for key length %d, got: %v", badLen, err)
+			}
+			expectedMsg := fmt.Sprintf("encryption key must be %d bytes, got %d", MasterKeySize, badLen)
+			if !strings.Contains(err.Error(), expectedMsg) {
+				t.Fatalf("expected error %q, got: %v", expectedMsg, err)
+			}
+		}
+	})
+
+	t.Run("Interaction_StoreWithKey_OpenedWithCipherOnly", func(t *testing.T) {
+		memFS := NewMemFS()
+		dir := "test_key_store_cipher_open"
+
+		store, err := Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(validKey[:]), WithCreate())
+		if err != nil {
+			t.Fatalf("Open with key failed: %v", err)
+		}
+		if err := store.Put("Table", "k", []byte("v")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		cipher, err := NewEphemeralAESGCMCipher()
+		if err != nil {
+			t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
+		}
+
+		// Reopen with only WithCipher: must return an error stating encryption key option is required,
+		// and NOT say "cipher option required".
+		_, err = Open(WithFS(memFS), WithDir(dir), WithCipher(cipher))
+		if err == nil {
+			t.Fatalf("expected Open with only cipher to fail on key-encrypted store")
+		}
+		expectedErr := "store is encrypted with a key: encryption key option required"
+		if !strings.Contains(err.Error(), expectedErr) {
+			t.Fatalf("expected error containing %q, got: %v", expectedErr, err)
+		}
+		if strings.Contains(err.Error(), "cipher option required") {
+			t.Fatalf("error should not mention 'cipher option required', got: %v", err)
+		}
+	})
+
+	t.Run("Interaction_StoreWithCipher_OpenedWithKey", func(t *testing.T) {
+		memFS := NewMemFS()
+		dir := "test_cipher_store_key_open"
+
+		cipher, err := NewEphemeralAESGCMCipher()
+		if err != nil {
+			t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
+		}
+
+		store, err := Open(WithFS(memFS), WithDir(dir), WithCipher(cipher), WithCreate())
+		if err != nil {
+			t.Fatalf("Open with cipher failed: %v", err)
+		}
+		if err := store.Put("Table", "k", []byte("v")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		// Reopen with WithEncryptionKey without WithEraseOnError: must fail with ErrInvalidKey
+		_, err = Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(validKey[:]))
+		if err == nil {
+			t.Fatalf("expected Open with key to fail on cipher-only store")
+		}
+		if !errors.Is(err, ErrInvalidKey) {
+			t.Fatalf("expected ErrInvalidKey, got: %v", err)
+		}
+
+		// Reopen with WithEncryptionKey and WithEraseOnError: must erase and recreate store
+		store2, err := Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(validKey[:]), WithEraseOnError())
+		if err != nil {
+			t.Fatalf("Open with key and WithEraseOnError failed: %v", err)
+		}
+		defer store2.Close()
+
+		if !store2.Wiped() {
+			t.Fatalf("expected store to be wiped when opening cipher-only store with key and WithEraseOnError")
+		}
+		_, exists, err := store2.Get("Table", "k")
+		if err != nil || exists {
+			t.Fatalf("expected key to be wiped, exists=%v, err=%v", exists, err)
 		}
 	})
 }

@@ -153,16 +153,26 @@ func WithCipher(cipher Cipher) Option {
 	}
 }
 
-// WithEncryptionKey sets the 32-byte master key for block-level encryption.
+// WithEncryptionKey sets the 32-byte caller's key for block-level encryption.
+//
+// At this stage of block-level encryption, this option only records the key-check
+// token in meta.db and verifies the key at Open. The engine does not yet encrypt
+// heap blocks, WAL blocks, or oversize files; values remain in plaintext on disk
+// even though meta.db records the store as encrypted.
+//
+// Interaction with WithCipher:
+// During the transition before the per-value cipher is removed:
+//   - A store created with WithEncryptionKey records a non-zero key-check token.
+//     Opening such a store with only WithCipher returns an error stating that the
+//     store is encrypted with a key and requires the encryption key option.
+//   - A store created with only WithCipher records an empty (zero) key-check token.
+//     Opening such a store with WithEncryptionKey fails key verification and
+//     returns ErrInvalidKey, which will cause WithEraseOnError to erase and
+//     recreate the store.
 func WithEncryptionKey(key []byte) Option {
 	return func(o *Options) {
 		o.EncryptionKey = key
 	}
-}
-
-// WithKey is an alias for WithEncryptionKey.
-func WithKey(key []byte) Option {
-	return WithEncryptionKey(key)
 }
 
 // WithNumPoolBlocks sets the block pool block count.
@@ -411,15 +421,23 @@ const (
 //   - Bytes 4..8:     StoreFormatVersion (uint32)
 //   - Bytes 8..24:    Database ID (16 bytes)
 //   - Bytes 24..32:   Flags (uint64, bit 0: encrypted flag)
-//   - Bytes 32..64:   KeyCheckToken (32 bytes HMAC-SHA256 of dbID)
+//   - Bytes 32..64:   KeyCheckToken (32 bytes HMAC-SHA256 of dbID; all zeroes in an unencrypted store)
 //   - Bytes 64..4092: Reserved bytes (must be zero under current StoreFormatVersion)
 //   - Bytes 4092..4096: CRC32C (uint32 over full 4096-byte block with CRC field zeroed)
 //
 // New fields take reserved bytes and bump StoreFormatVersion.
 type metaRecord struct {
-	dbID          [16]byte
-	version       uint32
-	encrypted     bool
+	// dbID is the 16-byte unique identifier of the database.
+	dbID [16]byte
+
+	// version is the StoreFormatVersion recorded at store creation.
+	version uint32
+
+	// encrypted indicates whether the store was created with encryption enabled.
+	encrypted bool
+
+	// keyCheckToken is the 32-byte HMAC-SHA256 token of dbID under the caller's key,
+	// or all zeroes in an unencrypted store.
 	keyCheckToken [32]byte
 }
 
@@ -529,7 +547,7 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 
 	if len(options.EncryptionKey) > 0 && len(options.EncryptionKey) != MasterKeySize {
-		return nil, ErrInvalidKey
+		return nil, fmt.Errorf("encryption key must be %d bytes, got %d", MasterKeySize, len(options.EncryptionKey))
 	}
 
 	dir := options.Dir
@@ -658,7 +676,7 @@ func Open(opts ...Option) (*Engine, error) {
 
 					if storeEncrypted {
 						if len(options.EncryptionKey) > 0 {
-							if err := VerifyKeyCheckToken(options.EncryptionKey, record.dbID, record.keyCheckToken); err != nil {
+							if err := verifyKeyCheckToken(options.EncryptionKey, record.dbID, record.keyCheckToken); err != nil {
 								if !options.EraseOnError {
 									return nil, err
 								}
@@ -667,7 +685,7 @@ func Open(opts ...Option) (*Engine, error) {
 								isNewStore = true
 							}
 						} else if record.keyCheckToken != [32]byte{} {
-							return nil, ErrStoreEncrypted
+							return nil, errors.New("store is encrypted with a key: encryption key option required")
 						}
 					}
 				}
@@ -714,7 +732,7 @@ func Open(opts ...Option) (*Engine, error) {
 		var keyCheckToken [32]byte
 		if len(options.EncryptionKey) > 0 {
 			var tokenErr error
-			keyCheckToken, tokenErr = ComputeKeyCheckToken(options.EncryptionKey, dbID)
+			keyCheckToken, tokenErr = computeKeyCheckToken(options.EncryptionKey, dbID)
 			if tokenErr != nil {
 				closeErr := metaFile.Close()
 				return nil, errors.Join(tokenErr, closeErr)
@@ -1040,11 +1058,6 @@ func (s *Engine) DBID() [16]byte {
 // Cipher returns the configured cipher.
 func (s *Engine) Cipher() Cipher {
 	return s.cipher
-}
-
-// EncryptionKey returns the configured master encryption key, or nil if unencrypted.
-func (s *Engine) EncryptionKey() []byte {
-	return bytes.Clone(s.encryptionKey)
 }
 
 // Path returns the store directory.
