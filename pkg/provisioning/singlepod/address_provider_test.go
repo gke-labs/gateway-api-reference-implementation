@@ -196,7 +196,19 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 		},
 	}
 
-	p := NewAddressProvider(client, WithEnableH2C(true))
+	gw.Spec.GatewayClassName = "my-class"
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	p := NewAddressProvider(client, WithEnableH2C(true), WithState(st))
 
 	// 1. Initial reconcile creates SA, adds to CRB, creates Deployment and Service in my-ns, but no Ingress and replicas not ready yet
 	addrs, ready, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
@@ -277,9 +289,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	}
 
 	// Publish DataplaneConfig -> Secret is created
-	dpCfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: "my-ns", Name: "my-gw"},
-	}
+	dpCfg := st.GetDataplaneConfig(types.NamespacedName{Namespace: "my-ns", Name: "my-gw"})
 	if err := p.PublishDataplaneConfig(ctx, gw, dpCfg); err != nil {
 		t.Fatalf("failed to publish config: %v", err)
 	}
@@ -315,7 +325,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 		t.Fatalf("failed to update deploy status: %v", err)
 	}
 
-	mockReadyEndpoints(t, client, p, gw, "rev-1")
+	mockReadyEndpoints(t, client, p, gw, dpCfg.Revision)
 
 	// Reconcile again -> should return the assigned LB address and ready=true
 	addrs, ready, err = p.GatewayAddresses(ctx, gw, effectiveListeners)
@@ -1709,7 +1719,6 @@ func TestSinglePodAddressProvider_NoChangesIssuesNoWrite(t *testing.T) {
 func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1718,6 +1727,7 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 			UID:       types.UID("gw-uid-1"),
 		},
 		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
 			Addresses: []gatewayv1.GatewaySpecAddress{
 				{
 					Type:  state.Ptr(gatewayv1.IPAddressType),
@@ -1729,6 +1739,17 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 			},
 		},
 	}
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.Recompute()
+	p := NewAddressProvider(c, WithState(st))
 
 	// 1. Initial reconcile with requested IP: Service pins loadBalancerIP, readiness is AddressNotUsable
 	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
@@ -1809,7 +1830,6 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
 
 	gw1 := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1818,6 +1838,7 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 			UID:       types.UID("gw-1-uid"),
 		},
 		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
 			Addresses: []gatewayv1.GatewaySpecAddress{
 				{Value: "192.0.2.50"},
 			},
@@ -1833,6 +1854,7 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 			UID:       types.UID("gw-2-uid"),
 		},
 		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
 			Addresses: []gatewayv1.GatewaySpecAddress{
 				{Value: "192.0.2.50"},
 			},
@@ -1841,6 +1863,18 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 			},
 		},
 	}
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw1)
+	st.UpsertGateway(gw2)
+	st.Recompute()
+	p := NewAddressProvider(c, WithState(st))
 
 	// Reconcile gw1 and mark bound
 	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw1, nil)
@@ -2362,7 +2396,7 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 		Build()
 
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, WithState(st))
 	st.SetSupportedAddressTypes(p.SupportedAddressTypes())
 
 	r := &controller.GatewayReconciler{
@@ -4281,7 +4315,17 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 		WithObjects(gw).
 		Build()
 
-	p := NewAddressProvider(c)
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	p := NewAddressProvider(c, WithState(st))
 
 	effectiveListeners := []*state.EffectiveListener{
 		{
@@ -4362,9 +4406,7 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 	}
 
 	// 6. Test PublishDataplaneConfig with max-length Gateway
-	dpCfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: gwNamespace, Name: gwName},
-	}
+	dpCfg := st.GetDataplaneConfig(types.NamespacedName{Namespace: gwNamespace, Name: gwName})
 	if err := p.PublishDataplaneConfig(t.Context(), gw, dpCfg); err != nil {
 		t.Fatalf("PublishDataplaneConfig failed for max length gateway: %v", err)
 	}
@@ -4387,7 +4429,7 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 		t.Fatalf("failed to update Deployment status: %v", err)
 	}
 
-	mockReadyEndpoints(t, c, p, gw, "rev-1")
+	mockReadyEndpoints(t, c, p, gw, dpCfg.Revision)
 
 	finalAddrs, readiness, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
 	if err != nil {
@@ -4662,6 +4704,8 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 		},
 	}
 
+	gw.Spec.GatewayClassName = "ref-class"
+
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(gw, slice).
@@ -4669,7 +4713,17 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
 
-	p := NewAddressProvider(cl)
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	p := NewAddressProvider(cl, WithState(st))
 	p.pollInterval = 20 * time.Millisecond
 	p.httpClient = &http.Client{
 		Transport: &http.Transport{
@@ -4697,13 +4751,13 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 	}
 
 	// Publish DataplaneConfig with current revision
-	dpCfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: "default", Name: "test-gw"},
-		Revision:    "current-rev",
-	}
+	dpCfg := st.GetDataplaneConfig(types.NamespacedName{Namespace: "default", Name: "test-gw"})
 	if err := p.PublishDataplaneConfig(ctx, gw, dpCfg); err != nil {
 		t.Fatalf("PublishDataplaneConfig failed: %v", err)
 	}
+
+	r1Current := []string{dpCfg.Revision}
+	rev1.Store(&r1Current)
 
 	// Simulate Service receiving LB IP and Deployment having 2 available replicas
 	var svc corev1.Service
@@ -4764,7 +4818,7 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 
 	// 3. Once both replicas report current revision, prober enqueues Gateway and it becomes ready without spec change
 	failServer2.Store(false)
-	r2Updated := []string{"current-rev"}
+	r2Updated := []string{dpCfg.Revision}
 	rev2.Store(&r2Updated)
 	p.probeEndpoints(ctx)
 
@@ -4794,11 +4848,20 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 	}
 
 	// 4. A stuck replica that never applies a new revision makes the Gateway not-ready:
-	// Publish a new revision that no replica applies.
-	stuckCfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: "default", Name: "test-gw"},
-		Revision:    "stuck-rev",
+	// Adding an HTTPRoute changes the Gateway's configuration revision.
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "new-route"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{Name: "test-gw"},
+				},
+			},
+		},
 	}
+	st.UpsertHTTPRoute(route)
+	st.Recompute()
+	stuckCfg := st.GetDataplaneConfig(types.NamespacedName{Namespace: "default", Name: "test-gw"})
 	if err := p.PublishDataplaneConfig(ctx, gw, stuckCfg); err != nil {
 		t.Fatalf("PublishDataplaneConfig failed: %v", err)
 	}
@@ -4835,8 +4898,8 @@ func TestSinglePodAddressProvider_AppliedRevisionConvergence(t *testing.T) {
 	}
 
 	// 5. If a replica restarts with an old config after having converged, prober enqueues Gateway and it stops being ready
-	r1Stuck := []string{"stuck-rev"}
-	r2Stuck := []string{"stuck-rev"}
+	r1Stuck := []string{stuckCfg.Revision}
+	r2Stuck := []string{stuckCfg.Revision}
 	rev1.Store(&r1Stuck)
 	rev2.Store(&r2Stuck)
 	p.probeEndpoints(ctx)
@@ -4976,13 +5039,27 @@ func TestSinglePodAddressProvider_PublishFailureRetryReadiness(t *testing.T) {
 	st.SetDataplanePublisher(p)
 	st.SetSupportedAddressTypes(p.SupportedAddressTypes())
 
-	var currentApplied atomic.Pointer[[]string]
-	initialRevs := []string{"initial-unrelated-rev"}
-	currentApplied.Store(&initialRevs)
+	ctx := t.Context()
 
+	// Start the state so background publish workqueue runs.
+	go func() {
+		_ = st.Start(ctx)
+	}()
+
+	// Fake data-plane endpoint reports the revision found in the published Secret, read through fake client.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(currentApplied.Load())
+		var sec corev1.Secret
+		var reported []string
+		if err := cl.Get(r.Context(), types.NamespacedName{Namespace: "default", Name: resName}, &sec); err == nil {
+			if data, ok := sec.Data[DataplaneSecretDataKey]; ok && len(data) > 0 {
+				var cfg state.DataplaneConfig
+				if err := json.Unmarshal(data, &cfg); err == nil && cfg.Revision != "" {
+					reported = []string{cfg.Revision}
+				}
+			}
+		}
+		_ = json.NewEncoder(w).Encode(reported)
 	}))
 	t.Cleanup(server.Close)
 
@@ -4994,7 +5071,6 @@ func TestSinglePodAddressProvider_PublishFailureRetryReadiness(t *testing.T) {
 		},
 	}
 
-	ctx := t.Context()
 	listeners := []*state.EffectiveListener{
 		{Port: 80, Protocol: gatewayv1.HTTPProtocolType},
 	}
@@ -5026,7 +5102,9 @@ func TestSinglePodAddressProvider_PublishFailureRetryReadiness(t *testing.T) {
 	}
 
 	// 2. Publish failure during config update leaves the Gateway Pending:
-	// Adding an HTTPRoute changes the Gateway's configuration revision.
+	// Set failSecretApply before adding route so PublishDataplaneConfig fails.
+	failSecretApply.Store(true)
+
 	route := &gatewayv1.HTTPRoute{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-route"},
 		Spec: gatewayv1.HTTPRouteSpec{
@@ -5039,9 +5117,18 @@ func TestSinglePodAddressProvider_PublishFailureRetryReadiness(t *testing.T) {
 	}
 	st.UpsertHTTPRoute(route)
 
-	// Set failSecretApply so PublishDataplaneConfig returns an error during Recompute.
-	failSecretApply.Store(true)
-	st.Recompute()
+	// Wait for state to compute the new config revision
+	var newRev string
+	for range 50 {
+		if cfg := st.GetDataplaneConfig(types.NamespacedName{Namespace: "default", Name: "test-gw"}); cfg != nil && cfg.Revision != "" {
+			newRev = cfg.Revision
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if newRev == "" {
+		t.Fatal("timed out waiting for state to compute dataplane config for route")
+	}
 
 	p.probeEndpoints(ctx)
 	_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, listeners)
@@ -5055,39 +5142,22 @@ func TestSinglePodAddressProvider_PublishFailureRetryReadiness(t *testing.T) {
 		t.Fatalf("expected reason Pending, got %s", readiness.Reason)
 	}
 
-	// 3. Retry succeeds: publish retry succeeds and Gateway becomes ready once replica applies config.
+	// 3. Clear failure: make no other change, and assert that the Gateway becomes ready through the state's retry.
 	failSecretApply.Store(false)
-	st.Recompute()
 
-	dpCfg := st.GetDataplaneConfig(types.NamespacedName{Namespace: "default", Name: "test-gw"})
-	if dpCfg == nil || dpCfg.Revision == "" {
-		t.Fatalf("expected non-empty revision from state")
-	}
-
-	// Replica applies the new config revision from the published Secret
-	newRevs := []string{dpCfg.Revision}
-	currentApplied.Store(&newRevs)
-
-	p.probeEndpoints(ctx)
-
-	// Verify prober enqueued Gateway on convergence
-	select {
-	case evt := <-p.eventCh:
-		if evt.Object.GetName() != "test-gw" {
-			t.Fatalf("unexpected event object: %+v", evt.Object)
+	// Wait for retry to publish the Secret and for prober to detect convergence.
+	pollDeadline := time.Now().Add(5 * time.Second)
+	isReady := false
+	for time.Now().Before(pollDeadline) {
+		p.probeEndpoints(ctx)
+		_, r, _ := p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+		if r.Ready && r.Reason == string(gatewayv1.GatewayReasonProgrammed) {
+			isReady = true
+			break
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for prober to enqueue Gateway after retry convergence")
+		time.Sleep(20 * time.Millisecond)
 	}
-
-	_, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, listeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !readiness.Ready {
-		t.Fatalf("expected readiness.Ready=true after publish retry succeeded and replica converged: reason=%s message=%s", readiness.Reason, readiness.Message)
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Fatalf("expected reason Programmed, got %s", readiness.Reason)
+	if !isReady {
+		t.Fatalf("expected Gateway to become ready through state's retry")
 	}
 }

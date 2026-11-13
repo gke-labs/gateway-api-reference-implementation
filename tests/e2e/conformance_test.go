@@ -48,7 +48,6 @@ func TestConformance(t *testing.T) {
 
 	h := NewHarness(t, clusterName)
 	h.Setup()
-	h.SetupDiagnosticsCleanup()
 
 	crdVersion, isPreviousMinor, err := resolveConformanceCRDs(os.Getenv("CONFORMANCE_CRDS"))
 	if err != nil {
@@ -132,12 +131,8 @@ func TestConformance(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 
-	testFilter := os.Getenv("CONFORMANCE_TEST_FILTER")
 	var selectedTests []suite.ConformanceTest
 	for _, tc := range tests.ConformanceTests {
-		if testFilter != "" && tc.ShortName != testFilter {
-			continue
-		}
 		if _, skip := skippedTests[tc.ShortName]; skip {
 			continue
 		}

@@ -30,14 +30,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 )
 
 type Harness struct {
@@ -436,74 +433,9 @@ func (h *Harness) DeployController() {
 
 	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/controller.yaml"))
 	h.RunCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
-	h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--dataplane-image","gari-controller:e2e","--enable-h2c","-v=2"]}]}}}}`)
+	h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--dataplane-image","gari-controller:e2e","--enable-h2c"]}]}}}}`)
 	h.RunCmd("kubectl", "rollout", "restart", "deployment/gari-controller", "--namespace=default")
 	h.RunCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
-}
-
-// DumpDiagnostics dumps controller logs (at V(2)) and each data-plane pod's /_gari/applied.
-func (h *Harness) DumpDiagnostics() {
-	h.T.Log("=== DUMPING CONTROLLER LOGS (V(2)) ===")
-	logs, err := h.RunCommand("kubectl", "logs", "deployment/gari-controller", "--namespace=default", "--tail=2000")
-	if err != nil {
-		h.T.Logf("Failed to get controller logs: %v", err)
-	} else if logs != "" {
-		h.T.Logf("Controller logs:\n%s", logs)
-	}
-
-	h.T.Log("=== DUMPING DATA-PLANE PODS /_gari/applied ===")
-	podsOut, err := h.RunCommand("kubectl", "get", "pods", "-A", "-l", "gateway.networking.k8s.io/gateway-name", "-o", "jsonpath={range .items[*]}{.metadata.namespace}{\" \"}{.metadata.name}{\" \"}{.status.podIP}{\"\\n\"}{end}")
-	if err != nil {
-		h.T.Logf("Failed to list data-plane pods: %v", err)
-		return
-	}
-
-	for _, line := range strings.Split(strings.TrimSpace(podsOut), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-		ns, podName, podIP := fields[0], fields[1], fields[2]
-		diagPodName := fmt.Sprintf("diag-check-%s", podName)
-		h.DeletePod(diagPodName)
-		h.KubectlApplyContent(h.ClientManifestWithArgs(diagPodName, fmt.Sprintf("http://%s:%d/_gari/applied", podIP, singlepod.DataPlaneHealthProbePort)))
-		h.WaitForPodSuccess(diagPodName, 30*time.Second)
-		appliedLogs := h.GetPodLogs(diagPodName)
-		h.T.Logf("Pod %s/%s (%s) /_gari/applied: %s", ns, podName, podIP, appliedLogs)
-		h.DeletePod(diagPodName)
-	}
-}
-
-// SetupDiagnosticsCleanup sets up failure cleanup and a pre-timeout timer to dump diagnostics.
-// If the test has a deadline, a timer fires ~1 minute before the test binary's timeout panic,
-// ensuring controller logs and pod applied revisions are captured before the test terminates.
-func (h *Harness) SetupDiagnosticsCleanup() {
-	var dumpOnce sync.Once
-	runDump := func() {
-		dumpOnce.Do(func() {
-			h.DumpDiagnostics()
-		})
-	}
-
-	h.T.Cleanup(func() {
-		if h.T.Failed() {
-			runDump()
-		}
-	})
-
-	if deadline, ok := h.T.Deadline(); ok {
-		timeRemaining := time.Until(deadline)
-		fireIn := timeRemaining - 1*time.Minute
-		if fireIn > 0 {
-			timer := time.AfterFunc(fireIn, func() {
-				h.T.Log("=== PRE-TIMEOUT DIAGNOSTIC DUMP (firing ~1m before test deadline) ===")
-				runDump()
-			})
-			h.T.Cleanup(func() {
-				timer.Stop()
-			})
-		}
-	}
 }
 
 func (h *Harness) BackendManifest() string {
