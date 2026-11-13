@@ -1196,6 +1196,127 @@ func (s *Engine) putRecordIntoSlottedPageLocked(qKey string, payload []byte, lsn
 	return targetPage, slotIdx, nil
 }
 
+// applyPutLocked applies a put mutation to the heap pages and the key index.
+//
+// Caller requirements:
+//   - Must hold s.writerMu.
+//   - qKey must be a qualified table/key string.
+//   - payload contains the stored bytes (plain/compressed/encrypted payload, or an encoded oversize pointer).
+//   - lsn is the WAL log sequence number assigned to this record.
+//   - isOversize indicates whether payload represents an oversize pointer.
+//
+// Guarantees:
+//   - applyPutLocked writes the record to a slotted page or multi-block page sequence.
+//   - It clears the record's old location (slotted slot or multi-block page) if replacing an existing record.
+//   - It stores the new location in the key index under keyMu, along with its LSN and metadata.
+//   - It adjusts GlobalMetrics.OversizeObjectsCount if the oversize status changed.
+//   - The function doesn't append to the WAL.
+//   - It doesn't create, read or delete oversize value files.
+func (s *Engine) applyPutLocked(qKey string, payload []byte, lsn uint64, isOversize bool) error {
+	s.keyMu.RLock()
+	existing, inIndex := s.keyIndex[qKey]
+	s.keyMu.RUnlock()
+
+	var fileName string
+	if isOversize {
+		var decodeErr error
+		_, _, fileName, decodeErr = DecodeOversizePointer(payload)
+		if decodeErr != nil {
+			return fmt.Errorf("%w: failed to decode oversize pointer: %v", ErrCorruptStore, decodeErr)
+		}
+	}
+
+	if isOversize || CanFitInSlottedPage(len(qKey), len(payload)) {
+		targetPage, slotIdx, putErr := s.putRecordIntoSlottedPageLocked(qKey, payload, lsn, existing, inIndex, isOversize)
+		if putErr != nil {
+			return putErr
+		}
+
+		s.keyMu.Lock()
+		wasOversize := inIndex && existing.IsOversize
+		s.keyIndex[qKey] = KeyIndexEntry{
+			LogicalPage:      targetPage,
+			Slot:             slotIdx,
+			LSN:              lsn,
+			NumBlocks:        1,
+			IsOversize:       isOversize,
+			OversizeFileName: fileName,
+		}
+		if isOversize {
+			if !wasOversize {
+				GlobalMetrics.OversizeObjectsCount.Add(1)
+			}
+		} else {
+			if wasOversize {
+				GlobalMetrics.OversizeObjectsCount.Add(-1)
+			}
+		}
+		s.keyMu.Unlock()
+		return nil
+	}
+
+	// Multi-block page
+	numBlocks, err := CalculateMultiBlockCount(len(qKey), len(payload))
+	if err != nil {
+		return err
+	}
+
+	// If replacing an existing slotted or multi-block record, clean up old location (Item 15)
+	if inIndex {
+		if existing.NumBlocks == 1 {
+			if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
+				return err
+			}
+		} else if existing.NumBlocks > 1 {
+			if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
+				return err
+			}
+		}
+	}
+
+	var targetPage uint64
+	if p, ok := s.emptyPages.Pop(); ok {
+		targetPage = p
+	} else {
+		targetPage = s.nextLogicalPage
+		s.nextLogicalPage++
+	}
+
+	mbPage, err := NewMultiBlockPage(targetPage, lsn, qKey, payload)
+	if err != nil {
+		return err
+	}
+
+	handle, err := s.bp.AllocateNewPage(targetPage, numBlocks, lsn)
+	if err != nil {
+		return err
+	}
+
+	handle.Desc.Mu.Lock()
+	for i, b := range mbPage.Blocks {
+		FinalizeBlockCRC(b)
+		copy(handle.Block(i), b)
+	}
+	handle.Desc.Mu.Unlock()
+	s.bp.MarkDirty(targetPage, lsn)
+	handle.Unpin()
+
+	s.keyMu.Lock()
+	wasOversize := inIndex && existing.IsOversize
+	s.keyIndex[qKey] = KeyIndexEntry{
+		LogicalPage: targetPage,
+		Slot:        0,
+		LSN:         lsn,
+		NumBlocks:   numBlocks,
+	}
+	if wasOversize {
+		GlobalMetrics.OversizeObjectsCount.Add(-1)
+	}
+	s.keyMu.Unlock()
+
+	return nil
+}
+
 // Put writes an object to the engine, encrypting if a cipher is configured.
 func (s *Engine) Put(tableName, key string, payload []byte) error {
 	if s.isFailed() {
@@ -1228,8 +1349,13 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		toStore = encrypted
 	}
 
+	var rec Record
+	var oldOversizeFile string
+	var isOversize bool
+
 	// Handle oversize object: records exceeding 512-block multi-block capacity persist to disk under oversize directory
 	if !fitsInMultiBlockPage(len(qKey), len(toStore)) {
+		isOversize = true
 		fileName := OversizeFileName(qKey, toStore)
 		checksum := OversizeHash(qKey, toStore)
 
@@ -1268,169 +1394,51 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 			defer s.unregisterInFlight(fileName)
 		}
 
-		var oldOversizeFile string
 		if inIndex && existing.IsOversize && existing.OversizeFileName != fileName {
 			oldOversizeFile = existing.OversizeFileName
 		}
 
 		ptrPayload := EncodeOversizePointer(uint64(len(toStore)), checksum, fileName)
-		rec := Record{
+		rec = Record{
 			Type:    RecordTypePutPointer,
 			Key:     qKey,
 			Payload: ptrPayload,
 		}
-		lsn, err := s.wal.AppendRecord(&rec)
-		if err != nil {
-			s.setFailed(err)
+	} else {
+		s.writerMu.Lock()
+		defer s.writerMu.Unlock()
+
+		if s.isFailed() {
 			return s.failErr()
 		}
 
-		targetPage, slotIdx, putErr := s.putRecordIntoSlottedPageLocked(qKey, ptrPayload, lsn, existing, inIndex, true)
-		if putErr != nil {
-			s.setFailed(putErr)
-			return s.failErr()
+		s.keyMu.RLock()
+		existing, inIndex := s.keyIndex[qKey]
+		s.keyMu.RUnlock()
+
+		if inIndex && existing.IsOversize {
+			oldOversizeFile = existing.OversizeFileName
 		}
 
-		s.keyMu.Lock()
-		wasOversize := inIndex && existing.IsOversize
-		s.keyIndex[qKey] = KeyIndexEntry{
-			LogicalPage:      targetPage,
-			Slot:             slotIdx,
-			LSN:              lsn,
-			NumBlocks:        1,
-			IsOversize:       true,
-			OversizeFileName: fileName,
+		rec = Record{
+			Type:    RecordTypePut,
+			Key:     qKey,
+			Payload: toStore,
 		}
-		if !wasOversize {
-			GlobalMetrics.OversizeObjectsCount.Add(1)
-		}
-		s.keyMu.Unlock()
-
-		// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
-		if oldOversizeFile != "" && !s.isInFlight(oldOversizeFile) {
-			if err := s.wal.SyncThrough(lsn); err != nil {
-				s.setFailed(err)
-				return s.failErr()
-			}
-			if err := s.removeOversizeFileByName(oldOversizeFile); err != nil {
-				s.setFailed(err)
-				return s.failErr()
-			}
-		}
-
-		return nil
 	}
 
-	s.writerMu.Lock()
-	defer s.writerMu.Unlock()
-
-	if s.isFailed() {
-		return s.failErr()
-	}
-
-	s.keyMu.RLock()
-	existing, inIndex := s.keyIndex[qKey]
-	s.keyMu.RUnlock()
-
-	var oldOversizeFile string
-	if inIndex && existing.IsOversize {
-		oldOversizeFile = existing.OversizeFileName
-	}
-
-	// Append record to WAL, assigning LSN under WAL lock
-	rec := Record{
-		Type:    RecordTypePut,
-		Key:     qKey,
-		Payload: toStore,
-	}
 	lsn, err := s.wal.AppendRecord(&rec)
 	if err != nil {
 		s.setFailed(err)
 		return s.failErr()
 	}
 
-	// Transition from oversize to standard page
-	if oldOversizeFile != "" {
-		s.keyMu.Lock()
-		GlobalMetrics.OversizeObjectsCount.Add(-1)
-		s.keyMu.Unlock()
-	}
-
-	// Check if this object fits in a 1-block slotted page
-	if CanFitInSlottedPage(len(qKey), len(toStore)) {
-		targetPage, slotIdx, putErr := s.putRecordIntoSlottedPageLocked(qKey, toStore, lsn, existing, inIndex, false)
-		if putErr != nil {
-			s.setFailed(putErr)
-			return s.failErr()
-		}
-
-		s.keyMu.Lock()
-		s.keyIndex[qKey] = KeyIndexEntry{
-			LogicalPage: targetPage,
-			Slot:        slotIdx,
-			LSN:         lsn,
-			NumBlocks:   1,
-		}
-		s.keyMu.Unlock()
-	} else {
-		// Multi-block page
-		numBlocks, err := CalculateMultiBlockCount(len(qKey), len(toStore))
-		if err != nil {
+	if err := s.applyPutLocked(qKey, rec.Payload, lsn, isOversize); err != nil {
+		if errors.Is(err, ErrObjectOversize) {
 			return err
 		}
-
-		// If replacing an existing slotted or multi-block record, clean up old location (Item 15)
-		if inIndex {
-			if existing.NumBlocks == 1 {
-				if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
-					s.setFailed(err)
-					return s.failErr()
-				}
-			} else if existing.NumBlocks > 1 {
-				if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
-					s.setFailed(err)
-					return s.failErr()
-				}
-			}
-		}
-
-		var targetPage uint64
-		if p, ok := s.emptyPages.Pop(); ok {
-			targetPage = p
-		} else {
-			targetPage = s.nextLogicalPage
-			s.nextLogicalPage++
-		}
-
-		mbPage, err := NewMultiBlockPage(targetPage, lsn, qKey, toStore)
-		if err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
-
-		handle, err := s.bp.AllocateNewPage(targetPage, numBlocks, lsn)
-		if err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
-
-		handle.Desc.Mu.Lock()
-		for i, b := range mbPage.Blocks {
-			FinalizeBlockCRC(b)
-			copy(handle.Block(i), b)
-		}
-		handle.Desc.Mu.Unlock()
-		s.bp.MarkDirty(targetPage, lsn)
-		handle.Unpin()
-
-		s.keyMu.Lock()
-		s.keyIndex[qKey] = KeyIndexEntry{
-			LogicalPage: targetPage,
-			Slot:        0,
-			LSN:         lsn,
-			NumBlocks:   numBlocks,
-		}
-		s.keyMu.Unlock()
+		s.setFailed(err)
+		return s.failErr()
 	}
 
 	// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
@@ -1718,17 +1726,21 @@ func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry
 	return decompressed, true, nil
 }
 
-// Delete removes an object by key.
-func (s *Engine) Delete(tableName, key string) error {
-	if s.isFailed() {
-		return s.failErr()
-	}
-
-	s.writerMu.Lock()
-	defer s.writerMu.Unlock()
-
-	qKey := qualifyKey(tableName, key)
-
+// applyDeleteLocked applies a delete mutation to the heap pages and the key index.
+//
+// Caller requirements:
+//   - Must hold s.writerMu.
+//   - qKey must be a qualified table/key string.
+//   - lsn is the WAL log sequence number assigned to this delete record.
+//
+// Guarantees:
+//   - applyDeleteLocked removes the record's entry from the key index under keyMu.
+//   - It clears the record's old location (slotted slot or multi-block page).
+//   - It decrements GlobalMetrics.OversizeObjectsCount if the deleted object was oversize.
+//   - If qKey does not exist in the key index, it is a no-op and returns nil.
+//   - The function doesn't append to the WAL.
+//   - It doesn't create, read or delete oversize value files.
+func (s *Engine) applyDeleteLocked(qKey string, lsn uint64) error {
 	s.keyMu.Lock()
 	entry, exists := s.keyIndex[qKey]
 	if !exists {
@@ -1741,6 +1753,45 @@ func (s *Engine) Delete(tableName, key string) error {
 	}
 	s.keyMu.Unlock()
 
+	if entry.IsOversize {
+		if entry.NumBlocks == 1 && entry.LogicalPage != 0 {
+			if err := s.deleteSlotFromPageLocked(entry.LogicalPage, entry.Slot, lsn); err != nil {
+				return err
+			}
+		}
+	} else {
+		if entry.NumBlocks == 1 {
+			if err := s.deleteSlotFromPageLocked(entry.LogicalPage, entry.Slot, lsn); err != nil {
+				return err
+			}
+		} else {
+			if err := s.clearLogicalPageLocked(entry.LogicalPage, lsn); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// Delete removes an object by key.
+func (s *Engine) Delete(tableName, key string) error {
+	if s.isFailed() {
+		return s.failErr()
+	}
+
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+
+	qKey := qualifyKey(tableName, key)
+
+	s.keyMu.RLock()
+	entry, exists := s.keyIndex[qKey]
+	s.keyMu.RUnlock()
+	if !exists {
+		return nil
+	}
+
 	rec := Record{
 		Type: RecordTypeDelete,
 		Key:  qKey,
@@ -1751,36 +1802,20 @@ func (s *Engine) Delete(tableName, key string) error {
 		return s.failErr()
 	}
 
-	if entry.IsOversize {
-		if entry.NumBlocks == 1 && entry.LogicalPage != 0 {
-			if err := s.deleteSlotFromPageLocked(entry.LogicalPage, entry.Slot, lsn); err != nil {
-				s.setFailed(err)
-				return s.failErr()
-			}
-		}
+	if err := s.applyDeleteLocked(qKey, lsn); err != nil {
+		s.setFailed(err)
+		return s.failErr()
+	}
 
-		// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
-		if entry.OversizeFileName != "" && !s.isInFlight(entry.OversizeFileName) {
-			if err := s.wal.SyncThrough(lsn); err != nil {
-				s.setFailed(err)
-				return s.failErr()
-			}
-			if err := s.removeOversizeFileByName(entry.OversizeFileName); err != nil {
-				s.setFailed(err)
-				return s.failErr()
-			}
+	// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
+	if entry.IsOversize && entry.OversizeFileName != "" && !s.isInFlight(entry.OversizeFileName) {
+		if err := s.wal.SyncThrough(lsn); err != nil {
+			s.setFailed(err)
+			return s.failErr()
 		}
-	} else {
-		if entry.NumBlocks == 1 {
-			if err := s.deleteSlotFromPageLocked(entry.LogicalPage, entry.Slot, lsn); err != nil {
-				s.setFailed(err)
-				return s.failErr()
-			}
-		} else {
-			if err := s.clearLogicalPageLocked(entry.LogicalPage, lsn); err != nil {
-				s.setFailed(err)
-				return s.failErr()
-			}
+		if err := s.removeOversizeFileByName(entry.OversizeFileName); err != nil {
+			s.setFailed(err)
+			return s.failErr()
 		}
 	}
 
