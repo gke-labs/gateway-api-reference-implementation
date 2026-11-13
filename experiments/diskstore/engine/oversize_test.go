@@ -253,12 +253,17 @@ func TestOversize_CrashAfterPointerRecordDurable_RecoversNewValue(t *testing.T) 
 	if err := store.Put(table, key, val); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
 
-	// Put completed. Crash faultFS dropping any unsynced data and reopen.
-	_ = faultFS.Crash(true, 0)
-	_ = store.Close()
+	// Pointer record is durable. Crash faultFS dropping any unsynced data and reopen.
+	// Abandon the crashed engine without calling Close() so that nothing is written after the crash.
+	if err := faultFS.Crash(true, 0); err != nil {
+		t.Fatalf("Crash failed: %v", err)
+	}
 
-	store2, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Open after crash failed: %v", err)
 	}
@@ -1014,9 +1019,6 @@ func TestOversize_Recovery_CrashBeforePointerRecord_QuarantinesOrphanAndPreserve
 		t.Fatalf("expected orphan file to have been created before crash")
 	}
 
-	// Stop the store without allowing new writes to complete
-	_ = store.Close()
-
 	orphanPath := filepath.Join(oversizeDir, orphanFileName)
 	if f, err := memFS.Open(orphanPath); err != nil {
 		t.Fatalf("expected orphan file %s to exist on disk before recovery: %v", orphanPath, err)
@@ -1024,7 +1026,7 @@ func TestOversize_Recovery_CrashBeforePointerRecord_QuarantinesOrphanAndPreserve
 		t.Fatalf("close orphan file failed: %v", err)
 	}
 
-	store2, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen after crash failed: %v", err)
 	}
@@ -1210,7 +1212,7 @@ func TestOversize_Recovery_WALOnlyPointer_ReferencedFileNeverQuarantined(t *test
 
 	// Reopen store: pointer must be recovered from WAL redo replay, and recovery
 	// startup pass must never quarantine this referenced file.
-	store2, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}

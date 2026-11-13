@@ -355,13 +355,19 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	// Un-checkpointed writes before crash
 	_ = store.Put("ConfigMap", "key4", []byte("val4-uncheckpointed"))
 	model["key4"] = "val4-uncheckpointed"
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
 
 	// Simulate crash with tearing of un-fsynced writes
-	faultFS.Crash(false, 0.5)
-	_ = store.Close()
+	// Abandon the crashed engine without calling Close() so that nothing is written after the crash.
+	if err := faultFS.Crash(false, 0.5); err != nil {
+		t.Fatalf("Crash failed: %v", err)
+	}
 
 	// Cycle 2: Reopen store and verify full contents against model
-	store2, err := Open(WithFS(faultFS), WithDir(dir))
+	faultFS2 := NewFaultFS(memFS)
+	store2, err := Open(WithFS(faultFS2), WithDir(dir))
 	if err != nil {
 		t.Fatalf("Cycle 2 Open failed: %v", err)
 	}
@@ -397,11 +403,14 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	}
 
 	// Crash again with drop of unsynced writes (power loss simulation)
-	faultFS.Crash(true, 0)
-	_ = store2.Close()
+	// Abandon the crashed engine without calling Close() so that nothing is written after the crash.
+	if err := faultFS2.Crash(true, 0); err != nil {
+		t.Fatalf("Crash failed: %v", err)
+	}
 
 	// Cycle 3: Reopen store again and verify full contents against updated model
-	store3, err := Open(WithFS(faultFS), WithDir(dir))
+	faultFS3 := NewFaultFS(memFS)
+	store3, err := Open(WithFS(faultFS3), WithDir(dir))
 	if err != nil {
 		t.Fatalf("Cycle 3 Open failed: %v", err)
 	}
@@ -1329,7 +1338,7 @@ func TestRecovery_WALTornTailAboveHeapLSN_SucceedsOpen(t *testing.T) {
 
 	// Append torn tail to the last WAL segment above the heap page LSN
 	segPath := filepath.Join(dir, "wal", segmentFileName(1))
-	file, err := faultFS.OpenFile(segPath, os.O_RDWR, 0644)
+	file, err := memFS.OpenFile(segPath, os.O_RDWR, 0644)
 	if err != nil {
 		t.Fatalf("OpenFile failed: %v", err)
 	}
@@ -1357,7 +1366,7 @@ func TestRecovery_WALTornTailAboveHeapLSN_SucceedsOpen(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	store2, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}

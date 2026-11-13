@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"os"
 	"strings"
 	"testing"
 )
@@ -224,5 +225,91 @@ func TestFaultFile_InjectedErrors(t *testing.T) {
 	err = file.Sync()
 	if !errors.Is(err, injectedErr) {
 		t.Fatalf("expected injected sync error, got %v", err)
+	}
+}
+
+func TestFaultFS_RejectsOperationsAfterCrash(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+
+	file, err := faultFS.Create("test.db")
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer file.Close()
+
+	if _, err := file.WriteAt([]byte("initial-data"), 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	if err := faultFS.Crash(true, 0); err != nil {
+		t.Fatalf("Crash failed: %v", err)
+	}
+
+	// Writes through crashed file must fail with ErrCrashed
+	if _, err := file.WriteAt([]byte("post-crash-data"), 0); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("expected ErrCrashed on WriteAt after crash, got: %v", err)
+	}
+
+	// Sync through crashed file must fail with ErrCrashed
+	if err := file.Sync(); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("expected ErrCrashed on Sync after crash, got: %v", err)
+	}
+
+	// Truncate through crashed file must fail with ErrCrashed
+	if err := file.Truncate(0); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("expected ErrCrashed on Truncate after crash, got: %v", err)
+	}
+
+	// Create through crashed filesystem must fail with ErrCrashed
+	if _, err := faultFS.Create("new.db"); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("expected ErrCrashed on Create after crash, got: %v", err)
+	}
+
+	// Remove through crashed filesystem must fail with ErrCrashed
+	if err := faultFS.Remove("test.db"); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("expected ErrCrashed on Remove after crash, got: %v", err)
+	}
+
+	// Rename through crashed filesystem must fail with ErrCrashed
+	if err := faultFS.Rename("test.db", "test_renamed.db"); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("expected ErrCrashed on Rename after crash, got: %v", err)
+	}
+
+	// SyncDir through crashed filesystem must fail with ErrCrashed
+	if err := faultFS.SyncDir("."); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("expected ErrCrashed on SyncDir after crash, got: %v", err)
+	}
+
+	// OpenFile with create/write flags on crashed filesystem must fail with ErrCrashed
+	if _, err := faultFS.OpenFile("test2.db", os.O_CREATE|os.O_WRONLY, 0644); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("expected ErrCrashed on OpenFile with write flags after crash, got: %v", err)
+	}
+
+	// Read through surviving bytes remains possible
+	readBuf := make([]byte, len("initial-data"))
+	if _, err := file.ReadAt(readBuf, 0); err != nil {
+		t.Fatalf("ReadAt after crash failed: %v", err)
+	}
+	if string(readBuf) != "initial-data" {
+		t.Fatalf("read mismatch: got %q, want %q", string(readBuf), "initial-data")
+	}
+
+	// Fresh view of surviving bytes permits writes again
+	freshFS := NewFaultFS(memFS)
+	freshFile, err := freshFS.OpenFile("test.db", os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("freshFS OpenFile failed: %v", err)
+	}
+	defer freshFile.Close()
+
+	if _, err := freshFile.WriteAt([]byte("fresh-write-data"), 0); err != nil {
+		t.Fatalf("fresh write failed: %v", err)
+	}
+	if err := freshFile.Sync(); err != nil {
+		t.Fatalf("fresh sync failed: %v", err)
 	}
 }
