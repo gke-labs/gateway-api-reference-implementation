@@ -191,96 +191,11 @@ spec:
         - "--server-cert=/etc/snigateway-frontend/certs/server.crt"
         - "--server-key=/etc/snigateway-frontend/certs/server.key"
         - "--listen=:443"
-        - "--tunnel-listen-udp=:443"
         - "--internal-hostname=snigateway.internal"
         ports:
         - containerPort: 443
           name: https
           protocol: TCP
-        - containerPort: 443
-          name: https-udp
-          protocol: UDP
-        volumeMounts:
-        - name: frontend-certs
-          mountPath: /etc/snigateway-frontend/certs
-          readOnly: true
-      volumes:
-      - name: frontend-certs
-        secret:
-          secretName: snigateway-frontend-certs
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: snigateway-frontend
-  namespace: %s
-spec:
-  selector:
-    app: snigateway-frontend
-  ports:
-  - port: 443
-    targetPort: 443
-    protocol: TCP
-    name: https
-  - port: 443
-    targetPort: 443
-    protocol: UDP
-    name: https-udp
-`, namespace, namespace))
-
-	h.RunCmd("kubectl", "patch", "service", "snigateway-frontend", "--namespace="+namespace, "--type=merge", "-p", `{"spec":{"ports":[{"name":"https","port":443,"protocol":"TCP","targetPort":443},{"name":"https-udp","port":443,"protocol":"UDP","targetPort":443}]}}`)
-	h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+namespace, "--timeout=2m")
-}
-
-func (h *Harness) DeploySNIGatewayFrontendTCPOnly(namespace string, infraCerts *certs.GeneratedCerts) {
-	h.T.Logf("Deploying TCP-only snigateway-frontend in namespace %s", namespace)
-	h.KubectlApplyContent(fmt.Sprintf(`
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: %s
-`, namespace))
-
-	h.CreateGenericSecret("snigateway-frontend-certs", namespace, map[string][]byte{
-		"ca.crt":     infraCerts.CA.CertPEM,
-		"server.crt": infraCerts.Server.CertPEM,
-		"server.key": infraCerts.Server.KeyPEM,
-	})
-
-	h.KubectlApplyContent(fmt.Sprintf(`
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: snigateway-frontend
-  namespace: %s
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: snigateway-frontend
-  template:
-    metadata:
-      labels:
-        app: snigateway-frontend
-    spec:
-      containers:
-      - name: frontend
-        image: snigateway-frontend:e2e
-        imagePullPolicy: Never
-        args:
-        - "--client-ca=/etc/snigateway-frontend/certs/ca.crt=*.snigateway.test"
-        - "--server-cert=/etc/snigateway-frontend/certs/server.crt"
-        - "--server-key=/etc/snigateway-frontend/certs/server.key"
-        - "--listen=:443"
-        - "--tunnel-listen-udp=:443"
-        - "--internal-hostname=snigateway.internal"
-        ports:
-        - containerPort: 443
-          name: https
-          protocol: TCP
-        - containerPort: 443
-          name: https-udp
-          protocol: UDP
         volumeMounts:
         - name: frontend-certs
           mountPath: /etc/snigateway-frontend/certs
@@ -320,7 +235,7 @@ func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, f
 
 	h.KubectlApplyFile(filepath.Join(gitRoot, "snigateway/k8s/controller.yaml"))
 
-	transportMode := "auto"
+	transportMode := "tcp"
 	if len(transport) > 0 && transport[0] != "" {
 		transportMode = transport[0]
 	}

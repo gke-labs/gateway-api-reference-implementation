@@ -7,7 +7,6 @@ toolchain go1.27.4
 require (
 	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261024134123-7373c0c33da0
 	github.com/gke-labs/gateway-api-reference-implementation/certserver/api v0.0.0-00010101000000-000000000000
-	github.com/quic-go/quic-go v0.64.1
 	golang.org/x/net v0.61.0
 	golang.org/x/sync v0.24.0
 	k8s.io/api v0.37.1
@@ -56,6 +55,7 @@ require (
 	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
+	github.com/quic-go/quic-go v0.64.1 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect

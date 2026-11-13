@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
-	"github.com/quic-go/quic-go"
 	"k8s.io/klog/v2"
 )
 
@@ -50,7 +49,6 @@ type Client struct {
 	tlsConfig        *tls.Config
 	httpClient       *http.Client
 	dialFunc         func(ctx context.Context, network, addr string) (net.Conn, error)
-	quicDialFunc     func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error)
 	tokenFile        string
 	tokenProvider    func() (string, error)
 }
@@ -69,13 +67,6 @@ func WithInternalHostname(hostname string) ClientOption {
 func WithDialFunc(fn func(ctx context.Context, network, addr string) (net.Conn, error)) ClientOption {
 	return func(c *Client) {
 		c.dialFunc = fn
-	}
-}
-
-// WithQUICDialFunc sets a custom dialer function for establishing QUIC connections.
-func WithQUICDialFunc(fn func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error)) ClientOption {
-	return func(c *Client) {
-		c.quicDialFunc = fn
 	}
 }
 
@@ -412,17 +403,4 @@ func (c *bufferedClientConn) ConnectionState() tls.ConnectionState {
 		return tc.ConnectionState()
 	}
 	return tls.ConnectionState{}
-}
-
-// DialQUIC dials an mTLS QUIC connection to the frontend server.
-func (c *Client) DialQUIC(ctx context.Context) (*quic.Conn, error) {
-	quicTLS := c.tlsConfig.Clone()
-	if c.internalHostname != "" {
-		quicTLS.ServerName = c.internalHostname
-	}
-	quicTLS.NextProtos = []string{api.TunnelALPN}
-	if c.quicDialFunc != nil {
-		return c.quicDialFunc(ctx, c.serverAddr, quicTLS, api.DefaultQUICConfig())
-	}
-	return quic.DialAddr(ctx, c.serverAddr, quicTLS, api.DefaultQUICConfig())
 }
