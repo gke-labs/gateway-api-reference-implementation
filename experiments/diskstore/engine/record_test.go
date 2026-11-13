@@ -107,7 +107,7 @@ func TestEngine_RejectsOldStoreFormatVersion(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
-	// Create meta.db with previous StoreFormatVersion (version 4)
+	// Create meta.db with previous StoreFormatVersion (version 6)
 	metaPath := filepath.Join(dir, "meta.db")
 	metaFile, err := memFS.Create(metaPath)
 	if err != nil {

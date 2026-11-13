@@ -71,6 +71,7 @@ type Options struct {
 	Dir           string
 	FS            FS
 	Cipher        Cipher
+	EncryptionKey []byte
 	NumPoolBlocks int
 	AutoDelete    bool
 	Clock         Clock
@@ -149,6 +150,28 @@ func WithFS(fs FS) Option {
 func WithCipher(cipher Cipher) Option {
 	return func(o *Options) {
 		o.Cipher = cipher
+	}
+}
+
+// WithEncryptionKey sets the 32-byte caller's key for block-level encryption.
+//
+// At this stage of block-level encryption, this option only records the key-check
+// token in meta.db and verifies the key at Open. The engine does not yet encrypt
+// heap blocks, WAL blocks, or oversize files; values remain in plaintext on disk
+// even though meta.db records the store as encrypted.
+//
+// Interaction with WithCipher:
+// During the transition before the per-value cipher is removed:
+//   - A store created with WithEncryptionKey records a non-zero key-check token.
+//     Opening such a store with only WithCipher returns an error stating that the
+//     store is encrypted with a key and requires the encryption key option.
+//   - A store created with only WithCipher records an empty (zero) key-check token.
+//     Opening such a store with WithEncryptionKey fails key verification and
+//     returns ErrInvalidKey, which will cause WithEraseOnError to erase and
+//     recreate the store.
+func WithEncryptionKey(key []byte) Option {
+	return func(o *Options) {
+		o.EncryptionKey = key
 	}
 }
 
@@ -237,6 +260,7 @@ type Engine struct {
 	autoDelete bool
 
 	cipher           Cipher
+	encryptionKey    []byte
 	compressionCodec CompressionCodec
 	maxObjectSize    int
 
@@ -343,6 +367,9 @@ var (
 
 	// ErrStoreNotEncrypted is returned when opening an unencrypted store with a cipher.
 	ErrStoreNotEncrypted = errors.New("store is not encrypted: cipher option provided")
+
+	// ErrInvalidKey is returned when the encryption key fails verification against the key-check token.
+	ErrInvalidKey = errors.New("invalid encryption key")
 )
 
 const (
@@ -367,7 +394,8 @@ const (
 	// Version 4 records whether the store was created with a cipher in meta.db.
 	// Version 5 makes meta.db a 4 KiB checksummed record with room for new fields.
 	// Version 6 stores oversize values in separate files and logs only pointers in the WAL.
-	StoreFormatVersion uint32 = 6
+	// Version 7 adds the HMAC-SHA256 key check token for block-level encryption.
+	StoreFormatVersion uint32 = 7
 
 	// metaFileSize is the fixed size of meta.db (one 4 KiB block).
 	metaFileSize = BlockSize
@@ -376,7 +404,8 @@ const (
 	metaOffsetVersion  = 4
 	metaOffsetDBID     = 8
 	metaOffsetFlags    = 24
-	metaOffsetReserved = 32
+	metaOffsetKeyCheck = 32
+	metaOffsetReserved = 64
 	metaOffsetCRC      = 4092
 )
 
@@ -391,14 +420,24 @@ const (
 //   - Bytes 4..8:     StoreFormatVersion (uint32)
 //   - Bytes 8..24:    Database ID (16 bytes)
 //   - Bytes 24..32:   Flags (uint64, bit 0: encrypted flag)
-//   - Bytes 32..4092: Reserved bytes (must be zero under current StoreFormatVersion)
+//   - Bytes 32..64:   KeyCheckToken (32 bytes HMAC-SHA256 of dbID; all zeroes in an unencrypted store)
+//   - Bytes 64..4092: Reserved bytes (must be zero under current StoreFormatVersion)
 //   - Bytes 4092..4096: CRC32C (uint32 over full 4096-byte block with CRC field zeroed)
 //
 // New fields take reserved bytes and bump StoreFormatVersion.
 type metaRecord struct {
-	dbID      [16]byte
-	version   uint32
+	// dbID is the 16-byte unique identifier of the database.
+	dbID [16]byte
+
+	// version is the StoreFormatVersion recorded at store creation.
+	version uint32
+
+	// encrypted indicates whether the store was created with encryption enabled.
 	encrypted bool
+
+	// keyCheckToken is the 32-byte HMAC-SHA256 token of dbID under the caller's key,
+	// or all zeroes in an unencrypted store.
+	keyCheckToken [32]byte
 }
 
 func encodeMetaRecord(record metaRecord) []byte {
@@ -410,7 +449,8 @@ func encodeMetaRecord(record metaRecord) []byte {
 	if record.encrypted {
 		flags |= metaFlagEncrypted
 	}
-	binary.BigEndian.PutUint64(buffer[metaOffsetFlags:metaOffsetReserved], flags)
+	binary.BigEndian.PutUint64(buffer[metaOffsetFlags:metaOffsetKeyCheck], flags)
+	copy(buffer[metaOffsetKeyCheck:metaOffsetReserved], record.keyCheckToken[:])
 
 	crc := crc32.Checksum(buffer, castagnoliTable)
 	binary.BigEndian.PutUint32(buffer[metaOffsetCRC:metaFileSize], crc)
@@ -440,7 +480,7 @@ func decodeMetaRecord(buffer []byte) (metaRecord, error) {
 		return metaRecord{}, fmt.Errorf("unsupported store format version: %d", version)
 	}
 
-	flags := binary.BigEndian.Uint64(buffer[metaOffsetFlags:metaOffsetReserved])
+	flags := binary.BigEndian.Uint64(buffer[metaOffsetFlags:metaOffsetKeyCheck])
 	if flags&^metaFlagEncrypted != 0 {
 		return metaRecord{}, errors.New("unknown meta flags")
 	}
@@ -455,6 +495,10 @@ func decodeMetaRecord(buffer []byte) (metaRecord, error) {
 	copy(record.dbID[:], buffer[metaOffsetDBID:metaOffsetFlags])
 	record.version = version
 	record.encrypted = (flags & metaFlagEncrypted) != 0
+	copy(record.keyCheckToken[:], buffer[metaOffsetKeyCheck:metaOffsetReserved])
+	if !record.encrypted && record.keyCheckToken != [32]byte{} {
+		return metaRecord{}, errors.New("non-zero key check token in unencrypted store")
+	}
 	return record, nil
 }
 
@@ -499,6 +543,10 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 	if options.Quarantine.MinQuarantinedRetention == 0 {
 		options.Quarantine.MinQuarantinedRetention = DefaultMinQuarantinedRetention
+	}
+
+	if len(options.EncryptionKey) > 0 && len(options.EncryptionKey) != MasterKeySize {
+		return nil, fmt.Errorf("encryption key must be %d bytes, got %d", MasterKeySize, len(options.EncryptionKey))
 	}
 
 	dir := options.Dir
@@ -617,12 +665,27 @@ func Open(opts ...Option) (*Engine, error) {
 				} else {
 					copy(dbID[:], record.dbID[:])
 					storeEncrypted := record.encrypted
-					optEncrypted := isEncrypted(options.Cipher)
-					if storeEncrypted && !optEncrypted {
+					callerEncrypted := len(options.EncryptionKey) > 0 || isEncrypted(options.Cipher)
+					if storeEncrypted && !callerEncrypted {
 						return nil, ErrStoreEncrypted
 					}
-					if !storeEncrypted && optEncrypted {
+					if !storeEncrypted && callerEncrypted {
 						return nil, ErrStoreNotEncrypted
+					}
+
+					if storeEncrypted {
+						if len(options.EncryptionKey) > 0 {
+							if err := verifyKeyCheckToken(options.EncryptionKey, record.dbID, record.keyCheckToken); err != nil {
+								if !options.EraseOnError {
+									return nil, err
+								}
+								needsErase = true
+								eraseReason = "invalid encryption key"
+								isNewStore = true
+							}
+						} else if record.keyCheckToken != [32]byte{} {
+							return nil, errors.New("store is encrypted with a key: encryption key option required")
+						}
 					}
 				}
 			}
@@ -665,10 +728,20 @@ func Open(opts ...Option) (*Engine, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create meta file: %w", err)
 		}
+		var keyCheckToken [32]byte
+		if len(options.EncryptionKey) > 0 {
+			var tokenErr error
+			keyCheckToken, tokenErr = computeKeyCheckToken(options.EncryptionKey, dbID)
+			if tokenErr != nil {
+				closeErr := metaFile.Close()
+				return nil, errors.Join(tokenErr, closeErr)
+			}
+		}
 		metaBuffer := encodeMetaRecord(metaRecord{
-			dbID:      dbID,
-			version:   StoreFormatVersion,
-			encrypted: isEncrypted(options.Cipher),
+			dbID:          dbID,
+			version:       StoreFormatVersion,
+			encrypted:     isEncrypted(options.Cipher) || len(options.EncryptionKey) > 0,
+			keyCheckToken: keyCheckToken,
 		})
 		if _, writeErr := metaFile.WriteAt(metaBuffer, 0); writeErr != nil {
 			closeErr := metaFile.Close()
@@ -723,6 +796,7 @@ func Open(opts ...Option) (*Engine, error) {
 		isTemp:           isTemp,
 		autoDelete:       options.AutoDelete,
 		cipher:           options.Cipher,
+		encryptionKey:    bytes.Clone(options.EncryptionKey),
 		compressionCodec: options.CompressionCodec,
 		maxObjectSize:    options.MaxObjectSize,
 		quarantine:       options.Quarantine,
