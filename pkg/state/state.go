@@ -126,17 +126,24 @@ type gatewayDataplaneState struct {
 
 // gatewayProvisioningErrors holds per-Gateway provisioning errors from different sources.
 type gatewayProvisioningErrors struct {
-	addressProvider string
-	publish         error
+	// addressProvider holds the provisioning error reported by the address provider
+	// or Gateway reconciler, set by SetGatewayProvisioningError.
+	addressProvider error
+	// publish holds the error from the most recent data-plane publish attempt,
+	// set by recordPublishError.
+	publish error
 }
 
+// empty reports whether all provisioning error sources are clear.
 func (e gatewayProvisioningErrors) empty() bool {
-	return e.addressProvider == "" && e.publish == nil
+	return e.addressProvider == nil && e.publish == nil
 }
 
+// message returns the error message for the Gateway's Programmed condition.
+// The address provider's error is shown first, then the publish error.
 func (e gatewayProvisioningErrors) message() string {
-	if e.addressProvider != "" {
-		return e.addressProvider
+	if e.addressProvider != nil {
+		return e.addressProvider.Error()
 	}
 	if e.publish != nil {
 		return e.publish.Error()
@@ -593,12 +600,14 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	}
 
 	if dpConfig == nil || gw == nil {
+		s.mu.Lock()
+		s.clearPublishErrorLocked(gwKey)
 		if cachedData == nil {
-			s.mu.Lock()
 			delete(s.dataplaneState, gwKey)
 			s.mu.Unlock()
 			return nil
 		}
+		s.mu.Unlock()
 
 		deleteGW := &gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
@@ -613,6 +622,7 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 
 		s.mu.Lock()
 		delete(s.dataplaneState, gwKey)
+		s.clearPublishErrorLocked(gwKey)
 		s.mu.Unlock()
 		return nil
 	}
@@ -672,6 +682,15 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		acceptedConfig:    data,
 		lastPublishResult: result,
 	}
+	s.clearPublishErrorLocked(gwKey)
+	s.mu.Unlock()
+
+	return nil
+}
+
+// clearPublishErrorLocked clears the data-plane publish error for a Gateway.
+// It must be called with s.mu held.
+func (s *State) clearPublishErrorLocked(gwKey types.NamespacedName) {
 	if errs, ok := s.provisioningErrors[gwKey]; ok && errs.publish != nil {
 		errs.publish = nil
 		if errs.empty() {
@@ -682,9 +701,6 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		s.revision++
 		s.markDirtyLocked()
 	}
-	s.mu.Unlock()
-
-	return nil
 }
 
 // recordPublishError records the error from a failed data-plane publish attempt on the Gateway's
@@ -692,6 +708,10 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if _, ok := s.gateways[gwKey]; !ok {
+		return
+	}
 
 	errs := s.provisioningErrors[gwKey]
 	if errs.publish != nil && errs.publish.Error() == err.Error() {
@@ -1520,16 +1540,23 @@ func (s *State) SetGatewayReadiness(key types.NamespacedName, readiness GatewayR
 	s.markDirtyLocked()
 }
 
+// SetGatewayProvisioningError sets the address provider provisioning error only for a Gateway.
 func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	errs := s.provisioningErrors[key]
-	if errs.addressProvider == provErr {
+	var newErr error
+	if provErr != "" {
+		newErr = errors.New(provErr)
+	}
+
+	if (errs.addressProvider == nil && newErr == nil) ||
+		(errs.addressProvider != nil && newErr != nil && errs.addressProvider.Error() == newErr.Error()) {
 		return
 	}
 
-	errs.addressProvider = provErr
+	errs.addressProvider = newErr
 	if errs.empty() {
 		delete(s.provisioningErrors, key)
 	} else {
