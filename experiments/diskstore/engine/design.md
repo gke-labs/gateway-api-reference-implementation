@@ -425,7 +425,7 @@ The type does not register a runtime finalizer. If the caller does not call `Rel
 
 ### Integrity
 
-The choice between upfront verification during `Get` and streaming verification during read is open for the maintainer; we recommend verifying as the caller reads.
+The choice between upfront verification during `Get` and streaming verification during read is open for the maintainer; the recommendation is to verify as the caller reads.
 
 The pointer record's checksum covers the stored (compressed) bytes, and an unencrypted file name derives from that hash. Verification while reading therefore runs over the compressed stream below the decompressor, and the caller sees decompressed bytes before the check completes.
 
@@ -463,8 +463,6 @@ In a planned change, the engine will support a read-only mode that opens an exis
 
 ### Rules
 
-The mode follows three rules in active voice:
-
 - **A read-only engine writes nothing to the store directory.** It doesn't quarantine files, flush pages, checkpoint, truncate the WAL, write the failure marker, or create missing files. All write paths are inactive, and files are opened read-only. If `meta.db`, `heap.db`, or required directories do not exist, `Open` returns an error instead of creating them.
 - **`Put`, `Delete`, `Sync`, and other mutating calls return a named error.** The engine rejects mutating operations immediately with a named error (such as `ErrReadOnly`) without acquiring write locks or appending records to the WAL.
 - **`Get` and listing return the same data that a normal `Open` would return after recovery.** The engine scans the heap file to rebuild the index and replays the uncheckpointed WAL tail into memory, ensuring point lookups and scans reflect all committed writes up to the highest durable LSN.
@@ -476,7 +474,7 @@ A normal `Open` replays the WAL tail into page buffers and flushes modified page
 1. **Replay into pool blocks that it never evicts:** Replay applies WAL records into resident pool blocks in the block pool, marking them pinned or un-evictable. If the dirty pages modified during replay exceed the block pool capacity (`NumPoolBlocks`), replay fails with a stated limit and error (`ErrBlockPoolFull`).
 2. **Read from the WAL through an overlay:** Replay builds an in-memory overlay index of log records that `Get` and range scans consult before reading heap pages.
 
-*Trade-offs:* An overlay avoids block pool limits and accommodates arbitrarily large WAL tails, but it introduces an overlay lookup on every read and duplicates record decoding and page search logic. Replaying into pool blocks uses the write path's existing page mechanics and adds no lookup overhead to steady-state reads. The choice is the maintainer's; we recommend replaying into pool blocks that are never evicted, because WAL tails are short in normal operation and an operator can increase `WithNumPoolBlocks` when opening a store with an unusually large tail.
+Read-only mode and deferred redo are the same mechanism: both serve records that exist only in the WAL without writing them to the heap first. Read-only never flushes, and fast recovery flushes later in the background. The two options differ in whether a later deferred redo could reuse them. Replaying everything into pool blocks at `Open` defers nothing, so a later deferred redo could not reuse it. The overlay defers writing to the heap, which a later deferred redo can reuse directly. An overlay introduces an overlay lookup on reads and duplicates record decoding and page search logic, whereas replaying into pool blocks uses existing page mechanics but fails if the dirty pages exceed the block pool capacity. The choice is the maintainer's; the recommendation is to use an overlay so that deferred redo can reuse the mechanism and replay is not bounded by the block pool size.
 
 ### Failure Tolerance
 
@@ -484,7 +482,7 @@ Normal `Open` fails closed on several error conditions. A read-only engine toler
 
 - **A file that can't be quarantined:** Normal `Open` fails when an unreferenced oversize file or abandoned WAL segment cannot be moved to `lost+found`. Read-only opens anyway because it skips quarantine. `Get` returns normal data for referenced keys; unreferenced files do not affect lookups.
 - **A failure marker from an earlier run:** Normal `Open` fails with `ErrFailed` (or erases the store if `WithEraseOnError` is set). Read-only opens anyway and leaves the marker untouched on disk. `Get` returns valid data for healthy keys, and returns `ErrCorruptStore` for keys on damaged pages or corrupt oversize files that caused the prior failure.
-- **Corruption in a closed WAL segment:** Normal `Open` fails under Invariant 10. The maintainer must choose whether read-only opens anyway or fails. We recommend opening anyway by replaying records up to the corruption point and stopping with a logged warning. For keys updated in or after the corrupted record, `Get` returns the older durable heap value, or `ErrNotFound` if the key was created within the damaged log records.
+- **Corruption in a closed WAL segment:** Normal `Open` fails under Invariant 10. The maintainer must choose whether read-only opens anyway or fails. The recommendation is to open anyway by replaying records up to the corruption point and stopping with a logged warning. For keys updated in or after the corrupted record, `Get` returns the older durable heap value, or `ErrNotFound` if the key was created within the damaged log records.
 - **A damaged heap page:** Normal `Open` treats unreadable candidate blocks as torn, but steady-state reads of corrupt pages trigger the failed state. Read-only opens anyway. For keys stored on a damaged heap page, `Get` returns `ErrCorruptStore` (or `ErrDecrypt`) without writing a failure marker to disk, while keys on undamaged pages remain readable.
 
 ### Skipped Cleanup
@@ -496,7 +494,7 @@ The engine skips all background maintenance and cleanup passes in read-only mode
 
 ### Concurrent Use
 
-The maintainer must decide whether a read-only engine may open a directory that a read-write engine has open. We recommend disallowing concurrent use (such as through advisory file locks).
+The maintainer must decide whether a read-only engine may open a directory that a read-write engine has open. The recommendation is to disallow concurrent use (such as through advisory file locks).
 
 If a read-only engine opens an active store directory anyway, it sees a point-in-time snapshot as of its startup scan and WAL replay. However, because the read-write engine flushes pages out-of-place, frees superseded blocks (Invariant 2), and deletes older WAL segments during checkpoints, the read-only engine will observe torn reads, checksum mismatches on reassigned heap blocks, or missing WAL segment errors.
 
@@ -508,6 +506,6 @@ A wrong key never erases a store in read-only mode, whatever the erase option (`
 
 ### Relation to Write-Path Apply Functions
 
-Crash recovery is planned to replay the WAL through the write path's apply functions (#1234, #1235). Read-only replay should use the same functions.
+Recovery will replay the WAL through the functions that `Put` and `Delete` use to apply a record. Read-only replay should use the same functions.
 
-Using the same apply functions (`applyPutRecord`, `applyDeleteRecord`) ensures that read-only recovery updates in-memory pool pages, slotted page directories, and the key index using identical logic to normal writes and recovery. The only difference is that read-only mode suppresses the post-replay flush and heap fsync, keeping the updated pages resident in memory.
+Calling the write path's record-application functions allows read-only recovery to update in-memory pool pages, slotted page directories, and the key index through the same code path as normal writes and recovery. The difference is that read-only mode suppresses the post-replay flush and heap fsync, keeping the updated pages in memory.
