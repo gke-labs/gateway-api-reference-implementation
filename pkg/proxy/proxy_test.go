@@ -2852,6 +2852,12 @@ func TestProxy_ListenerPortMatching(t *testing.T) {
 					Hostnames: testRouteHostnames("foo.com"),
 					Rules: []state.InternalRule{
 						{
+							Matches: []state.InternalMatch{
+								{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/longer"}},
+							},
+							Backends: []state.InternalBackend{{Host: u2.Hostname(), Port: int32(port2), Weight: 1}},
+						},
+						{
 							Backends: []state.InternalBackend{{Host: u2.Hostname(), Port: int32(port2), Weight: 1}},
 						},
 					},
@@ -2904,6 +2910,7 @@ func TestProxy_ListenerPortMatching(t *testing.T) {
 
 	cases := []struct {
 		host        string
+		path        string
 		wantStatus  int
 		wantBackend string
 	}{
@@ -2912,22 +2919,31 @@ func TestProxy_ListenerPortMatching(t *testing.T) {
 		{host: "bar.com:8080", wantStatus: 200, wantBackend: "v2"},
 		{host: "foo.com:8090", wantStatus: 200, wantBackend: "v3"},
 		{host: "bar.com:8090", wantStatus: 404},
+		{host: "foo.com", path: "/longer", wantStatus: 200, wantBackend: "v1"},
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.host, func(t *testing.T) {
-			req := httptest.NewRequest("GET", "http://"+tc.host+"/", nil)
+		name := tc.host
+		if tc.path != "" {
+			name += tc.path
+		}
+		t.Run(name, func(t *testing.T) {
+			path := "/"
+			if tc.path != "" {
+				path = tc.path
+			}
+			req := httptest.NewRequest("GET", "http://"+tc.host+path, nil)
 			req.Host = tc.host
 			w := httptest.NewRecorder()
 			p.ServeHTTP(w, req)
 
 			resp := w.Result()
 			if resp.StatusCode != tc.wantStatus {
-				t.Errorf("host %q: status code = %d, want %d", tc.host, resp.StatusCode, tc.wantStatus)
+				t.Errorf("host %q path %q: status code = %d, want %d", tc.host, path, resp.StatusCode, tc.wantStatus)
 			}
 			if tc.wantBackend != "" {
 				if got := resp.Header.Get("X-Backend"); got != tc.wantBackend {
-					t.Errorf("host %q: backend = %q, want %q", tc.host, got, tc.wantBackend)
+					t.Errorf("host %q path %q: backend = %q, want %q", tc.host, path, got, tc.wantBackend)
 				}
 			}
 		})
@@ -5640,4 +5656,308 @@ func TestServeHTTP_NormalizeRequestPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func startRealProxyServers(t *testing.T, p *Proxy) (string, string) {
+	t.Helper()
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen TCP: %v", err)
+	}
+	t.Cleanup(func() { _ = rawLis.Close() })
+
+	sniLis := p.NewSNIListener(rawLis)
+	t.Cleanup(func() { _ = sniLis.Close() })
+
+	tlsConfig := p.TLSConfig()
+	httpsSrv := &http.Server{Handler: p, TLSConfig: tlsConfig}
+	tlsLis := tls.NewListener(sniLis, tlsConfig)
+	t.Cleanup(func() { _ = tlsLis.Close() })
+	go func() { _ = httpsSrv.Serve(tlsLis) }()
+	t.Cleanup(func() { _ = httpsSrv.Close() })
+
+	httpRawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen HTTP: %v", err)
+	}
+	t.Cleanup(func() { _ = httpRawLis.Close() })
+
+	httpSrv := &http.Server{Handler: p}
+	go func() { _ = httpSrv.Serve(httpRawLis) }()
+	t.Cleanup(func() { _ = httpSrv.Close() })
+
+	return rawLis.Addr().String(), httpRawLis.Addr().String()
+}
+
+func TestProxy_ListenerIsolation_RealSockets(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backendServer.Close()
+
+	backendHost, backendPortStr, _ := net.SplitHostPort(backendServer.Listener.Addr().String())
+	backendPort, _ := strconv.Atoi(backendPortStr)
+	backendRef := []state.InternalBackend{{Host: backendHost, Port: int32(backendPort), Weight: 1}}
+
+	t.Run("Gateway with only client-validation listener does not return 200 without client cert", func(t *testing.T) {
+		caPEM, _ := generateTestCAAndClientCert(t, "client-ca")
+		_, serverCert := generateTestCAAndCert(t, []string{"val.example.com"}, nil)
+
+		route := state.InternalRoute{
+			Hostnames: testRouteHostnames("val.example.com"),
+			Rules: []state.InternalRule{{
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+				Backends: backendRef,
+			}},
+		}
+		listener := state.InternalListener{
+			Name:     "https-val",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     443,
+			Hostname: "val.example.com",
+			Routes:   []state.InternalRoute{route},
+			ClientValidation: &state.InternalClientValidation{
+				CACertPEMs: [][]byte{caPEM},
+				Mode:       gatewayv1.AllowValidOnly,
+			},
+		}
+
+		p := NewProxy()
+		p.UpdateCertificates(map[string]*tls.Certificate{"val.example.com": &serverCert}, &serverCert)
+		p.UpdateConfig([]state.InternalListener{listener}, []state.InternalRoute{route})
+
+		httpsAddr, _ := startRealProxyServers(t, p)
+
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         "unknown.example.com",
+			},
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, httpsAddr)
+			},
+		}
+		defer tr.CloseIdleConnections()
+		client := &http.Client{Transport: tr, Timeout: 3 * time.Second}
+
+		req, err := http.NewRequest(http.MethodGet, "https://unknown.example.com/", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.Host = "val.example.com"
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				t.Fatalf("expected non-200 without client certificate, got 200 OK")
+			}
+		}
+	})
+
+	t.Run("SNI for listener A with Host for listener B gets 421", func(t *testing.T) {
+		_, serverCertA := generateTestCAAndCert(t, []string{"a.example.com"}, nil)
+		_, serverCertB := generateTestCAAndCert(t, []string{"b.example.com"}, nil)
+
+		routeA := state.InternalRoute{
+			Hostnames: testRouteHostnames("a.example.com"),
+			Rules: []state.InternalRule{{
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+				Backends: backendRef,
+			}},
+		}
+		routeB := state.InternalRoute{
+			Hostnames: testRouteHostnames("b.example.com"),
+			Rules: []state.InternalRule{{
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+				Backends: backendRef,
+			}},
+		}
+		listeners := []state.InternalListener{
+			{Name: "https-a", Protocol: gatewayv1.HTTPSProtocolType, Port: 443, Hostname: "a.example.com", Routes: []state.InternalRoute{routeA}},
+			{Name: "https-b", Protocol: gatewayv1.HTTPSProtocolType, Port: 443, Hostname: "b.example.com", Routes: []state.InternalRoute{routeB}},
+		}
+
+		p := NewProxy()
+		p.UpdateCertificates(map[string]*tls.Certificate{
+			"a.example.com": &serverCertA,
+			"b.example.com": &serverCertB,
+		}, &serverCertA)
+		p.UpdateConfig(listeners, []state.InternalRoute{routeA, routeB})
+
+		httpsAddr, _ := startRealProxyServers(t, p)
+
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         "a.example.com",
+			},
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, httpsAddr)
+			},
+		}
+		defer tr.CloseIdleConnections()
+		client := &http.Client{Transport: tr, Timeout: 3 * time.Second}
+
+		req, err := http.NewRequest(http.MethodGet, "https://a.example.com/", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.Host = "b.example.com"
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusMisdirectedRequest {
+			t.Fatalf("expected 421 Misdirected Request, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Plain HTTP routing and listener isolation", func(t *testing.T) {
+		routePlain := state.InternalRoute{
+			Hostnames: testRouteHostnames("plain.example.com"),
+			Rules: []state.InternalRule{{
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+				Backends: backendRef,
+			}},
+		}
+		routeSecure := state.InternalRoute{
+			Hostnames: testRouteHostnames("secure.example.com"),
+			Rules: []state.InternalRule{{
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+				Backends: backendRef,
+			}},
+		}
+		listeners := []state.InternalListener{
+			{Name: "http-plain", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: "plain.example.com", Routes: []state.InternalRoute{routePlain}},
+			{Name: "https-secure", Protocol: gatewayv1.HTTPSProtocolType, Port: 443, Hostname: "secure.example.com", Routes: []state.InternalRoute{routeSecure}},
+		}
+
+		p := NewProxy()
+		p.UpdateConfig(listeners, []state.InternalRoute{routePlain, routeSecure})
+
+		_, httpAddr := startRealProxyServers(t, p)
+		httpClient := &http.Client{Timeout: 3 * time.Second}
+
+		// A plain-HTTP request for a route attached only to the HTTPS listener gets 404
+		reqSecure, err := http.NewRequest(http.MethodGet, "http://"+httpAddr+"/", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		reqSecure.Host = "secure.example.com"
+		respSecure, err := httpClient.Do(reqSecure)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer respSecure.Body.Close()
+		if respSecure.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected 404 for HTTPS-only route over plain HTTP, got %d", respSecure.StatusCode)
+		}
+
+		// A Host with an arbitrary port routes by hostname on the plaintext server
+		reqPlain, err := http.NewRequest(http.MethodGet, "http://"+httpAddr+"/", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		reqPlain.Host = "plain.example.com:1234"
+		respPlain, err := httpClient.Do(reqPlain)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer respPlain.Body.Close()
+		if respPlain.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 for plain HTTP with arbitrary port, got %d", respPlain.StatusCode)
+		}
+	})
+
+	t.Run("two HTTP listeners on different ports with same hostname route by Host port", func(t *testing.T) {
+		s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Backend", "v1")
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer s1.Close()
+
+		s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Backend", "v2")
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer s2.Close()
+
+		u1, _ := url.Parse(s1.URL)
+		u2, _ := url.Parse(s2.URL)
+		port1, _ := strconv.Atoi(u1.Port())
+		port2, _ := strconv.Atoi(u2.Port())
+
+		route1 := state.InternalRoute{
+			Hostnames: testRouteHostnames("same.example.com"),
+			Rules: []state.InternalRule{{
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+				Backends: []state.InternalBackend{{Host: u1.Hostname(), Port: int32(port1), Weight: 1}},
+			}},
+		}
+		route2 := state.InternalRoute{
+			Hostnames: testRouteHostnames("same.example.com"),
+			Rules: []state.InternalRule{{
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+				Backends: []state.InternalBackend{{Host: u2.Hostname(), Port: int32(port2), Weight: 1}},
+			}},
+		}
+
+		listeners := []state.InternalListener{
+			{Name: "http-80", Protocol: gatewayv1.HTTPProtocolType, Port: 80, Hostname: "same.example.com", Routes: []state.InternalRoute{route1}},
+			{Name: "http-8080", Protocol: gatewayv1.HTTPProtocolType, Port: 8080, Hostname: "same.example.com", Routes: []state.InternalRoute{route2}},
+		}
+
+		p := NewProxy()
+		p.UpdateConfig(listeners, []state.InternalRoute{route1, route2})
+
+		_, httpAddr := startRealProxyServers(t, p)
+		httpClient := &http.Client{Timeout: 3 * time.Second}
+
+		// Host port 8080 narrows to http-8080 (backend v2)
+		req8080, err := http.NewRequest(http.MethodGet, "http://"+httpAddr+"/", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req8080.Host = "same.example.com:8080"
+		resp8080, err := httpClient.Do(req8080)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp8080.Body.Close()
+		if resp8080.StatusCode != http.StatusOK || resp8080.Header.Get("X-Backend") != "v2" {
+			t.Fatalf("expected 200 OK from v2, got status %d, backend %q", resp8080.StatusCode, resp8080.Header.Get("X-Backend"))
+		}
+
+		// Host port 80 narrows to http-80 (backend v1)
+		req80, err := http.NewRequest(http.MethodGet, "http://"+httpAddr+"/", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req80.Host = "same.example.com:80"
+		resp80, err := httpClient.Do(req80)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp80.Body.Close()
+		if resp80.StatusCode != http.StatusOK || resp80.Header.Get("X-Backend") != "v1" {
+			t.Fatalf("expected 200 OK from v1, got status %d, backend %q", resp80.StatusCode, resp80.Header.Get("X-Backend"))
+		}
+
+		// Host port matching no listener (e.g. :9999) does not narrow; routes by hostname
+		req9999, err := http.NewRequest(http.MethodGet, "http://"+httpAddr+"/", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req9999.Host = "same.example.com:9999"
+		resp9999, err := httpClient.Do(req9999)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp9999.Body.Close()
+		if resp9999.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK for non-matching port routed by hostname, got %d", resp9999.StatusCode)
+		}
+	})
 }

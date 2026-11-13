@@ -858,17 +858,37 @@ func splitHostPort(hostPort string, defaultPort int32) (string, int32, bool) {
 	return h, int32(p), true
 }
 
-// matchHTTPListeners finds HTTP listeners matching the host header port (defaulting to 80) and host.
-func matchHTTPListeners(listeners []state.InternalListener, hostHeader string) ([]state.InternalListener, bool) {
-	reqHost, reqPort, _ := splitHostPort(hostHeader, 80)
+// narrowListenersByPort narrows candidate listeners using the port in the Host header.
+// The Service maps every listener port of a protocol to one pod port, so the Host port is only a hint
+// between same-protocol listeners, and it never widens the candidate set: if the port matches at least
+// one candidate listener, we keep only those listeners; if it matches no candidate, we keep all candidates.
+// On the plaintext server, a Host with no port means port 80, so we narrow to port-80 listeners when
+// at least one exists. On the TLS server, a port-less Host keeps all candidates because SNI selects
+// the listener there.
+func narrowListenersByPort(candidates []state.InternalListener, hostHeader string, defaultPort int32, defaultPortNarrows bool) ([]state.InternalListener, string) {
+	reqHost, reqPort, hasPort := splitHostPort(hostHeader, defaultPort)
 	reqHost = strings.ToLower(reqHost)
+	if !hasPort && !defaultPortNarrows {
+		return candidates, reqHost
+	}
+	var matched []state.InternalListener
+	for _, l := range candidates {
+		if l.Port == 0 || int32(l.Port) == reqPort {
+			matched = append(matched, l)
+		}
+	}
+	if len(matched) > 0 {
+		return matched, reqHost
+	}
+	return candidates, reqHost
+}
 
+// matchHTTPListeners finds HTTP listeners matching the host header.
+func matchHTTPListeners(listeners []state.InternalListener, hostHeader string) ([]state.InternalListener, bool) {
 	var httpListeners []state.InternalListener
 	for _, l := range listeners {
 		if l.Protocol == gatewayv1.HTTPProtocolType {
-			if l.Port == 0 || int32(l.Port) == reqPort {
-				httpListeners = append(httpListeners, l)
-			}
+			httpListeners = append(httpListeners, l)
 		}
 	}
 
@@ -876,7 +896,8 @@ func matchHTTPListeners(listeners []state.InternalListener, hostHeader string) (
 		return nil, false
 	}
 
-	matchedListeners, _ := state.MatchListeners(httpListeners, reqHost)
+	candidates, reqHost := narrowListenersByPort(httpListeners, hostHeader, 80, true)
+	matchedListeners, _ := state.MatchListeners(candidates, reqHost)
 	return matchedListeners, true
 }
 
@@ -1125,9 +1146,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if len(listeners) > 0 {
 		if r.TLS != nil {
-			reqHost, reqPort, hasPort := splitHostPort(r.Host, 443)
-			reqHost = strings.ToLower(reqHost)
-
 			var httpsListeners []state.InternalListener
 			for _, l := range listeners {
 				if l.Protocol == gatewayv1.HTTPSProtocolType {
@@ -1137,99 +1155,87 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if hasPort {
-				var filtered []state.InternalListener
-				for _, l := range httpsListeners {
-					if l.Port == 0 || int32(l.Port) == reqPort {
-						filtered = append(filtered, l)
-					}
-				}
-				httpsListeners = filtered
-			} else {
-				// With no port in Host, do not filter by port; let hostname precedence decide
-				// (exact > wildcard > catch-all) with ties broken in favor of port 443.
-				sort.SliceStable(httpsListeners, func(i, j int) bool {
-					is443I := httpsListeners[i].Port == 443 || httpsListeners[i].Port == 0
-					is443J := httpsListeners[j].Port == 443 || httpsListeners[j].Port == 0
-					if is443I != is443J {
-						return is443I
-					}
-					return false
-				})
+			if len(httpsListeners) == 0 {
+				// Gateway API listener-isolation rule: reject requests that match no listener.
+				p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
+				return
 			}
 
-			if len(httpsListeners) > 0 {
-				sni := strings.ToLower(r.TLS.ServerName)
-				connListeners, connMatchType := state.MatchListeners(httpsListeners, sni)
-				if len(connListeners) == 0 {
-					p.respondNotFound(w, r, fmt.Sprintf("No listener for server name %s", sni))
+			candidates, reqHost := narrowListenersByPort(httpsListeners, r.Host, 443, false)
+
+			sni := strings.ToLower(r.TLS.ServerName)
+			connListeners, connMatchType := state.MatchListeners(candidates, sni)
+			if len(connListeners) == 0 {
+				p.respondNotFound(w, r, fmt.Sprintf("No listener for server name %s", sni))
+				return
+			}
+
+			reqHostListeners, reqMatchType := state.MatchListeners(candidates, reqHost)
+
+			if connMatchType == state.CatchAllMatch {
+				if reqMatchType == state.ExactMatch || reqMatchType == state.WildcardMatch {
+					http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
 					return
 				}
-
-				reqHostListeners, reqMatchType := state.MatchListeners(httpsListeners, reqHost)
-
-				if connMatchType == state.CatchAllMatch {
-					if reqMatchType == state.ExactMatch || reqMatchType == state.WildcardMatch {
-						http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
-						return
-					}
-				} else if connMatchType == state.WildcardMatch {
-					hasMatchingConnListener := false
-					for _, l := range connListeners {
-						if state.MatchesWildcard(l.Hostname, reqHost) {
-							hasMatchingConnListener = true
-							break
-						}
-					}
-					if !hasMatchingConnListener {
-						if len(reqHostListeners) > 0 {
-							http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
-						} else {
-							p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
-						}
-						return
-					}
-					if reqMatchType == state.ExactMatch {
-						http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
-						return
-					}
-				} else if connMatchType == state.ExactMatch {
-					hasMatchingConnListener := false
-					for _, l := range connListeners {
-						if strings.EqualFold(l.Hostname, reqHost) {
-							hasMatchingConnListener = true
-							break
-						}
-					}
-					if !hasMatchingConnListener {
-						if len(reqHostListeners) > 0 {
-							http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
-						} else {
-							p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
-						}
-						return
-					}
-				}
-
-				var connRoutes []state.InternalRoute
+			} else if connMatchType == state.WildcardMatch {
+				hasMatchingConnListener := false
 				for _, l := range connListeners {
-					connRoutes = append(connRoutes, l.Routes...)
+					if state.MatchesWildcard(l.Hostname, reqHost) {
+						hasMatchingConnListener = true
+						break
+					}
 				}
-				routes = connRoutes
+				if !hasMatchingConnListener {
+					if len(reqHostListeners) > 0 {
+						http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
+					} else {
+						p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
+					}
+					return
+				}
+				if reqMatchType == state.ExactMatch {
+					http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
+					return
+				}
+			} else if connMatchType == state.ExactMatch {
+				hasMatchingConnListener := false
+				for _, l := range connListeners {
+					if strings.EqualFold(l.Hostname, reqHost) {
+						hasMatchingConnListener = true
+						break
+					}
+				}
+				if !hasMatchingConnListener {
+					if len(reqHostListeners) > 0 {
+						http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
+					} else {
+						p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
+					}
+					return
+				}
 			}
+
+			var connRoutes []state.InternalRoute
+			for _, l := range connListeners {
+				connRoutes = append(connRoutes, l.Routes...)
+			}
+			routes = connRoutes
 		} else {
 			reqHostListeners, hasPortListeners := matchHTTPListeners(listeners, r.Host)
-			if hasPortListeners {
-				if len(reqHostListeners) == 0 {
-					p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
-					return
-				}
-				var matchedRoutes []state.InternalRoute
-				for _, l := range reqHostListeners {
-					matchedRoutes = append(matchedRoutes, l.Routes...)
-				}
-				routes = matchedRoutes
+			if !hasPortListeners {
+				// Gateway API listener-isolation rule: reject requests that match no listener.
+				p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
+				return
 			}
+			if len(reqHostListeners) == 0 {
+				p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
+				return
+			}
+			var matchedRoutes []state.InternalRoute
+			for _, l := range reqHostListeners {
+				matchedRoutes = append(matchedRoutes, l.Routes...)
+			}
+			routes = matchedRoutes
 		}
 	}
 
