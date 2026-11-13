@@ -220,8 +220,12 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	// Step 2: Mark blocks of winning candidates as allocated in the buddy allocator
 	pageDescs := make(map[uint64]*PageDesc)
 	var maxRecoveredLogicalPage uint64
+	var maxHeapLSN uint64
 
 	for logicalPage, cand := range bestCandidates {
+		if cand.lsn > maxHeapLSN {
+			maxHeapLSN = cand.lsn
+		}
 		order := 0
 		for (1 << order) < cand.numBlocks {
 			order++
@@ -353,6 +357,14 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		if closeErr := walScanIt.Close(); closeErr != nil {
 			return nil, fmt.Errorf("failed to close WAL scan iterator: %w", closeErr)
 		}
+	}
+
+	// Under the write-ahead rule, a heap page with LSN L can only be on disk
+	// if the WAL was fsynced through L. If WAL replay ends below the highest
+	// page LSN found in the heap, records that the engine acknowledged are
+	// missing, which indicates provable corruption rather than an unacknowledged torn tail.
+	if maxWAL_LSN < maxHeapLSN {
+		return nil, fmt.Errorf("%w: WAL replay ended at LSN %d below highest heap page LSN %d", ErrCorruptWAL, maxWAL_LSN, maxHeapLSN)
 	}
 
 	// Step 5: Full Redo Replay from redoStartLSN (Item 3)

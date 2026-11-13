@@ -99,6 +99,11 @@ func TestRecovery_InvalidMagicBlocks(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("rec-foreign-db01"))
 
+	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 5, Key: "k", Payload: []byte("v")})
+	_ = wal.Sync()
+	_ = wal.Close()
+
 	heapFile, _ := faultFS.Create("heap.db")
 
 	// Write a valid block
@@ -221,10 +226,10 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	h1.Unpin()
 	_ = bp.FlushPage(1)
 
-	// Now store the malicious object containing forged headers at LSN 10
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "malicious-key", Payload: maliciousPayload})
+	// Now store the malicious object containing forged headers at LSN 6
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 6, Key: "malicious-key", Payload: maliciousPayload})
 	_ = wal.Sync()
-	mbPage, err := NewMultiBlockPage(2, 10, "malicious-key", maliciousPayload)
+	mbPage, err := NewMultiBlockPage(2, 6, "malicious-key", maliciousPayload)
 	if err != nil {
 		t.Fatalf("NewMultiBlockPage failed: %v", err)
 	}
@@ -461,22 +466,26 @@ func TestRegression_Item4_HighestLSNKeySelection(t *testing.T) {
 	copy(dbID[:], []byte("rec-highest-lsn-"))
 
 	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 1, Key: "target-key", Payload: []byte("older-val")})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 2, Key: "target-key", Payload: []byte("newer-val")})
+	_ = wal.Sync()
+
 	heapFile, _ := faultFS.Create("heap.db")
 	buddy := NewBuddyAllocator(512)
 	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 
-	// Page 1: holds key at LSN 10
-	h1, _ := bp.AllocateNewPage(1, 1, 10)
+	// Page 1: holds key at LSN 1
+	h1, _ := bp.AllocateNewPage(1, 1, 1)
 	s1, _ := WrapSlottedPage(h1.Block(0))
-	_, _ = s1.Put("target-key", []byte("older-val"), 10)
+	_, _ = s1.Put("target-key", []byte("older-val"), 1)
 	s1.Finalize()
 	h1.Unpin()
 	_ = bp.FlushPage(1)
 
-	// Page 2: holds key at LSN 20 (newer!)
-	h2, _ := bp.AllocateNewPage(2, 1, 20)
+	// Page 2: holds key at LSN 2 (newer!)
+	h2, _ := bp.AllocateNewPage(2, 1, 2)
 	s2, _ := WrapSlottedPage(h2.Block(0))
-	_, _ = s2.Put("target-key", []byte("newer-val"), 20)
+	_, _ = s2.Put("target-key", []byte("newer-val"), 2)
 	s2.Finalize()
 	h2.Unpin()
 	_ = bp.FlushPage(2)
@@ -498,8 +507,8 @@ func TestRegression_Item4_HighestLSNKeySelection(t *testing.T) {
 	if !exists {
 		t.Fatalf("target-key missing from recovered index")
 	}
-	if entry.LSN != 20 {
-		t.Fatalf("recovery chose stale LSN %d instead of highest LSN 20", entry.LSN)
+	if entry.LSN != 2 {
+		t.Fatalf("recovery chose stale LSN %d instead of highest LSN 2", entry.LSN)
 	}
 }
 
@@ -599,8 +608,9 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	t.Logf("empty page %d has DurableLoc %d (v1 was at %d, v2 was at %d)", entryK1.LogicalPage, durLoc, v1Loc, v2Loc)
 
 	// Step 8: Reuse the emptied logical page in the block pool
-	_ = store.wal.Append(Record{Type: RecordTypePut, LSN: 50, Key: "new-key", Payload: []byte("new-val")})
-	hNew, err := store.bp.AllocateNewPage(entryK1.LogicalPage, 1, 50)
+	lsnNew := store.wal.NextLSN()
+	_ = store.wal.Append(Record{Type: RecordTypePut, LSN: lsnNew, Key: "new-key", Payload: []byte("new-val")})
+	hNew, err := store.bp.AllocateNewPage(entryK1.LogicalPage, 1, lsnNew)
 	if err != nil {
 		t.Fatalf("AllocateNewPage failed: %v", err)
 	}
@@ -608,8 +618,9 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 
 	// Step 9: Allocate a new page (filler) and flush it to disk.
 	// On main, AllocateNewPage freed durLoc (block 1), so filler page gets block 1 and overwrites it.
-	_ = store.wal.Append(Record{Type: RecordTypePut, LSN: 51, Key: "filler", Payload: []byte("filler-val")})
-	hFiller, err := store.bp.AllocateNewPage(99, 1, 51)
+	lsnFiller := store.wal.NextLSN()
+	_ = store.wal.Append(Record{Type: RecordTypePut, LSN: lsnFiller, Key: "filler", Payload: []byte("filler-val")})
+	hFiller, err := store.bp.AllocateNewPage(99, 1, lsnFiller)
 	if err != nil {
 		t.Fatalf("AllocateNewPage 99 failed: %v", err)
 	}
@@ -617,10 +628,10 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WrapSlottedPage failed: %v", err)
 	}
-	_, _ = spFiller.Put("filler", []byte("filler-val"), 51)
+	_, _ = spFiller.Put("filler", []byte("filler-val"), lsnFiller)
 	spFiller.Finalize()
 	hFiller.Unpin()
-	store.bp.MarkDirty(99, 51)
+	store.bp.MarkDirty(99, lsnFiller)
 	if err := store.bp.FlushPage(99); err != nil {
 		t.Fatalf("FlushPage(99) failed: %v", err)
 	}
@@ -1120,4 +1131,106 @@ func TestRecovery_WALRecordLengthExceedsSegment_NoAllocation(t *testing.T) {
 			t.Fatalf("recovery allocated %d bytes (>= %d), expected no buffer of that length", alloc, excessiveLen)
 		}
 	})
+}
+
+func TestRecovery_WALCorruptBelowHeapLSN_FailsOpen(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_wal_corrupt_below_heap"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "k1", []byte("val1")); err != nil {
+		t.Fatalf("Put k1 failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Corrupt record 1 in the last segment below the heap page LSN.
+	segPath := filepath.Join(dir, "wal", segmentFileName(1))
+	file, err := memFS.OpenFile(segPath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	var b [1]byte
+	if _, err := file.ReadAt(b[:], int64(SegmentHeaderSize+10)); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	b[0] ^= 0xff
+	if _, err := file.WriteAt(b[:], int64(SegmentHeaderSize+10)); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	_, err = Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if !errors.Is(err, ErrCorruptWAL) {
+		t.Fatalf("expected ErrCorruptWAL, got: %v", err)
+	}
+}
+
+func TestRecovery_WALTornTailAboveHeapLSN_SucceedsOpen(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_wal_torn_tail_above_heap"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "k1", []byte("val1")); err != nil {
+		t.Fatalf("Put k1 failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	// Write k2 (LSN > heap LSN) and sync to WAL, but close without checkpointing
+	if err := store.Put("ConfigMap", "k2", []byte("val2")); err != nil {
+		t.Fatalf("Put k2 failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	store.cp = nil
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Append torn tail to the last WAL segment above the heap page LSN
+	segPath := filepath.Join(dir, "wal", segmentFileName(1))
+	file, err := memFS.OpenFile(segPath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	size, err := file.Size()
+	if err != nil {
+		t.Fatalf("Size failed: %v", err)
+	}
+	tornHeader := []byte{RecordMagic, RecordFormatVersion, byte(RecordTypePut), 0, 0, 0, 0, 10}
+	if _, err := file.WriteAt(tornHeader, size); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store2.Close()
+
+	val1, ok1, err := store2.Get("ConfigMap", "k1")
+	if err != nil || !ok1 || string(val1) != "val1" {
+		t.Fatalf("Get k1 mismatch: ok=%v, val=%q, err=%v", ok1, string(val1), err)
+	}
+	val2, ok2, err := store2.Get("ConfigMap", "k2")
+	if err != nil || !ok2 || string(val2) != "val2" {
+		t.Fatalf("Get k2 mismatch: ok=%v, val=%q, err=%v", ok2, string(val2), err)
+	}
 }
