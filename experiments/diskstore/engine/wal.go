@@ -1181,12 +1181,6 @@ func (it *WALIterator) advanceSegment() error {
 	}
 
 	nextSeg := it.segments[it.currSegIdx+1]
-	if it.expectedLSN > 0 && nextSeg.startLSN != it.expectedLSN {
-		it.done = true
-		// Next segment does not start at expected LSN, so this is corruption; see WALIterator.
-		return fmt.Errorf("%w: segment %s starts at LSN %d, expected %d", ErrCorruptWAL, nextSeg.name, nextSeg.startLSN, it.expectedLSN)
-	}
-
 	if err := it.nextSegment(); err != nil {
 		it.done = true
 		if errors.Is(err, io.EOF) {
@@ -1197,6 +1191,13 @@ func (it *WALIterator) advanceSegment() error {
 		}
 		return fmt.Errorf("%w: failed to advance to next segment %s: %w", ErrCorruptWAL, nextSeg.name, err)
 	}
+
+	if it.expectedLSN > 0 && nextSeg.startLSN != it.expectedLSN {
+		it.done = true
+		// Next segment does not start at expected LSN, so this is corruption; see WALIterator.
+		return fmt.Errorf("%w: segment %s starts at LSN %d, expected %d", ErrCorruptWAL, nextSeg.name, nextSeg.startLSN, it.expectedLSN)
+	}
+
 	return nil
 }
 

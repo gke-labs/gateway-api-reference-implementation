@@ -1024,4 +1024,3 @@ func TestRecovery_WALCrashAfterRotation_EmptySegment_SucceedsOpen(t *testing.T) 
 		t.Fatalf("Get k1 mismatch: ok=%v, val=%q, err=%v", ok, string(val), err)
 	}
 }
->>>>>>> e0d70d2 (experiments/diskstore/engine: fail on WAL corruption outside the torn tail)
