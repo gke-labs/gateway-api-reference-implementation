@@ -980,7 +980,7 @@ func (s *Engine) setFailed(err error) {
 	}
 	s.failMu.Lock()
 	if s.failedErr == nil {
-		s.failedErr = fmt.Errorf("%w: %v", ErrFailed, err)
+		s.failedErr = fmt.Errorf("%w: %w", ErrFailed, err)
 		close(s.failedCh)
 		if markerErr := s.writeFailureMarker(err); markerErr != nil {
 			s.failedErr = fmt.Errorf("%w (marker error: %v)", s.failedErr, markerErr)
@@ -1088,6 +1088,7 @@ func (s *Engine) decompress(data []byte) ([]byte, error) {
 
 func (s *Engine) putRecordIntoSlottedPageLocked(qKey string, payload []byte, lsn uint64, existing KeyIndexEntry, inIndex bool, isOversize bool) (uint64, uint32, error) {
 	var targetPage uint64
+	var isNewPage bool
 	if inIndex && existing.NumBlocks == 1 && existing.LogicalPage != 0 {
 		targetPage = existing.LogicalPage
 	} else if s.activeSlottedPage != 0 {
@@ -1095,16 +1096,27 @@ func (s *Engine) putRecordIntoSlottedPageLocked(qKey string, payload []byte, lsn
 	} else if p, ok := s.emptyPages.Pop(); ok {
 		targetPage = p
 		s.activeSlottedPage = targetPage
+		isNewPage = true
 	} else {
 		targetPage = s.nextLogicalPage
 		s.nextLogicalPage++
 		s.activeSlottedPage = targetPage
+		isNewPage = true
 	}
 
-	handle, err := s.bp.PinPage(targetPage)
-	if err != nil {
+	var handle *PageHandle
+	var err error
+	if isNewPage {
 		handle, err = s.bp.AllocateNewPage(targetPage, 1, lsn)
 		if err != nil {
+			return 0, 0, err
+		}
+	} else {
+		handle, err = s.bp.PinPage(targetPage)
+		if err != nil {
+			if errors.Is(err, ErrPageNotFound) {
+				return 0, 0, fmt.Errorf("%w: page %d not found: %w", ErrCorruptStore, targetPage, err)
+			}
 			return 0, 0, err
 		}
 	}

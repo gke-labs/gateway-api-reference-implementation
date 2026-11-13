@@ -1450,6 +1450,158 @@ func TestGet_PinPageFailurePreservesCause(t *testing.T) {
 	}
 }
 
+type faultDirectIO struct {
+	base    DirectIO
+	readErr error
+}
+
+func (f *faultDirectIO) Readv(file File, off int64, iov [][]byte) error {
+	if f.readErr != nil {
+		return f.readErr
+	}
+	return f.base.Readv(file, off, iov)
+}
+
+func (f *faultDirectIO) Writev(file File, off int64, iov [][]byte) error {
+	return f.base.Writev(file, off, iov)
+}
+
+func (f *faultDirectIO) Write(file File, off int64, buffer []byte) error {
+	return f.base.Write(file, off, buffer)
+}
+
+// TestPut_ExistingPageNotFoundReturnsCorruptStore verifies that when an existing page
+// cannot be found by PinPage during Put, Put returns an error wrapping ErrCorruptStore
+// and naming the page.
+func TestPut_ExistingPageNotFoundReturnsCorruptStore(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := Open(WithFS(memFS), WithDir("corrupt_page_test"), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	table := "TestTable"
+	key := "k1"
+	if err := store.Put(table, key, []byte("val1")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	qKey := qualifyKey(table, key)
+	store.keyMu.RLock()
+	entry := store.keyIndex[qKey]
+	store.keyMu.RUnlock()
+
+	// Delete page descriptor from pageTable so PinPage returns ErrPageNotFound
+	store.bp.mu.Lock()
+	delete(store.bp.pageTable, entry.LogicalPage)
+	store.bp.mu.Unlock()
+
+	err = store.Put(table, key, []byte("val2"))
+	if err == nil {
+		t.Fatalf("expected error from Put on missing existing page, got nil")
+	}
+	if !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("expected error to wrap ErrCorruptStore, got %v", err)
+	}
+	expectedPageStr := fmt.Sprintf("page %d", entry.LogicalPage)
+	if !strings.Contains(err.Error(), expectedPageStr) {
+		t.Fatalf("expected error message to name %q, got: %v", expectedPageStr, err)
+	}
+
+	// Also test activeSlottedPage case: inserting a new key when activeSlottedPage is missing
+	store2, err := Open(WithFS(NewMemFS()), WithDir("corrupt_active_test"), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store2.Close()
+
+	if err := store2.Put(table, "k1", []byte("val1")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	activePage := store2.activeSlottedPage
+	if activePage == 0 {
+		t.Fatalf("expected activeSlottedPage to be set")
+	}
+	store2.bp.mu.Lock()
+	delete(store2.bp.pageTable, activePage)
+	store2.bp.mu.Unlock()
+
+	err = store2.Put(table, "k2", []byte("val2"))
+	if err == nil {
+		t.Fatalf("expected error from Put on missing activeSlottedPage, got nil")
+	}
+	if !errors.Is(err, ErrCorruptStore) {
+		t.Fatalf("expected error to wrap ErrCorruptStore, got %v", err)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("page %d", activePage)) {
+		t.Fatalf("expected error message to name page %d, got: %v", activePage, err)
+	}
+}
+
+// TestPut_PinFailureDoesNotAllocate verifies that when pinning a page fails with an
+// injected I/O error, Put returns the error and does not allocate a new page.
+func TestPut_PinFailureDoesNotAllocate(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := Open(WithFS(memFS), WithDir("pin_fail_test"), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	table := "TestTable"
+	key := "k1"
+	if err := store.Put(table, key, []byte("val1")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	qKey := qualifyKey(table, key)
+	store.keyMu.RLock()
+	entry := store.keyIndex[qKey]
+	store.keyMu.RUnlock()
+
+	// Flush page to disk so it has a valid disk location
+	if err := store.bp.FlushPage(entry.LogicalPage); err != nil {
+		t.Fatalf("FlushPage failed: %v", err)
+	}
+	if err := store.heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := store.bp.PromoteFlushedToDurable(); err != nil {
+		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	}
+
+	// Evict page from memory pool blocks
+	store.bp.mu.Lock()
+	desc := store.bp.pageTable[entry.LogicalPage]
+	desc.PoolBlocks = nil
+	store.bp.mu.Unlock()
+
+	injectedErr := errors.New("injected disk read error")
+	store.bp.directIO = &faultDirectIO{base: store.bp.directIO, readErr: injectedErr}
+
+	err = store.Put(table, key, []byte("val2"))
+	if err == nil {
+		t.Fatalf("expected error from Put when pin fails with I/O error, got nil")
+	}
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected error to wrap %v, got %v", injectedErr, err)
+	}
+	if !strings.Contains(err.Error(), injectedErr.Error()) {
+		t.Fatalf("expected error to contain %q, got: %v", injectedErr.Error(), err)
+	}
+
+	store.bp.mu.Lock()
+	if len(desc.PoolBlocks) > 0 {
+		store.bp.mu.Unlock()
+		t.Fatalf("page should not have been reallocated after pin failure")
+	}
+	store.bp.mu.Unlock()
+}
+
 func TestRegression_OversizePutAfterWipe(t *testing.T) {
 	oversizePayload := make([]byte, 3*1024*1024)
 	copy(oversizePayload, []byte("large-payload-after-wipe"))
