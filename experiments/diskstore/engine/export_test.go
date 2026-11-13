@@ -14,7 +14,13 @@
 
 package engine
 
+import "path/filepath"
+
 // SimulateFailure transitions the engine into the failed state and writes the failure marker for testing.
 func (s *Engine) SimulateFailure(err error) {
 	s.setFailed(err)
+}
+
+func (s *Engine) oversizeFilePath(fileName string) string {
+	return filepath.Join(s.dir, "oversize", fileName)
 }

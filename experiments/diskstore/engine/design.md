@@ -199,6 +199,7 @@ The record fields contain:
   - `1`: `Put`
   - `2`: `Delete`
   - `3`: `Checkpoint`
+  - `4`: `PutPointer`
 - **Reserved (1 byte):** Zero padding.
 - **LSN (8 bytes):** The monotonically assigned log sequence number.
 - **RedoStartLSN (8 bytes):** The starting LSN for WAL redo replay. This field is populated on Checkpoint records.

@@ -17,13 +17,12 @@ package engine
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log/slog"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -46,6 +45,9 @@ var (
 
 	// ErrDecrypt indicates a failure during payload decryption.
 	ErrDecrypt = errors.New("payload decryption failed")
+
+	// ErrCorruptStore indicates corruption in the store state or referenced files.
+	ErrCorruptStore = errors.New("store corruption")
 )
 
 // TestHookFail is an internal hook used by tests to trigger the failed state without exposing a method on Engine.
@@ -271,6 +273,10 @@ type Engine struct {
 	keyIndex        map[string]KeyIndexEntry // tableQualifiedKey -> KeyIndexEntry
 	oversizeObjects map[string][]byte        // tableQualifiedKey -> payload
 
+	inFlightMu       sync.Mutex
+	inFlightOversize map[string]int
+	inFlightSeq      atomic.Uint64
+
 	// Free logical page allocations and tracking; guarded by writerMu
 	emptyPages        *emptyPageTracker
 	nextLogicalPage   uint64
@@ -380,7 +386,8 @@ const (
 	// Version 3 removes resourceVersion (token) handling from WAL records and the engine.
 	// Version 4 records whether the store was created with a cipher in meta.db.
 	// Version 5 makes meta.db a 4 KiB checksummed record with room for new fields.
-	StoreFormatVersion uint32 = 5
+	// Version 6 stores oversize values in separate files and logs only pointers in the WAL.
+	StoreFormatVersion uint32 = 6
 
 	// metaFileSize is the fixed size of meta.db (one 4 KiB block).
 	metaFileSize = BlockSize
@@ -740,14 +747,15 @@ func Open(opts ...Option) (*Engine, error) {
 			MaxQuarantinedFiles:     options.MaxQuarantinedFiles,
 			MinQuarantinedRetention: options.MinQuarantinedRetention,
 		},
-		heapFile:        heapFile,
-		keyIndex:        make(map[string]KeyIndexEntry),
-		oversizeObjects: make(map[string][]byte),
-		emptyPages:      newEmptyPageTracker(nil),
-		failedCh:        make(chan struct{}),
-		closedCh:        make(chan struct{}),
-		wiped:           wiped,
-		nextLogicalPage: 1,
+		heapFile:         heapFile,
+		keyIndex:         make(map[string]KeyIndexEntry),
+		oversizeObjects:  make(map[string][]byte),
+		inFlightOversize: make(map[string]int),
+		emptyPages:       newEmptyPageTracker(nil),
+		failedCh:         make(chan struct{}),
+		closedCh:         make(chan struct{}),
+		wiped:            wiped,
+		nextLogicalPage:  1,
 	}
 
 	walQuarantine := s.quarantine
@@ -806,40 +814,54 @@ func Open(opts ...Option) (*Engine, error) {
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
-
-		// Item 17: Load persisted oversize objects
-		if err := s.loadOversizeObjects(); err != nil {
-			closeErr := heapFile.Close()
-			return nil, errors.Join(fmt.Errorf("failed to load oversize objects: %w", err), closeErr)
-		}
 	}
 
 	return s, nil
 }
 
-const (
-	// OversizeMagic identifies valid oversize object files ("OVRS").
-	OversizeMagic uint32 = 0x4F565253
-
-	// OversizeVersion is 1.
-	OversizeVersion uint32 = 1
-
-	// OversizeHeaderSize is 32 bytes.
-	OversizeHeaderSize = 32
-)
-
-func oversizeFileName(qKey string) string {
-	h := sha256.Sum256([]byte(qKey))
-	return fmt.Sprintf("%x.obj", h)
+func (s *Engine) registerInFlight(names ...string) {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	for _, name := range names {
+		if name != "" {
+			s.inFlightOversize[name]++
+		}
+	}
 }
 
-func (s *Engine) oversizeFilePath(qKey string) string {
-	return filepath.Join(s.dir, "oversize", oversizeFileName(qKey))
+func (s *Engine) unregisterInFlight(names ...string) {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	for _, name := range names {
+		if name != "" {
+			s.inFlightOversize[name]--
+			if s.inFlightOversize[name] <= 0 {
+				delete(s.inFlightOversize, name)
+			}
+		}
+	}
 }
 
-func (s *Engine) removeOversizeFile(qKey string) error {
-	p := s.oversizeFilePath(qKey)
-	if err := s.fs.Remove(p); err != nil && !os.IsNotExist(err) {
+func (s *Engine) isInFlight(name string) bool {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	return s.inFlightOversize[name] > 0
+}
+
+// Oversize file lifecycle invariants:
+//  1. Delete only after the pointer is durable: the engine fsyncs the WAL through the
+//     record's LSN before deleting any previous version's file so crash recovery can
+//     always find the previous version if the new record is not yet durable.
+//  2. Register before creating: the writer registers the target file name in the in-flight
+//     registry before creating it on disk so other operations observe it as active.
+//  3. Skip in-flight files: the writer checks the in-flight registry under writerMu and
+//     skips deleting any file that is currently being written.
+func (s *Engine) removeOversizeFileByName(fileName string) error {
+	if fileName == "" {
+		return nil
+	}
+	p := filepath.Join(s.dir, "oversize", fileName)
+	if err := s.fs.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("failed to remove oversize file %s: %w", p, err)
 	}
 	if err := s.fs.SyncDir(filepath.Join(s.dir, "oversize")); err != nil {
@@ -848,232 +870,55 @@ func (s *Engine) removeOversizeFile(qKey string) error {
 	return nil
 }
 
-func encodeOversizeFile(qKey string, lsn uint64, payload []byte) []byte {
-	keyBytes := []byte(qKey)
-	totalLen := OversizeHeaderSize + len(keyBytes) + len(payload)
-	buf := make([]byte, totalLen)
-
-	binary.BigEndian.PutUint32(buf[0:4], OversizeMagic)
-	binary.BigEndian.PutUint32(buf[4:8], OversizeVersion)
-	binary.BigEndian.PutUint64(buf[8:16], lsn)
-	// bytes 16..20 zeroed for CRC
-	binary.BigEndian.PutUint32(buf[20:24], uint32(len(keyBytes)))
-	binary.BigEndian.PutUint32(buf[24:28], uint32(len(payload)))
-
-	copy(buf[OversizeHeaderSize:], keyBytes)
-	copy(buf[OversizeHeaderSize+len(keyBytes):], payload)
-
-	crc := crc32.Checksum(buf, castagnoliTable)
-	binary.BigEndian.PutUint32(buf[16:20], crc)
-	return buf
-}
-
-func decodeOversizeFile(data []byte) (string, uint64, []byte, error) {
-	if len(data) < OversizeHeaderSize {
-		return "", 0, nil, errors.New("oversize file too small")
+func (s *Engine) writeOversizeValueFile(qualifiedKey string, payload []byte) (string, error) {
+	dir := filepath.Join(s.dir, "oversize")
+	if err := s.fs.MkdirAll(dir, StoreDirMode); err != nil {
+		return "", fmt.Errorf("failed to create oversize dir: %w", err)
 	}
 
-	magic := binary.BigEndian.Uint32(data[0:4])
-	ver := binary.BigEndian.Uint32(data[4:8])
-	if magic != OversizeMagic || ver != OversizeVersion {
-		return "", 0, nil, errors.New("invalid oversize magic or version")
-	}
+	fileName := OversizeFileName(qualifiedKey, payload)
+	finalPath := filepath.Join(dir, fileName)
 
-	storedCRC := binary.BigEndian.Uint32(data[16:20])
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-	dataCopy[16] = 0
-	dataCopy[17] = 0
-	dataCopy[18] = 0
-	dataCopy[19] = 0
-
-	actualCRC := crc32.Checksum(dataCopy, castagnoliTable)
-	if storedCRC != actualCRC {
-		return "", 0, nil, errors.New("oversize file CRC mismatch")
-	}
-
-	lsn := binary.BigEndian.Uint64(data[8:16])
-	keyLen := binary.BigEndian.Uint32(data[20:24])
-	payloadLen := binary.BigEndian.Uint32(data[24:28])
-
-	if len(data) < OversizeHeaderSize+int(keyLen)+int(payloadLen) {
-		return "", 0, nil, errors.New("incomplete oversize file body")
-	}
-
-	key := string(data[OversizeHeaderSize : OversizeHeaderSize+keyLen])
-	payload := data[OversizeHeaderSize+keyLen : OversizeHeaderSize+keyLen+payloadLen]
-	return key, lsn, payload, nil
-}
-
-func writeOversizeFileWithTemp(fs FS, storeDir string, qualifiedKey string, lsn uint64, payload []byte) error {
-	dir := filepath.Join(storeDir, "oversize")
-	if err := fs.MkdirAll(dir, StoreDirMode); err != nil {
-		return fmt.Errorf("failed to create oversize dir: %w", err)
-	}
-
-	encoded := encodeOversizeFile(qualifiedKey, lsn, payload)
-	finalPath := filepath.Join(dir, oversizeFileName(qualifiedKey))
-
-	// Atomic write via temp file
-	tempName := fmt.Sprintf(".tmp-%x-%d", sha256.Sum256([]byte(qualifiedKey)), lsn)
+	tempName := fmt.Sprintf(".tmp-%s-%d", fileName, s.inFlightSeq.Add(1))
 	tempPath := filepath.Join(dir, tempName)
 
-	tempFile, err := fs.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
-	if err != nil {
-		return fmt.Errorf("failed to create temp oversize file: %w", err)
+	s.registerInFlight(tempName, fileName)
+
+	cleanup := func(cause error) error {
+		removeErr := s.fs.Remove(tempPath)
+		s.unregisterInFlight(tempName, fileName)
+		return errors.Join(cause, removeErr)
 	}
 
-	if _, err := tempFile.WriteAt(encoded, 0); err != nil {
-		if closeErr := tempFile.Close(); closeErr != nil {
-			err = errors.Join(err, closeErr)
-		}
-		if removeErr := fs.Remove(tempPath); removeErr != nil {
-			err = errors.Join(err, removeErr)
-		}
-		return fmt.Errorf("failed to write temp oversize file: %w", err)
+	tempFile, err := s.fs.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
+	if err != nil {
+		return "", cleanup(fmt.Errorf("failed to create temp oversize file: %w", err))
+	}
+
+	if _, err := tempFile.WriteAt(payload, 0); err != nil {
+		closeErr := tempFile.Close()
+		return "", cleanup(errors.Join(fmt.Errorf("failed to write temp oversize file: %w", err), closeErr))
 	}
 
 	if err := tempFile.Sync(); err != nil {
-		if closeErr := tempFile.Close(); closeErr != nil {
-			err = errors.Join(err, closeErr)
-		}
-		if removeErr := fs.Remove(tempPath); removeErr != nil {
-			err = errors.Join(err, removeErr)
-		}
-		return fmt.Errorf("failed to sync temp oversize file: %w", err)
+		closeErr := tempFile.Close()
+		return "", cleanup(errors.Join(fmt.Errorf("failed to sync temp oversize file: %w", err), closeErr))
 	}
 
 	if err := tempFile.Close(); err != nil {
-		if removeErr := fs.Remove(tempPath); removeErr != nil {
-			err = errors.Join(err, removeErr)
-		}
-		return fmt.Errorf("failed to close temp oversize file: %w", err)
+		return "", cleanup(fmt.Errorf("failed to close temp oversize file: %w", err))
 	}
 
-	if err := fs.Rename(tempPath, finalPath); err != nil {
-		if removeErr := fs.Remove(tempPath); removeErr != nil {
-			err = errors.Join(err, removeErr)
-		}
-		return fmt.Errorf("failed to rename temp oversize file to final: %w", err)
+	if err := s.fs.Rename(tempPath, finalPath); err != nil {
+		return "", cleanup(fmt.Errorf("failed to rename temp oversize file to final: %w", err))
 	}
 
-	if err := fs.SyncDir(dir); err != nil {
-		return fmt.Errorf("failed to sync oversize dir: %w", err)
+	if err := s.fs.SyncDir(dir); err != nil {
+		return "", cleanup(fmt.Errorf("failed to sync oversize dir: %w", err))
 	}
 
-	return nil
-}
-
-func (s *Engine) writeOversizeFile(qualifiedKey string, lsn uint64, payload []byte) error {
-	// Write-ahead rule: fsync WAL through record LSN before publishing oversize file
-	if err := s.wal.SyncThrough(lsn); err != nil {
-		return fmt.Errorf("failed to fsync WAL before publishing oversize file: %w", err)
-	}
-	return writeOversizeFileWithTemp(s.fs, s.dir, qualifiedKey, lsn, payload)
-}
-
-func (s *Engine) loadOversizeObjects() error {
-	oversizeDir := filepath.Join(s.dir, "oversize")
-	entries, err := s.fs.ReadDir(oversizeDir)
-	if err != nil {
-		return err
-	}
-
-	var movedUncommitted bool
-	lostDir := filepath.Join(oversizeDir, "lost+found")
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		filePath := filepath.Join(oversizeDir, name)
-
-		if strings.HasPrefix(name, ".tmp-") {
-			// Clean up abandoned temporary files from previous crashes
-			if removeErr := s.fs.Remove(filePath); removeErr != nil && !os.IsNotExist(removeErr) {
-				return fmt.Errorf("failed to remove abandoned temp file %s: %w", filePath, removeErr)
-			}
-			continue
-		}
-
-		f, err := s.fs.Open(filePath)
-		if err != nil {
-			return fmt.Errorf("failed to open oversize file %s: %w", name, err)
-		}
-		info, err := entry.Info()
-		if err != nil {
-			if closeErr := f.Close(); closeErr != nil {
-				err = errors.Join(err, closeErr)
-			}
-			return fmt.Errorf("failed to stat oversize file %s: %w", name, err)
-		}
-		data := make([]byte, info.Size())
-		if _, readErr := f.ReadAt(data, 0); readErr != nil {
-			if closeErr := f.Close(); closeErr != nil {
-				readErr = errors.Join(readErr, closeErr)
-			}
-			return fmt.Errorf("failed to read oversize file %s: %w", name, readErr)
-		}
-		if closeErr := f.Close(); closeErr != nil {
-			return fmt.Errorf("failed to close oversize file %s: %w", name, closeErr)
-		}
-
-		qKey, lsn, payload, err := decodeOversizeFile(data)
-		if err != nil {
-			return fmt.Errorf("corrupt oversize file %s: %w", name, err)
-		}
-
-		// Do not load oversize files from future uncommitted writes beyond recovered WAL LSN.
-		// Quarantine to lost+found for optional offline recovery/reconstruction.
-		if s.wal != nil && lsn > s.wal.MaxLSN() {
-			if err := s.fs.MkdirAll(lostDir, StoreDirMode); err != nil {
-				return fmt.Errorf("failed to create oversize lost+found dir: %w", err)
-			}
-			dest := uniqueQuarantinePath(lostDir, name)
-			if renameErr := s.fs.Rename(filePath, dest); renameErr != nil {
-				if !errors.Is(renameErr, os.ErrNotExist) {
-					return fmt.Errorf("failed to move uncommitted oversize file %s to %s: %w", filePath, dest, renameErr)
-				}
-				// Safe to ignore if already gone: the file disappeared after ReadDir listed it,
-				// so there is nothing left to load or quarantine.
-			} else {
-				slog.Warn("diskstore: moved uncommitted oversize file", "from", filePath, "to", dest, "lsn", lsn, "recoveredLSN", s.wal.MaxLSN())
-			}
-			movedUncommitted = true
-			continue
-		}
-
-		// Item 2: Loading must respect LSNs
-		if existing, ok := s.keyIndex[qKey]; ok {
-			if !existing.IsOversize || existing.LSN > lsn {
-				continue
-			}
-		}
-
-		s.keyIndex[qKey] = KeyIndexEntry{
-			LogicalPage: 0,
-			Slot:        0,
-			LSN:         lsn,
-			NumBlocks:   0,
-			IsOversize:  true,
-		}
-		s.oversizeObjects[qKey] = bytes.Clone(payload)
-		GlobalMetrics.OversizeObjectsCount.Add(1)
-	}
-	qOpts := s.quarantine
-	qOpts.Dir = lostDir
-	if err := pruneLostFound(s.fs, qOpts); err != nil {
-		return fmt.Errorf("failed to prune oversize lost+found dir: %w", err)
-	}
-	if movedUncommitted {
-		if err := s.fs.SyncDir(lostDir); err != nil {
-			return fmt.Errorf("failed to sync oversize lost+found dir: %w", err)
-		}
-		if err := s.fs.SyncDir(oversizeDir); err != nil {
-			return fmt.Errorf("failed to sync oversize dir after moving uncommitted files: %w", err)
-		}
-	}
-	return nil
+	s.unregisterInFlight(tempName)
+	return fileName, nil
 }
 
 // setFailed transitions the engine into the permanent failed state and notifies listeners.
@@ -1189,16 +1034,116 @@ func (s *Engine) decompress(data []byte) ([]byte, error) {
 	return decompressValue(data, s.maxObjectSize)
 }
 
+func (s *Engine) putRecordIntoSlottedPageLocked(qKey string, payload []byte, lsn uint64, existing KeyIndexEntry, inIndex bool, isOversize bool) (uint64, uint32, error) {
+	var targetPage uint64
+	if inIndex && existing.NumBlocks == 1 && existing.LogicalPage != 0 {
+		targetPage = existing.LogicalPage
+	} else if s.activeSlottedPage != 0 {
+		targetPage = s.activeSlottedPage
+	} else if p, ok := s.emptyPages.Pop(); ok {
+		targetPage = p
+		s.activeSlottedPage = targetPage
+	} else {
+		targetPage = s.nextLogicalPage
+		s.nextLogicalPage++
+		s.activeSlottedPage = targetPage
+	}
+
+	handle, err := s.bp.PinPage(targetPage)
+	if err != nil {
+		handle, err = s.bp.AllocateNewPage(targetPage, 1, lsn)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	handle.Desc.Mu.Lock()
+	slotted, err := WrapSlottedPage(handle.Block(0))
+	if err != nil {
+		handle.Desc.Mu.Unlock()
+		handle.Unpin()
+		return 0, 0, err
+	}
+
+	slotIdx, err := slotted.PutWithFlag(qKey, payload, lsn, isOversize)
+	if err == nil {
+		if inIndex && targetPage == existing.LogicalPage && existing.NumBlocks == 1 && slotIdx != existing.Slot {
+			if delErr := slotted.Delete(existing.Slot, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
+				handle.Desc.Mu.Unlock()
+				handle.Unpin()
+				return 0, 0, delErr
+			}
+		}
+	} else if errors.Is(err, ErrPageFull) {
+		handle.Desc.Mu.Unlock()
+		handle.Unpin()
+
+		// Allocate next slotted page
+		if p, ok := s.emptyPages.Pop(); ok {
+			targetPage = p
+		} else {
+			targetPage = s.nextLogicalPage
+			s.nextLogicalPage++
+		}
+		s.activeSlottedPage = targetPage
+
+		handle, err = s.bp.AllocateNewPage(targetPage, 1, lsn)
+		if err != nil {
+			return 0, 0, err
+		}
+
+		handle.Desc.Mu.Lock()
+		slotted, err = WrapSlottedPage(handle.Block(0))
+		if err != nil {
+			handle.Desc.Mu.Unlock()
+			handle.Unpin()
+			return 0, 0, err
+		}
+		slotIdx, err = slotted.PutWithFlag(qKey, payload, lsn, isOversize)
+		if err != nil {
+			handle.Desc.Mu.Unlock()
+			handle.Unpin()
+			return 0, 0, err
+		}
+	} else {
+		handle.Desc.Mu.Unlock()
+		handle.Unpin()
+		return 0, 0, err
+	}
+
+	slotted.Finalize()
+	handle.Desc.Mu.Unlock()
+	s.bp.MarkDirty(targetPage, lsn)
+	handle.Unpin()
+
+	// If old record was on a different page, delete its slot or clear its page
+	if inIndex && (targetPage != existing.LogicalPage || existing.NumBlocks > 1) {
+		if existing.NumBlocks == 1 && existing.LogicalPage != 0 {
+			if delErr := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); delErr != nil {
+				return 0, 0, delErr
+			}
+		} else if existing.NumBlocks > 1 {
+			if clrErr := s.clearLogicalPageLocked(existing.LogicalPage, lsn); clrErr != nil {
+				return 0, 0, clrErr
+			}
+		}
+	}
+
+	return targetPage, slotIdx, nil
+}
+
 // Put writes an object to the engine, encrypting if a cipher is configured.
 func (s *Engine) Put(tableName, key string, payload []byte) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
 
-	s.writerMu.Lock()
-	defer s.writerMu.Unlock()
-
 	qKey := qualifyKey(tableName, key)
+
+	// Validate key length: a key over 65535 bytes cannot fit in the 16-bit key length field.
+	if len(qKey) > 65535 {
+		return ErrObjectOversize
+	}
 
 	// Compress payload
 	compressed, err := s.compress(payload)
@@ -1219,13 +1164,114 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		toStore = encrypted
 	}
 
+	// Handle oversize object: records exceeding 512-block multi-block capacity persist to disk under oversize directory
+	if !fitsInMultiBlockPage(len(qKey), len(toStore)) {
+		fileName := OversizeFileName(qKey, toStore)
+		checksum := OversizeHash(qKey, toStore)
+
+		s.keyMu.RLock()
+		existing, inIndex := s.keyIndex[qKey]
+		s.keyMu.RUnlock()
+
+		skipWrite := inIndex && existing.IsOversize && existing.OversizeFileName == fileName
+		if !skipWrite {
+			if _, err := s.writeOversizeValueFile(qKey, toStore); err != nil {
+				return err
+			}
+		}
+
+		s.writerMu.Lock()
+		defer s.writerMu.Unlock()
+
+		if !skipWrite {
+			defer s.unregisterInFlight(fileName)
+		}
+
+		if s.isFailed() {
+			return s.failErr()
+		}
+
+		s.keyMu.RLock()
+		existing, inIndex = s.keyIndex[qKey]
+		s.keyMu.RUnlock()
+
+		// Re-check the skip decision under writerMu lock.
+		// If the index changed while waiting for the lock, write the file now.
+		if skipWrite && (!inIndex || !existing.IsOversize || existing.OversizeFileName != fileName) {
+			if _, err := s.writeOversizeValueFile(qKey, toStore); err != nil {
+				return err
+			}
+			defer s.unregisterInFlight(fileName)
+		}
+
+		var oldOversizeFile string
+		if inIndex && existing.IsOversize && existing.OversizeFileName != fileName {
+			oldOversizeFile = existing.OversizeFileName
+		}
+
+		ptrPayload := EncodeOversizePointer(uint64(len(toStore)), checksum, fileName)
+		rec := Record{
+			Type:    RecordTypePutPointer,
+			Key:     qKey,
+			Payload: ptrPayload,
+		}
+		lsn, err := s.wal.AppendRecord(&rec)
+		if err != nil {
+			s.setFailed(err)
+			return s.failErr()
+		}
+
+		targetPage, slotIdx, putErr := s.putRecordIntoSlottedPageLocked(qKey, ptrPayload, lsn, existing, inIndex, true)
+		if putErr != nil {
+			s.setFailed(putErr)
+			return s.failErr()
+		}
+
+		s.keyMu.Lock()
+		wasOversize := inIndex && existing.IsOversize
+		s.keyIndex[qKey] = KeyIndexEntry{
+			LogicalPage:      targetPage,
+			Slot:             slotIdx,
+			LSN:              lsn,
+			NumBlocks:        1,
+			IsOversize:       true,
+			OversizeFileName: fileName,
+		}
+		s.oversizeObjects[qKey] = bytes.Clone(toStore)
+		if !wasOversize {
+			GlobalMetrics.OversizeObjectsCount.Add(1)
+		}
+		s.keyMu.Unlock()
+
+		// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
+		if oldOversizeFile != "" && !s.isInFlight(oldOversizeFile) {
+			if err := s.wal.SyncThrough(lsn); err != nil {
+				s.setFailed(err)
+				return s.failErr()
+			}
+			if err := s.removeOversizeFileByName(oldOversizeFile); err != nil {
+				s.setFailed(err)
+				return s.failErr()
+			}
+		}
+
+		return nil
+	}
+
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+
+	if s.isFailed() {
+		return s.failErr()
+	}
+
 	s.keyMu.RLock()
 	existing, inIndex := s.keyIndex[qKey]
 	s.keyMu.RUnlock()
 
-	// Validate key length: a key over 65535 bytes cannot fit in the 16-bit key length field.
-	if len(qKey) > 65535 {
-		return ErrObjectOversize
+	var oldOversizeFile string
+	if inIndex && existing.IsOversize {
+		oldOversizeFile = existing.OversizeFileName
 	}
 
 	// Append record to WAL, assigning LSN under WAL lock
@@ -1240,49 +1286,8 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		return s.failErr()
 	}
 
-	// Handle oversize object: records exceeding 512-block multi-block capacity persist to disk under oversize directory
-	if !fitsInMultiBlockPage(len(qKey), len(toStore)) {
-		if inIndex {
-			if !existing.IsOversize {
-				if existing.NumBlocks == 1 {
-					if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
-						s.setFailed(err)
-						return s.failErr()
-					}
-				} else {
-					if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
-						s.setFailed(err)
-						return s.failErr()
-					}
-				}
-			}
-		}
-
-		if err := s.writeOversizeFile(qKey, lsn, toStore); err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
-
-		s.keyMu.Lock()
-		s.keyIndex[qKey] = KeyIndexEntry{
-			LogicalPage: 0,
-			Slot:        0,
-			LSN:         lsn,
-			NumBlocks:   0,
-			IsOversize:  true,
-		}
-		s.oversizeObjects[qKey] = bytes.Clone(toStore)
-		s.keyMu.Unlock()
-		GlobalMetrics.OversizeObjectsCount.Add(1)
-		return nil
-	}
-
 	// Transition from oversize to standard page
-	if inIndex && existing.IsOversize {
-		if err := s.removeOversizeFile(qKey); err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
+	if oldOversizeFile != "" {
 		s.keyMu.Lock()
 		delete(s.oversizeObjects, qKey)
 		GlobalMetrics.OversizeObjectsCount.Add(-1)
@@ -1291,113 +1296,10 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 
 	// Check if this object fits in a 1-block slotted page
 	if CanFitInSlottedPage(len(qKey), len(toStore)) {
-		// Use or allocate a slotted page
-		var targetPage uint64
-		if inIndex && !existing.IsOversize && existing.NumBlocks == 1 {
-			targetPage = existing.LogicalPage
-		} else if s.activeSlottedPage != 0 {
-			targetPage = s.activeSlottedPage
-		} else if p, ok := s.emptyPages.Pop(); ok {
-			targetPage = p
-			s.activeSlottedPage = targetPage
-		} else {
-			targetPage = s.nextLogicalPage
-			s.nextLogicalPage++
-			s.activeSlottedPage = targetPage
-		}
-
-		handle, err := s.bp.PinPage(targetPage)
-		if err != nil {
-			handle, err = s.bp.AllocateNewPage(targetPage, 1, lsn)
-			if err != nil {
-				s.setFailed(err)
-				return s.failErr()
-			}
-		}
-
-		handle.Desc.Mu.Lock()
-		slotted, err := WrapSlottedPage(handle.Block(0))
-		if err != nil {
-			handle.Desc.Mu.Unlock()
-			handle.Unpin()
-			s.setFailed(err)
+		targetPage, slotIdx, putErr := s.putRecordIntoSlottedPageLocked(qKey, toStore, lsn, existing, inIndex, false)
+		if putErr != nil {
+			s.setFailed(putErr)
 			return s.failErr()
-		}
-
-		slotIdx, err := slotted.Put(qKey, toStore, lsn)
-		if err == nil {
-			if inIndex && !existing.IsOversize && targetPage == existing.LogicalPage && slotIdx != existing.Slot {
-				if delErr := slotted.Delete(existing.Slot, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
-					handle.Desc.Mu.Unlock()
-					handle.Unpin()
-					s.setFailed(delErr)
-					return s.failErr()
-				}
-			}
-		} else {
-			// Page is full; allocate a fresh slotted page and update activeSlottedPage
-			handle.Desc.Mu.Unlock()
-			handle.Unpin()
-
-			// If old record was on another page, delete it from old page
-			if inIndex && !existing.IsOversize && existing.NumBlocks == 1 {
-				if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
-					s.setFailed(err)
-					return s.failErr()
-				}
-			} else if inIndex && !existing.IsOversize && existing.NumBlocks > 1 {
-				if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
-					s.setFailed(err)
-					return s.failErr()
-				}
-			}
-
-			if p, ok := s.emptyPages.Pop(); ok {
-				targetPage = p
-			} else {
-				targetPage = s.nextLogicalPage
-				s.nextLogicalPage++
-			}
-			s.activeSlottedPage = targetPage
-			handle, err = s.bp.AllocateNewPage(targetPage, 1, lsn)
-			if err != nil {
-				s.setFailed(err)
-				return s.failErr()
-			}
-			handle.Desc.Mu.Lock()
-			slotted, err = WrapSlottedPage(handle.Block(0))
-			if err != nil {
-				handle.Desc.Mu.Unlock()
-				handle.Unpin()
-				s.setFailed(err)
-				return s.failErr()
-			}
-			slotIdx, err = slotted.Put(qKey, toStore, lsn)
-			if err != nil {
-				handle.Desc.Mu.Unlock()
-				handle.Unpin()
-				s.setFailed(err)
-				return s.failErr()
-			}
-		}
-
-		slotted.Finalize()
-		handle.Desc.Mu.Unlock()
-		s.bp.MarkDirty(targetPage, lsn)
-		handle.Unpin()
-
-		if err == nil && inIndex && !existing.IsOversize && targetPage != existing.LogicalPage {
-			if existing.NumBlocks == 1 {
-				if delErr := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); delErr != nil {
-					s.setFailed(delErr)
-					return s.failErr()
-				}
-			} else if existing.NumBlocks > 1 {
-				if clrErr := s.clearLogicalPageLocked(existing.LogicalPage, lsn); clrErr != nil {
-					s.setFailed(clrErr)
-					return s.failErr()
-				}
-			}
 		}
 
 		s.keyMu.Lock()
@@ -1417,12 +1319,12 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 
 		// If replacing an existing slotted or multi-block record, clean up old location (Item 15)
 		if inIndex {
-			if !existing.IsOversize && existing.NumBlocks == 1 {
+			if existing.NumBlocks == 1 {
 				if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
 					s.setFailed(err)
 					return s.failErr()
 				}
-			} else if !existing.IsOversize && existing.NumBlocks > 1 {
+			} else if existing.NumBlocks > 1 {
 				if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
 					s.setFailed(err)
 					return s.failErr()
@@ -1468,6 +1370,19 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		}
 		s.keyMu.Unlock()
 	}
+
+	// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
+	if oldOversizeFile != "" && !s.isInFlight(oldOversizeFile) {
+		if err := s.wal.SyncThrough(lsn); err != nil {
+			s.setFailed(err)
+			return s.failErr()
+		}
+		if err := s.removeOversizeFileByName(oldOversizeFile); err != nil {
+			s.setFailed(err)
+			return s.failErr()
+		}
+	}
+
 	return nil
 }
 
@@ -1627,7 +1542,67 @@ func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry
 		data, ok := s.oversizeObjects[qKey]
 		s.keyMu.RUnlock()
 		if !ok {
-			return nil, false, nil
+			handle, err := s.bp.PinPage(entry.LogicalPage)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to pin page %d for key %s: %w", entry.LogicalPage, key, err)
+			}
+			handle.Desc.Mu.RLock()
+			var rawPtr []byte
+			var isSlotOversize bool
+			slotted, wrapErr := WrapSlottedPage(handle.Block(0))
+			if wrapErr == nil {
+				var raw []byte
+				_, raw, _, isSlotOversize, err = slotted.GetWithFlag(entry.Slot)
+				if err == nil {
+					rawPtr = bytes.Clone(raw)
+				}
+			} else {
+				err = wrapErr
+			}
+			handle.Desc.Mu.RUnlock()
+			handle.Unpin()
+
+			if err != nil || !isSlotOversize {
+				return nil, false, fmt.Errorf("%w: missing or invalid oversize slot %d on page %d: %v", ErrCorruptStore, entry.Slot, entry.LogicalPage, err)
+			}
+
+			expectedLen, expectedChecksum, fileName, decodeErr := DecodeOversizePointer(rawPtr)
+			if decodeErr != nil {
+				return nil, false, fmt.Errorf("%w: failed to decode oversize pointer: %v", ErrCorruptStore, decodeErr)
+			}
+
+			p := filepath.Join(s.dir, "oversize", fileName)
+			f, openErr := s.fs.Open(p)
+			if openErr != nil {
+				return nil, false, fmt.Errorf("%w: missing oversize file %s: %v", ErrCorruptStore, fileName, openErr)
+			}
+			sz, sizeErr := f.Size()
+			if sizeErr != nil {
+				closeErr := f.Close()
+				return nil, false, fmt.Errorf("%w: failed to get size of oversize file %s: %v", ErrCorruptStore, fileName, errors.Join(sizeErr, closeErr))
+			}
+			if uint64(sz) != expectedLen {
+				closeErr := f.Close()
+				return nil, false, errors.Join(fmt.Errorf("%w: oversize file %s size mismatch (want %d, got %d)", ErrCorruptStore, fileName, expectedLen, sz), closeErr)
+			}
+			fileData := make([]byte, sz)
+			if _, readErr := f.ReadAt(fileData, 0); readErr != nil && !errors.Is(readErr, io.EOF) {
+				closeErr := f.Close()
+				return nil, false, fmt.Errorf("%w: failed to read oversize file %s: %v", ErrCorruptStore, fileName, errors.Join(readErr, closeErr))
+			}
+			if closeErr := f.Close(); closeErr != nil {
+				return nil, false, fmt.Errorf("%w: failed to close oversize file %s: %v", ErrCorruptStore, fileName, closeErr)
+			}
+
+			actualChecksum := OversizeHash(qKey, fileData)
+			if actualChecksum != expectedChecksum {
+				return nil, false, fmt.Errorf("%w: corrupt oversize file %s (checksum mismatch)", ErrCorruptStore, fileName)
+			}
+
+			data = fileData
+			s.keyMu.Lock()
+			s.oversizeObjects[qKey] = bytes.Clone(data)
+			s.keyMu.Unlock()
 		}
 		res := bytes.Clone(data)
 		if s.cipher != nil {
@@ -1734,9 +1709,23 @@ func (s *Engine) Delete(tableName, key string) error {
 	}
 
 	if entry.IsOversize {
-		if err := s.removeOversizeFile(qKey); err != nil {
-			s.setFailed(err)
-			return s.failErr()
+		if entry.NumBlocks == 1 && entry.LogicalPage != 0 {
+			if err := s.deleteSlotFromPageLocked(entry.LogicalPage, entry.Slot, lsn); err != nil {
+				s.setFailed(err)
+				return s.failErr()
+			}
+		}
+
+		// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
+		if entry.OversizeFileName != "" && !s.isInFlight(entry.OversizeFileName) {
+			if err := s.wal.SyncThrough(lsn); err != nil {
+				s.setFailed(err)
+				return s.failErr()
+			}
+			if err := s.removeOversizeFileByName(entry.OversizeFileName); err != nil {
+				s.setFailed(err)
+				return s.failErr()
+			}
 		}
 	} else {
 		if entry.NumBlocks == 1 {

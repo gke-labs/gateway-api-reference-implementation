@@ -856,135 +856,6 @@ func TestRegression_RecoveryStep6ReuseRule(t *testing.T) {
 	}
 }
 
-func TestRegression_OversizeUncommittedDiscard(t *testing.T) {
-	memFS := NewMemFS()
-	dir := "test_oversize_uncommitted"
-
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-
-	payload1 := append([]byte("valid-oversize-v1"), make([]byte, 2100*1024)...)
-	if err := store.Put("ConfigMap", "largeKey", payload1); err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	oversizeDir := filepath.Join(dir, "oversize")
-	uncommittedQKey := qualifyKey("ConfigMap", "uncommittedKey")
-	uncommittedFile := filepath.Join(oversizeDir, oversizeFileName(uncommittedQKey))
-	uncommittedPayload := make([]byte, 1+2100*1024)
-	uncommittedPayload[0] = byte(CodecNone)
-	copy(uncommittedPayload[1:], "uncommitted-future-data")
-	encoded := encodeOversizeFile(uncommittedQKey, 999, uncommittedPayload)
-
-	f, err := memFS.OpenFile(uncommittedFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		t.Fatalf("OpenFile failed: %v", err)
-	}
-	_, writeErr := f.WriteAt(encoded, 0)
-	closeErr := f.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
-		t.Fatalf("write uncommitted file failed: %v", err)
-	}
-
-	// Reopen store. Recovery must quarantine the uncommitted oversize file whose LSN exceeds WAL max LSN.
-	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
-	if err != nil {
-		t.Fatalf("Reopen failed: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := store2.Close(); err != nil {
-			t.Errorf("store2.Close failed: %v", err)
-		}
-	})
-
-	val, exists, err := store2.Get("ConfigMap", "largeKey")
-	if err != nil {
-		t.Fatalf("Get largeKey error: %v", err)
-	}
-	if !exists {
-		t.Fatalf("expected largeKey to exist at LSN 1")
-	}
-	if !bytes.HasPrefix(val, []byte("valid-oversize-v1")) {
-		t.Fatalf("unexpected value for largeKey: len=%d", len(val))
-	}
-
-	if _, exists, err := store2.Get("ConfigMap", "uncommittedKey"); err != nil || exists {
-		t.Fatalf("uncommitted future oversize file loaded into index: exists=%v, err=%v", exists, err)
-	}
-
-	// Uncommitted oversize file must be moved out of oversize directory into lost+found
-	if f, err := memFS.Open(uncommittedFile); err == nil {
-		if err := f.Close(); err != nil {
-			t.Errorf("Close failed: %v", err)
-		}
-		t.Fatalf("expected uncommitted oversize file to be moved from %s", uncommittedFile)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected os.ErrNotExist, got err: %v", err)
-	}
-
-	lostDir := filepath.Join(oversizeDir, "lost+found")
-	entries, err := memFS.ReadDir(lostDir)
-	if err != nil || len(entries) == 0 {
-		t.Fatalf("expected quarantined file in %s, err=%v, count=%d", lostDir, err, len(entries))
-	}
-}
-
-func TestRegression_OversizeRedoRecreate(t *testing.T) {
-	memFS := NewMemFS()
-	dir := "test_oversize_redo_recreate"
-
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-
-	payload := make([]byte, 2100*1024)
-	copy(payload, "recreated-from-wal-payload")
-	if err := store.Put("ConfigMap", "largeKey", payload); err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
-	if err := store.Sync(); err != nil {
-		t.Fatalf("Sync failed: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	// Delete the oversize file from disk to simulate missing file
-	qualifiedKey := qualifyKey("ConfigMap", "largeKey")
-	oversizePath := filepath.Join(dir, "oversize", oversizeFileName(qualifiedKey))
-	if err := memFS.Remove(oversizePath); err != nil {
-		t.Fatalf("Remove failed: %v", err)
-	}
-
-	// Reopen store: WAL redo must recreate the oversize file from the WAL payload
-	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
-	if err != nil {
-		t.Fatalf("Reopen failed: %v", err)
-	}
-	defer func() {
-		if closeErr := store2.Close(); closeErr != nil {
-			t.Errorf("store2.Close failed: %v", closeErr)
-		}
-	}()
-
-	val, exists, err := store2.Get("ConfigMap", "largeKey")
-	if err != nil {
-		t.Fatalf("Get error: %v", err)
-	}
-	if !exists {
-		t.Fatalf("expected largeKey to exist after redo recreation")
-	}
-	if !bytes.HasPrefix(val, []byte("recreated-from-wal-payload")) {
-		t.Fatalf("content mismatch: got %q", string(val[:30]))
-	}
-}
-
 func setupDeletedOversizeStore(t *testing.T, dir string) (*MemFS, string, []byte, [16]byte) {
 	t.Helper()
 	memFS := NewMemFS()
@@ -1005,7 +876,8 @@ func setupDeletedOversizeStore(t *testing.T, dir string) (*MemFS, string, []byte
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	qKey := qualifyKey("ConfigMap", "largeKey")
-	oversizePath := filepath.Join(dir, "oversize", oversizeFileName(qKey))
+	fileName := store.keyIndex[qKey].OversizeFileName
+	oversizePath := filepath.Join(dir, "oversize", fileName)
 
 	memFS.mu.RLock()
 	oversizeData := append([]byte(nil), memFS.files[oversizePath]...)
@@ -1045,37 +917,5 @@ func TestRegression_OversizeNoResurrectionAcrossCheckpointTruncation(t *testing.
 
 	if _, exists, err := store.Get("ConfigMap", "largeKey"); err != nil || exists {
 		t.Fatalf("deleted oversize key resurrected after recovery (exists=%v, err=%v)", exists, err)
-	}
-}
-
-func TestRegression_OversizeUndecodableHeaderPreserved(t *testing.T) {
-	const dir = "test_oversize_undecodable"
-	memFS, oversizePath, _, dbID := setupDeletedOversizeStore(t, dir)
-
-	// Leave a truncated (undecodable) oversize file in place.
-	memFS.mu.Lock()
-	memFS.files[oversizePath] = []byte("short-header")
-	memFS.mu.Unlock()
-
-	heapFile, err := memFS.OpenFile(filepath.Join(dir, "heap.db"), os.O_RDWR, 0644)
-	if err != nil {
-		t.Fatalf("OpenFile heap failed: %v", err)
-	}
-	t.Cleanup(func() {
-		if closeErr := heapFile.Close(); closeErr != nil {
-			t.Errorf("Close failed: %v", closeErr)
-		}
-	})
-
-	// Recovery must succeed without aborting, leaving the damaged file in place.
-	if _, err := Recover(memFS, heapFile, dir, filepath.Join(dir, "wal"), dbID); err != nil {
-		t.Fatalf("Recover failed on undecodable oversize file: %v", err)
-	}
-
-	memFS.mu.RLock()
-	_, exists := memFS.files[oversizePath]
-	memFS.mu.RUnlock()
-	if !exists {
-		t.Fatalf("expected undecodable oversize file to remain on disk, but was removed")
 	}
 }

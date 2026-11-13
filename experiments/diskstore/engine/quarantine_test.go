@@ -170,29 +170,22 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	oversizeDir := filepath.Join(dir, "oversize")
-	lostDir := filepath.Join(oversizeDir, "lost+found")
+	walDir := filepath.Join(dir, "wal")
+	lostDir := filepath.Join(walDir, "lost+found")
 
-	writeUncommitted := func(key string, lsn uint64) string {
-		qKey := qualifyKey("ConfigMap", key)
-		payload := append([]byte("uncommitted-data"), make([]byte, 2100*1024)...)
-		payload[0] = byte(CodecNone)
-		encoded := encodeOversizeFile(qKey, lsn, payload)
-		fileName := oversizeFileName(qKey)
-		filePath := filepath.Join(oversizeDir, fileName)
+	writeAbandoned := func(startLSN uint64) string {
+		fileName := segmentFileName(startLSN)
+		filePath := filepath.Join(walDir, fileName)
 		f, err := memFS.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
 		if err != nil {
 			t.Fatalf("OpenFile failed: %v", err)
-		}
-		if _, err := f.WriteAt(encoded, 0); err != nil {
-			t.Fatalf("WriteAt failed: %v", err)
 		}
 		_ = f.Close()
 		return fileName
 	}
 
 	// 1. First uncommitted file quarantined
-	f1 := writeUncommitted("key1", 101)
+	f1 := writeAbandoned(101)
 	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
 	if err != nil {
 		t.Fatalf("Open 1 failed: %v", err)
@@ -200,7 +193,7 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 	_ = s1.Close()
 
 	// 2. Second uncommitted file quarantined
-	f2 := writeUncommitted("key2", 102)
+	f2 := writeAbandoned(102)
 	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
 	if err != nil {
 		t.Fatalf("Open 2 failed: %v", err)
@@ -208,7 +201,7 @@ func TestLostFound_QuarantineBound(t *testing.T) {
 	_ = s2.Close()
 
 	// 3. Third uncommitted file quarantined (exceeds bound of 2)
-	f3 := writeUncommitted("key3", 103)
+	f3 := writeAbandoned(103)
 	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2), WithMinQuarantinedRetention(-1))
 	if err != nil {
 		t.Fatalf("Open 3 failed: %v", err)
@@ -262,43 +255,36 @@ func TestLostFound_MinRetentionProtected(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	oversizeDir := filepath.Join(dir, "oversize")
-	lostDir := filepath.Join(oversizeDir, "lost+found")
+	walDir := filepath.Join(dir, "wal")
+	lostDir := filepath.Join(walDir, "lost+found")
 
-	writeUncommitted := func(key string, lsn uint64) string {
-		qKey := qualifyKey("ConfigMap", key)
-		payload := append([]byte("uncommitted-data"), make([]byte, 2100*1024)...)
-		payload[0] = byte(CodecNone)
-		encoded := encodeOversizeFile(qKey, lsn, payload)
-		fileName := oversizeFileName(qKey)
-		filePath := filepath.Join(oversizeDir, fileName)
+	writeAbandoned := func(startLSN uint64) string {
+		fileName := segmentFileName(startLSN)
+		filePath := filepath.Join(walDir, fileName)
 		f, err := memFS.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
 		if err != nil {
 			t.Fatalf("OpenFile failed: %v", err)
-		}
-		if _, err := f.WriteAt(encoded, 0); err != nil {
-			t.Fatalf("WriteAt failed: %v", err)
 		}
 		_ = f.Close()
 		return fileName
 	}
 
 	// Quarantine 3 files under default 7-day retention
-	writeUncommitted("key1", 101)
+	writeAbandoned(101)
 	s1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
 	if err != nil {
 		t.Fatalf("Open 1 failed: %v", err)
 	}
 	_ = s1.Close()
 
-	writeUncommitted("key2", 102)
+	writeAbandoned(102)
 	s2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
 	if err != nil {
 		t.Fatalf("Open 2 failed: %v", err)
 	}
 	_ = s2.Close()
 
-	writeUncommitted("key3", 103)
+	writeAbandoned(103)
 	s3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithMaxQuarantinedFiles(2))
 	if err != nil {
 		t.Fatalf("Open 3 failed: %v", err)
