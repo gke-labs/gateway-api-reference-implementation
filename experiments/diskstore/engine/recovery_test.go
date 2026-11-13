@@ -76,7 +76,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 	reopenedHeap, _ := faultFS.OpenFile("heap.db", 0, 0)
 	defer reopenedHeap.Close()
 
-	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
+	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID, RecoveryOptions{})
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestRecovery_InvalidMagicBlocks(t *testing.T) {
 	_ = heapFile.Sync()
 
 	// Run recovery
-	res, err := Recover(faultFS, heapFile, ".", "wal_dir", dbID)
+	res, err := Recover(faultFS, heapFile, ".", "wal_dir", dbID, RecoveryOptions{})
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	reopenedHeap, _ := faultFS.OpenFile("heap.db", 0, 0)
 	defer reopenedHeap.Close()
 
-	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
+	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID, RecoveryOptions{})
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 		}
 	}()
 
-	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
+	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID, RecoveryOptions{})
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -590,7 +590,7 @@ func TestRegression_Item4_HighestLSNKeySelection(t *testing.T) {
 		}
 	}()
 
-	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID)
+	res, err := Recover(faultFS, reopenedHeap, ".", "wal_dir", dbID, RecoveryOptions{})
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
@@ -904,7 +904,7 @@ func TestRegression_RecoveryStep6ReuseRule(t *testing.T) {
 		},
 	}
 
-	_, err = Recover(memFS, trackingHeap, ".", "wal", dbID)
+	_, err = Recover(memFS, trackingHeap, ".", "wal", dbID, RecoveryOptions{})
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
 	}
