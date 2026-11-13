@@ -884,6 +884,73 @@ func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
 	}
 }
 
+func TestState_PublishDataplaneConfig_PlainError(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	plainErr := errors.New("simulated publish failure")
+	mockPub := &mockDataplanePublisher{
+		publishErr: plainErr,
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// 1. Initial publish fails with a plain error, which records the provisioning error.
+	// Wait for the Gateway condition to show Programmed=False with the error message.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionFalse && progCond.Message == plainErr.Error()
+	})
+
+	// 2. Failure resolved: publisher succeeds, clearing the recorded error.
+	mockPub.setPublishErr(nil)
+
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil && progCond.Status == metav1.ConditionTrue && progCond.Reason == string(gatewayv1.GatewayReasonProgrammed)
+	})
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
 type retryTestPublisher struct {
 	mu                sync.Mutex
 	failCount         int
