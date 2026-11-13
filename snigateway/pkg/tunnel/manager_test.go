@@ -80,11 +80,6 @@ func TestManager_EndToEnd(t *testing.T) {
 	}
 	serverAddr := ln.Addr().String()
 
-	pc, err := net.ListenPacket("udp", serverAddr)
-	if err != nil {
-		t.Fatalf("net.ListenPacket failed: %v", err)
-	}
-
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
@@ -97,7 +92,7 @@ func TestManager_EndToEnd(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+		_ = srv.Serve(ln)
 	}()
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
@@ -402,11 +397,6 @@ func TestManager_SessionReconnect(t *testing.T) {
 	}
 	serverAddr := ln.Addr().String()
 
-	pc, err := net.ListenPacket("udp", serverAddr)
-	if err != nil {
-		t.Fatalf("net.ListenPacket failed: %v", err)
-	}
-
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
@@ -419,7 +409,7 @@ func TestManager_SessionReconnect(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+		_ = srv.Serve(ln)
 	}()
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
@@ -654,7 +644,7 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		_ = srv.ServeAll([]net.Listener{ln}, nil)
+		_ = srv.Serve(ln)
 	}()
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
@@ -977,11 +967,6 @@ func TestManager_H2BackendShutdownGOAWAY(t *testing.T) {
 	}
 	serverAddr := ln.Addr().String()
 
-	pc, err := net.ListenPacket("udp", serverAddr)
-	if err != nil {
-		t.Fatalf("net.ListenPacket failed: %v", err)
-	}
-
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
@@ -994,7 +979,7 @@ func TestManager_H2BackendShutdownGOAWAY(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+		_ = srv.Serve(ln)
 	}()
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
@@ -1201,11 +1186,6 @@ func TestManager_H2BackendDrainTimeoutForceCloses(t *testing.T) {
 	}
 	serverAddr := ln.Addr().String()
 
-	pc, err := net.ListenPacket("udp", serverAddr)
-	if err != nil {
-		t.Fatalf("net.ListenPacket failed: %v", err)
-	}
-
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
@@ -1218,7 +1198,7 @@ func TestManager_H2BackendDrainTimeoutForceCloses(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+		_ = srv.Serve(ln)
 	}()
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")

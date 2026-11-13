@@ -255,12 +255,6 @@ func (s *Server) Serve(listeners ...net.Listener) error {
 	}
 }
 
-// ServeAll serves TCP client traffic on the given listeners.
-// The udpConns parameter is ignored as UDP tunnel transport has been removed.
-func (s *Server) ServeAll(listeners []net.Listener, _ []net.PacketConn) error {
-	return s.Serve(listeners...)
-}
-
 // Close gracefully closes all listeners and stops the server.
 func (s *Server) Close() error {
 	s.listenersMu.Lock()

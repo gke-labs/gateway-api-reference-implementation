@@ -1169,11 +1169,6 @@ func setupTestServerWithConfig(t *testing.T, modifyCfg func(*ServerConfig)) (*Se
 
 	serverAddr := ln.Addr().String()
 
-	pc, err := net.ListenPacket("udp", serverAddr)
-	if err != nil {
-		t.Fatalf("ListenPacket failed: %v", err)
-	}
-
 	cfg := ServerConfig{
 		ServerTLSConfig:   serverTLS,
 		InternalHostname:  "snigateway.internal",
@@ -1191,7 +1186,7 @@ func setupTestServerWithConfig(t *testing.T, modifyCfg func(*ServerConfig)) (*Se
 	}
 
 	go func() {
-		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+		_ = srv.Serve(ln)
 	}()
 
 	cleanup := func() {
