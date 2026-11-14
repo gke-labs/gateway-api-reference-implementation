@@ -39,6 +39,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testdataplane"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -1974,7 +1975,10 @@ func TestDataplaneSecretReconciler_MissingSecretLeavesProxyNotSynced(t *testing.
 	}
 }
 
-func TestInProcessDataplanePublisher_RoutesAndCertificates(t *testing.T) {
+func TestDataplane_RoutesAndCertificates(t *testing.T) {
+	env := testenv.Start(t)
+	ctx := t.Context()
+
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("backend ok"))
@@ -1993,15 +1997,26 @@ func TestInProcessDataplanePublisher_RoutesAndCertificates(t *testing.T) {
 		t.Fatalf("failed to generate cert: %v", err)
 	}
 
-	p := proxy.NewProxy()
-	publisher := state.NewInProcessDataplanePublisher(p)
-
-	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
+	const (
+		gwNamespace = "default"
+		gwName      = "test-gw"
+	)
+	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "test-ns",
-			Name:      "test-gw",
+			Namespace: gwNamespace,
+			Name:      gwName,
 		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+	if err := env.Client.Create(ctx, gw); err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
 	}
 	route := state.InternalRoute{
 		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
@@ -2028,46 +2043,184 @@ func TestInProcessDataplanePublisher_RoutesAndCertificates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildDataplaneConfig failed: %v", err)
 	}
+	dpConfig.Revision, err = dpConfig.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision failed: %v", err)
+	}
 
-	ctx := t.Context()
-	// Full in-process path: publisher.PublishDataplaneConfig -> serialize -> ApplyDataplaneConfig -> proxy
+	publisher := singlepod.NewAddressProvider(env.Client)
 	if err := publisher.PublishDataplaneConfig(ctx, gw, dpConfig); err != nil {
 		t.Fatalf("PublishDataplaneConfig failed: %v", err)
 	}
 
-	// 1. Assert proxy serves the compiled route
-	reqHTTP, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/ok", nil)
+	dp := testdataplane.StartDataplane(t, env, gwNamespace, gwName)
+	initialPID := dp.PID
+
+	// 1. Assert proxy serves the compiled backend route
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+dp.HTTPAddress+"/ok", nil)
 	if err != nil {
-		t.Fatalf("failed to create request: %v", err)
+		t.Fatalf("creating request: %v", err)
 	}
-	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, reqHTTP)
-	if rec.Code != http.StatusOK {
-		t.Errorf("expected 200 OK from proxy, got %d", rec.Code)
+	req.Host = "example.com"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request through subprocess failed: %v", err)
 	}
-	if rec.Body.String() != "backend ok" {
-		t.Errorf("expected 'backend ok' body, got %q", rec.Body.String())
+	body, readErr := io.ReadAll(resp.Body)
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		t.Errorf("closing response body: %v", closeErr)
+	}
+	if readErr != nil {
+		t.Fatalf("reading response body: %v", readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK from proxy, got %d", resp.StatusCode)
+	}
+	if string(body) != "backend ok" {
+		t.Errorf("expected 'backend ok' body, got %q", string(body))
 	}
 
-	// 2. Assert proxy serves the compiled certificates
-	gotCert, err := p.GetCertificate(&tls.ClientHelloInfo{ServerName: "https.example.com"})
+	// 2. Assert proxy serves the compiled certificates on HTTPS listener
+	httpsClient := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         "https.example.com",
+			},
+		},
+	}
+	reqHTTPS, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+dp.HTTPSAddress+"/", nil)
 	if err != nil {
-		t.Fatalf("GetCertificate failed: %v", err)
+		t.Fatalf("creating https request: %v", err)
 	}
-	if gotCert == nil || len(gotCert.Certificate) == 0 {
-		t.Fatalf("expected non-nil certificate for https.example.com")
+	reqHTTPS.Host = "https.example.com"
+	respHTTPS, err := httpsClient.Do(reqHTTPS)
+	if err != nil {
+		t.Fatalf("https request failed: %v", err)
 	}
-	if len(gotCert.Certificate[0]) != len(cert.Certificate[0]) {
-		t.Errorf("certificate length mismatch: got %d, want %d", len(gotCert.Certificate[0]), len(cert.Certificate[0]))
+	if closeErr := respHTTPS.Body.Close(); closeErr != nil {
+		t.Errorf("closing https response body: %v", closeErr)
+	}
+	if respHTTPS.TLS == nil || len(respHTTPS.TLS.PeerCertificates) == 0 {
+		t.Fatalf("expected non-nil peer certificates on TLS connection")
+	}
+	if !bytes.Equal(respHTTPS.TLS.PeerCertificates[0].Raw, cert.Certificate[0]) {
+		t.Errorf("certificate presented on https listener does not match expected cert")
 	}
 
-	// 3. Assert default certificate fallback
-	defaultCert, err := p.GetCertificate(&tls.ClientHelloInfo{ServerName: "unrecognized.example.com"})
-	if err != nil {
-		t.Fatalf("GetCertificate for default cert failed: %v", err)
+	// 3. Assert default certificate fallback on unrecognized server name
+	fallbackClient := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         "unrecognized.example.com",
+			},
+		},
 	}
-	if defaultCert == nil {
-		t.Errorf("expected default certificate fallback, got nil")
+	reqFallback, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+dp.HTTPSAddress+"/", nil)
+	if err != nil {
+		t.Fatalf("creating fallback request: %v", err)
+	}
+	reqFallback.Host = "unrecognized.example.com"
+	respFallback, err := fallbackClient.Do(reqFallback)
+	if err != nil {
+		t.Fatalf("fallback https request failed: %v", err)
+	}
+	if closeErr := respFallback.Body.Close(); closeErr != nil {
+		t.Errorf("closing fallback response body: %v", closeErr)
+	}
+	if respFallback.TLS == nil || len(respFallback.TLS.PeerCertificates) == 0 {
+		t.Errorf("expected default fallback certificate on unrecognized server name")
+	}
+
+	// 4. Publish second config with updated route and verify applied without restart
+	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend v2"))
+	}))
+	defer backend2.Close()
+	_, backend2PortStr, err := net.SplitHostPort(backend2.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to split backend2 addr: %v", err)
+	}
+	var backend2Port int
+	_, _ = fmt.Sscanf(backend2PortStr, "%d", &backend2Port)
+
+	route2 := state.InternalRoute{
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/v2"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: backendHost, Port: int32(backend2Port), Weight: 1},
+				},
+			},
+		},
+	}
+	listeners2 := []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route2}},
+		{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+	}
+	dpConfig2, err := state.BuildDataplaneConfig(gwKey, listeners2, []state.InternalRoute{route2}, certsMap, &cert, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig 2 failed: %v", err)
+	}
+	dpConfig2.Revision, err = dpConfig2.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 2 failed: %v", err)
+	}
+
+	if err := publisher.PublishDataplaneConfig(ctx, gw, dpConfig2); err != nil {
+		t.Fatalf("PublishDataplaneConfig 2 failed: %v", err)
+	}
+
+	if err := dp.WaitApplied(ctx); err != nil {
+		t.Fatalf("waiting for second config applied: %v", err)
+	}
+
+	if dp.PID != initialPID {
+		t.Errorf("subprocess restarted: original PID %d, now %d", initialPID, dp.PID)
+	}
+
+	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+dp.HTTPAddress+"/v2", nil)
+	if err != nil {
+		t.Fatalf("creating request 2: %v", err)
+	}
+	req2.Host = "example.com"
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("request 2 through subprocess failed: %v", err)
+	}
+	body2, readErr2 := io.ReadAll(resp2.Body)
+	if closeErr := resp2.Body.Close(); closeErr != nil {
+		t.Errorf("closing response body 2: %v", closeErr)
+	}
+	if readErr2 != nil {
+		t.Fatalf("reading response body 2: %v", readErr2)
+	}
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK from second config, got %d", resp2.StatusCode)
+	}
+	if string(body2) != "backend v2" {
+		t.Errorf("expected 'backend v2', got %q", string(body2))
+	}
+
+	// Old route /ok should no longer match (returns 404)
+	reqOld, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+dp.HTTPAddress+"/ok", nil)
+	reqOld.Host = "example.com"
+	respOld, err := client.Do(reqOld)
+	if err == nil {
+		if closeErr := respOld.Body.Close(); closeErr != nil {
+			t.Errorf("closing old response body: %v", closeErr)
+		}
+		if respOld.StatusCode != http.StatusNotFound {
+			t.Errorf("expected 404 for old route, got %d", respOld.StatusCode)
+		}
 	}
 }
 
