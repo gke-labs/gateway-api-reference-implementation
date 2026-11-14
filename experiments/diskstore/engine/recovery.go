@@ -718,13 +718,16 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	// If quarantining an unreferenced file, pruning lost+found, or syncing the directories
 	// fails, recovery aborts and Open fails. Failing fast prevents operating on an unhealthy
 	// filesystem that cannot quarantine obsolete data or make directory updates durable.
-	referenced := make(map[string]bool)
-	for _, entry := range keyIndex {
-		if entry.IsOversize && entry.OversizeFileName != "" {
-			referenced[entry.OversizeFileName] = true
+	getReferenced := func() map[string]bool {
+		referenced := make(map[string]bool)
+		for _, entry := range keyIndex {
+			if entry.IsOversize && entry.OversizeFileName != "" {
+				referenced[entry.OversizeFileName] = true
+			}
 		}
+		return referenced
 	}
-	if _, _, err := quarantineUnreferencedOversizeFiles(fs, storeDir, referenced, options.Quarantine); err != nil {
+	if _, _, err := quarantineUnreferencedOversizeFiles(fs, storeDir, getReferenced, options.Quarantine, 0); err != nil {
 		return nil, fmt.Errorf("failed to quarantine unreferenced oversize files: %w", err)
 	}
 

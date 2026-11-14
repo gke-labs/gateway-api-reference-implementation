@@ -38,6 +38,14 @@ type oversizeHookFS struct {
 	removeErr    func(name string) error
 	beforeRename func(oldpath, newpath string)
 	renameErr    func(oldpath, newpath string) error
+	onReadDir    func(dirname string)
+}
+
+func (h *oversizeHookFS) ReadDir(dirname string) ([]os.DirEntry, error) {
+	if h.onReadDir != nil {
+		h.onReadDir(dirname)
+	}
+	return h.FS.ReadDir(dirname)
 }
 
 func (h *oversizeHookFS) SyncDir(dirname string) error {
@@ -1510,9 +1518,9 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutR
 	hookFS := &oversizeHookFS{FS: memFS}
 	dir := "test_oversize_failed_put_quarantine_no_reopen"
 
-	// Open store with a fast periodic quarantine sweep interval
+	// Open store with a periodic quarantine sweep interval
 	store, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate(),
-		WithQuarantineSweepInterval(20*time.Millisecond))
+		WithQuarantine(QuarantineOptions{SweepInterval: 10 * time.Millisecond}))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1526,6 +1534,17 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutR
 	key := "targetKey"
 	oversizeVal := append([]byte("failed-put-payload"), make([]byte, 2100*1024)...)
 	oversizeDir := filepath.Join(dir, "oversize")
+	lostDir := filepath.Join(oversizeDir, "lost+found")
+
+	quarantinedCh := make(chan struct{}, 1)
+	hookFS.onSyncDir = func(dirname string) {
+		if filepath.Clean(dirname) == filepath.Clean(lostDir) {
+			select {
+			case quarantinedCh <- struct{}{}:
+			default:
+			}
+		}
+	}
 
 	// Inject an error on SyncDir for oversizeDir during the Put.
 	// This causes Put to write and rename the oversize file, but fail during the directory fsync,
@@ -1565,44 +1584,29 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutR
 	}
 
 	orphanPath := filepath.Join(oversizeDir, orphanName)
-	lostDir := filepath.Join(oversizeDir, "lost+found")
 
 	// Wait for the periodic background sweep to quarantine the unreferenced file without reopening
-	var quarantined bool
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		lostEntries, readErr := memFS.ReadDir(lostDir)
-		if readErr == nil {
-			for _, e := range lostEntries {
-				if strings.HasPrefix(e.Name(), orphanName) {
-					quarantined = true
-					break
-				}
-			}
-		}
-		if quarantined {
-			break
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
-
-	if !quarantined {
-		t.Fatalf("expected orphan file %s to be quarantined in %s without reopening the store", orphanName, lostDir)
+	select {
+	case <-quarantinedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for background sweep to quarantine %s in %s", orphanName, lostDir)
 	}
 
 	// Verify the orphan file is no longer in oversize/
 	if f, err := memFS.Open(orphanPath); err == nil {
-		_ = f.Close()
+		if closeErr := f.Close(); closeErr != nil {
+			t.Fatalf("f.Close failed: %v", closeErr)
+		}
 		t.Fatalf("expected orphan file %s to no longer exist in oversize dir", orphanPath)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("expected ErrNotExist for %s, got: %v", orphanPath, err)
 	}
 
 	// Metrics: count the files and bytes that sweep moved
-	if count := store.QuarantineSweepFilesCount(); count < 1 {
+	if count := QuarantineSweepFilesCount(); count < 1 {
 		t.Fatalf("expected QuarantineSweepFilesCount >= 1, got %d", count)
 	}
-	if bytesCount := store.QuarantineSweepBytesCount(); bytesCount < int64(len(oversizeVal)) {
+	if bytesCount := QuarantineSweepBytesCount(); bytesCount < int64(len(oversizeVal)) {
 		t.Fatalf("expected QuarantineSweepBytesCount >= %d, got %d", len(oversizeVal), bytesCount)
 	}
 
@@ -1623,10 +1627,23 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutR
 func TestOversize_PeriodicSweep_UnreferencedFileFromCrashPointQuarantinedWithoutReopen(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
+	hookFS := &oversizeHookFS{FS: faultFS}
 	dir := "test_oversize_crash_point_quarantine_no_reopen"
+	oversizeDir := filepath.Join(dir, "oversize")
+	lostDir := filepath.Join(oversizeDir, "lost+found")
 
-	store, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate(),
-		WithQuarantineSweepInterval(20*time.Millisecond))
+	quarantinedCh := make(chan struct{}, 1)
+	hookFS.onSyncDir = func(dirname string) {
+		if filepath.Clean(dirname) == filepath.Clean(lostDir) {
+			select {
+			case quarantinedCh <- struct{}{}:
+			default:
+			}
+		}
+	}
+
+	store, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate(),
+		WithQuarantine(QuarantineOptions{SweepInterval: 10 * time.Millisecond}))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1636,7 +1653,6 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromCrashPointQuarantinedWithout
 		}
 	}()
 
-	oversizeDir := filepath.Join(dir, "oversize")
 	if err := faultFS.MkdirAll(oversizeDir, StoreDirMode); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
@@ -1650,45 +1666,33 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromCrashPointQuarantinedWithout
 		t.Fatalf("OpenFile failed: %v", err)
 	}
 	if _, err := f.WriteAt(orphanData, 0); err != nil {
-		_ = f.Close()
+		if closeErr := f.Close(); closeErr != nil {
+			t.Fatalf("f.Close failed: %v", closeErr)
+		}
 		t.Fatalf("WriteAt failed: %v", err)
 	}
 	if err := f.Sync(); err != nil {
-		_ = f.Close()
+		if closeErr := f.Close(); closeErr != nil {
+			t.Fatalf("f.Close failed: %v", closeErr)
+		}
 		t.Fatalf("Sync failed: %v", err)
 	}
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	lostDir := filepath.Join(oversizeDir, "lost+found")
-
 	// Wait for the next sweep to quarantine the unreferenced file without reopening
-	var quarantined bool
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		lostEntries, readErr := faultFS.ReadDir(lostDir)
-		if readErr == nil {
-			for _, e := range lostEntries {
-				if strings.HasPrefix(e.Name(), orphanName) {
-					quarantined = true
-					break
-				}
-			}
-		}
-		if quarantined {
-			break
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
-
-	if !quarantined {
-		t.Fatalf("expected crash-point file %s to be quarantined in %s without reopening the store", orphanName, lostDir)
+	select {
+	case <-quarantinedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for crash-point file %s to be quarantined in %s", orphanName, lostDir)
 	}
 
 	// Verify the file is no longer in oversize/
 	if f, err := faultFS.Open(orphanPath); err == nil {
-		_ = f.Close()
+		if closeErr := f.Close(); closeErr != nil {
+			t.Fatalf("f.Close failed: %v", closeErr)
+		}
 		t.Fatalf("expected orphan file %s to be removed from oversize dir", orphanPath)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("expected ErrNotExist, got: %v", err)
@@ -1706,7 +1710,7 @@ func TestOversize_PeriodicSweep_InFlightPutPreservedDuringSweep(t *testing.T) {
 
 	// Disable background timer so we deterministically run the sweep on demand
 	store, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate(),
-		WithQuarantineSweepInterval(-1))
+		WithQuarantine(QuarantineOptions{SweepInterval: -1}))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1743,7 +1747,11 @@ func TestOversize_PeriodicSweep_InFlightPutPreservedDuringSweep(t *testing.T) {
 	}()
 
 	// Wait until Put has written the oversize file to disk and is blocked before appending pointer
-	<-fileWrittenCh
+	select {
+	case <-fileWrittenCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for Put to write file")
+	}
 
 	// Verify the oversize file exists on disk
 	entries, err := memFS.ReadDir(oversizeDir)
@@ -1761,7 +1769,7 @@ func TestOversize_PeriodicSweep_InFlightPutPreservedDuringSweep(t *testing.T) {
 		t.Fatalf("expected .obj file to exist in oversize dir while Put is in flight")
 	}
 
-	filesMovedBefore := store.QuarantineSweepFilesCount()
+	filesMovedBefore := QuarantineSweepFilesCount()
 
 	// Run a sweep while Put is in flight!
 	if err := store.QuarantineSweep(); err != nil {
@@ -1772,8 +1780,8 @@ func TestOversize_PeriodicSweep_InFlightPutPreservedDuringSweep(t *testing.T) {
 	inFlightPath := filepath.Join(oversizeDir, inFlightFileName)
 	if f, err := memFS.Open(inFlightPath); err != nil {
 		t.Fatalf("expected in-flight file %s to stay in place, but Open failed: %v", inFlightPath, err)
-	} else if err := f.Close(); err != nil {
-		t.Fatalf("close in-flight file failed: %v", err)
+	} else if closeErr := f.Close(); closeErr != nil {
+		t.Fatalf("close in-flight file failed: %v", closeErr)
 	}
 
 	// Verify lost+found is empty or non-existent
@@ -1783,15 +1791,20 @@ func TestOversize_PeriodicSweep_InFlightPutPreservedDuringSweep(t *testing.T) {
 	}
 
 	// Metrics should show 0 files moved during this sweep
-	if filesMovedAfter := store.QuarantineSweepFilesCount(); filesMovedAfter != filesMovedBefore {
+	if filesMovedAfter := QuarantineSweepFilesCount(); filesMovedAfter != filesMovedBefore {
 		t.Fatalf("expected no files moved, count changed from %d to %d", filesMovedBefore, filesMovedAfter)
 	}
 
 	// Let the Put finish
 	close(resumePutCh)
 
-	if err := <-putErrCh; err != nil {
-		t.Fatalf("Put failed: %v", err)
+	select {
+	case err := <-putErrCh:
+		if err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for Put to complete")
 	}
 
 	// Read the value back through the public API
@@ -1807,25 +1820,225 @@ func TestOversize_PeriodicSweep_InFlightPutPreservedDuringSweep(t *testing.T) {
 	}
 }
 
+// TestOversize_PeriodicSweep_PutStartedAfterWriterMuBeforeReadDir verifies that
+// when a Put starts after the sweep has acquired writerMu and before the sweep lists oversize/,
+// the sweep preserves the file because it reads inFlightOversize after listing the directory.
+func TestOversize_PeriodicSweep_PutStartedAfterWriterMuBeforeReadDir(t *testing.T) {
+	memFS := NewMemFS()
+	hookFS := &oversizeHookFS{FS: memFS}
+	dir := "test_oversize_put_started_after_writermu"
+
+	store, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate(),
+		WithQuarantine(QuarantineOptions{SweepInterval: -1}))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close failed: %v", err)
+		}
+	}()
+
+	table := "TestTable"
+	key := "targetKey"
+	oversizeVal := append([]byte("put-after-writermu-content"), make([]byte, 2100*1024)...)
+	oversizeDir := filepath.Join(dir, "oversize")
+
+	putFileWrittenCh := make(chan struct{})
+	var putStarted atomic.Bool
+
+	// Set onSyncDir: when Put finishes writing and renaming the file in oversize/,
+	// but before Put acquires writerMu, it syncs oversizeDir.
+	hookFS.onSyncDir = func(dirname string) {
+		if filepath.Clean(dirname) == filepath.Clean(oversizeDir) && putStarted.Load() {
+			select {
+			case putFileWrittenCh <- struct{}{}:
+			default:
+			}
+		}
+	}
+
+	// Set onReadDir: triggered inside QuarantineSweep while holding writerMu,
+	// immediately before ReadDir(oversizeDir) returns the directory listing.
+	var triggerPutOnce sync.Once
+	putDoneCh := make(chan error, 1)
+	hookFS.onReadDir = func(dirname string) {
+		if filepath.Clean(dirname) == filepath.Clean(oversizeDir) {
+			triggerPutOnce.Do(func() {
+				putStarted.Store(true)
+				go func() {
+					putDoneCh <- store.Put(table, key, oversizeVal)
+				}()
+				// Wait until Put has registered its file and created it in oversize/
+				// Put will then block attempting to acquire writerMu, which QuarantineSweep holds.
+				select {
+				case <-putFileWrittenCh:
+				case <-time.After(3 * time.Second):
+					t.Errorf("timed out waiting for Put to write file")
+				}
+			})
+		}
+	}
+
+	filesMovedBefore := QuarantineSweepFilesCount()
+
+	// Run QuarantineSweep: it acquires writerMu, calls ReadDir(oversizeDir),
+	// which triggers onReadDir, starts Put, waits for Put's file to be on disk,
+	// then ReadDir lists the directory including Put's file.
+	// The sweep then reads inFlightOversize and sees the file is registered in-flight.
+	if err := store.QuarantineSweep(); err != nil {
+		t.Fatalf("QuarantineSweep failed: %v", err)
+	}
+
+	// Verify the sweep did not quarantine the in-flight file
+	if filesMovedAfter := QuarantineSweepFilesCount(); filesMovedAfter != filesMovedBefore {
+		t.Fatalf("expected 0 files moved, got %d", filesMovedAfter-filesMovedBefore)
+	}
+
+	// Now Put can acquire writerMu and finish
+	select {
+	case err := <-putDoneCh:
+		if err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for Put to finish")
+	}
+
+	// Read back through the public API
+	gotVal, exists, err := store.Get(table, key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected key %s to exist", key)
+	}
+	if !bytes.Equal(gotVal, oversizeVal) {
+		t.Fatalf("value mismatch")
+	}
+
+	// Verify lost+found is empty
+	lostDir := filepath.Join(oversizeDir, "lost+found")
+	if entries, err := memFS.ReadDir(lostDir); err == nil && len(entries) > 0 {
+		t.Fatalf("expected 0 files in lost+found, got %d", len(entries))
+	}
+}
+
+// TestOversize_PeriodicSweep_BatchBoundApplied asserts that QuarantineSweep bounds
+// the number of files moved in a single pass to DefaultMaxQuarantineSweepBatch (100).
+func TestOversize_PeriodicSweep_BatchBoundApplied(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_oversize_batch_bound"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(),
+		WithQuarantine(QuarantineOptions{SweepInterval: -1}))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("store.Close failed: %v", err)
+		}
+	}()
+
+	oversizeDir := filepath.Join(dir, "oversize")
+	if err := memFS.MkdirAll(oversizeDir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	// Create 150 unreferenced files
+	totalFiles := 150
+	for i := 0; i < totalFiles; i++ {
+		p := filepath.Join(oversizeDir, fmt.Sprintf("orphan-%03d.obj", i))
+		f, err := memFS.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
+		}
+		if _, err := f.WriteAt([]byte("unreferenced"), 0); err != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				t.Fatalf("f.Close failed: %v", closeErr)
+			}
+			t.Fatalf("WriteAt failed: %v", err)
+		}
+		if err := f.Sync(); err != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				t.Fatalf("f.Close failed: %v", closeErr)
+			}
+			t.Fatalf("Sync failed: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+	}
+
+	beforeCount := QuarantineSweepFilesCount()
+
+	// First sweep: must move exactly DefaultMaxQuarantineSweepBatch (100) files
+	if err := store.QuarantineSweep(); err != nil {
+		t.Fatalf("QuarantineSweep pass 1 failed: %v", err)
+	}
+
+	movedPass1 := QuarantineSweepFilesCount() - beforeCount
+	if movedPass1 != int64(DefaultMaxQuarantineSweepBatch) {
+		t.Fatalf("expected pass 1 to move %d files, got %d", DefaultMaxQuarantineSweepBatch, movedPass1)
+	}
+
+	// Remaining 50 files must still exist in oversize/
+	entries, err := memFS.ReadDir(oversizeDir)
+	if err != nil {
+		t.Fatalf("ReadDir oversize failed: %v", err)
+	}
+	var oversizeRemaining int
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".obj") {
+			oversizeRemaining++
+		}
+	}
+	if oversizeRemaining != 50 {
+		t.Fatalf("expected 50 files remaining in oversize dir, got %d", oversizeRemaining)
+	}
+
+	// Second sweep: must move the remaining 50 files
+	if err := store.QuarantineSweep(); err != nil {
+		t.Fatalf("QuarantineSweep pass 2 failed: %v", err)
+	}
+
+	movedPass2 := QuarantineSweepFilesCount() - beforeCount - movedPass1
+	if movedPass2 != 50 {
+		t.Fatalf("expected pass 2 to move 50 files, got %d", movedPass2)
+	}
+
+	// Verify lost+found now has all 150 files
+	lostDir := filepath.Join(oversizeDir, "lost+found")
+	lostEntries, err := memFS.ReadDir(lostDir)
+	if err != nil {
+		t.Fatalf("ReadDir lost+found failed: %v", err)
+	}
+	if len(lostEntries) != totalFiles {
+		t.Fatalf("expected %d files in lost+found, got %d", totalFiles, len(lostEntries))
+	}
+}
+
 // TestOversize_PeriodicSweep_CloseStopsSweepNoGoroutineLeak asserts that Close stops the sweep,
 // with no goroutine left running.
 func TestOversize_PeriodicSweep_CloseStopsSweepNoGoroutineLeak(t *testing.T) {
-	for i := 0; i < 5; i++ {
-		runtime.GC()
-		time.Sleep(10 * time.Millisecond)
-	}
+	runtime.GC()
 	baseline := runtime.NumGoroutine()
 
 	memFS := NewMemFS()
 	dir := "test_oversize_close_stops_sweep_no_leak"
 
 	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(),
-		WithQuarantineSweepInterval(10*time.Millisecond))
+		WithQuarantine(QuarantineOptions{SweepInterval: 10 * time.Millisecond}))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	// Verify the background sweep goroutine is running
+	// Wait on condition for the background sweep goroutine to be running
+	runningDeadline := time.Now().Add(time.Second)
+	for runtime.NumGoroutine() <= baseline && time.Now().Before(runningDeadline) {
+		runtime.Gosched()
+	}
 	if runtime.NumGoroutine() <= baseline {
 		t.Fatalf("expected goroutine count to exceed baseline %d, got %d", baseline, runtime.NumGoroutine())
 	}
@@ -1835,19 +2048,13 @@ func TestOversize_PeriodicSweep_CloseStopsSweepNoGoroutineLeak(t *testing.T) {
 		t.Fatalf("store.Close failed: %v", err)
 	}
 
-	// Verify the goroutine count returns to baseline
-	var current int
-	returnedToBaseline := false
-	for attempt := 0; attempt < 50; attempt++ {
-		time.Sleep(10 * time.Millisecond)
-		runtime.GC()
-		current = runtime.NumGoroutine()
-		if current <= baseline {
-			returnedToBaseline = true
-			break
-		}
+	// Close waits on sweepDone, so the sweep goroutine exits before Close returns.
+	// Wait on condition for goroutine count to return to baseline.
+	exitDeadline := time.Now().Add(time.Second)
+	for runtime.NumGoroutine() > baseline && time.Now().Before(exitDeadline) {
+		runtime.Gosched()
 	}
-	if !returnedToBaseline {
+	if current := runtime.NumGoroutine(); current > baseline {
 		t.Fatalf("goroutine leak: expected goroutine count to return to baseline %d, got %d", baseline, current)
 	}
 }
@@ -1858,12 +2065,15 @@ func TestOversize_PeriodicSweep_DoesNotRunWithFailedEngine(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_sweep_failed_engine"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithQuarantineSweepInterval(-1))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(),
+		WithQuarantine(QuarantineOptions{SweepInterval: -1}))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
 	defer func() {
-		_ = store.Close()
+		if err := store.Close(); err != nil && !errors.Is(err, ErrFailed) {
+			t.Fatalf("store.Close failed: %v", err)
+		}
 	}()
 
 	oversizeDir := filepath.Join(dir, "oversize")
@@ -1877,9 +2087,21 @@ func TestOversize_PeriodicSweep_DoesNotRunWithFailedEngine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenFile failed: %v", err)
 	}
-	_, _ = f.WriteAt([]byte("orphan"), 0)
-	_ = f.Sync()
-	_ = f.Close()
+	if _, err := f.WriteAt([]byte("orphan"), 0); err != nil {
+		if closeErr := f.Close(); closeErr != nil {
+			t.Fatalf("f.Close failed: %v", closeErr)
+		}
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		if closeErr := f.Close(); closeErr != nil {
+			t.Fatalf("f.Close failed: %v", closeErr)
+		}
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
 
 	// Fail the engine
 	TestHookFail(store, errors.New("simulated fatal failure"))
@@ -1895,8 +2117,8 @@ func TestOversize_PeriodicSweep_DoesNotRunWithFailedEngine(t *testing.T) {
 	// The orphan must NOT have been moved because the sweep doesn't run when failed
 	if f, err := memFS.Open(orphanPath); err != nil {
 		t.Fatalf("orphan file should remain in oversize dir when engine is failed: %v", err)
-	} else {
-		_ = f.Close()
+	} else if closeErr := f.Close(); closeErr != nil {
+		t.Fatalf("close orphan file failed: %v", closeErr)
 	}
 
 	lostDir := filepath.Join(oversizeDir, "lost+found")
@@ -1904,4 +2126,3 @@ func TestOversize_PeriodicSweep_DoesNotRunWithFailedEngine(t *testing.T) {
 		t.Fatalf("lost+found should be empty when sweep was skipped, got %d files", len(entries))
 	}
 }
-

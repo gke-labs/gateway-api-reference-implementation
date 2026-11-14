@@ -441,7 +441,7 @@ func TestQuarantineFiles_EmptyList(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
-	err := quarantineFiles(memFS, dir, nil, QuarantineOptions{})
+	_, err := quarantineFiles(memFS, dir, nil, QuarantineOptions{})
 	if err != nil {
 		t.Fatalf("quarantineFiles with empty list failed: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestQuarantineFiles_MovesFilesAndSyncsBothDirs(t *testing.T) {
 		_ = f.Close()
 	}
 
-	err := quarantineFiles(memFS, dir, []string{"file1.bin", "file2.bin"}, QuarantineOptions{})
+	_, err := quarantineFiles(memFS, dir, []string{"file1.bin", "file2.bin"}, QuarantineOptions{})
 	if err != nil {
 		t.Fatalf("quarantineFiles failed: %v", err)
 	}
@@ -524,7 +524,7 @@ func TestQuarantineFiles_RenameError_ReturnsFirstErrorAndDeletesNothing(t *testi
 		},
 	}
 
-	err = quarantineFiles(hookFS, dir, []string{fileName}, QuarantineOptions{})
+	_, err = quarantineFiles(hookFS, dir, []string{fileName}, QuarantineOptions{})
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -558,7 +558,7 @@ func TestQuarantineFiles_PruningAndBoundsApplied(t *testing.T) {
 		_ = f.Close()
 	}
 
-	err := quarantineFiles(memFS, dir, names, QuarantineOptions{
+	_, err := quarantineFiles(memFS, dir, names, QuarantineOptions{
 		MaxQuarantinedFiles:     2,
 		MinQuarantinedRetention: -1,
 	})
