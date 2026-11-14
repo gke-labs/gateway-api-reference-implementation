@@ -66,7 +66,7 @@ func (q *inProcessQuerier) Query(name string, qtype dnsmessage.Type, timeout tim
 }
 
 func (q *inProcessQuerier) QueryWithAnswers(name string, qtype dnsmessage.Type, knownAnswers []dnsmessage.Resource, timeout time.Duration) ([]dnsmessage.Resource, error) {
-	qname, err := dnsmessage.NewName(toFQDN(name))
+	qname, err := dnsmessage.NewName(ToFQDN(name))
 	if err != nil {
 		return nil, err
 	}
