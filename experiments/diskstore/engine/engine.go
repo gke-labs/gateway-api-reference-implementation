@@ -168,10 +168,10 @@ func WithCipher(cipher Cipher) Option {
 
 // WithEncryptionKey sets the 32-byte caller's key for block-level encryption.
 //
-// At this stage of block-level encryption, the engine encrypts heap blocks only;
-// the WAL and oversize files are not yet encrypted. When configured, the block
-// pool encrypts each 4 KiB heap block with AES-256-XTS under the derived heap key
-// when flushing to disk, and decrypts it when reading.
+// When configured, the block pool encrypts each 4 KiB heap block with AES-256-XTS
+// under the derived heap key when flushing to disk and decrypts it when reading,
+// and the WAL encrypts each 4 KiB log block under the derived segment key when
+// writing and decrypts it when recovery reads. Oversize files are not yet encrypted.
 //
 // Interaction with WithCipher:
 // During the transition before the per-value cipher is removed:
@@ -841,6 +841,10 @@ func Open(opts ...Option) (*Engine, error) {
 	walQuarantine := s.quarantine
 	walQuarantine.Dir = filepath.Join(walDir, "lost+found")
 
+	if faultFS, ok := options.FS.(*FaultFS); ok && len(options.EncryptionKey) > 0 {
+		faultFS.SetEncryptionKey(options.EncryptionKey)
+	}
+
 	var heapCipher *xts.Cipher
 	if len(options.EncryptionKey) > 0 {
 		cipher, err := newHeapCipher(options.EncryptionKey, dbID)
@@ -853,9 +857,10 @@ func Open(opts ...Option) (*Engine, error) {
 
 	if isNewStore {
 		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{
-			OnFailure:  s.setFailed,
-			Clock:      options.Clock,
-			Quarantine: walQuarantine,
+			OnFailure:     s.setFailed,
+			Clock:         options.Clock,
+			Quarantine:    walQuarantine,
+			EncryptionKey: options.EncryptionKey,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -875,6 +880,7 @@ func Open(opts ...Option) (*Engine, error) {
 			Quarantine:    options.Quarantine,
 			HeapCipher:    heapCipher,
 			ClosedCleanly: closedCleanly,
+			EncryptionKey: options.EncryptionKey,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -906,9 +912,10 @@ func Open(opts ...Option) (*Engine, error) {
 
 		// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
 		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{
-			OnFailure:  s.setFailed,
-			Clock:      options.Clock,
-			Quarantine: walQuarantine,
+			OnFailure:     s.setFailed,
+			Clock:         options.Clock,
+			Quarantine:    walQuarantine,
+			EncryptionKey: options.EncryptionKey,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -983,7 +990,9 @@ func Open(opts ...Option) (*Engine, error) {
 // because a page image at LSN L holds every record up to L that touched it, and a record
 // that replay applies again leaves the key with the same value.
 func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLSN uint64) error {
-	walRedoIt, err := NewWALIterator(storeFS, walDir, dbID, redoStartLSN)
+	walRedoIt, err := NewWALIterator(storeFS, walDir, dbID, redoStartLSN, WALIteratorOptions{
+		EncryptionKey: s.encryptionKey,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create WAL redo iterator: %w", err)
 	}
