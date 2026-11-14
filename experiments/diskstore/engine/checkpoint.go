@@ -36,6 +36,38 @@ func NewCheckpointer(bp *BlockPool, heapFile File, wal *WAL) *Checkpointer {
 	}
 }
 
+// FlushPages flushes all dirty pages to the heap file, fsyncs the heap, and promotes
+// flushed locations to durable under the reuse rule without appending a checkpoint
+// record to the WAL.
+func (c *Checkpointer) FlushPages() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.flushPagesLocked()
+}
+
+func (c *Checkpointer) flushPagesLocked() error {
+	// Flush dirty pages to disk under write-ahead rule
+	if err := c.bp.FlushAllDirty(); err != nil {
+		return fmt.Errorf("failed to flush dirty pages: %w", err)
+	}
+
+	// Record locations flushed before fsync begins (Reuse Rule / Item 11)
+	c.bp.SnapshotFlushedForSync()
+
+	// Fsync heap file
+	if err := c.heapFile.Sync(); err != nil {
+		return fmt.Errorf("failed to fsync heap file: %w", err)
+	}
+
+	// Promote flushed locations to durable (frees superseded locations)
+	if err := c.bp.PromoteFlushedToDurable(); err != nil {
+		return fmt.Errorf("failed to promote flushed pages: %w", err)
+	}
+
+	return nil
+}
+
 // Checkpoint performs a non-blocking checkpoint:
 // 1. Snapshot dirty pages and capture current max LSN at snapshot time.
 // 2. Flush dirty pages to new physical locations (out-of-place write).
@@ -64,22 +96,9 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 		redoStartLSN = snapshotLSN
 	}
 
-	// 2. Flush dirty pages to disk under write-ahead rule
-	if err := c.bp.FlushAllDirty(); err != nil {
+	// 2-5. Flush dirty pages, sync heap file, and promote flushed locations
+	if err := c.flushPagesLocked(); err != nil {
 		return 0, fmt.Errorf("checkpoint failed to flush dirty pages: %w", err)
-	}
-
-	// 3. Record locations flushed before fsync begins (Reuse Rule / Item 11)
-	c.bp.SnapshotFlushedForSync()
-
-	// 4. Fsync heap file
-	if err := c.heapFile.Sync(); err != nil {
-		return 0, fmt.Errorf("checkpoint failed to fsync heap file: %w", err)
-	}
-
-	// 5. Promote flushed locations to durable (frees superseded locations)
-	if err := c.bp.PromoteFlushedToDurable(); err != nil {
-		return 0, fmt.Errorf("checkpoint failed to promote flushed pages: %w", err)
 	}
 
 	// 6. Append checkpoint record to WAL, assigning LSN under WAL lock

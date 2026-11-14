@@ -833,7 +833,6 @@ func Open(opts ...Option) (*Engine, error) {
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
 			Cipher:        options.Cipher,
-			OnFailure:     s.setFailed,
 		})
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 	} else {
@@ -867,10 +866,39 @@ func Open(opts ...Option) (*Engine, error) {
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
 			Cipher:        options.Cipher,
-			OnFailure:     s.setFailed,
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
+
+		// Replay WAL records from redo start LSN through write path apply functions.
+		if err := s.replayWAL(options.FS, walDir, dbID, recoveryRes.RedoStartLSN); err != nil {
+			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+			return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeErr)
+		}
+
+		// After replay, the engine flushes the changed pages as it does for a checkpoint,
+		// before it accepts writes.
+		if err := s.cp.FlushPages(); err != nil {
+			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+			return nil, errors.Join(fmt.Errorf("failed to flush pages after replay: %w", err), closeErr)
+		}
+
+		// Quarantine unreferenced oversize files now that keyIndex holds all recovered pointers.
+		getReferenced := func() map[string]bool {
+			referenced := make(map[string]bool)
+			s.keyMu.RLock()
+			for _, entry := range s.keyIndex {
+				if entry.IsOversize && entry.OversizeFileName != "" {
+					referenced[entry.OversizeFileName] = true
+				}
+			}
+			s.keyMu.RUnlock()
+			return referenced
+		}
+		if _, err := quarantineUnreferencedOversizeFiles(context.Background(), options.FS, dir, getReferenced, options.Quarantine, 0); err != nil {
+			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+			return nil, errors.Join(fmt.Errorf("failed to quarantine unreferenced oversize files: %w", err), closeErr)
+		}
 	}
 
 	sweepInterval := DefaultQuarantineSweepInterval
@@ -884,7 +912,68 @@ func Open(opts ...Option) (*Engine, error) {
 		go s.backgroundQuarantineSweep()
 	}
 
+	s.bp.SetOnFailure(s.setFailed)
 	return s, nil
+}
+
+// replayWAL replays each WAL record from redoStartLSN through the write path apply functions.
+// Replay holds writerMu throughout, and appends nothing to the WAL.
+// Replay skips a record when the page that holds the key carries that LSN or a newer one,
+// because a page image at LSN L holds every record up to L that touched it, and a record
+// that replay applies again leaves the key with the same value.
+func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLSN uint64) error {
+	walRedoIt, err := NewWALIterator(storeFS, walDir, dbID, redoStartLSN)
+	if err != nil {
+		return fmt.Errorf("failed to create WAL redo iterator: %w", err)
+	}
+
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+
+	for {
+		rec, err := walRedoIt.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return errors.Join(fmt.Errorf("error during WAL redo: %w", err), walRedoIt.Close())
+		}
+
+		s.keyMu.RLock()
+		existing, inIndex := s.keyIndex[rec.Key]
+		s.keyMu.RUnlock()
+
+		// Replay skips a record when the page that holds the key carries that LSN
+		// or a newer one, because a page image at LSN L holds every record up to L
+		// that touched it, and a record that replay applies again leaves the key
+		// with the same value.
+		if inIndex {
+			if pageLSN, ok := s.bp.PageLSN(existing.LogicalPage); ok && pageLSN >= rec.LSN {
+				continue
+			}
+		}
+
+		switch rec.Type {
+		case RecordTypePut, RecordTypePutPointer:
+			isOversize := rec.Type == RecordTypePutPointer
+			if err := s.applyPutLocked(rec.Key, rec.Payload, rec.LSN, isOversize); err != nil {
+				return errors.Join(err, walRedoIt.Close())
+			}
+
+		case RecordTypeDelete:
+			if !inIndex {
+				continue
+			}
+			if err := s.applyDeleteLocked(rec.Key, rec.LSN); err != nil {
+				return errors.Join(err, walRedoIt.Close())
+			}
+		}
+	}
+
+	if err := walRedoIt.Close(); err != nil {
+		return fmt.Errorf("failed to close WAL redo iterator: %w", err)
+	}
+	return nil
 }
 
 func (s *Engine) registerInFlight(names ...string) {
