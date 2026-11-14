@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1799,6 +1800,117 @@ func TestRecovery_ReplayHeapWriteFailure_NoMarkerAndSucceedsOnReopen(t *testing.
 		}
 		if !bytes.Equal(gotVal, wantVal) {
 			t.Fatalf("Get(%q) value mismatch: got len=%d, want len=%d", k, len(gotVal), len(wantVal))
+		}
+	}
+}
+
+// TestRecovery_SmallBlockPoolReuseRule verifies that after a crash, recovery and later writes
+// with a 16-block pool don't overwrite the block that holds a page's newest durable copy.
+func TestRecovery_SmallBlockPoolReuseRule(t *testing.T) {
+	for trial := 0; trial < 5; trial++ {
+		rng := rand.New(rand.NewSource(int64(trial)))
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := fmt.Sprintf("test_small_pool_reuse_%d", trial)
+
+		store, err := Open(WithFS(faultFS), WithDir(dir), WithNumPoolBlocks(16), WithCompressionCodec(CodecNone), WithCreate())
+		if err != nil {
+			t.Fatalf("trial %d: Open failed: %v", trial, err)
+		}
+
+		table := "TestTable"
+		keys := make([]string, 40)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("key-%d", i)
+		}
+
+		expectedValues := make(map[string][]byte)
+
+		// Initial durable pages
+		for i := 0; i < 20; i++ {
+			val := []byte(fmt.Sprintf("init-%d", i))
+			if err := store.Put(table, keys[i], val); err != nil {
+				t.Fatalf("trial %d: Put failed: %v", trial, err)
+			}
+			expectedValues[keys[i]] = val
+		}
+		if _, err := store.Checkpoint(); err != nil {
+			t.Fatalf("trial %d: Checkpoint failed: %v", trial, err)
+		}
+
+		currentStore := store
+		currentFS := faultFS
+
+		for cycle := 0; cycle < 10; cycle++ {
+			numOps := 30 + rng.Intn(50)
+			for op := 0; op < numOps; op++ {
+				key := keys[rng.Intn(len(keys))]
+				action := rng.Intn(10)
+				switch {
+				case action < 4: // small slotted
+					val := []byte(fmt.Sprintf("v-%d-%d-%d", trial, cycle, op))
+					if err := currentStore.Put(table, key, val); err != nil {
+						t.Fatalf("trial %d cycle %d: Put %s failed: %v", trial, cycle, key, err)
+					}
+					expectedValues[key] = val
+				case action < 7: // multi-block (2, 4, 8 blocks)
+					numBlocks := 1 << (1 + rng.Intn(3))
+					size := (numBlocks-1)*BlockUsableSize + 100
+					payload := bytes.Repeat([]byte("x"), size)
+					if err := currentStore.Put(table, key, payload); err != nil {
+						t.Fatalf("trial %d cycle %d: Put multi-block %s failed: %v", trial, cycle, key, err)
+					}
+					expectedValues[key] = payload
+				case action < 9: // delete
+					if err := currentStore.Delete(table, key); err != nil {
+						t.Fatalf("trial %d cycle %d: Delete %s failed: %v", trial, cycle, key, err)
+					}
+					delete(expectedValues, key)
+				case action == 9: // occasional checkpoint
+					if rng.Intn(3) == 0 {
+						if _, err := currentStore.Checkpoint(); err != nil {
+							t.Fatalf("trial %d cycle %d: Checkpoint failed: %v", trial, cycle, err)
+						}
+					}
+				}
+			}
+
+			if err := currentStore.Sync(); err != nil {
+				t.Fatalf("trial %d cycle %d: Sync failed: %v", trial, cycle, err)
+			}
+
+			if err := currentFS.Crash(true, 0); err != nil {
+				t.Fatalf("trial %d cycle %d: Crash failed: %v", trial, cycle, err)
+			}
+
+			currentFS = NewFaultFS(memFS)
+			currentStore, err = Open(WithFS(currentFS), WithDir(dir), WithNumPoolBlocks(16), WithCompressionCodec(CodecNone))
+			if err != nil {
+				t.Fatalf("trial %d cycle %d: Reopen failed: %v", trial, cycle, err)
+			}
+
+			for _, key := range keys {
+				gotVal, exists, err := currentStore.Get(table, key)
+				if err != nil {
+					t.Fatalf("trial %d cycle %d: Get(%q) returned error: %v", trial, cycle, key, err)
+				}
+				expectedVal, expectedExists := expectedValues[key]
+				if expectedExists {
+					if !exists {
+						t.Fatalf("trial %d cycle %d: Get(%q) missing key after reopen", trial, cycle, key)
+					}
+					if !bytes.Equal(gotVal, expectedVal) {
+						t.Fatalf("trial %d cycle %d: Get(%q) value mismatch: got len=%d, want len=%d", trial, cycle, key, len(gotVal), len(expectedVal))
+					}
+				} else {
+					if exists {
+						t.Fatalf("trial %d cycle %d: Get(%q) found deleted key after reopen", trial, cycle, key)
+					}
+				}
+			}
+		}
+		if err := currentStore.Close(); err != nil {
+			t.Fatalf("trial %d: Close failed: %v", trial, err)
 		}
 	}
 }
