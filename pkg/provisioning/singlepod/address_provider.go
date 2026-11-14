@@ -1086,43 +1086,54 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		return nil
 	}
 	name := ResourceNameForGateway(gw.Name)
-	return PublishDataplaneSecret(ctx, p.client, gw.Namespace, name, gw, config)
+	return PublishDataplaneConfig(ctx, p.client, gw.Namespace, name, gw, config)
 }
 
-// PublishDataplaneSecret writes or deletes a data plane's config Secret.
+// PublishDataplaneConfig writes or deletes a data plane's config Secret.
 // It guarantees that it applies with the provider's field owner, it refuses an
 // object that another owner holds, and it deletes the object when the payload is nil.
-func PublishDataplaneSecret(ctx context.Context, cl client.Client, namespace, name string, owner client.Object, payload any) error {
+func PublishDataplaneConfig(ctx context.Context, cl client.Client, namespace, name string, owner client.Object, payload any) error {
 	if cl == nil {
 		return nil
+	}
+	if owner != nil && reflect.ValueOf(owner).Kind() == reflect.Pointer && reflect.ValueOf(owner).IsNil() {
+		owner = nil
 	}
 
 	var existingSecret corev1.Secret
 	err := cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &existingSecret)
 	if err == nil {
-		if !isConfigSecretOwnedBy(&existingSecret, owner) {
-			ownerDesc := "unknown"
-			if owner != nil && !reflect.ValueOf(owner).IsNil() {
-				_, kind := ownerGVK(owner, cl)
-				if kind != "" {
-					ownerDesc = kind + " " + owner.GetName()
-				} else {
-					ownerDesc = owner.GetName()
-				}
-			} else if ref := metav1.GetControllerOf(&existingSecret); ref != nil {
+		ref := metav1.GetControllerOf(&existingSecret)
+		if owner == nil {
+			if ref != nil {
 				return &controller.OwnershipConflictError{
 					Message: fmt.Sprintf("conflict: existing Secret %s/%s is owned by %s %s", namespace, name, ref.Kind, ref.Name),
 				}
 			}
-			return &controller.OwnershipConflictError{
-				Message: fmt.Sprintf("conflict: existing Secret %s/%s is not owned by %s", namespace, name, ownerDesc),
+		} else {
+			if ref == nil || (owner.GetUID() != "" && ref.UID != "" && ref.UID != owner.GetUID()) || ref.Name != owner.GetName() {
+				ownerDesc := owner.GetName()
+				if _, ok := owner.(*gatewayv1.Gateway); ok {
+					ownerDesc = "Gateway " + ownerDesc
+				}
+				return &controller.OwnershipConflictError{
+					Message: fmt.Sprintf("conflict: existing Secret %s/%s is not owned by %s", namespace, name, ownerDesc),
+				}
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to get config Secret %s/%s: %w", namespace, name, err)
 	}
 
-	if isNilPayload(payload) {
+	isNil := payload == nil
+	if !isNil {
+		val := reflect.ValueOf(payload)
+		switch val.Kind() {
+		case reflect.Pointer, reflect.Interface, reflect.Slice, reflect.Map:
+			isNil = val.IsNil()
+		}
+	}
+	if isNil {
 		if err == nil {
 			secret := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1153,10 +1164,26 @@ func PublishDataplaneSecret(ctx context.Context, cl client.Client, namespace, na
 			DataplaneSecretDataKey: configJSON,
 		})
 
-	if owner != nil && !reflect.ValueOf(owner).IsNil() {
-		if ownerRef := buildOwnerRefApply(owner, cl); ownerRef != nil {
-			secretApply.WithOwnerReferences(ownerRef)
+	if owner != nil {
+		apiVersion := gatewayv1.GroupVersion.String()
+		kind := "Gateway"
+		if cl.Scheme() != nil {
+			if gvk, err := apiutil.GVKForObject(owner, cl.Scheme()); err == nil && gvk.Kind != "" {
+				apiVersion = gvk.GroupVersion().String()
+				kind = gvk.Kind
+			}
 		}
+		ref := metav1ac.OwnerReference().
+			WithAPIVersion(apiVersion).
+			WithKind(kind).
+			WithName(owner.GetName()).
+			WithController(true).
+			WithBlockOwnerDeletion(true)
+		if owner.GetUID() != "" {
+			ref.WithUID(owner.GetUID())
+		}
+		secretApply.WithOwnerReferences(ref)
+
 		if gw, ok := owner.(*gatewayv1.Gateway); ok && gw != nil {
 			labels, annotations := buildLabelsAndAnnotations(gw)
 			if len(labels) > 0 {
@@ -1172,77 +1199,6 @@ func PublishDataplaneSecret(ctx context.Context, cl client.Client, namespace, na
 		return fmt.Errorf("failed to apply config Secret %s/%s: %w", namespace, name, err)
 	}
 	return nil
-}
-
-// PublishConfigSecret writes or deletes a data plane's config Secret.
-// It guarantees that it applies with the provider's field owner, it refuses an
-// object that another owner holds, and it deletes the object when the payload is nil.
-func PublishConfigSecret(ctx context.Context, cl client.Client, namespace, name string, owner client.Object, payload any) error {
-	return PublishDataplaneSecret(ctx, cl, namespace, name, owner, payload)
-}
-
-func isNilPayload(payload any) bool {
-	if payload == nil {
-		return true
-	}
-	val := reflect.ValueOf(payload)
-	return (val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface || val.Kind() == reflect.Slice || val.Kind() == reflect.Map) && val.IsNil()
-}
-
-func isConfigSecretOwnedBy(obj metav1.Object, owner client.Object) bool {
-	ref := metav1.GetControllerOf(obj)
-	if owner == nil || reflect.ValueOf(owner).IsNil() {
-		return ref == nil
-	}
-	if ref == nil {
-		return false
-	}
-	if owner.GetUID() != "" {
-		return ref.UID == owner.GetUID()
-	}
-	return ref.Name == owner.GetName()
-}
-
-func ownerGVK(owner client.Object, cl client.Client) (string, string) {
-	if owner == nil || reflect.ValueOf(owner).IsNil() {
-		return "", ""
-	}
-	if gvk := owner.GetObjectKind().GroupVersionKind(); gvk.Kind != "" {
-		return gvk.GroupVersion().String(), gvk.Kind
-	}
-	if cl != nil && cl.Scheme() != nil {
-		if gvk, err := apiutil.GVKForObject(owner, cl.Scheme()); err == nil && gvk.Kind != "" {
-			return gvk.GroupVersion().String(), gvk.Kind
-		}
-	}
-	if _, ok := owner.(*gatewayv1.Gateway); ok {
-		return gatewayv1.GroupVersion.String(), "Gateway"
-	}
-	t := reflect.TypeOf(owner)
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	return "", t.Name()
-}
-
-func buildOwnerRefApply(owner client.Object, cl client.Client) *metav1ac.OwnerReferenceApplyConfiguration {
-	apiVersion, kind := ownerGVK(owner, cl)
-	if kind == "" {
-		return nil
-	}
-	if apiVersion == "" {
-		apiVersion = gatewayv1.GroupVersion.String()
-	}
-	ref := metav1ac.OwnerReference().
-		WithAPIVersion(apiVersion).
-		WithKind(kind).
-		WithName(owner.GetName()).
-		WithController(true).
-		WithBlockOwnerDeletion(true)
-	if owner.GetUID() != "" {
-		ref.WithUID(owner.GetUID())
-	}
-	return ref
 }
 
 // Begin implements state.DataplanePublisher.

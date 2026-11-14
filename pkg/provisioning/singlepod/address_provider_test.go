@@ -4515,7 +4515,7 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 	}
 }
 
-func TestPublishDataplaneSecret(t *testing.T) {
+func TestPublishDataplaneConfig(t *testing.T) {
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-gw",
@@ -4536,8 +4536,8 @@ func TestPublishDataplaneSecret(t *testing.T) {
 		ctx := t.Context()
 
 		payload := map[string]string{"key": "initial"}
-		if err := PublishDataplaneSecret(ctx, cl, "default", "cfg-secret", gw, payload); err != nil {
-			t.Fatalf("PublishDataplaneSecret create failed: %v", err)
+		if err := PublishDataplaneConfig(ctx, cl, "default", "cfg-secret", gw, payload); err != nil {
+			t.Fatalf("PublishDataplaneConfig create failed: %v", err)
 		}
 
 		var sec corev1.Secret
@@ -4565,8 +4565,8 @@ func TestPublishDataplaneSecret(t *testing.T) {
 		}
 
 		// Also verify creating without owner
-		if err := PublishConfigSecret(ctx, cl, "default", "unowned-secret", nil, payload); err != nil {
-			t.Fatalf("PublishConfigSecret without owner failed: %v", err)
+		if err := PublishDataplaneConfig(ctx, cl, "default", "unowned-secret", nil, payload); err != nil {
+			t.Fatalf("PublishDataplaneConfig without owner failed: %v", err)
 		}
 		var unowned corev1.Secret
 		if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: "unowned-secret"}, &unowned); err != nil {
@@ -4582,12 +4582,12 @@ func TestPublishDataplaneSecret(t *testing.T) {
 		ctx := t.Context()
 
 		payload1 := map[string]string{"version": "1"}
-		if err := PublishDataplaneSecret(ctx, cl, "default", "cfg-secret", gw, payload1); err != nil {
+		if err := PublishDataplaneConfig(ctx, cl, "default", "cfg-secret", gw, payload1); err != nil {
 			t.Fatalf("create failed: %v", err)
 		}
 
 		payload2 := map[string]string{"version": "2"}
-		if err := PublishDataplaneSecret(ctx, cl, "default", "cfg-secret", gw, payload2); err != nil {
+		if err := PublishDataplaneConfig(ctx, cl, "default", "cfg-secret", gw, payload2); err != nil {
 			t.Fatalf("update failed: %v", err)
 		}
 
@@ -4632,7 +4632,7 @@ func TestPublishDataplaneSecret(t *testing.T) {
 		}
 
 		// 1. Caller with different owner gets OwnershipConflictError
-		err := PublishDataplaneSecret(ctx, cl, "default", "conflict-secret", gw, map[string]string{"key": "new"})
+		err := PublishDataplaneConfig(ctx, cl, "default", "conflict-secret", gw, map[string]string{"key": "new"})
 		if err == nil {
 			t.Fatalf("expected OwnershipConflictError, got nil")
 		}
@@ -4651,7 +4651,7 @@ func TestPublishDataplaneSecret(t *testing.T) {
 		}
 
 		// 2. Caller with nil owner also gets OwnershipConflictError
-		nilOwnerErr := PublishDataplaneSecret(ctx, cl, "default", "conflict-secret", nil, map[string]string{"key": "new"})
+		nilOwnerErr := PublishDataplaneConfig(ctx, cl, "default", "conflict-secret", nil, map[string]string{"key": "new"})
 		if nilOwnerErr == nil {
 			t.Fatalf("expected OwnershipConflictError for nil owner on owned secret, got nil")
 		}
@@ -4660,7 +4660,7 @@ func TestPublishDataplaneSecret(t *testing.T) {
 		}
 
 		// 3. Caller attempting delete on conflicting secret also gets OwnershipConflictError
-		deleteErr := PublishDataplaneSecret(ctx, cl, "default", "conflict-secret", gw, nil)
+		deleteErr := PublishDataplaneConfig(ctx, cl, "default", "conflict-secret", gw, nil)
 		if deleteErr == nil {
 			t.Fatalf("expected OwnershipConflictError for delete on conflicted secret, got nil")
 		}
@@ -4677,13 +4677,13 @@ func TestPublishDataplaneSecret(t *testing.T) {
 		cl := setupTestClient(t)
 		ctx := t.Context()
 
-		if err := PublishDataplaneSecret(ctx, cl, "default", "del-secret", gw, map[string]string{"a": "b"}); err != nil {
+		if err := PublishDataplaneConfig(ctx, cl, "default", "del-secret", gw, map[string]string{"a": "b"}); err != nil {
 			t.Fatalf("failed to create secret before delete: %v", err)
 		}
 
 		// Delete with nil payload
-		if err := PublishDataplaneSecret(ctx, cl, "default", "del-secret", gw, nil); err != nil {
-			t.Fatalf("PublishDataplaneSecret delete failed: %v", err)
+		if err := PublishDataplaneConfig(ctx, cl, "default", "del-secret", gw, nil); err != nil {
+			t.Fatalf("PublishDataplaneConfig delete failed: %v", err)
 		}
 
 		var sec corev1.Secret
@@ -4693,15 +4693,15 @@ func TestPublishDataplaneSecret(t *testing.T) {
 		}
 
 		// Delete on already deleted secret succeeds idempotently
-		if err := PublishDataplaneSecret(ctx, cl, "default", "del-secret", gw, nil); err != nil {
+		if err := PublishDataplaneConfig(ctx, cl, "default", "del-secret", gw, nil); err != nil {
 			t.Fatalf("idempotent delete failed: %v", err)
 		}
 
 		// Delete unowned secret with nil owner and nil payload
-		if err := PublishConfigSecret(ctx, cl, "default", "unowned-del", nil, map[string]string{"x": "y"}); err != nil {
+		if err := PublishDataplaneConfig(ctx, cl, "default", "unowned-del", nil, map[string]string{"x": "y"}); err != nil {
 			t.Fatalf("create unowned secret failed: %v", err)
 		}
-		if err := PublishConfigSecret(ctx, cl, "default", "unowned-del", nil, nil); err != nil {
+		if err := PublishDataplaneConfig(ctx, cl, "default", "unowned-del", nil, nil); err != nil {
 			t.Fatalf("delete unowned secret failed: %v", err)
 		}
 		err = cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: "unowned-del"}, &sec)
