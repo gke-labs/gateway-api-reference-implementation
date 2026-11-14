@@ -36,6 +36,9 @@ import (
 const (
 	// DefaultPoolSize is the default number of idle pooled reverse tunnel connections.
 	DefaultPoolSize = 4
+
+	// recordTypeHandshake is the TLS record type for a handshake message (0x16).
+	recordTypeHandshake = 0x16
 )
 
 // ManagerOption configures a Manager.
@@ -45,6 +48,13 @@ type ManagerOption func(*Manager)
 func WithListener(lis *Listener) ManagerOption {
 	return func(m *Manager) {
 		m.listener = lis
+	}
+}
+
+// WithHTTPListener sets a custom HTTP Listener for the Manager.
+func WithHTTPListener(lis *Listener) ManagerOption {
+	return func(m *Manager) {
+		m.httpListener = lis
 	}
 }
 
@@ -84,6 +94,7 @@ func WithBackoff(min, max time.Duration) ManagerOption {
 type Manager struct {
 	client          *client.Client
 	listener        *Listener
+	httpListener    *Listener
 	poolSize        int
 	dialTimeout     time.Duration
 	registerTimeout time.Duration
@@ -108,6 +119,7 @@ func NewManager(c *client.Client, opts ...ManagerOption) *Manager {
 	m := &Manager{
 		client:          c,
 		listener:        NewListener(),
+		httpListener:    NewListener(),
 		poolSize:        DefaultPoolSize,
 		dialTimeout:     10 * time.Second,
 		registerTimeout: 5 * time.Second,
@@ -124,6 +136,11 @@ func NewManager(c *client.Client, opts ...ManagerOption) *Manager {
 // Listener returns the tunnel Listener used to accept reverse-tunnelled connections.
 func (m *Manager) Listener() *Listener {
 	return m.listener
+}
+
+// HTTPListener returns the tunnel Listener used to accept reverse-tunnelled plain HTTP connections.
+func (m *Manager) HTTPListener() *Listener {
+	return m.httpListener
 }
 
 // IsConnected returns whether the manager currently has an active tunnel session with the frontend.
@@ -238,9 +255,10 @@ func (m *Manager) scheduleTokenReRegistration(token string) {
 }
 
 // Run starts the session, transport, and registration loops, maintaining connectivity to the frontend
-// and feeding connections into the tunnel Listener until ctx is canceled.
+// and feeding connections into the tunnel Listeners until ctx is canceled.
 func (m *Manager) Run(ctx context.Context) error {
 	defer closeConn(m.listener)
+	defer closeConn(m.httpListener)
 	defer func() {
 		m.mu.Lock()
 		if m.reRegTimer != nil {
@@ -385,8 +403,9 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 }
 
 // handleTunnelConn decodes the PROXY v2 header from conn and enqueues the resulting
-// proxyproto.Conn into m.listener. It closes conn if decoding or enqueuing fails.
-// Returns an error if PROXY header decoding or reading remaining bytes fails.
+// proxyproto.Conn into either m.listener (for TLS connections starting with 0x16) or
+// m.httpListener (for plain HTTP connections). It closes conn if decoding or enqueuing fails.
+// Returns an error if PROXY header decoding, reading the first byte, or reading remaining bytes fails.
 func (m *Manager) handleTunnelConn(conn net.Conn) error {
 	bufReader := bufio.NewReader(conn)
 	hdr, err := proxyproto.Decode(bufReader)
@@ -395,17 +414,25 @@ func (m *Manager) handleTunnelConn(conn net.Conn) error {
 		return err
 	}
 
-	var remaining []byte
-	if bufReader.Buffered() > 0 {
-		remaining = make([]byte, bufReader.Buffered())
-		if _, err := io.ReadFull(bufReader, remaining); err != nil {
-			closeConn(conn)
-			return err
-		}
+	first, err := bufReader.Peek(1)
+	if err != nil {
+		closeConn(conn)
+		return err
+	}
+
+	remaining := make([]byte, bufReader.Buffered())
+	if _, err := io.ReadFull(bufReader, remaining); err != nil {
+		closeConn(conn)
+		return err
+	}
+
+	targetLis := m.httpListener
+	if first[0] == recordTypeHandshake {
+		targetLis = m.listener
 	}
 
 	proxyConn := proxyproto.NewConn(conn, hdr.SrcAddr, hdr.DstAddr, remaining)
-	if err := m.listener.Enqueue(proxyConn); err != nil {
+	if err := targetLis.Enqueue(proxyConn); err != nil {
 		closeConn(conn)
 		return err
 	}

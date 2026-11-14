@@ -15,6 +15,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -371,23 +372,38 @@ func TestManager_SessionReconnect(t *testing.T) {
 func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
 	mgr := NewManager(nil)
 	defer mgr.Listener().Close()
+	defer mgr.HTTPListener().Close()
 
-	// Test with connection scenario representing TCP pool
+	// Test with connection scenarios representing TLS and plain HTTP streams
 	testCases := []struct {
-		name    string
-		srcIP   string
-		dstIP   string
-		srcPort uint16
-		dstPort uint16
-		payload string
+		name          string
+		srcIP         string
+		dstIP         string
+		srcPort       uint16
+		dstPort       uint16
+		payload       []byte
+		wantListener  func(m *Manager) *Listener
+		otherListener func(m *Manager) *Listener
 	}{
 		{
-			name:    "TCP_Pool_Stream",
-			srcIP:   "192.0.2.10",
-			dstIP:   "198.51.100.1",
-			srcPort: 54321,
-			dstPort: 443,
-			payload: "ClientHello payload from TCP pool",
+			name:          "TLS_Handshake_Record",
+			srcIP:         "192.0.2.10",
+			dstIP:         "198.51.100.1",
+			srcPort:       54321,
+			dstPort:       443,
+			payload:       []byte("\x16\x03\x01\x00\x05hello"),
+			wantListener:  func(m *Manager) *Listener { return m.Listener() },
+			otherListener: func(m *Manager) *Listener { return m.HTTPListener() },
+		},
+		{
+			name:          "Plain_HTTP_Request",
+			srcIP:         "192.0.2.10",
+			dstIP:         "198.51.100.1",
+			srcPort:       54321,
+			dstPort:       80,
+			payload:       []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+			wantListener:  func(m *Manager) *Listener { return m.HTTPListener() },
+			otherListener: func(m *Manager) *Listener { return m.Listener() },
 		},
 	}
 
@@ -409,7 +425,7 @@ func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
 			// In a goroutine, write header + payload to c1
 			go func() {
 				_, _ = c1.Write(encodedHdr)
-				_, _ = c1.Write([]byte(tc.payload))
+				_, _ = c1.Write(tc.payload)
 			}()
 
 			// Call the shared backend method handleTunnelConn
@@ -418,8 +434,8 @@ func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
 				errCh <- mgr.handleTunnelConn(c2)
 			}()
 
-			// Accept from manager listener
-			acceptedConn, err := mgr.Listener().Accept()
+			// Accept from the expected manager listener
+			acceptedConn, err := tc.wantListener(mgr).Accept()
 			if err != nil {
 				t.Fatalf("Listener.Accept failed: %v", err)
 			}
@@ -427,6 +443,14 @@ func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
 
 			if err := <-errCh; err != nil {
 				t.Fatalf("handleTunnelConn failed: %v", err)
+			}
+
+			// Verify other listener did not receive the connection
+			select {
+			case unexpected := <-tc.otherListener(mgr).connCh:
+				unexpected.Close()
+				t.Fatalf("expected other listener to receive nothing, but got a connection")
+			default:
 			}
 
 			// Verify addresses from PROXY header
@@ -442,13 +466,16 @@ func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
 				t.Errorf("expected LocalAddr %s:%d, got %s", tc.dstIP, tc.dstPort, pConn.LocalAddr())
 			}
 
-			// Verify payload read
+			// Verify payload read and that the first byte is preserved
 			buf := make([]byte, len(tc.payload))
 			if _, err := io.ReadFull(pConn, buf); err != nil {
 				t.Fatalf("reading payload failed: %v", err)
 			}
-			if string(buf) != tc.payload {
-				t.Errorf("expected payload %q, got %q", tc.payload, string(buf))
+			if !bytes.Equal(buf, tc.payload) {
+				t.Errorf("expected payload %q, got %q", tc.payload, buf)
+			}
+			if buf[0] != tc.payload[0] {
+				t.Errorf("first byte mismatch: got 0x%02x, want 0x%02x", buf[0], tc.payload[0])
 			}
 		})
 	}
