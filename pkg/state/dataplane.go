@@ -321,7 +321,7 @@ func BuildGatewayDataplaneConfig(cg *CompiledGateway) (*DataplaneConfig, error) 
 	var challenges []HTTP01Challenge
 	seen := make(map[string]bool)
 	for _, effectiveListener := range cg.EffectiveListeners {
-		for _, challenge := range effectiveListener.Challenges {
+		for _, challenge := range effectiveListener.ListenerInfo.Challenges {
 			key := challenge.Hostname + "/" + challenge.Token
 			if !seen[key] {
 				seen[key] = true

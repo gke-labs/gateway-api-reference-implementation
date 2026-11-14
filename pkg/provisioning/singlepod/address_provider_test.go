@@ -1983,11 +1983,13 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 			Name:     "tcp-conflicted",
 			Port:     8080,
 			Protocol: gatewayv1.TCPProtocolType,
-			Conditions: []metav1.Condition{
-				{
-					Type:   string(gatewayv1.ListenerConditionConflicted),
-					Status: metav1.ConditionTrue,
-					Reason: string(gatewayv1.ListenerReasonPortUnavailable),
+			ListenerInfo: state.ListenerInfo{
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(gatewayv1.ListenerConditionConflicted),
+						Status: metav1.ConditionTrue,
+						Reason: string(gatewayv1.ListenerReasonPortUnavailable),
+					},
 				},
 			},
 		},
@@ -2161,11 +2163,13 @@ func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testin
 			Name:     "udp-conflicted",
 			Port:     8443,
 			Protocol: gatewayv1.UDPProtocolType,
-			Conditions: []metav1.Condition{
-				{
-					Type:   string(gatewayv1.ListenerConditionConflicted),
-					Status: metav1.ConditionTrue,
-					Reason: string(gatewayv1.ListenerReasonPortUnavailable),
+			ListenerInfo: state.ListenerInfo{
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(gatewayv1.ListenerConditionConflicted),
+						Status: metav1.ConditionTrue,
+						Reason: string(gatewayv1.ListenerReasonPortUnavailable),
+					},
 				},
 			},
 		},

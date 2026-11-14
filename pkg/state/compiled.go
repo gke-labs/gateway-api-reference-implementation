@@ -352,11 +352,9 @@ type EffectiveListener struct {
 	TLS *gatewayv1.ListenerTLSConfig
 	// AllowedRoutes defines constraints on routes permitted to attach to this listener.
 	AllowedRoutes *gatewayv1.AllowedRoutes
-	// SupportedKinds lists the route GroupKinds permitted by this listener's protocol and spec.
-	SupportedKinds []gatewayv1.RouteGroupKind
 
-	// Conditions tracks validation and programmed conditions reported in listener status.
-	Conditions []metav1.Condition
+	// ListenerInfo holds what the controller knows about this listener from validation and resolution.
+	ListenerInfo ListenerInfo
 	// AttachedRoutes is the count of routes bound to this listener, updated during compilation.
 	AttachedRoutes int32
 
@@ -374,24 +372,14 @@ type EffectiveListener struct {
 	BoundUDPRoute *types.NamespacedName
 	// UDPBackends holds backend destinations attached by the bound UDPRoute.
 	UDPBackends []InternalUDPBackend
-	// ClientValidation specifies client certificate validation rules for mutual TLS, if configured.
-	ClientValidation *InternalClientValidation
 
 	// Generation is the observed generation of the defining resource at compile time.
 	Generation int64
-
-	// ResolvedCertificates holds TLS certificates resolved from Secret references or certificate sources.
-	ResolvedCertificates []*tls.Certificate
-	// ResolvedCertificate holds the primary resolved certificate for this listener.
-	ResolvedCertificate *tls.Certificate
-
-	// Challenges holds pending HTTP-01 challenges to be served for this listener.
-	Challenges []HTTP01Challenge
 }
 
 // IsAccepted returns true if the listener has an Accepted condition with status True.
 func (el *EffectiveListener) IsAccepted() bool {
-	for _, c := range el.Conditions {
+	for _, c := range el.ListenerInfo.Conditions {
 		if c.Type == string(gatewayv1.ListenerConditionAccepted) && c.Status == metav1.ConditionTrue {
 			return true
 		}
@@ -401,7 +389,7 @@ func (el *EffectiveListener) IsAccepted() bool {
 
 // IsProgrammed returns true if the listener has a Programmed condition with status True.
 func (el *EffectiveListener) IsProgrammed() bool {
-	for _, c := range el.Conditions {
+	for _, c := range el.ListenerInfo.Conditions {
 		if c.Type == string(gatewayv1.ListenerConditionProgrammed) && c.Status == metav1.ConditionTrue {
 			return true
 		}
@@ -411,7 +399,7 @@ func (el *EffectiveListener) IsProgrammed() bool {
 
 // IsConflicted returns true if the listener has a Conflicted condition with status True.
 func (el *EffectiveListener) IsConflicted() bool {
-	for _, c := range el.Conditions {
+	for _, c := range el.ListenerInfo.Conditions {
 		if c.Type == string(gatewayv1.ListenerConditionConflicted) && c.Status == metav1.ConditionTrue {
 			return true
 		}
@@ -460,8 +448,8 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 		copy(udpBackends, el.UDPBackends)
 	}
 	var clientValidation *InternalClientValidation
-	if el.ClientValidation != nil {
-		clientValidation = el.ClientValidation.DeepCopy()
+	if el.ListenerInfo.ClientValidation != nil {
+		clientValidation = el.ListenerInfo.ClientValidation.DeepCopy()
 	}
 	return InternalListener{
 		Name:             el.QualifiedName(),
@@ -632,7 +620,7 @@ func computeOverlappingTLSConfigForListeners(listeners []*EffectiveListener, sec
 					reason = gatewayv1.ListenerReasonOverlappingCertificates
 					msg = fmt.Sprintf("Overlapping TLS configuration: listener shares port %d and overlapping hostname with another listener using differing certificates", port)
 				}
-				SetCondition(&portListeners[i].Conditions, NewCondition(
+				SetCondition(&portListeners[i].ListenerInfo.Conditions, NewCondition(
 					string(gatewayv1.ListenerConditionOverlappingTLSConfig),
 					metav1.ConditionTrue,
 					string(reason),
@@ -1352,22 +1340,18 @@ func BuildEffectiveListener(
 		parentGateway = types.NamespacedName{Namespace: owner.Namespace, Name: owner.Name}
 	}
 	return &EffectiveListener{
-		Owner:                owner,
-		ParentGateway:        parentGateway,
-		Name:                 listener.Name,
-		Port:                 listener.Port,
-		Protocol:             listener.Protocol,
-		Hostname:             listener.Hostname,
-		TLS:                  listener.TLS,
-		AllowedRoutes:        listener.AllowedRoutes,
-		SupportedKinds:       validationResult.SupportedKinds,
-		Conditions:           validationResult.Conditions,
-		AttachedRoutes:       0,
-		Routes:               nil,
-		ClientValidation:     validationResult.ClientValidation,
-		ResolvedCertificates: validationResult.Certificates,
-		Challenges:           validationResult.Challenges,
-		Generation:           generation,
+		Owner:          owner,
+		ParentGateway:  parentGateway,
+		Name:           listener.Name,
+		Port:           listener.Port,
+		Protocol:       listener.Protocol,
+		Hostname:       listener.Hostname,
+		TLS:            listener.TLS,
+		AllowedRoutes:  listener.AllowedRoutes,
+		ListenerInfo:   validationResult,
+		AttachedRoutes: 0,
+		Routes:         nil,
+		Generation:     generation,
 	}
 }
 
@@ -1710,7 +1694,7 @@ func ComputeGatewayConditions(
 
 func hasInsecureFallbackListener(gw *gatewayv1.Gateway, effectiveListeners []*EffectiveListener) bool {
 	for _, el := range effectiveListeners {
-		if el.ClientValidation != nil && el.ClientValidation.Mode == gatewayv1.AllowInsecureFallback {
+		if el.ListenerInfo.ClientValidation != nil && el.ListenerInfo.ClientValidation.Mode == gatewayv1.AllowInsecureFallback {
 			return true
 		}
 		if gw != nil && el.Protocol == gatewayv1.HTTPSProtocolType {
@@ -1747,21 +1731,21 @@ func IsReservedDataPlanePort(port gatewayv1.PortNumber) bool {
 }
 
 func markListenerConflicted(el *EffectiveListener, reason gatewayv1.ListenerConditionReason, message string) {
-	SetCondition(&el.Conditions, NewCondition(
+	SetCondition(&el.ListenerInfo.Conditions, NewCondition(
 		string(gatewayv1.ListenerConditionAccepted),
 		metav1.ConditionFalse,
 		string(reason),
 		message,
 		el.Generation,
 	))
-	SetCondition(&el.Conditions, NewCondition(
+	SetCondition(&el.ListenerInfo.Conditions, NewCondition(
 		string(gatewayv1.ListenerConditionProgrammed),
 		metav1.ConditionFalse,
 		string(reason),
 		message,
 		el.Generation,
 	))
-	SetCondition(&el.Conditions, NewCondition(
+	SetCondition(&el.ListenerInfo.Conditions, NewCondition(
 		string(gatewayv1.ListenerConditionConflicted),
 		metav1.ConditionTrue,
 		string(reason),
@@ -1991,7 +1975,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			)
 			if inputs.ListenerValidator != nil {
 				for _, cond := range inputs.ListenerValidator(ListenerToSpec(l), ListenerOwner{Kind: "Gateway", Namespace: gw.Namespace, Name: gw.Name}, gw) {
-					SetCondition(&el.Conditions, cond)
+					SetCondition(&el.ListenerInfo.Conditions, cond)
 				}
 			}
 			cg.EffectiveListeners = append(cg.EffectiveListeners, el)
@@ -2037,7 +2021,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 				)
 				if inputs.ListenerValidator != nil {
 					for _, cond := range inputs.ListenerValidator(ListenerEntryToSpec(l), ListenerOwner{Kind: "ListenerSet", Namespace: ls.Namespace, Name: ls.Name}, gw) {
-						SetCondition(&el.Conditions, cond)
+						SetCondition(&el.ListenerInfo.Conditions, cond)
 					}
 				}
 				cg.EffectiveListeners = append(cg.EffectiveListeners, el)
@@ -2096,7 +2080,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			for _, el := range cg.EffectiveListeners {
 				if el.Protocol == gatewayv1.TCPProtocolType && el.IsAccepted() && !el.IsConflicted() {
 					if firstGW, exists := boundTCPPorts[el.Port]; exists {
-						SetCondition(&el.Conditions, NewCondition(
+						SetCondition(&el.ListenerInfo.Conditions, NewCondition(
 							string(gatewayv1.ListenerConditionProgrammed),
 							metav1.ConditionFalse,
 							string(gatewayv1.ListenerReasonPortUnavailable),
@@ -2109,7 +2093,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 				}
 				if el.Protocol == gatewayv1.UDPProtocolType && el.IsAccepted() && !el.IsConflicted() {
 					if firstGW, exists := boundUDPPorts[el.Port]; exists {
-						SetCondition(&el.Conditions, NewCondition(
+						SetCondition(&el.ListenerInfo.Conditions, NewCondition(
 							string(gatewayv1.ListenerConditionProgrammed),
 							metav1.ConditionFalse,
 							string(gatewayv1.ListenerReasonPortUnavailable),
@@ -2130,7 +2114,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 							reason = gatewayv1.ListenerReasonPortUnavailable
 							msg = fmt.Sprintf("Port %d is already bound by Gateway %s in all-in-one mode", el.Port, firstGW)
 						}
-						SetCondition(&el.Conditions, NewCondition(
+						SetCondition(&el.ListenerInfo.Conditions, NewCondition(
 							string(gatewayv1.ListenerConditionProgrammed),
 							metav1.ConditionFalse,
 							string(reason),
@@ -2918,7 +2902,7 @@ func ExtractCertificates(gateways []*CompiledGateway) (map[string]*tls.Certifica
 				listenerHost = strings.ToLower(string(*el.Hostname))
 			}
 
-			for _, cert := range el.ResolvedCertificates {
+			for _, cert := range el.ListenerInfo.Certificates {
 				if cert == nil || len(cert.Certificate) == 0 {
 					continue
 				}
@@ -3246,10 +3230,10 @@ func ComputeDesiredGatewayStatus(
 		attachedRoutes := int32(0)
 		var conds []metav1.Condition
 		if matchedEl != nil {
-			supportedKinds = matchedEl.SupportedKinds
+			supportedKinds = matchedEl.ListenerInfo.SupportedKinds
 			attachedRoutes = matchedEl.AttachedRoutes
-			conds = make([]metav1.Condition, len(matchedEl.Conditions))
-			copy(conds, matchedEl.Conditions)
+			conds = make([]metav1.Condition, len(matchedEl.ListenerInfo.Conditions))
+			copy(conds, matchedEl.ListenerInfo.Conditions)
 		}
 
 		desiredListenerStatuses = append(desiredListenerStatuses, gatewayv1.ListenerStatus{
@@ -3312,10 +3296,10 @@ func ComputeDesiredListenerSetStatus(
 				continue
 			}
 
-			supportedKinds := matchedEl.SupportedKinds
+			supportedKinds := matchedEl.ListenerInfo.SupportedKinds
 			attachedRoutes := matchedEl.AttachedRoutes
-			conds := make([]metav1.Condition, len(matchedEl.Conditions))
-			copy(conds, matchedEl.Conditions)
+			conds := make([]metav1.Condition, len(matchedEl.ListenerInfo.Conditions))
+			copy(conds, matchedEl.ListenerInfo.Conditions)
 
 			desiredListeners = append(desiredListeners, gatewayv1.ListenerEntryStatus{
 				Name:           l.Name,

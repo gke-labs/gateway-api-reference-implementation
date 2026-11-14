@@ -261,12 +261,12 @@ func TestLocalGateway_E2E_AppLocalCompiledRoute(t *testing.T) {
 			t.Errorf("expected listener IsProgrammed() to be true")
 		}
 
-		accCond := state.FindCondition(el.Conditions, string(gatewayv1.ListenerConditionAccepted))
+		accCond := state.FindCondition(el.ListenerInfo.Conditions, string(gatewayv1.ListenerConditionAccepted))
 		if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.ListenerReasonAccepted) {
 			t.Errorf("expected Accepted=True/Accepted, got %+v", accCond)
 		}
 
-		progCond := state.FindCondition(el.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		progCond := state.FindCondition(el.ListenerInfo.Conditions, string(gatewayv1.ListenerConditionProgrammed))
 		if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
 			t.Errorf("expected Programmed=True/Programmed, got %+v", progCond)
 		}
