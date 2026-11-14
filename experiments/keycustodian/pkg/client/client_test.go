@@ -19,43 +19,270 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	keycustodianv1alpha1 "github.com/gke-labs/gateway-api-reference-implementation/experiments/keycustodian/api/v1alpha1"
 	"github.com/gke-labs/gateway-api-reference-implementation/experiments/keycustodian/pkg/client"
+	"github.com/gke-labs/gateway-api-reference-implementation/experiments/keycustodian/pkg/custodian"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
+type testDaemon struct {
+	socketPath  string
+	maxInFlight atomic.Int32
+	inFlight    atomic.Int32
+	grpcServer  *grpc.Server
+	listener    net.Listener
+}
+
+func (daemon *testDaemon) MaxInFlight() int {
+	return int(daemon.maxInFlight.Load())
+}
+
+func (daemon *testDaemon) Close() error {
+	daemon.grpcServer.Stop()
+	err := daemon.listener.Close()
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+func writeECDSAKeyAndCertificate(t *testing.T, directory, name string) *ecdsa.PrivateKey {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate ECDSA key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: name},
+		DNSNames:     []string{"localhost", name},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(privateKey)
+	if err != nil {
+		t.Fatalf("failed to marshal EC private key: %v", err)
+	}
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
+
+	if err := os.WriteFile(filepath.Join(directory, name+".key"), keyPEM, 0600); err != nil {
+		t.Fatalf("failed to write key file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, name+".crt"), certificatePEM, 0644); err != nil {
+		t.Fatalf("failed to write certificate file: %v", err)
+	}
+	return privateKey
+}
+
+func writeRSAKeyAndCertificate(t *testing.T, directory, name string) *rsa.PrivateKey {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate RSA key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: name},
+		DNSNames:     []string{"localhost", name},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	keyDER := x509.MarshalPKCS1PrivateKey(privateKey)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyDER})
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
+
+	if err := os.WriteFile(filepath.Join(directory, name+".key"), keyPEM, 0600); err != nil {
+		t.Fatalf("failed to write key file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, name+".crt"), certificatePEM, 0644); err != nil {
+		t.Fatalf("failed to write certificate file: %v", err)
+	}
+	return privateKey
+}
+
+func writeMismatchedKeyAndCertificate(t *testing.T, directory, name string) {
+	t.Helper()
+	keyA, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key A: %v", err)
+	}
+	keyB, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key B: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: name},
+		DNSNames:     []string{"localhost", name},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &keyB.PublicKey, keyB)
+	if err != nil {
+		t.Fatalf("failed to create certificate with key B: %v", err)
+	}
+
+	keyADER, err := x509.MarshalECPrivateKey(keyA)
+	if err != nil {
+		t.Fatalf("failed to marshal key A: %v", err)
+	}
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyADER})
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
+
+	if err := os.WriteFile(filepath.Join(directory, name+".key"), keyPEM, 0600); err != nil {
+		t.Fatalf("failed to write key file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, name+".crt"), certificatePEM, 0644); err != nil {
+		t.Fatalf("failed to write certificate file: %v", err)
+	}
+}
+
+func startTestDaemon(t *testing.T, keysDirectory string, signDelay time.Duration) *testDaemon {
+	t.Helper()
+
+	socketDirectory := t.TempDir()
+	socketPath := filepath.Join(socketDirectory, "custodian.sock")
+
+	custodianServer, err := custodian.NewServer(keysDirectory)
+	if err != nil {
+		t.Fatalf("failed to create custodian server: %v", err)
+	}
+
+	listener, err := custodian.ListenUnix(socketPath)
+	if err != nil {
+		t.Fatalf("failed to listen on unix socket %s: %v", socketPath, err)
+	}
+
+	daemon := &testDaemon{
+		socketPath: socketPath,
+		listener:   listener,
+	}
+
+	trackingInterceptor := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if strings.HasSuffix(info.FullMethod, "/Sign") {
+			current := daemon.inFlight.Add(1)
+			for {
+				max := daemon.maxInFlight.Load()
+				if current <= max || daemon.maxInFlight.CompareAndSwap(max, current) {
+					break
+				}
+			}
+			defer daemon.inFlight.Add(-1)
+			if signDelay > 0 {
+				time.Sleep(signDelay)
+			}
+		}
+		return handler(ctx, req)
+	}
+
+	allowedUIDs := []uint32{uint32(os.Getuid())}
+	daemon.grpcServer = grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			custodian.UnaryAuthInterceptor(allowedUIDs, nil, nil),
+			trackingInterceptor,
+		),
+		grpc.StreamInterceptor(custodian.StreamAuthInterceptor(allowedUIDs, nil, nil)),
+	)
+	keycustodianv1alpha1.RegisterKeyCustodianServiceServer(daemon.grpcServer, custodianServer)
+
+	go func() {
+		_ = daemon.grpcServer.Serve(listener)
+	}()
+
+	t.Cleanup(func() {
+		daemon.grpcServer.Stop()
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Logf("closing test daemon listener: %v", closeErr)
+		}
+	})
+
+	return daemon
+}
+
 // Acceptance criterion: A tls.Server whose certificate uses the client's crypto.Signer
 // completes a TLS 1.3 handshake with a tls.Client, through a real Unix socket (ECDSA).
 func TestTLS13Handshake_ECDSA(t *testing.T) {
-	fake := client.NewFakeCustodian(t)
+	keysDirectory := t.TempDir()
+	writeECDSAKeyAndCertificate(t, keysDirectory, "p256")
+	daemon := startTestDaemon(t, keysDirectory, 0)
 
-	rawSigner, err := client.NewSigner(fake.SocketPath(), fake.KeyName())
+	custodianClient, err := client.New(daemon.socketPath)
 	if err != nil {
-		t.Fatalf("NewSigner failed: %v", err)
+		t.Fatalf("client.New failed: %v", err)
 	}
 	defer func() {
-		if closer, ok := rawSigner.(io.Closer); ok {
-			_ = closer.Close()
+		if closeErr := custodianClient.Close(); closeErr != nil {
+			t.Logf("closing client: %v", closeErr)
 		}
 	}()
 
+	signer, err := custodianClient.NewSigner("p256")
+	if err != nil {
+		t.Fatalf("NewSigner failed: %v", err)
+	}
+
+	chainPEM, err := custodianClient.GetCertificateChain(t.Context(), "p256")
+	if err != nil {
+		t.Fatalf("GetCertificateChain failed: %v", err)
+	}
+	block, _ := pem.Decode(chainPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		t.Fatalf("failed to decode certificate PEM")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("ParseCertificate failed: %v", err)
+	}
+
 	tlsCert := tls.Certificate{
-		Certificate: [][]byte{fake.Certificate().Raw},
-		PrivateKey:  rawSigner,
+		Certificate: [][]byte{certificate.Raw},
+		PrivateKey:  signer,
 	}
 
 	serverTLSConfig := &tls.Config{
@@ -68,20 +295,28 @@ func TestTLS13Handshake_ECDSA(t *testing.T) {
 		t.Fatalf("net.Listen failed: %v", err)
 	}
 	tlsListener := tls.NewListener(tcpListener, serverTLSConfig)
-	defer tlsListener.Close()
+	defer func() {
+		if closeErr := tlsListener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Logf("closing tlsListener: %v", closeErr)
+		}
+	}()
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		conn, err := tlsListener.Accept()
-		if err != nil {
-			serverErrCh <- err
+		conn, acceptErr := tlsListener.Accept()
+		if acceptErr != nil {
+			serverErrCh <- acceptErr
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				t.Logf("closing server conn: %v", closeErr)
+			}
+		}()
 
 		tlsConn := conn.(*tls.Conn)
-		if err := tlsConn.HandshakeContext(context.Background()); err != nil {
-			serverErrCh <- fmt.Errorf("server handshake: %w", err)
+		if handshakeErr := tlsConn.HandshakeContext(t.Context()); handshakeErr != nil {
+			serverErrCh <- fmt.Errorf("server handshake: %w", handshakeErr)
 			return
 		}
 
@@ -92,19 +327,19 @@ func TestTLS13Handshake_ECDSA(t *testing.T) {
 		}
 
 		buf := make([]byte, 5)
-		if _, err := io.ReadFull(tlsConn, buf); err != nil {
-			serverErrCh <- fmt.Errorf("server read: %w", err)
+		if _, readErr := io.ReadFull(tlsConn, buf); readErr != nil {
+			serverErrCh <- fmt.Errorf("server read: %w", readErr)
 			return
 		}
-		if _, err := tlsConn.Write([]byte("world")); err != nil {
-			serverErrCh <- fmt.Errorf("server write: %w", err)
+		if _, writeErr := tlsConn.Write([]byte("world")); writeErr != nil {
+			serverErrCh <- fmt.Errorf("server write: %w", writeErr)
 			return
 		}
 		serverErrCh <- nil
 	}()
 
 	certPool := x509.NewCertPool()
-	certPool.AddCert(fake.Certificate())
+	certPool.AddCert(certificate)
 
 	clientTLSConfig := &tls.Config{
 		RootCAs:    certPool,
@@ -116,7 +351,11 @@ func TestTLS13Handshake_ECDSA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls.Dial failed: %v", err)
 	}
-	defer clientConn.Close()
+	defer func() {
+		if closeErr := clientConn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Logf("closing clientConn: %v", closeErr)
+		}
+	}()
 
 	if _, err := clientConn.Write([]byte("hello")); err != nil {
 		t.Fatalf("client write failed: %v", err)
@@ -138,22 +377,45 @@ func TestTLS13Handshake_ECDSA(t *testing.T) {
 // Acceptance criterion: A tls.Server whose certificate uses the client's crypto.Signer
 // completes a TLS 1.3 handshake with a tls.Client, through a real Unix socket (RSA-PSS).
 func TestTLS13Handshake_RSAPSS(t *testing.T) {
-	fake := client.NewFakeCustodian(t, client.WithFakeRSAKey("rsa-test"))
+	keysDirectory := t.TempDir()
+	writeRSAKeyAndCertificate(t, keysDirectory, "rsa")
+	daemon := startTestDaemon(t, keysDirectory, 0)
 
-	c, err := client.New(fake.SocketPath())
+	signer, err := client.NewSigner(daemon.socketPath, "rsa")
+	if err != nil {
+		t.Fatalf("NewSigner failed: %v", err)
+	}
+	defer func() {
+		if closer, ok := signer.(io.Closer); ok {
+			if closeErr := closer.Close(); closeErr != nil {
+				t.Logf("closing signer: %v", closeErr)
+			}
+		}
+	}()
+
+	custodianClient, err := client.New(daemon.socketPath)
 	if err != nil {
 		t.Fatalf("client.New failed: %v", err)
 	}
-	defer c.Close()
+	defer func() {
+		if closeErr := custodianClient.Close(); closeErr != nil {
+			t.Logf("closing client: %v", closeErr)
+		}
+	}()
 
-	signer, err := c.Signer(fake.KeyName())
+	chainPEM, err := custodianClient.GetCertificateChain(t.Context(), "rsa")
 	if err != nil {
-		t.Fatalf("c.Signer failed: %v", err)
+		t.Fatalf("GetCertificateChain failed: %v", err)
+	}
+	block, _ := pem.Decode(chainPEM)
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("ParseCertificate failed: %v", err)
 	}
 
-	tlsCert, err := signer.TLSCertificate()
-	if err != nil {
-		t.Fatalf("signer.TLSCertificate failed: %v", err)
+	tlsCert := tls.Certificate{
+		Certificate: [][]byte{certificate.Raw},
+		PrivateKey:  signer,
 	}
 
 	serverTLSConfig := &tls.Config{
@@ -166,20 +428,28 @@ func TestTLS13Handshake_RSAPSS(t *testing.T) {
 		t.Fatalf("net.Listen failed: %v", err)
 	}
 	tlsListener := tls.NewListener(tcpListener, serverTLSConfig)
-	defer tlsListener.Close()
+	defer func() {
+		if closeErr := tlsListener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Logf("closing tlsListener: %v", closeErr)
+		}
+	}()
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		conn, err := tlsListener.Accept()
-		if err != nil {
-			serverErrCh <- err
+		conn, acceptErr := tlsListener.Accept()
+		if acceptErr != nil {
+			serverErrCh <- acceptErr
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				t.Logf("closing server conn: %v", closeErr)
+			}
+		}()
 
 		tlsConn := conn.(*tls.Conn)
-		if err := tlsConn.HandshakeContext(context.Background()); err != nil {
-			serverErrCh <- fmt.Errorf("server handshake: %w", err)
+		if handshakeErr := tlsConn.HandshakeContext(t.Context()); handshakeErr != nil {
+			serverErrCh <- fmt.Errorf("server handshake: %w", handshakeErr)
 			return
 		}
 
@@ -190,19 +460,19 @@ func TestTLS13Handshake_RSAPSS(t *testing.T) {
 		}
 
 		buf := make([]byte, 4)
-		if _, err := io.ReadFull(tlsConn, buf); err != nil {
-			serverErrCh <- fmt.Errorf("server read: %w", err)
+		if _, readErr := io.ReadFull(tlsConn, buf); readErr != nil {
+			serverErrCh <- fmt.Errorf("server read: %w", readErr)
 			return
 		}
-		if _, err := tlsConn.Write([]byte("pong")); err != nil {
-			serverErrCh <- fmt.Errorf("server write: %w", err)
+		if _, writeErr := tlsConn.Write([]byte("pong")); writeErr != nil {
+			serverErrCh <- fmt.Errorf("server write: %w", writeErr)
 			return
 		}
 		serverErrCh <- nil
 	}()
 
 	certPool := x509.NewCertPool()
-	certPool.AddCert(fake.Certificate())
+	certPool.AddCert(certificate)
 
 	clientTLSConfig := &tls.Config{
 		RootCAs:    certPool,
@@ -214,7 +484,11 @@ func TestTLS13Handshake_RSAPSS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls.Dial failed: %v", err)
 	}
-	defer clientConn.Close()
+	defer func() {
+		if closeErr := clientConn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Logf("closing clientConn: %v", closeErr)
+		}
+	}()
 
 	if _, err := clientConn.Write([]byte("ping")); err != nil {
 		t.Fatalf("client write failed: %v", err)
@@ -236,9 +510,11 @@ func TestTLS13Handshake_RSAPSS(t *testing.T) {
 // Acceptance criterion: Under -race, 200 parallel Sign calls with the bound set to 8
 // finish, and the custodian never sees more than 8 in flight.
 func TestParallelSign_BoundedConcurrency(t *testing.T) {
-	fake := client.NewFakeCustodian(t, client.WithFakeSignDelay(2*time.Millisecond))
+	keysDirectory := t.TempDir()
+	writeECDSAKeyAndCertificate(t, keysDirectory, "p256")
+	daemon := startTestDaemon(t, keysDirectory, 2*time.Millisecond)
 
-	signer, err := client.NewSigner(fake.SocketPath(), fake.KeyName(),
+	signer, err := client.NewSigner(daemon.socketPath, "p256",
 		client.WithMaxInFlight(8),
 	)
 	if err != nil {
@@ -246,44 +522,46 @@ func TestParallelSign_BoundedConcurrency(t *testing.T) {
 	}
 	defer func() {
 		if closer, ok := signer.(io.Closer); ok {
-			_ = closer.Close()
+			if closeErr := closer.Close(); closeErr != nil {
+				t.Logf("closing signer: %v", closeErr)
+			}
 		}
 	}()
 
 	const totalCalls = 200
-	var wg sync.WaitGroup
+	var waitGroup sync.WaitGroup
 	errCh := make(chan error, totalCalls)
 
 	for i := 0; i < totalCalls; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			digest := sha256.Sum256([]byte(fmt.Sprintf("message-%d", idx)))
-			sig, err := signer.Sign(rand.Reader, digest[:], crypto.SHA256)
-			if err != nil {
-				errCh <- fmt.Errorf("call %d failed: %w", idx, err)
+		waitGroup.Add(1)
+		go func(index int) {
+			defer waitGroup.Done()
+			digest := sha256.Sum256([]byte(fmt.Sprintf("message-%d", index)))
+			sig, signErr := signer.Sign(rand.Reader, digest[:], crypto.SHA256)
+			if signErr != nil {
+				errCh <- fmt.Errorf("call %d failed: %w", index, signErr)
 				return
 			}
-			pubKey, ok := signer.Public().(*ecdsa.PublicKey)
+			publicKey, ok := signer.Public().(*ecdsa.PublicKey)
 			if !ok {
 				errCh <- fmt.Errorf("unexpected public key type: %T", signer.Public())
 				return
 			}
-			if !ecdsa.VerifyASN1(pubKey, digest[:], sig) {
-				errCh <- fmt.Errorf("signature verification failed for call %d", idx)
+			if !ecdsa.VerifyASN1(publicKey, digest[:], sig) {
+				errCh <- fmt.Errorf("signature verification failed for call %d", index)
 				return
 			}
 		}(i)
 	}
 
-	wg.Wait()
+	waitGroup.Wait()
 	close(errCh)
 
-	for err := range errCh {
-		t.Fatal(err)
+	for callErr := range errCh {
+		t.Fatal(callErr)
 	}
 
-	maxSeen := fake.MaxInFlight()
+	maxSeen := daemon.MaxInFlight()
 	if maxSeen > 8 {
 		t.Fatalf("custodian saw %d in flight, expected <= 8", maxSeen)
 	}
@@ -295,11 +573,12 @@ func TestParallelSign_BoundedConcurrency(t *testing.T) {
 // Acceptance criterion: When the socket is gone, Sign returns an error within the deadline.
 // It never hangs.
 func TestSign_SocketGoneReturnsWithinDeadline(t *testing.T) {
-	fake := client.NewFakeCustodian(t)
+	keysDirectory := t.TempDir()
+	writeECDSAKeyAndCertificate(t, keysDirectory, "p256")
+	daemon := startTestDaemon(t, keysDirectory, 0)
 
-	// Configure a short deadline of 100ms
 	shortDeadline := 100 * time.Millisecond
-	signer, err := client.NewSigner(fake.SocketPath(), fake.KeyName(),
+	signer, err := client.NewSigner(daemon.socketPath, "p256",
 		client.WithDeadline(shortDeadline),
 	)
 	if err != nil {
@@ -307,24 +586,23 @@ func TestSign_SocketGoneReturnsWithinDeadline(t *testing.T) {
 	}
 	defer func() {
 		if closer, ok := signer.(io.Closer); ok {
-			_ = closer.Close()
+			if closeErr := closer.Close(); closeErr != nil {
+				t.Logf("closing signer: %v", closeErr)
+			}
 		}
 	}()
 
-	// Verify signing succeeds while the socket is alive.
 	digest := sha256.Sum256([]byte("before closing socket"))
 	if _, err := signer.Sign(rand.Reader, digest[:], crypto.SHA256); err != nil {
 		t.Fatalf("initial Sign failed: %v", err)
 	}
 
-	// Close the custodian server and ensure the socket file is removed.
-	sockPath := fake.SocketPath()
-	if err := fake.Close(); err != nil {
-		t.Fatalf("fake.Close failed: %v", err)
+	socketPath := daemon.socketPath
+	if err := daemon.Close(); err != nil {
+		t.Fatalf("daemon.Close failed: %v", err)
 	}
-	_ = os.Remove(sockPath)
+	_ = os.Remove(socketPath)
 
-	// Sign must fail within the deadline and not hang.
 	start := time.Now()
 	_, err = signer.Sign(rand.Reader, digest[:], crypto.SHA256)
 	elapsed := time.Since(start)
@@ -338,69 +616,67 @@ func TestSign_SocketGoneReturnsWithinDeadline(t *testing.T) {
 }
 
 func TestListKeysAndGetCertificateChain(t *testing.T) {
-	fake := client.NewFakeCustodian(t)
+	keysDirectory := t.TempDir()
+	writeECDSAKeyAndCertificate(t, keysDirectory, "p256")
+	daemon := startTestDaemon(t, keysDirectory, 0)
 
-	c, err := client.New(fake.SocketPath())
+	custodianClient, err := client.New(daemon.socketPath)
 	if err != nil {
 		t.Fatalf("client.New failed: %v", err)
 	}
-	defer c.Close()
+	defer func() {
+		if closeErr := custodianClient.Close(); closeErr != nil {
+			t.Logf("closing client: %v", closeErr)
+		}
+	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	keys, err := c.ListKeys(ctx)
+	keys, err := custodianClient.ListKeys(ctx)
 	if err != nil {
 		t.Fatalf("ListKeys failed: %v", err)
 	}
-	if len(keys) != 1 || keys[0] != fake.KeyName() {
-		t.Fatalf("expected keys [%q], got %v", fake.KeyName(), keys)
+	if len(keys) != 1 || keys[0] != "p256" {
+		t.Fatalf("expected keys [\"p256\"], got %v", keys)
 	}
 
-	chain, err := c.GetCertificateChain(ctx, fake.KeyName())
+	chain, err := custodianClient.GetCertificateChain(ctx, "p256")
 	if err != nil {
 		t.Fatalf("GetCertificateChain failed: %v", err)
 	}
-	if !bytes.Equal(chain, fake.CertificatePEM()) {
+	expectedCertPEM, err := os.ReadFile(filepath.Join(keysDirectory, "p256.crt"))
+	if err != nil {
+		t.Fatalf("reading expected cert file: %v", err)
+	}
+	if !bytes.Equal(chain, expectedCertPEM) {
 		t.Fatalf("certificate chain mismatch")
 	}
 
-	// Top-level helpers
-	topKeys, err := client.ListKeys(ctx, fake.SocketPath())
-	if err != nil {
-		t.Fatalf("client.ListKeys helper failed: %v", err)
-	}
-	if len(topKeys) != 1 || topKeys[0] != fake.KeyName() {
-		t.Fatalf("top-level ListKeys mismatch: %v", topKeys)
-	}
-
-	topChain, err := client.GetCertificateChain(ctx, fake.SocketPath(), fake.KeyName())
-	if err != nil {
-		t.Fatalf("client.GetCertificateChain helper failed: %v", err)
-	}
-	if !bytes.Equal(topChain, fake.CertificatePEM()) {
-		t.Fatalf("top-level GetCertificateChain mismatch")
-	}
-
-	// Unknown key
-	_, err = c.GetCertificateChain(ctx, "non-existent")
+	_, err = custodianClient.GetCertificateChain(ctx, "non-existent")
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("expected NotFound for non-existent key, got: %v", err)
 	}
 }
 
 func TestSign_HashAlgorithmsAndOptions(t *testing.T) {
-	fake := client.NewFakeCustodian(t)
+	keysDirectory := t.TempDir()
+	writeECDSAKeyAndCertificate(t, keysDirectory, "p256")
+	daemon := startTestDaemon(t, keysDirectory, 0)
 
-	signer, err := client.NewSigner(fake.SocketPath(), fake.KeyName())
+	signer, err := client.NewSigner(daemon.socketPath, "p256")
 	if err != nil {
 		t.Fatalf("NewSigner failed: %v", err)
 	}
 	defer func() {
 		if closer, ok := signer.(io.Closer); ok {
-			_ = closer.Close()
+			if closeErr := closer.Close(); closeErr != nil {
+				t.Logf("closing signer: %v", closeErr)
+			}
 		}
 	}()
+
+	publicKey := signer.Public().(*ecdsa.PublicKey)
 
 	// SHA-256
 	d256 := sha256.Sum256([]byte("sha256 message"))
@@ -408,8 +684,7 @@ func TestSign_HashAlgorithmsAndOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign SHA256 failed: %v", err)
 	}
-	pubKey := signer.Public().(*ecdsa.PublicKey)
-	if !ecdsa.VerifyASN1(pubKey, d256[:], sig256) {
+	if !ecdsa.VerifyASN1(publicKey, d256[:], sig256) {
 		t.Fatal("SHA256 verification failed")
 	}
 
@@ -419,7 +694,7 @@ func TestSign_HashAlgorithmsAndOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign SHA384 failed: %v", err)
 	}
-	if !ecdsa.VerifyASN1(pubKey, d384[:], sig384) {
+	if !ecdsa.VerifyASN1(publicKey, d384[:], sig384) {
 		t.Fatal("SHA384 verification failed")
 	}
 
@@ -429,59 +704,75 @@ func TestSign_HashAlgorithmsAndOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign SHA512 failed: %v", err)
 	}
-	if !ecdsa.VerifyASN1(pubKey, d512[:], sig512) {
+	if !ecdsa.VerifyASN1(publicKey, d512[:], sig512) {
 		t.Fatal("SHA512 verification failed")
 	}
 
-	// Nil opts (infers SHA-256 from 32-byte digest)
-	sigNil, err := signer.Sign(rand.Reader, d256[:], nil)
-	if err != nil {
-		t.Fatalf("Sign nil opts failed: %v", err)
+	// Nil options (hash 0) must be rejected
+	if _, err := signer.Sign(rand.Reader, d256[:], nil); err == nil {
+		t.Fatal("expected error for nil options, got nil")
 	}
-	if !ecdsa.VerifyASN1(pubKey, d256[:], sigNil) {
-		t.Fatal("nil opts verification failed")
+
+	// crypto.Hash(0) unhashed message must be rejected
+	if _, err := signer.Sign(rand.Reader, d256[:], crypto.Hash(0)); err == nil {
+		t.Fatal("expected error for hash 0, got nil")
 	}
 
 	// Digest length mismatch
-	_, err = signer.Sign(rand.Reader, d256[:10], crypto.SHA256)
-	if err == nil {
+	if _, err := signer.Sign(rand.Reader, d256[:10], crypto.SHA256); err == nil {
 		t.Fatal("expected error for mismatched digest length, got nil")
 	}
 
 	// Unsupported hash (MD5)
-	_, err = signer.Sign(rand.Reader, make([]byte, 16), crypto.MD5)
-	if err == nil {
+	if _, err := signer.Sign(rand.Reader, make([]byte, 16), crypto.MD5); err == nil {
 		t.Fatal("expected error for unsupported hash MD5, got nil")
 	}
 }
 
 func TestSign_RSAPSSOptions(t *testing.T) {
-	fake := client.NewFakeCustodian(t, client.WithFakeRSAKey("rsa-opts"))
+	keysDirectory := t.TempDir()
+	writeRSAKeyAndCertificate(t, keysDirectory, "rsa")
+	daemon := startTestDaemon(t, keysDirectory, 0)
 
-	signer, err := client.NewSigner(fake.SocketPath(), fake.KeyName())
+	signer, err := client.NewSigner(daemon.socketPath, "rsa")
 	if err != nil {
 		t.Fatalf("NewSigner failed: %v", err)
 	}
 	defer func() {
 		if closer, ok := signer.(io.Closer); ok {
-			_ = closer.Close()
+			if closeErr := closer.Close(); closeErr != nil {
+				t.Logf("closing signer: %v", closeErr)
+			}
 		}
 	}()
 
 	d256 := sha256.Sum256([]byte("rsa pss test message"))
-	pubKey := signer.Public().(*rsa.PublicKey)
+	publicKey := signer.Public().(*rsa.PublicKey)
 
-	// RSA-PSS SaltLengthEqualsHash
-	pssOpts := &rsa.PSSOptions{
+	pssOptions := &rsa.PSSOptions{
 		SaltLength: rsa.PSSSaltLengthEqualsHash,
 		Hash:       crypto.SHA256,
 	}
-	sig, err := signer.Sign(rand.Reader, d256[:], pssOpts)
+	sig, err := signer.Sign(rand.Reader, d256[:], pssOptions)
 	if err != nil {
 		t.Fatalf("Sign RSA-PSS failed: %v", err)
 	}
-	if err := rsa.VerifyPSS(pubKey, crypto.SHA256, d256[:], sig, pssOpts); err != nil {
+	if err := rsa.VerifyPSS(publicKey, crypto.SHA256, d256[:], sig, pssOptions); err != nil {
 		t.Fatalf("VerifyPSS failed: %v", err)
+	}
+}
+
+func TestNewSigner_MismatchedKeyAndCertificateRejected(t *testing.T) {
+	keysDirectory := t.TempDir()
+	writeMismatchedKeyAndCertificate(t, keysDirectory, "mismatch")
+	daemon := startTestDaemon(t, keysDirectory, 0)
+
+	_, err := client.NewSigner(daemon.socketPath, "mismatch")
+	if err == nil {
+		t.Fatal("expected NewSigner to fail for mismatched key and certificate, but succeeded")
+	}
+	if !strings.Contains(err.Error(), "mismatch") {
+		t.Fatalf("expected error to name key %q, got: %v", "mismatch", err)
 	}
 }
 

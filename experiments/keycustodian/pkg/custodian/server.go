@@ -64,16 +64,6 @@ func WithAuditLogger(logger *slog.Logger) ServerOption {
 	}
 }
 
-// WithKey registers an in-memory signer and PEM-encoded certificate chain for keyName.
-func WithKey(name string, signer crypto.Signer, certificateChain []byte) ServerOption {
-	return func(server *Server) {
-		server.keys[name] = &keyEntry{
-			signer:           signer,
-			certificateChain: certificateChain,
-		}
-	}
-}
-
 // NewServer creates a new custodian server, loading keys and certificate chains from directory.
 func NewServer(directory string, options ...ServerOption) (*Server, error) {
 	keys := make(map[string]*keyEntry)

@@ -17,8 +17,9 @@ package client
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/rsa"
-	"crypto/tls"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -32,68 +33,73 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// DefaultMaxInFlight is the default maximum number of concurrent in-flight Sign calls.
+// DefaultMaxInFlight is the default maximum number of concurrent in-flight Sign calls (64).
+// This bounds memory usage and concurrent RPCs to prevent overwhelming the local custodian
+// daemon process while providing ample headroom for parallel TLS handshake bursts.
 const DefaultMaxInFlight = 64
 
-// DefaultDeadline is the default per-call timeout for Sign and other RPCs.
+// DefaultDeadline is the default per-call timeout for Sign and other RPCs (5 seconds).
+// This provides generous headroom for local Unix domain socket IPC and signature computation
+// without false timeouts under scheduling jitter, while ensuring callers fail fast rather
+// than hanging indefinitely if the daemon stalls.
 const DefaultDeadline = 5 * time.Second
 
 type options struct {
+	// maxInFlight limits the maximum number of concurrent in-flight Sign calls.
 	maxInFlight int
-	deadline    time.Duration
-	dialer      func(context.Context, string) (net.Conn, error)
+	// deadline is the per-call timeout for RPCs.
+	deadline time.Duration
 }
 
 // Option configures Client and Signer settings.
 type Option func(*options)
 
 // WithMaxInFlight sets the maximum number of concurrent in-flight Sign calls.
-func WithMaxInFlight(max int) Option {
-	return func(o *options) {
-		if max > 0 {
-			o.maxInFlight = max
+func WithMaxInFlight(maxInFlight int) Option {
+	return func(options *options) {
+		if maxInFlight > 0 {
+			options.maxInFlight = maxInFlight
 		}
 	}
 }
 
 // WithDeadline sets the per-call deadline for Sign and other RPCs.
-func WithDeadline(d time.Duration) Option {
-	return func(o *options) {
-		if d > 0 {
-			o.deadline = d
+func WithDeadline(deadline time.Duration) Option {
+	return func(options *options) {
+		if deadline > 0 {
+			options.deadline = deadline
 		}
 	}
 }
 
-// WithDialer configures a custom context dialer for gRPC transport.
-func WithDialer(dialer func(context.Context, string) (net.Conn, error)) Option {
-	return func(o *options) { o.dialer = dialer }
-}
-
-// Client communicates with KeyCustodianService over a Unix domain socket.
+// Client communicates with the KeyCustodianService over a Unix domain socket.
 type Client struct {
-	conn *grpc.ClientConn
-	rpc  keycustodianv1alpha1.KeyCustodianServiceClient
-	opts options
-	sem  chan struct{}
+	// connection is the underlying gRPC client connection to the custodian daemon.
+	connection *grpc.ClientConn
+	// serviceClient is the gRPC client stub for the KeyCustodianService.
+	serviceClient keycustodianv1alpha1.KeyCustodianServiceClient
+	// options holds the configured client settings.
+	options options
+	// semaphore bounds the number of concurrent in-flight Sign calls.
+	semaphore chan struct{}
 }
 
 // New creates a new Client connected to socketPath.
-func New(socketPath string, opts ...Option) (*Client, error) {
-	cfg := options{maxInFlight: DefaultMaxInFlight, deadline: DefaultDeadline}
-	for _, opt := range opts {
-		opt(&cfg)
+func New(socketPath string, clientOptions ...Option) (*Client, error) {
+	configuration := options{
+		maxInFlight: DefaultMaxInFlight,
+		deadline:    DefaultDeadline,
+	}
+	for _, option := range clientOptions {
+		option(&configuration)
 	}
 
-	dialer := cfg.dialer
-	if dialer == nil {
-		dialer = func(ctx context.Context, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", socketPath)
-		}
+	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
+		var socketDialer net.Dialer
+		return socketDialer.DialContext(ctx, "unix", socketPath)
 	}
 
-	conn, err := grpc.NewClient("passthrough:///unix",
+	connection, err := grpc.NewClient("passthrough:///unix",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer),
 	)
@@ -102,228 +108,211 @@ func New(socketPath string, opts ...Option) (*Client, error) {
 	}
 
 	return &Client{
-		conn: conn,
-		rpc:  keycustodianv1alpha1.NewKeyCustodianServiceClient(conn),
-		opts: cfg,
-		sem:  make(chan struct{}, cfg.maxInFlight),
+		connection:    connection,
+		serviceClient: keycustodianv1alpha1.NewKeyCustodianServiceClient(connection),
+		options:       configuration,
+		semaphore:     make(chan struct{}, configuration.maxInFlight),
 	}, nil
 }
 
 // Close closes the underlying gRPC connection.
-func (c *Client) Close() error { return c.conn.Close() }
+func (client *Client) Close() error {
+	return client.connection.Close()
+}
 
-func (c *Client) withDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+func (client *Client) withDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithTimeout(ctx, c.opts.deadline)
+	return context.WithTimeout(ctx, client.options.deadline)
 }
 
 // ListKeys returns the names of all keys held by the custodian.
-func (c *Client) ListKeys(ctx context.Context) ([]string, error) {
-	callCtx, cancel := c.withDeadline(ctx)
+func (client *Client) ListKeys(ctx context.Context) ([]string, error) {
+	callContext, cancel := client.withDeadline(ctx)
 	defer cancel()
-	resp, err := c.rpc.ListKeys(callCtx, &keycustodianv1alpha1.ListKeysRequest{})
+	response, err := client.serviceClient.ListKeys(callContext, &keycustodianv1alpha1.ListKeysRequest{})
 	if err != nil {
 		return nil, err
 	}
-	return resp.Keys, nil
+	return response.Keys, nil
 }
 
 // GetCertificateChain returns the PEM-encoded certificate chain for keyName.
-func (c *Client) GetCertificateChain(ctx context.Context, keyName string) ([]byte, error) {
-	callCtx, cancel := c.withDeadline(ctx)
+func (client *Client) GetCertificateChain(ctx context.Context, keyName string) ([]byte, error) {
+	callContext, cancel := client.withDeadline(ctx)
 	defer cancel()
-	resp, err := c.rpc.GetCertificateChain(callCtx, &keycustodianv1alpha1.GetCertificateChainRequest{Key: keyName})
+	response, err := client.serviceClient.GetCertificateChain(callContext, &keycustodianv1alpha1.GetCertificateChainRequest{Key: keyName})
 	if err != nil {
 		return nil, err
 	}
-	return resp.CertificateChain, nil
+	return response.CertificateChain, nil
 }
 
-// ListKeys connects to socketPath, retrieves key names, and closes the connection.
-func ListKeys(ctx context.Context, socketPath string, opts ...Option) ([]string, error) {
-	c, err := New(socketPath, opts...)
+// NewSigner creates a crypto.Signer for keyName using this client.
+func (client *Client) NewSigner(keyName string) (crypto.Signer, error) {
+	chainPEM, err := client.GetCertificateChain(context.Background(), keyName)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getting certificate chain for %q: %w", keyName, err)
 	}
-	defer func() { _ = c.Close() }()
-	return c.ListKeys(ctx)
+	block, _ := pem.Decode(chainPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("no certificate PEM block found in chain for %q", keyName)
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parsing leaf certificate for %q: %w", keyName, err)
+	}
+
+	signer := &Signer{
+		client:    client,
+		keyName:   keyName,
+		publicKey: certificate.PublicKey,
+	}
+
+	probeDigest := sha256.Sum256([]byte("keycustodian probe " + keyName))
+	signature, err := signer.Sign(nil, probeDigest[:], crypto.SHA256)
+	if err != nil {
+		return nil, fmt.Errorf("verifying key %q: %w", keyName, err)
+	}
+	if err := verifySignature(certificate.PublicKey, probeDigest[:], signature); err != nil {
+		return nil, fmt.Errorf("key %q does not match certificate: %w", keyName, err)
+	}
+
+	return signer, nil
 }
 
-// GetCertificateChain connects to socketPath, retrieves the certificate chain, and closes the connection.
-func GetCertificateChain(ctx context.Context, socketPath, keyName string, opts ...Option) ([]byte, error) {
-	c, err := New(socketPath, opts...)
+func verifySignature(publicKey crypto.PublicKey, digest []byte, signature []byte) error {
+	switch pub := publicKey.(type) {
+	case *ecdsa.PublicKey:
+		if !ecdsa.VerifyASN1(pub, digest, signature) {
+			return errors.New("signature verification failed")
+		}
+		return nil
+	case *rsa.PublicKey:
+		return rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest, signature)
+	default:
+		return fmt.Errorf("unsupported public key type %T", publicKey)
+	}
+}
+
+// NewSigner connects to socketPath and returns a crypto.Signer for keyName.
+func NewSigner(socketPath string, keyName string, clientOptions ...Option) (crypto.Signer, error) {
+	client, err := New(socketPath, clientOptions...)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = c.Close() }()
-	return c.GetCertificateChain(ctx, keyName)
+	signer, err := client.NewSigner(keyName)
+	if err != nil {
+		if closeErr := client.Close(); closeErr != nil {
+			return nil, errors.Join(err, closeErr)
+		}
+		return nil, err
+	}
+	signer.(*Signer).ownsClient = true
+	return signer, nil
 }
 
 // Signer implements crypto.Signer backed by KeyCustodianService.
 type Signer struct {
-	client     *Client
-	keyName    string
-	pubKey     crypto.PublicKey
-	cert       *x509.Certificate
-	certChain  []byte
+	// client is the custodian client used to perform signing RPCs.
+	client *Client
+	// keyName is the name of the key held by the custodian.
+	keyName string
+	// publicKey is the public key extracted from the key's certificate chain.
+	publicKey crypto.PublicKey
+	// ownsClient indicates whether this Signer created and owns its Client.
 	ownsClient bool
 }
 
 var _ crypto.Signer = (*Signer)(nil)
 var _ io.Closer = (*Signer)(nil)
 
-// Signer returns a *Signer for keyName using this client.
-func (c *Client) Signer(keyName string) (*Signer, error) {
-	chain, err := c.GetCertificateChain(context.Background(), keyName)
-	if err != nil {
-		return nil, fmt.Errorf("getting certificate chain for %q: %w", keyName, err)
-	}
-	block, _ := pem.Decode(chain)
-	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, fmt.Errorf("no certificate PEM block found in chain for %q", keyName)
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parsing leaf certificate for %q: %w", keyName, err)
-	}
-	return &Signer{
-		client:    c,
-		keyName:   keyName,
-		pubKey:    cert.PublicKey,
-		cert:      cert,
-		certChain: chain,
-	}, nil
-}
-
-// NewSigner creates a crypto.Signer for keyName using this client.
-func (c *Client) NewSigner(keyName string) (crypto.Signer, error) {
-	return c.Signer(keyName)
-}
-
-// NewSigner connects to socketPath and returns a crypto.Signer for keyName.
-func NewSigner(socketPath, keyName string, opts ...Option) (crypto.Signer, error) {
-	c, err := New(socketPath, opts...)
-	if err != nil {
-		return nil, err
-	}
-	s, err := c.Signer(keyName)
-	if err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	s.ownsClient = true
-	return s, nil
-}
-
 // Public returns the public key extracted from the key's certificate chain.
-func (s *Signer) Public() crypto.PublicKey { return s.pubKey }
-
-// Certificate returns the leaf certificate for the signer.
-func (s *Signer) Certificate() *x509.Certificate { return s.cert }
-
-// CertificateChain returns the PEM-encoded certificate chain for the signer.
-func (s *Signer) CertificateChain() []byte { return s.certChain }
-
-// TLSCertificate constructs a tls.Certificate using this Signer as its PrivateKey.
-func (s *Signer) TLSCertificate() (tls.Certificate, error) {
-	var certDERs [][]byte
-	rest := s.certChain
-	for {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		if block.Type == "CERTIFICATE" {
-			certDERs = append(certDERs, block.Bytes)
-		}
-	}
-	if len(certDERs) == 0 {
-		return tls.Certificate{}, errors.New("keycustodian: no certificates found in chain")
-	}
-	return tls.Certificate{Certificate: certDERs, PrivateKey: s}, nil
+func (signer *Signer) Public() crypto.PublicKey {
+	return signer.publicKey
 }
 
-// Close closes the underlying connection if created by NewSigner.
-func (s *Signer) Close() error {
-	if s.ownsClient && s.client != nil {
-		return s.client.Close()
+// Close closes the underlying gRPC connection if the Signer was created with NewSigner.
+func (signer *Signer) Close() error {
+	if signer.ownsClient && signer.client != nil {
+		return signer.client.Close()
 	}
 	return nil
 }
 
-// Sign signs digest using the remote custodian.
-func (s *Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
-	return s.SignWithContext(context.Background(), digest, opts)
-}
-
-// SignWithContext signs digest using the remote custodian, bounded by ctx and the configured deadline.
-func (s *Signer) SignWithContext(ctx context.Context, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
-	req := &keycustodianv1alpha1.SignRequest{Key: s.keyName, Digest: digest}
-
-	var hash crypto.Hash
-	if opts != nil {
-		hash = opts.HashFunc()
-		if pssOpts, ok := opts.(*rsa.PSSOptions); ok {
-			saltLen := int32(pssOpts.SaltLength)
-			req.RsaPssSaltLength = &saltLen
-			if pssOpts.Hash != 0 {
-				hash = pssOpts.Hash
-			}
-		}
+// Sign signs digest using the remote key custodian daemon.
+//
+// The signer supports ECDSA (P-256, P-384, P-521) and RSA keys with
+// SHA-256, SHA-384, and SHA-512 hashes. RSA keys support PKCS #1 v1.5
+// signatures (passing crypto.SHA256, crypto.SHA384, or crypto.SHA512 as options)
+// or RSA-PSS signatures (passing *rsa.PSSOptions as options).
+//
+// Ed25519 keys are not supported. Unhashed messages (hash 0) are not supported.
+// The options parameter must not be nil and must specify a supported hash function.
+func (signer *Signer) Sign(_ io.Reader, digest []byte, signerOptions crypto.SignerOpts) ([]byte, error) {
+	if signerOptions == nil || signerOptions.HashFunc() == 0 {
+		return nil, errors.New("keycustodian: unhashed messages (hash 0) are not supported; options must specify a supported hash")
 	}
 
-	algo, err := hashAlgo(hash, len(digest))
+	hashAlgorithm, pssSaltLength, err := convertHashAlgorithm(signerOptions, len(digest))
 	if err != nil {
 		return nil, err
 	}
-	req.HashAlgorithm = algo
 
-	callCtx, cancel := s.client.withDeadline(ctx)
+	request := &keycustodianv1alpha1.SignRequest{
+		Key:               signer.keyName,
+		HashAlgorithm:    hashAlgorithm,
+		Digest:           digest,
+		RsaPssSaltLength: pssSaltLength,
+	}
+
+	callContext, cancel := signer.client.withDeadline(context.Background())
 	defer cancel()
 
 	select {
-	case s.client.sem <- struct{}{}:
-		defer func() { <-s.client.sem }()
-	case <-callCtx.Done():
-		return nil, fmt.Errorf("keycustodian: acquiring sign slot: %w", callCtx.Err())
+	case signer.client.semaphore <- struct{}{}:
+		defer func() { <-signer.client.semaphore }()
+	case <-callContext.Done():
+		return nil, fmt.Errorf("keycustodian: acquiring sign slot: %w", callContext.Err())
 	}
 
-	resp, err := s.client.rpc.Sign(callCtx, req)
+	response, err := signer.client.serviceClient.Sign(callContext, request)
 	if err != nil {
 		return nil, err
 	}
-	return resp.Signature, nil
+	return response.Signature, nil
 }
 
-func hashAlgo(h crypto.Hash, digestLen int) (keycustodianv1alpha1.HashAlgorithm, error) {
-	switch h {
-	case crypto.SHA256:
-		if digestLen != 32 {
-			return 0, fmt.Errorf("keycustodian: digest length %d does not match SHA-256 (expected 32)", digestLen)
-		}
-		return keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA256, nil
-	case crypto.SHA384:
-		if digestLen != 48 {
-			return 0, fmt.Errorf("keycustodian: digest length %d does not match SHA-384 (expected 48)", digestLen)
-		}
-		return keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA384, nil
-	case crypto.SHA512:
-		if digestLen != 64 {
-			return 0, fmt.Errorf("keycustodian: digest length %d does not match SHA-512 (expected 64)", digestLen)
-		}
-		return keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA512, nil
-	case 0:
-		switch digestLen {
-		case 32:
-			return keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA256, nil
-		case 48:
-			return keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA384, nil
-		case 64:
-			return keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA512, nil
+func convertHashAlgorithm(signerOptions crypto.SignerOpts, digestLength int) (keycustodianv1alpha1.HashAlgorithm, *int32, error) {
+	hash := signerOptions.HashFunc()
+	var pssSaltLength *int32
+	if pssOptions, ok := signerOptions.(*rsa.PSSOptions); ok {
+		salt := int32(pssOptions.SaltLength)
+		pssSaltLength = &salt
+		if pssOptions.Hash != 0 {
+			hash = pssOptions.Hash
 		}
 	}
-	return 0, fmt.Errorf("keycustodian: unsupported hash algorithm %v", h)
+
+	var hashAlgorithm keycustodianv1alpha1.HashAlgorithm
+	var expectedLength int
+	switch hash {
+	case crypto.SHA256:
+		hashAlgorithm = keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA256
+		expectedLength = 32
+	case crypto.SHA384:
+		hashAlgorithm = keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA384
+		expectedLength = 48
+	case crypto.SHA512:
+		hashAlgorithm = keycustodianv1alpha1.HashAlgorithm_HASH_ALGORITHM_SHA512
+		expectedLength = 64
+	default:
+		return 0, nil, fmt.Errorf("keycustodian: unsupported hash algorithm %v", hash)
+	}
+
+	if digestLength != expectedLength {
+		return 0, nil, fmt.Errorf("keycustodian: digest length %d does not match hash algorithm (expected %d)", digestLength, expectedLength)
+	}
+	return hashAlgorithm, pssSaltLength, nil
 }
