@@ -33,12 +33,10 @@ import (
 
 // FileInfo holds metadata about an oversize file moved to quarantine.
 type FileInfo struct {
+	// Name is the file name relative to the oversize directory (not a full path).
 	Name string
+	// Size is the size of the file in bytes.
 	Size uint64
-}
-
-type fileInfo struct {
-	size uint64
 }
 
 const (
@@ -274,7 +272,7 @@ func quarantineUnreferencedOversizeFiles(ctx context.Context, storeFS FS, storeD
 
 	referenced := getReferenced()
 
-	unreferenced := make(map[string]fileInfo)
+	unreferenced := make(map[string]FileInfo)
 	var names []string
 	for _, entry := range oversizeEntries {
 		if entry.IsDir() || referenced[entry.Name()] {
@@ -287,7 +285,10 @@ func quarantineUnreferencedOversizeFiles(ctx context.Context, storeFS FS, storeD
 			}
 			return nil, fmt.Errorf("failed to stat unreferenced oversize file %s: %w", entry.Name(), err)
 		}
-		unreferenced[entry.Name()] = fileInfo{size: uint64(info.Size())}
+		unreferenced[entry.Name()] = FileInfo{
+			Name: entry.Name(),
+			Size: uint64(info.Size()),
+		}
 		names = append(names, entry.Name())
 		if maxBatch > 0 && len(names) >= maxBatch {
 			break
@@ -302,10 +303,7 @@ func quarantineUnreferencedOversizeFiles(ctx context.Context, storeFS FS, storeD
 	movedNames, err := quarantineFiles(ctx, storeFS, oversizeDir, names, opts, liveSweep)
 	var movedFiles []FileInfo
 	for _, name := range movedNames {
-		movedFiles = append(movedFiles, FileInfo{
-			Name: name,
-			Size: unreferenced[name].size,
-		})
+		movedFiles = append(movedFiles, unreferenced[name])
 	}
 	if err != nil {
 		return movedFiles, err

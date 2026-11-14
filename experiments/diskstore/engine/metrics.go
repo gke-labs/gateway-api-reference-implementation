@@ -18,9 +18,13 @@ import "sync/atomic"
 
 // Metrics tracks runtime counters for diskstore operations.
 type Metrics struct {
-	OversizeObjectsCount      atomic.Int64
-	DirectIOFallbackCount     atomic.Int64
+	// OversizeObjectsCount counts the active oversize objects.
+	OversizeObjectsCount atomic.Int64
+	// DirectIOFallbackCount counts the number of times direct I/O fell back to buffered I/O.
+	DirectIOFallbackCount atomic.Int64
+	// QuarantineSweepFilesCount counts the total number of unreferenced files moved by quarantine sweeps.
 	QuarantineSweepFilesCount atomic.Int64
+	// QuarantineSweepBytesCount counts the total number of bytes moved by quarantine sweeps.
 	QuarantineSweepBytesCount atomic.Int64
 }
 
