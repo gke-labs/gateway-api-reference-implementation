@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -311,5 +312,63 @@ func TestFaultFS_RejectsOperationsAfterCrash(t *testing.T) {
 	}
 	if err := freshFile.Sync(); err != nil {
 		t.Fatalf("fresh sync failed: %v", err)
+	}
+}
+
+func TestFaultFile_ReadAt_EOF(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+
+	file, err := faultFS.Create("test_eof.db")
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer file.Close()
+
+	data := []byte("hello-world")
+	if _, err := file.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// 1. Read exactly all bytes: should return len(data), nil
+	readBuffer := make([]byte, len(data))
+	n, err := file.ReadAt(readBuffer, 0)
+	if err != nil || n != len(data) || !bytes.Equal(readBuffer, data) {
+		t.Fatalf("ReadAt exact: got n=%d, err=%v, want n=%d, err=nil", n, err, len(data))
+	}
+
+	// 2. Read at exact EOF (off == len(data)): must return 0, io.EOF (not os.ErrNotExist)
+	zeroBuffer := make([]byte, 10)
+	n, err = file.ReadAt(zeroBuffer, int64(len(data)))
+	if !errors.Is(err, io.EOF) || n != 0 {
+		t.Fatalf("ReadAt at EOF: got n=%d, err=%v, want 0, io.EOF", n, err)
+	}
+
+	// 3. Read beyond EOF (off > len(data)): must return 0, io.EOF (not os.ErrNotExist)
+	n, err = file.ReadAt(zeroBuffer, int64(len(data)+10))
+	if !errors.Is(err, io.EOF) || n != 0 {
+		t.Fatalf("ReadAt beyond EOF: got n=%d, err=%v, want 0, io.EOF", n, err)
+	}
+
+	// 4. Short read crossing EOF: must return n, io.EOF
+	crossBuffer := make([]byte, 10)
+	n, err = file.ReadAt(crossBuffer, int64(len(data)-3))
+	if !errors.Is(err, io.EOF) || n != 3 || !bytes.Equal(crossBuffer[:n], []byte("rld")) {
+		t.Fatalf("ReadAt crossing EOF: got n=%d, err=%v, want 3, io.EOF", n, err)
+	}
+
+	// 5. Read negative offset: must return error
+	_, err = file.ReadAt(readBuffer, -1)
+	if err == nil {
+		t.Fatalf("ReadAt negative offset: expected error, got nil")
+	}
+
+	// 6. Read on closed file: must return error
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	_, err = file.ReadAt(readBuffer, 0)
+	if err == nil {
+		t.Fatalf("ReadAt on closed file: expected error, got nil")
 	}
 }
