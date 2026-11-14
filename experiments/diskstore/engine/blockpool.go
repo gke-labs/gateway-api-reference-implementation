@@ -104,11 +104,13 @@ func (h *PageHandle) Unpin() {
 // and write-ahead rule enforcement.
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
 type BlockPool struct {
-	file       File
-	wal        *WAL
-	buddy      *BuddyAllocator
-	directIO   DirectIO
-	cipher     Cipher
+	file     File
+	wal      *WAL
+	buddy    *BuddyAllocator
+	directIO DirectIO
+	cipher   Cipher
+	// heapCipher is the AES-256-XTS cipher used for heap block encryption.
+	// A nil cipher means the store is not encrypted.
 	heapCipher *xts.Cipher
 	dbID       [16]byte
 
@@ -139,9 +141,10 @@ type BlockPool struct {
 type BlockPoolOptions struct {
 	NumPoolBlocks int
 	Cipher        Cipher
-	EncryptionKey []byte
-	HeapCipher    *xts.Cipher
-	OnFailure     func(error)
+	// HeapCipher is the AES-256-XTS cipher used for encrypting and decrypting heap blocks.
+	// A nil cipher means the store is not encrypted.
+	HeapCipher *xts.Cipher
+	OnFailure  func(error)
 }
 
 // NewBlockPool initializes a fixed-size block pool backed by a single pointer-free byte arena.
@@ -155,16 +158,8 @@ func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opt
 			numPoolBlocks = opts[0].NumPoolBlocks
 		}
 		cipher = opts[0].Cipher
+		heapCipher = opts[0].HeapCipher
 		onFailure = opts[0].OnFailure
-		if opts[0].HeapCipher != nil {
-			heapCipher = opts[0].HeapCipher
-		} else if len(opts[0].EncryptionKey) > 0 {
-			c, err := newHeapCipher(opts[0].EncryptionKey, dbID)
-			if err != nil {
-				panic(fmt.Sprintf("failed to create heap cipher: %v", err))
-			}
-			heapCipher = c
-		}
 	}
 
 	// Allocate pointer-free byte arena aligned to 4096 bytes without mmap

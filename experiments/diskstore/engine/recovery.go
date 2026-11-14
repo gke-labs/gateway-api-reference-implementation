@@ -61,6 +61,8 @@ type chunkBlockReader struct {
 	chunkBuf   []byte
 	chunkStart int64
 	chunkLen   int64
+	// heapCipher is the AES-256-XTS cipher used for heap block decryption during recovery.
+	// A nil cipher means the store is not encrypted.
 	heapCipher *xts.Cipher
 }
 
@@ -110,8 +112,8 @@ func (r *chunkBlockReader) ReadBlock(b uint64) ([]byte, error) {
 		chunkStartBlock := uint64(r.chunkStart / BlockSize)
 		numBlocksInChunk := int(r.chunkLen / BlockSize)
 		for i := 0; i < numBlocksInChunk; i++ {
-			blk := r.chunkBuf[i*BlockSize : (i+1)*BlockSize]
-			decryptHeapBlock(blk, blk, chunkStartBlock+uint64(i), r.heapCipher)
+			block := r.chunkBuf[i*BlockSize : (i+1)*BlockSize]
+			decryptHeapBlock(block, block, chunkStartBlock+uint64(i), r.heapCipher)
 		}
 	}
 
@@ -121,9 +123,10 @@ func (r *chunkBlockReader) ReadBlock(b uint64) ([]byte, error) {
 // RecoveryOptions configures crash recovery.
 type RecoveryOptions struct {
 	// Quarantine configures quarantine bounding and retention for lost+found directories.
-	Quarantine    QuarantineOptions
-	EncryptionKey []byte
-	HeapCipher    *xts.Cipher
+	Quarantine QuarantineOptions
+	// HeapCipher is the AES-256-XTS cipher used for decrypting heap blocks during recovery.
+	// A nil cipher means the store is not encrypted.
+	HeapCipher *xts.Cipher
 }
 
 // Recover scans the heap file, filters out foreign and torn copies, finds the WAL redo start LSN,
@@ -167,17 +170,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	}
 	buddy := NewBuddyAllocator(totalBlocks)
 
-	var heapCipher *xts.Cipher
-	if options.HeapCipher != nil {
-		heapCipher = options.HeapCipher
-	} else if len(options.EncryptionKey) > 0 {
-		c, err := newHeapCipher(options.EncryptionKey, dbID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create heap cipher for recovery: %w", err)
-		}
-		heapCipher = c
-	}
-	reader := newChunkBlockReader(heapFile, size, heapCipher)
+	reader := newChunkBlockReader(heapFile, size, options.HeapCipher)
 
 	// Step 1: Scan physical blocks in heap file sequentially to find valid candidate page copies
 	bestCandidates := make(map[uint64]candidatePageCopy) // logicalPage -> candidatePageCopy

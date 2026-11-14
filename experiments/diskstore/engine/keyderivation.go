@@ -94,18 +94,18 @@ func newHeapCipher(key []byte, dbID [16]byte) (*xts.Cipher, error) {
 }
 
 // encryptHeapBlock encrypts a 4 KiB heap block with AES-256-XTS using blockNum as tweak.
-func encryptHeapBlock(dst, src []byte, blockNum uint64, c *xts.Cipher) {
-	if c != nil {
-		c.Encrypt(dst, src, blockNum)
+func encryptHeapBlock(dst, src []byte, blockNum uint64, cipher *xts.Cipher) {
+	if cipher != nil {
+		cipher.Encrypt(dst, src, blockNum)
 	} else if &dst[0] != &src[0] {
 		copy(dst, src)
 	}
 }
 
 // decryptHeapBlock decrypts a 4 KiB heap block with AES-256-XTS using blockNum as tweak.
-func decryptHeapBlock(dst, src []byte, blockNum uint64, c *xts.Cipher) {
-	if c != nil {
-		c.Decrypt(dst, src, blockNum)
+func decryptHeapBlock(dst, src []byte, blockNum uint64, cipher *xts.Cipher) {
+	if cipher != nil {
+		cipher.Decrypt(dst, src, blockNum)
 	} else if &dst[0] != &src[0] {
 		copy(dst, src)
 	}

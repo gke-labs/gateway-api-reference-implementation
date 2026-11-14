@@ -325,8 +325,8 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 	faultFS := NewFaultFS(memFS)
 	dir := "test_crash_consistency_store"
 
-	baseOpts := func() []Option {
-		opts := []Option{WithFS(faultFS), WithDir(dir)}
+	openOpts := func(fs FS) []Option {
+		opts := []Option{WithFS(fs), WithDir(dir)}
 		if len(key) > 0 {
 			opts = append(opts, WithEncryptionKey(key))
 		}
@@ -337,7 +337,7 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 	model := make(map[string]string)
 
 	// Cycle 1: Open fresh store, put initial keys and a large multi-block object, checkpoint
-	store, err := Open(append(baseOpts(), WithCreate())...)
+	store, err := Open(append(openOpts(faultFS), WithCreate())...)
 	if err != nil {
 		t.Fatalf("Cycle 1 Open failed: %v", err)
 	}
@@ -388,11 +388,7 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 
 	// Cycle 2: Reopen store and verify full contents against model
 	faultFS2 := NewFaultFS(memFS)
-	opts2 := []Option{WithFS(faultFS2), WithDir(dir)}
-	if len(key) > 0 {
-		opts2 = append(opts2, WithEncryptionKey(key))
-	}
-	store2, err := Open(opts2...)
+	store2, err := Open(openOpts(faultFS2)...)
 	if err != nil {
 		t.Fatalf("Cycle 2 Open failed: %v", err)
 	}
@@ -435,11 +431,7 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 
 	// Cycle 3: Reopen store again and verify full contents against updated model
 	faultFS3 := NewFaultFS(memFS)
-	opts3 := []Option{WithFS(faultFS3), WithDir(dir)}
-	if len(key) > 0 {
-		opts3 = append(opts3, WithEncryptionKey(key))
-	}
-	store3, err := Open(opts3...)
+	store3, err := Open(openOpts(faultFS3)...)
 	if err != nil {
 		t.Fatalf("Cycle 3 Open failed: %v", err)
 	}
