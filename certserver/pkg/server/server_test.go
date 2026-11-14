@@ -343,20 +343,7 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 	}
 
 	// 10. Retry call until issuance completes and certificate is returned from cache
-	var successResp *certserverv1.GetCertificateResponse
-	retryDeadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(retryDeadline) {
-		time.Sleep(200 * time.Millisecond)
-		r, err := client.GetCertificate(callCtx, req)
-		if err == nil && r != nil && len(r.CertificateChain) > 0 {
-			successResp = r
-			break
-		}
-	}
-
-	if successResp == nil {
-		t.Fatalf("issuance timed out; GetCertificate did not return certificate on retry")
-	}
+	successResp := waitForCertificate(t, client, callCtx, req)
 
 	// 11. Verify certificate chain and private key
 	if len(successResp.CertificateChain) == 0 {

@@ -192,19 +192,7 @@ func TestPebble_CachedCertificateReuse_ValidatedViaLocalProbe_NoACMEOrder(t *tes
 	dp2Mu.Unlock()
 
 	// Poll until self-check passes and cached cert is released
-	var cert2 *certserverv1.GetCertificateResponse
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := h.client.GetCertificate(h.callCtx2, req2)
-		if err == nil && resp != nil && len(resp.CertificateChain) > 0 {
-			cert2 = resp
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if cert2 == nil {
-		t.Fatal("expected cluster 2 to receive cached certificate after local probe self-check")
-	}
+	waitForCertificate(t, h.client, h.callCtx2, req2)
 
 	if finalOrders := h.pebble.OrderCount(); finalOrders != 1 {
 		t.Fatalf("expected Pebble order count to remain 1 (no ACME order for cache reuse), got %d", finalOrders)
