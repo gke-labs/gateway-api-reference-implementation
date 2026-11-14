@@ -298,6 +298,9 @@ type Options struct {
 	// ACMEChallengeTokenPath is the path to the projected service-account token file for data-plane identity.
 	ACMEChallengeTokenPath string
 
+	// SkipNameValidation is a test option that disables controller-runtime controller name uniqueness validation.
+	SkipNameValidation bool
+
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
 	// is created, allowing callers to register additional reconcilers or runnables before
 	// the manager starts. If non-nil, it is passed the manager and the GARI Server.
@@ -558,6 +561,7 @@ func New(opts Options) (*Server, error) {
 		state: st,
 		proxy: p,
 	}
+	p.SetOnListenerReady(s.promotePending)
 
 	mgr := opts.Manager
 	if mgr == nil {
@@ -596,9 +600,10 @@ func New(opts Options) (*Server, error) {
 		}
 
 		var err error
-		skipNameValidation := true
-		controllerOpts := config.Controller{
-			SkipNameValidation: &skipNameValidation,
+		var controllerOpts config.Controller
+		if opts.SkipNameValidation {
+			skip := true
+			controllerOpts.SkipNameValidation = &skip
 		}
 		if opts.DataplaneMode {
 			secretName := singlepod.ResourceNameForGateway(opts.DataplaneGatewayName)
@@ -675,6 +680,39 @@ func samePortOrAddr(addr1, addr2 string) bool {
 	return false
 }
 
+// sharedListeners returns the listeners from previous that are also present in next, matching by protocol and port.
+func sharedListeners(previous, next []state.InternalListener) []state.InternalListener {
+	var shared []state.InternalListener
+	for _, prev := range previous {
+		for _, nxt := range next {
+			if prev.Protocol == nxt.Protocol && prev.Port == nxt.Port {
+				shared = append(shared, prev)
+				break
+			}
+		}
+	}
+	return shared
+}
+
+// promotePendingLocked promotes pending revisions whose required listeners are now all accepting connections.
+func (s *Server) promotePendingLocked() {
+	for gatewayKey, config := range s.appliedConfigs {
+		if config.pendingRevision != "" && (!s.opts.DataplaneMode || s.listenersAccepting(config.pendingListeners)) {
+			config.appliedRevision = config.pendingRevision
+			config.appliedListeners = config.pendingListeners
+			config.pendingRevision = ""
+			config.pendingListeners = nil
+			s.appliedConfigs[gatewayKey] = config
+		}
+	}
+}
+
+func (s *Server) promotePending() {
+	s.appliedMu.Lock()
+	defer s.appliedMu.Unlock()
+	s.promotePendingLocked()
+}
+
 // readyzChecker returns a healthz.Checker that reports the data plane as ready
 // only after every listener that the applied config needs is bound and accepting
 // connections. A new revision whose listeners are not accepting yet does not make
@@ -695,16 +733,9 @@ func (s *Server) readyzChecker() healthz.Checker {
 			return errors.New("proxy configuration not yet applied")
 		}
 		if s.opts.DataplaneMode {
-			s.appliedMu.Lock()
-			defer s.appliedMu.Unlock()
-			for gatewayKey, config := range s.appliedConfigs {
-				if config.pendingRevision != "" && s.listenersAccepting(config.pendingListeners) {
-					config.appliedRevision = config.pendingRevision
-					config.appliedListeners = config.pendingListeners
-					config.pendingRevision = ""
-					config.pendingListeners = nil
-					s.appliedConfigs[gatewayKey] = config
-				}
+			s.appliedMu.RLock()
+			defer s.appliedMu.RUnlock()
+			for _, config := range s.appliedConfigs {
 				if config.appliedRevision == "" || !s.listenersAccepting(config.appliedListeners) {
 					return errors.New("listeners not yet accepting connections")
 				}
@@ -762,17 +793,10 @@ func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Han
 
 // appliedRevisionsList returns the list of configuration revisions currently served by the data plane.
 func (s *Server) appliedRevisionsList() []string {
-	s.appliedMu.Lock()
-	defer s.appliedMu.Unlock()
+	s.appliedMu.RLock()
+	defer s.appliedMu.RUnlock()
 	revisions := make([]string, 0, len(s.appliedConfigs))
-	for gatewayKey, config := range s.appliedConfigs {
-		if config.pendingRevision != "" && (!s.opts.DataplaneMode || s.listenersAccepting(config.pendingListeners)) {
-			config.appliedRevision = config.pendingRevision
-			config.appliedListeners = config.pendingListeners
-			config.pendingRevision = ""
-			config.pendingListeners = nil
-			s.appliedConfigs[gatewayKey] = config
-		}
+	for _, config := range s.appliedConfigs {
 		if config.appliedRevision != "" && (!s.opts.DataplaneMode || s.listenersAccepting(config.appliedListeners)) {
 			revisions = append(revisions, config.appliedRevision)
 		}
@@ -788,16 +812,11 @@ func (s *Server) recordAppliedRevision(gatewayKey, revision string, listeners []
 		s.appliedConfigs = make(map[string]appliedConfig)
 	}
 	config := s.appliedConfigs[gatewayKey]
-	if !s.opts.DataplaneMode || s.listenersAccepting(listeners) {
-		config.appliedRevision = revision
-		config.appliedListeners = listeners
-		config.pendingRevision = ""
-		config.pendingListeners = nil
-	} else {
-		config.pendingRevision = revision
-		config.pendingListeners = listeners
-	}
+	config.appliedListeners = sharedListeners(config.appliedListeners, listeners)
+	config.pendingRevision = revision
+	config.pendingListeners = listeners
 	s.appliedConfigs[gatewayKey] = config
+	s.promotePendingLocked()
 }
 
 func (s *Server) appliedHandler() http.Handler {
@@ -1048,7 +1067,10 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			srv := s.newHTTPServer(handler, nil)
 			readyLis := &readyListener{
 				Listener: filterLis,
-				onAccept: func() { s.httpAccepting.Store(true) },
+				onAccept: func() {
+					s.httpAccepting.Store(true)
+					s.promotePending()
+				},
 			}
 			defer s.httpAccepting.Store(false)
 			go func() {
@@ -1143,7 +1165,10 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			tlsLis := tls.NewListener(sniLis, tlsConfig)
 			readyTLS := &readyListener{
 				Listener: tlsLis,
-				onAccept: func() { s.httpsAccepting.Store(true) },
+				onAccept: func() {
+					s.httpsAccepting.Store(true)
+					s.promotePending()
+				},
 			}
 			defer s.httpsAccepting.Store(false)
 			go func() {

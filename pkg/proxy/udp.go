@@ -39,13 +39,13 @@ const (
 )
 
 type udpPortListener struct {
-	port      gatewayv1.PortNumber
-	conn      net.PacketConn
-	backends  atomic.Pointer[[]state.InternalUDPBackend]
-	closed    atomic.Bool
+	port     gatewayv1.PortNumber
+	conn     net.PacketConn
+	backends atomic.Pointer[[]state.InternalUDPBackend]
+	closed   atomic.Bool
 	// reading indicates that the UDP socket is bound and the read loop is running.
-	reading   atomic.Bool
-	done      chan struct{}
+	reading atomic.Bool
+	done    chan struct{}
 
 	idleTimeout atomic.Int64 // nanoseconds
 	maxSessions atomic.Int64
@@ -258,7 +258,9 @@ func (p *Proxy) udpReadLoop(portListener *udpPortListener) {
 	defer portListener.reading.Store(false)
 	buf := make([]byte, udpBufferSize)
 	for {
-		portListener.reading.Store(true)
+		if !portListener.reading.Swap(true) {
+			p.notifyListenerReady()
+		}
 		n, clientAddr, err := portListener.conn.ReadFrom(buf)
 		if err != nil {
 			if portListener.closed.Load() || errors.Is(err, net.ErrClosed) {
