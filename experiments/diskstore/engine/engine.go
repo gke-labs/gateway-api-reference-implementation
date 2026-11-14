@@ -881,8 +881,8 @@ func Open(opts ...Option) (*Engine, error) {
 		// Track empty logical pages recovered from disk only after WAL replay completes,
 		// so replayed historical mutations never reuse an empty page whose durable copy
 		// carries a newer LSN and regress its LSN under small block pool eviction.
-		for _, p := range recoveryRes.EmptyLogicalPages {
-			s.emptyPages.Add(p)
+		for _, pageID := range recoveryRes.EmptyLogicalPages {
+			s.emptyPages.Add(pageID)
 		}
 
 		// After replay, the engine flushes the changed pages as it does for a checkpoint,
