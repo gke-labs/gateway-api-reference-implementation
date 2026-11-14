@@ -4,22 +4,27 @@ metadata:
   name: localgateway-dns
   namespace: default
 ---
+# localgateway-dns is permitted to read only its own config Secret ("localgateway-dns"
+# in the default namespace). It has no access to Gateways, TLS Secrets, or any other Gateway's config.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
   name: localgateway-dns
+  namespace: default
 rules:
-- apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["gateways"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["localgateway-dns"]
   verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: localgateway-dns
+  namespace: default
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: localgateway-dns
 subjects:
 - kind: ServiceAccount
@@ -54,7 +59,8 @@ spec:
         image: localgateway-dns:latest
         imagePullPolicy: IfNotPresent
         args:
-        - --gateway-class=localgateway
+        - --config-secret=localgateway-dns
+        - --config-namespace=default
         ports:
         - name: mdns
           containerPort: 5353
