@@ -15,14 +15,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 
 	"k8s.io/klog/v2/textlogger"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/address"
+	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/dnsconfig"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
@@ -99,6 +102,22 @@ func BuildOptions(args []string) (gari.Options, Config, error) {
 	return gariOpts, cfg, nil
 }
 
+// uncachedReaderClient wraps a client.Client and overrides Get to read directly from the API server.
+// Reading through mgr.GetAPIReader() avoids triggering controller-runtime's cache informer to start
+// an unbounded cluster-wide watch on Secrets, which is forbidden by the narrowed single-Secret RBAC rule.
+type uncachedReaderClient struct {
+	// Client is the underlying controller-runtime client used for writes and non-Get operations.
+	client.Client
+
+	// reader is the uncached API reader used for direct GET operations against the API server.
+	reader client.Reader
+}
+
+// Get performs an uncached read of the object directly from the API server.
+func (c *uncachedReaderClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
+}
+
 // WirePublisher connects an mDNS Publisher to GARI options and registers it as a manager Runnable.
 func WirePublisher(opts *gari.Options, pub *mdns.Publisher) {
 	opts.GatewayStatusHook = pub.StatusHook
@@ -107,6 +126,15 @@ func WirePublisher(opts *gari.Options, pub *mdns.Publisher) {
 		pub.SetEnqueueGateway(s.EnqueueGateway)
 		if err := mgr.Add(pub); err != nil {
 			return fmt.Errorf("failed to register mDNS publisher with manager: %w", err)
+		}
+
+		uncachedClient := &uncachedReaderClient{
+			Client: mgr.GetClient(),
+			reader: mgr.GetAPIReader(),
+		}
+		dnsPublisher := dnsconfig.NewPublisher(uncachedClient, dnsconfig.DefaultConfigSecretNamespace, dnsconfig.DefaultConfigSecretName, s.State())
+		if err := mgr.Add(dnsPublisher); err != nil {
+			return fmt.Errorf("failed to register dns config publisher with manager: %w", err)
 		}
 		return nil
 	}

@@ -340,6 +340,13 @@ func (s *State) SetSynced(synced bool) {
 	s.synced = synced
 }
 
+// Synced reports whether the state has finished its initial sync.
+func (s *State) Synced() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.synced
+}
+
 func (s *State) IsDirty() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
