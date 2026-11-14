@@ -19,8 +19,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"slices"
-	"strings"
 )
 
 // Record represents a published single-label .local DNS name and its resolved IP addresses.
@@ -42,19 +40,8 @@ type Config struct {
 }
 
 // ComputeRevision computes a deterministic SHA-256 hash of the records in the config.
-// The revision is the same for the same records in any input order.
 func (c *Config) ComputeRevision() (string, error) {
-	records := slices.Clone(c.Records)
-	if records == nil {
-		records = []Record{}
-	}
-	slices.SortFunc(records, func(a, b Record) int {
-		if cmp := strings.Compare(a.Name, b.Name); cmp != 0 {
-			return cmp
-		}
-		return slices.Compare(a.Addresses, b.Addresses)
-	})
-	data, err := json.Marshal(records)
+	data, err := json.Marshal(c.Records)
 	if err != nil {
 		return "", fmt.Errorf("marshaling records for revision: %w", err)
 	}

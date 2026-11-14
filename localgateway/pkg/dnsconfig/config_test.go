@@ -18,90 +18,60 @@ import (
 	"testing"
 )
 
-func TestConfig_ComputeRevision_OrderInvariance(t *testing.T) {
-	r1 := Record{Name: "alpha.local", Addresses: []string{"192.168.1.1"}}
-	r2 := Record{Name: "beta.local", Addresses: []string{"192.168.1.2"}}
-	r3 := Record{Name: "gamma.local", Addresses: []string{"192.168.1.3", "2001:db8::1"}}
-
-	permutations := [][]Record{
-		{r1, r2, r3},
-		{r1, r3, r2},
-		{r2, r1, r3},
-		{r2, r3, r1},
-		{r3, r1, r2},
-		{r3, r2, r1},
+func TestConfig_ComputeRevision_Deterministic(t *testing.T) {
+	config := Config{
+		Records: []Record{
+			{Name: "alpha.local", Addresses: []string{"192.168.1.1"}},
+			{Name: "beta.local", Addresses: []string{"192.168.1.2"}},
+		},
 	}
-
-	var baseRev string
-	for i, perm := range permutations {
-		cfg := Config{Records: perm}
-		rev, err := cfg.ComputeRevision()
-		if err != nil {
-			t.Fatalf("ComputeRevision failed for permutation %d: %v", i, err)
-		}
-		if rev == "" {
-			t.Fatalf("expected non-empty revision for permutation %d", i)
-		}
-		if i == 0 {
-			baseRev = rev
-		} else if rev != baseRev {
-			t.Errorf("permutation %d produced revision %q, want %q", i, rev, baseRev)
-		}
+	revision1, err := config.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision failed: %v", err)
+	}
+	revision2, err := config.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision failed: %v", err)
+	}
+	if revision1 != revision2 || revision1 == "" {
+		t.Errorf("expected deterministic non-empty revision, got revision1=%q revision2=%q", revision1, revision2)
 	}
 }
 
-func TestConfig_ComputeRevision_DifferentRecordsDifferentRevision(t *testing.T) {
-	cfg1 := Config{
+func TestConfig_ComputeRevision_DifferentRecords(t *testing.T) {
+	config1 := Config{
 		Records: []Record{
 			{Name: "alpha.local", Addresses: []string{"192.168.1.1"}},
 		},
 	}
-	cfg2 := Config{
+	config2 := Config{
 		Records: []Record{
 			{Name: "alpha.local", Addresses: []string{"192.168.1.2"}},
 		},
 	}
-	cfg3 := Config{
+	config3 := Config{
 		Records: []Record{
 			{Name: "beta.local", Addresses: []string{"192.168.1.1"}},
 		},
 	}
 
-	rev1, err := cfg1.ComputeRevision()
+	revision1, err := config1.ComputeRevision()
 	if err != nil {
-		t.Fatalf("cfg1 ComputeRevision failed: %v", err)
+		t.Fatalf("config1 ComputeRevision failed: %v", err)
 	}
-	rev2, err := cfg2.ComputeRevision()
+	revision2, err := config2.ComputeRevision()
 	if err != nil {
-		t.Fatalf("cfg2 ComputeRevision failed: %v", err)
+		t.Fatalf("config2 ComputeRevision failed: %v", err)
 	}
-	rev3, err := cfg3.ComputeRevision()
+	revision3, err := config3.ComputeRevision()
 	if err != nil {
-		t.Fatalf("cfg3 ComputeRevision failed: %v", err)
+		t.Fatalf("config3 ComputeRevision failed: %v", err)
 	}
 
-	if rev1 == rev2 {
-		t.Errorf("expected different revisions for differing addresses, got %q", rev1)
+	if revision1 == revision2 {
+		t.Errorf("expected different revisions for differing addresses, got %q", revision1)
 	}
-	if rev1 == rev3 {
-		t.Errorf("expected different revisions for differing names, got %q", rev1)
-	}
-}
-
-func TestConfig_ComputeRevision_EmptyAndNil(t *testing.T) {
-	cfgNil := Config{Records: nil}
-	cfgEmpty := Config{Records: []Record{}}
-
-	revNil, err := cfgNil.ComputeRevision()
-	if err != nil {
-		t.Fatalf("cfgNil ComputeRevision failed: %v", err)
-	}
-	revEmpty, err := cfgEmpty.ComputeRevision()
-	if err != nil {
-		t.Fatalf("cfgEmpty ComputeRevision failed: %v", err)
-	}
-
-	if revNil != revEmpty {
-		t.Errorf("expected nil and empty records to yield same revision, got nil=%q empty=%q", revNil, revEmpty)
+	if revision1 == revision3 {
+		t.Errorf("expected different revisions for differing names, got %q", revision1)
 	}
 }

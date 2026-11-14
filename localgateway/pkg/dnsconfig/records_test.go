@@ -33,27 +33,28 @@ const testControllerName = "github.com/gke-labs/gateway-api-reference-implementa
 func setupTestState(t *testing.T) *state.State {
 	t.Helper()
 
-	st := state.NewState()
-	st.SetControllerName(testControllerName)
-	st.SetListenerValidator(validation.ValidateListener)
-	p := proxy.NewProxy()
-	st.SetProxy(p)
+	testState := state.NewState()
+	testState.SetControllerName(testControllerName)
+	testState.SetListenerValidator(validation.ValidateListener)
+	testProxy := proxy.NewProxy()
+	testState.SetProxy(testProxy)
+	testState.SetSynced(true)
 
-	gc := &gatewayv1.GatewayClass{
+	gatewayClass := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "localgateway"},
 		Spec: gatewayv1.GatewayClassSpec{
 			ControllerName: gatewayv1.GatewayController(testControllerName),
 		},
 	}
-	st.UpsertGatewayClass(gc)
-	return st
+	testState.UpsertGatewayClass(gatewayClass)
+	return testState
 }
 
-func makeGateway(ns, name, hostname string, port int, createdAt time.Time) *gatewayv1.Gateway {
-	h := gatewayv1.Hostname(hostname)
+func makeGateway(namespace, name, hostname string, port int, createdAt time.Time) *gatewayv1.Gateway {
+	host := gatewayv1.Hostname(hostname)
 	return &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace:         ns,
+			Namespace:         namespace,
 			Name:              name,
 			CreationTimestamp: metav1.NewTime(createdAt),
 		},
@@ -64,38 +65,47 @@ func makeGateway(ns, name, hostname string, port int, createdAt time.Time) *gate
 					Name:     "http",
 					Port:     gatewayv1.PortNumber(port),
 					Protocol: gatewayv1.HTTPProtocolType,
-					Hostname: &h,
+					Hostname: &host,
 				},
 			},
 		},
 	}
 }
 
+func upsertGateway(testState *state.State, gateway *gatewayv1.Gateway, addresses []string, ready bool) {
+	testState.UpsertGateway(gateway)
+	key := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
+	var statusAddresses []gatewayv1.GatewayStatusAddress
+	for _, address := range addresses {
+		statusAddresses = append(statusAddresses, gatewayv1.GatewayStatusAddress{Value: address})
+	}
+	testState.SetGatewayAddresses(key, statusAddresses)
+	testState.SetGatewayReadiness(key, state.GatewayReadiness{Ready: ready})
+	testState.Recompute()
+}
+
+func assertRecords(t *testing.T, actual, expected []Record) {
+	t.Helper()
+	if len(actual) != len(expected) {
+		t.Fatalf("record count mismatch: got %d (%+v), want %d (%+v)", len(actual), actual, len(expected), expected)
+	}
+	for i := range actual {
+		if actual[i].Name != expected[i].Name || !slices.Equal(actual[i].Addresses, expected[i].Addresses) {
+			t.Fatalf("record[%d] mismatch:\ngot:  %+v\nwant: %+v", i, actual[i], expected[i])
+		}
+	}
+}
+
 // TestBuildRecords_ProgrammedGatewayWithAddress verifies that a programmed Gateway
 // with an address produces a DNS record.
 func TestBuildRecords_ProgrammedGatewayWithAddress(t *testing.T) {
-	st := setupTestState(t)
+	testState := setupTestState(t)
+	gateway := makeGateway("default", "my-gateway", "app.local", 80, time.Now())
+	upsertGateway(testState, gateway, []string{"192.168.1.100"}, true)
 
-	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
-	gw := makeGateway(gwKey.Namespace, gwKey.Name, "app.local", 80, time.Now())
-
-	st.UpsertGateway(gw)
-	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
-	st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-	st.SetSynced(true)
-	st.Recompute()
-
-	records := BuildRecords(st)
-	if len(records) != 1 {
-		t.Fatalf("expected 1 record, got %d", len(records))
-	}
-	if records[0].Name != "app.local" {
-		t.Errorf("expected name app.local, got %q", records[0].Name)
-	}
-	expectedAddresses := []string{"192.168.1.100"}
-	if !slices.Equal(records[0].Addresses, expectedAddresses) {
-		t.Errorf("expected addresses %v, got %v", expectedAddresses, records[0].Addresses)
-	}
+	assertRecords(t, BuildRecords(testState), []Record{
+		{Name: "app.local", Addresses: []string{"192.168.1.100"}},
+	})
 }
 
 // TestBuildRecords_ContestedNameBothCreationOrders verifies that when two Gateways
@@ -105,59 +115,32 @@ func TestBuildRecords_ContestedNameBothCreationOrders(t *testing.T) {
 	olderTime := now.Add(-10 * time.Minute)
 	newerTime := now.Add(-5 * time.Minute)
 
-	olderIP := "192.168.1.10"
-	newerIP := "192.168.1.20"
-
 	testCases := []struct {
 		name       string
 		orderFirst string
 	}{
-		{
-			name:       "older added first",
-			orderFirst: "older",
-		},
-		{
-			name:       "newer added first",
-			orderFirst: "newer",
-		},
+		{name: "older added first", orderFirst: "older"},
+		{name: "newer added first", orderFirst: "newer"},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			st := setupTestState(t)
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			testState := setupTestState(t)
 
-			olderKey := types.NamespacedName{Namespace: "default", Name: "gw-older"}
-			newerKey := types.NamespacedName{Namespace: "default", Name: "gw-newer"}
+			olderGateway := makeGateway("default", "gateway-older", "app.local", 80, olderTime)
+			newerGateway := makeGateway("default", "gateway-newer", "app.local", 8080, newerTime)
 
-			olderGw := makeGateway("default", "gw-older", "app.local", 80, olderTime)
-			newerGw := makeGateway("default", "gw-newer", "app.local", 8080, newerTime)
-
-			if tc.orderFirst == "older" {
-				st.UpsertGateway(olderGw)
-				st.UpsertGateway(newerGw)
+			if testCase.orderFirst == "older" {
+				upsertGateway(testState, olderGateway, []string{"192.168.1.10"}, true)
+				upsertGateway(testState, newerGateway, []string{"192.168.1.20"}, true)
 			} else {
-				st.UpsertGateway(newerGw)
-				st.UpsertGateway(olderGw)
+				upsertGateway(testState, newerGateway, []string{"192.168.1.20"}, true)
+				upsertGateway(testState, olderGateway, []string{"192.168.1.10"}, true)
 			}
 
-			st.SetGatewayAddresses(olderKey, []gatewayv1.GatewayStatusAddress{{Value: olderIP}})
-			st.SetGatewayReadiness(olderKey, state.GatewayReadiness{Ready: true})
-			st.SetGatewayAddresses(newerKey, []gatewayv1.GatewayStatusAddress{{Value: newerIP}})
-			st.SetGatewayReadiness(newerKey, state.GatewayReadiness{Ready: true})
-
-			st.SetSynced(true)
-			st.Recompute()
-
-			records := BuildRecords(st)
-			if len(records) != 1 {
-				t.Fatalf("expected 1 record, got %d", len(records))
-			}
-			if records[0].Name != "app.local" {
-				t.Errorf("expected name app.local, got %q", records[0].Name)
-			}
-			if !slices.Contains(records[0].Addresses, olderIP) {
-				t.Errorf("expected winning record to contain older IP %s, got %v", olderIP, records[0].Addresses)
-			}
+			assertRecords(t, BuildRecords(testState), []Record{
+				{Name: "app.local", Addresses: []string{"192.168.1.10"}},
+			})
 		})
 	}
 }
@@ -168,63 +151,29 @@ func TestBuildRecords_EqualTimestamps(t *testing.T) {
 	sameTime := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 
 	t.Run("tie-break by namespace", func(t *testing.T) {
-		st := setupTestState(t)
+		testState := setupTestState(t)
+		alphaGateway := makeGateway("alpha", "gateway", "service.local", 80, sameTime)
+		betaGateway := makeGateway("beta", "gateway", "service.local", 8080, sameTime)
 
-		gwAlphaKey := types.NamespacedName{Namespace: "alpha", Name: "gw"}
-		gwBetaKey := types.NamespacedName{Namespace: "beta", Name: "gw"}
+		upsertGateway(testState, betaGateway, []string{"10.0.2.1"}, true)
+		upsertGateway(testState, alphaGateway, []string{"10.0.1.1"}, true)
 
-		gwAlpha := makeGateway("alpha", "gw", "service.local", 80, sameTime)
-		gwBeta := makeGateway("beta", "gw", "service.local", 8080, sameTime)
-
-		// Insert beta first to verify insertion order does not decide winner
-		st.UpsertGateway(gwBeta)
-		st.UpsertGateway(gwAlpha)
-
-		st.SetGatewayAddresses(gwAlphaKey, []gatewayv1.GatewayStatusAddress{{Value: "10.0.1.1"}})
-		st.SetGatewayReadiness(gwAlphaKey, state.GatewayReadiness{Ready: true})
-		st.SetGatewayAddresses(gwBetaKey, []gatewayv1.GatewayStatusAddress{{Value: "10.0.2.1"}})
-		st.SetGatewayReadiness(gwBetaKey, state.GatewayReadiness{Ready: true})
-
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 1 {
-			t.Fatalf("expected 1 record, got %d", len(records))
-		}
-		if !slices.Contains(records[0].Addresses, "10.0.1.1") {
-			t.Errorf("expected alpha namespace to win tie-break, got addresses %v", records[0].Addresses)
-		}
+		assertRecords(t, BuildRecords(testState), []Record{
+			{Name: "service.local", Addresses: []string{"10.0.1.1"}},
+		})
 	})
 
 	t.Run("tie-break by name within same namespace", func(t *testing.T) {
-		st := setupTestState(t)
+		testState := setupTestState(t)
+		gatewayA := makeGateway("default", "gateway-a", "service.local", 80, sameTime)
+		gatewayB := makeGateway("default", "gateway-b", "service.local", 8080, sameTime)
 
-		gwAKey := types.NamespacedName{Namespace: "default", Name: "gw-a"}
-		gwBKey := types.NamespacedName{Namespace: "default", Name: "gw-b"}
+		upsertGateway(testState, gatewayB, []string{"10.0.2.1"}, true)
+		upsertGateway(testState, gatewayA, []string{"10.0.1.1"}, true)
 
-		gwA := makeGateway("default", "gw-a", "service.local", 80, sameTime)
-		gwB := makeGateway("default", "gw-b", "service.local", 8080, sameTime)
-
-		// Insert B first to verify insertion order does not decide winner
-		st.UpsertGateway(gwB)
-		st.UpsertGateway(gwA)
-
-		st.SetGatewayAddresses(gwAKey, []gatewayv1.GatewayStatusAddress{{Value: "10.0.1.1"}})
-		st.SetGatewayReadiness(gwAKey, state.GatewayReadiness{Ready: true})
-		st.SetGatewayAddresses(gwBKey, []gatewayv1.GatewayStatusAddress{{Value: "10.0.2.1"}})
-		st.SetGatewayReadiness(gwBKey, state.GatewayReadiness{Ready: true})
-
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 1 {
-			t.Fatalf("expected 1 record, got %d", len(records))
-		}
-		if !slices.Contains(records[0].Addresses, "10.0.1.1") {
-			t.Errorf("expected gw-a name to win tie-break, got addresses %v", records[0].Addresses)
-		}
+		assertRecords(t, BuildRecords(testState), []Record{
+			{Name: "service.local", Addresses: []string{"10.0.1.1"}},
+		})
 	})
 }
 
@@ -233,77 +182,36 @@ func TestBuildRecords_EqualTimestamps(t *testing.T) {
 // loses Programmed status without contenders its records are withdrawn.
 func TestBuildRecords_OlderGatewayLosesProgrammed(t *testing.T) {
 	t.Run("single Gateway loses Programmed withdraws record", func(t *testing.T) {
-		st := setupTestState(t)
-		gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
-		gw := makeGateway(gwKey.Namespace, gwKey.Name, "app.local", 80, time.Now())
+		testState := setupTestState(t)
+		gateway := makeGateway("default", "my-gateway", "app.local", 80, time.Now())
+		upsertGateway(testState, gateway, []string{"192.168.1.100"}, true)
+		assertRecords(t, BuildRecords(testState), []Record{
+			{Name: "app.local", Addresses: []string{"192.168.1.100"}},
+		})
 
-		st.UpsertGateway(gw)
-		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 1 {
-			t.Fatalf("expected 1 record initially, got %d", len(records))
-		}
-
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: false})
-		st.Recompute()
-
-		records = BuildRecords(st)
-		if len(records) != 0 {
-			t.Errorf("expected 0 records after gateway lost programmed, got %d", len(records))
-		}
+		upsertGateway(testState, gateway, []string{"192.168.1.100"}, false)
+		assertRecords(t, BuildRecords(testState), nil)
 	})
 
 	t.Run("contested name transfers when older Gateway loses Programmed", func(t *testing.T) {
-		st := setupTestState(t)
-
+		testState := setupTestState(t)
 		now := time.Now()
-		olderKey := types.NamespacedName{Namespace: "default", Name: "gw-older"}
-		newerKey := types.NamespacedName{Namespace: "default", Name: "gw-newer"}
+		olderGateway := makeGateway("default", "gateway-older", "app.local", 80, now.Add(-10*time.Minute))
+		newerGateway := makeGateway("default", "gateway-newer", "app.local", 8080, now.Add(-5*time.Minute))
 
-		olderGw := makeGateway("default", "gw-older", "app.local", 80, now.Add(-10*time.Minute))
-		newerGw := makeGateway("default", "gw-newer", "app.local", 8080, now.Add(-5*time.Minute))
+		upsertGateway(testState, olderGateway, []string{"192.168.1.10"}, true)
+		upsertGateway(testState, newerGateway, []string{"192.168.1.20"}, true)
+		assertRecords(t, BuildRecords(testState), []Record{
+			{Name: "app.local", Addresses: []string{"192.168.1.10"}},
+		})
 
-		st.UpsertGateway(olderGw)
-		st.UpsertGateway(newerGw)
+		upsertGateway(testState, olderGateway, []string{"192.168.1.10"}, false)
+		assertRecords(t, BuildRecords(testState), []Record{
+			{Name: "app.local", Addresses: []string{"192.168.1.20"}},
+		})
 
-		st.SetGatewayAddresses(olderKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.10"}})
-		st.SetGatewayReadiness(olderKey, state.GatewayReadiness{Ready: true})
-		st.SetGatewayAddresses(newerKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.20"}})
-		st.SetGatewayReadiness(newerKey, state.GatewayReadiness{Ready: true})
-
-		st.SetSynced(true)
-		st.Recompute()
-
-		// Initially older Gateway wins
-		records := BuildRecords(st)
-		if len(records) != 1 || !slices.Contains(records[0].Addresses, "192.168.1.10") {
-			t.Fatalf("expected older Gateway to hold record initially, got %v", records)
-		}
-
-		// Older Gateway loses Programmed (ready = false)
-		st.SetGatewayReadiness(olderKey, state.GatewayReadiness{Ready: false})
-		st.Recompute()
-
-		records = BuildRecords(st)
-		if len(records) != 1 {
-			t.Fatalf("expected 1 record after older gateway lost programmed, got %d", len(records))
-		}
-		if !slices.Contains(records[0].Addresses, "192.168.1.20") {
-			t.Errorf("expected newer Gateway to take over record, got %v", records[0].Addresses)
-		}
-
-		// Newer Gateway also loses Programmed -> no records
-		st.SetGatewayReadiness(newerKey, state.GatewayReadiness{Ready: false})
-		st.Recompute()
-
-		records = BuildRecords(st)
-		if len(records) != 0 {
-			t.Errorf("expected no records when all gateways lose programmed, got %v", records)
-		}
+		upsertGateway(testState, newerGateway, []string{"192.168.1.20"}, false)
+		assertRecords(t, BuildRecords(testState), nil)
 	})
 }
 
@@ -311,206 +219,126 @@ func TestBuildRecords_OlderGatewayLosesProgrammed(t *testing.T) {
 // collide on the canonical lowercase name and are resolved by the oldest Gateway rule.
 func TestBuildRecords_NamesDifferOnlyInCase(t *testing.T) {
 	now := time.Now()
+	testCases := []struct {
+		name          string
+		olderHostname string
+		newerHostname string
+	}{
+		{name: "older mixed case, newer lowercase", olderHostname: "App.Local", newerHostname: "app.local"},
+		{name: "older lowercase, newer uppercase", olderHostname: "app.local", newerHostname: "APP.LOCAL"},
+	}
 
-	t.Run("older has mixed case, newer has lowercase", func(t *testing.T) {
-		st := setupTestState(t)
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			testState := setupTestState(t)
+			olderGateway := makeGateway("default", "gateway-older", testCase.olderHostname, 80, now.Add(-10*time.Minute))
+			newerGateway := makeGateway("default", "gateway-newer", testCase.newerHostname, 8080, now.Add(-5*time.Minute))
 
-		olderKey := types.NamespacedName{Namespace: "default", Name: "gw-older"}
-		newerKey := types.NamespacedName{Namespace: "default", Name: "gw-newer"}
+			upsertGateway(testState, olderGateway, []string{"192.168.1.10"}, true)
+			upsertGateway(testState, newerGateway, []string{"192.168.1.20"}, true)
 
-		olderGw := makeGateway("default", "gw-older", "App.Local", 80, now.Add(-10*time.Minute))
-		newerGw := makeGateway("default", "gw-newer", "app.local", 8080, now.Add(-5*time.Minute))
-
-		st.UpsertGateway(olderGw)
-		st.UpsertGateway(newerGw)
-		st.SetGatewayAddresses(olderKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.10"}})
-		st.SetGatewayReadiness(olderKey, state.GatewayReadiness{Ready: true})
-		st.SetGatewayAddresses(newerKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.20"}})
-		st.SetGatewayReadiness(newerKey, state.GatewayReadiness{Ready: true})
-
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 1 {
-			t.Fatalf("expected 1 record, got %d", len(records))
-		}
-		if records[0].Name != "app.local" {
-			t.Errorf("expected canonical lowercase name app.local, got %q", records[0].Name)
-		}
-		if !slices.Contains(records[0].Addresses, "192.168.1.10") {
-			t.Errorf("expected older Gateway to hold record, got %v", records[0].Addresses)
-		}
-	})
-
-	t.Run("older has lowercase, newer has uppercase", func(t *testing.T) {
-		st := setupTestState(t)
-
-		olderKey := types.NamespacedName{Namespace: "default", Name: "gw-older"}
-		newerKey := types.NamespacedName{Namespace: "default", Name: "gw-newer"}
-
-		olderGw := makeGateway("default", "gw-older", "app.local", 80, now.Add(-10*time.Minute))
-		newerGw := makeGateway("default", "gw-newer", "APP.LOCAL", 8080, now.Add(-5*time.Minute))
-
-		st.UpsertGateway(olderGw)
-		st.UpsertGateway(newerGw)
-		st.SetGatewayAddresses(olderKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.10"}})
-		st.SetGatewayReadiness(olderKey, state.GatewayReadiness{Ready: true})
-		st.SetGatewayAddresses(newerKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.20"}})
-		st.SetGatewayReadiness(newerKey, state.GatewayReadiness{Ready: true})
-
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 1 {
-			t.Fatalf("expected 1 record, got %d", len(records))
-		}
-		if records[0].Name != "app.local" {
-			t.Errorf("expected canonical lowercase name app.local, got %q", records[0].Name)
-		}
-		if !slices.Contains(records[0].Addresses, "192.168.1.10") {
-			t.Errorf("expected older Gateway to hold record, got %v", records[0].Addresses)
-		}
-	})
+			assertRecords(t, BuildRecords(testState), []Record{
+				{Name: "app.local", Addresses: []string{"192.168.1.10"}},
+			})
+		})
+	}
 }
 
 // TestBuildRecords_LoopbackAndUnspecifiedAddresses verifies that loopback and unspecified
 // addresses are filtered out and not published.
 func TestBuildRecords_LoopbackAndUnspecifiedAddresses(t *testing.T) {
-	t.Run("only loopback IPv4 address yields no records", func(t *testing.T) {
-		st := setupTestState(t)
-		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-loopback"}
-		gw := makeGateway(gwKey.Namespace, gwKey.Name, "app.local", 80, time.Now())
+	testCases := []struct {
+		name    string
+		address string
+	}{
+		{name: "loopback IPv4", address: "127.0.0.1"},
+		{name: "loopback IPv6", address: "::1"},
+		{name: "unspecified IPv4", address: "0.0.0.0"},
+		{name: "unspecified IPv6", address: "::"},
+	}
 
-		st.UpsertGateway(gw)
-		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "127.0.0.1"}})
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 0 {
-			t.Errorf("expected no records for loopback IPv4 address, got %v", records)
-		}
-	})
-
-	t.Run("only loopback IPv6 address yields no records", func(t *testing.T) {
-		st := setupTestState(t)
-		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-loopback6"}
-		gw := makeGateway(gwKey.Namespace, gwKey.Name, "app.local", 80, time.Now())
-
-		st.UpsertGateway(gw)
-		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "::1"}})
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 0 {
-			t.Errorf("expected no records for loopback IPv6 address, got %v", records)
-		}
-	})
-
-	t.Run("only unspecified IPv4 address yields no records", func(t *testing.T) {
-		st := setupTestState(t)
-		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-unspec4"}
-		gw := makeGateway(gwKey.Namespace, gwKey.Name, "app.local", 80, time.Now())
-
-		st.UpsertGateway(gw)
-		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "0.0.0.0"}})
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 0 {
-			t.Errorf("expected no records for unspecified IPv4 address, got %v", records)
-		}
-	})
-
-	t.Run("only unspecified IPv6 address yields no records", func(t *testing.T) {
-		st := setupTestState(t)
-		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-unspec6"}
-		gw := makeGateway(gwKey.Namespace, gwKey.Name, "app.local", 80, time.Now())
-
-		st.UpsertGateway(gw)
-		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "::"}})
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 0 {
-			t.Errorf("expected no records for unspecified IPv6 address, got %v", records)
-		}
-	})
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			testState := setupTestState(t)
+			gateway := makeGateway("default", "gateway", "app.local", 80, time.Now())
+			upsertGateway(testState, gateway, []string{testCase.address}, true)
+			assertRecords(t, BuildRecords(testState), nil)
+		})
+	}
 
 	t.Run("mixed loopback and routable addresses filters loopback", func(t *testing.T) {
-		st := setupTestState(t)
-		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-mixed"}
-		gw := makeGateway(gwKey.Namespace, gwKey.Name, "app.local", 80, time.Now())
+		testState := setupTestState(t)
+		gateway := makeGateway("default", "gateway", "app.local", 80, time.Now())
+		upsertGateway(testState, gateway, []string{
+			"127.0.0.1",
+			"192.168.1.50",
+			"::1",
+			"0.0.0.0",
+			"2001:db8::50",
+		}, true)
 
-		st.UpsertGateway(gw)
-		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{
-			{Value: "127.0.0.1"},
-			{Value: "192.168.1.50"},
-			{Value: "::1"},
-			{Value: "0.0.0.0"},
-			{Value: "2001:db8::50"},
+		assertRecords(t, BuildRecords(testState), []Record{
+			{Name: "app.local", Addresses: []string{"192.168.1.50", "2001:db8::50"}},
 		})
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 1 {
-			t.Fatalf("expected 1 record, got %d", len(records))
-		}
-		expectedAddresses := []string{"192.168.1.50", "2001:db8::50"}
-		if !slices.Equal(records[0].Addresses, expectedAddresses) {
-			t.Errorf("expected addresses %v, got %v", expectedAddresses, records[0].Addresses)
-		}
 	})
 }
 
-// TestBuildRecords_EdgeCases verifies edge conditions like nil state, non-HTTP listeners,
-// invalid hostnames, and deleted Gateways.
-func TestBuildRecords_EdgeCases(t *testing.T) {
-	t.Run("nil state returns nil", func(t *testing.T) {
-		records := BuildRecords(nil)
-		if records != nil {
-			t.Errorf("expected nil records for nil state, got %v", records)
-		}
+// TestBuildRecords_AddressSortingAndDeduplication verifies that addresses are sorted
+// and de-duplicated in records computed from Gateway status.
+func TestBuildRecords_AddressSortingAndDeduplication(t *testing.T) {
+	testState := setupTestState(t)
+	gateway := makeGateway("default", "gateway", "app.local", 80, time.Now())
+
+	upsertGateway(testState, gateway, []string{
+		"192.168.1.50",
+		"192.168.1.10",
+		"192.168.1.50",
+		"192.168.1.20",
+	}, true)
+
+	assertRecords(t, BuildRecords(testState), []Record{
+		{Name: "app.local", Addresses: []string{"192.168.1.10", "192.168.1.20", "192.168.1.50"}},
 	})
+}
 
+// TestBuildRecords_RecordsSortedByName verifies that BuildRecords returns records
+// sorted alphabetically by name.
+func TestBuildRecords_RecordsSortedByName(t *testing.T) {
+	testState := setupTestState(t)
+	now := time.Now()
+
+	olderGateway := makeGateway("default", "gateway-older", "zulu.local", 80, now.Add(-10*time.Minute))
+	newerGateway := makeGateway("default", "gateway-newer", "alpha.local", 8080, now.Add(-5*time.Minute))
+
+	upsertGateway(testState, olderGateway, []string{"192.168.1.10"}, true)
+	upsertGateway(testState, newerGateway, []string{"192.168.1.20"}, true)
+
+	assertRecords(t, BuildRecords(testState), []Record{
+		{Name: "alpha.local", Addresses: []string{"192.168.1.20"}},
+		{Name: "zulu.local", Addresses: []string{"192.168.1.10"}},
+	})
+}
+
+// TestBuildRecords_SkippedGatewaysAndListeners verifies that non-viable Gateways and listeners
+// (deleted, non-HTTP, invalid hostname) are skipped.
+func TestBuildRecords_SkippedGatewaysAndListeners(t *testing.T) {
 	t.Run("deleted Gateway is skipped", func(t *testing.T) {
-		st := setupTestState(t)
-		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-deleted"}
-		gw := makeGateway(gwKey.Namespace, gwKey.Name, "app.local", 80, time.Now())
+		testState := setupTestState(t)
+		gateway := makeGateway("default", "gateway-deleted", "app.local", 80, time.Now())
 		deletionTime := metav1.Now()
-		gw.DeletionTimestamp = &deletionTime
+		gateway.DeletionTimestamp = &deletionTime
 
-		st.UpsertGateway(gw)
-		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 0 {
-			t.Errorf("expected no records for deleted gateway, got %v", records)
-		}
+		upsertGateway(testState, gateway, []string{"192.168.1.100"}, true)
+		assertRecords(t, BuildRecords(testState), nil)
 	})
 
 	t.Run("non-HTTP listener is skipped", func(t *testing.T) {
-		st := setupTestState(t)
-		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-https"}
-		h := gatewayv1.Hostname("app.local")
-		gw := &gatewayv1.Gateway{
+		testState := setupTestState(t)
+		hostname := gatewayv1.Hostname("app.local")
+		gateway := &gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: gwKey.Namespace,
-				Name:      gwKey.Name,
+				Namespace: "default",
+				Name:      "gateway-https",
 			},
 			Spec: gatewayv1.GatewaySpec{
 				GatewayClassName: "localgateway",
@@ -519,38 +347,21 @@ func TestBuildRecords_EdgeCases(t *testing.T) {
 						Name:     "https",
 						Port:     443,
 						Protocol: gatewayv1.HTTPSProtocolType,
-						Hostname: &h,
+						Hostname: &hostname,
 					},
 				},
 			},
 		}
 
-		st.UpsertGateway(gw)
-		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 0 {
-			t.Errorf("expected no records for non-HTTP listener, got %v", records)
-		}
+		upsertGateway(testState, gateway, []string{"192.168.1.100"}, true)
+		assertRecords(t, BuildRecords(testState), nil)
 	})
 
 	t.Run("invalid hostname is skipped", func(t *testing.T) {
-		st := setupTestState(t)
-		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-invalid"}
-		gw := makeGateway(gwKey.Namespace, gwKey.Name, "multi.label.local", 80, time.Now())
+		testState := setupTestState(t)
+		gateway := makeGateway("default", "gateway-invalid", "multi.label.local", 80, time.Now())
 
-		st.UpsertGateway(gw)
-		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
-		st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
-		st.SetSynced(true)
-		st.Recompute()
-
-		records := BuildRecords(st)
-		if len(records) != 0 {
-			t.Errorf("expected no records for invalid multi-label hostname, got %v", records)
-		}
+		upsertGateway(testState, gateway, []string{"192.168.1.100"}, true)
+		assertRecords(t, BuildRecords(testState), nil)
 	})
 }

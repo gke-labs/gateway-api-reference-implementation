@@ -16,10 +16,11 @@ package dnsconfig
 
 import (
 	"net"
+	"slices"
 	"sort"
 	"strings"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -32,14 +33,9 @@ import (
 // that are accepted and programmed, skips loopback and unspecified addresses,
 // and resolves conflicts deterministically by oldest creation time, then namespace and name.
 func BuildRecords(controllerState *state.State) []Record {
-	if controllerState == nil {
-		return nil
-	}
-
-	gatewayStates := controllerState.GetGateways()
 	var matchingGateways []*gatewayv1.Gateway
-	for _, gatewayState := range gatewayStates {
-		if gatewayState == nil || gatewayState.Gateway == nil || gatewayState.Gateway.DeletionTimestamp != nil {
+	for _, gatewayState := range controllerState.GetGateways() {
+		if gatewayState.Gateway.DeletionTimestamp != nil {
 			continue
 		}
 		matchingGateways = append(matchingGateways, gatewayState.Gateway)
@@ -64,7 +60,7 @@ func BuildRecords(controllerState *state.State) []Record {
 	for _, gateway := range matchingGateways {
 		gatewayKey := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
 		status, ok := controllerState.GetDesiredGatewayStatus(gatewayKey)
-		if !ok || !isGatewayProgrammed(status) {
+		if !ok || !meta.IsStatusConditionTrue(status.Conditions, string(gatewayv1.GatewayConditionProgrammed)) {
 			continue
 		}
 
@@ -84,6 +80,8 @@ func BuildRecords(controllerState *state.State) []Record {
 		if len(addressStrings) == 0 {
 			continue
 		}
+		slices.Sort(addressStrings)
+		addressStrings = slices.Compact(addressStrings)
 
 		for _, listener := range gateway.Spec.Listeners {
 			if listener.Protocol != gatewayv1.HTTPProtocolType || listener.Hostname == nil {
@@ -106,22 +104,16 @@ func BuildRecords(controllerState *state.State) []Record {
 
 			records = append(records, Record{
 				Name:      canonicalHostname,
-				Addresses: append([]string(nil), addressStrings...),
+				Addresses: slices.Clone(addressStrings),
 			})
 		}
 	}
 
-	return records
-}
+	slices.SortFunc(records, func(a, b Record) int {
+		return strings.Compare(a.Name, b.Name)
+	})
 
-// isGatewayProgrammed returns true if the status has a Programmed condition with status True.
-func isGatewayProgrammed(status gatewayv1.GatewayStatus) bool {
-	for _, condition := range status.Conditions {
-		if condition.Type == string(gatewayv1.GatewayConditionProgrammed) && condition.Status == metav1.ConditionTrue {
-			return true
-		}
-	}
-	return false
+	return records
 }
 
 // isListenerAcceptedAndProgrammed returns true if the specified listener has both Accepted
@@ -131,16 +123,8 @@ func isListenerAcceptedAndProgrammed(status gatewayv1.GatewayStatus, listenerNam
 		if listenerStatus.Name != listenerName {
 			continue
 		}
-		var accepted, programmed bool
-		for _, condition := range listenerStatus.Conditions {
-			if condition.Type == string(gatewayv1.ListenerConditionAccepted) && condition.Status == metav1.ConditionTrue {
-				accepted = true
-			}
-			if condition.Type == string(gatewayv1.ListenerConditionProgrammed) && condition.Status == metav1.ConditionTrue {
-				programmed = true
-			}
-		}
-		return accepted && programmed
+		return meta.IsStatusConditionTrue(listenerStatus.Conditions, string(gatewayv1.ListenerConditionAccepted)) &&
+			meta.IsStatusConditionTrue(listenerStatus.Conditions, string(gatewayv1.ListenerConditionProgrammed))
 	}
 	return false
 }
