@@ -331,34 +331,34 @@ func TestFaultFile_ReadAt_EOF(t *testing.T) {
 	}
 
 	// 1. Read exactly all bytes: should return len(data), nil
-	buf := make([]byte, len(data))
-	n, err := file.ReadAt(buf, 0)
-	if err != nil || n != len(data) || !bytes.Equal(buf, data) {
+	readBuffer := make([]byte, len(data))
+	n, err := file.ReadAt(readBuffer, 0)
+	if err != nil || n != len(data) || !bytes.Equal(readBuffer, data) {
 		t.Fatalf("ReadAt exact: got n=%d, err=%v, want n=%d, err=nil", n, err, len(data))
 	}
 
 	// 2. Read at exact EOF (off == len(data)): must return 0, io.EOF (not os.ErrNotExist)
-	bufZero := make([]byte, 10)
-	n, err = file.ReadAt(bufZero, int64(len(data)))
+	zeroBuffer := make([]byte, 10)
+	n, err = file.ReadAt(zeroBuffer, int64(len(data)))
 	if !errors.Is(err, io.EOF) || n != 0 {
 		t.Fatalf("ReadAt at EOF: got n=%d, err=%v, want 0, io.EOF", n, err)
 	}
 
 	// 3. Read beyond EOF (off > len(data)): must return 0, io.EOF (not os.ErrNotExist)
-	n, err = file.ReadAt(bufZero, int64(len(data)+10))
+	n, err = file.ReadAt(zeroBuffer, int64(len(data)+10))
 	if !errors.Is(err, io.EOF) || n != 0 {
 		t.Fatalf("ReadAt beyond EOF: got n=%d, err=%v, want 0, io.EOF", n, err)
 	}
 
 	// 4. Short read crossing EOF: must return n, io.EOF
-	bufCross := make([]byte, 10)
-	n, err = file.ReadAt(bufCross, int64(len(data)-3))
-	if !errors.Is(err, io.EOF) || n != 3 || !bytes.Equal(bufCross[:n], []byte("rld")) {
+	crossBuffer := make([]byte, 10)
+	n, err = file.ReadAt(crossBuffer, int64(len(data)-3))
+	if !errors.Is(err, io.EOF) || n != 3 || !bytes.Equal(crossBuffer[:n], []byte("rld")) {
 		t.Fatalf("ReadAt crossing EOF: got n=%d, err=%v, want 3, io.EOF", n, err)
 	}
 
 	// 5. Read negative offset: must return error
-	_, err = file.ReadAt(buf, -1)
+	_, err = file.ReadAt(readBuffer, -1)
 	if err == nil {
 		t.Fatalf("ReadAt negative offset: expected error, got nil")
 	}
@@ -367,9 +367,8 @@ func TestFaultFile_ReadAt_EOF(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
-	_, err = file.ReadAt(buf, 0)
+	_, err = file.ReadAt(readBuffer, 0)
 	if err == nil {
 		t.Fatalf("ReadAt on closed file: expected error, got nil")
 	}
 }
-

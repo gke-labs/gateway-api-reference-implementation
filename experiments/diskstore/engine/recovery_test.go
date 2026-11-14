@@ -1804,7 +1804,6 @@ func TestRecovery_ReplayHeapWriteFailure_NoMarkerAndSucceedsOnReopen(t *testing.
 	}
 }
 
-<<<<<<< HEAD
 // TestRecovery_SmallBlockPoolReuseRule verifies that after a crash, recovery and later writes
 // with a 16-block pool don't overwrite the block that holds a page's newest durable copy.
 func TestRecovery_SmallBlockPoolReuseRule(t *testing.T) {
@@ -1916,9 +1915,9 @@ func TestRecovery_SmallBlockPoolReuseRule(t *testing.T) {
 	}
 }
 
-// TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds reproduces issue #1296 where
-// a WAL segment ending exactly on a block boundary causes recovery to read at offset == fileSize.
-// With FaultFS returning os.ErrNotExist instead of io.EOF, recovery fails during WAL scan.
+// TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds checks that recovery succeeds
+// when the last WAL record ends exactly on a block boundary, so the scan reads at an offset
+// equal to the file size.
 func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
@@ -1947,14 +1946,14 @@ func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 
 	// Calculate payload for a final Put so that wal.appendOff lands exactly on a 4 KiB block boundary.
 	store.wal.mu.Lock()
-	currentOff := store.wal.appendOff
+	currentOffset := store.wal.appendOff
 	store.wal.mu.Unlock()
 
 	finalKey := "key-boundary"
-	qFinalKey := qualifyKey(table, finalKey)
-	recordOverhead := int64(RecordHeaderSize + len(qFinalKey) + 1) // +1 for CodecNone compression header
-	rem := int64(WALBlockSize) - ((currentOff + recordOverhead) % int64(WALBlockSize))
-	finalPayloadLen := rem
+	qualifiedFinalKey := qualifyKey(table, finalKey)
+	recordOverhead := int64(RecordHeaderSize + len(qualifiedFinalKey) + 1) // +1 for CodecNone compression header
+	remainder := int64(WALBlockSize) - ((currentOffset + recordOverhead) % int64(WALBlockSize))
+	finalPayloadLen := remainder
 	finalPayload := bytes.Repeat([]byte("z"), int(finalPayloadLen))
 
 	if err := store.Put(table, finalKey, finalPayload); err != nil {
@@ -1963,10 +1962,10 @@ func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 
 	// Verify that appendOff is on an exact block boundary
 	store.wal.mu.Lock()
-	appendOff := store.wal.appendOff
+	appendOffset := store.wal.appendOff
 	store.wal.mu.Unlock()
-	if appendOff%int64(WALBlockSize) != 0 {
-		t.Fatalf("expected appendOff to be a multiple of %d, got %d", WALBlockSize, appendOff)
+	if appendOffset%int64(WALBlockSize) != 0 {
+		t.Fatalf("expected appendOff to be a multiple of %d, got %d", WALBlockSize, appendOffset)
 	}
 
 	// Sync ensures all WAL records are durable. Because appendOff is on a block boundary,
@@ -1979,10 +1978,10 @@ func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open wal segment failed: %v", err)
 	}
-	sz, err := walFile.Size()
+	segmentSize, err := walFile.Size()
 	walFile.Close()
-	if err != nil || sz != appendOff {
-		t.Fatalf("expected segment size %d, got %d (err: %v)", appendOff, sz, err)
+	if err != nil || segmentSize != appendOffset {
+		t.Fatalf("expected segment size %d, got %d (err: %v)", appendOffset, segmentSize, err)
 	}
 
 	// Simulate crash without clean close
@@ -1990,7 +1989,7 @@ func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 		t.Fatalf("Crash failed: %v", err)
 	}
 
-	// Reopen with fresh FaultFS: WAL scan reads at offset == fileSize (appendOff)
+	// Reopen with fresh FaultFS: WAL scan reads at offset == fileSize (appendOffset)
 	faultFS2 := NewFaultFS(memFS)
 	store2, err := Open(WithFS(faultFS2), WithDir(dir), WithCompressionCodec(CodecNone))
 	if err != nil {
@@ -1999,9 +1998,9 @@ func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 	defer store2.Close()
 
 	// Verify data integrity
-	v1, exists, err := store2.Get(table, "key1")
-	if err != nil || !exists || !bytes.Equal(v1, []byte("val1-replacement")) {
-		t.Fatalf("key1 mismatch: exists=%v, got=%q, err=%v", exists, string(v1), err)
+	value1, exists, err := store2.Get(table, "key1")
+	if err != nil || !exists || !bytes.Equal(value1, []byte("val1-replacement")) {
+		t.Fatalf("key1 mismatch: exists=%v, got=%q, err=%v", exists, string(value1), err)
 	}
 
 	_, exists, err = store2.Get(table, "key2")
@@ -2009,8 +2008,8 @@ func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 		t.Fatalf("expected deleted key2 to not exist, exists=%v, err=%v", exists, err)
 	}
 
-	vFinal, exists, err := store2.Get(table, finalKey)
-	if err != nil || !exists || !bytes.Equal(vFinal, finalPayload) {
-		t.Fatalf("finalKey mismatch: exists=%v, len=%d, err=%v", exists, len(vFinal), err)
+	valueFinal, exists, err := store2.Get(table, finalKey)
+	if err != nil || !exists || !bytes.Equal(valueFinal, finalPayload) {
+		t.Fatalf("finalKey mismatch: exists=%v, len=%d, err=%v", exists, len(valueFinal), err)
 	}
 }
