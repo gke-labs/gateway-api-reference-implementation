@@ -127,7 +127,14 @@ type Proxy struct {
 	acmeTimeout           time.Duration
 	logForwarderErrorOnce sync.Once
 
+	challenges atomic.Pointer[map[challengeKey]string]
+
 	closed bool
+}
+
+type challengeKey struct {
+	hostname string
+	token    string
 }
 
 type tcpPortListener struct {
@@ -177,6 +184,8 @@ func NewProxy() *Proxy {
 
 	p.sniConfig.Store(&sniConfig{})
 	p.clientValidationConfig.Store(&clientValidationConfig{})
+	emptyChallenges := make(map[challengeKey]string)
+	p.challenges.Store(&emptyChallenges)
 	return p
 }
 
@@ -796,6 +805,16 @@ func (p *Proxy) UpdateCertificates(certs map[string]*tls.Certificate, defaultCer
 	}
 }
 
+// UpdateChallenges updates the pending ACME HTTP-01 challenges served directly from memory.
+func (p *Proxy) UpdateChallenges(challenges []state.HTTP01Challenge) {
+	m := make(map[challengeKey]string, len(challenges))
+	for _, c := range challenges {
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(c.Hostname), "."))
+		m[challengeKey{hostname: host, token: c.Token}] = c.KeyAuthorization
+	}
+	p.challenges.Store(&m)
+}
+
 func (p *Proxy) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -899,6 +918,56 @@ func matchHTTPListeners(listeners []state.InternalListener, hostHeader string) (
 	candidates, reqHost := narrowListenersByPort(httpListeners, hostHeader, 80, true)
 	matchedListeners, _ := state.MatchListeners(candidates, reqHost)
 	return matchedListeners, true
+}
+
+// maybeServeACMEChallenge checks if a plain-HTTP request on an HTTP listener matches a pending
+// ACME HTTP-01 challenge for the requested hostname and token, serving the key authorization with text/plain.
+// Any other request falls through to normal routing (or forwarding) immediately.
+func (p *Proxy) maybeServeACMEChallenge(w http.ResponseWriter, r *http.Request, listeners []state.InternalListener) bool {
+	if r.TLS != nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+		return false
+	}
+	if !strings.HasPrefix(r.URL.Path, ACMEChallengePrefix) {
+		return false
+	}
+	token := strings.TrimPrefix(r.URL.Path, ACMEChallengePrefix)
+	if token == "" || strings.Contains(token, "/") {
+		return false
+	}
+	entries := p.challenges.Load()
+	if entries == nil || len(*entries) == 0 {
+		return false
+	}
+	origHost := r.Host
+	if v := r.Context().Value(originalHostContextKey); v != nil {
+		if s, ok := v.(string); ok && s != "" {
+			origHost = s
+		}
+	}
+	reqHost, _, _ := splitHostPort(origHost, 80)
+	reqHost = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(reqHost), "."))
+
+	keyAuth, ok := (*entries)[challengeKey{hostname: reqHost, token: token}]
+	if !ok {
+		return false
+	}
+
+	if len(listeners) > 0 {
+		matchedListeners, hasHTTP := matchHTTPListeners(listeners, origHost)
+		if !hasHTTP || len(matchedListeners) == 0 {
+			return false
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Length", strconv.Itoa(len(keyAuth)))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		if _, writeErr := w.Write([]byte(keyAuth)); writeErr != nil {
+			klog.V(4).Infof("error writing acme challenge response: %v", writeErr)
+		}
+	}
+	return true
 }
 
 // maybeForwardACMEChallenge checks if a plain-HTTP request matches the ACME HTTP-01 challenge prefix,
@@ -1139,6 +1208,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	routes := p.routes
 	listeners := p.listeners
 	p.mu.RUnlock()
+
+	if p.maybeServeACMEChallenge(w, r, listeners) {
+		return
+	}
 
 	if p.maybeForwardACMEChallenge(w, r, listeners) {
 		return
@@ -2072,8 +2145,12 @@ func (p *Proxy) evictUnusedTransports(activeRoutes []state.InternalRoute) {
 }
 
 func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper {
+	p.mu.RLock()
+	customDial := p.dialFunc
+	p.mu.RUnlock()
+
 	key := backendTransportKey(backend)
-	if key == "default" {
+	if customDial == nil && key == "default" {
 		return http.DefaultTransport
 	}
 
@@ -2134,7 +2211,15 @@ func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper 
 			Protocols:   &protocols,
 		}
 	} else {
-		return http.DefaultTransport
+		if customDial != nil {
+			transport = &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return customDial(network, addr)
+				},
+			}
+		} else {
+			return http.DefaultTransport
+		}
 	}
 
 	p.transports[key] = transport

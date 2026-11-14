@@ -34,6 +34,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/client"
@@ -525,5 +526,109 @@ func TestSource_Eviction_FailingLoopExits(t *testing.T) {
 	callsAfter := rpcCalls.Load()
 	if callsAfter != callsAtEviction {
 		t.Errorf("expected fetchLoop to have exited with no further RPCs, but calls increased from %d to %d", callsAtEviction, callsAfter)
+	}
+}
+
+func TestSource_PendingChallenges_TrackAndDrop(t *testing.T) {
+	testCert, _ := generateTestTLSCert(t)
+	var step atomic.Int32
+	chal1 := &certserverv1.HTTP01Challenge{
+		Hostname:         "test.example.com",
+		Token:            "token-abc",
+		KeyAuthorization: "token-abc.auth-key",
+	}
+
+	mock := &mockCertClient{
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
+			switch step.Load() {
+			case 0:
+				return &client.CertificateInfo{
+					Certificate: nil,
+					Challenges:  []*certserverv1.HTTP01Challenge{chal1},
+				}, nil
+			default:
+				return &client.CertificateInfo{
+					Certificate: testCert,
+					Leaf:        testCert.Leaf,
+					Challenges:  nil,
+				}, nil
+			}
+		},
+	}
+
+	src := NewSource(
+		mock,
+		WithMinBackoff(10*time.Millisecond),
+		WithMaxBackoff(20*time.Millisecond),
+	)
+	defer src.Close()
+
+	recomputeCh := make(chan struct{}, 10)
+	src.SetRecomputeTrigger(func() {
+		recomputeCh <- struct{}{}
+	})
+
+	host := gatewayv1.Hostname("test.example.com")
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name}}
+	listener := &gatewayv1.Listener{Hostname: &host}
+
+	// 1. Initial call returns Pending
+	res, err := src.ResolveCertificates(gw, listener)
+	if err != nil || !res.Pending {
+		t.Fatalf("expected Pending=true on initial call, got res=%+v, err=%v", res, err)
+	}
+
+	// 2. Wait for trigger indicating challenges received
+	select {
+	case <-recomputeCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for trigger on challenge received")
+	}
+
+	// 3. ResolveCertificates now returns the pending challenges
+	res, err = src.ResolveCertificates(gw, listener)
+	if err != nil {
+		t.Fatalf("unexpected error from ResolveCertificates: %v", err)
+	}
+	if !res.Pending {
+		t.Errorf("expected Pending=true while challenge active")
+	}
+	if len(res.Challenges) != 1 || res.Challenges[0].Token != "token-abc" {
+		t.Errorf("expected 1 challenge with token-abc, got %+v", res.Challenges)
+	}
+
+	// 4. PendingChallenges returns the challenge per Gateway
+	gwChals := src.PendingChallenges(gwKey)
+	if len(gwChals) != 1 || gwChals[0].KeyAuthorization != "token-abc.auth-key" {
+		t.Errorf("expected PendingChallenges to match, got %+v", gwChals)
+	}
+
+	// 5. Transition to certificate ready (challenges dropped)
+	step.Store(1)
+
+	// Wait for trigger indicating certificate issuance / challenge removal
+	select {
+	case <-recomputeCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for trigger on cert issued")
+	}
+
+	// 6. ResolveCertificates now returns the certificate, and challenges are gone
+	res, err = src.ResolveCertificates(gw, listener)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Pending {
+		t.Errorf("expected Pending=false after cert issued")
+	}
+	if len(res.Certificates) != 1 {
+		t.Errorf("expected 1 certificate, got %d", len(res.Certificates))
+	}
+	if len(res.Challenges) != 0 {
+		t.Errorf("expected 0 challenges after cert issued, got %d", len(res.Challenges))
+	}
+	if len(src.PendingChallenges(gwKey)) != 0 {
+		t.Errorf("expected PendingChallenges to be empty, got %+v", src.PendingChallenges(gwKey))
 	}
 }

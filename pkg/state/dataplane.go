@@ -62,6 +62,13 @@ const (
 	DataPlaneHealthProbePort = 8999
 )
 
+// HTTP01Challenge represents an ACME HTTP-01 challenge to be served by the data plane.
+type HTTP01Challenge struct {
+	Hostname         string `json:"hostname"`
+	Token            string `json:"token"`
+	KeyAuthorization string `json:"keyAuthorization"`
+}
+
 // DataplaneConfig represents the serialized proxy configuration for a single Gateway.
 type DataplaneConfig struct {
 	Revision                  string                     `json:"revision,omitempty"`
@@ -75,6 +82,7 @@ type DataplaneConfig struct {
 	AllowedSourceCIDRs        []string                   `json:"allowedSourceCIDRs,omitempty"`
 	ProxyProtocol             string                     `json:"proxyProtocol,omitempty"`
 	ProxyProtocolTrustedCIDRs []string                   `json:"proxyProtocolTrustedCIDRs,omitempty"`
+	Challenges                []HTTP01Challenge          `json:"challenges,omitempty"`
 }
 
 // ComputeRevision computes a deterministic hash of the DataplaneConfig excluding the Revision field.
@@ -306,6 +314,26 @@ func BuildGatewayDataplaneConfig(cg *CompiledGateway) (*DataplaneConfig, error) 
 		cfg.ProxyProtocol = cg.Parameters.ProxyProtocol
 		cfg.ProxyProtocolTrustedCIDRs = cg.Parameters.ProxyProtocolTrustedCIDRs
 	}
+
+	var challenges []HTTP01Challenge
+	seen := make(map[string]bool)
+	for _, el := range cg.EffectiveListeners {
+		for _, ch := range el.Challenges {
+			key := ch.Hostname + "/" + ch.Token
+			if !seen[key] {
+				seen[key] = true
+				challenges = append(challenges, ch)
+			}
+		}
+	}
+	sort.Slice(challenges, func(i, j int) bool {
+		if challenges[i].Hostname != challenges[j].Hostname {
+			return challenges[i].Hostname < challenges[j].Hostname
+		}
+		return challenges[i].Token < challenges[j].Token
+	})
+	cfg.Challenges = challenges
+
 	rev, err := cfg.ComputeRevision()
 	if err != nil {
 		return nil, err
@@ -326,6 +354,11 @@ func UnmarshalDataplaneConfig(data []byte) (*DataplaneConfig, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// ChallengesUpdater defines an optional interface for proxies that can serve ACME HTTP-01 challenges.
+type ChallengesUpdater interface {
+	UpdateChallenges(challenges []HTTP01Challenge)
 }
 
 // ProxyConfigUpdater defines the interface needed to apply configuration and certificates to a proxy.
@@ -409,6 +442,9 @@ func ApplyDataplaneConfig(updater ProxyConfigUpdater, data []byte) error {
 
 	updater.UpdateConfig(cfg.Listeners, cfg.Routes)
 	updater.UpdateCertificates(certsMap, defaultCert)
+	if cu, ok := updater.(ChallengesUpdater); ok {
+		cu.UpdateChallenges(cfg.Challenges)
+	}
 	return nil
 }
 
@@ -539,6 +575,7 @@ func (p *InProcessDataplanePublisher) applyLocked() error {
 		if combined.DefaultCertID == "" {
 			combined.DefaultCertID = cfg.DefaultCertID
 		}
+		combined.Challenges = append(combined.Challenges, cfg.Challenges...)
 	}
 	data, err := combined.Marshal()
 	if err != nil {

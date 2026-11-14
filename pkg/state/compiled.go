@@ -85,6 +85,9 @@ const CertificateSourceOptionKey = "gateway.gke-labs.io/certificate-source"
 type CertificateResult struct {
 	Certificates []*tls.Certificate
 
+	// Challenges holds pending HTTP-01 challenges to be served for this Gateway.
+	Challenges []HTTP01Challenge
+
 	// FailedReason is set when certificate resolution failed (e.g. InvalidCertificateRef, RefNotPermitted).
 	// If empty and not Pending, resolution succeeded.
 	FailedReason gatewayv1.ListenerConditionReason
@@ -381,6 +384,9 @@ type EffectiveListener struct {
 	ResolvedCertificates []*tls.Certificate
 	// ResolvedCertificate holds the primary resolved certificate for this listener.
 	ResolvedCertificate *tls.Certificate
+
+	// Challenges holds pending HTTP-01 challenges to be served for this listener.
+	Challenges []HTTP01Challenge
 }
 
 // IsAccepted returns true if the listener has an Accepted condition with status True.
@@ -935,7 +941,7 @@ func ValidateListener(
 	refValidator ReferenceGrantValidator,
 	certSources map[string]CertificateSource,
 	disabledRouteKinds ...map[gatewayv1.Kind]bool,
-) (supportedKinds []gatewayv1.RouteGroupKind, conditions []metav1.Condition, clientValidation *InternalClientValidation, resolvedCerts []*tls.Certificate) {
+) (supportedKinds []gatewayv1.RouteGroupKind, conditions []metav1.Condition, clientValidation *InternalClientValidation, resolvedCerts []*tls.Certificate, challenges []HTTP01Challenge) {
 	gwNamespace := ""
 	if gw != nil {
 		gwNamespace = gw.Namespace
@@ -972,7 +978,7 @@ func ValidateListener(
 				generation,
 			),
 		}
-		return supportedKinds, conditions, nil, nil
+		return supportedKinds, conditions, nil, nil, nil
 	}
 
 	hasInvalidRouteKind := false
@@ -1085,6 +1091,7 @@ func ValidateListener(
 
 		if source != nil && tlsInvalidReason == "" {
 			res, err := source.ResolveCertificates(gw, gListener)
+			challenges = res.Challenges
 			if err != nil {
 				logSourceError(selectedSourceName, gw, listener.Name, err)
 				tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
@@ -1281,7 +1288,7 @@ func ValidateListener(
 		),
 	}
 
-	return supportedKinds, conditions, clientValidation, resolvedCerts
+	return supportedKinds, conditions, clientValidation, resolvedCerts, challenges
 }
 
 // BuildEffectiveListener constructs an EffectiveListener from a listener specification.
@@ -1297,7 +1304,7 @@ func BuildEffectiveListener(
 	certSources map[string]CertificateSource,
 	disabledRouteKinds ...map[gatewayv1.Kind]bool,
 ) *EffectiveListener {
-	supportedKinds, conditions, clientValidation, resolvedCerts := ValidateListener(
+	supportedKinds, conditions, clientValidation, resolvedCerts, challenges := ValidateListener(
 		listener,
 		owner,
 		gw,
@@ -1330,6 +1337,7 @@ func BuildEffectiveListener(
 		Routes:               nil,
 		ClientValidation:     clientValidation,
 		ResolvedCertificates: resolvedCerts,
+		Challenges:           challenges,
 		Generation:           generation,
 	}
 }

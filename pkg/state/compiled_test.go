@@ -1351,7 +1351,7 @@ func TestValidateListener_CertificateRefGroup(t *testing.T) {
 				},
 			}
 
-			_, conds, _, _ := ValidateListener(
+			_, conds, _, _, _ := ValidateListener(
 				ListenerToSpec(listener),
 				ListenerOwner{Kind: "Gateway", Namespace: "default", Name: "gw"},
 				&gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw"}},

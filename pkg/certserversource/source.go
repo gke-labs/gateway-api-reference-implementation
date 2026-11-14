@@ -19,6 +19,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -93,9 +95,10 @@ type Source struct {
 	clusterID      string
 	timeNow        func() time.Time
 
-	// mu guards cache and recomputeTrigger.
+	// mu guards cache, challenges, and recomputeTrigger.
 	mu               sync.Mutex
 	cache            map[cacheKey]*cacheEntry
+	challenges       map[types.NamespacedName][]state.HTTP01Challenge
 	recomputeTrigger func()
 
 	ctx       context.Context
@@ -168,6 +171,7 @@ func NewSource(cli CertClient, opts ...SourceOption) *Source {
 		logInterval:    defaultLogInterval,
 		timeNow:        time.Now,
 		cache:          make(map[cacheKey]*cacheEntry),
+		challenges:     make(map[types.NamespacedName][]state.HTTP01Challenge),
 		ctx:            ctx,
 		cancel:         cancel,
 		stopCh:         make(chan struct{}),
@@ -225,6 +229,7 @@ func (s *Source) checkAndRefresh() {
 		// Evict inactive entries that ResolveCertificates has not requested within EvictionPeriod.
 		if now.Sub(entry.lastRequested) > s.evictionPeriod {
 			delete(s.cache, k)
+			s.cleanChallengesIfNoEntriesLocked(k.gateway)
 			continue
 		}
 		if entry.certificate != nil && !entry.inFlight && now.After(entry.refreshAt) {
@@ -233,6 +238,28 @@ func (s *Source) checkAndRefresh() {
 		}
 	}
 	s.mu.Unlock()
+}
+
+func (s *Source) cleanChallengesIfNoEntriesLocked(gwKey types.NamespacedName) {
+	for k := range s.cache {
+		if k.gateway == gwKey {
+			return
+		}
+	}
+	delete(s.challenges, gwKey)
+}
+
+// PendingChallenges returns any active HTTP-01 challenges for the given Gateway.
+func (s *Source) PendingChallenges(gw types.NamespacedName) []state.HTTP01Challenge {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	chals := s.challenges[gw]
+	if len(chals) == 0 {
+		return nil
+	}
+	res := make([]state.HTTP01Challenge, len(chals))
+	copy(res, chals)
+	return res
 }
 
 // ResolveCertificates returns certificates from the local cache and triggers background fetching on cache misses.
@@ -315,6 +342,12 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 		}, nil
 	}
 
+	var chals []state.HTTP01Challenge
+	if gwChals := s.challenges[gwKey]; len(gwChals) > 0 {
+		chals = make([]state.HTTP01Challenge, len(gwChals))
+		copy(chals, gwChals)
+	}
+
 	// No valid unexpired certificate:
 	switch entry.state {
 	case stateFailed:
@@ -336,6 +369,7 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 		return state.CertificateResult{
 			Pending:           true,
 			ProgrammedMessage: "Certificate issuance in progress with certserver",
+			Challenges:        chals,
 		}, nil
 	default:
 		if !entry.inFlight {
@@ -345,6 +379,7 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 		return state.CertificateResult{
 			Pending:           true,
 			ProgrammedMessage: "Certificate issuance in progress with certserver",
+			Challenges:        chals,
 		}, nil
 	}
 }
@@ -417,6 +452,7 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 			if ok {
 				entry.inFlight = false
 				delete(s.cache, key)
+				s.cleanChallengesIfNoEntriesLocked(key.gateway)
 			}
 			s.mu.Unlock()
 			return
@@ -429,8 +465,41 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		stCode := st.Code()
 
 		if err == nil {
+			var newChals []state.HTTP01Challenge
+			if info != nil && info.Certificate == nil && len(info.Challenges) > 0 {
+				newChals = make([]state.HTTP01Challenge, len(info.Challenges))
+				for i, c := range info.Challenges {
+					newChals[i] = state.HTTP01Challenge{
+						Hostname:         c.Hostname,
+						Token:            c.Token,
+						KeyAuthorization: c.KeyAuthorization,
+					}
+				}
+				sort.Slice(newChals, func(i, j int) bool {
+					if newChals[i].Hostname != newChals[j].Hostname {
+						return newChals[i].Hostname < newChals[j].Hostname
+					}
+					return newChals[i].Token < newChals[j].Token
+				})
+			}
+
+			s.mu.Lock()
+			chalsChanged := !reflect.DeepEqual(s.challenges[key.gateway], newChals)
+			if chalsChanged {
+				if len(newChals) == 0 {
+					delete(s.challenges, key.gateway)
+				} else {
+					s.challenges[key.gateway] = newChals
+				}
+			}
+			s.mu.Unlock()
+
+			if chalsChanged {
+				s.notifyTrigger()
+			}
+
 			if info == nil || info.Certificate == nil {
-				// A pending certificate is retried; this source doesn't serve challenges yet.
+				// A pending certificate is retried.
 				// Poll at a short fixed interval (minBackoff, 1 second by default) rather than
 				// backing off exponentially. This ensures the controller fetches challenges
 				// promptly, well within the certserver self-check window (e.g. 15 seconds).
@@ -501,6 +570,10 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		notifyNeeded := false
 		if !hasValidCert {
 			if isNonRetryableCode(stCode) {
+				if _, hasChals := s.challenges[key.gateway]; hasChals {
+					delete(s.challenges, key.gateway)
+					notifyNeeded = true
+				}
 				if entry.state != stateFailed {
 					entry.state = stateFailed
 					notifyNeeded = true
