@@ -150,9 +150,9 @@ func TestE2ESmoke(t *testing.T) {
 
 	mgr.UpdateHostnames([]string{"app.example.com", "*.wildcard.org"})
 
-	// Accept connections on tunnel listener
+	// Accept connections on tunnel HTTPS listener
 	go func() {
-		lis := mgr.Listener()
+		lis := mgr.HTTPSListener()
 		for {
 			conn, err := lis.Accept()
 			if err != nil {

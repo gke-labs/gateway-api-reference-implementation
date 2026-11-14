@@ -44,10 +44,10 @@ const (
 // ManagerOption configures a Manager.
 type ManagerOption func(*Manager)
 
-// WithListener sets a custom Listener for the Manager.
-func WithListener(lis *Listener) ManagerOption {
+// WithHTTPSListener sets a custom HTTPS Listener for the Manager.
+func WithHTTPSListener(lis *Listener) ManagerOption {
 	return func(m *Manager) {
-		m.listener = lis
+		m.httpsListener = lis
 	}
 }
 
@@ -86,7 +86,7 @@ func WithBackoff(min, max time.Duration) ManagerOption {
 // of pre-dialed reverse tunnel connections and announcing SNI hostnames.
 type Manager struct {
 	client          *client.Client
-	listener        *Listener
+	httpsListener   *Listener
 	httpListener    *Listener
 	poolSize        int
 	dialTimeout     time.Duration
@@ -111,7 +111,7 @@ type Manager struct {
 func NewManager(c *client.Client, opts ...ManagerOption) *Manager {
 	m := &Manager{
 		client:          c,
-		listener:        NewListener(),
+		httpsListener:   NewListener(),
 		httpListener:    NewListener(),
 		poolSize:        DefaultPoolSize,
 		dialTimeout:     10 * time.Second,
@@ -126,9 +126,9 @@ func NewManager(c *client.Client, opts ...ManagerOption) *Manager {
 	return m
 }
 
-// Listener returns the tunnel Listener used to accept reverse-tunnelled connections.
-func (m *Manager) Listener() *Listener {
-	return m.listener
+// HTTPSListener returns the tunnel Listener used to accept reverse-tunnelled HTTPS connections.
+func (m *Manager) HTTPSListener() *Listener {
+	return m.httpsListener
 }
 
 // HTTPListener returns the tunnel Listener used to accept reverse-tunnelled plain HTTP connections.
@@ -250,7 +250,7 @@ func (m *Manager) scheduleTokenReRegistration(token string) {
 // Run starts the session, transport, and registration loops, maintaining connectivity to the frontend
 // and feeding connections into the tunnel Listeners until ctx is canceled.
 func (m *Manager) Run(ctx context.Context) error {
-	defer closeConn(m.listener)
+	defer closeConn(m.httpsListener)
 	defer closeConn(m.httpListener)
 	defer func() {
 		m.mu.Lock()
@@ -396,7 +396,7 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 }
 
 // handleTunnelConn decodes the PROXY v2 header from conn and enqueues the resulting
-// proxyproto.Conn into either m.listener (for TLS connections starting with 0x16) or
+// proxyproto.Conn into either m.httpsListener (for TLS connections starting with 0x16) or
 // m.httpListener (for plain HTTP connections). It closes conn if decoding or enqueuing fails.
 // Returns an error if PROXY header decoding, reading the first byte, or reading remaining bytes fails.
 func (m *Manager) handleTunnelConn(conn net.Conn) error {
@@ -426,7 +426,7 @@ func (m *Manager) handleTunnelConn(conn net.Conn) error {
 
 	targetListener := m.httpListener
 	if first[0] == recordTypeHandshake {
-		targetListener = m.listener
+		targetListener = m.httpsListener
 	}
 
 	proxyConn := proxyproto.NewConn(conn, hdr.SrcAddr, hdr.DstAddr, remaining)
