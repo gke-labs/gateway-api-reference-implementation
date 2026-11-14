@@ -20,6 +20,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -65,12 +66,16 @@ type Manager struct {
 	mu       sync.RWMutex
 	renewals map[string]*renewalItem
 
-	// inFlightMu guards inFlightIssuances.
-	inFlightMu        sync.Mutex
-	inFlightIssuances map[string]struct{}
+	// inFlightMu guards inFlightIssuances and failedRevalidations.
+	inFlightMu          sync.Mutex
+	inFlightIssuances   map[string]struct{}
+	failedRevalidations map[string]time.Time
 
 	cancelLoop context.CancelFunc
-	loopWg     sync.WaitGroup
+	// loopCtx is the base context for background tasks (renewal loop, async issuance, and probe revalidations).
+	// It is created in Start and canceled in Stop; it is nil before Start is called.
+	loopCtx context.Context
+	loopWg  sync.WaitGroup
 }
 
 // NewManager creates a new certificate Manager.
@@ -129,14 +134,15 @@ func NewManager(
 	}
 
 	return &Manager{
-		client:            client,
-		cache:             diskCache,
-		challengeStore:    challengeStore,
-		metrics:           m,
-		opts:              opts,
-		selfCheckClient:   selfCheckClient,
-		renewals:          make(map[string]*renewalItem),
-		inFlightIssuances: make(map[string]struct{}),
+		client:              client,
+		cache:               diskCache,
+		challengeStore:      challengeStore,
+		metrics:             m,
+		opts:                opts,
+		selfCheckClient:     selfCheckClient,
+		renewals:            make(map[string]*renewalItem),
+		inFlightIssuances:   make(map[string]struct{}),
+		failedRevalidations: make(map[string]time.Time),
 	}
 }
 
@@ -154,6 +160,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Unlock()
 
 	loopCtx, cancel := context.WithCancel(ctx)
+	m.loopCtx = loopCtx
 	m.cancelLoop = cancel
 
 	m.loopWg.Add(1)
@@ -219,7 +226,8 @@ func (m *Manager) GetPendingChallenges(ctx context.Context, req challenge.Reques
 
 // EnsureIssuance starts asynchronous certificate issuance for the given hostnames
 // if no issuance is already in flight for that hostname set.
-// It uses a detached context (via context.WithoutCancel) with a 10-minute timeout.
+// It uses loopCtx with a 10-minute timeout once the manager has started, or a detached
+// context (via context.WithoutCancel) if the manager has not yet started.
 // Returns true if a new issuance was started, false if an issuance is already in flight.
 func (m *Manager) EnsureIssuance(ctx context.Context, hostnames []string, requester challenge.Requester) (bool, error) {
 	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
@@ -244,8 +252,16 @@ func (m *Manager) EnsureIssuance(ctx context.Context, hostnames []string, reques
 	m.inFlightIssuances[hostnamesKey] = struct{}{}
 	m.inFlightMu.Unlock()
 
-	detachedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+	baseCtx := ctx
+	if m.loopCtx != nil {
+		baseCtx = m.loopCtx
+	} else {
+		baseCtx = context.WithoutCancel(ctx)
+	}
+	detachedCtx, cancel := context.WithTimeout(baseCtx, 10*time.Minute)
+	m.loopWg.Add(1)
 	go func() {
+		defer m.loopWg.Done()
 		defer cancel()
 		defer func() {
 			m.inFlightMu.Lock()
@@ -261,9 +277,54 @@ func (m *Manager) EnsureIssuance(ctx context.Context, hostnames []string, reques
 	return true, nil
 }
 
+// FailedProbeCooldown is the minimum interval before certserver initiates another probe self-check
+// loop for the same requester and hostnames after a probe failure. This avoids hammering unready data planes
+// or tight retry loops from callers polling GetCertificate.
+const FailedProbeCooldown = 10 * time.Second
+
+type probeChallenge struct {
+	// Hostname is the domain name to probe.
+	Hostname string
+	// Token is the challenge token placed in the HTTP-01 URL path.
+	Token string
+	// KeyAuth is the expected response body containing the key authorization.
+	KeyAuth string
+}
+
+// mintProbeChallenge generates a random probe token and key authorization
+// formatted as an ACME HTTP-01 challenge response without contacting an ACME server.
+func mintProbeChallenge() (token, keyAuth string, err error) {
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", "", fmt.Errorf("generating probe token: %w", err)
+	}
+	token = base64.RawURLEncoding.EncodeToString(tokenBytes)
+
+	authBytes := make([]byte, 32)
+	if _, err := rand.Read(authBytes); err != nil {
+		return "", "", fmt.Errorf("generating probe key authorization: %w", err)
+	}
+	keyAuth = fmt.Sprintf("%s.%s", token, base64.RawURLEncoding.EncodeToString(authBytes))
+	return token, keyAuth, nil
+}
+
+func (m *Manager) cleanupProbes(ctx context.Context, probes []probeChallenge) {
+	if m.challengeStore == nil {
+		return
+	}
+	for _, probe := range probes {
+		if err := m.challengeStore.Remove(context.WithoutCancel(ctx), probe.Token); err != nil {
+			log.Printf("certserver: failed to remove probe challenge %s: %v", probe.Token, err)
+		}
+	}
+}
+
 // EnsureRevalidation starts asynchronous certificate revalidation for the given hostnames and requester
 // if no revalidation is already in flight for that requester and hostname set.
-// It creates an ACME order to revalidate domain control without issuing a new certificate.
+// It uses loopCtx with a 10-minute timeout once the manager has started, or a detached
+// context (via context.WithoutCancel) if the manager has not yet started.
+// It mints probe challenges, stores them in the challenge store for the requester,
+// and runs self-checks against the probe tokens without opening an ACME order.
 func (m *Manager) EnsureRevalidation(ctx context.Context, hostnames []string, requester challenge.Requester) (bool, error) {
 	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
 	if err != nil {
@@ -273,7 +334,15 @@ func (m *Manager) EnsureRevalidation(ctx context.Context, hostnames []string, re
 
 	revalKey := fmt.Sprintf("%s/%s/%s", hostnamesKey, requester.ClusterID, requester.Gateway)
 
+	now := m.opts.Clock.Now()
 	m.inFlightMu.Lock()
+	if nextAllowed, failed := m.failedRevalidations[revalKey]; failed {
+		if now.Before(nextAllowed) {
+			m.inFlightMu.Unlock()
+			return false, nil
+		}
+		delete(m.failedRevalidations, revalKey)
+	}
 	if _, inFlight := m.inFlightIssuances[revalKey]; inFlight {
 		m.inFlightMu.Unlock()
 		return false, nil
@@ -281,16 +350,56 @@ func (m *Manager) EnsureRevalidation(ctx context.Context, hostnames []string, re
 	m.inFlightIssuances[revalKey] = struct{}{}
 	m.inFlightMu.Unlock()
 
-	detachedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
-	go func() {
-		defer cancel()
-		defer func() {
+	expiresAt := now.Add(10 * time.Minute)
+	probes := make([]probeChallenge, 0, len(normalized))
+	for _, hostname := range normalized {
+		token, keyAuth, err := mintProbeChallenge()
+		if err != nil {
+			m.cleanupProbes(ctx, probes)
 			m.inFlightMu.Lock()
 			delete(m.inFlightIssuances, revalKey)
 			m.inFlightMu.Unlock()
-		}()
+			return false, err
+		}
+		if m.challengeStore != nil {
+			if err := m.challengeStore.Put(ctx, token, hostname, keyAuth, expiresAt, requester); err != nil {
+				m.cleanupProbes(ctx, probes)
+				m.inFlightMu.Lock()
+				delete(m.inFlightIssuances, revalKey)
+				m.inFlightMu.Unlock()
+				return false, err
+			}
+		}
+		probes = append(probes, probeChallenge{
+			Hostname: hostname,
+			Token:    token,
+			KeyAuth:  keyAuth,
+		})
+	}
 
-		if err := m.revalidateControl(detachedCtx, normalized, hostnamesKey, requester); err != nil {
+	baseCtx := ctx
+	if m.loopCtx != nil {
+		baseCtx = m.loopCtx
+	} else {
+		baseCtx = context.WithoutCancel(ctx)
+	}
+	detachedCtx, cancel := context.WithTimeout(baseCtx, 10*time.Minute)
+	m.loopWg.Add(1)
+	go func() {
+		defer m.loopWg.Done()
+		defer cancel()
+
+		err := m.revalidateControl(detachedCtx, normalized, requester, probes)
+		m.inFlightMu.Lock()
+		delete(m.inFlightIssuances, revalKey)
+		if err != nil {
+			m.failedRevalidations[revalKey] = m.opts.Clock.Now().Add(FailedProbeCooldown)
+		} else {
+			delete(m.failedRevalidations, revalKey)
+		}
+		m.inFlightMu.Unlock()
+
+		if err != nil {
 			log.Printf("certserver: async revalidation failed for %s (requester %s/%s): %v",
 				hostnamesKey, requester.ClusterID, requester.Gateway, err)
 		}
@@ -299,33 +408,23 @@ func (m *Manager) EnsureRevalidation(ctx context.Context, hostnames []string, re
 	return true, nil
 }
 
-// revalidateControl creates an ACME order solely to prove domain control for the requester,
-// fulfilling authorizations through challenge binding and then deactivating them without finalizing the order.
-func (m *Manager) revalidateControl(ctx context.Context, normalized []string, hostnamesKey string, req challenge.Requester) error {
-	// Ensure ACME account is registered
-	if _, err := m.client.EnsureAccount(ctx); err != nil {
-		return fmt.Errorf("failed to ensure ACME account: %w", err)
-	}
+// revalidateControl validates domain control for a cached certificate by performing
+// HTTP-01 self-checks on local probe challenges. certserver records a validated binding
+// for the requester only after the hostname, resolved through DNS, serves that requester's probe.
+func (m *Manager) revalidateControl(ctx context.Context, normalized []string, req challenge.Requester, probes []probeChallenge) error {
+	defer m.cleanupProbes(ctx, probes)
 
-	order, err := m.client.AuthorizeOrder(ctx, acme.DomainIDs(normalized...))
-	if err != nil {
-		return fmt.Errorf("failed to authorize ACME order for revalidation: %w", err)
-	}
-
-	// Always deactivate authorizations without finalizing the order
-	defer func() {
-		for _, authzURL := range order.AuthzURLs {
-			if revokeErr := m.client.RevokeAuthorization(context.WithoutCancel(ctx), authzURL); revokeErr != nil {
-				log.Printf("certserver: failed to revoke authorization %s: %v", authzURL, revokeErr)
-			}
-		}
-	}()
-
-	for _, authzURL := range order.AuthzURLs {
-		if err := m.fulfillAuthorization(ctx, authzURL, req, nil); err != nil {
-			return err
+	for _, probe := range probes {
+		if err := m.selfCheckChallenge(ctx, probe.Hostname, probe.Token, probe.KeyAuth); err != nil {
+			return fmt.Errorf("self-check failed for %s: %w", probe.Hostname, err)
 		}
 	}
+
+	ttl := m.opts.ValidatedBindingTTL
+	if ttl <= 0 {
+		ttl = challenge.DefaultValidatedBindingTTL
+	}
+	challenge.RecordValidatedBinding(m.opts.BindingStore, req, m.opts.Clock.Now(), ttl)
 
 	return nil
 }
@@ -489,9 +588,10 @@ func (m *Manager) executeACMEOrder(ctx context.Context, normalized []string, hos
 		return nil, fmt.Errorf("failed to authorize ACME order: %w", err)
 	}
 
+	authzURLs := append([]string(nil), order.AuthzURLs...)
 	// Ensure authorizations are relinquished so subsequent orders must prove fresh domain control
 	defer func() {
-		for _, authzURL := range order.AuthzURLs {
+		for _, authzURL := range authzURLs {
 			if revokeErr := m.client.RevokeAuthorization(context.WithoutCancel(ctx), authzURL); revokeErr != nil {
 				log.Printf("certserver: failed to revoke authorization %s: %v", authzURL, revokeErr)
 			}
@@ -715,4 +815,11 @@ func (m *Manager) selfCheckChallenge(ctx context.Context, hostname, token, keyAu
 		case <-ticker.C:
 		}
 	}
+}
+
+// FailedRevalidationsCount returns the number of active failed revalidation cooldown entries (used in tests).
+func (m *Manager) FailedRevalidationsCount() int {
+	m.inFlightMu.Lock()
+	defer m.inFlightMu.Unlock()
+	return len(m.failedRevalidations)
 }

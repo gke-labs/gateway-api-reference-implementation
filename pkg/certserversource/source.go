@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +67,7 @@ type cacheEntry struct {
 	hostnames   []string
 	gateway     string
 	dataPlaneSA string
+	addresses   []string
 
 	state        entryState
 	certificate  *tls.Certificate
@@ -227,7 +229,7 @@ func (s *Source) checkAndRefresh() {
 		}
 		if entry.certificate != nil && !entry.inFlight && now.After(entry.refreshAt) {
 			entry.inFlight = true
-			go s.fetchLoop(entry.key, entry.hostnames, entry.gateway, entry.dataPlaneSA)
+			go s.fetchLoop(entry.key, entry.hostnames, entry.gateway, entry.dataPlaneSA, entry.addresses)
 		}
 	}
 	s.mu.Unlock()
@@ -272,6 +274,15 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 		hostnames: hostnamesKey,
 	}
 
+	var addresses []string
+	for _, address := range gw.Status.Addresses {
+		if address.Type == nil || *address.Type == gatewayv1.IPAddressType {
+			if trimmed := strings.TrimSpace(address.Value); trimmed != "" {
+				addresses = append(addresses, trimmed)
+			}
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -283,19 +294,21 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 			hostnames:     normalized,
 			gateway:       gwFormatted,
 			dataPlaneSA:   dpSA,
+			addresses:     addresses,
 			state:         statePending,
 			lastRequested: now,
 		}
 		s.cache[key] = entry
 	} else {
 		entry.lastRequested = now
+		entry.addresses = addresses
 	}
 
 	// If we have a valid unexpired certificate, keep serving it even if a recent background renewal failed.
 	if entry.certificate != nil && !now.After(entry.expiresAt) {
 		if now.After(entry.refreshAt) && !entry.inFlight {
 			entry.inFlight = true
-			go s.fetchLoop(entry.key, entry.hostnames, entry.gateway, entry.dataPlaneSA)
+			go s.fetchLoop(entry.key, entry.hostnames, entry.gateway, entry.dataPlaneSA, entry.addresses)
 		}
 		return state.CertificateResult{
 			Certificates: []*tls.Certificate{state.CopyTLSCertificate(entry.certificate)},
@@ -307,7 +320,7 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 	case stateFailed:
 		if !entry.inFlight {
 			entry.inFlight = true
-			go s.fetchLoop(entry.key, entry.hostnames, entry.gateway, entry.dataPlaneSA)
+			go s.fetchLoop(entry.key, entry.hostnames, entry.gateway, entry.dataPlaneSA, entry.addresses)
 		}
 		msg := entry.failedReason
 		if msg == "" {
@@ -327,7 +340,7 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 	default:
 		if !entry.inFlight {
 			entry.inFlight = true
-			go s.fetchLoop(entry.key, entry.hostnames, entry.gateway, entry.dataPlaneSA)
+			go s.fetchLoop(entry.key, entry.hostnames, entry.gateway, entry.dataPlaneSA, entry.addresses)
 		}
 		return state.CertificateResult{
 			Pending:           true,
@@ -368,7 +381,7 @@ func isNonRetryableCode(code codes.Code) bool {
 	}
 }
 
-func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dataPlaneSA string) {
+func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dataPlaneSA string, addresses []string) {
 	backoff := s.minBackoff
 	var retryTimer *time.Timer
 	defer func() {
@@ -382,6 +395,7 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		Gateway:                 gateway,
 		DataPlaneServiceAccount: dataPlaneSA,
 		ClusterId:               s.clusterID,
+		Addresses:               addresses,
 	}
 
 	for {
@@ -407,6 +421,7 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 			s.mu.Unlock()
 			return
 		}
+		req.Addresses = entry.addresses
 		s.mu.Unlock()
 
 		info, err := s.client.GetCertificate(s.ctx, req)
