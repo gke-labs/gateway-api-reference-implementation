@@ -18,6 +18,11 @@ rules:
 - apiGroups: [""]
   resources: ["services", "namespaces", "configmaps", "nodes"]
   verbs: ["get", "list", "watch"]
+# Permission to manage only the DNS data plane configuration Secret (localgateway-dns).
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["localgateway-dns"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["create", "patch", "update"]
@@ -80,6 +85,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         ports:
         - name: http
           containerPort: 80

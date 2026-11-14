@@ -23,6 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/address"
+	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/dnsconfig"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
@@ -107,6 +108,15 @@ func WirePublisher(opts *gari.Options, pub *mdns.Publisher) {
 		pub.SetEnqueueGateway(s.EnqueueGateway)
 		if err := mgr.Add(pub); err != nil {
 			return fmt.Errorf("failed to register mDNS publisher with manager: %w", err)
+		}
+
+		controllerNamespace := os.Getenv("POD_NAMESPACE")
+		if controllerNamespace == "" {
+			controllerNamespace = "default"
+		}
+		dnsPublisher := dnsconfig.NewPublisher(mgr.GetClient(), controllerNamespace, "localgateway-dns", s.State())
+		if err := mgr.Add(dnsPublisher); err != nil {
+			return fmt.Errorf("failed to register dns config publisher with manager: %w", err)
 		}
 		return nil
 	}

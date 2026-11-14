@@ -44,6 +44,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -4381,6 +4382,77 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 	}
 	if len(finalAddrs) == 0 || finalAddrs[0].Value != "1.2.3.4" {
 		t.Errorf("expected address 1.2.3.4, got %v", finalAddrs)
+	}
+}
+
+func TestWriteConfigSecret(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
+		Build()
+
+	ctx := t.Context()
+	ownerRef := metav1ac.OwnerReference().
+		WithAPIVersion(gatewayv1.GroupVersion.String()).
+		WithKind("Gateway").
+		WithName("owner-gw").
+		WithUID(types.UID("owner-uid-1")).
+		WithController(true)
+
+	// 1. Create: Secret is applied with payload
+	payload1 := []byte(`{"key":"value1"}`)
+	if err := WriteConfigSecret(ctx, cl, "default", "test-cfg", ownerRef, payload1); err != nil {
+		t.Fatalf("WriteConfigSecret create failed: %v", err)
+	}
+
+	var sec corev1.Secret
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-cfg"}, &sec); err != nil {
+		t.Fatalf("failed to get created Secret: %v", err)
+	}
+	if string(sec.Data[DataplaneSecretDataKey]) != string(payload1) {
+		t.Errorf("expected payload %q, got %q", string(payload1), string(sec.Data[DataplaneSecretDataKey]))
+	}
+
+	// 2. Update: Same owner updates payload
+	payload2 := []byte(`{"key":"value2"}`)
+	if err := WriteConfigSecret(ctx, cl, "default", "test-cfg", ownerRef, payload2); err != nil {
+		t.Fatalf("WriteConfigSecret update failed: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-cfg"}, &sec); err != nil {
+		t.Fatalf("failed to get updated Secret: %v", err)
+	}
+	if string(sec.Data[DataplaneSecretDataKey]) != string(payload2) {
+		t.Errorf("expected updated payload %q, got %q", string(payload2), string(sec.Data[DataplaneSecretDataKey]))
+	}
+
+	// 3. Conflicting owner: Different owner is refused
+	diffOwnerRef := metav1ac.OwnerReference().
+		WithAPIVersion(gatewayv1.GroupVersion.String()).
+		WithKind("Gateway").
+		WithName("different-gw").
+		WithUID(types.UID("different-uid-2")).
+		WithController(true)
+
+	err := WriteConfigSecret(ctx, cl, "default", "test-cfg", diffOwnerRef, []byte(`{"conflict":true}`))
+	if err == nil {
+		t.Fatalf("expected OwnershipConflictError, got nil")
+	}
+	var conflictErr *controller.OwnershipConflictError
+	if !errors.As(err, &conflictErr) {
+		t.Fatalf("expected OwnershipConflictError, got: %v", err)
+	}
+
+	// 4. Delete: payload == nil deletes the Secret
+	if err := WriteConfigSecret(ctx, cl, "default", "test-cfg", ownerRef, nil); err != nil {
+		t.Fatalf("WriteConfigSecret delete failed: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-cfg"}, &sec); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected Secret to be deleted, got: %v", err)
 	}
 }
 
