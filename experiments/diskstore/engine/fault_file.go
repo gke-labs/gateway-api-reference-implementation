@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -320,13 +321,19 @@ func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error)
 func (f *FaultFile) ReadAt(p []byte, off int64) (int, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	if f.closed {
+		return 0, errors.New("file closed")
+	}
 	if off < 0 {
 		return 0, errors.New("negative offset")
 	}
 	if off >= int64(len(f.pendingData)) {
-		return 0, os.ErrNotExist
+		return 0, io.EOF
 	}
 	n := copy(p, f.pendingData[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
 	return n, nil
 }
 
