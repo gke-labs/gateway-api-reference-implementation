@@ -18,8 +18,10 @@ import "sync/atomic"
 
 // Metrics tracks runtime counters for diskstore operations.
 type Metrics struct {
-	OversizeObjectsCount  atomic.Int64
-	DirectIOFallbackCount atomic.Int64
+	OversizeObjectsCount      atomic.Int64
+	DirectIOFallbackCount     atomic.Int64
+	QuarantineSweepFilesCount atomic.Int64
+	QuarantineSweepBytesCount atomic.Int64
 }
 
 // GlobalMetrics holds the shared store metrics instance.
@@ -33,4 +35,14 @@ func OversizeCount() int64 {
 // DirectIOFallbackCount returns the number of times direct I/O fell back to buffered I/O.
 func DirectIOFallbackCount() int64 {
 	return GlobalMetrics.DirectIOFallbackCount.Load()
+}
+
+// QuarantineSweepFilesCount returns the total number of unreferenced files moved by quarantine sweeps.
+func QuarantineSweepFilesCount() int64 {
+	return GlobalMetrics.QuarantineSweepFilesCount.Load()
+}
+
+// QuarantineSweepBytesCount returns the total number of bytes moved by quarantine sweeps.
+func QuarantineSweepBytesCount() int64 {
+	return GlobalMetrics.QuarantineSweepBytesCount.Load()
 }
