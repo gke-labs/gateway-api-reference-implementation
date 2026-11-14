@@ -929,8 +929,8 @@ func EffectiveFrontendValidation(gwTLS *gatewayv1.GatewayTLSConfig, port gateway
 	return gwTLS.Frontend.Default.Validation
 }
 
-// ListenerValidationResult holds the computed validation outputs for a listener.
-type ListenerValidationResult struct {
+// ListenerInfo holds what the controller knows about a listener: supported kinds, conditions, client validation settings, resolved certificates, and pending challenges.
+type ListenerInfo struct {
 	// SupportedKinds is the set of route kinds this listener accepts.
 	SupportedKinds []gatewayv1.RouteGroupKind
 	// Conditions holds status conditions computed for this listener.
@@ -955,7 +955,7 @@ func ValidateListener(
 	refValidator ReferenceGrantValidator,
 	certSources map[string]CertificateSource,
 	disabledRouteKinds ...map[gatewayv1.Kind]bool,
-) ListenerValidationResult {
+) ListenerInfo {
 	var supportedKinds []gatewayv1.RouteGroupKind
 	var conditions []metav1.Condition
 	var clientValidation *InternalClientValidation
@@ -998,7 +998,7 @@ func ValidateListener(
 				generation,
 			),
 		}
-		return ListenerValidationResult{
+		return ListenerInfo{
 			SupportedKinds: supportedKinds,
 			Conditions:     conditions,
 		}
@@ -1311,7 +1311,7 @@ func ValidateListener(
 		),
 	}
 
-	return ListenerValidationResult{
+	return ListenerInfo{
 		SupportedKinds:   supportedKinds,
 		Conditions:       conditions,
 		ClientValidation: clientValidation,
