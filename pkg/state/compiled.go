@@ -85,6 +85,9 @@ const CertificateSourceOptionKey = "gateway.gke-labs.io/certificate-source"
 type CertificateResult struct {
 	Certificates []*tls.Certificate
 
+	// Challenges holds pending HTTP-01 challenges to be served for this Gateway.
+	Challenges []HTTP01Challenge
+
 	// FailedReason is set when certificate resolution failed (e.g. InvalidCertificateRef, RefNotPermitted).
 	// If empty and not Pending, resolution succeeded.
 	FailedReason gatewayv1.ListenerConditionReason
@@ -381,6 +384,9 @@ type EffectiveListener struct {
 	ResolvedCertificates []*tls.Certificate
 	// ResolvedCertificate holds the primary resolved certificate for this listener.
 	ResolvedCertificate *tls.Certificate
+
+	// Challenges holds pending HTTP-01 challenges to be served for this listener.
+	Challenges []HTTP01Challenge
 }
 
 // IsAccepted returns true if the listener has an Accepted condition with status True.
@@ -933,6 +939,8 @@ type ListenerValidationResult struct {
 	ClientValidation *InternalClientValidation
 	// Certificates holds the resolved TLS certificates for this listener.
 	Certificates []*tls.Certificate
+	// Challenges holds pending HTTP-01 challenges to be served for this listener.
+	Challenges []HTTP01Challenge
 }
 
 // ValidateListener validates a listener specification, computing its supported kinds, conditions, and client validation.
@@ -952,6 +960,7 @@ func ValidateListener(
 	var conditions []metav1.Condition
 	var clientValidation *InternalClientValidation
 	var resolvedCerts []*tls.Certificate
+	var challenges []HTTP01Challenge
 
 	gwNamespace := ""
 	if gw != nil {
@@ -1104,7 +1113,8 @@ func ValidateListener(
 		}
 
 		if source != nil && tlsInvalidReason == "" {
-			res, err := source.ResolveCertificates(gw, gListener)
+			result, err := source.ResolveCertificates(gw, gListener)
+			challenges = result.Challenges
 			if err != nil {
 				logSourceError(selectedSourceName, gw, listener.Name, err)
 				tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
@@ -1114,20 +1124,20 @@ func ValidateListener(
 				}
 				tlsInvalidMessage = msg
 				tlsProgrammedMessage = msg
-			} else if res.Pending {
+			} else if result.Pending {
 				tlsPendingMessage = "Certificate pending from source"
-			} else if res.FailedReason != "" {
-				tlsInvalidReason = string(res.FailedReason)
-				tlsInvalidMessage = res.FailedMessage
-				tlsProgrammedMessage = res.ProgrammedMessage
-			} else if len(res.Certificates) == 0 {
+			} else if result.FailedReason != "" {
+				tlsInvalidReason = string(result.FailedReason)
+				tlsInvalidMessage = result.FailedMessage
+				tlsProgrammedMessage = result.ProgrammedMessage
+			} else if len(result.Certificates) == 0 {
 				tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
 				tlsInvalidMessage = "No certificate resolved"
 				tlsProgrammedMessage = "No certificate resolved"
 			} else {
 				var validCerts []*tls.Certificate
 				var valErr error
-				for _, c := range res.Certificates {
+				for _, c := range result.Certificates {
 					cp := CopyTLSCertificate(c)
 					if err := ValidateCertificate(cp); err != nil {
 						valErr = err
@@ -1306,6 +1316,7 @@ func ValidateListener(
 		Conditions:       conditions,
 		ClientValidation: clientValidation,
 		Certificates:     resolvedCerts,
+		Challenges:       challenges,
 	}
 }
 
@@ -1355,6 +1366,7 @@ func BuildEffectiveListener(
 		Routes:               nil,
 		ClientValidation:     validationResult.ClientValidation,
 		ResolvedCertificates: validationResult.Certificates,
+		Challenges:           validationResult.Challenges,
 		Generation:           generation,
 	}
 }

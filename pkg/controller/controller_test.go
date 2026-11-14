@@ -27,12 +27,15 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -2842,6 +2845,7 @@ type fakeCertificateSource struct {
 	mu         sync.Mutex
 	trigger    func()
 	cache      map[string]*tls.Certificate
+	challenges []state.HTTP01Challenge
 	err        error
 	calledWith []fakeCertificateSourceCall
 }
@@ -2868,7 +2872,10 @@ func (f *fakeCertificateSource) ResolveCertificates(gw *gatewayv1.Gateway, liste
 	}
 	cert, ok := f.cache[hostname]
 	if !ok {
-		return state.CertificateResult{Pending: true}, nil
+		return state.CertificateResult{
+			Pending:    true,
+			Challenges: f.challenges,
+		}, nil
 	}
 	return state.CertificateResult{Certificates: []*tls.Certificate{cert}}, nil
 }
@@ -2887,6 +2894,16 @@ func (f *fakeCertificateSource) set(hostname string, cert *tls.Certificate) {
 		f.cache = make(map[string]*tls.Certificate)
 	}
 	f.cache[hostname] = cert
+	trigger := f.trigger
+	f.mu.Unlock()
+	if trigger != nil {
+		trigger()
+	}
+}
+
+func (f *fakeCertificateSource) setChallenges(challenges []state.HTTP01Challenge) {
+	f.mu.Lock()
+	f.challenges = challenges
 	trigger := f.trigger
 	f.mu.Unlock()
 	if trigger != nil {
@@ -4211,4 +4228,143 @@ func TestGatewayReconciler_PreservesForeignConditions(t *testing.T) {
 		!storedGw2.LastTransitionTime.Equal(&foreignGwCond.LastTransitionTime) {
 		t.Errorf("foreign Gateway condition was modified on second reconcile: got %+v, want %+v", storedGw2, foreignGwCond)
 	}
+}
+
+func TestGatewayReconciler_DataPlane_ACMEChallengeServing(t *testing.T) {
+	// 1. Setup fake certificate source with pending challenge
+	fakeSource := &fakeCertificateSource{}
+	fakeSource.setChallenges([]state.HTTP01Challenge{
+		{
+			Hostname:         "example.com",
+			Token:            "test-token-123",
+			KeyAuthorization: "test-token-123.auth-key-456",
+		},
+	})
+
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add clientgoscheme: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add gatewayv1 scheme: %v", err)
+	}
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.RegisterCertificateSources(map[string]state.CertificateSource{
+		"test-source": fakeSource,
+	})
+
+	proxyInstance := proxy.NewProxy()
+	st.SetProxy(proxyInstance)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		// State runner loop exits when ctx is canceled at the end of the test.
+		if err := st.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("st.Start returned unexpected error: %v", err)
+		}
+	}()
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	host := gatewayv1.Hostname("example.com")
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: gwKey.Namespace,
+			Name:      gwKey.Name,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: &host,
+				},
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: &host,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						Options: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+							gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	reconciler := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	reconcileRequest := ctrl.Request{NamespacedName: gwKey}
+	if _, err := reconciler.Reconcile(ctx, reconcileRequest); err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	// 1. Acceptance Criteria: a fake certificate source reports a pending challenge,
+	// and an HTTP request for that token and hostname returns the key authorization.
+	pollUntil(t, 2*time.Second, func() bool {
+		httpRequest := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/test-token-123", nil)
+		recorder := httptest.NewRecorder()
+		proxyInstance.ServeHTTP(recorder, httpRequest)
+		return recorder.Code == http.StatusOK &&
+			recorder.Header().Get("Content-Type") == "text/plain" &&
+			recorder.Body.String() == "test-token-123.auth-key-456"
+	})
+
+	// 2. Acceptance Criteria: A request for another token, or the same token on another hostname, gets normal routing.
+	// 2a. Request for another token on example.com gets normal routing (404 as no route is configured)
+	requestOtherToken := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/other-token", nil)
+	recorderOtherToken := httptest.NewRecorder()
+	proxyInstance.ServeHTTP(recorderOtherToken, requestOtherToken)
+	if recorderOtherToken.Code != http.StatusNotFound {
+		t.Errorf("expected 404 from normal routing for other token, got %d", recorderOtherToken.Code)
+	}
+	if recorderOtherToken.Body.String() == "test-token-123.auth-key-456" {
+		t.Errorf("challenge body was unexpectedly served for other token")
+	}
+
+	// 2b. Request for the same token on another hostname gets normal routing (404)
+	requestOtherHost := httptest.NewRequest(http.MethodGet, "http://other.com/.well-known/acme-challenge/test-token-123", nil)
+	recorderOtherHost := httptest.NewRecorder()
+	proxyInstance.ServeHTTP(recorderOtherHost, requestOtherHost)
+	if recorderOtherHost.Code != http.StatusNotFound {
+		t.Errorf("expected 404 from normal routing for other host, got %d", recorderOtherHost.Code)
+	}
+	if recorderOtherHost.Body.String() == "test-token-123.auth-key-456" {
+		t.Errorf("expected challenge NOT to be served on different hostname")
+	}
+
+	// 3. Acceptance Criteria: When the source drops the challenge, the data plane stops serving it.
+	fakeSource.setChallenges(nil)
+
+	pollUntil(t, 2*time.Second, func() bool {
+		httpRequest := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/test-token-123", nil)
+		recorder := httptest.NewRecorder()
+		proxyInstance.ServeHTTP(recorder, httpRequest)
+		return recorder.Code == http.StatusNotFound && recorder.Body.String() != "test-token-123.auth-key-456"
+	})
 }
