@@ -116,7 +116,7 @@ func TestSNIGateway(t *testing.T) {
 	// Assertion 0: Gateway status shows Programmed=True and reported address matches frontend host
 	t.Run("Gateway reports Programmed=True and frontend address", func(t *testing.T) {
 		t.Cleanup(func() { dumpLogsIfFailed(t) })
-		addr := h.WaitForGatewayAddress("snigateway-test", "default", 30*time.Second)
+		addr, _ := h.WaitForGatewayAddress("snigateway-test", "default", 30*time.Second)
 		expectedHost := fmt.Sprintf("snigateway-frontend.%s.svc.cluster.local", frontendNS)
 		if addr != expectedHost {
 			t.Errorf("Expected Gateway address %s, got: %s", expectedHost, addr)

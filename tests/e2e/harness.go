@@ -241,9 +241,26 @@ func (h *Harness) WaitForGatewayClassStatus(name string, timeout time.Duration) 
 	}
 }
 
-func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Duration) string {
+func (h *Harness) logGatewayTiming(namespace, name, event string, since time.Time) {
+	if since.IsZero() {
+		return
+	}
+	elapsed := time.Since(since)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	h.T.Logf("gateway %s/%s: %s after %.2fs", namespace, name, event, elapsed.Seconds())
+}
+
+func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Duration) (string, time.Time) {
 	h.T.Logf("Waiting for Gateway %s/%s to have an address assigned", namespace, name)
 	start := time.Now()
+	var (
+		addr              string
+		loggedAddress     bool
+		loggedProgrammed  bool
+		creationTimestamp time.Time
+	)
 	for {
 		if time.Since(start) > timeout {
 			logs, err := h.RunCommand("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
@@ -255,14 +272,48 @@ func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Dur
 			h.T.Fatalf("Timeout waiting for Gateway %s/%s address", namespace, name)
 		}
 
-		out, err := exec.Command("kubectl", "get", "gateway", name, "--namespace", namespace, "-o", "jsonpath={.status.addresses[0].value}").Output()
+		out, err := exec.Command("kubectl", "get", "gateway", name, "--namespace", namespace, "-o", "json").Output()
 		if err != nil {
 			h.T.Logf("waiting for gateway %s/%s address: %v", namespace, name, err)
 		} else {
-			addr := strings.TrimSpace(string(out))
-			if addr != "" {
-				h.T.Logf("Gateway %s/%s assigned address: %s", namespace, name, addr)
-				return addr
+			var gatewayObj struct {
+				Metadata struct {
+					CreationTimestamp time.Time `json:"creationTimestamp"`
+				} `json:"metadata"`
+				Status struct {
+					Addresses []struct {
+						Value string `json:"value"`
+					} `json:"addresses"`
+					Conditions []struct {
+						Type   string `json:"type"`
+						Status string `json:"status"`
+					} `json:"conditions"`
+				} `json:"status"`
+			}
+			if err := json.Unmarshal(out, &gatewayObj); err != nil {
+				h.T.Logf("failed to parse gateway %s/%s: %v", namespace, name, err)
+			} else {
+				if !gatewayObj.Metadata.CreationTimestamp.IsZero() {
+					creationTimestamp = gatewayObj.Metadata.CreationTimestamp
+				}
+				if !loggedAddress && len(gatewayObj.Status.Addresses) > 0 && strings.TrimSpace(gatewayObj.Status.Addresses[0].Value) != "" {
+					addr = strings.TrimSpace(gatewayObj.Status.Addresses[0].Value)
+					loggedAddress = true
+					h.T.Logf("Gateway %s/%s assigned address: %s", namespace, name, addr)
+					h.logGatewayTiming(namespace, name, "address assigned", creationTimestamp)
+				}
+				if !loggedProgrammed {
+					for _, condition := range gatewayObj.Status.Conditions {
+						if condition.Type == "Programmed" && condition.Status == "True" {
+							loggedProgrammed = true
+							h.logGatewayTiming(namespace, name, "Programmed=True", creationTimestamp)
+							break
+						}
+					}
+				}
+				if loggedAddress && loggedProgrammed {
+					return addr, creationTimestamp
+				}
 			}
 		}
 		time.Sleep(1 * time.Second)
