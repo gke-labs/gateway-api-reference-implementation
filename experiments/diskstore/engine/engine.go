@@ -37,6 +37,11 @@ import (
 	"golang.org/x/crypto/xts"
 )
 
+// cleanMarkerFilename is the name of the marker file that Engine.Close creates after syncing
+// all store files to indicate a clean shutdown, and that Open removes (syncing the directory)
+// before performing recovery or writing anything to the heap.
+const cleanMarkerFilename = "CLEAN"
+
 var (
 	// ErrFailed is returned when the engine has entered the failed state due to corruption or I/O error.
 	ErrFailed = errors.New("engine failed")
@@ -333,7 +338,7 @@ func wipeStoreFiles(fs FS, dir string) error {
 	var errs []error
 
 	// Remove known store files (excluding FAILED marker)
-	for _, name := range []string{"meta.db", "heap.db"} {
+	for _, name := range []string{"meta.db", "heap.db", cleanMarkerFilename} {
 		p := filepath.Join(dir, name)
 		if err := fs.Remove(p); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, fmt.Errorf("failed to remove %s: %w", p, err))
@@ -584,6 +589,18 @@ func Open(opts ...Option) (*Engine, error) {
 		eraseReason = "failure marker"
 	} else if !os.IsNotExist(markerErr) && !errors.Is(markerErr, os.ErrNotExist) {
 		return nil, fmt.Errorf("failed to check failure marker: %w", markerErr)
+	}
+
+	cleanMarkerPath := filepath.Join(dir, cleanMarkerFilename)
+	closedCleanly := false
+	cleanFile, cleanErr := options.FS.OpenFile(cleanMarkerPath, os.O_RDONLY, 0)
+	if cleanErr == nil {
+		if closeErr := cleanFile.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to close clean shutdown marker: %w", closeErr)
+		}
+		closedCleanly = true
+	} else if !os.IsNotExist(cleanErr) && !errors.Is(cleanErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("failed to check clean shutdown marker: %w", cleanErr)
 	}
 
 	metaPath := filepath.Join(dir, "meta.db")
@@ -852,12 +869,28 @@ func Open(opts ...Option) (*Engine, error) {
 	} else {
 		// Existing store: perform crash recovery scan and WAL redo replay
 		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID, RecoveryOptions{
-			Quarantine: options.Quarantine,
-			HeapCipher: heapCipher,
+			Quarantine:    options.Quarantine,
+			HeapCipher:    heapCipher,
+			ClosedCleanly: closedCleanly,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("recovery failed: %w", err), closeErr)
+		}
+
+		if closedCleanly {
+			// Remove the clean shutdown marker and sync the directory after the heap scan has
+			// verified block integrity without finding damage, and before Open writes anything
+			// to the heap or replays the WAL, so that a crash during Open cannot leave the marker
+			// alongside a block that Open itself tore.
+			if err := options.FS.Remove(cleanMarkerPath); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+				closeErr := heapFile.Close()
+				return nil, errors.Join(fmt.Errorf("failed to remove clean shutdown marker: %w", err), closeErr)
+			}
+			if err := options.FS.SyncDir(dir); err != nil {
+				closeErr := heapFile.Close()
+				return nil, errors.Join(fmt.Errorf("failed to sync directory after removing clean shutdown marker: %w", err), closeErr)
+			}
 		}
 
 		s.buddy = recoveryRes.Buddy
@@ -2107,6 +2140,21 @@ func (s *Engine) Close() error {
 	if s.wal != nil {
 		if err := s.wal.Close(); err != nil {
 			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) == 0 && !s.isFailed() && !s.autoDelete {
+		cleanMarkerPath := filepath.Join(s.dir, cleanMarkerFilename)
+		cleanFile, openErr := s.fs.OpenFile(cleanMarkerPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
+		if openErr != nil {
+			errs = append(errs, fmt.Errorf("failed to create clean shutdown marker: %w", openErr))
+		} else {
+			if closeErr := cleanFile.Close(); closeErr != nil {
+				errs = append(errs, fmt.Errorf("failed to close clean shutdown marker: %w", closeErr))
+			}
+			if syncErr := s.fs.SyncDir(s.dir); syncErr != nil {
+				errs = append(errs, fmt.Errorf("failed to sync directory after writing clean shutdown marker: %w", syncErr))
+			}
 		}
 	}
 
