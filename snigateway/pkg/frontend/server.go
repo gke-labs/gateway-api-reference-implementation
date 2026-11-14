@@ -26,12 +26,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/httphost"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
@@ -51,7 +53,10 @@ const (
 
 // ServerConfig holds configuration options for the frontend server.
 type ServerConfig struct {
-	ListenAddrs              []string
+	ListenAddrs []string
+	// ListenHTTPAddrs configures addresses that accept plain HTTP routed by Host.
+	// An empty list turns the feature off.
+	ListenHTTPAddrs          []string
 	InternalHostname         string
 	ServerTLSConfig          *tls.Config
 	ConnectTimeout           time.Duration
@@ -173,31 +178,52 @@ func (s *Server) PoolTransport() *PoolTransport {
 	return s.pool
 }
 
-// ListenAndServe starts listening on all configured TCP addresses and serves traffic.
-func (s *Server) ListenAndServe() error {
-	var listeners []net.Listener
-	for _, addr := range s.config.ListenAddrs {
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			for _, l := range listeners {
-				closeCloser(l)
-			}
-			return fmt.Errorf("listening on %s: %w", addr, err)
-		}
-		listeners = append(listeners, ln)
+func closeListeners(listeners []net.Listener) {
+	for _, listener := range listeners {
+		closeCloser(listener)
 	}
-
-	return s.Serve(listeners...)
 }
 
-// Serve serves TCP traffic on the given pre-created listeners.
+// ListenAndServe starts listening on all configured TCP addresses and serves traffic.
+func (s *Server) ListenAndServe() error {
+	var tlsListeners []net.Listener
+	for _, addr := range s.config.ListenAddrs {
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			closeListeners(tlsListeners)
+			return fmt.Errorf("listening on %s: %w", addr, err)
+		}
+		tlsListeners = append(tlsListeners, listener)
+	}
+
+	var httpListeners []net.Listener
+	for _, addr := range s.config.ListenHTTPAddrs {
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			closeListeners(tlsListeners)
+			closeListeners(httpListeners)
+			return fmt.Errorf("listening on HTTP %s: %w", addr, err)
+		}
+		httpListeners = append(httpListeners, listener)
+	}
+
+	return s.ServeWithHTTP(tlsListeners, httpListeners)
+}
+
+// Serve serves TCP traffic on the given pre-created TLS listeners.
 func (s *Server) Serve(listeners ...net.Listener) error {
+	return s.ServeWithHTTP(listeners, nil)
+}
+
+// ServeWithHTTP serves TLS and HTTP TCP traffic on the given pre-created listeners.
+func (s *Server) ServeWithHTTP(tlsListeners []net.Listener, httpListeners []net.Listener) error {
+	allListeners := slices.Concat(tlsListeners, httpListeners)
 	s.listenersMu.Lock()
-	s.listeners = listeners
+	s.listeners = allListeners
 	s.listenersMu.Unlock()
 
 	// Start internal mTLS HTTP server
-	errCh := make(chan error, len(listeners)+1)
+	errCh := make(chan error, len(allListeners)+1)
 	go func() {
 		if err := s.httpServer.Serve(s.internalListener); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			errCh <- fmt.Errorf("internal HTTP server: %w", err)
@@ -207,11 +233,10 @@ func (s *Server) Serve(listeners ...net.Listener) error {
 	// Start background lease reaper for periodic token expiration
 	go s.runLeaseReaper()
 
-	// Accept connections on each TCP listener
-	for _, ln := range listeners {
-		go func(l net.Listener) {
+	serveListener := func(listener net.Listener, handler func(net.Conn)) {
+		go func() {
 			for {
-				conn, err := l.Accept()
+				conn, err := listener.Accept()
 				if err != nil {
 					select {
 					case <-s.shutdownCh:
@@ -228,9 +253,16 @@ func (s *Server) Serve(listeners ...net.Listener) error {
 						continue
 					}
 				}
-				go s.handleConnection(conn)
+				go handler(conn)
 			}
-		}(ln)
+		}()
+	}
+
+	for _, listener := range tlsListeners {
+		serveListener(listener, s.handleConnection)
+	}
+	for _, listener := range httpListeners {
+		serveListener(listener, s.handleHTTPConnection)
 	}
 
 	select {
@@ -250,9 +282,7 @@ func (s *Server) Close() error {
 	}
 	s.closed = true
 	close(s.shutdownCh)
-	for _, ln := range s.listeners {
-		closeCloser(ln)
-	}
+	closeListeners(s.listeners)
 	s.listenersMu.Unlock()
 
 	closeCloser(s.internalListener)
@@ -358,7 +388,30 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// 2. Otherwise route to backend with failover/replay loop
+	s.routeToBackend(sniHostname, peekedConn)
+}
+
+// handleHTTPConnection peeks the HTTP/1.1 request head of an incoming plaintext connection,
+// parses its Host header, and routes the connection to a matching backend session via PROXY v2.
+// After the first request, the frontend splices the connection and copies raw bytes bidirectionally,
+// so later pipelined or keep-alive requests on the same connection go to the same session whatever
+// their Host says; the backend routes each request by Host itself and serves only its own Gateways.
+func (s *Server) handleHTTPConnection(conn net.Conn) {
+	defer s.activeConns.Add(-1)
+	setTCPKeepAlive(conn)
+
+	hostname, peekedConn, err := httphost.SniffHost(conn, s.config.ReadSNITimeout)
+	if err != nil {
+		closeCloser(peekedConn)
+		return
+	}
+
+	s.routeToBackend(hostname, peekedConn)
+}
+
+func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
+	cleanHost := CleanHostname(hostname)
+
 	var rawClientConn net.Conn = peekedConn
 	var peekedBytes []byte
 	if pc, ok := peekedConn.(*sni.PeekedConn); ok {
@@ -370,7 +423,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		Command:   proxyproto.CommandProxy,
 		SrcAddr:   peekedConn.RemoteAddr(),
 		DstAddr:   peekedConn.LocalAddr(),
-		Authority: sniHostname,
+		Authority: hostname,
 	}
 	proxyBytes, err := proxyHdr.Format()
 	if err != nil {
@@ -386,7 +439,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	for {
 		now := time.Now()
 		if now.After(deadline) {
-			log.Printf("Frontend: connect timeout reached for SNI %q", sniHostname)
+			log.Printf("Frontend: connect timeout reached for host %q", hostname)
 			closeCloser(peekedConn)
 			return
 		}
@@ -397,9 +450,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 			attemptTimeout = remaining
 		}
 
-		sessions := s.table.MatchSessions(cleanSNI)
+		sessions := s.table.MatchSessions(cleanHost)
 		if len(sessions) == 0 {
-			log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
+			log.Printf("Frontend: rejecting connection with host %q (clean: %q): not registered", hostname, cleanHost)
 			closeCloser(peekedConn)
 			return
 		}
@@ -415,7 +468,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		setTCPKeepAlive(tunnelConn)
 
-		// Set write deadline for PROXY header + peeked ClientHello
+		// Set write deadline for PROXY header + peeked bytes
 		if err := tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout)); err != nil {
 			closeCloser(tunnelConn)
 			continue

@@ -64,6 +64,8 @@ func run(ctx context.Context, args []string) error {
 
 	var listenAddrs stringSliceFlag
 	fs.Var(&listenAddrs, "listen", "Address to listen on (can be specified multiple times, default :443)")
+	var listenHTTPAddrs stringSliceFlag
+	fs.Var(&listenHTTPAddrs, "listen-http", "Address to listen on for plaintext HTTP (can be specified multiple times, off by default)")
 	var clientCAs stringSliceFlag
 	fs.Var(&clientCAs, "client-ca", "Client CA allowlist entry in format <path-to-ca.crt>=<hostname-pattern>[,<hostname-pattern>...] (can be specified multiple times)")
 	caCertPath := fs.String("ca-cert", "ca.crt", "Path to CA certificate PEM file (used when no --client-ca flags are specified)")
@@ -241,6 +243,7 @@ func run(ctx context.Context, args []string) error {
 
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ListenAddrs:            listenAddrs,
+		ListenHTTPAddrs:        listenHTTPAddrs,
 		InternalHostname:       *internalHostname,
 		ServerTLSConfig:        serverTLS,
 		ConnectTimeout:         *connectTimeout,
@@ -262,7 +265,11 @@ func run(ctx context.Context, args []string) error {
 		}
 	}()
 
-	log.Printf("Starting snigateway-frontend listening on %v (internal SNI: %s)...", listenAddrs, *internalHostname)
+	if len(listenHTTPAddrs) > 0 {
+		log.Printf("Starting snigateway-frontend listening on %v (TLS) and %v (HTTP) (internal SNI: %s)...", listenAddrs, listenHTTPAddrs, *internalHostname)
+	} else {
+		log.Printf("Starting snigateway-frontend listening on %v (internal SNI: %s)...", listenAddrs, *internalHostname)
+	}
 	if err := srv.ListenAndServe(); err != nil {
 		return fmt.Errorf("server stopped: %w", err)
 	}
