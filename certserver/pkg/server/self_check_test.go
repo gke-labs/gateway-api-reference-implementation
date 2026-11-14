@@ -143,28 +143,29 @@ func (h *selfCheckHarness) serveChallenge(token, keyAuth string) {
 
 func (h *selfCheckHarness) obtainCertificate(t *testing.T, req *certserverv1.GetCertificateRequest) *certserverv1.GetCertificateResponse {
 	t.Helper()
-	pollDeadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(pollDeadline) {
+	// Wait for Pebble ACME order creation, challenge self-check, authorization
+	// validation, order finalization, and certificate issuance. Under race detection
+	// and parallel CI load across packages, multiple 1-second ACME client polling intervals
+	// (WaitAuthorization, WaitOrder) can elapse during order fulfillment, so allow
+	// 25 seconds (matching renewDeadline) for certificate issuance to complete.
+	deadline := time.Now().Add(25 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
 		resp, err := h.client.GetCertificate(h.callCtx, req)
 		if err != nil {
-			t.Fatalf("GetCertificate failed: %v", err)
-		}
-		if len(resp.Challenges) > 0 {
+			lastErr = err
+		} else if resp != nil {
+			if len(resp.CertificateChain) > 0 {
+				return resp
+			}
 			for _, ch := range resp.Challenges {
 				h.serveChallenge(ch.Token, ch.KeyAuthorization)
 			}
-			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-
-	retryDeadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(retryDeadline) {
-		time.Sleep(100 * time.Millisecond)
-		resp, err := h.client.GetCertificate(h.callCtx, req)
-		if err == nil && resp != nil && len(resp.CertificateChain) > 0 {
-			return resp
-		}
+	if lastErr != nil {
+		t.Fatalf("timed out waiting for certificate issuance for %s (last error: %v)", req.Gateway, lastErr)
 	}
 	t.Fatalf("timed out waiting for certificate issuance for %s", req.Gateway)
 	return nil

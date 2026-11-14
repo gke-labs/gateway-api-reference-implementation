@@ -44,6 +44,23 @@ type ServerConfig struct {
 	ChallengeHandler http.Handler
 }
 
+type orderRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (r *orderRecorder) WriteHeader(status int) {
+	r.statusCode = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *orderRecorder) Write(b []byte) (int, error) {
+	if r.statusCode == 0 {
+		r.statusCode = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
+}
+
 // Server encapsulates an in-process Pebble ACME test environment.
 type Server struct {
 	DirectoryURL    string
@@ -139,7 +156,12 @@ func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 	orderCount := &atomic.Int64{}
 	pebbleHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/order-plz" && r.Method == http.MethodPost {
-			orderCount.Add(1)
+			rec := &orderRecorder{ResponseWriter: w}
+			pebbleWFE.Handler().ServeHTTP(rec, r)
+			if rec.statusCode == http.StatusCreated {
+				orderCount.Add(1)
+			}
+			return
 		}
 		pebbleWFE.Handler().ServeHTTP(w, r)
 	})
