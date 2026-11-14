@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -42,6 +43,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -1080,50 +1082,121 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 
 // PublishDataplaneConfig writes the Gateway's compiled data-plane config to its per-Gateway Secret.
 func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
-	if p.client == nil || gw == nil || config == nil {
+	if p.client == nil || gw == nil {
 		return nil
 	}
-
 	name := ResourceNameForGateway(gw.Name)
+	return PublishDataplaneConfig(ctx, p.client, gw.Namespace, name, gw, config)
+}
+
+// PublishDataplaneConfig writes or deletes a data plane's config Secret.
+// It guarantees that it applies with the provider's field owner, it refuses an
+// object that another owner holds, and it deletes the object when the payload is nil.
+func PublishDataplaneConfig(ctx context.Context, cl client.Client, namespace, name string, owner client.Object, payload any) error {
+	if cl == nil {
+		return nil
+	}
+	if owner != nil && reflect.ValueOf(owner).Kind() == reflect.Pointer && reflect.ValueOf(owner).IsNil() {
+		owner = nil
+	}
 
 	var existingSecret corev1.Secret
-	err := p.client.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: name}, &existingSecret)
+	err := cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &existingSecret)
 	if err == nil {
-		if !isOwnedByGateway(&existingSecret, gw) {
-			return &controller.OwnershipConflictError{
-				Message: fmt.Sprintf("conflict: existing Secret %s/%s is not owned by Gateway %s", gw.Namespace, name, gw.Name),
+		ref := metav1.GetControllerOf(&existingSecret)
+		if owner == nil {
+			if ref != nil {
+				return &controller.OwnershipConflictError{
+					Message: fmt.Sprintf("conflict: existing Secret %s/%s is owned by %s %s", namespace, name, ref.Kind, ref.Name),
+				}
+			}
+		} else {
+			if ref == nil || (owner.GetUID() != "" && ref.UID != "" && ref.UID != owner.GetUID()) || ref.Name != owner.GetName() {
+				ownerDesc := owner.GetName()
+				if _, ok := owner.(*gatewayv1.Gateway); ok {
+					ownerDesc = "Gateway " + ownerDesc
+				}
+				return &controller.OwnershipConflictError{
+					Message: fmt.Sprintf("conflict: existing Secret %s/%s is not owned by %s", namespace, name, ownerDesc),
+				}
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to get config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		return fmt.Errorf("failed to get config Secret %s/%s: %w", namespace, name, err)
 	}
 
-	labels, annotations := buildLabelsAndAnnotations(gw)
-	ownerRef := metav1ac.OwnerReference().
-		WithAPIVersion(gatewayv1.GroupVersion.String()).
-		WithKind("Gateway").
-		WithName(gw.Name).
-		WithUID(gw.UID).
-		WithController(true).
-		WithBlockOwnerDeletion(true)
-
-	configJSON, err := json.Marshal(config)
-	if err != nil {
-		return fmt.Errorf("failed to marshal dataplane config: %w", err)
+	isNil := payload == nil
+	if !isNil {
+		val := reflect.ValueOf(payload)
+		switch val.Kind() {
+		case reflect.Pointer, reflect.Interface, reflect.Slice, reflect.Map:
+			isNil = val.IsNil()
+		}
+	}
+	if isNil {
+		if err == nil {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      name,
+				},
+			}
+			if err := cl.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete config Secret %s/%s: %w", namespace, name, err)
+			}
+		}
+		return nil
 	}
 
-	secretApply := corev1ac.Secret(name, gw.Namespace).
-		WithOwnerReferences(ownerRef).
-		WithLabels(labels).
+	var configJSON []byte
+	if b, ok := payload.([]byte); ok {
+		configJSON = b
+	} else {
+		var marshalErr error
+		configJSON, marshalErr = json.Marshal(payload)
+		if marshalErr != nil {
+			return fmt.Errorf("failed to marshal dataplane config: %w", marshalErr)
+		}
+	}
+
+	secretApply := corev1ac.Secret(name, namespace).
 		WithData(map[string][]byte{
 			DataplaneSecretDataKey: configJSON,
 		})
-	if len(annotations) > 0 {
-		secretApply.WithAnnotations(annotations)
+
+	if owner != nil {
+		apiVersion := gatewayv1.GroupVersion.String()
+		kind := "Gateway"
+		if cl.Scheme() != nil {
+			if gvk, err := apiutil.GVKForObject(owner, cl.Scheme()); err == nil && gvk.Kind != "" {
+				apiVersion = gvk.GroupVersion().String()
+				kind = gvk.Kind
+			}
+		}
+		ref := metav1ac.OwnerReference().
+			WithAPIVersion(apiVersion).
+			WithKind(kind).
+			WithName(owner.GetName()).
+			WithController(true).
+			WithBlockOwnerDeletion(true)
+		if owner.GetUID() != "" {
+			ref.WithUID(owner.GetUID())
+		}
+		secretApply.WithOwnerReferences(ref)
+
+		if gw, ok := owner.(*gatewayv1.Gateway); ok && gw != nil {
+			labels, annotations := buildLabelsAndAnnotations(gw)
+			if len(labels) > 0 {
+				secretApply.WithLabels(labels)
+			}
+			if len(annotations) > 0 {
+				secretApply.WithAnnotations(annotations)
+			}
+		}
 	}
 
-	if err := p.client.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return fmt.Errorf("failed to apply config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+	if err := cl.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return fmt.Errorf("failed to apply config Secret %s/%s: %w", namespace, name, err)
 	}
 	return nil
 }
