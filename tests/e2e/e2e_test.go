@@ -58,7 +58,7 @@ func TestGatewayAPI(t *testing.T) {
 	h.CreateTLSSecret("gateway-tls-cert", "default", certPEM, keyPEM)
 
 	h.KubectlApplyContent(h.ExampleGatewayManifest())
-	gwAddr := h.WaitForGatewayAddress("reference-gateway", "default", 1*time.Minute)
+	gwAddr, gwCreated := h.WaitForGatewayAddress("reference-gateway", "default", 1*time.Minute)
 
 	// 5. Run Client Pod (HTTP)
 	clientPodName := "test-client"
@@ -81,7 +81,7 @@ func TestGatewayAPI(t *testing.T) {
 			t.Errorf("Expected hostname example.com in response body, got: %s", logs)
 		}
 	}
-	h.LogGatewayTiming("reference-gateway", "default", "first successful request")
+	h.logGatewayTiming("default", "reference-gateway", "first successful request", gwCreated)
 
 	// 7. Run Client Pod (HTTPS - verify Alt-Svc header and certificate)
 	httpsClientPodName := "test-client-https"
@@ -143,7 +143,7 @@ spec:
       port: 8080
 `
 	h.KubectlApplyContent(secondGwManifest)
-	secondGwAddr := h.WaitForGatewayAddress("second-gateway", "default", 1*time.Minute)
+	secondGwAddr, _ := h.WaitForGatewayAddress("second-gateway", "default", 1*time.Minute)
 	if secondGwAddr == gwAddr {
 		t.Errorf("Expected second Gateway to get distinct address, got same: %s", secondGwAddr)
 	}
@@ -229,7 +229,7 @@ spec:
       name: live-switch-params
 `
 	h.KubectlApplyContent(liveSwitchCM)
-	liveGwAddr := h.WaitForGatewayAddress("live-switch-gw", "default", 1*time.Minute)
+	liveGwAddr, _ := h.WaitForGatewayAddress("live-switch-gw", "default", 1*time.Minute)
 	if liveGwAddr == "" {
 		t.Fatalf("Expected live-switch-gw to get an address")
 	}

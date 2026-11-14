@@ -48,8 +48,6 @@ type Harness struct {
 
 	setupDiagnosticsOnce sync.Once
 	dumpOnce             sync.Once
-
-	gatewayCreationTimestamps sync.Map
 }
 
 func NewHarness(t *testing.T, clusterName string) *Harness {
@@ -243,50 +241,18 @@ func (h *Harness) WaitForGatewayClassStatus(name string, timeout time.Duration) 
 	}
 }
 
-// FormatGatewayTiming formats a gateway lifecycle timing log entry.
-func FormatGatewayTiming(namespace, name, event string, elapsed time.Duration) string {
+func (h *Harness) logGatewayTiming(namespace, name, event string, since time.Time) {
+	if since.IsZero() {
+		return
+	}
+	elapsed := time.Since(since)
 	if elapsed < 0 {
 		elapsed = 0
 	}
-	return fmt.Sprintf("gateway %s/%s: %s after %.2fs", namespace, name, event, elapsed.Seconds())
+	h.T.Logf("gateway %s/%s: %s after %.2fs", namespace, name, event, elapsed.Seconds())
 }
 
-// SetGatewayCreationTimestamp stores the creationTimestamp for a Gateway in the harness cache.
-func (h *Harness) SetGatewayCreationTimestamp(name, namespace string, creationTimestamp time.Time) {
-	h.gatewayCreationTimestamps.Store(namespace+"/"+name, creationTimestamp)
-}
-
-// GatewayCreationTimestamp returns the metadata.creationTimestamp for the specified Gateway.
-// It returns a cached timestamp if one was recorded during WaitForGatewayAddress,
-// or queries the API server directly.
-func (h *Harness) GatewayCreationTimestamp(name, namespace string) time.Time {
-	if val, ok := h.gatewayCreationTimestamps.Load(namespace + "/" + name); ok {
-		return val.(time.Time)
-	}
-	out, err := exec.Command("kubectl", "get", "gateway", name, "--namespace", namespace, "-o", "jsonpath={.metadata.creationTimestamp}").Output()
-	if err != nil {
-		h.T.Logf("failed to get gateway %s/%s creationTimestamp: %v", namespace, name, err)
-		return time.Time{}
-	}
-	creationTimestamp, err := time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
-	if err != nil {
-		h.T.Logf("failed to parse gateway %s/%s creationTimestamp: %v", namespace, name, err)
-		return time.Time{}
-	}
-	h.gatewayCreationTimestamps.Store(namespace+"/"+name, creationTimestamp)
-	return creationTimestamp
-}
-
-// LogGatewayTiming logs the elapsed time since the Gateway's creationTimestamp.
-func (h *Harness) LogGatewayTiming(name, namespace, event string) {
-	creationTimestamp := h.GatewayCreationTimestamp(name, namespace)
-	if creationTimestamp.IsZero() {
-		return
-	}
-	h.T.Logf("%s", FormatGatewayTiming(namespace, name, event, time.Since(creationTimestamp)))
-}
-
-func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Duration) string {
+func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Duration) (string, time.Time) {
 	h.T.Logf("Waiting for Gateway %s/%s to have an address assigned", namespace, name)
 	start := time.Now()
 	var (
@@ -329,29 +295,24 @@ func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Dur
 			} else {
 				if !gatewayObj.Metadata.CreationTimestamp.IsZero() {
 					creationTimestamp = gatewayObj.Metadata.CreationTimestamp
-					h.SetGatewayCreationTimestamp(name, namespace, creationTimestamp)
 				}
 				if !loggedAddress && len(gatewayObj.Status.Addresses) > 0 && strings.TrimSpace(gatewayObj.Status.Addresses[0].Value) != "" {
 					addr = strings.TrimSpace(gatewayObj.Status.Addresses[0].Value)
 					loggedAddress = true
 					h.T.Logf("Gateway %s/%s assigned address: %s", namespace, name, addr)
-					if !creationTimestamp.IsZero() {
-						h.LogGatewayTiming(name, namespace, "address assigned")
-					}
+					h.logGatewayTiming(namespace, name, "address assigned", creationTimestamp)
 				}
 				if !loggedProgrammed {
 					for _, condition := range gatewayObj.Status.Conditions {
 						if condition.Type == "Programmed" && condition.Status == "True" {
 							loggedProgrammed = true
-							if !creationTimestamp.IsZero() {
-								h.LogGatewayTiming(name, namespace, "Programmed=True")
-							}
+							h.logGatewayTiming(namespace, name, "Programmed=True", creationTimestamp)
 							break
 						}
 					}
 				}
 				if loggedAddress && loggedProgrammed {
-					return addr
+					return addr, creationTimestamp
 				}
 			}
 		}
