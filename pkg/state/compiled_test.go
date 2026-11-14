@@ -1351,7 +1351,7 @@ func TestValidateListener_CertificateRefGroup(t *testing.T) {
 				},
 			}
 
-			_, conds, _, _ := ValidateListener(
+			validationResult := ValidateListener(
 				ListenerToSpec(listener),
 				ListenerOwner{Kind: "Gateway", Namespace: "default", Name: "gw"},
 				&gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw"}},
@@ -1364,12 +1364,12 @@ func TestValidateListener_CertificateRefGroup(t *testing.T) {
 			)
 
 			var progCond, resCond *metav1.Condition
-			for i := range conds {
-				if conds[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
-					progCond = &conds[i]
+			for i := range validationResult.Conditions {
+				if validationResult.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
+					progCond = &validationResult.Conditions[i]
 				}
-				if conds[i].Type == string(gatewayv1.ListenerConditionResolvedRefs) {
-					resCond = &conds[i]
+				if validationResult.Conditions[i].Type == string(gatewayv1.ListenerConditionResolvedRefs) {
+					resCond = &validationResult.Conditions[i]
 				}
 			}
 
