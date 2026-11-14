@@ -51,6 +51,7 @@ Three options exist for adapting SNIGateway:
    - The data-plane container runs the tunnel client next to the reference implementation's data plane, reads its config through the normal Secret distribution, registers its own hostnames, and feeds tunnel connections to the data plane over loopback (or via an in-pod adapter).
    - *Reference implementation burden:* None. `pkg/gari` and `pkg/proxy` can delete all in-process proxy options and hooks.
    - *Config distribution:* **Exercised.**
+   - *Shared identity trade-off:* Because both containers share a single pod under the `snigateway-controller` ServiceAccount, the data-plane container shares the pod's identity and has the controller's permissions (such as create, update, and patch on Secrets). That is the cost of running two containers in a single static pod.
    - *Size:* Adds ~80–120 lines in `snigateway` (Deployment manifest update and a lightweight loopback tunnel forwarder/registration helper); deletes ~200 lines from `snigateway` and unblocks removing hundreds of lines of in-process proxy code in `pkg/gari`.
 
 ## 5. Verdict and Recommendation

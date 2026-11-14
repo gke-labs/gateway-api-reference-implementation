@@ -151,13 +151,37 @@ func (m *Manager) HasRegisteredHostnames(hostnames []string) bool {
 	if !m.connected || m.sessionID == "" || m.sessionID != m.lastRegisteredSessionID {
 		return false
 	}
-	for _, h := range hostnames {
-		h = strings.ToLower(strings.TrimSpace(h))
-		if !slices.Contains(m.registeredHostnames, h) {
+	for _, hostname := range hostnames {
+		hostname = strings.ToLower(strings.TrimSpace(hostname))
+		if !slices.Contains(m.registeredHostnames, hostname) {
 			return false
 		}
 	}
 	return true
+}
+
+// HasRegisteredAllHostnames returns true if the tunnel is connected and all currently
+// configured hostnames have been successfully registered with the frontend under the active session.
+func (m *Manager) HasRegisteredAllHostnames() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.connected || m.sessionID == "" || m.sessionID != m.lastRegisteredSessionID {
+		return false
+	}
+	for _, hostname := range m.hostnames {
+		hostname = strings.ToLower(strings.TrimSpace(hostname))
+		if !slices.Contains(m.registeredHostnames, hostname) {
+			return false
+		}
+	}
+	return true
+}
+
+// Hostnames returns a clone of the currently configured hostnames.
+func (m *Manager) Hostnames() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.hostnames)
 }
 
 func (m *Manager) notifyListeners() {
