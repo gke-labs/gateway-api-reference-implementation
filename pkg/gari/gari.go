@@ -413,8 +413,10 @@ type Server struct {
 type appliedConfig struct {
 	appliedRevision  string
 	appliedListeners []state.InternalListener
+	savedListeners   []state.InternalListener
 	pendingRevision  string
 	pendingListeners []state.InternalListener
+	proxyApplied     bool
 }
 
 // readyListener wraps a net.Listener and invokes onAccept when Accept is first called.
@@ -425,18 +427,6 @@ type readyListener struct {
 }
 
 func (listener *readyListener) Accept() (net.Conn, error) {
-	underlying := listener.Listener
-	for {
-		if r, ok := underlying.(interface{ Ready() <-chan struct{} }); ok {
-			<-r.Ready()
-			break
-		}
-		if u, ok := underlying.(interface{ Unwrap() net.Listener }); ok {
-			underlying = u.Unwrap()
-		} else {
-			break
-		}
-	}
 	if listener.onAccept != nil {
 		listener.readyOnce.Do(listener.onAccept)
 	}
@@ -715,11 +705,13 @@ func sharedListeners(previous, next []state.InternalListener) []state.InternalLi
 // promotePendingLocked promotes pending revisions whose required listeners are now all accepting connections.
 func (s *Server) promotePendingLocked() {
 	for gatewayKey, config := range s.appliedConfigs {
-		if config.pendingRevision != "" && s.listenersAccepting(config.pendingListeners) {
+		if config.proxyApplied && config.pendingRevision != "" && s.listenersAccepting(config.pendingListeners) {
 			config.appliedRevision = config.pendingRevision
 			config.appliedListeners = config.pendingListeners
+			config.savedListeners = nil
 			config.pendingRevision = ""
 			config.pendingListeners = nil
+			config.proxyApplied = false
 			s.appliedConfigs[gatewayKey] = config
 		}
 	}
@@ -818,6 +810,8 @@ func (s *Server) appliedRevisionsList() []string {
 	defer s.appliedMu.RUnlock()
 	revisions := make([]string, 0, len(s.appliedConfigs))
 	for _, config := range s.appliedConfigs {
+		// In controller mode (DataplaneMode == false), the controller runs no in-process proxy or listeners,
+		// so all recorded revisions are considered applied without listener readiness checks.
 		if config.appliedRevision != "" && (!s.opts.DataplaneMode || s.listenersAccepting(config.appliedListeners)) {
 			revisions = append(revisions, config.appliedRevision)
 		}
@@ -826,18 +820,42 @@ func (s *Server) appliedRevisionsList() []string {
 	return revisions
 }
 
-func (s *Server) recordAppliedRevision(gatewayKey, revision string, listeners []state.InternalListener) {
+func (s *Server) recordPendingRevision(gatewayKey, revision string, listeners []state.InternalListener) {
 	s.appliedMu.Lock()
 	defer s.appliedMu.Unlock()
 	if s.appliedConfigs == nil {
 		s.appliedConfigs = make(map[string]appliedConfig)
 	}
 	config := s.appliedConfigs[gatewayKey]
+	config.savedListeners = config.appliedListeners
 	config.appliedListeners = sharedListeners(config.appliedListeners, listeners)
 	config.pendingRevision = revision
 	config.pendingListeners = listeners
+	config.proxyApplied = false
 	s.appliedConfigs[gatewayKey] = config
-	s.promotePendingLocked()
+}
+
+func (s *Server) recordProxyApplied(gatewayKey string) {
+	s.appliedMu.Lock()
+	defer s.appliedMu.Unlock()
+	if config, ok := s.appliedConfigs[gatewayKey]; ok {
+		config.proxyApplied = true
+		s.appliedConfigs[gatewayKey] = config
+		s.promotePendingLocked()
+	}
+}
+
+func (s *Server) dropPendingRevision(gatewayKey string) {
+	s.appliedMu.Lock()
+	defer s.appliedMu.Unlock()
+	if config, ok := s.appliedConfigs[gatewayKey]; ok {
+		config.appliedListeners = config.savedListeners
+		config.savedListeners = nil
+		config.pendingRevision = ""
+		config.pendingListeners = nil
+		config.proxyApplied = false
+		s.appliedConfigs[gatewayKey] = config
+	}
 }
 
 func (s *Server) appliedHandler() http.Handler {
@@ -870,7 +888,9 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 			gatewayNamespace: s.opts.DataplaneGatewayNamespace,
 			secretName:       secretName,
 			onConfigUpdate:   s.updateListenerFilters,
-			onConfigApplied:  s.recordAppliedRevision,
+			onConfigPending:  s.recordPendingRevision,
+			onConfigApplied:  s.recordProxyApplied,
+			onConfigFailed:   s.dropPendingRevision,
 		}
 		if err := ctrl.NewControllerManagedBy(mgr).
 			For(&corev1.Secret{}).
@@ -893,6 +913,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 				if dpCfg := s.state.GetDataplaneConfig(gwKey); dpCfg != nil && dpCfg.Revision != "" {
 					newConfigs[gwKey.String()] = appliedConfig{
 						appliedRevision: dpCfg.Revision,
+						proxyApplied:    true,
 					}
 				}
 			}
@@ -925,7 +946,9 @@ type dataplaneSecretReconciler struct {
 	gatewayNamespace string
 	secretName       string
 	onConfigUpdate   func(opts proxyproto.ListenerOptions) error
-	onConfigApplied  func(gwKey string, revision string, listeners []state.InternalListener)
+	onConfigPending  func(gwKey string, revision string, listeners []state.InternalListener)
+	onConfigApplied  func(gwKey string)
+	onConfigFailed   func(gwKey string)
 }
 
 func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -951,14 +974,21 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
 	}
 
-	if r.onConfigApplied != nil && dpCfg.Revision != "" {
-		r.onConfigApplied(dpCfg.GatewayName.String(), dpCfg.Revision, dpCfg.Listeners)
+	if r.onConfigPending != nil && dpCfg.Revision != "" {
+		r.onConfigPending(dpCfg.GatewayName.String(), dpCfg.Revision, dpCfg.Listeners)
 	}
 
 	if err := state.ApplyDataplaneConfig(r.proxy, data); err != nil {
+		if r.onConfigFailed != nil {
+			r.onConfigFailed(dpCfg.GatewayName.String())
+		}
 		return ctrl.Result{}, fmt.Errorf("failed to apply dataplane config: %w", err)
 	}
 	r.proxySynced.Store(true)
+
+	if r.onConfigApplied != nil {
+		r.onConfigApplied(dpCfg.GatewayName.String())
+	}
 
 	if r.onConfigUpdate != nil {
 		opts := proxyproto.ListenerOptions{

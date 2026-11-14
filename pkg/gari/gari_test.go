@@ -3203,39 +3203,6 @@ func TestCertificateSources_OptionsWiring(t *testing.T) {
 	}
 }
 
-type delayingListener struct {
-	addr       net.Addr
-	ready      chan struct{}
-	realLn     net.Listener
-	listenOnce sync.Once
-}
-
-func (l *delayingListener) Addr() net.Addr {
-	return l.addr
-}
-
-func (l *delayingListener) Close() error {
-	if l.realLn != nil {
-		return l.realLn.Close()
-	}
-	return nil
-}
-
-func (l *delayingListener) Ready() <-chan struct{} {
-	return l.ready
-}
-
-func (l *delayingListener) Accept() (net.Conn, error) {
-	<-l.ready
-	l.listenOnce.Do(func() {
-		l.realLn, _ = net.Listen("tcp", l.addr.String())
-	})
-	if l.realLn == nil {
-		return nil, net.ErrClosed
-	}
-	return l.realLn.Accept()
-}
-
 func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	env := testenv.Start(t)
 
@@ -3270,12 +3237,11 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 
 	healthAddr := allocatePort()
 	proxyAddr := allocatePort()
-	tcpAddr, err := net.ResolveTCPAddr("tcp", proxyAddr)
-	if err != nil {
-		t.Fatalf("failed to resolve TCP addr: %v", err)
-	}
+	tcpPortAddr1 := allocatePort()
+	_, tcpPortStr1, _ := net.SplitHostPort(tcpPortAddr1)
+	tcpPortNum1, _ := strconv.Atoi(tcpPortStr1)
+	tcpPort1 := gatewayv1.PortNumber(tcpPortNum1)
 
-	unblockHTTP := make(chan struct{})
 	opts := DefaultOptions()
 	opts.RestConfig = env.Config
 	opts.Scheme = env.Scheme
@@ -3284,10 +3250,7 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	opts.DataplaneGatewayName = gwName
 	opts.HealthProbeBindAddress = healthAddr
 	opts.MetricsAddr = healthAddr
-	opts.HTTPListener = &delayingListener{
-		addr:  tcpAddr,
-		ready: unblockHTTP,
-	}
+	opts.ProxyAddr = proxyAddr
 	opts.ProxyHTTPSAddr = ""
 	opts.LeaderElection = false
 	opts.SkipNameValidation = true
@@ -3296,6 +3259,14 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
+
+	var tcpReady1 atomic.Bool
+	server.Proxy().SetListenFunc(func(network, addr string) (net.Listener, error) {
+		if strings.HasSuffix(addr, tcpPortStr1) && !tcpReady1.Load() {
+			return nil, errors.New("listener setup delayed")
+		}
+		return net.Listen(network, addr)
+	})
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -3361,7 +3332,7 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 		t.Errorf("expected /_gari/applied to be empty before Secret exists, got %v", revs)
 	}
 
-	// 1. Initial config Secret (Revision 1) with HTTP listener
+	// 1. Initial config Secret (Revision 1) with HTTP listener and TCP listener 1
 	route1 := state.InternalRoute{
 		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
@@ -3377,6 +3348,7 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	}
 	dpConfig1, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
 		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
+		{Name: "tcp1", Port: tcpPort1, Protocol: gatewayv1.TCPProtocolType},
 	}, []state.InternalRoute{route1}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("BuildDataplaneConfig 1 failed: %v", err)
@@ -3403,31 +3375,30 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 		t.Fatalf("failed to create secret: %v", err)
 	}
 
-	// Wait until the secret has been applied to proxy (proxySynced is true)
-	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
-		return server.proxySynced.Load(), nil
-	})
-	if err != nil {
-		t.Fatalf("timed out waiting for secret to be applied: %v", err)
-	}
-
-	// While listener setup is delayed (unblockHTTP not closed):
+	// While listener setup is delayed (tcpReady1 is false):
 	// /readyz must fail (500) and /_gari/applied must omit revision 1.
-	if code := getReadyzStatus(); code != http.StatusInternalServerError {
-		t.Errorf("expected readyz status 500 while listener setup delayed, got %d", code)
-	}
-	if revs := getAppliedRevisions(); slices.Contains(revs, dpConfig1.Revision) {
-		t.Errorf("expected /_gari/applied to omit revision while listener delayed, got %v", revs)
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if code := getReadyzStatus(); code != http.StatusInternalServerError {
+			t.Errorf("expected readyz status 500 while listener setup delayed, got %d", code)
+		}
+		if revs := getAppliedRevisions(); slices.Contains(revs, dpConfig1.Revision) {
+			t.Errorf("expected /_gari/applied to omit revision while listener delayed, got %v", revs)
+		}
 	}
 
-	// Attempting a connection now must fail (connection refused) because HTTP proxy is not listening yet.
-	if conn, err := net.DialTimeout("tcp", proxyAddr, 100*time.Millisecond); err == nil {
+	// Attempting a connection now must fail (connection refused) because TCP listener is delayed.
+	if conn, err := net.DialTimeout("tcp", tcpPortAddr1, 100*time.Millisecond); err == nil {
 		conn.Close()
-		t.Errorf("expected connection to %s to fail while listener setup delayed", proxyAddr)
+		t.Errorf("expected connection to %s to fail while listener setup delayed", tcpPortAddr1)
 	}
 
-	// Unblock HTTP listener setup so listeners can accept connections.
-	close(unblockHTTP)
+	// Unblock TCP listener setup so listeners can accept connections.
+	tcpReady1.Store(true)
+	secret.Annotations = map[string]string{"test/reconcile": "1"}
+	if err := env.Client.Update(ctx, secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
 
 	// Wait for /readyz to return 200 OK and /_gari/applied to include revision 1.
 	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
@@ -3438,21 +3409,21 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	}
 
 	// Connection made right after either signal succeeds.
-	conn, err := net.DialTimeout("tcp", proxyAddr, 1*time.Second)
+	conn, err := net.DialTimeout("tcp", tcpPortAddr1, 1*time.Second)
 	if err != nil {
-		t.Fatalf("connection to %s failed right after ready signal: %v", proxyAddr, err)
+		t.Fatalf("connection to %s failed right after ready signal: %v", tcpPortAddr1, err)
 	}
 	conn.Close()
 
-	// 2. Config change that adds a listener port (TCP port)
-	tcpPortAddr := allocatePort()
-	_, tcpPortStr, _ := net.SplitHostPort(tcpPortAddr)
-	tcpPortNum, _ := strconv.Atoi(tcpPortStr)
-	tcpPort := gatewayv1.PortNumber(tcpPortNum)
+	// 2. Config change that adds a listener port (TCP port 2)
+	tcpPortAddr2 := allocatePort()
+	_, tcpPortStr2, _ := net.SplitHostPort(tcpPortAddr2)
+	tcpPortNum2, _ := strconv.Atoi(tcpPortStr2)
+	tcpPort2 := gatewayv1.PortNumber(tcpPortNum2)
 
-	var tcpReady atomic.Bool
+	var tcpReady2 atomic.Bool
 	server.Proxy().SetListenFunc(func(network, addr string) (net.Listener, error) {
-		if !tcpReady.Load() {
+		if strings.HasSuffix(addr, tcpPortStr2) && !tcpReady2.Load() {
 			return nil, errors.New("listener setup delayed")
 		}
 		return net.Listen(network, addr)
@@ -3460,7 +3431,8 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 
 	dpConfig2, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
 		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
-		{Name: "tcp", Port: tcpPort, Protocol: gatewayv1.TCPProtocolType},
+		{Name: "tcp1", Port: tcpPort1, Protocol: gatewayv1.TCPProtocolType},
+		{Name: "tcp2", Port: tcpPort2, Protocol: gatewayv1.TCPProtocolType},
 	}, []state.InternalRoute{route1}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("BuildDataplaneConfig 2 failed: %v", err)
@@ -3475,6 +3447,7 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	}
 
 	secret.Data[singlepod.DataplaneSecretDataKey] = configBytes2
+	secret.Annotations["test/reconcile"] = "2"
 	if err := env.Client.Update(ctx, secret); err != nil {
 		t.Fatalf("failed to update secret: %v", err)
 	}
@@ -3495,18 +3468,15 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 		}
 	}
 
-	// Connection to tcpPortAddr must fail (connection refused)
-	if conn, err := net.DialTimeout("tcp", tcpPortAddr, 100*time.Millisecond); err == nil {
+	// Connection to tcpPortAddr2 must fail (connection refused)
+	if conn, err := net.DialTimeout("tcp", tcpPortAddr2, 100*time.Millisecond); err == nil {
 		conn.Close()
-		t.Errorf("expected connection to %s to fail while listener port delayed", tcpPortAddr)
+		t.Errorf("expected connection to %s to fail while listener port delayed", tcpPortAddr2)
 	}
 
 	// Unblock TCP listener setup and trigger re-reconcile
-	tcpReady.Store(true)
-	if secret.Annotations == nil {
-		secret.Annotations = make(map[string]string)
-	}
-	secret.Annotations["test/reconcile"] = "1"
+	tcpReady2.Store(true)
+	secret.Annotations["test/reconcile"] = "3"
 	if err := env.Client.Update(ctx, secret); err != nil {
 		t.Fatalf("failed to update secret: %v", err)
 	}
@@ -3520,11 +3490,68 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	}
 
 	// Connection made right after either signal succeeds.
-	tcpConn, err := net.DialTimeout("tcp", tcpPortAddr, 1*time.Second)
+	tcpConn, err := net.DialTimeout("tcp", tcpPortAddr2, 1*time.Second)
 	if err != nil {
-		t.Fatalf("connection to %s failed right after ready signal: %v", tcpPortAddr, err)
+		t.Fatalf("connection to %s failed right after ready signal: %v", tcpPortAddr2, err)
 	}
 	tcpConn.Close()
+
+	// 3. Config that fails to apply (missing backend client certificate):
+	// its revision is never listed, the previous revision stays listed, and /readyz stays 200.
+	dpConfig3, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{
+			{
+				Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+				Rules: []state.InternalRule{
+					{
+						Matches: []state.InternalMatch{
+							{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/v1"}},
+						},
+						Backends: []state.InternalBackend{
+							{
+								Host: "backend-1",
+								Port: 8080,
+								TLSConfig: &state.InternalTLSConfig{
+									ClientCertID: "missing-cert-id",
+								},
+							},
+						},
+					},
+				},
+			},
+		}},
+	}, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig 3 failed: %v", err)
+	}
+	dpConfig3.Revision, err = dpConfig3.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 3 failed: %v", err)
+	}
+	configBytes3, err := dpConfig3.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig3: %v", err)
+	}
+
+	secret.Data[singlepod.DataplaneSecretDataKey] = configBytes3
+	secret.Annotations["test/reconcile"] = "4"
+	if err := env.Client.Update(ctx, secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if code := getReadyzStatus(); code != http.StatusOK {
+			t.Errorf("expected readyz status 200 while config fails to apply, got %d", code)
+		}
+		revs := getAppliedRevisions()
+		if !slices.Contains(revs, dpConfig2.Revision) {
+			t.Errorf("expected previous revision 2 to stay listed, got %v", revs)
+		}
+		if slices.Contains(revs, dpConfig3.Revision) {
+			t.Errorf("expected failed revision 3 to never be listed, got %v", revs)
+		}
+	}
 }
 
 func TestDataplane_ConfigRemovesListenerAndAddsUnreadyPort(t *testing.T) {
