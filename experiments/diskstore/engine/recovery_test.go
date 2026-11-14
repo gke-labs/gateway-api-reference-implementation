@@ -1387,9 +1387,9 @@ func TestRecovery_WALTornTailAboveHeapLSN_SucceedsOpen(t *testing.T) {
 }
 
 // TestRecovery_UncheckpointedMixReopenTwice tests crashing after a mix of puts, replacements
-// and deletes with no checkpoint, reopening to compare every key with expected values,
-// and reopening a second time without writing to verify that pages were flushed and keys
-// remain intact without duplicate replay issues.
+// and deletes with a checkpoint partway and uncheckpointed writes at the end, reopening to
+// compare every key, crashing again straight after the first reopen without calling Close()
+// to verify stricter non-checkpointed recovery, and reopening a second time.
 func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
@@ -1404,7 +1404,63 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	expected := make(map[string][]byte)
 	var deletedKeys []string
 
-	// 1. Slotted put: normal small key/val
+	// Phase 1: Writes before a checkpoint partway through the workload.
+	kPre1 := "pre-chk-slotted-1"
+	vPre1 := []byte("val-pre-chk-1")
+	if err := store.Put(table, kPre1, vPre1); err != nil {
+		t.Fatalf("Put kPre1 failed: %v", err)
+	}
+
+	kPre2 := "pre-chk-slotted-2"
+	vPre2 := []byte("val-pre-chk-2")
+	if err := store.Put(table, kPre2, vPre2); err != nil {
+		t.Fatalf("Put kPre2 failed: %v", err)
+	}
+
+	kPreMB := "pre-chk-mb"
+	vPreMB := bytes.Repeat([]byte("val-pre-chk-mb-"), 500)
+	if err := store.Put(table, kPreMB, vPreMB); err != nil {
+		t.Fatalf("Put kPreMB failed: %v", err)
+	}
+
+	kPreDel := "pre-chk-del"
+	vPreDel := []byte("val-pre-chk-del")
+	if err := store.Put(table, kPreDel, vPreDel); err != nil {
+		t.Fatalf("Put kPreDel failed: %v", err)
+	}
+
+	// Checkpoint partway through the workload (truncates WAL prior to checkpoint redo start).
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	// Phase 2: Post-checkpoint mix of puts, replacements (both pre- and post-checkpoint keys),
+	// and deletes (both pre- and post-checkpoint keys).
+
+	// Replace pre-checkpoint key kPre1 with new slotted value
+	vPre1Replaced := []byte("val-pre-chk-1-replaced")
+	if err := store.Put(table, kPre1, vPre1Replaced); err != nil {
+		t.Fatalf("Put kPre1 replaced failed: %v", err)
+	}
+	expected[kPre1] = vPre1Replaced
+
+	// Replace pre-checkpoint key kPre2 with multi-block value
+	vPre2MB := bytes.Repeat([]byte("val-pre-chk-2-now-mb-"), 550)
+	if err := store.Put(table, kPre2, vPre2MB); err != nil {
+		t.Fatalf("Put kPre2 MB replaced failed: %v", err)
+	}
+	expected[kPre2] = vPre2MB
+
+	// Keep pre-checkpoint multi-block key kPreMB intact
+	expected[kPreMB] = vPreMB
+
+	// Delete pre-checkpoint key kPreDel after the checkpoint
+	if err := store.Delete(table, kPreDel); err != nil {
+		t.Fatalf("Delete kPreDel failed: %v", err)
+	}
+	deletedKeys = append(deletedKeys, kPreDel)
+
+	// Post-checkpoint new slotted put
 	k1 := "slotted-1"
 	v1 := []byte("val-slotted-1")
 	if err := store.Put(table, k1, v1); err != nil {
@@ -1412,7 +1468,7 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	expected[k1] = v1
 
-	// 2. Slotted put that will be replaced by another slotted value
+	// Post-checkpoint slotted put that will be replaced by another slotted value
 	k2 := "slotted-replace"
 	v2Initial := []byte("val-slotted-2-initial")
 	if err := store.Put(table, k2, v2Initial); err != nil {
@@ -1424,7 +1480,7 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	expected[k2] = v2Replaced
 
-	// 3. Multi-block put (~10KB)
+	// Post-checkpoint multi-block put (~10KB)
 	kMB := "mb-key"
 	vMB := bytes.Repeat([]byte("mb-payload-data-"), 600)
 	if err := store.Put(table, kMB, vMB); err != nil {
@@ -1432,7 +1488,7 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	expected[kMB] = vMB
 
-	// 4. Multi-block put replaced by slotted value
+	// Post-checkpoint multi-block put replaced by slotted value
 	kMBToSlot := "mb-to-slot"
 	vMBInitial := bytes.Repeat([]byte("mb-initial-bytes-"), 500)
 	if err := store.Put(table, kMBToSlot, vMBInitial); err != nil {
@@ -1444,7 +1500,7 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	expected[kMBToSlot] = vMBSlotted
 
-	// 5. Slotted put replaced by multi-block value
+	// Post-checkpoint slotted put replaced by multi-block value
 	kSlotToMB := "slot-to-mb"
 	vSlotInitial := []byte("slot-initial-val")
 	if err := store.Put(table, kSlotToMB, vSlotInitial); err != nil {
@@ -1456,7 +1512,7 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	expected[kSlotToMB] = vSlotMB
 
-	// 6. Oversize put (~2.1 MB)
+	// Post-checkpoint oversize put (~2.1 MB)
 	kOver := "oversize-key"
 	vOver := append([]byte("oversize-payload-data"), make([]byte, 2100*1024)...)
 	if err := store.Put(table, kOver, vOver); err != nil {
@@ -1464,7 +1520,7 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	expected[kOver] = vOver
 
-	// 7. Oversize put replaced by slotted value
+	// Post-checkpoint oversize put replaced by slotted value
 	kOverToSlot := "oversize-to-slot"
 	vOverInitial := append([]byte("oversize-initial-data"), make([]byte, 2100*1024)...)
 	if err := store.Put(table, kOverToSlot, vOverInitial); err != nil {
@@ -1476,8 +1532,8 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	expected[kOverToSlot] = vOverSlotted
 
-	// 8. Puts followed by Delete:
-	// 8a. Delete slotted key
+	// Post-checkpoint deletes:
+	// Delete slotted key
 	kDelSlot := "delete-slotted"
 	if err := store.Put(table, kDelSlot, []byte("will-be-deleted-slot")); err != nil {
 		t.Fatalf("Put delete-slotted failed: %v", err)
@@ -1487,7 +1543,7 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	deletedKeys = append(deletedKeys, kDelSlot)
 
-	// 8b. Delete multi-block key
+	// Delete multi-block key
 	kDelMB := "delete-mb"
 	if err := store.Put(table, kDelMB, bytes.Repeat([]byte("del-mb-bytes-"), 500)); err != nil {
 		t.Fatalf("Put delete-mb failed: %v", err)
@@ -1497,7 +1553,7 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	deletedKeys = append(deletedKeys, kDelMB)
 
-	// 8c. Delete oversize key
+	// Delete oversize key
 	kDelOver := "delete-oversize"
 	vDelOver := append([]byte("del-oversize-bytes"), make([]byte, 2100*1024)...)
 	if err := store.Put(table, kDelOver, vDelOver); err != nil {
@@ -1508,7 +1564,7 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 	deletedKeys = append(deletedKeys, kDelOver)
 
-	// 8d. Delete non-existent key
+	// Delete non-existent key
 	kDelNonExistent := "never-existed-key"
 	if err := store.Delete(table, kDelNonExistent); err != nil {
 		t.Fatalf("Delete non-existent failed: %v", err)
@@ -1558,12 +1614,14 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 
 	compareKeys(store2, "reopen 1")
 
-	// Close store2 without writing anything.
-	if err := store2.Close(); err != nil {
-		t.Fatalf("store2.Close failed: %v", err)
+	// Crash again straight after the first reopen without calling Close() (which would checkpoint).
+	// This verifies the stricter case that the flush after replay made pages durable and
+	// reopening without writing still preserves all expected keys and tombstoned deletions.
+	if err := faultFS.Crash(true, 0); err != nil {
+		t.Fatalf("Crash after reopen 1 failed: %v", err)
 	}
 
-	// Reopen 2: reopen without any new writes. All keys must match expected values again.
+	// Reopen 2: reopen without any new writes following the crash.
 	store3, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen 2 failed: %v", err)
@@ -1574,5 +1632,86 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 		}
 	}()
 
-	compareKeys(store3, "reopen 2")
+	compareKeys(store3, "reopen 2 (post-crash)")
+}
+
+// TestRecovery_ReplayHeapWriteFailure_NoMarkerAndSucceedsOnReopen verifies that a heap write error
+// during WAL replay fails Open without writing a permanent failure marker, and that a subsequent
+// Open on a healthy filesystem succeeds and recovers all keys.
+func TestRecovery_ReplayHeapWriteFailure_NoMarkerAndSucceedsOnReopen(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	dir := "test_replay_heap_write_failure"
+
+	store, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	table := "TestTable"
+	expected := map[string][]byte{
+		"k1":        []byte("val1-initial"),
+		"k2":        bytes.Repeat([]byte("val2-mb-"), 500),
+		"oversize1": append([]byte("val-over-"), make([]byte, 2100*1024)...),
+	}
+	for k, v := range expected {
+		if err := store.Put(table, k, v); err != nil {
+			t.Fatalf("Put %s failed: %v", k, err)
+		}
+	}
+
+	// Sync WAL without checkpointing so records require replay on recovery.
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Crash to drop un-fsynced heap page buffers.
+	if err := faultFS.Crash(true, 0); err != nil {
+		t.Fatalf("Crash failed: %v", err)
+	}
+
+	// Create a new filesystem instance representing the rebooted system with an injected write error
+	// so the heap write during replay flush fails.
+	faultFS2 := NewFaultFS(memFS)
+	injectedErr := errors.New("simulated disk write failure during heap flush")
+	faultFS2.SetWriteError(injectedErr)
+
+	// Reopen must fail due to the write error during replay/flush.
+	storeFail, err := Open(WithFS(faultFS2), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err == nil {
+		_ = storeFail.Close()
+		t.Fatalf("expected Open to fail due to injected write error, got nil")
+	}
+
+	// Crucially, the failed replay must NOT write a failure marker (FAILED).
+	failureMarkerPath := filepath.Join(dir, "FAILED")
+	if mf, statErr := memFS.Open(failureMarkerPath); statErr == nil {
+		_ = mf.Close()
+		t.Fatalf("failure marker %s was written during replay failure; should not be present", failureMarkerPath)
+	}
+
+	// Reopen on a healthy filesystem (without write errors) must succeed and recover all keys.
+	faultFS3 := NewFaultFS(memFS)
+	storeRecovered, err := Open(WithFS(faultFS3), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen on healthy filesystem failed: %v", err)
+	}
+	defer func() {
+		if err := storeRecovered.Close(); err != nil {
+			t.Errorf("storeRecovered.Close failed: %v", err)
+		}
+	}()
+
+	for k, wantVal := range expected {
+		gotVal, exists, err := storeRecovered.Get(table, k)
+		if err != nil {
+			t.Fatalf("Get(%q) returned error: %v", k, err)
+		}
+		if !exists {
+			t.Fatalf("Get(%q) missing key after recovery", k)
+		}
+		if !bytes.Equal(gotVal, wantVal) {
+			t.Fatalf("Get(%q) value mismatch: got len=%d, want len=%d", k, len(gotVal), len(wantVal))
+		}
+	}
 }

@@ -833,7 +833,6 @@ func Open(opts ...Option) (*Engine, error) {
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
 			Cipher:        options.Cipher,
-			OnFailure:     s.setFailed,
 		})
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 	} else {
@@ -867,7 +866,6 @@ func Open(opts ...Option) (*Engine, error) {
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
 			Cipher:        options.Cipher,
-			OnFailure:     s.setFailed,
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
@@ -914,11 +912,15 @@ func Open(opts ...Option) (*Engine, error) {
 		go s.backgroundQuarantineSweep()
 	}
 
+	s.bp.SetOnFailure(s.setFailed)
 	return s, nil
 }
 
 // replayWAL replays each WAL record from redoStartLSN through the write path apply functions.
-// Replay must not append to the WAL.
+// Replay holds writerMu throughout, and appends nothing to the WAL.
+// Replay skips a record when the page that holds the key carries that LSN or a newer one,
+// because a page image at LSN L holds every record up to L that touched it, and a record
+// that replay applies again leaves the key with the same value.
 func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLSN uint64) error {
 	walRedoIt, err := NewWALIterator(storeFS, walDir, dbID, redoStartLSN)
 	if err != nil {
@@ -934,20 +936,17 @@ func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLS
 			break
 		}
 		if err != nil {
-			_ = walRedoIt.Close()
-			return fmt.Errorf("error during WAL redo: %w", err)
+			return errors.Join(fmt.Errorf("error during WAL redo: %w", err), walRedoIt.Close())
 		}
 
 		s.keyMu.RLock()
 		existing, inIndex := s.keyIndex[rec.Key]
 		s.keyMu.RUnlock()
 
-		// Replay skips a record when the page that holds the key already carries that
-		// LSN or a newer one. Replaying a record twice is safe because applying a record
-		// is idempotent: applying Put writes the identical key and payload to the page
-		// and key index at the record's LSN, and applying Delete removes the key and
-		// clears its location. In both cases, repeated application produces the exact
-		// same page and index state.
+		// Replay skips a record when the page that holds the key carries that LSN
+		// or a newer one, because a page image at LSN L holds every record up to L
+		// that touched it, and a record that replay applies again leaves the key
+		// with the same value.
 		if inIndex {
 			if pageLSN, ok := s.bp.PageLSN(existing.LogicalPage); ok && pageLSN >= rec.LSN {
 				continue
@@ -958,8 +957,7 @@ func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLS
 		case RecordTypePut, RecordTypePutPointer:
 			isOversize := rec.Type == RecordTypePutPointer
 			if err := s.applyPutLocked(rec.Key, rec.Payload, rec.LSN, isOversize); err != nil {
-				_ = walRedoIt.Close()
-				return err
+				return errors.Join(err, walRedoIt.Close())
 			}
 
 		case RecordTypeDelete:
@@ -967,8 +965,7 @@ func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLS
 				continue
 			}
 			if err := s.applyDeleteLocked(rec.Key, rec.LSN); err != nil {
-				_ = walRedoIt.Close()
-				return err
+				return errors.Join(err, walRedoIt.Close())
 			}
 		}
 	}
