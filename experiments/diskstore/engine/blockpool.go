@@ -289,7 +289,7 @@ func (bp *BlockPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 		return nil, ErrPageNotFound
 	}
 
-	poolBlocks, err := bp.acquirePoolBlocksLocked(desc.NumBlocks)
+	poolBlocks, err := bp.acquirePoolBlocksLocked(desc.NumBlocks, 0)
 	if err != nil {
 		bp.mu.Unlock()
 		return nil, err
@@ -391,7 +391,7 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 		bp.cond.Wait()
 	}
 
-	poolBlocks, err := bp.acquirePoolBlocksLocked(numBlocks)
+	poolBlocks, err := bp.acquirePoolBlocksLocked(numBlocks, logicalPage)
 	if err != nil {
 		return nil, err
 	}
@@ -508,7 +508,10 @@ func (bp *BlockPool) FreePage(logicalPage uint64) {
 }
 
 // acquirePoolBlocksLocked acquires count pool blocks, evicting clean pages first by LRU, then flushing dirty pages.
-func (bp *BlockPool) acquirePoolBlocksLocked(count int) ([]int, error) {
+// If allocatingPage is non-zero, it identifies a page descriptor currently being reallocated by AllocateNewPage;
+// that descriptor is never flushed to disk because its dirty data is being overwritten. When all other dirty pages
+// are exhausted, its pool blocks are evicted with zero disk I/O.
+func (bp *BlockPool) acquirePoolBlocksLocked(count int, allocatingPage uint64) ([]int, error) {
 	for len(bp.freePoolBlocks) < count {
 		// Pass 1: Evict clean, unpinned pages first by oldest LastAccess (zero disk I/O)
 		var bestClean *PageDesc
@@ -546,6 +549,9 @@ func (bp *BlockPool) acquirePoolBlocksLocked(count int) ([]int, error) {
 					hasInFlight = true
 				}
 				if desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
+					if allocatingPage != 0 && desc.LogicalPage == allocatingPage {
+						continue
+					}
 					candidates = append(candidates, desc)
 				}
 			}
@@ -557,6 +563,18 @@ func (bp *BlockPool) acquirePoolBlocksLocked(count int) ([]int, error) {
 				// waking this waiter to re-check candidate pages.
 				bp.cond.Wait()
 				continue
+			}
+			// When other pages cannot satisfy the allocation and the page being allocated
+			// itself holds pool blocks with no pins or in-flight flush, evict its pool blocks
+			// with zero disk I/O. Its dirty contents are obsolete and being overwritten, so
+			// they must never be flushed to disk.
+			if allocatingPage != 0 {
+				if oldDesc := bp.pageTable[allocatingPage]; oldDesc != nil && len(oldDesc.PoolBlocks) > 0 && oldDesc.PinCount.Load() == 0 && !oldDesc.InFlight {
+					bp.freePoolBlocks = append(bp.freePoolBlocks, oldDesc.PoolBlocks...)
+					oldDesc.PoolBlocks = nil
+					oldDesc.Dirty = false
+					continue
+				}
 			}
 			return nil, ErrBlockPoolFull
 		}
