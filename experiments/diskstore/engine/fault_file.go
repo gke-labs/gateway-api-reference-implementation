@@ -32,6 +32,9 @@ var (
 
 	// ErrWriteAheadRuleViolation is returned when a heap write violates the write-ahead rule.
 	ErrWriteAheadRuleViolation = errors.New("write-ahead rule violation: page written before WAL fsynced through page LSN")
+
+	// ErrCrashed is returned when a write, sync, rename, or remove is attempted after a simulated crash.
+	ErrCrashed = errors.New("filesystem crashed")
 )
 
 const (
@@ -65,6 +68,8 @@ type FaultFS struct {
 
 	beforeWriteAt func(path string, p []byte, off int64)
 	beforeSync    func(path string)
+
+	crashed bool
 }
 
 // NewFaultFS creates a new FaultFS wrapping an underlying FS.
@@ -135,6 +140,13 @@ func (f *FaultFS) SetBeforeSync(fn func(path string)) {
 }
 
 func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	f.mu.RLock()
+	crashed := f.crashed
+	f.mu.RUnlock()
+	if crashed && (flag&(os.O_WRONLY|os.O_CREATE|os.O_TRUNC) != 0) {
+		return nil, ErrCrashed
+	}
+
 	cleaned := cleanPath(name)
 	file, err := f.underlying.OpenFile(cleaned, flag, perm)
 	if err != nil {
@@ -151,15 +163,27 @@ func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error
 			closeErr := file.Close()
 			return nil, errors.Join(newErr, closeErr)
 		}
+		if f.crashed {
+			ff.crashed = true
+		}
 		f.files[cleaned] = ff
 	} else {
 		ff.underlying = file
 		ff.closed = false
+		if f.crashed {
+			ff.crashed = true
+		}
 	}
 	return ff, nil
 }
 
 func (f *FaultFS) Create(name string) (File, error) {
+	f.mu.RLock()
+	crashed := f.crashed
+	f.mu.RUnlock()
+	if crashed {
+		return nil, ErrCrashed
+	}
 	return f.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, StoreFileMode)
 }
 
@@ -170,6 +194,9 @@ func (f *FaultFS) Open(name string) (File, error) {
 func (f *FaultFS) Remove(name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.crashed {
+		return ErrCrashed
+	}
 	delete(f.files, cleanPath(name))
 	return f.underlying.Remove(name)
 }
@@ -177,6 +204,9 @@ func (f *FaultFS) Remove(name string) error {
 func (f *FaultFS) Rename(oldpath, newpath string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.crashed {
+		return ErrCrashed
+	}
 	oldClean := cleanPath(oldpath)
 	newClean := cleanPath(newpath)
 	if ff, exists := f.files[oldClean]; exists {
@@ -195,6 +225,12 @@ func (f *FaultFS) ReadDir(dirname string) ([]os.DirEntry, error) {
 }
 
 func (f *FaultFS) SyncDir(dirname string) error {
+	f.mu.RLock()
+	crashed := f.crashed
+	f.mu.RUnlock()
+	if crashed {
+		return ErrCrashed
+	}
 	return f.underlying.SyncDir(dirname)
 }
 
@@ -202,8 +238,9 @@ func (f *FaultFS) SyncDir(dirname string) error {
 // If dropUnsynced is true, all un-fsynced writes are discarded.
 // If tearFraction > 0, randomly tears un-fsynced blocks.
 func (f *FaultFS) Crash(dropUnsynced bool, tearFraction float64) error {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.crashed = true
 	var errs []error
 	for _, ff := range f.files {
 		if err := ff.Crash(dropUnsynced, tearFraction); err != nil {
@@ -230,6 +267,19 @@ type FaultFile struct {
 	isHeapFile bool
 	isWALFile  bool
 	closed     bool
+	crashed    bool
+}
+
+func (f *FaultFile) isCrashed() bool {
+	f.fs.mu.RLock()
+	fsCrashed := f.fs.crashed
+	f.fs.mu.RUnlock()
+
+	f.mu.RLock()
+	fileCrashed := f.crashed
+	f.mu.RUnlock()
+
+	return fsCrashed || fileCrashed
 }
 
 func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error) {
@@ -281,6 +331,10 @@ func (f *FaultFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
+	if f.isCrashed() {
+		return 0, ErrCrashed
+	}
+
 	f.fs.mu.RLock()
 	writeErr := f.fs.writeErr
 	assertReuse := f.fs.assertReuseRule
@@ -291,6 +345,9 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 
 	if beforeWriteAt != nil {
 		beforeWriteAt(f.name, p, off)
+		if f.isCrashed() {
+			return 0, ErrCrashed
+		}
 		f.fs.mu.RLock()
 		writeErr = f.fs.writeErr
 		f.fs.mu.RUnlock()
@@ -368,6 +425,10 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (f *FaultFile) Sync() error {
+	if f.isCrashed() {
+		return ErrCrashed
+	}
+
 	f.fs.mu.RLock()
 	syncErr := f.fs.syncErr
 	beforeSync := f.fs.beforeSync
@@ -375,6 +436,9 @@ func (f *FaultFile) Sync() error {
 
 	if beforeSync != nil {
 		beforeSync(f.name)
+		if f.isCrashed() {
+			return ErrCrashed
+		}
 		f.fs.mu.RLock()
 		syncErr = f.fs.syncErr
 		f.fs.mu.RUnlock()
@@ -500,6 +564,8 @@ func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.crashed = true
+
 	if f.closed {
 		return nil
 	}
@@ -539,6 +605,10 @@ func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) error {
 }
 
 func (f *FaultFile) Truncate(size int64) error {
+	if f.isCrashed() {
+		return ErrCrashed
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if size < 0 {
