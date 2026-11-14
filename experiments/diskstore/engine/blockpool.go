@@ -328,6 +328,17 @@ func (bp *BlockPool) LoadPageDescs(descs map[uint64]*PageDesc) {
 	}
 }
 
+// PageLSN returns the latest LSN of the specified logical page and whether it exists in the page table.
+func (bp *BlockPool) PageLSN(logicalPage uint64) (uint64, bool) {
+	bp.mu.Lock()
+	desc, exists := bp.pageTable[logicalPage]
+	bp.mu.Unlock()
+	if !exists || desc == nil {
+		return 0, false
+	}
+	return desc.PageLSN.Load(), true
+}
+
 // PinPageWithLocation pins a page, loading from disk at physicalBlock if not currently in memory.
 func (bp *BlockPool) PinPageWithLocation(logicalPage uint64, physicalBlock uint64, numBlocks int) (*PageHandle, error) {
 	bp.mu.Lock()

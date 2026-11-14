@@ -1385,3 +1385,194 @@ func TestRecovery_WALTornTailAboveHeapLSN_SucceedsOpen(t *testing.T) {
 		t.Fatalf("Get k2 mismatch: ok=%v, val=%q, err=%v", ok2, string(val2), err)
 	}
 }
+
+// TestRecovery_UncheckpointedMixReopenTwice tests crashing after a mix of puts, replacements
+// and deletes with no checkpoint, reopening to compare every key with expected values,
+// and reopening a second time without writing to verify that pages were flushed and keys
+// remain intact without duplicate replay issues.
+func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	dir := "test_uncheckpointed_mix_reopen_twice"
+
+	store, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	table := "TestTable"
+	expected := make(map[string][]byte)
+	var deletedKeys []string
+
+	// 1. Slotted put: normal small key/val
+	k1 := "slotted-1"
+	v1 := []byte("val-slotted-1")
+	if err := store.Put(table, k1, v1); err != nil {
+		t.Fatalf("Put k1 failed: %v", err)
+	}
+	expected[k1] = v1
+
+	// 2. Slotted put that will be replaced by another slotted value
+	k2 := "slotted-replace"
+	v2Initial := []byte("val-slotted-2-initial")
+	if err := store.Put(table, k2, v2Initial); err != nil {
+		t.Fatalf("Put k2 initial failed: %v", err)
+	}
+	v2Replaced := []byte("val-slotted-2-replaced")
+	if err := store.Put(table, k2, v2Replaced); err != nil {
+		t.Fatalf("Put k2 replaced failed: %v", err)
+	}
+	expected[k2] = v2Replaced
+
+	// 3. Multi-block put (~10KB)
+	kMB := "mb-key"
+	vMB := bytes.Repeat([]byte("mb-payload-data-"), 600)
+	if err := store.Put(table, kMB, vMB); err != nil {
+		t.Fatalf("Put mb failed: %v", err)
+	}
+	expected[kMB] = vMB
+
+	// 4. Multi-block put replaced by slotted value
+	kMBToSlot := "mb-to-slot"
+	vMBInitial := bytes.Repeat([]byte("mb-initial-bytes-"), 500)
+	if err := store.Put(table, kMBToSlot, vMBInitial); err != nil {
+		t.Fatalf("Put mb-to-slot initial failed: %v", err)
+	}
+	vMBSlotted := []byte("mb-now-slotted-val")
+	if err := store.Put(table, kMBToSlot, vMBSlotted); err != nil {
+		t.Fatalf("Put mb-to-slot replaced failed: %v", err)
+	}
+	expected[kMBToSlot] = vMBSlotted
+
+	// 5. Slotted put replaced by multi-block value
+	kSlotToMB := "slot-to-mb"
+	vSlotInitial := []byte("slot-initial-val")
+	if err := store.Put(table, kSlotToMB, vSlotInitial); err != nil {
+		t.Fatalf("Put slot-to-mb initial failed: %v", err)
+	}
+	vSlotMB := bytes.Repeat([]byte("slot-now-mb-val-"), 550)
+	if err := store.Put(table, kSlotToMB, vSlotMB); err != nil {
+		t.Fatalf("Put slot-to-mb replaced failed: %v", err)
+	}
+	expected[kSlotToMB] = vSlotMB
+
+	// 6. Oversize put (~2.1 MB)
+	kOver := "oversize-key"
+	vOver := append([]byte("oversize-payload-data"), make([]byte, 2100*1024)...)
+	if err := store.Put(table, kOver, vOver); err != nil {
+		t.Fatalf("Put oversize failed: %v", err)
+	}
+	expected[kOver] = vOver
+
+	// 7. Oversize put replaced by slotted value
+	kOverToSlot := "oversize-to-slot"
+	vOverInitial := append([]byte("oversize-initial-data"), make([]byte, 2100*1024)...)
+	if err := store.Put(table, kOverToSlot, vOverInitial); err != nil {
+		t.Fatalf("Put oversize-to-slot initial failed: %v", err)
+	}
+	vOverSlotted := []byte("oversize-now-slotted-val")
+	if err := store.Put(table, kOverToSlot, vOverSlotted); err != nil {
+		t.Fatalf("Put oversize-to-slot replaced failed: %v", err)
+	}
+	expected[kOverToSlot] = vOverSlotted
+
+	// 8. Puts followed by Delete:
+	// 8a. Delete slotted key
+	kDelSlot := "delete-slotted"
+	if err := store.Put(table, kDelSlot, []byte("will-be-deleted-slot")); err != nil {
+		t.Fatalf("Put delete-slotted failed: %v", err)
+	}
+	if err := store.Delete(table, kDelSlot); err != nil {
+		t.Fatalf("Delete slotted failed: %v", err)
+	}
+	deletedKeys = append(deletedKeys, kDelSlot)
+
+	// 8b. Delete multi-block key
+	kDelMB := "delete-mb"
+	if err := store.Put(table, kDelMB, bytes.Repeat([]byte("del-mb-bytes-"), 500)); err != nil {
+		t.Fatalf("Put delete-mb failed: %v", err)
+	}
+	if err := store.Delete(table, kDelMB); err != nil {
+		t.Fatalf("Delete mb failed: %v", err)
+	}
+	deletedKeys = append(deletedKeys, kDelMB)
+
+	// 8c. Delete oversize key
+	kDelOver := "delete-oversize"
+	vDelOver := append([]byte("del-oversize-bytes"), make([]byte, 2100*1024)...)
+	if err := store.Put(table, kDelOver, vDelOver); err != nil {
+		t.Fatalf("Put delete-oversize failed: %v", err)
+	}
+	if err := store.Delete(table, kDelOver); err != nil {
+		t.Fatalf("Delete oversize failed: %v", err)
+	}
+	deletedKeys = append(deletedKeys, kDelOver)
+
+	// 8d. Delete non-existent key
+	kDelNonExistent := "never-existed-key"
+	if err := store.Delete(table, kDelNonExistent); err != nil {
+		t.Fatalf("Delete non-existent failed: %v", err)
+	}
+	deletedKeys = append(deletedKeys, kDelNonExistent)
+
+	// Fsync WAL so write records are durable, without taking any checkpoint.
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Simulate crash: drop un-fsynced heap page buffers, abandon engine without calling Close()
+	if err := faultFS.Crash(true, 0); err != nil {
+		t.Fatalf("Crash failed: %v", err)
+	}
+
+	compareKeys := func(s *Engine, reopenName string) {
+		t.Helper()
+		for k, wantVal := range expected {
+			gotVal, exists, err := s.Get(table, k)
+			if err != nil {
+				t.Fatalf("[%s] Get(%q) returned error: %v", reopenName, k, err)
+			}
+			if !exists {
+				t.Fatalf("[%s] Get(%q) missing key", reopenName, k)
+			}
+			if !bytes.Equal(gotVal, wantVal) {
+				t.Fatalf("[%s] Get(%q) payload mismatch: got len=%d, want len=%d", reopenName, k, len(gotVal), len(wantVal))
+			}
+		}
+		for _, k := range deletedKeys {
+			_, exists, err := s.Get(table, k)
+			if err != nil {
+				t.Fatalf("[%s] Get(%q) deleted key returned error: %v", reopenName, k, err)
+			}
+			if exists {
+				t.Fatalf("[%s] deleted key %q resurrected", reopenName, k)
+			}
+		}
+	}
+
+	// Reopen 1: replays WAL from redo start LSN through apply functions, then flushes pages.
+	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen 1 failed: %v", err)
+	}
+
+	compareKeys(store2, "reopen 1")
+
+	// Close store2 without writing anything.
+	if err := store2.Close(); err != nil {
+		t.Fatalf("store2.Close failed: %v", err)
+	}
+
+	// Reopen 2: reopen without any new writes. All keys must match expected values again.
+	store3, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen 2 failed: %v", err)
+	}
+	defer func() {
+		if err := store3.Close(); err != nil {
+			t.Errorf("store3.Close failed: %v", err)
+		}
+	}()
+
+	compareKeys(store3, "reopen 2")
+}

@@ -871,6 +871,36 @@ func Open(opts ...Option) (*Engine, error) {
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
+
+		// Replay WAL records from redo start LSN through write path apply functions.
+		if err := s.replayWAL(options.FS, walDir, dbID, recoveryRes.RedoStartLSN); err != nil {
+			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+			return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeErr)
+		}
+
+		// After replay, the engine flushes the changed pages as it does for a checkpoint,
+		// before it accepts writes.
+		if err := s.cp.FlushPages(); err != nil {
+			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+			return nil, errors.Join(fmt.Errorf("failed to flush pages after replay: %w", err), closeErr)
+		}
+
+		// Quarantine unreferenced oversize files now that keyIndex holds all recovered pointers.
+		getReferenced := func() map[string]bool {
+			referenced := make(map[string]bool)
+			s.keyMu.RLock()
+			for _, entry := range s.keyIndex {
+				if entry.IsOversize && entry.OversizeFileName != "" {
+					referenced[entry.OversizeFileName] = true
+				}
+			}
+			s.keyMu.RUnlock()
+			return referenced
+		}
+		if _, err := quarantineUnreferencedOversizeFiles(context.Background(), options.FS, dir, getReferenced, options.Quarantine, 0); err != nil {
+			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+			return nil, errors.Join(fmt.Errorf("failed to quarantine unreferenced oversize files: %w", err), closeErr)
+		}
 	}
 
 	sweepInterval := DefaultQuarantineSweepInterval
@@ -885,6 +915,68 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 
 	return s, nil
+}
+
+// replayWAL replays each WAL record from redoStartLSN through the write path apply functions.
+// Replay must not append to the WAL.
+func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLSN uint64) error {
+	walRedoIt, err := NewWALIterator(storeFS, walDir, dbID, redoStartLSN)
+	if err != nil {
+		return fmt.Errorf("failed to create WAL redo iterator: %w", err)
+	}
+
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+
+	for {
+		rec, err := walRedoIt.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			_ = walRedoIt.Close()
+			return fmt.Errorf("error during WAL redo: %w", err)
+		}
+
+		s.keyMu.RLock()
+		existing, inIndex := s.keyIndex[rec.Key]
+		s.keyMu.RUnlock()
+
+		// Replay skips a record when the page that holds the key already carries that
+		// LSN or a newer one. Replaying a record twice is safe because applying a record
+		// is idempotent: applying Put writes the identical key and payload to the page
+		// and key index at the record's LSN, and applying Delete removes the key and
+		// clears its location. In both cases, repeated application produces the exact
+		// same page and index state.
+		if inIndex {
+			if pageLSN, ok := s.bp.PageLSN(existing.LogicalPage); ok && pageLSN >= rec.LSN {
+				continue
+			}
+		}
+
+		switch rec.Type {
+		case RecordTypePut, RecordTypePutPointer:
+			isOversize := rec.Type == RecordTypePutPointer
+			if err := s.applyPutLocked(rec.Key, rec.Payload, rec.LSN, isOversize); err != nil {
+				_ = walRedoIt.Close()
+				return err
+			}
+
+		case RecordTypeDelete:
+			if !inIndex {
+				continue
+			}
+			if err := s.applyDeleteLocked(rec.Key, rec.LSN); err != nil {
+				_ = walRedoIt.Close()
+				return err
+			}
+		}
+	}
+
+	if err := walRedoIt.Close(); err != nil {
+		return fmt.Errorf("failed to close WAL redo iterator: %w", err)
+	}
+	return nil
 }
 
 func (s *Engine) registerInFlight(names ...string) {
