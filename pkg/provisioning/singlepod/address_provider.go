@@ -1080,14 +1080,33 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 
 // PublishDataplaneConfig writes the Gateway's compiled data-plane config to its per-Gateway Secret.
 func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
-	if p.client == nil || gw == nil || config == nil {
+	return PublishDataplaneSecret(ctx, p.client, gw, config)
+}
+
+// PublishDataplaneSecret writes or deletes a Gateway's compiled data-plane config Secret.
+// When config is nil, the Secret is deleted if it exists.
+func PublishDataplaneSecret(ctx context.Context, cl client.Client, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
+	if cl == nil || gw == nil {
 		return nil
 	}
 
 	name := ResourceNameForGateway(gw.Name)
 
+	if config == nil {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: gw.Namespace,
+				Name:      name,
+			},
+		}
+		if err := cl.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		}
+		return nil
+	}
+
 	var existingSecret corev1.Secret
-	err := p.client.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: name}, &existingSecret)
+	err := cl.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: name}, &existingSecret)
 	if err == nil {
 		if !isOwnedByGateway(&existingSecret, gw) {
 			return &controller.OwnershipConflictError{
@@ -1122,7 +1141,7 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 		secretApply.WithAnnotations(annotations)
 	}
 
-	if err := p.client.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+	if err := cl.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 	return nil
