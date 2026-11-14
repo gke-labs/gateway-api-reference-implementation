@@ -16,6 +16,7 @@ package engine
 
 import (
 	"bytes"
+	"crypto/aes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -23,8 +24,12 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/crypto/xts"
 )
 
 var (
@@ -69,6 +74,10 @@ type FaultFS struct {
 
 	beforeWriteAt func(path string, p []byte, off int64)
 	beforeSync    func(path string)
+
+	heapCipher  atomic.Pointer[xts.Cipher]
+	walCipher   atomic.Pointer[xts.Cipher]
+	walCipherFn func(path string) *xts.Cipher
 
 	crashed bool
 }
@@ -140,6 +149,84 @@ func (f *FaultFS) SetBeforeSync(fn func(path string)) {
 	f.beforeSync = fn
 }
 
+// SetHeapCipher sets the AES-256-XTS cipher used for decrypting heap blocks during invariant checks.
+func (f *FaultFS) SetHeapCipher(cipher *xts.Cipher) {
+	f.heapCipher.Store(cipher)
+	f.mu.RLock()
+	files := make([]*FaultFile, 0, len(f.files))
+	for _, ff := range f.files {
+		if ff.isHeapFile {
+			files = append(files, ff)
+		}
+	}
+	f.mu.RUnlock()
+
+	for _, ff := range files {
+		ff.SetHeapCipher(cipher)
+	}
+}
+
+// HeapCipher returns the configured heap cipher.
+func (f *FaultFS) HeapCipher() *xts.Cipher {
+	return f.heapCipher.Load()
+}
+
+// SetWALCipher sets the AES-256-XTS cipher used for decrypting WAL blocks during invariant checks.
+func (f *FaultFS) SetWALCipher(cipher *xts.Cipher) {
+	f.walCipher.Store(cipher)
+	f.mu.RLock()
+	files := make([]*FaultFile, 0, len(f.files))
+	for _, ff := range f.files {
+		if ff.isWALFile {
+			files = append(files, ff)
+		}
+	}
+	f.mu.RUnlock()
+
+	for _, ff := range files {
+		ff.SetWALCipher(cipher)
+	}
+}
+
+// WALCipher returns the configured WAL cipher.
+func (f *FaultFS) WALCipher() *xts.Cipher {
+	return f.walCipher.Load()
+}
+
+// SetWALCipherFunc sets a callback to obtain the WAL segment cipher for a given segment file path.
+func (f *FaultFS) SetWALCipherFunc(fn func(path string) *xts.Cipher) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.walCipherFn = fn
+}
+
+// SetEncryptionKey sets the master key and database ID, configuring heap and WAL ciphers.
+func (f *FaultFS) SetEncryptionKey(key []byte, dbID [16]byte) error {
+	cipher, err := newHeapCipher(key, dbID)
+	if err != nil {
+		return err
+	}
+	f.SetHeapCipher(cipher)
+	f.SetWALCipherFunc(func(path string) *xts.Cipher {
+		base := filepath.Base(path)
+		stem := strings.TrimSuffix(base, ".wal")
+		startLSN, err := strconv.ParseUint(stem, 10, 64)
+		if err != nil {
+			return nil
+		}
+		walKey, err := deriveWALKey(key, dbID, startLSN)
+		if err != nil {
+			return nil
+		}
+		c, err := xts.NewCipher(aes.NewCipher, walKey)
+		if err != nil {
+			return nil
+		}
+		return c
+	})
+	return nil
+}
+
 func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 	f.mu.RLock()
 	crashed := f.crashed
@@ -173,6 +260,20 @@ func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error
 		ff.closed = false
 		if f.crashed {
 			ff.crashed = true
+		}
+		if ff.isHeapFile && ff.heapCipher.Load() == nil {
+			if hc := f.heapCipher.Load(); hc != nil {
+				ff.heapCipher.Store(hc)
+			}
+		}
+		if ff.isWALFile && ff.walCipher.Load() == nil {
+			if f.walCipherFn != nil {
+				if wc := f.walCipherFn(cleaned); wc != nil {
+					ff.walCipher.Store(wc)
+				}
+			} else if wc := f.walCipher.Load(); wc != nil {
+				ff.walCipher.Store(wc)
+			}
 		}
 	}
 	return ff, nil
@@ -265,10 +366,53 @@ type FaultFile struct {
 	// Map of logicalPage -> newest durable range (heap files only)
 	durablePages map[uint64]DurablePageRange
 
+	heapCipher atomic.Pointer[xts.Cipher]
+	walCipher  atomic.Pointer[xts.Cipher]
+
 	isHeapFile bool
 	isWALFile  bool
 	closed     bool
 	crashed    bool
+}
+
+// SetHeapCipher sets the AES-256-XTS cipher used for decrypting heap blocks.
+func (f *FaultFile) SetHeapCipher(cipher *xts.Cipher) {
+	f.heapCipher.Store(cipher)
+	f.mu.Lock()
+	if f.isHeapFile && len(f.durableData) > 0 {
+		f.rebuildDurablePagesLocked()
+	}
+	f.mu.Unlock()
+}
+
+// SetWALCipher sets the AES-256-XTS cipher used for decrypting WAL blocks.
+func (f *FaultFile) SetWALCipher(cipher *xts.Cipher) {
+	f.walCipher.Store(cipher)
+	f.mu.Lock()
+	if f.isWALFile && len(f.durableData) > 0 {
+		f.updateMaxFsyncedWAL_LSNLocked()
+	}
+	f.mu.Unlock()
+}
+
+func (f *FaultFile) getHeapCipher() *xts.Cipher {
+	if c := f.heapCipher.Load(); c != nil {
+		return c
+	}
+	return f.fs.heapCipher.Load()
+}
+
+func (f *FaultFile) getWALCipher() *xts.Cipher {
+	if c := f.walCipher.Load(); c != nil {
+		return c
+	}
+	if c := f.fs.walCipher.Load(); c != nil {
+		return c
+	}
+	if f.fs.walCipherFn != nil {
+		return f.fs.walCipherFn(f.name)
+	}
+	return nil
 }
 
 func (f *FaultFile) isCrashed() bool {
@@ -285,7 +429,7 @@ func (f *FaultFile) isCrashed() bool {
 
 func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error) {
 	base := filepath.Base(name)
-	isHeap := filepath.Ext(name) == ".db" || filepath.Ext(name) == ".heap" || base == "heap.db"
+	isHeap := (filepath.Ext(name) == ".db" || filepath.Ext(name) == ".heap" || base == "heap.db") && base != "meta.db"
 	isWAL := filepath.Ext(name) == ".wal"
 
 	// Read initial contents from underlying file
@@ -312,8 +456,22 @@ func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error)
 		isWALFile:     isWAL,
 	}
 
+	if hc := fs.heapCipher.Load(); hc != nil {
+		ff.heapCipher.Store(hc)
+	}
+	if wc := fs.walCipher.Load(); wc != nil {
+		ff.walCipher.Store(wc)
+	} else if fs.walCipherFn != nil {
+		if wc := fs.walCipherFn(name); wc != nil {
+			ff.walCipher.Store(wc)
+		}
+	}
+
 	if isHeap && len(initial) > 0 {
 		ff.rebuildDurablePagesLocked()
+	}
+	if isWAL && len(initial) > 0 {
+		ff.updateMaxFsyncedWAL_LSNLocked()
 	}
 	return ff, nil
 }
@@ -375,6 +533,7 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 	if f.isHeapFile {
 		startBlock := uint64(off / DefaultBlockSize)
 		numBlocksInWrite := (len(p) + DefaultBlockSize - 1) / DefaultBlockSize
+		cipher := f.getHeapCipher()
 
 		for i := 0; i < numBlocksInWrite; i++ {
 			bIdx := startBlock + uint64(i)
@@ -385,10 +544,23 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 			}
 			blockBytes := p[blockOff:blockEnd]
 
+			headerBytes := blockBytes
+			if cipher != nil && len(blockBytes) == DefaultBlockSize {
+				var decBuf [DefaultBlockSize]byte
+				decryptHeapBlock(decBuf[:], blockBytes, bIdx, cipher)
+				headerBytes = decBuf[:]
+			}
+
 			// Parse block header if at least HeaderSize bytes
-			if len(blockBytes) >= BlockHeaderSize {
-				if blockBytes[0] == BlockMagic && blockBytes[1] == FormatVersion {
-					lsn := binary.BigEndian.Uint64(blockBytes[16:24])
+			if len(headerBytes) >= BlockHeaderSize {
+				valid := headerBytes[0] == BlockMagic && headerBytes[1] == FormatVersion
+				if valid && cipher != nil && len(headerBytes) == DefaultBlockSize {
+					if _, err := DecodeBlockHeader(headerBytes); err != nil {
+						valid = false
+					}
+				}
+				if valid {
+					lsn := binary.BigEndian.Uint64(headerBytes[16:24])
 
 					// Assert Write-Ahead Rule:
 					// Before writing any page whose LSN is L, log must be fsynced through L.
@@ -478,6 +650,7 @@ func (f *FaultFile) Sync() error {
 func (f *FaultFile) rebuildDurablePagesLocked() {
 	f.durablePages = make(map[uint64]DurablePageRange)
 	totalBlocks := len(f.durableData) / DefaultBlockSize
+	cipher := f.getHeapCipher()
 
 	type candidatePage struct {
 		startBlock  uint64
@@ -491,7 +664,13 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 	for b < totalBlocks {
 		blockStart := b * DefaultBlockSize
 		blockBytes := f.durableData[blockStart : blockStart+DefaultBlockSize]
-		hdr, err := DecodeBlockHeader(blockBytes)
+		decBuf := blockBytes
+		if cipher != nil {
+			var buf [DefaultBlockSize]byte
+			decryptHeapBlock(buf[:], blockBytes, uint64(b), cipher)
+			decBuf = buf[:]
+		}
+		hdr, err := DecodeBlockHeader(decBuf)
 		if err != nil || hdr.BlockIndex != 0 || hdr.NumBlocks == 0 || b+int(hdr.NumBlocks) > totalBlocks {
 			b++
 			continue
@@ -502,7 +681,13 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 		for k := 0; k < numBlocks; k++ {
 			kbStart := (b + k) * DefaultBlockSize
 			kbBytes := f.durableData[kbStart : kbStart+DefaultBlockSize]
-			kHdr, err := DecodeBlockHeader(kbBytes)
+			decKBuf := kbBytes
+			if cipher != nil {
+				var buf [DefaultBlockSize]byte
+				decryptHeapBlock(buf[:], kbBytes, uint64(b+k), cipher)
+				decKBuf = buf[:]
+			}
+			kHdr, err := DecodeBlockHeader(decKBuf)
 			if err != nil || kHdr.LogicalPage != hdr.LogicalPage || kHdr.LSN != hdr.LSN ||
 				kHdr.BlockIndex != uint32(k) || kHdr.NumBlocks != hdr.NumBlocks {
 				valid = false
@@ -536,20 +721,27 @@ func (f *FaultFile) updateMaxFsyncedWAL_LSNLocked() {
 	if len(f.durableData) < SegmentHeaderSize {
 		return
 	}
+	cipher := f.getWALCipher()
+
+	data := f.durableData
+	if cipher != nil {
+		data = f.decryptWALData(cipher, f.durableData)
+	}
+
 	offset := SegmentHeaderSize
 	var maxLSN uint64
-	for offset+RecordHeaderSize <= len(f.durableData) {
-		if f.durableData[offset] == 0 {
+	for offset+RecordHeaderSize <= len(data) {
+		if data[offset] == 0 {
 			// Zero padding in block: skip to next 4 KiB block boundary
 			nextBlock := ((offset / DefaultBlockSize) + 1) * DefaultBlockSize
-			if nextBlock <= offset || nextBlock >= len(f.durableData) {
+			if nextBlock <= offset || nextBlock >= len(data) {
 				break
 			}
 			offset = nextBlock
 			continue
 		}
 
-		r, err := DecodeRecord(bytes.NewReader(f.durableData[offset:]))
+		r, err := DecodeRecord(bytes.NewReader(data[offset:]))
 		if err != nil {
 			break
 		}
@@ -564,6 +756,23 @@ func (f *FaultFile) updateMaxFsyncedWAL_LSNLocked() {
 	if maxLSN > 0 {
 		f.fs.SetMaxFsyncedLSN(maxLSN)
 	}
+}
+
+func (f *FaultFile) decryptWALData(c *xts.Cipher, src []byte) []byte {
+	if c == nil || len(src) == 0 {
+		return src
+	}
+	dst := bytes.Clone(src)
+	totalBlocks := len(dst) / DefaultBlockSize
+	for b := 0; b < totalBlocks; b++ {
+		start := b * DefaultBlockSize
+		end := start + DefaultBlockSize
+		c.Decrypt(dst[start:end], src[start:end], uint64(b))
+	}
+	if len(dst) >= SegmentHeaderSize {
+		copy(dst[:SegmentHeaderSize], src[:SegmentHeaderSize])
+	}
+	return dst
 }
 
 // Crash simulates a crash on this file.

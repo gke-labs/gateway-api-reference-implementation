@@ -16,13 +16,17 @@ package engine
 
 import (
 	"bytes"
+	"crypto/aes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/xts"
 )
 
 func makeTestBlock(logicalPage, lsn uint64, blockIndex, numBlocks uint32) []byte {
@@ -370,5 +374,154 @@ func TestFaultFile_ReadAt_EOF(t *testing.T) {
 	_, err = file.ReadAt(readBuffer, 0)
 	if err == nil {
 		t.Fatalf("ReadAt on closed file: expected error, got nil")
+	}
+}
+
+func TestFaultFile_EncryptedStoreWriteAheadAndReuseChecks(t *testing.T) {
+	var key [32]byte
+	copy(key[:], []byte("fault-test-cipher-key-32bytes-00"))
+	var dbID [16]byte
+	copy(dbID[:], []byte("db-id-fault-test"))
+
+	cipher, err := newHeapCipher(key[:], dbID)
+	if err != nil {
+		t.Fatalf("newHeapCipher failed: %v", err)
+	}
+
+	// 1. Verify false write-ahead violation is prevented when ciphertext happens to start with magic & version
+	fakeCiphertext := make([]byte, DefaultBlockSize)
+	fakeCiphertext[0] = BlockMagic
+	fakeCiphertext[1] = FormatVersion
+	binary.BigEndian.PutUint64(fakeCiphertext[16:24], 9999) // large LSN
+
+	// Without cipher: verifies the bug where ciphertext starting with magic triggers a false panic
+	func() {
+		memFS := NewMemFS()
+		unencFS := NewFaultFS(memFS)
+		unencFS.SetMaxFsyncedLSN(50)
+		file, _ := unencFS.Create("heap.db")
+		defer file.Close()
+
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("expected unencrypted faultFS to panic on fake ciphertext starting with magic")
+			}
+		}()
+		_, _ = file.WriteAt(fakeCiphertext, 0)
+	}()
+
+	// With cipher: ciphertext decrypts to random bytes without valid CRC -> no false panic
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	faultFS.SetMaxFsyncedLSN(50)
+	faultFS.SetHeapCipher(cipher)
+
+	file, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer file.Close()
+
+	if _, err := file.WriteAt(fakeCiphertext, 0); err != nil {
+		t.Fatalf("WriteAt fake ciphertext should not fail or panic: %v", err)
+	}
+
+	// 2. Verify write-ahead rule violation IS caught when plaintext page LSN > maxFsyncedLSN
+	plainOver := makeTestBlock(1, 100, 0, 1) // LSN 100 > maxFsyncedLSN 50
+	encOver := make([]byte, DefaultBlockSize)
+	encryptHeapBlock(encOver, plainOver, 1, cipher)
+
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("expected panic for encrypted block with plaintext LSN exceeding maxFsyncedLSN")
+			}
+			errMsg := fmt.Sprintf("%v", r)
+			if !strings.Contains(errMsg, "write-ahead rule violation") {
+				t.Fatalf("unexpected panic message: %v", r)
+			}
+		}()
+		_, _ = file.WriteAt(encOver, DefaultBlockSize)
+	}()
+
+	// 3. Encrypted block with valid LSN <= maxFsyncedLSN succeeds
+	plainValid := makeTestBlock(10, 40, 0, 1) // LSN 40 <= 50
+	encValid := make([]byte, DefaultBlockSize)
+	encryptHeapBlock(encValid, plainValid, 2, cipher)
+
+	if _, err := file.WriteAt(encValid, 2*DefaultBlockSize); err != nil {
+		t.Fatalf("WriteAt valid encrypted block failed: %v", err)
+	}
+
+	// 4. Verify durable pages are indexed and reuse rule is asserted on encrypted store
+	if err := file.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Overwriting block 2 (holds durable copy of page 10) must panic with reuse rule violation
+	plainNew := makeTestBlock(20, 45, 0, 1)
+	encNew := make([]byte, DefaultBlockSize)
+	encryptHeapBlock(encNew, plainNew, 2, cipher)
+
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("expected panic on reuse rule violation for encrypted store")
+			}
+			errMsg := fmt.Sprintf("%v", r)
+			if !strings.Contains(errMsg, "reuse rule violation") {
+				t.Fatalf("unexpected panic message: %v", r)
+			}
+		}()
+		_, _ = file.WriteAt(encNew, 2*DefaultBlockSize)
+	}()
+
+	// 5. Verify WAL cipher support updates maxFsyncedLSN on Sync
+	walPath := segmentFileName(1)
+	walFile, err := faultFS.Create(walPath)
+	if err != nil {
+		t.Fatalf("Create WAL failed: %v", err)
+	}
+	defer walFile.Close()
+
+	// Write segment header
+	segHdr := make([]byte, SegmentHeaderSize)
+	binary.BigEndian.PutUint32(segHdr[0:4], WALMagic)
+	binary.BigEndian.PutUint32(segHdr[4:8], WALVersion)
+	copy(segHdr[16:32], dbID[:])
+
+	// Build WAL block 0 with a record having LSN 200
+	rec := Record{LSN: 200, Type: RecordTypePut, Key: "k1", Payload: []byte("val1")}
+	recBytes := EncodeRecord(rec)
+	block0 := make([]byte, DefaultBlockSize)
+	copy(block0[:SegmentHeaderSize], segHdr)
+	copy(block0[SegmentHeaderSize:], recBytes)
+
+	walKey, err := deriveWALKey(key[:], dbID, 1)
+	if err != nil {
+		t.Fatalf("deriveWALKey failed: %v", err)
+	}
+	walCipher, err := xts.NewCipher(aes.NewCipher, walKey)
+	if err != nil {
+		t.Fatalf("NewCipher for WAL failed: %v", err)
+	}
+
+	encBlock0 := make([]byte, DefaultBlockSize)
+	walCipher.Encrypt(encBlock0, block0, 0)
+	copy(encBlock0[:SegmentHeaderSize], segHdr) // plaintext header
+
+	faultFS.SetWALCipher(walCipher)
+	if _, err := walFile.WriteAt(encBlock0, 0); err != nil {
+		t.Fatalf("WriteAt WAL failed: %v", err)
+	}
+	if err := walFile.Sync(); err != nil {
+		t.Fatalf("Sync WAL failed: %v", err)
+	}
+
+	if faultFS.MaxFsyncedLSN() != 200 {
+		t.Fatalf("expected MaxFsyncedLSN 200 after WAL sync, got %d", faultFS.MaxFsyncedLSN())
 	}
 }
