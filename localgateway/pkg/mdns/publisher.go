@@ -422,9 +422,9 @@ func (p *Publisher) OnGatewaysUpdate(gateways []*gatewayv1.Gateway) {
 		currentGWFQDNs := make(map[string]struct{})
 		currentGWListeners := make(map[gatewayv1.SectionName]struct{})
 
-		// 2. Evaluate listeners for single-label .local HTTP names
+		// 2. Evaluate listeners for single-label .local names
 		for _, l := range gw.Spec.Listeners {
-			if l.Protocol != gatewayv1.HTTPProtocolType {
+			if l.Protocol != "" && l.Protocol != gatewayv1.HTTPProtocolType && l.Protocol != gatewayv1.HTTPSProtocolType {
 				continue
 			}
 			if l.Hostname == nil {
@@ -432,6 +432,9 @@ func (p *Publisher) OnGatewaysUpdate(gateways []*gatewayv1.Gateway) {
 			}
 			rawHostname := string(*l.Hostname)
 			if err := validation.ValidateSingleLabelLocalHostname(rawHostname); err != nil {
+				continue
+			}
+			if len(ips) == 0 {
 				continue
 			}
 
@@ -640,6 +643,11 @@ func (p *Publisher) syncListener(lk listenerKey, rawHostname, fqdn string, addrs
 	}
 
 	st.listeners[lk] = struct{}{}
+
+	if st.state == StateProbing && !ipsEqual(st.addresses, addrs) {
+		st.addresses = append([]net.IP(nil), addrs...)
+		st.records = records
+	}
 
 	// If already published and addresses changed, re-announce
 	if st.state == StatePublished && !ipsEqual(st.addresses, addrs) {
