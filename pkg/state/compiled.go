@@ -923,6 +923,18 @@ func EffectiveFrontendValidation(gwTLS *gatewayv1.GatewayTLSConfig, port gateway
 	return gwTLS.Frontend.Default.Validation
 }
 
+// ListenerValidationResult holds the computed validation outputs for a listener.
+type ListenerValidationResult struct {
+	// SupportedKinds is the set of route kinds this listener accepts.
+	SupportedKinds []gatewayv1.RouteGroupKind
+	// Conditions holds status conditions computed for this listener.
+	Conditions []metav1.Condition
+	// ClientValidation holds TLS client certificate validation settings, if configured.
+	ClientValidation *InternalClientValidation
+	// Certificates holds the resolved TLS certificates for this listener.
+	Certificates []*tls.Certificate
+}
+
 // ValidateListener validates a listener specification, computing its supported kinds, conditions, and client validation.
 func ValidateListener(
 	listener ListenerSpec,
@@ -935,7 +947,12 @@ func ValidateListener(
 	refValidator ReferenceGrantValidator,
 	certSources map[string]CertificateSource,
 	disabledRouteKinds ...map[gatewayv1.Kind]bool,
-) (supportedKinds []gatewayv1.RouteGroupKind, conditions []metav1.Condition, clientValidation *InternalClientValidation, resolvedCerts []*tls.Certificate) {
+) ListenerValidationResult {
+	var supportedKinds []gatewayv1.RouteGroupKind
+	var conditions []metav1.Condition
+	var clientValidation *InternalClientValidation
+	var resolvedCerts []*tls.Certificate
+
 	gwNamespace := ""
 	if gw != nil {
 		gwNamespace = gw.Namespace
@@ -972,7 +989,10 @@ func ValidateListener(
 				generation,
 			),
 		}
-		return supportedKinds, conditions, nil, nil
+		return ListenerValidationResult{
+			SupportedKinds: supportedKinds,
+			Conditions:     conditions,
+		}
 	}
 
 	hasInvalidRouteKind := false
@@ -1281,7 +1301,12 @@ func ValidateListener(
 		),
 	}
 
-	return supportedKinds, conditions, clientValidation, resolvedCerts
+	return ListenerValidationResult{
+		SupportedKinds:   supportedKinds,
+		Conditions:       conditions,
+		ClientValidation: clientValidation,
+		Certificates:     resolvedCerts,
+	}
 }
 
 // BuildEffectiveListener constructs an EffectiveListener from a listener specification.
@@ -1297,7 +1322,7 @@ func BuildEffectiveListener(
 	certSources map[string]CertificateSource,
 	disabledRouteKinds ...map[gatewayv1.Kind]bool,
 ) *EffectiveListener {
-	supportedKinds, conditions, clientValidation, resolvedCerts := ValidateListener(
+	validationResult := ValidateListener(
 		listener,
 		owner,
 		gw,
@@ -1324,12 +1349,12 @@ func BuildEffectiveListener(
 		Hostname:             listener.Hostname,
 		TLS:                  listener.TLS,
 		AllowedRoutes:        listener.AllowedRoutes,
-		SupportedKinds:       supportedKinds,
-		Conditions:           conditions,
+		SupportedKinds:       validationResult.SupportedKinds,
+		Conditions:           validationResult.Conditions,
 		AttachedRoutes:       0,
 		Routes:               nil,
-		ClientValidation:     clientValidation,
-		ResolvedCertificates: resolvedCerts,
+		ClientValidation:     validationResult.ClientValidation,
+		ResolvedCertificates: validationResult.Certificates,
 		Generation:           generation,
 	}
 }
