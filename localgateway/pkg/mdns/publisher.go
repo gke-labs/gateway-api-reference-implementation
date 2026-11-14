@@ -306,7 +306,7 @@ func isNormalClose(err error) bool {
 // onConflict is invoked by the Responder when a conflict is detected on the LAN
 // during active probing or after publishing (RFC 6762 §9).
 func (p *Publisher) onConflict(fqdn string, conflictingRR dnsmessage.Resource) {
-	name := strings.ToLower(toFQDN(fqdn))
+	name := strings.ToLower(ToFQDN(fqdn))
 
 	p.mu.Lock()
 	st, ok := p.names[name]
@@ -436,7 +436,7 @@ func (p *Publisher) OnGatewaysUpdate(gateways []*gatewayv1.Gateway) {
 			}
 
 			currentGWListeners[l.Name] = struct{}{}
-			fqdn := strings.ToLower(toFQDN(rawHostname))
+			fqdn := strings.ToLower(ToFQDN(rawHostname))
 			currentGWFQDNs[fqdn] = struct{}{}
 			lk := listenerKey{gw: gwKey, listener: l.Name}
 
@@ -535,7 +535,7 @@ func (p *Publisher) StatusHook(ctx context.Context, gw *gatewayv1.Gateway, statu
 		}
 
 		// Read publisher state for this hostname
-		fqdn := strings.ToLower(toFQDN(rawHostname))
+		fqdn := strings.ToLower(ToFQDN(rawHostname))
 		pubState, found := p.GetHostnameState(fqdn)
 		if !found {
 			// If not yet picked up by OnGatewaysUpdate, report Probing
@@ -589,7 +589,7 @@ func (p *Publisher) StatusHook(ctx context.Context, gw *gatewayv1.Gateway, statu
 
 // GetHostnameState returns a snapshot of the current publication state for a hostname.
 func (p *Publisher) GetHostnameState(fqdn string) (HostnamePublicationSnapshot, bool) {
-	name := strings.ToLower(toFQDN(fqdn))
+	name := strings.ToLower(ToFQDN(fqdn))
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	st, ok := p.names[name]
@@ -615,7 +615,7 @@ func (p *Publisher) syncListener(lk listenerKey, rawHostname, fqdn string, addrs
 	}
 	p.listeners[lk] = fqdn
 
-	records, err := buildRecords(fqdn, addrs, p.opts.TTL)
+	records, err := BuildRecords(fqdn, addrs, p.opts.TTL)
 	if err != nil {
 		klog.Warningf("failed to build records for %s: %v", fqdn, err)
 		return nil
@@ -782,9 +782,9 @@ func (p *Publisher) runProbe(ctx context.Context, fqdn string, proposedRecords [
 	p.enqueueGateways(gws)
 }
 
-// buildRecords creates A and AAAA dnsmessage.Resource records for the given FQDN and IP addresses.
-func buildRecords(fqdn string, addrs []net.IP, ttl uint32) ([]dnsmessage.Resource, error) {
-	name, err := dnsmessage.NewName(toFQDN(fqdn))
+// BuildRecords creates A and AAAA dnsmessage.Resource records for the given FQDN and IP addresses.
+func BuildRecords(fqdn string, addrs []net.IP, ttl uint32) ([]dnsmessage.Resource, error) {
+	name, err := dnsmessage.NewName(ToFQDN(fqdn))
 	if err != nil {
 		return nil, fmt.Errorf("invalid fqdn %q: %w", fqdn, err)
 	}

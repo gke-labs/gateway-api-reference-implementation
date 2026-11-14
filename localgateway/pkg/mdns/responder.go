@@ -325,7 +325,7 @@ func (r *Responder) SetRecord(rs *RecordSet) {
 	if rs == nil || rs.FQDN == "" {
 		return
 	}
-	fqdn := strings.ToLower(toFQDN(rs.FQDN))
+	fqdn := strings.ToLower(ToFQDN(rs.FQDN))
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.records[fqdn] = &RecordSet{
@@ -338,7 +338,7 @@ func (r *Responder) SetRecord(rs *RecordSet) {
 
 // RemoveRecord removes a published RecordSet by hostname.
 func (r *Responder) RemoveRecord(hostname string) *RecordSet {
-	fqdn := strings.ToLower(toFQDN(hostname))
+	fqdn := strings.ToLower(ToFQDN(hostname))
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	old := r.records[fqdn]
@@ -348,7 +348,7 @@ func (r *Responder) RemoveRecord(hostname string) *RecordSet {
 
 // GetRecord returns a published RecordSet by hostname.
 func (r *Responder) GetRecord(hostname string) (*RecordSet, bool) {
-	fqdn := strings.ToLower(toFQDN(hostname))
+	fqdn := strings.ToLower(ToFQDN(hostname))
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rec, ok := r.records[fqdn]
@@ -372,7 +372,7 @@ func (r *Responder) SetConflictHandler(h ConflictHandler) {
 
 // RegisterProbe registers an active probe for simultaneous conflict detection.
 func (r *Responder) RegisterProbe(fqdn string, proposedRecords []dnsmessage.Resource) {
-	name := strings.ToLower(toFQDN(fqdn))
+	name := strings.ToLower(ToFQDN(fqdn))
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.activeProbes[name] = proposedRecords
@@ -380,7 +380,7 @@ func (r *Responder) RegisterProbe(fqdn string, proposedRecords []dnsmessage.Reso
 
 // UnregisterProbe unregisters an active probe.
 func (r *Responder) UnregisterProbe(fqdn string) {
-	name := strings.ToLower(toFQDN(fqdn))
+	name := strings.ToLower(ToFQDN(fqdn))
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.activeProbes, name)
@@ -507,7 +507,7 @@ func (r *Responder) handleResponse(p *dnsmessage.Parser, _ dnsmessage.Header) {
 
 		// 2. Conflict with an already published record (RFC 6762 §9)
 		if pubRec, isPub := published[name]; isPub {
-			proposed, err := buildRecords(pubRec.FQDN, append(append([]net.IP(nil), pubRec.A...), pubRec.AAAA...), pubRec.TTL)
+			proposed, err := BuildRecords(pubRec.FQDN, append(append([]net.IP(nil), pubRec.A...), pubRec.AAAA...), pubRec.TTL)
 			if err != nil {
 				klog.Warningf("failed to build records for %s: %v", pubRec.FQDN, err)
 				continue
@@ -638,7 +638,7 @@ func (r *Responder) handleQuery(p *dnsmessage.Parser, queryHeader dnsmessage.Hea
 			rrClass |= CacheFlushBit
 		}
 
-		recName, err := dnsmessage.NewName(toFQDN(rec.FQDN))
+		recName, err := dnsmessage.NewName(ToFQDN(rec.FQDN))
 		if err != nil {
 			klog.Warningf("failed to construct DNS name for %q: %v", rec.FQDN, err)
 			continue
@@ -893,7 +893,7 @@ func recordsEqual(a, b dnsmessage.Resource) bool {
 	if a.Header.Type != b.Header.Type {
 		return false
 	}
-	if !strings.EqualFold(toFQDN(a.Header.Name.String()), toFQDN(b.Header.Name.String())) {
+	if !strings.EqualFold(ToFQDN(a.Header.Name.String()), ToFQDN(b.Header.Name.String())) {
 		return false
 	}
 	switch bodyA := a.Body.(type) {
@@ -932,7 +932,7 @@ func appendResource(b *dnsmessage.Builder, r dnsmessage.Resource) error {
 
 // SendProbe broadcasts an mDNS probe query for the given FQDN with proposed authority records (RFC 6762 §8.1).
 func (r *Responder) SendProbe(fqdn string, proposedRecords []dnsmessage.Resource) error {
-	name, err := dnsmessage.NewName(toFQDN(fqdn))
+	name, err := dnsmessage.NewName(ToFQDN(fqdn))
 	if err != nil {
 		return fmt.Errorf("invalid fqdn %q: %w", fqdn, err)
 	}
@@ -1103,7 +1103,8 @@ func (r *Responder) Close() error {
 	return err
 }
 
-func toFQDN(name string) string {
+// ToFQDN returns name ending with a dot.
+func ToFQDN(name string) string {
 	if strings.HasSuffix(name, ".") {
 		return name
 	}
