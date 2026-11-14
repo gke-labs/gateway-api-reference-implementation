@@ -50,11 +50,16 @@ type ClusterConfig struct {
 	// DeniedHostnames is an optional deny list of hostname patterns.
 	DeniedHostnames []string `json:"deniedHostnames,omitempty"`
 
-	// SharedFrontEndGroup is an optional shared-front-end group membership.
+	// SharedFrontEndGroup is an optional shared-front-end group membership for the cluster.
+	// Gateways in one group share a front end, so certserver treats a proof from one of
+	// them as covering the others. The cluster-level SharedFrontEndGroup puts every
+	// Gateway in the cluster into one group; an operator should set it only when all of
+	// the cluster's Gateways really share one front end.
 	SharedFrontEndGroup string `json:"sharedFrontEndGroup,omitempty"`
 
 	// GatewaySharedFrontEndGroups is an optional per-Gateway override for shared-front-end group memberships.
-	// Maps Gateway identity ("namespace/name" or "name") to group name.
+	// Maps Gateway identity ("namespace/name") to group name. Gateways in one group share a front end,
+	// so certserver treats a proof from one of them as covering the others.
 	GatewaySharedFrontEndGroups map[string]string `json:"gatewaySharedFrontEndGroups,omitempty"`
 }
 

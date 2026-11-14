@@ -182,15 +182,9 @@ func getGatewaySharedFrontEndGroup(cluster *ClusterConfig, gateway string) strin
 	if cluster == nil {
 		return ""
 	}
-	if cluster.GatewaySharedFrontEndGroups != nil && gateway != "" {
+	if cluster.GatewaySharedFrontEndGroups != nil && strings.Contains(gateway, "/") {
 		if g, ok := cluster.GatewaySharedFrontEndGroups[gateway]; ok && g != "" {
 			return g
-		}
-		if strings.Contains(gateway, "/") {
-			parts := strings.Split(gateway, "/")
-			if g, ok := cluster.GatewaySharedFrontEndGroups[parts[len(parts)-1]]; ok && g != "" {
-				return g
-			}
 		}
 	}
 	return cluster.SharedFrontEndGroup

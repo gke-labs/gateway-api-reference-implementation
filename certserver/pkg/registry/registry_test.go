@@ -875,6 +875,67 @@ func TestIsAuthorizedForwarder(t *testing.T) {
 		CallerIdentity{ClusterID: "cluster-d", Namespace: "default", ServiceAccount: "dp-d"}) {
 		t.Errorf("expected authorized for same gateway")
 	}
+
+	// 7. Per-gateway group entry for ns-a/gw does not apply to ns-b/gw
+	clusterE := ClusterConfig{
+		ClusterID: "cluster-e",
+		IssuerURL: "https://issuer-e.example.com",
+		GatewaySharedFrontEndGroups: map[string]string{
+			"ns-a/gw": "group-1",
+		},
+	}
+	regE, err := NewRegistry([]ClusterConfig{clusters[0], clusters[1], clusterE})
+	if err != nil {
+		t.Fatalf("failed to create registry: %v", err)
+	}
+	defer regE.Close()
+
+	if !IsAuthorizedForwarder(regE, bindingStore, "cluster-e", "ns-a/gw", "default/dp-a",
+		CallerIdentity{ClusterID: "cluster-b", Namespace: "default", ServiceAccount: "dp-b"}) {
+		t.Errorf("expected authorized for ns-a/gw matching shared front end group")
+	}
+	if IsAuthorizedForwarder(regE, bindingStore, "cluster-e", "ns-b/gw", "default/dp-a",
+		CallerIdentity{ClusterID: "cluster-b", Namespace: "default", ServiceAccount: "dp-b"}) {
+		t.Errorf("expected refused: per-gateway group entry for ns-a/gw must not apply to ns-b/gw")
+	}
+}
+
+func TestGetGatewaySharedFrontEndGroup(t *testing.T) {
+	cluster := &ClusterConfig{
+		SharedFrontEndGroup: "cluster-default-group",
+		GatewaySharedFrontEndGroups: map[string]string{
+			"ns-a/gw": "group-a",
+			"gw-bare": "group-bare",
+		},
+	}
+
+	// 1. A per-Gateway group entry for ns-a/gw applies to ns-a/gw
+	if got := getGatewaySharedFrontEndGroup(cluster, "ns-a/gw"); got != "group-a" {
+		t.Errorf("getGatewaySharedFrontEndGroup(cluster, %q) = %q, want %q", "ns-a/gw", got, "group-a")
+	}
+
+	// 2. A per-Gateway group entry for ns-a/gw doesn't apply to ns-b/gw (falls back to cluster group)
+	if got := getGatewaySharedFrontEndGroup(cluster, "ns-b/gw"); got != "cluster-default-group" {
+		t.Errorf("getGatewaySharedFrontEndGroup(cluster, %q) = %q, want %q", "ns-b/gw", got, "cluster-default-group")
+	}
+
+	// 3. When no cluster-level SharedFrontEndGroup is configured, ns-b/gw receives no group
+	clusterNoDefault := &ClusterConfig{
+		GatewaySharedFrontEndGroups: map[string]string{
+			"ns-a/gw": "group-a",
+		},
+	}
+	if got := getGatewaySharedFrontEndGroup(clusterNoDefault, "ns-b/gw"); got != "" {
+		t.Errorf("getGatewaySharedFrontEndGroup(clusterNoDefault, %q) = %q, want empty string", "ns-b/gw", got)
+	}
+
+	// 4. Bare name entries in GatewaySharedFrontEndGroups do not match full namespace/name or bare names
+	if got := getGatewaySharedFrontEndGroup(cluster, "ns-a/gw-bare"); got != "cluster-default-group" {
+		t.Errorf("getGatewaySharedFrontEndGroup(cluster, %q) = %q, want %q", "ns-a/gw-bare", got, "cluster-default-group")
+	}
+	if got := getGatewaySharedFrontEndGroup(cluster, "gw-bare"); got != "cluster-default-group" {
+		t.Errorf("getGatewaySharedFrontEndGroup(cluster, %q) = %q, want %q", "gw-bare", got, "cluster-default-group")
+	}
 }
 
 func TestRegistry_DirectoryRegistration(t *testing.T) {
