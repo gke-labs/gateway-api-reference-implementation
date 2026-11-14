@@ -28,8 +28,7 @@ import (
 )
 
 // maxHeadBytes is the maximum allowed size of an HTTP/1.1 request head (request line and headers).
-// 8 KiB is standard across production HTTP servers (e.g. Apache, Nginx default) and ample
-// for typical request headers while bounding memory consumption and peeking overhead.
+// The bound limits the memory and time one connection can hold before routing.
 const maxHeadBytes = 8 * 1024
 
 var (
@@ -47,77 +46,87 @@ var (
 
 	// ErrInvalidHost is returned when the hostname contains invalid characters.
 	ErrInvalidHost = errors.New("invalid hostname in request")
+
+	// ErrNonPositiveTimeout is returned when readTimeout is zero or negative.
+	ErrNonPositiveTimeout = errors.New("read timeout must be positive")
 )
 
 // SniffHost reads the head of an HTTP/1.1 request from conn within readTimeout, bounded at 8 KiB,
-// and extracts the hostname with any port removed. It returns the hostname, a connection that
-// replays the peeked bytes, and any error encountered.
+// and extracts the hostname with any port removed.
+//
+// The hostname is returned as sent, so upper case and a trailing dot are kept and the caller
+// normalises before matching. Hostname validation checks characters only, not label structure
+// or length. When the request target is in absolute form, it takes precedence over the Host header.
+//
+// SniffHost returns the replaying connection on error paths too.
 func SniffHost(conn net.Conn, readTimeout time.Duration) (host string, peeked net.Conn, err error) {
-	if readTimeout > 0 {
-		if err = conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
-			return "", conn, fmt.Errorf("setting read deadline: %w", err)
-		}
-		defer func() {
-			if clearErr := conn.SetReadDeadline(time.Time{}); clearErr != nil && err == nil {
-				host = ""
-				err = fmt.Errorf("clearing read deadline: %w", clearErr)
-			}
-		}()
+	if readTimeout <= 0 {
+		return "", sni.NewPeekedConn(conn, nil), ErrNonPositiveTimeout
 	}
 
-	var buf []byte
-	tmp := make([]byte, maxHeadBytes)
-	for {
-		n, readErr := conn.Read(tmp[:maxHeadBytes-len(buf)])
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
+	if err = conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		return "", sni.NewPeekedConn(conn, nil), fmt.Errorf("setting read deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := conn.SetReadDeadline(time.Time{}); clearErr != nil && err == nil {
+			host = ""
+			err = fmt.Errorf("clearing read deadline: %w", clearErr)
 		}
-		if bytes.Contains(buf, []byte("\r\n\r\n")) || bytes.Contains(buf, []byte("\n\n")) {
+	}()
+
+	var buffer []byte
+	temporary := make([]byte, maxHeadBytes)
+	for {
+		bytesRead, readErr := conn.Read(temporary[:maxHeadBytes-len(buffer)])
+		if bytesRead > 0 {
+			buffer = append(buffer, temporary[:bytesRead]...)
+		}
+		if bytes.Contains(buffer, []byte("\r\n\r\n")) || bytes.Contains(buffer, []byte("\n\n")) {
 			break
 		}
-		if len(buf) >= maxHeadBytes {
-			return "", sni.NewPeekedConn(conn, buf), ErrHeadTooLarge
+		if len(buffer) >= maxHeadBytes {
+			return "", sni.NewPeekedConn(conn, buffer), ErrHeadTooLarge
 		}
 		if readErr != nil {
-			return "", sni.NewPeekedConn(conn, buf), readErr
+			return "", sni.NewPeekedConn(conn, buffer), readErr
 		}
 	}
 
-	req, parseErr := http.ReadRequest(bufio.NewReader(bytes.NewReader(buf)))
+	request, parseErr := http.ReadRequest(bufio.NewReader(bytes.NewReader(buffer)))
 	if parseErr != nil {
 		if strings.Contains(parseErr.Error(), "too many Host headers") {
-			return "", sni.NewPeekedConn(conn, buf), ErrMultipleHosts
+			return "", sni.NewPeekedConn(conn, buffer), ErrMultipleHosts
 		}
-		return "", sni.NewPeekedConn(conn, buf), parseErr
+		return "", sni.NewPeekedConn(conn, buffer), parseErr
 	}
-	if req.ProtoMajor != 1 || req.ProtoMinor != 1 {
-		return "", sni.NewPeekedConn(conn, buf), ErrNotHTTP11
+	if request.ProtoMajor != 1 || request.ProtoMinor != 1 {
+		return "", sni.NewPeekedConn(conn, buffer), ErrNotHTTP11
 	}
 
-	rawHost, port, splitErr := net.SplitHostPort(req.Host)
+	rawHost, port, splitErr := net.SplitHostPort(request.Host)
 	if splitErr != nil {
-		rawHost = req.Host
+		rawHost = request.Host
 	} else {
-		for i := 0; i < len(port); i++ {
-			if port[i] < '0' || port[i] > '9' {
-				return "", sni.NewPeekedConn(conn, buf), ErrInvalidHost
+		for index := 0; index < len(port); index++ {
+			if port[index] < '0' || port[index] > '9' {
+				return "", sni.NewPeekedConn(conn, buffer), ErrInvalidHost
 			}
 		}
 	}
 	if rawHost == "" {
-		return "", sni.NewPeekedConn(conn, buf), ErrNoHost
+		return "", sni.NewPeekedConn(conn, buffer), ErrNoHost
 	}
 	if !validHostname(rawHost) {
-		return "", sni.NewPeekedConn(conn, buf), ErrInvalidHost
+		return "", sni.NewPeekedConn(conn, buffer), ErrInvalidHost
 	}
 
-	return rawHost, sni.NewPeekedConn(conn, buf), nil
+	return rawHost, sni.NewPeekedConn(conn, buffer), nil
 }
 
-func validHostname(s string) bool {
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' {
+func validHostname(hostname string) bool {
+	for index := 0; index < len(hostname); index++ {
+		character := hostname[index]
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '.' {
 			continue
 		}
 		return false

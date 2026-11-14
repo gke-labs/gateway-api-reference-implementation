@@ -146,7 +146,7 @@ func TestSniffHost(t *testing.T) {
 			timeout: 50 * time.Millisecond,
 			writeFn: func(conn net.Conn) {
 				defer conn.Close()
-				for i := 0; i < 20; i++ {
+				for index := 0; index < 20; index++ {
 					if _, err := conn.Write([]byte("G")); err != nil {
 						return
 					}
@@ -159,6 +159,12 @@ func TestSniffHost(t *testing.T) {
 				return errors.As(err, &netErr) && netErr.Timeout()
 			},
 		},
+		{
+			name:     "non-positive timeout",
+			timeout:  -time.Second,
+			wantErr:  true,
+			errCheck: func(err error) bool { return errors.Is(err, ErrNonPositiveTimeout) },
+		},
 	}
 
 	for _, tc := range tests {
@@ -168,7 +174,7 @@ func TestSniffHost(t *testing.T) {
 			defer clientConn.Close()
 
 			timeout := tc.timeout
-			if timeout == 0 {
+			if timeout == 0 && tc.name != "non-positive timeout" {
 				timeout = 2 * time.Second
 			}
 
@@ -181,6 +187,7 @@ func TestSniffHost(t *testing.T) {
 					t.Errorf("writing input: %v", err)
 				}
 				if tc.wantErr {
+					// Close client end so SniffHost sees EOF rather than waiting for timeout on invalid input.
 					_ = clientConn.Close()
 				}
 			}()
@@ -195,6 +202,9 @@ func TestSniffHost(t *testing.T) {
 				}
 				if tc.errCheck != nil && !tc.errCheck(err) {
 					t.Fatalf("error %v did not match expected check", err)
+				}
+				if peekedConn == nil {
+					t.Fatalf("expected non-nil peekedConn on error path")
 				}
 				return
 			}
@@ -241,9 +251,12 @@ func TestSniffHost_ClearDeadlineError(t *testing.T) {
 		}
 	}()
 
-	host, _, err := SniffHost(wrappedConn, time.Second)
+	host, peekedConn, err := SniffHost(wrappedConn, time.Second)
 	if err == nil {
 		t.Fatalf("expected error clearing deadline, got host %q", host)
+	}
+	if peekedConn == nil {
+		t.Fatalf("expected non-nil peekedConn on clear deadline error")
 	}
 	if !strings.Contains(err.Error(), "clearing read deadline") {
 		t.Fatalf("expected clearing read deadline error, got %v", err)
