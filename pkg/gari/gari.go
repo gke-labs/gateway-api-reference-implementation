@@ -297,6 +297,10 @@ type Options struct {
 	// ACMEChallengeTokenPath is the path to the projected service-account token file for data-plane identity.
 	ACMEChallengeTokenPath string
 
+	// BeforeStartProxyServers is an optional hook called at the start of StartProxyServers,
+	// before any listeners are bound or proxy servers started.
+	BeforeStartProxyServers func(ctx context.Context) error
+
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
 	// is created, allowing callers to register additional reconcilers or runnables before
 	// the manager starts. If non-nil, it is passed the manager and the GARI Server.
@@ -373,7 +377,9 @@ type Server struct {
 	state   *state.State
 	proxy   *proxy.Proxy
 
-	proxySynced atomic.Bool
+	proxySynced    atomic.Bool
+	httpAccepting  atomic.Bool
+	httpsAccepting atomic.Bool
 
 	// filterMu guards listenerOpts, httpFilter, and httpsFilter.
 	filterMu     sync.Mutex
@@ -381,9 +387,27 @@ type Server struct {
 	httpFilter   *proxyproto.Listener
 	httpsFilter  *proxyproto.Listener
 
-	// appliedMu guards appliedRevisions.
-	appliedMu        sync.RWMutex
-	appliedRevisions map[string]string
+	// appliedMu guards appliedConfigs.
+	appliedMu      sync.RWMutex
+	appliedConfigs map[string]appliedConfig
+}
+
+type appliedConfig struct {
+	revision  string
+	listeners []state.InternalListener
+}
+
+type readyListener struct {
+	net.Listener
+	readyOnce sync.Once
+	onAccept  func()
+}
+
+func (l *readyListener) Accept() (net.Conn, error) {
+	if l.onAccept != nil {
+		l.readyOnce.Do(l.onAccept)
+	}
+	return l.Listener.Accept()
 }
 
 func (s *Server) listenerOptionsLocked() proxyproto.ListenerOptions {
@@ -633,6 +657,9 @@ func samePortOrAddr(addr1, addr2 string) bool {
 	return false
 }
 
+// readyzChecker returns a healthz.Checker that reports the data plane as ready
+// only after every listener that the applied config needs is bound and accepting
+// connections. The controller reports a Gateway as Programmed from these signals.
 func (s *Server) readyzChecker() healthz.Checker {
 	return func(req *http.Request) error {
 		if s.opts.DrainSentinelPath != "" {
@@ -647,8 +674,46 @@ func (s *Server) readyzChecker() healthz.Checker {
 		if !s.proxySynced.Load() {
 			return errors.New("proxy configuration not yet applied")
 		}
+		if !s.listenersAccepting() {
+			return errors.New("listeners not yet accepting connections")
+		}
 		return nil
 	}
+}
+
+func (s *Server) isListenerAccepting(l state.InternalListener) bool {
+	switch l.Protocol {
+	case gatewayv1.HTTPProtocolType:
+		return s.httpAccepting.Load()
+	case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
+		return s.httpsAccepting.Load()
+	case gatewayv1.TCPProtocolType:
+		return s.proxy != nil && s.proxy.IsTCPPortAccepting(l.Port)
+	case gatewayv1.UDPProtocolType:
+		return s.proxy != nil && s.proxy.IsUDPPortAccepting(l.Port)
+	default:
+		return false
+	}
+}
+
+func (s *Server) areListenersAccepting(listeners []state.InternalListener) bool {
+	for _, l := range listeners {
+		if !s.isListenerAccepting(l) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) listenersAccepting() bool {
+	s.appliedMu.RLock()
+	defer s.appliedMu.RUnlock()
+	for _, cfg := range s.appliedConfigs {
+		if !s.areListenersAccepting(cfg.listeners) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Handler) {
@@ -673,21 +738,26 @@ func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Han
 func (s *Server) appliedRevisionsList() []string {
 	s.appliedMu.RLock()
 	defer s.appliedMu.RUnlock()
-	revisions := make([]string, 0, len(s.appliedRevisions))
-	for _, rev := range s.appliedRevisions {
-		revisions = append(revisions, rev)
+	revisions := make([]string, 0, len(s.appliedConfigs))
+	for _, cfg := range s.appliedConfigs {
+		if cfg.revision != "" && s.areListenersAccepting(cfg.listeners) {
+			revisions = append(revisions, cfg.revision)
+		}
 	}
 	slices.Sort(revisions)
 	return revisions
 }
 
-func (s *Server) recordAppliedRevision(gatewayKey, revision string) {
+func (s *Server) recordAppliedRevision(gatewayKey, revision string, listeners []state.InternalListener) {
 	s.appliedMu.Lock()
 	defer s.appliedMu.Unlock()
-	if s.appliedRevisions == nil {
-		s.appliedRevisions = make(map[string]string)
+	if s.appliedConfigs == nil {
+		s.appliedConfigs = make(map[string]appliedConfig)
 	}
-	s.appliedRevisions[gatewayKey] = revision
+	s.appliedConfigs[gatewayKey] = appliedConfig{
+		revision:  revision,
+		listeners: listeners,
+	}
 }
 
 func (s *Server) appliedHandler() http.Handler {
@@ -722,7 +792,12 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 			onConfigUpdate:   s.updateListenerFilters,
 			onConfigApplied:  s.recordAppliedRevision,
 		}
+		ctrlName := "dataplane-secret"
+		if s.opts.DataplaneGatewayName != "" {
+			ctrlName = fmt.Sprintf("dataplane-secret-%s-%s", s.opts.DataplaneGatewayNamespace, s.opts.DataplaneGatewayName)
+		}
 		if err := ctrl.NewControllerManagedBy(mgr).
+			Named(ctrlName).
 			For(&corev1.Secret{}).
 			Complete(reconciler); err != nil {
 			return fmt.Errorf("failed to create dataplane secret controller: %w", err)
@@ -733,7 +808,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	userHook := s.opts.OnGatewaysUpdate
 	wrappedHook := func(gateways []*gatewayv1.Gateway) {
 		s.proxySynced.Store(true)
-		newRevisions := make(map[string]string, len(gateways))
+		newConfigs := make(map[string]appliedConfig, len(gateways))
 		for _, gw := range gateways {
 			if gw == nil {
 				continue
@@ -741,12 +816,15 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 			gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
 			if s.state != nil {
 				if dpCfg := s.state.GetDataplaneConfig(gwKey); dpCfg != nil && dpCfg.Revision != "" {
-					newRevisions[gwKey.String()] = dpCfg.Revision
+					newConfigs[gwKey.String()] = appliedConfig{
+						revision:  dpCfg.Revision,
+						listeners: dpCfg.Listeners,
+					}
 				}
 			}
 		}
 		s.appliedMu.Lock()
-		s.appliedRevisions = newRevisions
+		s.appliedConfigs = newConfigs
 		s.appliedMu.Unlock()
 		if userHook != nil {
 			userHook(gateways)
@@ -773,7 +851,7 @@ type dataplaneSecretReconciler struct {
 	gatewayNamespace string
 	secretName       string
 	onConfigUpdate   func(opts proxyproto.ListenerOptions) error
-	onConfigApplied  func(gwKey string, revision string)
+	onConfigApplied  func(gwKey string, revision string, listeners []state.InternalListener)
 }
 
 func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -816,7 +894,7 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	if r.onConfigApplied != nil && dpCfg.Revision != "" {
-		r.onConfigApplied(dpCfg.GatewayName.String(), dpCfg.Revision)
+		r.onConfigApplied(dpCfg.GatewayName.String(), dpCfg.Revision, dpCfg.Listeners)
 	}
 
 	return ctrl.Result{}, nil
@@ -884,6 +962,12 @@ func (s *Server) newHTTPServer(handler http.Handler, tlsConfig *tls.Config) *htt
 }
 
 func (s *Server) StartProxyServers(ctx context.Context) error {
+	if s.opts.BeforeStartProxyServers != nil {
+		if err := s.opts.BeforeStartProxyServers(ctx); err != nil {
+			return err
+		}
+	}
+
 	g, ctx := errgroup.WithContext(ctx)
 
 	go func() {
@@ -930,6 +1014,11 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				handler = h2c.NewHandler(s.proxy, h2s)
 			}
 			srv := s.newHTTPServer(handler, nil)
+			readyLis := &readyListener{
+				Listener: filterLis,
+				onAccept: func() { s.httpAccepting.Store(true) },
+			}
+			defer s.httpAccepting.Store(false)
 			go func() {
 				<-ctx.Done()
 				setupLog.Info("shutting down proxy server")
@@ -939,7 +1028,7 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 					klog.Warningf("failed to shut down proxy server: %v", err)
 				}
 			}()
-			if err := srv.Serve(filterLis); err != nil && err != http.ErrServerClosed {
+			if err := srv.Serve(readyLis); err != nil && err != http.ErrServerClosed {
 				return fmt.Errorf("proxy server failed: %w", err)
 			}
 			return nil
@@ -1016,6 +1105,11 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			}
 			sniLis := s.proxy.NewSNIListener(filterLis)
 			tlsLis := tls.NewListener(sniLis, tlsConfig)
+			readyTLS := &readyListener{
+				Listener: tlsLis,
+				onAccept: func() { s.httpsAccepting.Store(true) },
+			}
+			defer s.httpsAccepting.Store(false)
 			go func() {
 				<-ctx.Done()
 				setupLog.Info("shutting down proxy HTTPS server")
@@ -1028,7 +1122,7 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 					klog.Warningf("failed to close HTTPS SNI listener: %v", err)
 				}
 			}()
-			if err := srv.Serve(tlsLis); err != nil && err != http.ErrServerClosed {
+			if err := srv.Serve(readyTLS); err != nil && err != http.ErrServerClosed {
 				return fmt.Errorf("proxy HTTPS server failed: %w", err)
 			}
 			return nil

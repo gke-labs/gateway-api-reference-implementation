@@ -39,11 +39,12 @@ const (
 )
 
 type udpPortListener struct {
-	port     gatewayv1.PortNumber
-	conn     net.PacketConn
-	backends atomic.Pointer[[]state.InternalUDPBackend]
-	closed   atomic.Bool
-	done     chan struct{}
+	port      gatewayv1.PortNumber
+	conn      net.PacketConn
+	backends  atomic.Pointer[[]state.InternalUDPBackend]
+	closed    atomic.Bool
+	accepting atomic.Bool
+	done      chan struct{}
 
 	idleTimeout atomic.Int64 // nanoseconds
 	maxSessions atomic.Int64
@@ -243,9 +244,19 @@ func (p *Proxy) updateUDPListenersLocked(listeners []state.InternalListener) {
 	}
 }
 
+// IsUDPPortAccepting returns whether the UDP listener for port is listening.
+func (p *Proxy) IsUDPPortAccepting(port gatewayv1.PortNumber) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	pl, ok := p.udpListeners[port]
+	return ok && pl.accepting.Load() && !pl.closed.Load()
+}
+
 func (p *Proxy) udpReadLoop(pl *udpPortListener) {
+	defer pl.accepting.Store(false)
 	buf := make([]byte, udpBufferSize)
 	for {
+		pl.accepting.Store(true)
 		n, clientAddr, err := pl.conn.ReadFrom(buf)
 		if err != nil {
 			if pl.closed.Load() || errors.Is(err, net.ErrClosed) {

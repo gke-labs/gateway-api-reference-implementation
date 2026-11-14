@@ -135,6 +135,7 @@ type tcpPortListener struct {
 	ln          net.Listener
 	backends    atomic.Pointer[[]state.InternalTCPBackend]
 	closed      atomic.Bool
+	accepting   atomic.Bool
 	done        chan struct{}
 	activeConns atomic.Int64
 	maxConns    atomic.Int64
@@ -372,6 +373,14 @@ func (p *Proxy) GetTCPListener(port gatewayv1.PortNumber) net.Listener {
 	return nil
 }
 
+// IsTCPPortAccepting returns whether the TCP listener for port is accepting connections.
+func (p *Proxy) IsTCPPortAccepting(port gatewayv1.PortNumber) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	pl, ok := p.tcpListeners[port]
+	return ok && pl.accepting.Load() && !pl.closed.Load()
+}
+
 func (p *Proxy) GetUDPListener(port gatewayv1.PortNumber) net.PacketConn {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -508,7 +517,9 @@ func (p *Proxy) updateTCPListenersLocked(listeners []state.InternalListener) {
 }
 
 func (p *Proxy) tcpAcceptLoop(pl *tcpPortListener) {
+	defer pl.accepting.Store(false)
 	for {
+		pl.accepting.Store(true)
 		conn, err := pl.ln.Accept()
 		if err != nil {
 			if pl.closed.Load() || errors.Is(err, net.ErrClosed) {
