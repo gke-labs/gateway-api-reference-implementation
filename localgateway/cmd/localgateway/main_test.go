@@ -15,18 +15,31 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/address"
+	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/dnsconfig"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
@@ -364,6 +377,159 @@ func TestLocalGateway_WirePublisher(t *testing.T) {
 	}
 	if opts.SetupWithManager == nil {
 		t.Errorf("expected SetupWithManager to be set")
+	}
+}
+
+type wireTestManager struct {
+	ctrl.Manager
+	client    client.Client
+	runnables []manager.Runnable
+}
+
+func (m *wireTestManager) GetClient() client.Client    { return m.client }
+func (m *wireTestManager) GetAPIReader() client.Reader { return m.client }
+func (m *wireTestManager) Add(r manager.Runnable) error {
+	m.runnables = append(m.runnables, r)
+	if m.Manager != nil {
+		return m.Manager.Add(r)
+	}
+	return nil
+}
+
+// TestLocalGateway_WirePublisher_PublishesDNSConfig verifies that WirePublisher hooks
+// the DNS config publisher into the manager and publishes the configuration Secret.
+func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	opts, _, err := BuildOptions([]string{})
+	if err != nil {
+		t.Fatalf("BuildOptions failed: %v", err)
+	}
+
+	rawConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to bind test socket: %v", err)
+	}
+	defer rawConn.Close()
+	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
+
+	mdnsPublisher, err := mdns.NewPublisher(mdns.PublisherOptions{
+		Port:        ephemeralPort,
+		IPv4Conn:    rawConn,
+		Ephemeral:   true,
+		DisableIPv6: true,
+	})
+	if err != nil {
+		t.Fatalf("NewPublisher failed: %v", err)
+	}
+	defer mdnsPublisher.Close()
+
+	WirePublisher(&opts, mdnsPublisher)
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme failed: %v", err)
+	}
+	if err := gatewayv1.Install(scheme); err != nil {
+		t.Fatalf("Install failed: %v", err)
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	skipNameValidation := true
+	realManager, err := ctrl.NewManager(&rest.Config{}, ctrl.Options{
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{
+			SkipNameValidation: &skipNameValidation,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+
+	mockManager := &wireTestManager{
+		Manager: realManager,
+		client:  fakeClient,
+	}
+
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = "default"
+	opts.DataplaneGatewayName = "test-gw"
+	opts.Manager = mockManager
+	server, err := gari.NewWithManager(mockManager, opts)
+	if err != nil {
+		t.Fatalf("NewWithManager failed: %v", err)
+	}
+
+	publisherErrChan := make(chan error, 1)
+	for _, runnable := range mockManager.runnables {
+		if dnsPublisher, ok := runnable.(*dnsconfig.Publisher); ok {
+			go func(publisher *dnsconfig.Publisher) {
+				publisherErrChan <- publisher.Start(ctx)
+			}(dnsPublisher)
+		}
+	}
+
+	t.Cleanup(func() {
+		cancel()
+		if err := <-publisherErrChan; err != nil {
+			t.Errorf("dnsPublisher.Start returned unexpected error: %v", err)
+		}
+	})
+
+	gatewayClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "localgateway"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: gatewayv1.GatewayController(DefaultControllerName),
+		},
+	}
+	server.State().UpsertGatewayClass(gatewayClass)
+
+	hostname := gatewayv1.Hostname("app.local")
+	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: gatewayKey.Namespace,
+			Name:      gatewayKey.Name,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "localgateway",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: &hostname,
+				},
+			},
+		},
+	}
+	server.State().UpsertGateway(gateway)
+	server.State().SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
+	server.State().SetGatewayReadiness(gatewayKey, state.GatewayReadiness{Ready: true})
+	server.State().SetSynced(true)
+	server.State().Recompute()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		var secret corev1.Secret
+		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "localgateway-dns"}, &secret); err == nil {
+			if len(secret.Data[singlepod.DataplaneSecretDataKey]) > 0 {
+				var config dnsconfig.Config
+				if err := json.Unmarshal(secret.Data[singlepod.DataplaneSecretDataKey], &config); err == nil {
+					if len(config.Records) == 1 && config.Records[0].Name == "app.local" {
+						break
+					}
+				}
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timeout waiting for localgateway-dns Secret through WirePublisher")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 

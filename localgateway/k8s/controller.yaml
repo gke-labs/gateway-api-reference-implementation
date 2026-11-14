@@ -41,6 +41,35 @@ subjects:
   name: localgateway-controller
   namespace: default
 ---
+# Role allowing the controller to manage only its DNS data plane configuration Secret (localgateway-dns).
+# The Role, RoleBinding and Deployment share the default namespace (matching DefaultConfigSecretNamespace in dnsconfig).
+# If installed into another namespace, update metadata.namespace on the Role, RoleBinding, and Deployment,
+# and subjects[0].namespace on the RoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: localgateway-dns-secret
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["localgateway-dns"]
+  verbs: ["get", "create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: localgateway-dns-secret
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: localgateway-dns-secret
+subjects:
+- kind: ServiceAccount
+  name: localgateway-controller
+  namespace: default
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
