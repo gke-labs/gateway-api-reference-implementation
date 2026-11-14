@@ -15,13 +15,17 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/scoped"
 )
 
 func TestWAL_LostFoundQuarantineBound(t *testing.T) {
@@ -609,3 +613,33 @@ func TestQuarantineFiles_SkipNotExistParameter(t *testing.T) {
 		t.Fatalf("expected [present.dat] moved, got %v", moved)
 	}
 }
+
+func TestQuarantineFiles_ScopedLogger(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_quarantine_scoped_log"
+	if err := memFS.MkdirAll(dir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	f, err := memFS.OpenFile(filepath.Join(dir, "target.bin"), os.O_CREATE|os.O_WRONLY, StoreFileMode)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	_ = f.Close()
+
+	var buf bytes.Buffer
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	customLog := slog.New(handler)
+
+	ctx := scoped.WithLog(t.Context(), customLog)
+	_, err = quarantineFiles(ctx, memFS, dir, []string{"target.bin"}, QuarantineOptions{}, false)
+	if err != nil {
+		t.Fatalf("quarantineFiles failed: %v", err)
+	}
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "diskstore: moved file to quarantine") {
+		t.Errorf("expected quarantine log in custom logger output, got: %s", logOutput)
+	}
+}
+

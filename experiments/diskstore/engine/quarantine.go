@@ -27,6 +27,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/scoped"
 )
 
 // FileInfo holds metadata about an oversize file moved to quarantine.
@@ -37,22 +39,6 @@ type FileInfo struct {
 
 type fileInfo struct {
 	size uint64
-}
-
-type loggerKey struct{}
-
-// WithLogger returns a new context with the logger attached.
-func WithLogger(ctx context.Context, logger *slog.Logger) context.Context {
-	return context.WithValue(ctx, loggerKey{}, logger)
-}
-
-func loggerFromContext(ctx context.Context) *slog.Logger {
-	if ctx != nil {
-		if l, ok := ctx.Value(loggerKey{}).(*slog.Logger); ok && l != nil {
-			return l
-		}
-	}
-	return slog.Default()
 }
 
 const (
@@ -224,7 +210,7 @@ func pruneLostFound(storeFS FS, opts QuarantineOptions) error {
 func quarantineFiles(ctx context.Context, storeFS FS, dir string, files []string, opts QuarantineOptions, skipNotExist bool) ([]string, error) {
 	lostDir := filepath.Join(dir, "lost+found")
 	opts.Dir = lostDir
-	log := loggerFromContext(ctx)
+	log := scoped.Log(ctx)
 
 	var moved []string
 	if len(files) > 0 {

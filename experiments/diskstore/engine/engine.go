@@ -32,6 +32,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/scoped"
 )
 
 var (
@@ -2007,7 +2009,7 @@ func (s *Engine) Close() error {
 
 func (s *Engine) backgroundQuarantineSweep() {
 	ctx := context.Background()
-	log := loggerFromContext(ctx)
+	log := scoped.Log(ctx)
 	ticker := time.NewTicker(s.sweepInterval)
 	defer ticker.Stop()
 
