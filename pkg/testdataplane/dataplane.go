@@ -260,6 +260,28 @@ func StartDataplane(t testing.TB, env *testenv.Environment, gatewayNamespace, ga
 	if err := dp.WaitApplied(t.Context()); err != nil {
 		t.Fatalf("StartDataplane: %v", err)
 	}
+
+	waitPortReady := func(addr string) error {
+		if addr == "" {
+			return nil
+		}
+		return wait.PollUntilContextTimeout(t.Context(), 10*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+			conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+			if err != nil {
+				return false, nil
+			}
+			if closeErr := conn.Close(); closeErr != nil {
+				return false, closeErr
+			}
+			return true, nil
+		})
+	}
+	if err := waitPortReady(httpAddress); err != nil {
+		t.Fatalf("StartDataplane: waiting for HTTP proxy ready: %v", err)
+	}
+	if err := waitPortReady(httpsAddress); err != nil {
+		t.Fatalf("StartDataplane: waiting for HTTPS proxy ready: %v", err)
+	}
 	return dp
 }
 
