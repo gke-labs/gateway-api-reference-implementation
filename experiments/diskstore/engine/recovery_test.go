@@ -1607,7 +1607,8 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	}
 
 	// Reopen 1: replays WAL from redo start LSN through apply functions, then flushes pages.
-	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
+	faultFS2 := NewFaultFS(memFS)
+	store2, err := Open(WithFS(faultFS2), WithDir(dir), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen 1 failed: %v", err)
 	}
@@ -1617,22 +1618,66 @@ func TestRecovery_UncheckpointedMixReopenTwice(t *testing.T) {
 	// Crash again straight after the first reopen without calling Close() (which would checkpoint).
 	// This verifies the stricter case that the flush after replay made pages durable and
 	// reopening without writing still preserves all expected keys and tombstoned deletions.
-	if err := faultFS.Crash(true, 0); err != nil {
+	if err := faultFS2.Crash(true, 0); err != nil {
 		t.Fatalf("Crash after reopen 1 failed: %v", err)
 	}
 
 	// Reopen 2: reopen without any new writes following the crash.
-	store3, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
+	faultFS3 := NewFaultFS(memFS)
+	store3, err := Open(WithFS(faultFS3), WithDir(dir), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen 2 failed: %v", err)
 	}
+
+	compareKeys(store3, "reopen 2 (post-crash)")
+
+	// After the replaying reopen, write more records, Sync, crash, reopen, Close, and reopen again.
+	// On main with its separate redo replay code, a deleted key would resurrect after this sequence.
+	kPostReopen1 := "post-reopen-slotted"
+	vPostReopen1 := []byte("val-post-reopen-1")
+	if err := store3.Put(table, kPostReopen1, vPostReopen1); err != nil {
+		t.Fatalf("Put post-reopen 1 failed: %v", err)
+	}
+	expected[kPostReopen1] = vPostReopen1
+
+	kPostReopenMB := "post-reopen-mb"
+	vPostReopenMB := bytes.Repeat([]byte("val-post-reopen-mb-"), 500)
+	if err := store3.Put(table, kPostReopenMB, vPostReopenMB); err != nil {
+		t.Fatalf("Put post-reopen mb failed: %v", err)
+	}
+	expected[kPostReopenMB] = vPostReopenMB
+
+	if err := store3.Sync(); err != nil {
+		t.Fatalf("Sync on store3 failed: %v", err)
+	}
+
+	if err := faultFS3.Crash(true, 0); err != nil {
+		t.Fatalf("Crash on store3 failed: %v", err)
+	}
+
+	faultFS4 := NewFaultFS(memFS)
+	store4, err := Open(WithFS(faultFS4), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen 3 failed: %v", err)
+	}
+
+	if err := store4.Close(); err != nil {
+		t.Fatalf("store4.Close failed: %v", err)
+	}
+
+	faultFS5 := NewFaultFS(memFS)
+	store5, err := Open(WithFS(faultFS5), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen 4 failed: %v", err)
+	}
 	defer func() {
-		if err := store3.Close(); err != nil {
-			t.Errorf("store3.Close failed: %v", err)
+		if err := store5.Close(); err != nil {
+			t.Errorf("store5.Close failed: %v", err)
 		}
 	}()
 
-	compareKeys(store3, "reopen 2 (post-crash)")
+	// Assert after the last reopen that every expected key matches and every deleted key is absent.
+	compareKeys(store5, "final reopen (post-checkpoint)")
 }
 
 // TestRecovery_ReplayHeapWriteFailure_NoMarkerAndSucceedsOnReopen verifies that a heap write error
