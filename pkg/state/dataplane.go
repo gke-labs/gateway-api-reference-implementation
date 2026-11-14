@@ -317,6 +317,26 @@ func BuildGatewayDataplaneConfig(cg *CompiledGateway) (*DataplaneConfig, error) 
 		cfg.ProxyProtocol = cg.Parameters.ProxyProtocol
 		cfg.ProxyProtocolTrustedCIDRs = cg.Parameters.ProxyProtocolTrustedCIDRs
 	}
+
+	var challenges []HTTP01Challenge
+	seen := make(map[string]bool)
+	for _, effectiveListener := range cg.EffectiveListeners {
+		for _, challenge := range effectiveListener.Challenges {
+			key := challenge.Hostname + "/" + challenge.Token
+			if !seen[key] {
+				seen[key] = true
+				challenges = append(challenges, challenge)
+			}
+		}
+	}
+	sort.Slice(challenges, func(i, j int) bool {
+		if challenges[i].Hostname != challenges[j].Hostname {
+			return challenges[i].Hostname < challenges[j].Hostname
+		}
+		return challenges[i].Token < challenges[j].Token
+	})
+	cfg.Challenges = challenges
+
 	rev, err := cfg.ComputeRevision()
 	if err != nil {
 		return nil, err
