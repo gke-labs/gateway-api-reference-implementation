@@ -52,6 +52,9 @@ var (
 
 	// ErrCorruptStore indicates corruption in the store state or referenced files.
 	ErrCorruptStore = errors.New("store corruption")
+
+	// ErrBlockPoolTooSmall is returned by Put when a record requires more blocks than the block pool's total capacity.
+	ErrBlockPoolTooSmall = errors.New("block pool is too small for page")
 )
 
 // TestHookFail is an internal hook used by tests to trigger the failed state without exposing a method on Engine.
@@ -1391,21 +1394,12 @@ func (s *Engine) applyPutLocked(qKey string, payload []byte, lsn uint64, isOvers
 		return err
 	}
 
-	// If replacing an existing slotted or multi-block record, clean up old location (Item 15)
-	if inIndex {
-		if existing.NumBlocks == 1 {
-			if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
-				return err
-			}
-		} else if existing.NumBlocks > 1 {
-			if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
-				return err
-			}
-		}
-	}
-
 	var targetPage uint64
-	if p, ok := s.emptyPages.Pop(); ok {
+	if inIndex && existing.NumBlocks > 1 && existing.LogicalPage != 0 {
+		// When replacing an existing multi-block record, reallocate the same logical page
+		// directly without writing an intermediate tombstone at the same LSN.
+		targetPage = existing.LogicalPage
+	} else if p, ok := s.emptyPages.Pop(); ok {
 		targetPage = p
 	} else {
 		targetPage = s.nextLogicalPage
@@ -1430,6 +1424,13 @@ func (s *Engine) applyPutLocked(qKey string, payload []byte, lsn uint64, isOvers
 	handle.Desc.Mu.Unlock()
 	s.bp.MarkDirty(targetPage, lsn)
 	handle.Unpin()
+
+	// If replacing an existing slotted record, delete its slot from the old slotted page.
+	if inIndex && existing.NumBlocks == 1 && existing.LogicalPage != 0 {
+		if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
+			return err
+		}
+	}
 
 	s.keyMu.Lock()
 	wasOversize := inIndex && existing.IsOversize
@@ -1477,6 +1478,20 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 			return s.failErr()
 		}
 		toStore = encrypted
+	}
+
+	pageBlocks := 1
+	if !fitsInMultiBlockPage(len(qKey), len(toStore)) {
+		pageBlocks = 1
+	} else if !CanFitInSlottedPage(len(qKey), len(toStore)) {
+		var countErr error
+		pageBlocks, countErr = CalculateMultiBlockCount(len(qKey), len(toStore))
+		if countErr != nil {
+			return countErr
+		}
+	}
+	if pageBlocks > s.bp.numPoolBlocks {
+		return fmt.Errorf("%w: page requires %d blocks but pool has %d blocks", ErrBlockPoolTooSmall, pageBlocks, s.bp.numPoolBlocks)
 	}
 
 	var rec Record

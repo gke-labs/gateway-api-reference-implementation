@@ -326,6 +326,8 @@ Because the engine writes pages out of place, older copies of a page remain on d
 
 To prevent resurrection, deleting all records from a page writes an empty page carrying the deletion's newer LSN. Recovery then finds the empty page, recognizes that its LSN supersedes all earlier copies, and ignores the stale data. The engine retains empty page numbers and reuses them for future allocations, ensuring that every logical page maintains an unbroken, monotonically increasing LSN history on disk.
 
+Two copies of a logical page don't reach disk with one LSN. Every flush of a logical page carries an LSN strictly greater than any prior copy of that page on disk. When a multi-block page is replaced by another multi-block record in the same operation, the engine writes the replacement directly to the logical page without first writing an intermediate tombstone at the same LSN.
+
 ### 6. Old-Version Retention for Oversize Values
 
 The engine deletes the file holding an older version of an oversize value only after a WAL fsync confirms that the replacement pointer record is durable.
