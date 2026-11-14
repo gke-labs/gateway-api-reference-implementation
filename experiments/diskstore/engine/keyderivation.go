@@ -15,11 +15,14 @@
 package engine
 
 import (
+	"crypto/aes"
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
 	"strconv"
+
+	"golang.org/x/crypto/xts"
 )
 
 const (
@@ -81,6 +84,33 @@ func verifyKeyCheckToken(key []byte, dbID [16]byte, expectedToken [keyCheckToken
 	return nil
 }
 
+// newHeapCipher creates an AES-256-XTS cipher for heap blocks using the derived heap key.
+func newHeapCipher(key []byte, dbID [16]byte) (*xts.Cipher, error) {
+	heapKey, err := deriveHeapKey(key, dbID)
+	if err != nil {
+		return nil, err
+	}
+	return xts.NewCipher(aes.NewCipher, heapKey)
+}
+
+// encryptHeapBlock encrypts a 4 KiB heap block with AES-256-XTS using blockNum as tweak.
+func encryptHeapBlock(dst, src []byte, blockNum uint64, c *xts.Cipher) {
+	if c != nil {
+		c.Encrypt(dst, src, blockNum)
+	} else if &dst[0] != &src[0] {
+		copy(dst, src)
+	}
+}
+
+// decryptHeapBlock decrypts a 4 KiB heap block with AES-256-XTS using blockNum as tweak.
+func decryptHeapBlock(dst, src []byte, blockNum uint64, c *xts.Cipher) {
+	if c != nil {
+		c.Decrypt(dst, src, blockNum)
+	} else if &dst[0] != &src[0] {
+		copy(dst, src)
+	}
+}
+
 func deriveKey(key []byte, dbID [16]byte, info string, length int) ([]byte, error) {
 	if len(key) != MasterKeySize {
 		return nil, fmt.Errorf("encryption key must be %d bytes, got %d", MasterKeySize, len(key))
@@ -88,9 +118,8 @@ func deriveKey(key []byte, dbID [16]byte, info string, length int) ([]byte, erro
 	return hkdf.Key(sha256.New, key, dbID[:], info, length)
 }
 
-// Suppress unused linter warnings until subsequent block encryption PRs (#1202, #1203, #1204) wire them into the engine.
+// Suppress unused linter warnings until subsequent block encryption PRs (#1203, #1204) wire them into the engine.
 var (
-	_ = deriveHeapKey
 	_ = deriveWALKey
 	_ = deriveOversizeKey
 )

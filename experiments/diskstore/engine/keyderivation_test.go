@@ -488,6 +488,9 @@ func TestEngine_BlockEncryption_OpenKeyVerification(t *testing.T) {
 		if !strings.Contains(err.Error(), expectedErr) {
 			t.Fatalf("expected error containing %q, got: %v", expectedErr, err)
 		}
+		if !errors.Is(err, ErrStoreEncrypted) {
+			t.Fatalf("expected error to wrap ErrStoreEncrypted, got: %v", err)
+		}
 		if strings.Contains(err.Error(), "cipher option required") {
 			t.Fatalf("error should not mention 'cipher option required', got: %v", err)
 		}

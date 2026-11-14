@@ -22,6 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"golang.org/x/crypto/xts"
 )
 
 const (
@@ -102,12 +104,13 @@ func (h *PageHandle) Unpin() {
 // and write-ahead rule enforcement.
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
 type BlockPool struct {
-	file     File
-	wal      *WAL
-	buddy    *BuddyAllocator
-	directIO DirectIO
-	cipher   Cipher
-	dbID     [16]byte
+	file       File
+	wal        *WAL
+	buddy      *BuddyAllocator
+	directIO   DirectIO
+	cipher     Cipher
+	heapCipher *xts.Cipher
+	dbID       [16]byte
 
 	numPoolBlocks int
 	arena         []byte // Pointer-free byte arena aligned to 4096 bytes
@@ -136,6 +139,8 @@ type BlockPool struct {
 type BlockPoolOptions struct {
 	NumPoolBlocks int
 	Cipher        Cipher
+	EncryptionKey []byte
+	HeapCipher    *xts.Cipher
 	OnFailure     func(error)
 }
 
@@ -143,6 +148,7 @@ type BlockPoolOptions struct {
 func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opts ...BlockPoolOptions) *BlockPool {
 	numPoolBlocks := DefaultBlockPoolBlocks
 	var cipher Cipher
+	var heapCipher *xts.Cipher
 	var onFailure func(error)
 	if len(opts) > 0 {
 		if opts[0].NumPoolBlocks > 0 {
@@ -150,6 +156,15 @@ func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opt
 		}
 		cipher = opts[0].Cipher
 		onFailure = opts[0].OnFailure
+		if opts[0].HeapCipher != nil {
+			heapCipher = opts[0].HeapCipher
+		} else if len(opts[0].EncryptionKey) > 0 {
+			c, err := newHeapCipher(opts[0].EncryptionKey, dbID)
+			if err != nil {
+				panic(fmt.Sprintf("failed to create heap cipher: %v", err))
+			}
+			heapCipher = c
+		}
 	}
 
 	// Allocate pointer-free byte arena aligned to 4096 bytes without mmap
@@ -173,6 +188,7 @@ func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opt
 		buddy:          buddy,
 		directIO:       NewDirectIO(),
 		cipher:         cipher,
+		heapCipher:     heapCipher,
 		dbID:           dbID,
 		numPoolBlocks:  numPoolBlocks,
 		arena:          arena,
@@ -304,13 +320,17 @@ func (bp *BlockPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 
 	// Verify block headers
 	for i := 0; i < desc.NumBlocks; i++ {
+		decryptHeapBlock(iov[i], iov[i], readBlock+uint64(i), bp.heapCipher)
 		hdr, err := DecodeBlockHeader(iov[i])
 		if err != nil || hdr.LogicalPage != logicalPage || hdr.BlockIndex != uint32(i) {
 			bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
 			desc.PoolBlocks = nil
 			desc.PinCount.Store(0)
 			bp.mu.Unlock()
-			return nil, fmt.Errorf("corrupt block in page %d", logicalPage)
+			if err != nil {
+				return nil, fmt.Errorf("corrupt block in page %d: %w", logicalPage, err)
+			}
+			return nil, fmt.Errorf("corrupt block in page %d: logical page or block index mismatch", logicalPage)
 		}
 		desc.PageLSN.Store(hdr.LSN)
 	}
@@ -725,7 +745,8 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 			FinalizeBlockCRC(blk)
 
 			destStart := int(blockOffset+uint64(j)) * BlockSize
-			copy(bp.stagingBuf[destStart:destStart+BlockSize], blk)
+			dest := bp.stagingBuf[destStart : destStart+BlockSize]
+			encryptHeapBlock(dest, blk, locs[i]+uint64(j), bp.heapCipher)
 		}
 		desc.Mu.Unlock()
 	}
