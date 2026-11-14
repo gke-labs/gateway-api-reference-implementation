@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -262,6 +263,15 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 
 	mgr := manager.NewManager(acmeCli, diskCache, challengeStore, m, func(o *manager.Options) {
 		o.BindingStore = bindingStore
+		if pebble.ChallengeServer != nil {
+			o.SelfCheckClient = &http.Client{
+				Transport: &http.Transport{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return net.Dial(network, pebble.ChallengeServer.Listener.Addr().String())
+					},
+				},
+			}
+		}
 	})
 	if err := mgr.Start(ctx); err != nil {
 		t.Fatalf("failed to start manager: %v", err)

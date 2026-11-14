@@ -16,6 +16,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -24,6 +25,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -233,6 +235,15 @@ func setupChallengeBindingHarness(t *testing.T) *testHarness {
 
 	mgr := manager.NewManager(acmeCli, diskCache, challengeStore, m, func(o *manager.Options) {
 		o.BindingStore = bindingStore
+		if pebble.ChallengeServer != nil {
+			o.SelfCheckClient = &http.Client{
+				Transport: &http.Transport{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return net.Dial(network, pebble.ChallengeServer.Listener.Addr().String())
+					},
+				},
+			}
+		}
 	})
 	if err := mgr.Start(ctx); err != nil {
 		t.Fatalf("failed to start manager: %v", err)

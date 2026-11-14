@@ -23,9 +23,14 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/acme"
@@ -45,11 +50,12 @@ var (
 
 // Manager coordinates certificate issuance, caching, and background renewals.
 type Manager struct {
-	client         *acmeclient.Client
-	cache          *cache.DiskCache
-	challengeStore challenge.Store
-	metrics        *metrics.Metrics
-	opts           Options
+	client          *acmeclient.Client
+	cache           *cache.DiskCache
+	challengeStore  challenge.Store
+	metrics         *metrics.Metrics
+	opts            Options
+	selfCheckClient *http.Client
 
 	obtainSf      singleflight.Group
 	renewSf       singleflight.Group
@@ -80,12 +86,55 @@ func NewManager(
 		fn(&opts)
 	}
 
+	selfCheckClient := opts.SelfCheckClient
+	if selfCheckClient == nil {
+		// certserver has no DNS pre-check today and an empty hostname allow-list
+		// permits any name, so the self-check could be pointed at internal names
+		// such as metadata.google.internal. The dialer's Control function refuses
+		// loopback, link-local (including 169.254.169.254 and fd00:ec2::254),
+		// unspecified, and multicast addresses to prevent SSRF against cloud metadata
+		// and node-local services. RFC 1918 and other private address ranges (e.g. 10.0.0.0/8,
+		// 172.16.0.0/12, 192.168.0.0/16) are deliberately allowed, because in-cluster and
+		// test setups resolve to them.
+		dialer := &net.Dialer{
+			Timeout: 3 * time.Second,
+			Control: func(network, address string, rawConnection syscall.RawConn) error {
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					return fmt.Errorf("parsing destination address %q: %w", address, err)
+				}
+				parsedIP := net.ParseIP(host)
+				if parsedIP != nil && isForbiddenSelfCheckIP(parsedIP) {
+					return fmt.Errorf("self-check destination IP %s is prohibited", parsedIP)
+				}
+				return nil
+			},
+		}
+		selfCheckClient = &http.Client{
+			Transport: &http.Transport{
+				DialContext:       dialer.DialContext,
+				DisableKeepAlives: true,
+			},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			Timeout: 3 * time.Second,
+		}
+	} else if selfCheckClient.CheckRedirect == nil {
+		clientCopy := *selfCheckClient
+		clientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		selfCheckClient = &clientCopy
+	}
+
 	return &Manager{
 		client:            client,
 		cache:             diskCache,
 		challengeStore:    challengeStore,
 		metrics:           m,
 		opts:              opts,
+		selfCheckClient:   selfCheckClient,
 		renewals:          make(map[string]*renewalItem),
 		inFlightIssuances: make(map[string]struct{}),
 	}
@@ -573,6 +622,11 @@ func (m *Manager) fulfillAuthorization(ctx context.Context, authzURL string, req
 		}
 	}(chal.Token)
 
+	// Perform HTTP-01 challenge self-check before accepting challenge
+	if err := m.selfCheckChallenge(ctx, authz.Identifier.Value, chal.Token, keyAuth); err != nil {
+		return fmt.Errorf("self-check failed for %s: %w", authz.Identifier.Value, err)
+	}
+
 	if _, err := m.client.Accept(ctx, chal); err != nil {
 		return fmt.Errorf("failed to accept challenge: %w", err)
 	}
@@ -581,5 +635,84 @@ func (m *Manager) fulfillAuthorization(ctx context.Context, authzURL string, req
 		return fmt.Errorf("authorization failed for %s: %w", authz.Identifier.Value, err)
 	}
 
+	// A Gateway holds a validated binding for a set of hostnames only after that Gateway
+	// itself proved that it serves them. When candidates is empty, the challenge went to
+	// exactly one requester (req), which proved domain control by passing self-check and
+	// ACME authorization. On renewal (when candidates is non-empty), the challenge may be
+	// served by any shared-front-end candidate and certserver cannot distinguish which one
+	// served it; therefore, renewals record no validated bindings, and Gateways prove
+	// themselves through their own revalidation.
+	if len(candidates) == 0 {
+		ttl := m.opts.ValidatedBindingTTL
+		if ttl <= 0 {
+			ttl = challenge.DefaultValidatedBindingTTL
+		}
+		challenge.RecordValidatedBinding(m.opts.BindingStore, req, m.opts.Clock.Now(), ttl)
+	}
+
 	return nil
+}
+
+// isForbiddenSelfCheckIP reports whether the destination IP address is disallowed
+// for challenge self-checks. Loopback, link-local, unspecified, multicast, and cloud
+// instance metadata service addresses are prohibited to prevent SSRF vulnerabilities.
+func isForbiddenSelfCheckIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	// Cloud instance metadata service addresses: IPv4 169.254.169.254, IPv6 fd00:ec2::254
+	if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00:ec2::254")) {
+		return true
+	}
+	return false
+}
+
+func (m *Manager) selfCheckChallenge(ctx context.Context, hostname, token, keyAuthorization string) error {
+	client := m.selfCheckClient
+	targetURL := fmt.Sprintf("http://%s/.well-known/acme-challenge/%s", hostname, token)
+
+	timeout := m.opts.SelfCheckTimeout
+	interval := m.opts.SelfCheckInterval
+
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	expectedResponse := strings.TrimSpace(keyAuthorization)
+	var lastError error
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		request, err := http.NewRequestWithContext(checkCtx, http.MethodGet, targetURL, nil)
+		if err != nil {
+			return fmt.Errorf("creating self-check request: %w", err)
+		}
+
+		response, err := client.Do(request)
+		if err == nil {
+			body, readErr := io.ReadAll(io.LimitReader(response.Body, 1024))
+			if closeErr := response.Body.Close(); closeErr != nil {
+				log.Printf("certserver: error closing self-check response body: %v", closeErr)
+			}
+			if readErr == nil && response.StatusCode == http.StatusOK && strings.TrimSpace(string(body)) == expectedResponse {
+				return nil
+			}
+			if response.StatusCode != http.StatusOK {
+				lastError = fmt.Errorf("unexpected status %d", response.StatusCode)
+			} else if readErr != nil {
+				lastError = fmt.Errorf("reading response: %w", readErr)
+			} else {
+				lastError = fmt.Errorf("unexpected response body")
+			}
+		} else {
+			lastError = err
+		}
+
+		select {
+		case <-checkCtx.Done():
+			return fmt.Errorf("self-check timed out after %v: %w (last error: %v)", timeout, checkCtx.Err(), lastError)
+		case <-ticker.C:
+		}
+	}
 }

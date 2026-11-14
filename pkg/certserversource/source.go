@@ -44,7 +44,7 @@ const (
 
 // CertClient is the interface representing the pure certserver client.
 type CertClient interface {
-	GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error)
+	GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error)
 	Close() error
 }
 
@@ -409,12 +409,12 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		}
 		s.mu.Unlock()
 
-		cert, leaf, _, err := s.client.GetCertificate(s.ctx, req)
+		info, err := s.client.GetCertificate(s.ctx, req)
 		st, _ := status.FromError(err)
 		stCode := st.Code()
 
 		if err == nil {
-			if cert == nil {
+			if info == nil || info.Certificate == nil {
 				// A pending certificate is retried; this source doesn't serve challenges yet.
 				// Poll at a short fixed interval (minBackoff, 1 second by default) rather than
 				// backing off exponentially. This ensures the controller fetches challenges
@@ -438,6 +438,8 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 				s.mu.Unlock()
 				return
 			}
+			cert := info.Certificate
+			leaf := info.Leaf
 			entry.inFlight = false
 			entry.state = stateReady
 			entry.certificate = cert

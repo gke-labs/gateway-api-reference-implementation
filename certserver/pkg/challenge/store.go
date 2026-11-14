@@ -157,16 +157,12 @@ func (s *MemoryStore) GetChallengesForRequester(ctx context.Context, req Request
 }
 
 func requesterMatches(item *Item, req Requester) bool {
-	if item.Requester.ClusterID == req.ClusterID && item.Requester.Gateway == req.Gateway {
-		if req.HostnamesKey == "" || item.Requester.HostnamesKey == "" || item.Requester.HostnamesKey == req.HostnamesKey {
-			return true
-		}
+	if item.Requester.ClusterID == req.ClusterID && item.Requester.Gateway == req.Gateway && item.Requester.HostnamesKey == req.HostnamesKey {
+		return true
 	}
 	for _, candidate := range item.CandidateRequesters {
-		if candidate.ClusterID == req.ClusterID && candidate.Gateway == req.Gateway {
-			if req.HostnamesKey == "" || candidate.HostnamesKey == "" || candidate.HostnamesKey == req.HostnamesKey {
-				return true
-			}
+		if candidate.ClusterID == req.ClusterID && candidate.Gateway == req.Gateway && candidate.HostnamesKey == req.HostnamesKey {
+			return true
 		}
 	}
 	return false

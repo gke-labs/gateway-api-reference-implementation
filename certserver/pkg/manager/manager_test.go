@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -60,6 +61,20 @@ func (c *mockClock) Set(t time.Time) {
 	c.now = t
 }
 
+func pebbleSelfCheckOption(pebble *testserver.Server) func(*Options) {
+	return func(o *Options) {
+		if pebble != nil && pebble.ChallengeServer != nil {
+			o.SelfCheckClient = &http.Client{
+				Transport: &http.Transport{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return net.Dial(network, pebble.ChallengeServer.Listener.Addr().String())
+					},
+				},
+			}
+		}
+	}
+}
+
 func createTestManager(
 	t *testing.T,
 	pebble *testserver.Server,
@@ -92,6 +107,7 @@ func createTestManager(
 	}
 
 	defaultOptFns := []func(*Options){
+		pebbleSelfCheckOption(pebble),
 		func(o *Options) {
 			if clock != nil {
 				o.Clock = clock
@@ -364,7 +380,7 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 		t.Fatalf("failed to create ACME client: %v", err)
 	}
 
-	mgr := NewManager(acmeCli, diskCache, pebble.ChallengeStore, m, func(o *Options) {
+	mgr := NewManager(acmeCli, diskCache, pebble.ChallengeStore, m, pebbleSelfCheckOption(pebble), func(o *Options) {
 		o.Clock = clock
 		o.RenewalCheckInterval = time.Hour // manual CheckRenewals control
 		o.InitialRetryBackoff = 100 * time.Millisecond
@@ -459,7 +475,7 @@ func TestManager_Pebble_ExternalAccountBinding(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
 	diskCache, _ := cache.NewDiskCache(cacheDir)
-	mgr := NewManager(acmeCli, diskCache, pebble.ChallengeStore, m)
+	mgr := NewManager(acmeCli, diskCache, pebble.ChallengeStore, m, pebbleSelfCheckOption(pebble))
 
 	ctx := t.Context()
 	if err := mgr.Start(ctx); err != nil {
@@ -591,7 +607,7 @@ func TestManager_AccountKeyPersistenceAndReuseOnRestart(t *testing.T) {
 	}
 
 	reg := prometheus.NewRegistry()
-	mgr1 := NewManager(acmeCli1, diskCache1, pebble.ChallengeStore, metrics.New(reg))
+	mgr1 := NewManager(acmeCli1, diskCache1, pebble.ChallengeStore, metrics.New(reg), pebbleSelfCheckOption(pebble))
 	if err := mgr1.Start(ctx); err != nil {
 		t.Fatalf("mgr1.Start failed: %v", err)
 	}
@@ -637,7 +653,7 @@ func TestManager_AccountKeyPersistenceAndReuseOnRestart(t *testing.T) {
 		t.Fatalf("NewClient 2 failed: %v", err)
 	}
 
-	mgr2 := NewManager(acmeCli2, diskCache2, pebble.ChallengeStore, metrics.New(prometheus.NewRegistry()))
+	mgr2 := NewManager(acmeCli2, diskCache2, pebble.ChallengeStore, metrics.New(prometheus.NewRegistry()), pebbleSelfCheckOption(pebble))
 	if err := mgr2.Start(ctx); err != nil {
 		t.Fatalf("mgr2.Start failed: %v", err)
 	}

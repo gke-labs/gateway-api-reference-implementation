@@ -35,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/client"
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 )
@@ -82,11 +83,11 @@ func generateTestTLSCert(t *testing.T) (*tls.Certificate, *x509.Certificate) {
 }
 
 type mockCertClient struct {
-	getCertFunc func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error)
+	getCertFunc func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error)
 	closeFunc   func() error
 }
 
-func (m *mockCertClient) GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error) {
+func (m *mockCertClient) GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
 	return m.getCertFunc(ctx, req)
 }
 
@@ -127,12 +128,12 @@ func TestSource_InputValidation(t *testing.T) {
 func TestSource_NamespaceQualifiedDataPlaneServiceAccount(t *testing.T) {
 	reqCh := make(chan *certserverv1.GetCertificateRequest, 1)
 	mock := &mockCertClient{
-		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error) {
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
 			select {
 			case reqCh <- req:
 			default:
 			}
-			return nil, nil, nil, status.Errorf(codes.Unavailable, "issuance in progress")
+			return nil, status.Errorf(codes.Unavailable, "issuance in progress")
 		},
 	}
 
@@ -173,8 +174,8 @@ func TestSource_NamespaceQualifiedDataPlaneServiceAccount(t *testing.T) {
 
 func TestSource_NonRetryableError(t *testing.T) {
 	mock := &mockCertClient{
-		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error) {
-			return nil, nil, nil, status.Errorf(codes.PermissionDenied, "hostname policy refused: domain denied")
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
+			return nil, status.Errorf(codes.PermissionDenied, "hostname policy refused: domain denied")
 		},
 	}
 
@@ -221,12 +222,12 @@ func TestSource_NonRetryableError_Recovery(t *testing.T) {
 
 	var calls atomic.Int32
 	mock := &mockCertClient{
-		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error) {
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
 			idx := calls.Add(1)
 			if idx == 1 {
-				return nil, nil, nil, status.Errorf(codes.PermissionDenied, "temporary policy denial")
+				return nil, status.Errorf(codes.PermissionDenied, "temporary policy denial")
 			}
-			return tlsCert, leaf, nil, nil
+			return &client.CertificateInfo{Certificate: tlsCert, Leaf: leaf}, nil
 		},
 	}
 
@@ -281,12 +282,12 @@ func TestSource_RefusedRefreshPreservesValidCertificate(t *testing.T) {
 
 	var calls atomic.Int32
 	mock := &mockCertClient{
-		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error) {
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
 			idx := calls.Add(1)
 			if idx == 1 {
-				return tlsCert, leaf, nil, nil
+				return &client.CertificateInfo{Certificate: tlsCert, Leaf: leaf}, nil
 			}
-			return nil, nil, nil, status.Errorf(codes.PermissionDenied, "renewal policy refusal")
+			return nil, status.Errorf(codes.PermissionDenied, "renewal policy refusal")
 		},
 	}
 
@@ -358,8 +359,8 @@ func TestSource_Eviction(t *testing.T) {
 	tlsCert, leaf := generateTestTLSCert(t)
 
 	mock := &mockCertClient{
-		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error) {
-			return tlsCert, leaf, nil, nil
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
+			return &client.CertificateInfo{Certificate: tlsCert, Leaf: leaf}, nil
 		},
 	}
 
@@ -417,9 +418,9 @@ func TestSource_Eviction(t *testing.T) {
 func TestSource_Eviction_FailingLoopExits(t *testing.T) {
 	var rpcCalls atomic.Int32
 	mock := &mockCertClient{
-		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error) {
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
 			rpcCalls.Add(1)
-			return nil, nil, nil, status.Errorf(codes.Unavailable, "issuance permanently broken in test")
+			return nil, status.Errorf(codes.Unavailable, "issuance permanently broken in test")
 		},
 	}
 

@@ -159,17 +159,24 @@ func (c *Client) ensureConn(ctx context.Context) (certserverv1.CertificateServic
 	return c.grpcClient, c.dialErr
 }
 
+// CertificateInfo contains the parsed TLS certificate (if issued) and any pending HTTP-01 challenges.
+type CertificateInfo struct {
+	Certificate *tls.Certificate
+	Leaf        *x509.Certificate
+	Challenges  []*certserverv1.HTTP01Challenge
+}
+
 // GetCertificate performs the GetCertificate RPC to certserver, reading the current
-// token from TokenPath and returning the parsed certificate and leaf, or pending challenges.
-func (c *Client) GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest) (*tls.Certificate, *x509.Certificate, []*certserverv1.HTTP01Challenge, error) {
+// token from TokenPath and returning parsed certificate details, or pending challenges.
+func (c *Client) GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest) (*CertificateInfo, error) {
 	grpcCli, err := c.ensureConn(ctx)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	token, err := c.readToken()
 	if err != nil {
-		return nil, nil, nil, status.Errorf(codes.Unauthenticated, "reading token file: %v", err)
+		return nil, status.Errorf(codes.Unauthenticated, "reading token file: %v", err)
 	}
 
 	rpcCtx, cancel := context.WithTimeout(ctx, c.cfg.RPCTimeout)
@@ -180,19 +187,25 @@ func (c *Client) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 
 	resp, err := grpcCli.GetCertificate(rpcCtx, req)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	if len(resp.GetCertificateChain()) == 0 {
-		return nil, nil, resp.GetChallenges(), nil
+		return &CertificateInfo{
+			Challenges: resp.GetChallenges(),
+		}, nil
 	}
 
 	tlsCert, leaf, err := ParseCertificateChain(resp.GetCertificateChain(), resp.GetPrivateKey())
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 
-	return tlsCert, leaf, resp.GetChallenges(), nil
+	return &CertificateInfo{
+		Certificate: tlsCert,
+		Leaf:        leaf,
+		Challenges:  resp.GetChallenges(),
+	}, nil
 }
 
 // ParseCertificateChain parses PEM-encoded certificate chain and private key into tls.Certificate and leaf.
