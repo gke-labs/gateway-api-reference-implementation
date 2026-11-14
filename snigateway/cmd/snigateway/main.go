@@ -169,7 +169,7 @@ func main() {
 	addrProvider.SetControllerName(gariOpts.ControllerName)
 
 	gariOpts.ProxyHTTPSAddr = ""
-	gariOpts.HTTPSListener = tunnelMgr.Listener()
+	gariOpts.HTTPSListener = tunnelMgr.HTTPSListener()
 	gariOpts.HTTPListener = tunnelMgr.HTTPListener()
 	gariOpts.AddressProvider = addrProvider
 	gariOpts.OnGatewaysUpdate = func(gateways []*gatewayv1.Gateway) {

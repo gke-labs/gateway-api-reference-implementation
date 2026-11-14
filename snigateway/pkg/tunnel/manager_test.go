@@ -134,13 +134,13 @@ func TestManager_EndToEnd(t *testing.T) {
 		t.Fatalf("registered hostnames mismatch, got %v", regHosts)
 	}
 
-	// 2. Start an HTTPS server on mgr.Listener()
+	// 2. Start an HTTPS server on mgr.HTTPSListener()
 	tlsCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
 	if err != nil {
 		t.Fatalf("tls.X509KeyPair: %v", err)
 	}
 
-	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{
+	tlsLis := tls.NewListener(mgr.HTTPSListener(), &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 	})
 
@@ -311,7 +311,7 @@ func TestManager_SessionReconnect(t *testing.T) {
 		t.Fatalf("tls.X509KeyPair: %v", err)
 	}
 
-	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{
+	tlsLis := tls.NewListener(mgr.HTTPSListener(), &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 	})
 
@@ -371,7 +371,7 @@ func TestManager_SessionReconnect(t *testing.T) {
 
 func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
 	mgr := NewManager(nil)
-	defer mgr.Listener().Close()
+	defer mgr.HTTPSListener().Close()
 	defer mgr.HTTPListener().Close()
 
 	// Test with connection scenarios representing TLS and plain HTTP streams
@@ -392,7 +392,7 @@ func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
 			srcPort:       54321,
 			dstPort:       443,
 			payload:       []byte("\x16\x03\x01\x00\x05hello"),
-			wantListener:  func(m *Manager) *Listener { return m.Listener() },
+			wantListener:  func(m *Manager) *Listener { return m.HTTPSListener() },
 			otherListener: func(m *Manager) *Listener { return m.HTTPListener() },
 		},
 		{
@@ -403,7 +403,7 @@ func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
 			dstPort:       80,
 			payload:       []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
 			wantListener:  func(m *Manager) *Listener { return m.HTTPListener() },
-			otherListener: func(m *Manager) *Listener { return m.Listener() },
+			otherListener: func(m *Manager) *Listener { return m.HTTPSListener() },
 		},
 	}
 

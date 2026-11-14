@@ -113,7 +113,7 @@ func setupBenchmarkBackend(b testing.TB, srv *Server, serverAddr string, generat
 	}()
 	mgr.UpdateHostnames([]string{hostname})
 
-	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{Certificates: []tls.Certificate{backendCert}})
+	tlsLis := tls.NewListener(mgr.HTTPSListener(), &tls.Config{Certificates: []tls.Certificate{backendCert}})
 	httpSrv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if len(payload) > 0 {
@@ -622,7 +622,7 @@ func runBenchmarkChildBackend(t *testing.T) {
 	}()
 	mgr.UpdateHostnames([]string{hostname})
 
-	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{Certificates: []tls.Certificate{backendCert}})
+	tlsLis := tls.NewListener(mgr.HTTPSListener(), &tls.Config{Certificates: []tls.Certificate{backendCert}})
 	httpSrv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			sizeStr := r.URL.Query().Get("size")

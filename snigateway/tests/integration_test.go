@@ -116,13 +116,13 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 		_ = mgr.Run(ctx)
 	}()
 
-	// 4. Generate backend application certificates and start HTTPS server on tunnel.Listener()
+	// 4. Generate backend application certificates and start HTTPS server on tunnel.HTTPSListener()
 	backendCert, err := generateBackendCert("service.example.com", "updated.example.com")
 	if err != nil {
 		t.Fatalf("generateBackendCert failed: %v", err)
 	}
 
-	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{
+	tlsLis := tls.NewListener(mgr.HTTPSListener(), &tls.Config{
 		Certificates: []tls.Certificate{backendCert},
 	})
 
@@ -397,13 +397,13 @@ func TestTokenAuthentication_ProjectedVolumeAndRotationIntegration(t *testing.T)
 		_ = mgr.Run(ctx)
 	}()
 
-	// 5. Start HTTPS backend on mgr.Listener()
+	// 5. Start HTTPS backend on mgr.HTTPSListener()
 	backendCert, err := generateBackendCert("service.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	backendLis := tls.NewListener(mgr.Listener(), &tls.Config{
+	backendLis := tls.NewListener(mgr.HTTPSListener(), &tls.Config{
 		Certificates: []tls.Certificate{backendCert},
 	})
 	mux := http.NewServeMux()
