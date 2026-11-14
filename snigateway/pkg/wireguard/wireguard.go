@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -41,71 +40,82 @@ var (
 
 // GenerateKey returns a new private key and its corresponding public key.
 func GenerateKey() (Key, Key, error) {
-	priv, err := wgtypes.GeneratePrivateKey()
+	privateKey, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		return Key{}, Key{}, fmt.Errorf("generating private key: %w", err)
 	}
-	return priv, priv.PublicKey(), nil
+	return privateKey, privateKey.PublicKey(), nil
 }
 
 // Config specifies the configuration for opening a kernel WireGuard device.
 type Config struct {
+	// InterfaceName is the name of the network interface to create (e.g. "wg0").
 	InterfaceName string
-	Name          string // alias for InterfaceName
-	PrivateKey    Key
-	ListenPort    int // zero lets the kernel choose
+	// PrivateKey is the WireGuard private key for the device.
+	PrivateKey Key
+	// ListenPort is the UDP port to listen on, or 0 to let the kernel choose.
+	ListenPort int
+	// DeviceAddress is the IP address assigned to the device inside the tunnel.
 	DeviceAddress net.IP
-	Address       net.IP // alias for DeviceAddress
-	TunnelPrefix  *net.IPNet
+	// TunnelPrefix is the network prefix and route for the tunnel.
+	TunnelPrefix *net.IPNet
 }
 
 // Peer represents a WireGuard peer configuration.
 type Peer struct {
-	PublicKey                   Key
-	Endpoint                    *net.UDPAddr
-	AllowedIPs                  []net.IPNet
-	PersistentKeepalive         *time.Duration
-	PersistentKeepaliveInterval *time.Duration // alias for PersistentKeepalive
+	// PublicKey is the WireGuard public key of the remote peer.
+	PublicKey Key
+	// Endpoint is the UDP address of the remote peer, or nil if not yet known.
+	Endpoint *net.UDPAddr
+	// AllowedIPs specifies the IP networks routed to and accepted from this peer.
+	AllowedIPs []net.IPNet
+	// PersistentKeepalive is the interval between keepalive packets, or nil to disable.
+	PersistentKeepalive *time.Duration
 }
 
 // Device manages a kernel WireGuard network interface.
 type Device struct {
-	name   string
-	link   netlink.Link
+	// name is the network interface name (e.g. "wg0").
+	name string
+	// link is the netlink handle to the network interface.
+	link netlink.Link
+	// client is the WireGuard control client for device and peer configuration.
 	client *wgctrl.Client
 
-	mu     sync.Mutex
+	// mu guards closed and serializes device configuration changes.
+	mu sync.Mutex
+	// closed indicates whether the device has been closed.
 	closed bool
 }
 
 // OpenDevice creates a link of type wireguard over rtnetlink, sets the private key
 // and UDP listen port, assigns the device's address inside the tunnel prefix,
 // brings the link up, and adds the route for the prefix.
-// If a later step fails, any created link is cleaned up before returning.
-func OpenDevice(ctx context.Context, config Config) (dev *Device, retErr error) {
+//
+// The netlink calls can't be interrupted, so the context is checked once before
+// the first call. If a later step fails, any created link is cleaned up before
+// returning. Close must run in the network namespace that opened the device.
+func OpenDevice(ctx context.Context, configuration Config) (device *Device, returnError error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	name := config.InterfaceName
-	if name == "" {
-		name = config.Name
-	}
-	if name == "" {
+	interfaceName := configuration.InterfaceName
+	if len(interfaceName) == 0 {
 		return nil, fmt.Errorf("interface name is required")
 	}
-	devAddr := config.DeviceAddress
-	if len(devAddr) == 0 {
-		devAddr = config.Address
+	if len(interfaceName) > 15 {
+		return nil, fmt.Errorf("interface name %q exceeds 15 bytes", interfaceName)
 	}
-	if len(devAddr) == 0 {
+	deviceAddress := configuration.DeviceAddress
+	if len(deviceAddress) == 0 {
 		return nil, fmt.Errorf("device address is required")
 	}
-	if config.TunnelPrefix == nil {
+	if configuration.TunnelPrefix == nil {
 		return nil, fmt.Errorf("tunnel prefix is required")
 	}
 
-	var link netlink.Link = &netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: name}}
+	var link netlink.Link = &netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: interfaceName}}
 	if err := netlink.LinkAdd(link); err != nil {
 		if isPermissionError(err) {
 			return nil, fmt.Errorf("%w: %w", ErrPermission, err)
@@ -113,21 +123,21 @@ func OpenDevice(ctx context.Context, config Config) (dev *Device, retErr error) 
 		if isNotSupportedError(err) {
 			return nil, fmt.Errorf("%w: %w", ErrNotSupported, err)
 		}
-		return nil, fmt.Errorf("creating wireguard link %q: %w", name, err)
+		return nil, fmt.Errorf("creating wireguard link %q: %w", interfaceName, err)
 	}
 
 	var success bool
 	defer func() {
 		if !success {
-			if delErr := netlink.LinkDel(link); delErr != nil {
-				retErr = errors.Join(retErr, delErr)
+			if deleteErr := netlink.LinkDel(link); deleteErr != nil {
+				returnError = errors.Join(returnError, deleteErr)
 			}
 		}
 	}()
 
-	liveLink, err := netlink.LinkByName(name)
+	liveLink, err := netlink.LinkByName(interfaceName)
 	if err != nil {
-		return nil, fmt.Errorf("getting link %q: %w", name, err)
+		return nil, fmt.Errorf("getting link %q: %w", interfaceName, err)
 	}
 	link = liveLink
 
@@ -136,7 +146,7 @@ func OpenDevice(ctx context.Context, config Config) (dev *Device, retErr error) 
 		if isPermissionError(err) {
 			return nil, fmt.Errorf("%w: %w", ErrPermission, err)
 		}
-		if isNotSupportedError(err) || errors.Is(err, syscall.ENOENT) {
+		if isNotSupportedError(err) {
 			return nil, fmt.Errorf("%w: %w", ErrNotSupported, err)
 		}
 		return nil, fmt.Errorf("opening wgctrl client: %w", err)
@@ -144,43 +154,39 @@ func OpenDevice(ctx context.Context, config Config) (dev *Device, retErr error) 
 	defer func() {
 		if !success {
 			if closeErr := wgClient.Close(); closeErr != nil {
-				retErr = errors.Join(retErr, closeErr)
+				returnError = errors.Join(returnError, closeErr)
 			}
 		}
 	}()
 
-	wgCfg := wgtypes.Config{PrivateKey: &config.PrivateKey}
-	if config.ListenPort != 0 {
-		wgCfg.ListenPort = &config.ListenPort
+	wireguardConfig := wgtypes.Config{PrivateKey: &configuration.PrivateKey}
+	if configuration.ListenPort != 0 {
+		wireguardConfig.ListenPort = &configuration.ListenPort
 	}
-	if err := wgClient.ConfigureDevice(name, wgCfg); err != nil {
-		return nil, fmt.Errorf("configuring wireguard device %q: %w", name, err)
+	if err := wgClient.ConfigureDevice(interfaceName, wireguardConfig); err != nil {
+		return nil, fmt.Errorf("configuring wireguard device %q: %w", interfaceName, err)
 	}
 
-	addr := &netlink.Addr{IPNet: &net.IPNet{IP: devAddr, Mask: config.TunnelPrefix.Mask}}
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		return nil, fmt.Errorf("assigning address %s to %q: %w", addr.IPNet, name, err)
+	address := &netlink.Addr{IPNet: &net.IPNet{IP: deviceAddress, Mask: configuration.TunnelPrefix.Mask}}
+	if err := netlink.AddrAdd(link, address); err != nil {
+		return nil, fmt.Errorf("assigning address %s to %q: %w", address.IPNet, interfaceName, err)
 	}
 
 	if err := netlink.LinkSetUp(link); err != nil {
-		return nil, fmt.Errorf("bringing link %q up: %w", name, err)
+		return nil, fmt.Errorf("bringing link %q up: %w", interfaceName, err)
 	}
 
-	dstNet := &net.IPNet{
-		IP:   config.TunnelPrefix.IP.Mask(config.TunnelPrefix.Mask),
-		Mask: config.TunnelPrefix.Mask,
+	destinationNetwork := &net.IPNet{
+		IP:   configuration.TunnelPrefix.IP.Mask(configuration.TunnelPrefix.Mask),
+		Mask: configuration.TunnelPrefix.Mask,
 	}
-	route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dstNet}
+	route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: destinationNetwork}
 	if err := netlink.RouteAdd(route); err != nil && !errors.Is(err, syscall.EEXIST) {
-		return nil, fmt.Errorf("adding prefix route for %s on %q: %w", dstNet, name, err)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("adding prefix route for %s on %q: %w", destinationNetwork, interfaceName, err)
 	}
 
 	success = true
-	return &Device{name: name, link: link, client: wgClient}, nil
+	return &Device{name: interfaceName, link: link, client: wgClient}, nil
 }
 
 // AddPeer adds or updates a WireGuard peer on the device.
@@ -191,20 +197,17 @@ func (d *Device) AddPeer(peer Peer) error {
 		return net.ErrClosed
 	}
 
-	keepalive := peer.PersistentKeepalive
-	if keepalive == nil {
-		keepalive = peer.PersistentKeepaliveInterval
+	peerConfig := wgtypes.PeerConfig{
+		PublicKey:                   peer.PublicKey,
+		Endpoint:                    peer.Endpoint,
+		AllowedIPs:                  peer.AllowedIPs,
+		ReplaceAllowedIPs:           true,
+		PersistentKeepaliveInterval: peer.PersistentKeepalive,
 	}
-	cfg := wgtypes.Config{
-		Peers: []wgtypes.PeerConfig{{
-			PublicKey:                   peer.PublicKey,
-			Endpoint:                    peer.Endpoint,
-			AllowedIPs:                  peer.AllowedIPs,
-			ReplaceAllowedIPs:           true,
-			PersistentKeepaliveInterval: keepalive,
-		}},
+	deviceConfig := wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{peerConfig},
 	}
-	if err := d.client.ConfigureDevice(d.name, cfg); err != nil {
+	if err := d.client.ConfigureDevice(d.name, deviceConfig); err != nil {
 		return fmt.Errorf("adding peer %s to %q: %w", peer.PublicKey, d.name, err)
 	}
 	return nil
@@ -218,19 +221,21 @@ func (d *Device) RemovePeer(publicKey Key) error {
 		return net.ErrClosed
 	}
 
-	cfg := wgtypes.Config{
-		Peers: []wgtypes.PeerConfig{{
-			PublicKey: publicKey,
-			Remove:    true,
-		}},
+	peerConfig := wgtypes.PeerConfig{
+		PublicKey: publicKey,
+		Remove:    true,
 	}
-	if err := d.client.ConfigureDevice(d.name, cfg); err != nil {
+	deviceConfig := wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{peerConfig},
+	}
+	if err := d.client.ConfigureDevice(d.name, deviceConfig); err != nil {
 		return fmt.Errorf("removing peer %s from %q: %w", publicKey, d.name, err)
 	}
 	return nil
 }
 
 // Close closes the WireGuard client and deletes the link.
+// It must run in the network namespace that opened the device.
 func (d *Device) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -263,26 +268,23 @@ func (d *Device) Port() (int, error) {
 	if d.closed {
 		return 0, net.ErrClosed
 	}
-	dev, err := d.client.Device(d.name)
+	wireguardDevice, err := d.client.Device(d.name)
 	if err != nil {
 		return 0, fmt.Errorf("getting wireguard device %q: %w", d.name, err)
 	}
-	return dev.ListenPort, nil
-}
-
-// ListenPort is an alias for Port.
-func (d *Device) ListenPort() (int, error) {
-	return d.Port()
+	return wireguardDevice.ListenPort, nil
 }
 
 func isPermissionError(err error) bool {
-	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) ||
-		strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "permission denied")
+	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES)
 }
 
 func isNotSupportedError(err error) bool {
-	return errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENODEV) ||
-		errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.ESOCKTNOSUPPORT) ||
-		strings.Contains(err.Error(), "operation not supported") || strings.Contains(err.Error(), "not supported") ||
-		strings.Contains(err.Error(), "no such device") || strings.Contains(err.Error(), "unknown device type")
+	// netlink.ErrNotImplemented is returned by vishvananda/netlink stubs on non-Linux platforms (e.g. macOS).
+	return errors.Is(err, netlink.ErrNotImplemented) ||
+		errors.Is(err, syscall.EOPNOTSUPP) ||
+		errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.ENOSYS) ||
+		errors.Is(err, syscall.ESOCKTNOSUPPORT) ||
+		errors.Is(err, syscall.ENOENT)
 }

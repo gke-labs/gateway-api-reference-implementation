@@ -21,32 +21,32 @@ import (
 	"net"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func TestGenerateKey(t *testing.T) {
-	priv, pub, err := GenerateKey()
+	privateKey, publicKey, err := GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
 	}
-	if priv == (Key{}) {
+	if privateKey == (Key{}) {
 		t.Fatal("private key is all zeros")
 	}
-	if pub == (Key{}) {
+	if publicKey == (Key{}) {
 		t.Fatal("public key is all zeros")
 	}
-	if pub != priv.PublicKey() {
-		t.Fatalf("public key mismatch: got %s, want %s", pub, priv.PublicKey())
+	if publicKey != privateKey.PublicKey() {
+		t.Fatalf("public key mismatch: got %s, want %s", publicKey, privateKey.PublicKey())
 	}
 }
 
-func TestOpenDevice_MissingPermissionsOrUnsupported(t *testing.T) {
-	priv, _, err := GenerateKey()
+func TestOpenDevice_InvalidInterfaceName(t *testing.T) {
+	privateKey, _, err := GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
 	}
@@ -55,89 +55,88 @@ func TestOpenDevice_MissingPermissionsOrUnsupported(t *testing.T) {
 		t.Fatalf("ParseCIDR failed: %v", err)
 	}
 
-	cfg := Config{
-		InterfaceName: "wg-test-probe",
-		PrivateKey:    priv,
-		ListenPort:    0,
-		DeviceAddress: net.ParseIP("fd00::1"),
-		TunnelPrefix:  prefix,
+	testCases := []struct {
+		name          string
+		interfaceName string
+	}{
+		{
+			name:          "empty",
+			interfaceName: "",
+		},
+		{
+			name:          "too long",
+			interfaceName: "wg-interface-name-too-long",
+		},
 	}
 
-	dev, err := OpenDevice(t.Context(), cfg)
-	if err != nil {
-		if !errors.Is(err, ErrPermission) && !errors.Is(err, ErrNotSupported) {
-			t.Fatalf("expected ErrPermission or ErrNotSupported, got: %v", err)
-		}
-		errMsg := err.Error()
-		if !strings.Contains(errMsg, "CAP_NET_ADMIN") && !strings.Contains(errMsg, "WireGuard support") {
-			t.Fatalf("error message does not indicate missing capability or WireGuard support: %v", err)
-		}
-		t.Logf("OpenDevice correctly reported error: %v", err)
-		return
-	}
-	// If it succeeded, clean up the device.
-	if closeErr := dev.Close(); closeErr != nil {
-		t.Logf("cleanup error: %v", closeErr)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := OpenDevice(t.Context(), Config{
+				InterfaceName: tc.interfaceName,
+				PrivateKey:    privateKey,
+				ListenPort:    0,
+				DeviceAddress: net.ParseIP("fd00::1"),
+				TunnelPrefix:  prefix,
+			})
+			if err == nil {
+				t.Fatalf("expected OpenDevice to fail with interface name %q, got nil", tc.interfaceName)
+			}
+		})
 	}
 }
 
-type testNSWorker struct {
-	ns   netns.NsHandle
-	work chan func()
+type testNamespaceWorker struct {
+	namespace netns.NsHandle
+	work      chan func()
 }
 
-func newTestNSWorker() (*testNSWorker, error) {
-	w := &testNSWorker{
+func newTestNamespaceWorker() (*testNamespaceWorker, error) {
+	worker := &testNamespaceWorker{
 		work: make(chan func()),
 	}
 	ready := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
-		ns, err := netns.New()
+		namespace, err := netns.New()
 		if err != nil {
 			ready <- err
 			return
 		}
-		w.ns = ns
+		worker.namespace = namespace
 		close(ready)
-		for fn := range w.work {
-			fn()
+		for workFunc := range worker.work {
+			workFunc()
 		}
 	}()
 	if err := <-ready; err != nil {
 		return nil, err
 	}
-	return w, nil
+	return worker, nil
 }
 
-func (w *testNSWorker) Do(fn func() error) error {
+func (worker *testNamespaceWorker) Do(workFunc func() error) error {
 	var err error
 	done := make(chan struct{})
-	w.work <- func() {
+	worker.work <- func() {
 		defer close(done)
-		err = fn()
+		err = workFunc()
 	}
 	<-done
 	return err
 }
 
-func (w *testNSWorker) Close() {
-	if w.work != nil {
-		close(w.work)
+func (worker *testNamespaceWorker) Close() error {
+	if worker.work != nil {
+		close(worker.work)
 	}
-	if w.ns.IsOpen() {
-		_ = w.ns.Close()
+	if worker.namespace.IsOpen() {
+		return worker.namespace.Close()
 	}
+	return nil
 }
 
-func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
-	w, err := newTestNSWorker()
-	if err != nil {
-		t.Skipf("skipping test: cannot create network namespace: %v", err)
-	}
-	defer w.Close()
-
-	priv, _, err := GenerateKey()
+func TestOpenDevice_MissingPermissionsOrUnsupported(t *testing.T) {
+	privateKey, _, err := GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
 	}
@@ -146,30 +145,101 @@ func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
 		t.Fatalf("ParseCIDR failed: %v", err)
 	}
 
-	const ifName = "wg-fail-cleanup"
-	err = w.Do(func() error {
+	configuration := Config{
+		InterfaceName: "wg-test-probe",
+		PrivateKey:    privateKey,
+		ListenPort:    0,
+		DeviceAddress: net.ParseIP("fd00::1"),
+		TunnelPrefix:  prefix,
+	}
+
+	runProbe := func() {
+		device, openErr := OpenDevice(t.Context(), configuration)
+		if openErr != nil {
+			if !errors.Is(openErr, ErrPermission) && !errors.Is(openErr, ErrNotSupported) {
+				t.Fatalf("expected ErrPermission or ErrNotSupported, got: %v", openErr)
+			}
+			errorMessage := openErr.Error()
+			if !strings.Contains(errorMessage, "CAP_NET_ADMIN") && !strings.Contains(errorMessage, "WireGuard support") {
+				t.Fatalf("error message does not indicate missing capability or WireGuard support: %v", openErr)
+			}
+			t.Logf("OpenDevice correctly reported error: %v", openErr)
+			return
+		}
+		t.Cleanup(func() {
+			if closeErr := device.Close(); closeErr != nil {
+				t.Logf("cleanup error: %v", closeErr)
+			}
+		})
+	}
+
+	worker, err := newTestNamespaceWorker()
+	if err != nil {
+		// When unprivileged or without network namespace support (such as macOS),
+		// run directly without touching host links because link creation will fail.
+		runProbe()
+		return
+	}
+	t.Cleanup(func() {
+		if closeErr := worker.Close(); closeErr != nil {
+			t.Errorf("closing worker namespace: %v", closeErr)
+		}
+	})
+
+	if err := worker.Do(func() error {
+		runProbe()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
+	worker, err := newTestNamespaceWorker()
+	if err != nil {
+		t.Skipf("skipping test: cannot create network namespace: %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := worker.Close(); closeErr != nil {
+			t.Errorf("closing worker namespace: %v", closeErr)
+		}
+	})
+
+	privateKey, _, err := GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	_, prefix, err := net.ParseCIDR("fd00::/64")
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
+
+	const interfaceName = "wg-fail-cleanup"
+	err = worker.Do(func() error {
 		// Provide an invalid IP address to cause AddrAdd to fail after LinkAdd succeeds.
-		cfg := Config{
-			InterfaceName: ifName,
-			PrivateKey:    priv,
+		configuration := Config{
+			InterfaceName: interfaceName,
+			PrivateKey:    privateKey,
 			ListenPort:    0,
 			DeviceAddress: net.IP{1, 2}, // invalid IP length
 			TunnelPrefix:  prefix,
 		}
-		dev, oErr := OpenDevice(t.Context(), cfg)
-		if oErr == nil {
-			_ = dev.Close()
+		device, openErr := OpenDevice(t.Context(), configuration)
+		if openErr == nil {
+			if closeErr := device.Close(); closeErr != nil {
+				t.Errorf("closing unexpected device: %v", closeErr)
+			}
 			return fmt.Errorf("expected OpenDevice to fail with invalid IP, but succeeded")
 		}
 
-		if errors.Is(oErr, ErrPermission) || errors.Is(oErr, ErrNotSupported) {
-			return oErr
+		if errors.Is(openErr, ErrPermission) || errors.Is(openErr, ErrNotSupported) {
+			return openErr
 		}
 
 		// Verify the link was cleaned up and does not exist.
-		_, getErr := netlink.LinkByName(ifName)
+		_, getErr := netlink.LinkByName(interfaceName)
 		if getErr == nil {
-			return fmt.Errorf("link %q was left behind after OpenDevice failure", ifName)
+			return fmt.Errorf("link %q was left behind after OpenDevice failure", interfaceName)
 		}
 		return nil
 	})
@@ -182,18 +252,89 @@ func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
 	}
 }
 
+func configureVethInterface(worker *testNamespaceWorker, interfaceName string, address net.IP) error {
+	return worker.Do(func() error {
+		loopback, err := netlink.LinkByName("lo")
+		if err != nil {
+			return fmt.Errorf("getting lo link: %w", err)
+		}
+		if err := netlink.LinkSetUp(loopback); err != nil {
+			return fmt.Errorf("bringing lo up: %w", err)
+		}
+		link, err := netlink.LinkByName(interfaceName)
+		if err != nil {
+			return fmt.Errorf("getting %q link: %w", interfaceName, err)
+		}
+		addr := &netlink.Addr{
+			IPNet: &net.IPNet{
+				IP:   address,
+				Mask: net.CIDRMask(24, 32),
+			},
+		}
+		if err := netlink.AddrAdd(link, addr); err != nil {
+			return fmt.Errorf("adding address to %q: %w", interfaceName, err)
+		}
+		if err := netlink.LinkSetUp(link); err != nil {
+			return fmt.Errorf("bringing %q up: %w", interfaceName, err)
+		}
+		return nil
+	})
+}
+
+func openTestDevice(t *testing.T, worker *testNamespaceWorker, interfaceName string, privateKey Key, deviceAddress net.IP, tunnelPrefix *net.IPNet) (*Device, int) {
+	t.Helper()
+	var device *Device
+	var port int
+	err := worker.Do(func() error {
+		var openErr error
+		device, openErr = OpenDevice(t.Context(), Config{
+			InterfaceName: interfaceName,
+			PrivateKey:    privateKey,
+			ListenPort:    0,
+			DeviceAddress: deviceAddress,
+			TunnelPrefix:  tunnelPrefix,
+		})
+		if openErr != nil {
+			return openErr
+		}
+		var portErr error
+		port, portErr = device.Port()
+		return portErr
+	})
+	if err != nil {
+		if errors.Is(err, ErrPermission) || errors.Is(err, ErrNotSupported) {
+			t.Skipf("skipping test: cannot create WireGuard link: %v", err)
+		}
+		t.Fatalf("opening device %q: %v", interfaceName, err)
+	}
+	t.Cleanup(func() {
+		if closeErr := worker.Do(func() error { return device.Close() }); closeErr != nil {
+			t.Errorf("closing device %q: %v", interfaceName, closeErr)
+		}
+	})
+	return device, port
+}
+
 func TestWireGuard_NamespaceCommunication(t *testing.T) {
-	w1, err := newTestNSWorker()
+	worker1, err := newTestNamespaceWorker()
 	if err != nil {
 		t.Skipf("skipping test: cannot create network namespace: %v", err)
 	}
-	defer w1.Close()
+	t.Cleanup(func() {
+		if closeErr := worker1.Close(); closeErr != nil {
+			t.Errorf("closing worker1 namespace: %v", closeErr)
+		}
+	})
 
-	w2, err := newTestNSWorker()
+	worker2, err := newTestNamespaceWorker()
 	if err != nil {
 		t.Skipf("skipping test: cannot create second network namespace: %v", err)
 	}
-	defer w2.Close()
+	t.Cleanup(func() {
+		if closeErr := worker2.Close(); closeErr != nil {
+			t.Errorf("closing worker2 namespace: %v", closeErr)
+		}
+	})
 
 	// Create veth pair to link the two namespaces.
 	veth := &netlink.Veth{
@@ -203,9 +344,11 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 	if err := netlink.LinkAdd(veth); err != nil {
 		t.Skipf("skipping test: cannot create veth pair: %v", err)
 	}
-	defer func() {
-		_ = netlink.LinkDel(veth)
-	}()
+	t.Cleanup(func() {
+		if delErr := netlink.LinkDel(veth); delErr != nil && !errors.Is(delErr, syscall.ENODEV) {
+			t.Errorf("deleting veth link: %v", delErr)
+		}
+	})
 
 	veth1, err := netlink.LinkByName("veth-test1")
 	if err != nil {
@@ -216,65 +359,26 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 		t.Fatalf("finding veth-test2: %v", err)
 	}
 
-	if err := netlink.LinkSetNsFd(veth1, int(w1.ns)); err != nil {
+	if err := netlink.LinkSetNsFd(veth1, int(worker1.namespace)); err != nil {
 		t.Fatalf("moving veth-test1 to ns1: %v", err)
 	}
-	if err := netlink.LinkSetNsFd(veth2, int(w2.ns)); err != nil {
+	if err := netlink.LinkSetNsFd(veth2, int(worker2.namespace)); err != nil {
 		t.Fatalf("moving veth-test2 to ns2: %v", err)
 	}
 
-	// Configure veth in ns1.
-	if err := w1.Do(func() error {
-		lo, _ := netlink.LinkByName("lo")
-		if lo != nil {
-			_ = netlink.LinkSetUp(lo)
-		}
-		link, err := netlink.LinkByName("veth-test1")
-		if err != nil {
-			return err
-		}
-		if err := netlink.AddrAdd(link, &netlink.Addr{
-			IPNet: &net.IPNet{
-				IP:   net.ParseIP("10.0.0.1"),
-				Mask: net.CIDRMask(24, 32),
-			},
-		}); err != nil {
-			return err
-		}
-		return netlink.LinkSetUp(link)
-	}); err != nil {
+	if err := configureVethInterface(worker1, "veth-test1", net.ParseIP("10.0.0.1")); err != nil {
 		t.Fatalf("configuring veth in ns1: %v", err)
 	}
-
-	// Configure veth in ns2.
-	if err := w2.Do(func() error {
-		lo, _ := netlink.LinkByName("lo")
-		if lo != nil {
-			_ = netlink.LinkSetUp(lo)
-		}
-		link, err := netlink.LinkByName("veth-test2")
-		if err != nil {
-			return err
-		}
-		if err := netlink.AddrAdd(link, &netlink.Addr{
-			IPNet: &net.IPNet{
-				IP:   net.ParseIP("10.0.0.2"),
-				Mask: net.CIDRMask(24, 32),
-			},
-		}); err != nil {
-			return err
-		}
-		return netlink.LinkSetUp(link)
-	}); err != nil {
+	if err := configureVethInterface(worker2, "veth-test2", net.ParseIP("10.0.0.2")); err != nil {
 		t.Fatalf("configuring veth in ns2: %v", err)
 	}
 
 	// Generate keys.
-	priv1, pub1, err := GenerateKey()
+	privateKey1, publicKey1, err := GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey 1 failed: %v", err)
 	}
-	priv2, pub2, err := GenerateKey()
+	privateKey2, publicKey2, err := GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey 2 failed: %v", err)
 	}
@@ -284,113 +388,76 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 		t.Fatalf("ParseCIDR failed: %v", err)
 	}
 
-	// Open wireguard device in ns1.
-	var dev1 *Device
-	var port1 int
-	if err := w1.Do(func() error {
-		var oErr error
-		dev1, oErr = OpenDevice(t.Context(), Config{
-			InterfaceName: "wg0",
-			PrivateKey:    priv1,
-			ListenPort:    0,
-			DeviceAddress: net.ParseIP("fd00::1"),
-			TunnelPrefix:  prefix,
-		})
-		if oErr != nil {
-			return oErr
-		}
-		port1, oErr = dev1.Port()
-		return oErr
-	}); err != nil {
-		if errors.Is(err, ErrPermission) || errors.Is(err, ErrNotSupported) {
-			t.Skipf("skipping test: cannot create WireGuard link in ns1: %v", err)
-		}
-		t.Fatalf("opening device in ns1: %v", err)
-	}
-	defer func() {
-		_ = w1.Do(func() error { return dev1.Close() })
-	}()
-
-	// Open wireguard device in ns2.
-	var dev2 *Device
-	var port2 int
-	if err := w2.Do(func() error {
-		var oErr error
-		dev2, oErr = OpenDevice(t.Context(), Config{
-			InterfaceName: "wg0",
-			PrivateKey:    priv2,
-			ListenPort:    0,
-			DeviceAddress: net.ParseIP("fd00::2"),
-			TunnelPrefix:  prefix,
-		})
-		if oErr != nil {
-			return oErr
-		}
-		port2, oErr = dev2.Port()
-		return oErr
-	}); err != nil {
-		if errors.Is(err, ErrPermission) || errors.Is(err, ErrNotSupported) {
-			t.Skipf("skipping test: cannot create WireGuard link in ns2: %v", err)
-		}
-		t.Fatalf("opening device in ns2: %v", err)
-	}
-	defer func() {
-		_ = w2.Do(func() error { return dev2.Close() })
-	}()
+	device1, port1 := openTestDevice(t, worker1, "wg0", privateKey1, net.ParseIP("fd00::1"), prefix)
+	device2, port2 := openTestDevice(t, worker2, "wg0", privateKey2, net.ParseIP("fd00::2"), prefix)
 
 	// Add peers.
-	_, allowedPeer2, _ := net.ParseCIDR("fd00::2/128")
-	if err := w1.Do(func() error {
-		return dev1.AddPeer(Peer{
-			PublicKey:  pub2,
+	_, allowedPeer2, err := net.ParseCIDR("fd00::2/128")
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
+	if err := worker1.Do(func() error {
+		return device1.AddPeer(Peer{
+			PublicKey:  publicKey2,
 			Endpoint:   &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: port2},
 			AllowedIPs: []net.IPNet{*allowedPeer2},
 		})
 	}); err != nil {
-		t.Fatalf("dev1 AddPeer: %v", err)
+		t.Fatalf("device1 AddPeer: %v", err)
 	}
 
-	_, allowedPeer1, _ := net.ParseCIDR("fd00::1/128")
-	if err := w2.Do(func() error {
-		return dev2.AddPeer(Peer{
-			PublicKey:  pub1,
+	_, allowedPeer1, err := net.ParseCIDR("fd00::1/128")
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
+	if err := worker2.Do(func() error {
+		return device2.AddPeer(Peer{
+			PublicKey:  publicKey1,
 			Endpoint:   &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: port1},
 			AllowedIPs: []net.IPNet{*allowedPeer1},
 		})
 	}); err != nil {
-		t.Fatalf("dev2 AddPeer: %v", err)
+		t.Fatalf("device2 AddPeer: %v", err)
 	}
 
 	// Start TCP listener inside ns2 on tunnel address.
-	var ln net.Listener
-	if err := w2.Do(func() error {
-		var lErr error
-		ln, lErr = net.Listen("tcp", "[fd00::2]:9999")
-		return lErr
+	var listener net.Listener
+	if err := worker2.Do(func() error {
+		var listenErr error
+		listener, listenErr = net.Listen("tcp", "[fd00::2]:9999")
+		return listenErr
 	}); err != nil {
 		t.Fatalf("Listen in ns2: %v", err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() {
+		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Errorf("closing listener: %v", closeErr)
+		}
+	})
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		conn, err := ln.Accept()
+		serverConnection, err := listener.Accept()
 		if err != nil {
 			serverErrCh <- err
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			if closeErr := serverConnection.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				t.Errorf("closing server connection: %v", closeErr)
+			}
+		}()
 
-		buf := make([]byte, 5)
-		if _, err := io.ReadFull(conn, buf); err != nil {
+		buffer := make([]byte, 5)
+		if _, err := io.ReadFull(serverConnection, buffer); err != nil {
 			serverErrCh <- fmt.Errorf("server read: %w", err)
 			return
 		}
-		if string(buf) != "ping!" {
-			serverErrCh <- fmt.Errorf("unexpected server read: %q", string(buf))
+		if string(buffer) != "ping!" {
+			serverErrCh <- fmt.Errorf("unexpected server read: %q", string(buffer))
 			return
 		}
-		if _, err := conn.Write([]byte("pong!")); err != nil {
+		if _, err := serverConnection.Write([]byte("pong!")); err != nil {
 			serverErrCh <- fmt.Errorf("server write: %w", err)
 			return
 		}
@@ -398,44 +465,47 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 	}()
 
 	// Dial TCP from ns1 over tunnel.
-	var conn net.Conn
-	if err := w1.Do(func() error {
-		var dErr error
-		conn, dErr = net.DialTimeout("tcp", "[fd00::2]:9999", 5*time.Second)
-		return dErr
+	var clientConnection net.Conn
+	if err := worker1.Do(func() error {
+		var dialErr error
+		clientConnection, dialErr = net.DialTimeout("tcp", "[fd00::2]:9999", 5*time.Second)
+		return dialErr
 	}); err != nil {
 		t.Fatalf("Dial from ns1: %v", err)
 	}
-	defer conn.Close()
 
-	if _, err := conn.Write([]byte("ping!")); err != nil {
+	if _, err := clientConnection.Write([]byte("ping!")); err != nil {
 		t.Fatalf("client write: %v", err)
 	}
-	resp := make([]byte, 5)
-	if _, err := io.ReadFull(conn, resp); err != nil {
+	response := make([]byte, 5)
+	if _, err := io.ReadFull(clientConnection, response); err != nil {
 		t.Fatalf("client read: %v", err)
 	}
-	if string(resp) != "pong!" {
-		t.Fatalf("unexpected client response: %q", string(resp))
+	if string(response) != "pong!" {
+		t.Fatalf("unexpected client response: %q", string(response))
 	}
-	_ = conn.Close()
+	if closeErr := clientConnection.Close(); closeErr != nil {
+		t.Fatalf("closing client connection: %v", closeErr)
+	}
 
 	if err := <-serverErrCh; err != nil {
 		t.Fatalf("server handler error: %v", err)
 	}
 
-	// Remove peer from dev1.
-	if err := w1.Do(func() error {
-		return dev1.RemovePeer(pub2)
+	// Remove peer from device1.
+	if err := worker1.Do(func() error {
+		return device1.RemovePeer(publicKey2)
 	}); err != nil {
-		t.Fatalf("dev1 RemovePeer: %v", err)
+		t.Fatalf("device1 RemovePeer: %v", err)
 	}
 
 	// Verify new connection fails after peer removal.
-	if err := w1.Do(func() error {
-		failConn, dErr := net.DialTimeout("tcp", "[fd00::2]:9999", 500*time.Millisecond)
-		if dErr == nil {
-			failConn.Close()
+	if err := worker1.Do(func() error {
+		failConnection, dialErr := net.DialTimeout("tcp", "[fd00::2]:9999", 500*time.Millisecond)
+		if dialErr == nil {
+			if closeErr := failConnection.Close(); closeErr != nil {
+				t.Errorf("closing unexpected connection: %v", closeErr)
+			}
 			return fmt.Errorf("expected connection to fail after removing peer, but succeeded")
 		}
 		return nil
@@ -443,6 +513,3 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-
-// Compile-time interface checks.
-var _ = wgtypes.Key{}
