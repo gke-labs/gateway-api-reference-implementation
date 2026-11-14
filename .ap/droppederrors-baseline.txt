@@ -1,3 +1,4 @@
 # Baseline for ap droppederrors ratchet.
 # Entries: <file>:<enclosing-function>[:<category>]:<callee>
 # Do not add entries manually; fix errors or run 'ap lint droppederrors --write-baseline' if approved.
+experiments/diskstore/engine/engine.go:(*Engine).backgroundQuarantineSweep:(*github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/engine.Engine).QuarantineSweep

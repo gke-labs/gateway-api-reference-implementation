@@ -441,7 +441,7 @@ func TestQuarantineFiles_EmptyList(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
-	err := quarantineFiles(memFS, dir, nil, QuarantineOptions{})
+	_, err := quarantineFiles(memFS, dir, nil, QuarantineOptions{}, false)
 	if err != nil {
 		t.Fatalf("quarantineFiles with empty list failed: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestQuarantineFiles_MovesFilesAndSyncsBothDirs(t *testing.T) {
 		_ = f.Close()
 	}
 
-	err := quarantineFiles(memFS, dir, []string{"file1.bin", "file2.bin"}, QuarantineOptions{})
+	_, err := quarantineFiles(memFS, dir, []string{"file1.bin", "file2.bin"}, QuarantineOptions{}, false)
 	if err != nil {
 		t.Fatalf("quarantineFiles failed: %v", err)
 	}
@@ -524,7 +524,7 @@ func TestQuarantineFiles_RenameError_ReturnsFirstErrorAndDeletesNothing(t *testi
 		},
 	}
 
-	err = quarantineFiles(hookFS, dir, []string{fileName}, QuarantineOptions{})
+	_, err = quarantineFiles(hookFS, dir, []string{fileName}, QuarantineOptions{}, false)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -558,10 +558,10 @@ func TestQuarantineFiles_PruningAndBoundsApplied(t *testing.T) {
 		_ = f.Close()
 	}
 
-	err := quarantineFiles(memFS, dir, names, QuarantineOptions{
+	_, err := quarantineFiles(memFS, dir, names, QuarantineOptions{
 		MaxQuarantinedFiles:     2,
 		MinQuarantinedRetention: -1,
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("quarantineFiles failed: %v", err)
 	}
@@ -573,5 +573,39 @@ func TestQuarantineFiles_PruningAndBoundsApplied(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Fatalf("expected exactly 2 files in lost+found after pruning, got %d", len(entries))
+	}
+}
+
+func TestQuarantineFiles_SkipNotExistParameter(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_quarantine_skip_not_exist"
+	if err := memFS.MkdirAll(dir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	// Create one existing file and reference one missing file
+	f, err := memFS.OpenFile(filepath.Join(dir, "present.dat"), os.O_CREATE|os.O_WRONLY, StoreFileMode)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	files := []string{"nonexistent.dat", "present.dat"}
+
+	// When skipNotExist is false (offline recovery/WAL cleanup), missing file is an error
+	_, err = quarantineFiles(memFS, dir, files, QuarantineOptions{}, false)
+	if err == nil {
+		t.Fatalf("expected error when skipNotExist=false and file is missing, got nil")
+	}
+
+	// When skipNotExist is true (live sweep), missing file is skipped and existing file is moved
+	moved, err := quarantineFiles(memFS, dir, files, QuarantineOptions{}, true)
+	if err != nil {
+		t.Fatalf("quarantineFiles with skipNotExist=true failed: %v", err)
+	}
+	if len(moved) != 1 || moved[0] != "present.dat" {
+		t.Fatalf("expected [present.dat] moved, got %v", moved)
 	}
 }

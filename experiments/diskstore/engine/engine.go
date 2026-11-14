@@ -23,6 +23,7 @@ import (
 	"hash/crc32"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -293,6 +295,11 @@ type Engine struct {
 
 	closed   atomic.Bool
 	closedCh chan struct{}
+
+	// sweepInterval is the duration between periodic sweeps for unreferenced oversize files.
+	sweepInterval time.Duration
+	// sweepDone is closed when the background quarantine sweep goroutine terminates.
+	sweepDone chan struct{}
 }
 
 func removeDirRecursive(fs FS, dir string) error {
@@ -866,6 +873,18 @@ func Open(opts ...Option) (*Engine, error) {
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
+	}
+
+	sweepInterval := DefaultQuarantineSweepInterval
+	if options.Quarantine.SweepInterval > 0 {
+		sweepInterval = options.Quarantine.SweepInterval
+	} else if options.Quarantine.SweepInterval < 0 {
+		sweepInterval = 0
+	}
+	s.sweepInterval = sweepInterval
+	if s.sweepInterval > 0 {
+		s.sweepDone = make(chan struct{})
+		go s.backgroundQuarantineSweep()
 	}
 
 	return s, nil
@@ -1917,6 +1936,9 @@ func (s *Engine) Close() error {
 		return nil
 	}
 	close(s.closedCh)
+	if s.sweepDone != nil {
+		<-s.sweepDone
+	}
 
 	var errs []error
 	// If not failed, checkpoint on close to truncate WAL and speed up reopen
@@ -1952,4 +1974,87 @@ func (s *Engine) Close() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (s *Engine) backgroundQuarantineSweep() {
+	defer close(s.sweepDone)
+	ticker := time.NewTicker(s.sweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.closedCh:
+			return
+		case <-ticker.C:
+			if !s.isFailed() {
+				// QuarantineSweep logs its own error on failure.
+				_ = s.QuarantineSweep()
+			}
+		}
+	}
+}
+
+// QuarantineSweep runs a sweep to quarantine unreferenced oversize files.
+//
+// The sweep lists the oversize directory first, then snapshots the in-flight registry
+// and the key index under writerMu. Because Put registers temporary and final file names
+// in the in-flight registry before creating them on disk, every file present in the directory
+// listing is guaranteed to be recorded in the in-flight registry when read, or in the key
+// index if Put has already completed. If a temporary file in the listing no longer exists
+// when the sweep attempts to move it (because a concurrent Put renamed it to final), the
+// sweep skips it.
+//
+// The sweep holds writerMu while it lists the directory, renames files, prunes lost+found,
+// and fsyncs directories. Moving at most 100 files bounds writerMu lock hold time to around
+// 36 milliseconds even with thousands of unreferenced files, preventing concurrent writers
+// from being stalled. QuarantineSweep bounds the number of files moved in a single pass
+// to DefaultMaxQuarantineSweepBatch (100) so that remaining files are moved in subsequent sweeps.
+//
+// If moving a file to quarantine or syncing directories fails, QuarantineSweep logs the error
+// and returns it. The engine keeps running and remains operational, and the next sweep tries
+// again. This differs from crash recovery during Open, where a quarantine failure fails Open
+// to prevent operating on an unhealthy filesystem that cannot quarantine obsolete data or
+// make directory updates durable.
+//
+// The sweep does not run while the engine is closed or failed.
+func (s *Engine) QuarantineSweep() error {
+	if s.closed.Load() || s.isFailed() {
+		return nil
+	}
+
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+
+	if s.closed.Load() || s.isFailed() {
+		return nil
+	}
+
+	getReferenced := func() map[string]bool {
+		referenced := make(map[string]bool)
+		s.keyMu.RLock()
+		for _, entry := range s.keyIndex {
+			if entry.IsOversize && entry.OversizeFileName != "" {
+				referenced[entry.OversizeFileName] = true
+			}
+		}
+		s.keyMu.RUnlock()
+
+		s.inFlightMu.Lock()
+		for name := range s.inFlightOversize {
+			referenced[name] = true
+		}
+		s.inFlightMu.Unlock()
+		return referenced
+	}
+
+	count, bytesMoved, err := quarantineUnreferencedOversizeFiles(s.fs, s.dir, getReferenced, s.quarantine, DefaultMaxQuarantineSweepBatch)
+	if count > 0 {
+		GlobalMetrics.QuarantineSweepFilesCount.Add(int64(count))
+		GlobalMetrics.QuarantineSweepBytesCount.Add(bytesMoved)
+	}
+	if err != nil {
+		slog.Error("diskstore: oversize quarantine sweep failed", "error", err)
+		return err
+	}
+	return nil
 }
