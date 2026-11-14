@@ -18,9 +18,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"sort"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2/textlogger"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -29,90 +33,190 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
+	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
 )
 
-// DefaultGatewayClassName is the default GatewayClass name managed by localgateway.
-const DefaultGatewayClassName = "localgateway"
+// defaultGatewayClassName is the default GatewayClass name managed by localgateway.
+const defaultGatewayClassName = "localgateway"
 
-// Config contains localgateway-dns configuration flags.
-type Config struct {
-	GatewayClass string
-	Interface    string
-	MDNSPort     int
-	MetricsAddr  string
+// config contains localgateway-dns configuration flags.
+type config struct {
+	gatewayClass     string
+	networkInterface string
+	mdnsPort         int
+	metricsAddr      string
 }
 
-// BuildOptions parses args and constructs the localgateway-dns Config.
-func BuildOptions(args []string) (Config, error) {
-	fs := flag.NewFlagSet("localgateway-dns", flag.ContinueOnError)
-	cfg := Config{
-		GatewayClass: DefaultGatewayClassName,
-		MDNSPort:     mdns.DefaultPort,
-		MetricsAddr:  "0",
+// buildOptions parses args and constructs the localgateway-dns config.
+func buildOptions(args []string) (config, error) {
+	flagSet := flag.NewFlagSet("localgateway-dns", flag.ContinueOnError)
+	configuration := config{
+		gatewayClass: defaultGatewayClassName,
+		mdnsPort:     mdns.DefaultPort,
+		metricsAddr:  "0",
 	}
 
-	fs.StringVar(&cfg.GatewayClass, "gateway-class", cfg.GatewayClass, "The GatewayClass name to watch Gateways for.")
-	fs.StringVar(&cfg.Interface, "interface", cfg.Interface, "Network interface to publish mDNS on (defaults to all).")
-	fs.IntVar(&cfg.MDNSPort, "mdns-port", cfg.MDNSPort, "UDP port for mDNS publishing.")
-	fs.StringVar(&cfg.MetricsAddr, "metrics-bind-address", cfg.MetricsAddr, "The address the metric endpoint binds to (0 to disable).")
+	flagSet.StringVar(&configuration.gatewayClass, "gateway-class", configuration.gatewayClass, "The GatewayClass name to watch Gateways for.")
+	flagSet.StringVar(&configuration.networkInterface, "interface", configuration.networkInterface, "Network interface to publish mDNS on (defaults to all).")
+	flagSet.IntVar(&configuration.mdnsPort, "mdns-port", configuration.mdnsPort, "UDP port for mDNS publishing.")
+	flagSet.StringVar(&configuration.metricsAddr, "metrics-bind-address", configuration.metricsAddr, "The address the metric endpoint binds to (0 to disable).")
 
 	logConfig := textlogger.NewConfig()
-	logConfig.AddFlags(fs)
+	logConfig.AddFlags(flagSet)
 
-	if err := fs.Parse(args); err != nil {
-		return Config{}, err
+	if err := flagSet.Parse(args); err != nil {
+		return config{}, err
+	}
+
+	if strings.TrimSpace(configuration.gatewayClass) == "" {
+		return config{}, fmt.Errorf("--gateway-class is required and cannot be empty")
 	}
 
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
-	return cfg, nil
+	return configuration, nil
 }
 
-// GatewayReconciler watches Gateways for the configured GatewayClass and publishes
+// gatewayReconciler watches Gateways for the configured GatewayClass and publishes
 // their listener hostnames and status.addresses via mDNS.
-type GatewayReconciler struct {
+type gatewayReconciler struct {
 	client.Client
-	GatewayClassName string
-	Publisher        *mdns.Publisher
+	gatewayClassName string
+	publisher        *mdns.Publisher
 }
 
 // Reconcile synchronizes active Gateways for the class with the mDNS publisher.
-func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var gwList gatewayv1.GatewayList
-	if err := r.List(ctx, &gwList); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+func (r *gatewayReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
+	var gatewayList gatewayv1.GatewayList
+	if err := r.List(ctx, &gatewayList); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	var matching []*gatewayv1.Gateway
-	for i := range gwList.Items {
-		gw := &gwList.Items[i]
-		if gw.DeletionTimestamp != nil {
+	var matchingGateways []*gatewayv1.Gateway
+	for i := range gatewayList.Items {
+		gateway := &gatewayList.Items[i]
+		if gateway.DeletionTimestamp != nil {
 			continue
 		}
-		if r.GatewayClassName == "" || string(gw.Spec.GatewayClassName) == r.GatewayClassName {
-			matching = append(matching, gw)
+		if string(gateway.Spec.GatewayClassName) != r.gatewayClassName {
+			continue
 		}
+		matchingGateways = append(matchingGateways, gateway)
 	}
 
-	r.Publisher.OnGatewaysUpdate(matching)
+	// Beyond the Gateway API specification:
+	// When multiple Gateways claim the same hostname, the conflict resolution is deterministic:
+	// the oldest Gateway by creation time holds the name, breaking ties by namespace and name.
+	sort.Slice(matchingGateways, func(i, j int) bool {
+		timeI := matchingGateways[i].CreationTimestamp
+		timeJ := matchingGateways[j].CreationTimestamp
+		if !timeI.Equal(&timeJ) {
+			return timeI.Before(&timeJ)
+		}
+		if matchingGateways[i].Namespace != matchingGateways[j].Namespace {
+			return matchingGateways[i].Namespace < matchingGateways[j].Namespace
+		}
+		return matchingGateways[i].Name < matchingGateways[j].Name
+	})
+
+	claimedHostnames := make(map[string]bool)
+	var gatewaysToPublish []*gatewayv1.Gateway
+
+	for _, gateway := range matchingGateways {
+		gatewayCopy := gateway.DeepCopy()
+
+		// A Gateway must be Programmed and have addresses to publish listeners.
+		if !isGatewayProgrammed(gateway) || !hasIPAddress(gateway) {
+			gatewayCopy.Spec.Listeners = nil
+			gatewaysToPublish = append(gatewaysToPublish, gatewayCopy)
+			continue
+		}
+
+		var eligibleListeners []gatewayv1.Listener
+		for _, listener := range gatewayCopy.Spec.Listeners {
+			if listener.Protocol != gatewayv1.HTTPProtocolType || listener.Hostname == nil {
+				continue
+			}
+			rawHostname := string(*listener.Hostname)
+			if err := validation.ValidateSingleLabelLocalHostname(rawHostname); err != nil {
+				continue
+			}
+			if !isListenerAcceptedAndProgrammed(gateway, listener.Name) {
+				continue
+			}
+
+			canonicalHostname := strings.ToLower(rawHostname)
+			if !strings.HasSuffix(canonicalHostname, ".") {
+				canonicalHostname += "."
+			}
+			if claimedHostnames[canonicalHostname] {
+				// Already claimed by an older Gateway (or earlier listener).
+				continue
+			}
+			claimedHostnames[canonicalHostname] = true
+			eligibleListeners = append(eligibleListeners, listener)
+		}
+
+		gatewayCopy.Spec.Listeners = eligibleListeners
+		gatewaysToPublish = append(gatewaysToPublish, gatewayCopy)
+	}
+
+	r.publisher.OnGatewaysUpdate(gatewaysToPublish)
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager registers the Gateway reconciler with the controller manager.
-func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func isGatewayProgrammed(gateway *gatewayv1.Gateway) bool {
+	for _, condition := range gateway.Status.Conditions {
+		if condition.Type == string(gatewayv1.GatewayConditionProgrammed) && condition.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func hasIPAddress(gateway *gatewayv1.Gateway) bool {
+	for _, address := range gateway.Status.Addresses {
+		if net.ParseIP(address.Value) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func isListenerAcceptedAndProgrammed(gateway *gatewayv1.Gateway, listenerName gatewayv1.SectionName) bool {
+	for _, listenerStatus := range gateway.Status.Listeners {
+		if listenerStatus.Name != listenerName {
+			continue
+		}
+		var accepted, programmed bool
+		for _, condition := range listenerStatus.Conditions {
+			if condition.Type == string(gatewayv1.ListenerConditionAccepted) && condition.Status == metav1.ConditionTrue {
+				accepted = true
+			}
+			if condition.Type == string(gatewayv1.ListenerConditionProgrammed) && condition.Status == metav1.ConditionTrue {
+				programmed = true
+			}
+		}
+		return accepted && programmed
+	}
+	return false
+}
+
+// setupWithManager registers the Gateway reconciler with the controller manager.
+func (r *gatewayReconciler) setupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
 		Complete(r)
 }
 
 func main() {
-	cfg, err := BuildOptions(os.Args[1:])
+	configuration, err := buildOptions(os.Args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to parse options: %v\n", err)
 		os.Exit(1)
 	}
 
 	setupLog := ctrl.Log.WithName("setup")
-	setupLog.Info("Starting localgateway-dns", "gatewayClass", cfg.GatewayClass, "mdnsPort", cfg.MDNSPort)
+	setupLog.Info("Starting localgateway-dns", "gatewayClass", configuration.gatewayClass, "mdnsPort", configuration.mdnsPort)
 
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -127,7 +231,7 @@ func main() {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
-			BindAddress: cfg.MetricsAddr,
+			BindAddress: configuration.metricsAddr,
 		},
 		LeaderElection: false,
 	})
@@ -136,26 +240,26 @@ func main() {
 		os.Exit(1)
 	}
 
-	pub, err := mdns.NewPublisher(mdns.PublisherOptions{
-		Interface: cfg.Interface,
-		Port:      cfg.MDNSPort,
+	publisher, err := mdns.NewPublisher(mdns.PublisherOptions{
+		Interface: configuration.networkInterface,
+		Port:      configuration.mdnsPort,
 	})
 	if err != nil {
 		setupLog.Error(err, "failed to create mDNS publisher")
 		os.Exit(1)
 	}
 
-	if err := mgr.Add(pub); err != nil {
+	if err := mgr.Add(publisher); err != nil {
 		setupLog.Error(err, "failed to register mDNS publisher with manager")
 		os.Exit(1)
 	}
 
-	reconciler := &GatewayReconciler{
+	reconciler := &gatewayReconciler{
 		Client:           mgr.GetClient(),
-		GatewayClassName: cfg.GatewayClass,
-		Publisher:        pub,
+		gatewayClassName: configuration.gatewayClass,
+		publisher:        publisher,
 	}
-	if err := reconciler.SetupWithManager(mgr); err != nil {
+	if err := reconciler.setupWithManager(mgr); err != nil {
 		setupLog.Error(err, "failed to setup Gateway controller")
 		os.Exit(1)
 	}
