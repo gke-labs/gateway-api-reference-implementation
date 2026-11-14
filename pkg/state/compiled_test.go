@@ -4502,10 +4502,11 @@ func TestGatewayBackendClientCertificate_DataplaneWiring(t *testing.T) {
 }
 
 type mockProxyUpdater struct {
-	listeners []InternalListener
-	routes    []InternalRoute
-	certs     map[string]*tls.Certificate
-	defCert   *tls.Certificate
+	listeners  []InternalListener
+	routes     []InternalRoute
+	certs      map[string]*tls.Certificate
+	defCert    *tls.Certificate
+	challenges []HTTP01Challenge
 }
 
 func (m *mockProxyUpdater) UpdateConfig(listeners []InternalListener, routes []InternalRoute) {
@@ -4516,6 +4517,10 @@ func (m *mockProxyUpdater) UpdateConfig(listeners []InternalListener, routes []I
 func (m *mockProxyUpdater) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
 	m.certs = certs
 	m.defCert = defaultCert
+}
+
+func (m *mockProxyUpdater) UpdateChallenges(challenges []HTTP01Challenge) {
+	m.challenges = challenges
 }
 
 func TestFrontendClientCertValidation_PerPortOverridesDefault(t *testing.T) {

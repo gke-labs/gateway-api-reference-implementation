@@ -62,6 +62,16 @@ const (
 	DataPlaneHealthProbePort = 8999
 )
 
+// HTTP01Challenge represents an ACME HTTP-01 challenge to be served by the data plane.
+type HTTP01Challenge struct {
+	// Hostname is the domain name that the ACME challenge validates.
+	Hostname string `json:"hostname"`
+	// Token is the challenge token requested in the URL path.
+	Token string `json:"token"`
+	// KeyAuthorization is the key authorization content returned as the response body.
+	KeyAuthorization string `json:"keyAuthorization"`
+}
+
 // DataplaneConfig represents the serialized proxy configuration for a single Gateway.
 type DataplaneConfig struct {
 	Revision                  string                     `json:"revision,omitempty"`
@@ -75,6 +85,7 @@ type DataplaneConfig struct {
 	AllowedSourceCIDRs        []string                   `json:"allowedSourceCIDRs,omitempty"`
 	ProxyProtocol             string                     `json:"proxyProtocol,omitempty"`
 	ProxyProtocolTrustedCIDRs []string                   `json:"proxyProtocolTrustedCIDRs,omitempty"`
+	Challenges                []HTTP01Challenge          `json:"challenges,omitempty"`
 }
 
 // ComputeRevision computes a deterministic hash of the DataplaneConfig excluding the Revision field.
@@ -328,10 +339,12 @@ func UnmarshalDataplaneConfig(data []byte) (*DataplaneConfig, error) {
 	return &cfg, nil
 }
 
-// ProxyConfigUpdater defines the interface needed to apply configuration and certificates to a proxy.
+// ProxyConfigUpdater defines the interface needed to apply configuration, certificates,
+// and ACME HTTP-01 challenges to a proxy.
 type ProxyConfigUpdater interface {
 	UpdateConfig(listeners []InternalListener, routes []InternalRoute)
 	UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate)
+	UpdateChallenges(challenges []HTTP01Challenge)
 }
 
 // ApplyDataplaneConfig deserializes JSON-encoded DataplaneConfig, extracts certificates,
@@ -409,6 +422,7 @@ func ApplyDataplaneConfig(updater ProxyConfigUpdater, data []byte) error {
 
 	updater.UpdateConfig(cfg.Listeners, cfg.Routes)
 	updater.UpdateCertificates(certsMap, defaultCert)
+	updater.UpdateChallenges(cfg.Challenges)
 	return nil
 }
 
@@ -539,6 +553,7 @@ func (p *InProcessDataplanePublisher) applyLocked() error {
 		if combined.DefaultCertID == "" {
 			combined.DefaultCertID = cfg.DefaultCertID
 		}
+		combined.Challenges = append(combined.Challenges, cfg.Challenges...)
 	}
 	data, err := combined.Marshal()
 	if err != nil {

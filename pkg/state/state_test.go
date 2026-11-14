@@ -1465,6 +1465,9 @@ func (c *countingProxyUpdater) UpdateConfig(listeners []InternalListener, routes
 func (c *countingProxyUpdater) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
 }
 
+func (c *countingProxyUpdater) UpdateChallenges(challenges []HTTP01Challenge) {
+}
+
 func (c *countingProxyUpdater) Count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
