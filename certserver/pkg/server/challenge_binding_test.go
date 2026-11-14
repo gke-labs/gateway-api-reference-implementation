@@ -290,6 +290,30 @@ func setupChallengeBindingHarness(t *testing.T) *testHarness {
 	return h
 }
 
+// waitForCertificate waits for certificate issuance by polling GetCertificate until a certificate
+// is returned or the deadline passes. Under race detection and parallel CI load across packages,
+// Pebble ACME order processing (order creation, challenge validation, and order finalization)
+// takes multiple 1-second ACME client polling intervals (WaitAuthorization, WaitOrder), so allow
+// 25 seconds for certificate issuance to complete.
+func waitForCertificate(t *testing.T, client certserverv1.CertificateServiceClient, ctx context.Context, req *certserverv1.GetCertificateRequest) *certserverv1.GetCertificateResponse {
+	t.Helper()
+
+	deadline := time.Now().Add(25 * time.Second)
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		resp, err := client.GetCertificate(ctx, req)
+		if err == nil && resp != nil && len(resp.CertificateChain) > 0 {
+			return resp
+		}
+		lastErr = err
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("expected certificate issuance to succeed for %s, last error: %v", req.Gateway, lastErr)
+	return nil
+}
+
 // TestPebble_ChallengeBindingScenarios verifies all acceptance criteria for challenge binding with Pebble:
 // 1. The requesting Gateway's data plane answers, and issuance succeeds;
 // 2. Another cluster's data plane answers, and issuance fails;
@@ -301,27 +325,19 @@ func TestPebble_ChallengeBindingScenarios(t *testing.T) {
 	pollCertificate := func(t *testing.T, client certserverv1.CertificateServiceClient, req *certserverv1.GetCertificateRequest, ctrlToken string, shouldSucceed bool) *certserverv1.GetCertificateResponse {
 		t.Helper()
 		ctx := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+ctrlToken))
-
-		deadline := time.Now().Add(10 * time.Second)
-		var lastResp *certserverv1.GetCertificateResponse
-		var lastErr error
-
-		for time.Now().Before(deadline) {
-			resp, err := client.GetCertificate(ctx, req)
-			if err == nil && resp != nil && len(resp.CertificateChain) > 0 {
-				lastResp = resp
-				if shouldSucceed {
-					return resp
-				}
-			}
-			lastErr = err
-			time.Sleep(200 * time.Millisecond)
-		}
-
 		if shouldSucceed {
-			t.Fatalf("expected certificate issuance to succeed, last error: %v", lastErr)
+			return waitForCertificate(t, client, ctx, req)
 		}
-		return lastResp
+		resp, _ := client.GetCertificate(ctx, req)
+		if resp != nil && len(resp.CertificateChain) > 0 {
+			return resp
+		}
+		time.Sleep(500 * time.Millisecond)
+		respRetry, _ := client.GetCertificate(ctx, req)
+		if respRetry != nil && len(respRetry.CertificateChain) > 0 {
+			return respRetry
+		}
+		return nil
 	}
 
 	t.Run("1_RequestingGatewayDataPlaneAnswers_IssuanceSucceeds", func(t *testing.T) {
@@ -496,20 +512,7 @@ func TestPebble_SecondRequesterCannotGetCachedCertWithoutBinding(t *testing.T) {
 
 	ctx1 := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+ctrlTokenC1))
 
-	var cert1 *certserverv1.GetCertificateResponse
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := h.grpcClient.GetCertificate(ctx1, req1)
-		if err == nil && resp != nil && len(resp.CertificateChain) > 0 {
-			cert1 = resp
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	if cert1 == nil {
-		t.Fatal("expected requester 1 to successfully receive certificate")
-	}
+	waitForCertificate(t, h.grpcClient, ctx1, req1)
 
 	// Requester 1 gets certificate from cache on subsequent call
 	resp1Again, err := h.grpcClient.GetCertificate(ctx1, req1)
@@ -567,14 +570,7 @@ func TestAuditLogs_NoTokensOrKeyAuthorizations(t *testing.T) {
 	}
 
 	ctx := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+rawCtrlToken))
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := h.grpcClient.GetCertificate(ctx, req)
-		if err == nil && resp != nil && len(resp.CertificateChain) > 0 {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+	waitForCertificate(t, h.grpcClient, ctx, req)
 
 	// Inspect audit log lines
 	logs := h.auditBuf.String()

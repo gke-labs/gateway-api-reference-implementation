@@ -158,16 +158,7 @@ func (h *selfCheckHarness) obtainCertificate(t *testing.T, req *certserverv1.Get
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	retryDeadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(retryDeadline) {
-		time.Sleep(100 * time.Millisecond)
-		resp, err := h.client.GetCertificate(h.callCtx, req)
-		if err == nil && resp != nil && len(resp.CertificateChain) > 0 {
-			return resp
-		}
-	}
-	t.Fatalf("timed out waiting for certificate issuance for %s", req.Gateway)
-	return nil
+	return waitForCertificate(t, h.client, h.callCtx, req)
 }
 
 func setupSelfCheckTest(t *testing.T, cfg selfCheckHarnessConfig) *selfCheckHarness {
