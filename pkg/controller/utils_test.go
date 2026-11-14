@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -304,6 +305,7 @@ type mockManager struct {
 	mapper    meta.RESTMapper
 	cache     cache.Cache
 	config    *rest.Config
+	logger    logr.Logger
 	runnables []manager.Runnable
 }
 
@@ -323,6 +325,12 @@ func (m *mockManager) GetScheme() *runtime.Scheme     { return m.scheme }
 func (m *mockManager) GetClient() client.Client       { return m.client }
 func (m *mockManager) GetRESTMapper() meta.RESTMapper { return m.mapper }
 func (m *mockManager) GetAPIReader() client.Reader    { return m.reader }
+func (m *mockManager) GetLogger() logr.Logger {
+	if m.logger.GetSink() != nil {
+		return m.logger
+	}
+	return logr.Discard()
+}
 func (m *mockManager) GetEventRecorderFor(name string) record.EventRecorder {
 	return &record.FakeRecorder{}
 }

@@ -50,7 +50,6 @@ import (
 // with the narrowed RBAC permissions from k8s/controller.yaml (impersonated service account).
 func TestController_NarrowedCRDPermissions(t *testing.T) {
 	core, observedLogs := observer.New(zapcore.InfoLevel)
-	ctrl.SetLogger(zapr.NewLogger(zap.New(core)))
 
 	env := testenv.Start(t)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -164,6 +163,7 @@ func TestController_NarrowedCRDPermissions(t *testing.T) {
 	skipNameValidation := true
 	mgr, err := ctrl.NewManager(impersonatedConfig, ctrl.Options{
 		Scheme:  env.Scheme,
+		Logger:  zapr.NewLogger(zap.New(core)),
 		Metrics: metricsserver.Options{BindAddress: "0"},
 		Controller: config.Controller{
 			SkipNameValidation: &skipNameValidation,
