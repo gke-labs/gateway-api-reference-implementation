@@ -642,4 +642,3 @@ func TestQuarantineFiles_ScopedLogger(t *testing.T) {
 		t.Errorf("expected quarantine log in custom logger output, got: %s", logOutput)
 	}
 }
-
