@@ -56,10 +56,11 @@ func stripPort(s string) string {
 	return h
 }
 
-// CleanHostname removes port if present and returns lowercase string.
+// CleanHostname removes port if present, strips one trailing dot, and returns lowercase string.
 func CleanHostname(host string) string {
 	host = stripPort(host)
-	return strings.ToLower(strings.TrimSpace(host))
+	host = strings.ToLower(strings.TrimSpace(host))
+	return strings.TrimSuffix(host, ".")
 }
 
 // RegisterSession records a backend session with its verified client identity.

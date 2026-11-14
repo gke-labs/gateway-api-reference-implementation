@@ -46,6 +46,18 @@ func TestRegistrationTable(t *testing.T) {
 			wantFound:  true,
 		},
 		{
+			name:       "exact match client A with trailing dot",
+			hostname:   "foo.example.com.",
+			wantClient: "client-a",
+			wantFound:  true,
+		},
+		{
+			name:       "exact match client A with port, uppercase, and trailing dot",
+			hostname:   "FOO.EXAMPLE.COM.:443",
+			wantClient: "client-a",
+			wantFound:  true,
+		},
+		{
 			name:       "exact match client B",
 			hostname:   "bar.example.com",
 			wantClient: "client-b",
@@ -207,5 +219,68 @@ func TestRegistrationTable_Lease(t *testing.T) {
 	}
 	if _, ok := tbl.Match("foo.example.com"); ok {
 		t.Fatal("expected foo.example.com to no longer match after lease expired")
+	}
+}
+
+func TestCleanHostname(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "trailing dot",
+			input: "a.example.com.",
+			want:  "a.example.com",
+		},
+		{
+			name:  "uppercase with trailing dot",
+			input: "A.Example.COM.",
+			want:  "a.example.com",
+		},
+		{
+			name:  "dot only",
+			input: ".",
+			want:  "",
+		},
+		{
+			name:  "standard hostname",
+			input: "a.example.com",
+			want:  "a.example.com",
+		},
+		{
+			name:  "uppercase standard hostname",
+			input: "A.Example.COM",
+			want:  "a.example.com",
+		},
+		{
+			name:  "trailing dot with port",
+			input: "a.example.com.:443",
+			want:  "a.example.com",
+		},
+		{
+			name:  "port and uppercase",
+			input: "A.EXAMPLE.COM:80",
+			want:  "a.example.com",
+		},
+		{
+			name:  "two trailing dots strips only one",
+			input: "a.example.com..",
+			want:  "a.example.com.",
+		},
+		{
+			name:  "empty string",
+			input: "",
+			want:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CleanHostname(tt.input)
+			if got != tt.want {
+				t.Errorf("CleanHostname(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
 	}
 }
