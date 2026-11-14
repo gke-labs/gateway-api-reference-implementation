@@ -6,7 +6,7 @@ This document specifies the split of `localgateway` from an all-in-one host-netw
 
 1. **Controller**: Reconciles Gateway API resources and Secrets, provisions per-Gateway data planes, and compiles data-plane configurations. It runs as a standard in-cluster Deployment without host networking and never exposes ports outside the cluster.
 2. **Gateway data plane**: Serves client traffic on the LAN using the reference implementation's standard per-Gateway data-plane pod (`--dataplane-mode`). It receives and holds only its own Gateway's configuration.
-3. **DNS**: Runs a standalone mDNS responder daemon with host networking. It answers multicast queries for single-label `.local` domains on the LAN without reading Secrets.
+3. **DNS**: Runs a standalone mDNS responder daemon with host networking as a data plane. It answers multicast queries for single-label `.local` domains on the LAN, reading only the `localgateway-dns` Secret and watching no Gateways. Its Role names only this one object; because the component runs with host networking, it gets the smallest permission that works.
 
 **The Core Rule**: No Secret-reading process listens on the host network.
 
@@ -45,9 +45,8 @@ Each component receives scoped RBAC:
   - `core`: `secrets` (`get`, `list`, `watch`) restricted by `resourceNames: ["<gateway-name>"]` in its own namespace.
   - Because Kubernetes RBAC does not authorize `list` and `watch` requests on Secrets with `resourceNames` alone, the data plane reads its Secret the way the reference implementation does today: running under a per-Gateway ServiceAccount with its informer cache restricted by a `metadata.name=<gateway-name>` field selector. The API server authorizes the filtered list and watch calls against the Role's resource name rule, and the data plane receives no access to other Secrets. The design keeps this approach.
 - **DNS (mDNS Responder)**:
-  - `gateway.networking.k8s.io`: `gateways` (`get`, `list`, `watch`).
-  - `core`: `nodes` (`get`, `list`, `watch`).
-  - The DNS component holds no RBAC permissions for Secrets. It reads published hostnames from `spec.listeners[*].hostname` and target LAN addresses from `status.addresses`.
+  - `core`: `secrets` (`get`, `list`, `watch`) restricted by `resourceNames: ["localgateway-dns"]`.
+  - The DNS component is a data plane. The controller computes the DNS records and publishes them in one Secret, `localgateway-dns`, and the DNS component reads that one Secret and nothing else. It watches no Gateways. Because the component runs with host networking, its Role names only this one object so it gets the smallest permission that works.
 
 ## 4. What the Data Plane Holds
 
