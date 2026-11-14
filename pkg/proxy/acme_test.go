@@ -1257,3 +1257,118 @@ func TestNewACMEChallengeForwarder_Handler(t *testing.T) {
 		t.Errorf("expected 404 on upstream error, got %d", rec500.Code)
 	}
 }
+
+func TestProxy_ACMEChallenge_ServedFromDataPlane(t *testing.T) {
+	_, backend := createTestBackend(t, "normal route response")
+	route := createTestHTTPRoute(ACMEChallengePrefix, backend)
+	p := NewProxy()
+	p.UpdateConfig([]state.InternalListener{
+		{
+			Name:     "http",
+			Protocol: gatewayv1.HTTPProtocolType,
+			Port:     80,
+			Hostname: "example.com",
+			Routes:   []state.InternalRoute{route},
+		},
+	}, []state.InternalRoute{route})
+
+	// 1. Without challenges configured, GET /.well-known/acme-challenge/tok-1 falls through to normal route
+	request := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/tok-1", nil)
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", recorder.Code)
+	}
+	if body := recorder.Body.String(); body != "normal route response" {
+		t.Fatalf("expected normal route response, got %q", body)
+	}
+
+	// 2. Configure pending challenge
+	p.UpdateChallenges([]state.HTTP01Challenge{
+		{
+			Hostname:         "example.com",
+			Token:            "tok-1",
+			KeyAuthorization: "tok-1.keyauth-signature",
+		},
+	})
+
+	// 3. Exact hostname and token match returns 200 text/plain and key authorization
+	request = httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/tok-1", nil)
+	recorder = httptest.NewRecorder()
+	p.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", recorder.Code)
+	}
+	if contentType := recorder.Header().Get("Content-Type"); contentType != "text/plain" {
+		t.Errorf("expected Content-Type: text/plain, got %q", contentType)
+	}
+	if body := recorder.Body.String(); body != "tok-1.keyauth-signature" {
+		t.Errorf("expected body %q, got %q", "tok-1.keyauth-signature", body)
+	}
+
+	// 4. HEAD request takes normal route matching (only GET serves challenge body)
+	requestHead := httptest.NewRequest(http.MethodHead, "http://example.com/.well-known/acme-challenge/tok-1", nil)
+	recorderHead := httptest.NewRecorder()
+	p.ServeHTTP(recorderHead, requestHead)
+	if recorderHead.Code != http.StatusOK {
+		t.Errorf("expected 200 OK on HEAD from normal route, got %d", recorderHead.Code)
+	}
+	if body := recorderHead.Body.String(); body == "tok-1.keyauth-signature" {
+		t.Errorf("HEAD must not serve challenge body directly")
+	}
+
+	// 5. Without a matching HTTP listener (no listeners at all), challenge is not served
+	pNoListeners := NewProxy()
+	pNoListeners.UpdateChallenges([]state.HTTP01Challenge{
+		{
+			Hostname:         "example.com",
+			Token:            "tok-1",
+			KeyAuthorization: "tok-1.keyauth-signature",
+		},
+	})
+	recorderNoListeners := httptest.NewRecorder()
+	pNoListeners.ServeHTTP(recorderNoListeners, request)
+	if recorderNoListeners.Code == http.StatusOK && recorderNoListeners.Body.String() == "tok-1.keyauth-signature" {
+		t.Errorf("expected challenge NOT to be served when proxy has no listeners")
+	}
+
+	// 6. Different token on same hostname gets normal routing
+	requestOtherToken := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/other-tok", nil)
+	recorderOtherToken := httptest.NewRecorder()
+	p.ServeHTTP(recorderOtherToken, requestOtherToken)
+	if recorderOtherToken.Code != http.StatusOK {
+		t.Fatalf("expected 200 from normal route, got %d", recorderOtherToken.Code)
+	}
+	if body := recorderOtherToken.Body.String(); body != "normal route response" {
+		t.Errorf("expected normal route response for other token, got %q", body)
+	}
+
+	// 7. Same token on another hostname gets normal routing (404 here because route is for example.com)
+	requestOtherHost := httptest.NewRequest(http.MethodGet, "http://other.com/.well-known/acme-challenge/tok-1", nil)
+	recorderOtherHost := httptest.NewRecorder()
+	p.ServeHTTP(recorderOtherHost, requestOtherHost)
+	if recorderOtherHost.Code == http.StatusOK && recorderOtherHost.Body.String() == "tok-1.keyauth-signature" {
+		t.Errorf("expected challenge NOT to be served on different hostname")
+	}
+
+	// 8. Non-GET method (e.g. POST) gets normal routing
+	requestPost := httptest.NewRequest(http.MethodPost, "http://example.com/.well-known/acme-challenge/tok-1", nil)
+	recorderPost := httptest.NewRecorder()
+	p.ServeHTTP(recorderPost, requestPost)
+	if body := recorderPost.Body.String(); body == "tok-1.keyauth-signature" {
+		t.Errorf("POST must not serve challenge body directly")
+	}
+
+	// 9. When source drops the challenge, the data plane stops serving it
+	p.UpdateChallenges(nil)
+
+	requestDropped := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/tok-1", nil)
+	recorderDropped := httptest.NewRecorder()
+	p.ServeHTTP(recorderDropped, requestDropped)
+	if recorderDropped.Code != http.StatusOK {
+		t.Fatalf("expected 200 from normal route, got %d", recorderDropped.Code)
+	}
+	if body := recorderDropped.Body.String(); body != "normal route response" {
+		t.Errorf("expected normal route response after challenge dropped, got %q", body)
+	}
+}

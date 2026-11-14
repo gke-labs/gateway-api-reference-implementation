@@ -19,6 +19,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +43,11 @@ const (
 	defaultCheckInterval  = 1 * time.Minute
 	defaultEvictionPeriod = 5 * time.Minute
 	defaultLogInterval    = 30 * time.Second
+
+	// maxTokenLength bounds the length of an ACME challenge token.
+	maxTokenLength = 128
+	// maxKeyAuthorizationLength bounds the length of an ACME key authorization.
+	maxKeyAuthorizationLength = 512
 )
 
 // CertClient is the interface representing the pure certserver client.
@@ -75,6 +82,7 @@ type cacheEntry struct {
 	expiresAt    time.Time
 	refreshAt    time.Time
 	failedReason string
+	challenges   []state.HTTP01Challenge
 
 	inFlight      bool
 	lastRequested time.Time
@@ -224,7 +232,11 @@ func (s *Source) checkAndRefresh() {
 	for k, entry := range s.cache {
 		// Evict inactive entries that ResolveCertificates has not requested within EvictionPeriod.
 		if now.Sub(entry.lastRequested) > s.evictionPeriod {
+			hadChallenges := len(entry.challenges) > 0
 			delete(s.cache, k)
+			if hadChallenges {
+				s.notifyTrigger()
+			}
 			continue
 		}
 		if entry.certificate != nil && !entry.inFlight && now.After(entry.refreshAt) {
@@ -233,6 +245,97 @@ func (s *Source) checkAndRefresh() {
 		}
 	}
 	s.mu.Unlock()
+}
+
+func isValidBase64URL(token string) bool {
+	if token == "" || len(token) > maxTokenLength {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		character := token[i]
+		if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func validateChallenges(reportedChallenges []*certserverv1.HTTP01Challenge, requestedHostnames []string) []state.HTTP01Challenge {
+	if len(reportedChallenges) == 0 || len(requestedHostnames) == 0 {
+		return nil
+	}
+	requestedSet := make(map[string]bool, len(requestedHostnames))
+	for _, hostname := range requestedHostnames {
+		requestedSet[strings.ToLower(hostname)] = true
+	}
+
+	var validatedChallenges []state.HTTP01Challenge
+	seenHostnames := make(map[string]bool)
+
+	for _, reportedChallenge := range reportedChallenges {
+		if reportedChallenge == nil {
+			continue
+		}
+		normalizedHostname := strings.ToLower(reportedChallenge.Hostname)
+		if !requestedSet[normalizedHostname] {
+			klog.Warningf("certserver reported challenge for unrequested hostname %q, dropping", reportedChallenge.Hostname)
+			continue
+		}
+		if !isValidBase64URL(reportedChallenge.Token) {
+			klog.Warningf("certserver reported challenge with invalid or oversized token for %s, dropping", reportedChallenge.Hostname)
+			continue
+		}
+		if reportedChallenge.KeyAuthorization == "" || len(reportedChallenge.KeyAuthorization) > maxKeyAuthorizationLength {
+			klog.Warningf("certserver reported challenge with invalid key authorization length %d for %s, dropping", len(reportedChallenge.KeyAuthorization), reportedChallenge.Hostname)
+			continue
+		}
+		if seenHostnames[normalizedHostname] {
+			klog.Warningf("certserver reported duplicate challenge for hostname %q, dropping", reportedChallenge.Hostname)
+			continue
+		}
+		if len(validatedChallenges) >= len(requestedHostnames) {
+			klog.Warningf("certserver reported more challenges than requested hostnames (%d), dropping excess", len(requestedHostnames))
+			break
+		}
+		seenHostnames[normalizedHostname] = true
+		validatedChallenges = append(validatedChallenges, state.HTTP01Challenge{
+			Hostname:         reportedChallenge.Hostname,
+			Token:            reportedChallenge.Token,
+			KeyAuthorization: reportedChallenge.KeyAuthorization,
+		})
+	}
+
+	sort.Slice(validatedChallenges, func(i, j int) bool {
+		if validatedChallenges[i].Hostname != validatedChallenges[j].Hostname {
+			return validatedChallenges[i].Hostname < validatedChallenges[j].Hostname
+		}
+		return validatedChallenges[i].Token < validatedChallenges[j].Token
+	})
+	return validatedChallenges
+}
+
+// gatewayChallengesLocked gathers and deduplicates challenges across all cache entries for the Gateway.
+func (s *Source) gatewayChallengesLocked(gateway types.NamespacedName) []state.HTTP01Challenge {
+	var combinedChallenges []state.HTTP01Challenge
+	seen := make(map[string]bool)
+	for cacheKey, entry := range s.cache {
+		if cacheKey.gateway == gateway {
+			for _, challenge := range entry.challenges {
+				key := challenge.Hostname + "/" + challenge.Token
+				if !seen[key] {
+					seen[key] = true
+					combinedChallenges = append(combinedChallenges, challenge)
+				}
+			}
+		}
+	}
+	sort.Slice(combinedChallenges, func(i, j int) bool {
+		if combinedChallenges[i].Hostname != combinedChallenges[j].Hostname {
+			return combinedChallenges[i].Hostname < combinedChallenges[j].Hostname
+		}
+		return combinedChallenges[i].Token < combinedChallenges[j].Token
+	})
+	return combinedChallenges
 }
 
 // ResolveCertificates returns certificates from the local cache and triggers background fetching on cache misses.
@@ -315,6 +418,12 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 		}, nil
 	}
 
+	var challenges []state.HTTP01Challenge
+	if gatewayChallenges := s.gatewayChallengesLocked(gwKey); len(gatewayChallenges) > 0 {
+		challenges = make([]state.HTTP01Challenge, len(gatewayChallenges))
+		copy(challenges, gatewayChallenges)
+	}
+
 	// No valid unexpired certificate:
 	switch entry.state {
 	case stateFailed:
@@ -336,6 +445,7 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 		return state.CertificateResult{
 			Pending:           true,
 			ProgrammedMessage: "Certificate issuance in progress with certserver",
+			Challenges:        challenges,
 		}, nil
 	default:
 		if !entry.inFlight {
@@ -345,6 +455,7 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 		return state.CertificateResult{
 			Pending:           true,
 			ProgrammedMessage: "Certificate issuance in progress with certserver",
+			Challenges:        challenges,
 		}, nil
 	}
 }
@@ -415,8 +526,12 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		entry, ok := s.cache[key]
 		if !ok || s.now().Sub(entry.lastRequested) > s.evictionPeriod {
 			if ok {
+				hadChallenges := len(entry.challenges) > 0
 				entry.inFlight = false
 				delete(s.cache, key)
+				if hadChallenges {
+					s.notifyTrigger()
+				}
 			}
 			s.mu.Unlock()
 			return
@@ -429,8 +544,27 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		stCode := st.Code()
 
 		if err == nil {
+			var newChallenges []state.HTTP01Challenge
+			if info != nil && info.Certificate == nil && len(info.Challenges) > 0 {
+				newChallenges = validateChallenges(info.Challenges, hostnames)
+			}
+
+			s.mu.Lock()
+			previousGatewayChallenges := s.gatewayChallengesLocked(key.gateway)
+			entry, ok = s.cache[key]
+			if ok {
+				entry.challenges = newChallenges
+			}
+			currentGatewayChallenges := s.gatewayChallengesLocked(key.gateway)
+			challengesChanged := !slices.Equal(previousGatewayChallenges, currentGatewayChallenges)
+			s.mu.Unlock()
+
+			if challengesChanged {
+				s.notifyTrigger()
+			}
+
 			if info == nil || info.Certificate == nil {
-				// A pending certificate is retried; this source doesn't serve challenges yet.
+				// A pending certificate is retried.
 				// Poll at a short fixed interval (minBackoff, 1 second by default) rather than
 				// backing off exponentially. This ensures the controller fetches challenges
 				// promptly, well within the certserver self-check window (e.g. 15 seconds).
@@ -448,7 +582,7 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 			}
 
 			s.mu.Lock()
-			entry, ok := s.cache[key]
+			entry, ok = s.cache[key]
 			if !ok {
 				s.mu.Unlock()
 				return
@@ -460,6 +594,7 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 			entry.certificate = cert
 			entry.leaf = leaf
 			entry.expiresAt = leaf.NotAfter
+			entry.challenges = nil
 
 			lifetime := leaf.NotAfter.Sub(leaf.NotBefore)
 			window := s.renewalWindow
@@ -501,6 +636,14 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		notifyNeeded := false
 		if !hasValidCert {
 			if isNonRetryableCode(stCode) {
+				previousGatewayChallenges := s.gatewayChallengesLocked(key.gateway)
+				if entry.challenges != nil {
+					entry.challenges = nil
+				}
+				currentGatewayChallenges := s.gatewayChallengesLocked(key.gateway)
+				if !slices.Equal(previousGatewayChallenges, currentGatewayChallenges) {
+					notifyNeeded = true
+				}
 				if entry.state != stateFailed {
 					entry.state = stateFailed
 					notifyNeeded = true

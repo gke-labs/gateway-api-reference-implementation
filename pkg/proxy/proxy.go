@@ -127,7 +127,16 @@ type Proxy struct {
 	acmeTimeout           time.Duration
 	logForwarderErrorOnce sync.Once
 
+	// challenges holds active ACME HTTP-01 challenges mapped by (hostname, token)
+	// to key authorization. Readers load the pointer atomically without acquiring mu.
+	challenges atomic.Pointer[map[challengeKey]string]
+
 	closed bool
+}
+
+type challengeKey struct {
+	hostname string
+	token    string
 }
 
 type tcpPortListener struct {
@@ -177,6 +186,8 @@ func NewProxy() *Proxy {
 
 	p.sniConfig.Store(&sniConfig{})
 	p.clientValidationConfig.Store(&clientValidationConfig{})
+	emptyChallenges := make(map[challengeKey]string)
+	p.challenges.Store(&emptyChallenges)
 	return p
 }
 
@@ -796,6 +807,16 @@ func (p *Proxy) UpdateCertificates(certs map[string]*tls.Certificate, defaultCer
 	}
 }
 
+// UpdateChallenges updates the pending ACME HTTP-01 challenges served directly from memory.
+func (p *Proxy) UpdateChallenges(challenges []state.HTTP01Challenge) {
+	challengeMap := make(map[challengeKey]string, len(challenges))
+	for _, challenge := range challenges {
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(challenge.Hostname), "."))
+		challengeMap[challengeKey{hostname: host, token: challenge.Token}] = challenge.KeyAuthorization
+	}
+	p.challenges.Store(&challengeMap)
+}
+
 func (p *Proxy) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -899,6 +920,54 @@ func matchHTTPListeners(listeners []state.InternalListener, hostHeader string) (
 	candidates, reqHost := narrowListenersByPort(httpListeners, hostHeader, 80, true)
 	matchedListeners, _ := state.MatchListeners(candidates, reqHost)
 	return matchedListeners, true
+}
+
+// Beyond the Gateway API specification:
+// The data plane answers a pending challenge only for the exact hostname and token, on an HTTP
+// listener, and before route matching, so that no route can take or redirect the request.
+func (p *Proxy) maybeServeACMEChallenge(w http.ResponseWriter, r *http.Request, listeners []state.InternalListener) bool {
+	if r.TLS != nil || r.Method != http.MethodGet {
+		return false
+	}
+	if !strings.HasPrefix(r.URL.Path, ACMEChallengePrefix) {
+		return false
+	}
+	token := strings.TrimPrefix(r.URL.Path, ACMEChallengePrefix)
+	if token == "" || strings.Contains(token, "/") {
+		return false
+	}
+	entries := p.challenges.Load()
+	if entries == nil || len(*entries) == 0 {
+		return false
+	}
+	originalHost := r.Host
+	if value := r.Context().Value(originalHostContextKey); value != nil {
+		if hostString, ok := value.(string); ok && hostString != "" {
+			originalHost = hostString
+		}
+	}
+	reqHost, _, _ := splitHostPort(originalHost, 80)
+	reqHost = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(reqHost), "."))
+
+	keyAuthorization, ok := (*entries)[challengeKey{hostname: reqHost, token: token}]
+	if !ok {
+		return false
+	}
+
+	matchedListeners, hasHTTP := matchHTTPListeners(listeners, originalHost)
+	if !hasHTTP || len(matchedListeners) == 0 {
+		return false
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Length", strconv.Itoa(len(keyAuthorization)))
+	w.WriteHeader(http.StatusOK)
+	if _, writeErr := w.Write([]byte(keyAuthorization)); writeErr != nil {
+		// A write error occurs when the remote client (e.g. ACME validator) closes the connection
+		// before receiving the full body; the proxy can safely ignore it because the connection is finished.
+		klog.V(4).Infof("error writing acme challenge response: %v", writeErr)
+	}
+	return true
 }
 
 // maybeForwardACMEChallenge checks if a plain-HTTP request matches the ACME HTTP-01 challenge prefix,
@@ -1139,6 +1208,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	routes := p.routes
 	listeners := p.listeners
 	p.mu.RUnlock()
+
+	if p.maybeServeACMEChallenge(w, r, listeners) {
+		return
+	}
 
 	if p.maybeForwardACMEChallenge(w, r, listeners) {
 		return
@@ -2072,8 +2145,12 @@ func (p *Proxy) evictUnusedTransports(activeRoutes []state.InternalRoute) {
 }
 
 func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper {
+	p.mu.RLock()
+	dialFunc := p.dialFunc
+	p.mu.RUnlock()
+
 	key := backendTransportKey(backend)
-	if key == "default" {
+	if dialFunc == nil && key == "default" {
 		return http.DefaultTransport
 	}
 
@@ -2134,7 +2211,15 @@ func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper 
 			Protocols:   &protocols,
 		}
 	} else {
-		return http.DefaultTransport
+		if dialFunc != nil {
+			transport = &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialFunc(network, addr)
+				},
+			}
+		} else {
+			return http.DefaultTransport
+		}
 	}
 
 	p.transports[key] = transport

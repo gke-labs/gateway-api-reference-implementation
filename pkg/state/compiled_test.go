@@ -1351,7 +1351,7 @@ func TestValidateListener_CertificateRefGroup(t *testing.T) {
 				},
 			}
 
-			_, conds, _, _ := ValidateListener(
+			validationResult := ValidateListener(
 				ListenerToSpec(listener),
 				ListenerOwner{Kind: "Gateway", Namespace: "default", Name: "gw"},
 				&gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw"}},
@@ -1364,12 +1364,12 @@ func TestValidateListener_CertificateRefGroup(t *testing.T) {
 			)
 
 			var progCond, resCond *metav1.Condition
-			for i := range conds {
-				if conds[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
-					progCond = &conds[i]
+			for i := range validationResult.Conditions {
+				if validationResult.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
+					progCond = &validationResult.Conditions[i]
 				}
-				if conds[i].Type == string(gatewayv1.ListenerConditionResolvedRefs) {
-					resCond = &conds[i]
+				if validationResult.Conditions[i].Type == string(gatewayv1.ListenerConditionResolvedRefs) {
+					resCond = &validationResult.Conditions[i]
 				}
 			}
 
@@ -4502,10 +4502,11 @@ func TestGatewayBackendClientCertificate_DataplaneWiring(t *testing.T) {
 }
 
 type mockProxyUpdater struct {
-	listeners []InternalListener
-	routes    []InternalRoute
-	certs     map[string]*tls.Certificate
-	defCert   *tls.Certificate
+	listeners  []InternalListener
+	routes     []InternalRoute
+	certs      map[string]*tls.Certificate
+	defCert    *tls.Certificate
+	challenges []HTTP01Challenge
 }
 
 func (m *mockProxyUpdater) UpdateConfig(listeners []InternalListener, routes []InternalRoute) {
@@ -4516,6 +4517,10 @@ func (m *mockProxyUpdater) UpdateConfig(listeners []InternalListener, routes []I
 func (m *mockProxyUpdater) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
 	m.certs = certs
 	m.defCert = defaultCert
+}
+
+func (m *mockProxyUpdater) UpdateChallenges(challenges []HTTP01Challenge) {
+	m.challenges = challenges
 }
 
 func TestFrontendClientCertValidation_PerPortOverridesDefault(t *testing.T) {

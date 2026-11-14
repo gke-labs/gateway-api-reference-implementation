@@ -26,6 +26,7 @@ import (
 	"math/big"
 	"net"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -34,11 +35,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/client"
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
 
 func generateTestTLSCert(t *testing.T) (*tls.Certificate, *x509.Certificate) {
@@ -525,5 +528,299 @@ func TestSource_Eviction_FailingLoopExits(t *testing.T) {
 	callsAfter := rpcCalls.Load()
 	if callsAfter != callsAtEviction {
 		t.Errorf("expected fetchLoop to have exited with no further RPCs, but calls increased from %d to %d", callsAtEviction, callsAfter)
+	}
+}
+
+func TestSource_PendingChallenges_TrackAndDrop(t *testing.T) {
+	testCert, _ := generateTestTLSCert(t)
+	var step atomic.Int32
+	challenge1 := &certserverv1.HTTP01Challenge{
+		Hostname:         "test.example.com",
+		Token:            "token-abc",
+		KeyAuthorization: "token-abc.auth-key",
+	}
+
+	mock := &mockCertClient{
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
+			switch step.Load() {
+			case 0:
+				return &client.CertificateInfo{
+					Certificate: nil,
+					Challenges:  []*certserverv1.HTTP01Challenge{challenge1},
+				}, nil
+			default:
+				return &client.CertificateInfo{
+					Certificate: testCert,
+					Leaf:        testCert.Leaf,
+					Challenges:  nil,
+				}, nil
+			}
+		},
+	}
+
+	src := NewSource(
+		mock,
+		WithMinBackoff(10*time.Millisecond),
+		WithMaxBackoff(20*time.Millisecond),
+	)
+	defer src.Close()
+
+	recomputeChannel := make(chan struct{}, 10)
+	src.SetRecomputeTrigger(func() {
+		recomputeChannel <- struct{}{}
+	})
+
+	host := gatewayv1.Hostname("test.example.com")
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name}}
+	listener := &gatewayv1.Listener{Hostname: &host}
+
+	// 1. Initial call returns Pending
+	result, err := src.ResolveCertificates(gateway, listener)
+	if err != nil || !result.Pending {
+		t.Fatalf("expected Pending=true on initial call, got result=%+v, err=%v", result, err)
+	}
+
+	// 2. Wait for trigger indicating challenges received
+	select {
+	case <-recomputeChannel:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for trigger on challenge received")
+	}
+
+	// 3. ResolveCertificates now returns the pending challenges
+	result, err = src.ResolveCertificates(gateway, listener)
+	if err != nil {
+		t.Fatalf("unexpected error from ResolveCertificates: %v", err)
+	}
+	if !result.Pending {
+		t.Errorf("expected Pending=true while challenge active")
+	}
+	if len(result.Challenges) != 1 || result.Challenges[0].Token != "token-abc" {
+		t.Errorf("expected 1 challenge with token-abc, got %+v", result.Challenges)
+	}
+
+	// 4. Transition to certificate ready (challenges dropped)
+	step.Store(1)
+
+	// Wait for trigger indicating certificate issuance / challenge removal
+	select {
+	case <-recomputeChannel:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for trigger on cert issued")
+	}
+
+	// 5. ResolveCertificates now returns the certificate, and challenges are gone
+	result, err = src.ResolveCertificates(gateway, listener)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Pending {
+		t.Errorf("expected Pending=false after cert issued")
+	}
+	if len(result.Certificates) != 1 {
+		t.Errorf("expected 1 certificate, got %d", len(result.Certificates))
+	}
+	if len(result.Challenges) != 0 {
+		t.Errorf("expected 0 challenges after cert issued, got %d", len(result.Challenges))
+	}
+}
+
+func TestSource_PendingChallenges_TwoListenersDifferentHostnames(t *testing.T) {
+	testCertB, _ := generateTestTLSCert(t)
+
+	challengeA := &certserverv1.HTTP01Challenge{
+		Hostname:         "a.example.com",
+		Token:            "token-a",
+		KeyAuthorization: "token-a.keyauth",
+	}
+	challengeB := &certserverv1.HTTP01Challenge{
+		Hostname:         "b.example.com",
+		Token:            "token-b",
+		KeyAuthorization: "token-b.keyauth",
+	}
+
+	var issueCertForB atomic.Bool
+
+	mock := &mockCertClient{
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest) (*client.CertificateInfo, error) {
+			if len(req.Hostnames) == 1 && req.Hostnames[0] == "a.example.com" {
+				return &client.CertificateInfo{
+					Certificate: nil,
+					Challenges:  []*certserverv1.HTTP01Challenge{challengeA},
+				}, nil
+			}
+			if len(req.Hostnames) == 1 && req.Hostnames[0] == "b.example.com" {
+				if issueCertForB.Load() {
+					return &client.CertificateInfo{
+						Certificate: testCertB,
+						Leaf:        testCertB.Leaf,
+						Challenges:  nil,
+					}, nil
+				}
+				return &client.CertificateInfo{
+					Certificate: nil,
+					Challenges:  []*certserverv1.HTTP01Challenge{challengeB},
+				}, nil
+			}
+			return nil, fmt.Errorf("unexpected request hostnames: %v", req.Hostnames)
+		},
+	}
+
+	src := NewSource(
+		mock,
+		WithMinBackoff(10*time.Millisecond),
+		WithMaxBackoff(20*time.Millisecond),
+	)
+	defer src.Close()
+
+	recomputeChannel := make(chan struct{}, 50)
+	src.SetRecomputeTrigger(func() {
+		select {
+		case recomputeChannel <- struct{}{}:
+		default:
+		}
+	})
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "two-listener-gw"}
+	gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name}}
+	hostA := gatewayv1.Hostname("a.example.com")
+	listenerA := &gatewayv1.Listener{Name: "listener-a", Hostname: &hostA}
+	hostB := gatewayv1.Hostname("b.example.com")
+	listenerB := &gatewayv1.Listener{Name: "listener-b", Hostname: &hostB}
+
+	// 1. Trigger resolution on both listeners
+	_, _ = src.ResolveCertificates(gateway, listenerA)
+	_, _ = src.ResolveCertificates(gateway, listenerB)
+
+	// Wait until both challenges are received and combined
+	deadline := time.Now().Add(5 * time.Second)
+	var combinedChallenges []state.HTTP01Challenge
+	for time.Now().Before(deadline) {
+		resultA, _ := src.ResolveCertificates(gateway, listenerA)
+		if len(resultA.Challenges) == 2 {
+			combinedChallenges = resultA.Challenges
+			break
+		}
+		select {
+		case <-recomputeChannel:
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	if len(combinedChallenges) != 2 {
+		t.Fatalf("expected combined list to hold 2 challenges, got %d: %+v", len(combinedChallenges), combinedChallenges)
+	}
+
+	// Verify both listeners see the same combined challenges
+	resultB, _ := src.ResolveCertificates(gateway, listenerB)
+	if !slices.Equal(resultB.Challenges, combinedChallenges) {
+		t.Errorf("expected listener B to see same combined challenges, got %+v vs %+v", resultB.Challenges, combinedChallenges)
+	}
+
+	// Verify challenges are sorted deterministically
+	if combinedChallenges[0].Hostname != "a.example.com" || combinedChallenges[1].Hostname != "b.example.com" {
+		t.Errorf("unexpected challenge ordering: %+v", combinedChallenges)
+	}
+
+	// 2. Issue certificate for listener B; only challenge A should remain
+	issueCertForB.Store(true)
+
+	var remainingChallenges []state.HTTP01Challenge
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resultA, _ := src.ResolveCertificates(gateway, listenerA)
+		if len(resultA.Challenges) == 1 && resultA.Challenges[0].Hostname == "a.example.com" {
+			remainingChallenges = resultA.Challenges
+			break
+		}
+		select {
+		case <-recomputeChannel:
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	if len(remainingChallenges) != 1 || remainingChallenges[0].Hostname != "a.example.com" {
+		t.Fatalf("expected 1 remaining challenge for a.example.com, got %+v", remainingChallenges)
+	}
+
+	// Listener B now returns certificate and 0 pending challenges
+	resultBAfter, err := src.ResolveCertificates(gateway, listenerB)
+	if err != nil {
+		t.Fatalf("unexpected error for listener B: %v", err)
+	}
+	if len(resultBAfter.Certificates) != 1 {
+		t.Errorf("expected certificate for listener B, got %d", len(resultBAfter.Certificates))
+	}
+}
+
+func TestSource_PendingChallenges_ValidationAndBounds(t *testing.T) {
+	requestedHostnames := []string{"app.example.com"}
+
+	validChallenge := &certserverv1.HTTP01Challenge{
+		Hostname:         "app.example.com",
+		Token:            "valid-token_123",
+		KeyAuthorization: "valid-token_123.auth",
+	}
+	unrequestedHostnameChallenge := &certserverv1.HTTP01Challenge{
+		Hostname:         "attacker.example.com",
+		Token:            "token-bad",
+		KeyAuthorization: "token-bad.auth",
+	}
+	invalidTokenCharactersChallenge := &certserverv1.HTTP01Challenge{
+		Hostname:         "app.example.com",
+		Token:            "token with spaces$",
+		KeyAuthorization: "token.auth",
+	}
+	oversizedTokenChallenge := &certserverv1.HTTP01Challenge{
+		Hostname:         "app.example.com",
+		Token:            strings.Repeat("a", maxTokenLength+1),
+		KeyAuthorization: "token.auth",
+	}
+	oversizedKeyAuthChallenge := &certserverv1.HTTP01Challenge{
+		Hostname:         "app.example.com",
+		Token:            "valid-token",
+		KeyAuthorization: strings.Repeat("b", maxKeyAuthorizationLength+1),
+	}
+	duplicateChallenge := &certserverv1.HTTP01Challenge{
+		Hostname:         "app.example.com",
+		Token:            "another-token",
+		KeyAuthorization: "another.auth",
+	}
+
+	// 1. Drop unrequested hostname
+	result := validateChallenges([]*certserverv1.HTTP01Challenge{unrequestedHostnameChallenge}, requestedHostnames)
+	if len(result) != 0 {
+		t.Errorf("expected unrequested challenge to be dropped, got %+v", result)
+	}
+
+	// 2. Drop invalid token characters
+	result = validateChallenges([]*certserverv1.HTTP01Challenge{invalidTokenCharactersChallenge}, requestedHostnames)
+	if len(result) != 0 {
+		t.Errorf("expected invalid token characters to be dropped, got %+v", result)
+	}
+
+	// 3. Drop oversized token
+	result = validateChallenges([]*certserverv1.HTTP01Challenge{oversizedTokenChallenge}, requestedHostnames)
+	if len(result) != 0 {
+		t.Errorf("expected oversized token to be dropped, got %+v", result)
+	}
+
+	// 4. Drop oversized key authorization
+	result = validateChallenges([]*certserverv1.HTTP01Challenge{oversizedKeyAuthChallenge}, requestedHostnames)
+	if len(result) != 0 {
+		t.Errorf("expected oversized key authorization to be dropped, got %+v", result)
+	}
+
+	// 5. Valid challenge accepted
+	result = validateChallenges([]*certserverv1.HTTP01Challenge{validChallenge}, requestedHostnames)
+	if len(result) != 1 || result[0].Token != "valid-token_123" {
+		t.Fatalf("expected valid challenge to be kept, got %+v", result)
+	}
+
+	// 6. Bound number of challenges by number of hostnames in request (1 hostname -> at most 1 challenge)
+	result = validateChallenges([]*certserverv1.HTTP01Challenge{validChallenge, duplicateChallenge}, requestedHostnames)
+	if len(result) != 1 {
+		t.Errorf("expected challenge count to be bounded by requested hostnames (1), got %d", len(result))
 	}
 }
