@@ -19,16 +19,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
-	"github.com/go-logr/zapr"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-	"go.uber.org/zap/zaptest/observer"
+	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -49,7 +47,15 @@ import (
 // detects runtime installation of optional CRDs, and tracks bundle-version updates when running
 // with the narrowed RBAC permissions from k8s/controller.yaml (impersonated service account).
 func TestController_NarrowedCRDPermissions(t *testing.T) {
-	core, observedLogs := observer.New(zapcore.InfoLevel)
+	var (
+		logMu sync.Mutex
+		logs  []string
+	)
+	logger := funcr.New(func(prefix, args string) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		logs = append(logs, prefix+" "+args)
+	}, funcr.Options{})
 
 	env := testenv.Start(t)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -163,7 +169,7 @@ func TestController_NarrowedCRDPermissions(t *testing.T) {
 	skipNameValidation := true
 	mgr, err := ctrl.NewManager(impersonatedConfig, ctrl.Options{
 		Scheme:  env.Scheme,
-		Logger:  zapr.NewLogger(zap.New(core)),
+		Logger:  logger,
 		Metrics: metricsserver.Options{BindAddress: "0"},
 		Controller: config.Controller{
 			SkipNameValidation: &skipNameValidation,
@@ -252,8 +258,14 @@ func TestController_NarrowedCRDPermissions(t *testing.T) {
 
 	// Verify runtime detection of unserved CRD addition via controller logs
 	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		entries := observedLogs.FilterMessageSnippet("Gateway API CRD added for unserved kind; restart controller deployment to serve it")
-		return entries.Len() >= 1, nil
+		logMu.Lock()
+		defer logMu.Unlock()
+		for _, line := range logs {
+			if strings.Contains(line, "Gateway API CRD added for unserved kind; restart controller deployment to serve it") {
+				return true, nil
+			}
+		}
+		return false, nil
 	})
 	if err != nil {
 		t.Fatalf("timed out waiting for controller to detect runtime TLSRoute installation: %v", err)
