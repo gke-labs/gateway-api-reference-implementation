@@ -298,7 +298,13 @@ type Options struct {
 	// ACMEChallengeTokenPath is the path to the projected service-account token file for data-plane identity.
 	ACMEChallengeTokenPath string
 
-	// SkipNameValidation is a test option that disables controller-runtime controller name uniqueness validation.
+	// SkipNameValidation disables controller-runtime's validation that ensures controller names
+	// are unique across the process. controller-runtime tracks controller names in a process-wide
+	// global registry, which causes test runs that instantiate multiple managers in a single process
+	// (such as `go test -count=2`) to fail when registering controllers. Production code never sets
+	// this option; it exists because New constructs the manager internally in data-plane mode,
+	// preventing tests from configuring manager-level controller options without replicating the
+	// internal cache and metric configurations.
 	SkipNameValidation bool
 
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
@@ -419,6 +425,18 @@ type readyListener struct {
 }
 
 func (listener *readyListener) Accept() (net.Conn, error) {
+	underlying := listener.Listener
+	for {
+		if r, ok := underlying.(interface{ Ready() <-chan struct{} }); ok {
+			<-r.Ready()
+			break
+		}
+		if u, ok := underlying.(interface{ Unwrap() net.Listener }); ok {
+			underlying = u.Unwrap()
+		} else {
+			break
+		}
+	}
 	if listener.onAccept != nil {
 		listener.readyOnce.Do(listener.onAccept)
 	}
@@ -697,7 +715,7 @@ func sharedListeners(previous, next []state.InternalListener) []state.InternalLi
 // promotePendingLocked promotes pending revisions whose required listeners are now all accepting connections.
 func (s *Server) promotePendingLocked() {
 	for gatewayKey, config := range s.appliedConfigs {
-		if config.pendingRevision != "" && (!s.opts.DataplaneMode || s.listenersAccepting(config.pendingListeners)) {
+		if config.pendingRevision != "" && s.listenersAccepting(config.pendingListeners) {
 			config.appliedRevision = config.pendingRevision
 			config.appliedListeners = config.pendingListeners
 			config.pendingRevision = ""
@@ -735,6 +753,9 @@ func (s *Server) readyzChecker() healthz.Checker {
 		if s.opts.DataplaneMode {
 			s.appliedMu.RLock()
 			defer s.appliedMu.RUnlock()
+			if len(s.appliedConfigs) == 0 {
+				return errors.New("no revision recorded yet")
+			}
 			for _, config := range s.appliedConfigs {
 				if config.appliedRevision == "" || !s.listenersAccepting(config.appliedListeners) {
 					return errors.New("listeners not yet accepting connections")
@@ -925,15 +946,19 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	if err := state.ApplyDataplaneConfig(r.proxy, data); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to apply dataplane config: %w", err)
-	}
-	r.proxySynced.Store(true)
-
 	dpCfg, err := state.UnmarshalDataplaneConfig(data)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
 	}
+
+	if r.onConfigApplied != nil && dpCfg.Revision != "" {
+		r.onConfigApplied(dpCfg.GatewayName.String(), dpCfg.Revision, dpCfg.Listeners)
+	}
+
+	if err := state.ApplyDataplaneConfig(r.proxy, data); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to apply dataplane config: %w", err)
+	}
+	r.proxySynced.Store(true)
 
 	if r.onConfigUpdate != nil {
 		opts := proxyproto.ListenerOptions{
@@ -944,10 +969,6 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err := r.onConfigUpdate(opts); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update listener filters: %w", err)
 		}
-	}
-
-	if r.onConfigApplied != nil && dpCfg.Revision != "" {
-		r.onConfigApplied(dpCfg.GatewayName.String(), dpCfg.Revision, dpCfg.Listeners)
 	}
 
 	return ctrl.Result{}, nil
@@ -1039,12 +1060,8 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			if s.opts.HTTPListener != nil {
 				lis = s.opts.HTTPListener
 			} else {
-				listenFn := net.Listen
-				if s.proxy != nil && s.proxy.GetListenFunc() != nil {
-					listenFn = s.proxy.GetListenFunc()
-				}
 				var err error
-				lis, err = listenFn("tcp", s.opts.ProxyAddr)
+				lis, err = net.Listen("tcp", s.opts.ProxyAddr)
 				if err != nil {
 					return fmt.Errorf("failed to listen on HTTP proxy address %q: %w", s.opts.ProxyAddr, err)
 				}
@@ -1126,12 +1143,8 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			if s.opts.HTTPSListener != nil {
 				lis = s.opts.HTTPSListener
 			} else {
-				listenFn := net.Listen
-				if s.proxy != nil && s.proxy.GetListenFunc() != nil {
-					listenFn = s.proxy.GetListenFunc()
-				}
 				var err error
-				lis, err = listenFn("tcp", s.opts.ProxyHTTPSAddr)
+				lis, err = net.Listen("tcp", s.opts.ProxyHTTPSAddr)
 				if err != nil {
 					return fmt.Errorf("failed to listen on HTTPS proxy address %q: %w", s.opts.ProxyHTTPSAddr, err)
 				}

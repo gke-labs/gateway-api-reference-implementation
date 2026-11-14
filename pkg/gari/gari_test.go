@@ -3203,6 +3203,39 @@ func TestCertificateSources_OptionsWiring(t *testing.T) {
 	}
 }
 
+type delayingListener struct {
+	addr       net.Addr
+	ready      chan struct{}
+	realLn     net.Listener
+	listenOnce sync.Once
+}
+
+func (l *delayingListener) Addr() net.Addr {
+	return l.addr
+}
+
+func (l *delayingListener) Close() error {
+	if l.realLn != nil {
+		return l.realLn.Close()
+	}
+	return nil
+}
+
+func (l *delayingListener) Ready() <-chan struct{} {
+	return l.ready
+}
+
+func (l *delayingListener) Accept() (net.Conn, error) {
+	<-l.ready
+	l.listenOnce.Do(func() {
+		l.realLn, _ = net.Listen("tcp", l.addr.String())
+	})
+	if l.realLn == nil {
+		return nil, net.ErrClosed
+	}
+	return l.realLn.Accept()
+}
+
 func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	env := testenv.Start(t)
 
@@ -3237,7 +3270,12 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 
 	healthAddr := allocatePort()
 	proxyAddr := allocatePort()
+	tcpAddr, err := net.ResolveTCPAddr("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("failed to resolve TCP addr: %v", err)
+	}
 
+	unblockHTTP := make(chan struct{})
 	opts := DefaultOptions()
 	opts.RestConfig = env.Config
 	opts.Scheme = env.Scheme
@@ -3246,7 +3284,10 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	opts.DataplaneGatewayName = gwName
 	opts.HealthProbeBindAddress = healthAddr
 	opts.MetricsAddr = healthAddr
-	opts.ProxyAddr = proxyAddr
+	opts.HTTPListener = &delayingListener{
+		addr:  tcpAddr,
+		ready: unblockHTTP,
+	}
 	opts.ProxyHTTPSAddr = ""
 	opts.LeaderElection = false
 	opts.SkipNameValidation = true
@@ -3255,16 +3296,6 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
-
-	unblockHTTP := make(chan struct{})
-	server.Proxy().SetListenFunc(func(network, addr string) (net.Listener, error) {
-		select {
-		case <-unblockHTTP:
-			return net.Listen(network, addr)
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	})
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -3307,6 +3338,27 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 		}
 		defer resp.Body.Close()
 		return resp.StatusCode
+	}
+
+	// Wait until health probe server starts answering requests
+	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		resp, err := httpClient.Get(readyURL)
+		if err != nil {
+			return false, nil
+		}
+		resp.Body.Close()
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("timed out waiting for health probe server to start: %v", err)
+	}
+
+	// Before any Secret exists: /readyz must fail (500) and /_gari/applied must be empty.
+	if code := getReadyzStatus(); code != http.StatusInternalServerError {
+		t.Errorf("expected readyz status 500 before Secret exists, got %d", code)
+	}
+	if revs := getAppliedRevisions(); len(revs) != 0 {
+		t.Errorf("expected /_gari/applied to be empty before Secret exists, got %v", revs)
 	}
 
 	// 1. Initial config Secret (Revision 1) with HTTP listener
@@ -3393,8 +3445,8 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	conn.Close()
 
 	// 2. Config change that adds a listener port (TCP port)
-	tcpAddr := allocatePort()
-	_, tcpPortStr, _ := net.SplitHostPort(tcpAddr)
+	tcpPortAddr := allocatePort()
+	_, tcpPortStr, _ := net.SplitHostPort(tcpPortAddr)
 	tcpPortNum, _ := strconv.Atoi(tcpPortStr)
 	tcpPort := gatewayv1.PortNumber(tcpPortNum)
 
@@ -3443,10 +3495,10 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 		}
 	}
 
-	// Connection to tcpAddr must fail (connection refused)
-	if conn, err := net.DialTimeout("tcp", tcpAddr, 100*time.Millisecond); err == nil {
+	// Connection to tcpPortAddr must fail (connection refused)
+	if conn, err := net.DialTimeout("tcp", tcpPortAddr, 100*time.Millisecond); err == nil {
 		conn.Close()
-		t.Errorf("expected connection to %s to fail while listener port delayed", tcpAddr)
+		t.Errorf("expected connection to %s to fail while listener port delayed", tcpPortAddr)
 	}
 
 	// Unblock TCP listener setup and trigger re-reconcile
@@ -3468,9 +3520,9 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	}
 
 	// Connection made right after either signal succeeds.
-	tcpConn, err := net.DialTimeout("tcp", tcpAddr, 1*time.Second)
+	tcpConn, err := net.DialTimeout("tcp", tcpPortAddr, 1*time.Second)
 	if err != nil {
-		t.Fatalf("connection to %s failed right after ready signal: %v", tcpAddr, err)
+		t.Fatalf("connection to %s failed right after ready signal: %v", tcpPortAddr, err)
 	}
 	tcpConn.Close()
 }

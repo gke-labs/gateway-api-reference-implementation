@@ -250,24 +250,24 @@ func (p *Proxy) updateUDPListenersLocked(listeners []state.InternalListener) {
 func (p *Proxy) IsUDPPortListening(port gatewayv1.PortNumber) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	portListener, ok := p.udpListeners[port]
-	return ok && portListener.reading.Load() && !portListener.closed.Load()
+	pl, ok := p.udpListeners[port]
+	return ok && pl.reading.Load() && !pl.closed.Load()
 }
 
-func (p *Proxy) udpReadLoop(portListener *udpPortListener) {
-	defer portListener.reading.Store(false)
+func (p *Proxy) udpReadLoop(pl *udpPortListener) {
+	defer pl.reading.Store(false)
 	buf := make([]byte, udpBufferSize)
 	for {
-		if !portListener.reading.Swap(true) {
+		if !pl.reading.Swap(true) {
 			p.notifyListenerReady()
 		}
-		n, clientAddr, err := portListener.conn.ReadFrom(buf)
+		n, clientAddr, err := pl.conn.ReadFrom(buf)
 		if err != nil {
-			if portListener.closed.Load() || errors.Is(err, net.ErrClosed) {
+			if pl.closed.Load() || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			select {
-			case <-portListener.done:
+			case <-pl.done:
 				return
 			case <-time.After(5 * time.Millisecond):
 			}
@@ -276,7 +276,7 @@ func (p *Proxy) udpReadLoop(portListener *udpPortListener) {
 		if n == 0 {
 			continue
 		}
-		p.handleUDPDatagram(portListener, clientAddr, buf[:n])
+		p.handleUDPDatagram(pl, clientAddr, buf[:n])
 	}
 }
 

@@ -83,6 +83,11 @@ func NewListener(lis net.Listener, opts ListenerOptions) (*Listener, error) {
 	return l, nil
 }
 
+// Unwrap returns the underlying net.Listener.
+func (l *Listener) Unwrap() net.Listener {
+	return l.Listener
+}
+
 // UpdateOptions dynamically updates the listener's CIDR filters and PROXY protocol settings.
 func (l *Listener) UpdateOptions(opts ListenerOptions) error {
 	allowed, err := ParseCIDRs(opts.AllowedSourceCIDRs)

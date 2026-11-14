@@ -253,13 +253,6 @@ func (p *Proxy) SetListenFunc(fn func(network, addr string) (net.Listener, error
 	p.listenFunc = fn
 }
 
-// GetListenFunc returns the custom net.Listen function if set, or nil.
-func (p *Proxy) GetListenFunc() func(network, addr string) (net.Listener, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.listenFunc
-}
-
 // SetOnListenerReady sets an optional callback invoked when a listener begins accepting connections.
 func (p *Proxy) SetOnListenerReady(fn func()) {
 	p.mu.Lock()
@@ -528,44 +521,44 @@ func (p *Proxy) updateTCPListenersLocked(listeners []state.InternalListener) {
 				klog.Errorf("failed to listen on TCP port %d (%s): %v", port, addr, err)
 				continue
 			}
-			portListener := &tcpPortListener{
+			pl := &tcpPortListener{
 				port: port,
 				ln:   ln,
 				done: make(chan struct{}),
 			}
-			portListener.backends.Store(&backendsCopy)
-			portListener.maxConns.Store(int64(maxConns))
-			p.tcpListeners[port] = portListener
-			go p.tcpAcceptLoop(portListener)
+			pl.backends.Store(&backendsCopy)
+			pl.maxConns.Store(int64(maxConns))
+			p.tcpListeners[port] = pl
+			go p.tcpAcceptLoop(pl)
 		}
 	}
 }
 
-func (p *Proxy) tcpAcceptLoop(portListener *tcpPortListener) {
-	defer portListener.accepting.Store(false)
+func (p *Proxy) tcpAcceptLoop(pl *tcpPortListener) {
+	defer pl.accepting.Store(false)
 	for {
-		if !portListener.accepting.Swap(true) {
+		if !pl.accepting.Swap(true) {
 			p.notifyListenerReady()
 		}
-		conn, err := portListener.ln.Accept()
+		conn, err := pl.ln.Accept()
 		if err != nil {
-			if portListener.closed.Load() || errors.Is(err, net.ErrClosed) {
+			if pl.closed.Load() || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			select {
-			case <-portListener.done:
+			case <-pl.done:
 				return
 			case <-time.After(5 * time.Millisecond):
 			}
 			continue
 		}
-		maxConns := portListener.maxConns.Load()
-		if maxConns > 0 && portListener.activeConns.Add(1) > maxConns {
-			portListener.activeConns.Add(-1)
+		maxConns := pl.maxConns.Load()
+		if maxConns > 0 && pl.activeConns.Add(1) > maxConns {
+			pl.activeConns.Add(-1)
 			closeConn(conn)
 			continue
 		}
-		go p.handleTCPConn(conn, portListener)
+		go p.handleTCPConn(conn, pl)
 	}
 }
 
