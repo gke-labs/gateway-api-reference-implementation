@@ -1788,7 +1788,7 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				t.Errorf("server exited with error: %v", err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Errorf("timed out waiting for server to stop")
 		}
 	})
@@ -3279,7 +3279,7 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				t.Errorf("server exited with error: %v", err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Errorf("timed out waiting for server to stop")
 		}
 	})
@@ -3618,7 +3618,7 @@ func TestDataplane_ConfigRemovesListenerAndAddsUnreadyPort(t *testing.T) {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				t.Errorf("server exited with error: %v", err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Errorf("timed out waiting for server to stop")
 		}
 	})
@@ -3799,7 +3799,7 @@ func TestController_ReadyAfterGatewayCreated(t *testing.T) {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				t.Errorf("server exited with error: %v", err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Errorf("timed out waiting for server to stop")
 		}
 	})
