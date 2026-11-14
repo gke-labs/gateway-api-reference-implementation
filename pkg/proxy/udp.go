@@ -43,7 +43,9 @@ type udpPortListener struct {
 	conn     net.PacketConn
 	backends atomic.Pointer[[]state.InternalUDPBackend]
 	closed   atomic.Bool
-	done     chan struct{}
+	// reading indicates that the UDP socket is bound and the read loop is running.
+	reading atomic.Bool
+	done    chan struct{}
 
 	idleTimeout atomic.Int64 // nanoseconds
 	maxSessions atomic.Int64
@@ -243,9 +245,22 @@ func (p *Proxy) updateUDPListenersLocked(listeners []state.InternalListener) {
 	}
 }
 
+// IsUDPPortListening returns whether the UDP listener socket for port is bound and its read loop is running.
+// Unlike TCP listeners, UDP has no connection accept; this reports that the socket is bound and actively reading packets.
+func (p *Proxy) IsUDPPortListening(port gatewayv1.PortNumber) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	pl, ok := p.udpListeners[port]
+	return ok && pl.reading.Load() && !pl.closed.Load()
+}
+
 func (p *Proxy) udpReadLoop(pl *udpPortListener) {
+	defer pl.reading.Store(false)
 	buf := make([]byte, udpBufferSize)
 	for {
+		if !pl.reading.Swap(true) {
+			p.notifyListenerReady()
+		}
 		n, clientAddr, err := pl.conn.ReadFrom(buf)
 		if err != nil {
 			if pl.closed.Load() || errors.Is(err, net.ErrClosed) {

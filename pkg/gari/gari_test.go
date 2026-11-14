@@ -29,8 +29,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1750,6 +1752,13 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	ln.Close()
 
 	healthAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate free port for proxy: %v", err)
+	}
+	proxyAddr := proxyLn.Addr().String()
+	proxyLn.Close()
+
 	opts := DefaultOptions()
 	opts.RestConfig = env.Config
 	opts.Scheme = env.Scheme
@@ -1758,9 +1767,10 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	opts.DataplaneGatewayName = gwName
 	opts.HealthProbeBindAddress = healthAddr
 	opts.MetricsAddr = healthAddr
-	opts.ProxyAddr = ""
+	opts.ProxyAddr = proxyAddr
 	opts.ProxyHTTPSAddr = ""
 	opts.LeaderElection = false
+	opts.SkipNameValidation = true
 
 	server, err := New(opts)
 	if err != nil {
@@ -1778,7 +1788,7 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				t.Errorf("server exited with error: %v", err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Errorf("timed out waiting for server to stop")
 		}
 	})
@@ -3190,5 +3200,658 @@ func TestCertificateSources_OptionsWiring(t *testing.T) {
 	}
 	if opts.CertificateSources["my-source"] != src {
 		t.Errorf("expected CertificateSources[my-source] to be preserved")
+	}
+}
+
+func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
+	env := testenv.Start(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const (
+		gwNamespace = "readiness-test-ns"
+		gwName      = "readiness-test-gw"
+	)
+	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: gwNamespace,
+		},
+	}
+	if err := env.Client.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	allocatePort := func() string {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to allocate free port: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		return addr
+	}
+
+	healthAddr := allocatePort()
+	proxyAddr := allocatePort()
+	tcpPortAddr1 := allocatePort()
+	_, tcpPortStr1, _ := net.SplitHostPort(tcpPortAddr1)
+	tcpPortNum1, _ := strconv.Atoi(tcpPortStr1)
+	tcpPort1 := gatewayv1.PortNumber(tcpPortNum1)
+
+	opts := DefaultOptions()
+	opts.RestConfig = env.Config
+	opts.Scheme = env.Scheme
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = gwNamespace
+	opts.DataplaneGatewayName = gwName
+	opts.HealthProbeBindAddress = healthAddr
+	opts.MetricsAddr = healthAddr
+	opts.ProxyAddr = proxyAddr
+	opts.ProxyHTTPSAddr = ""
+	opts.LeaderElection = false
+	opts.SkipNameValidation = true
+
+	server, err := New(opts)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	var tcpReady1 atomic.Bool
+	server.Proxy().SetListenFunc(func(network, addr string) (net.Listener, error) {
+		if strings.HasSuffix(addr, tcpPortStr1) && !tcpReady1.Load() {
+			return nil, errors.New("listener setup delayed")
+		}
+		return net.Listen(network, addr)
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("server exited with error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Errorf("timed out waiting for server to stop")
+		}
+	})
+
+	httpClient := &http.Client{Timeout: 1 * time.Second}
+	readyURL := fmt.Sprintf("http://%s/readyz", healthAddr)
+	appliedURL := fmt.Sprintf("http://%s/_gari/applied", healthAddr)
+
+	getAppliedRevisions := func() []string {
+		resp, err := httpClient.Get(appliedURL)
+		if err != nil {
+			return nil
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil
+		}
+		var revs []string
+		_ = json.NewDecoder(resp.Body).Decode(&revs)
+		return revs
+	}
+
+	getReadyzStatus := func() int {
+		resp, err := httpClient.Get(readyURL)
+		if err != nil {
+			return 0
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Wait until health probe server starts answering requests
+	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		resp, err := httpClient.Get(readyURL)
+		if err != nil {
+			return false, nil
+		}
+		resp.Body.Close()
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("timed out waiting for health probe server to start: %v", err)
+	}
+
+	// Before any Secret exists: /readyz must fail (500) and /_gari/applied must be empty.
+	if code := getReadyzStatus(); code != http.StatusInternalServerError {
+		t.Errorf("expected readyz status 500 before Secret exists, got %d", code)
+	}
+	if revs := getAppliedRevisions(); len(revs) != 0 {
+		t.Errorf("expected /_gari/applied to be empty before Secret exists, got %v", revs)
+	}
+
+	// 1. Initial config Secret (Revision 1) with HTTP listener and TCP listener 1
+	route1 := state.InternalRoute{
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/v1"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: "backend-1", Port: 8080, Weight: 1},
+				},
+			},
+		},
+	}
+	dpConfig1, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
+		{Name: "tcp1", Port: tcpPort1, Protocol: gatewayv1.TCPProtocolType},
+	}, []state.InternalRoute{route1}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig 1 failed: %v", err)
+	}
+	dpConfig1.Revision, err = dpConfig1.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 1 failed: %v", err)
+	}
+	configBytes1, err := dpConfig1.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig1: %v", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: gwNamespace,
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			singlepod.DataplaneSecretDataKey: configBytes1,
+		},
+	}
+	if err := env.Client.Create(ctx, secret); err != nil {
+		t.Fatalf("failed to create secret: %v", err)
+	}
+
+	// While listener setup is delayed (tcpReady1 is false):
+	// /readyz must fail (500) and /_gari/applied must omit revision 1.
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if code := getReadyzStatus(); code != http.StatusInternalServerError {
+			t.Errorf("expected readyz status 500 while listener setup delayed, got %d", code)
+		}
+		if revs := getAppliedRevisions(); slices.Contains(revs, dpConfig1.Revision) {
+			t.Errorf("expected /_gari/applied to omit revision while listener delayed, got %v", revs)
+		}
+	}
+
+	// Attempting a connection now must fail (connection refused) because TCP listener is delayed.
+	if conn, err := net.DialTimeout("tcp", tcpPortAddr1, 100*time.Millisecond); err == nil {
+		conn.Close()
+		t.Errorf("expected connection to %s to fail while listener setup delayed", tcpPortAddr1)
+	}
+
+	// Unblock TCP listener setup so listeners can accept connections.
+	tcpReady1.Store(true)
+	secret.Annotations = map[string]string{"test/reconcile": "1"}
+	if err := env.Client.Update(ctx, secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
+
+	// Wait for /readyz to return 200 OK and /_gari/applied to include revision 1.
+	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		return getReadyzStatus() == http.StatusOK && slices.Contains(getAppliedRevisions(), dpConfig1.Revision), nil
+	})
+	if err != nil {
+		t.Fatalf("timed out waiting for readyz OK and revision 1 applied: %v", err)
+	}
+
+	// Connection made right after either signal succeeds.
+	conn, err := net.DialTimeout("tcp", tcpPortAddr1, 1*time.Second)
+	if err != nil {
+		t.Fatalf("connection to %s failed right after ready signal: %v", tcpPortAddr1, err)
+	}
+	conn.Close()
+
+	// 2. Config change that adds a listener port (TCP port 2)
+	tcpPortAddr2 := allocatePort()
+	_, tcpPortStr2, _ := net.SplitHostPort(tcpPortAddr2)
+	tcpPortNum2, _ := strconv.Atoi(tcpPortStr2)
+	tcpPort2 := gatewayv1.PortNumber(tcpPortNum2)
+
+	var tcpReady2 atomic.Bool
+	server.Proxy().SetListenFunc(func(network, addr string) (net.Listener, error) {
+		if strings.HasSuffix(addr, tcpPortStr2) && !tcpReady2.Load() {
+			return nil, errors.New("listener setup delayed")
+		}
+		return net.Listen(network, addr)
+	})
+
+	dpConfig2, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
+		{Name: "tcp1", Port: tcpPort1, Protocol: gatewayv1.TCPProtocolType},
+		{Name: "tcp2", Port: tcpPort2, Protocol: gatewayv1.TCPProtocolType},
+	}, []state.InternalRoute{route1}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig 2 failed: %v", err)
+	}
+	dpConfig2.Revision, err = dpConfig2.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 2 failed: %v", err)
+	}
+	configBytes2, err := dpConfig2.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig2: %v", err)
+	}
+
+	secret.Data[singlepod.DataplaneSecretDataKey] = configBytes2
+	secret.Annotations["test/reconcile"] = "2"
+	if err := env.Client.Update(ctx, secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
+
+	// While the new TCP listener port cannot bind:
+	// /readyz must stay 200 OK (still serving applied revision 1) and /_gari/applied keeps listing revision 1.
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if code := getReadyzStatus(); code != http.StatusOK {
+			t.Errorf("expected readyz status 200 while previous revision is served, got %d", code)
+		}
+		revs := getAppliedRevisions()
+		if !slices.Contains(revs, dpConfig1.Revision) {
+			t.Errorf("expected previous revision 1 to stay listed, got %v", revs)
+		}
+		if slices.Contains(revs, dpConfig2.Revision) {
+			t.Errorf("expected new revision 2 to be omitted while listener port cannot bind, got %v", revs)
+		}
+	}
+
+	// Connection to tcpPortAddr2 must fail (connection refused)
+	if conn, err := net.DialTimeout("tcp", tcpPortAddr2, 100*time.Millisecond); err == nil {
+		conn.Close()
+		t.Errorf("expected connection to %s to fail while listener port delayed", tcpPortAddr2)
+	}
+
+	// Unblock TCP listener setup and trigger re-reconcile
+	tcpReady2.Store(true)
+	secret.Annotations["test/reconcile"] = "3"
+	if err := env.Client.Update(ctx, secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
+
+	// Wait for the new revision to appear in /_gari/applied and /readyz to be 200 OK.
+	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		return getReadyzStatus() == http.StatusOK && slices.Contains(getAppliedRevisions(), dpConfig2.Revision), nil
+	})
+	if err != nil {
+		t.Fatalf("timed out waiting for revision 2: %v", err)
+	}
+
+	// Connection made right after either signal succeeds.
+	tcpConn, err := net.DialTimeout("tcp", tcpPortAddr2, 1*time.Second)
+	if err != nil {
+		t.Fatalf("connection to %s failed right after ready signal: %v", tcpPortAddr2, err)
+	}
+	tcpConn.Close()
+
+	// 3. Config that fails to apply (missing backend client certificate):
+	// its revision is never listed, the previous revision stays listed, and /readyz stays 200.
+	dpConfig3, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{
+			{
+				Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+				Rules: []state.InternalRule{
+					{
+						Matches: []state.InternalMatch{
+							{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/v1"}},
+						},
+						Backends: []state.InternalBackend{
+							{
+								Host: "backend-1",
+								Port: 8080,
+								TLSConfig: &state.InternalTLSConfig{
+									ClientCertID: "missing-cert-id",
+								},
+							},
+						},
+					},
+				},
+			},
+		}},
+	}, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig 3 failed: %v", err)
+	}
+	dpConfig3.Revision, err = dpConfig3.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 3 failed: %v", err)
+	}
+	configBytes3, err := dpConfig3.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig3: %v", err)
+	}
+
+	secret.Data[singlepod.DataplaneSecretDataKey] = configBytes3
+	secret.Annotations["test/reconcile"] = "4"
+	if err := env.Client.Update(ctx, secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if code := getReadyzStatus(); code != http.StatusOK {
+			t.Errorf("expected readyz status 200 while config fails to apply, got %d", code)
+		}
+		revs := getAppliedRevisions()
+		if !slices.Contains(revs, dpConfig2.Revision) {
+			t.Errorf("expected previous revision 2 to stay listed, got %v", revs)
+		}
+		if slices.Contains(revs, dpConfig3.Revision) {
+			t.Errorf("expected failed revision 3 to never be listed, got %v", revs)
+		}
+	}
+}
+
+func TestDataplane_ConfigRemovesListenerAndAddsUnreadyPort(t *testing.T) {
+	env := testenv.Start(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const (
+		gwNamespace = "shared-listener-ns"
+		gwName      = "shared-listener-gw"
+	)
+	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: gwNamespace,
+		},
+	}
+	if err := env.Client.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("failed to create namespace: %v", err)
+	}
+
+	allocatePort := func() string {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to allocate free port: %v", err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		return addr
+	}
+
+	healthAddr := allocatePort()
+	proxyAddr := allocatePort()
+
+	opts := DefaultOptions()
+	opts.RestConfig = env.Config
+	opts.Scheme = env.Scheme
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = gwNamespace
+	opts.DataplaneGatewayName = gwName
+	opts.HealthProbeBindAddress = healthAddr
+	opts.MetricsAddr = healthAddr
+	opts.ProxyAddr = proxyAddr
+	opts.ProxyHTTPSAddr = ""
+	opts.LeaderElection = false
+	opts.SkipNameValidation = true
+
+	server, err := New(opts)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("server exited with error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Errorf("timed out waiting for server to stop")
+		}
+	})
+
+	httpClient := &http.Client{Timeout: 1 * time.Second}
+	readyURL := fmt.Sprintf("http://%s/readyz", healthAddr)
+	appliedURL := fmt.Sprintf("http://%s/_gari/applied", healthAddr)
+
+	getAppliedRevisions := func() []string {
+		resp, err := httpClient.Get(appliedURL)
+		if err != nil {
+			return nil
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil
+		}
+		var revs []string
+		_ = json.NewDecoder(resp.Body).Decode(&revs)
+		return revs
+	}
+
+	getReadyzStatus := func() int {
+		resp, err := httpClient.Get(readyURL)
+		if err != nil {
+			return 0
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// 1. Initial config (Revision 1) with HTTP listener and TCP port 1
+	tcpAddr1 := allocatePort()
+	_, tcpPortStr1, _ := net.SplitHostPort(tcpAddr1)
+	tcpPortNum1, _ := strconv.Atoi(tcpPortStr1)
+	tcpPort1 := gatewayv1.PortNumber(tcpPortNum1)
+
+	route1 := state.InternalRoute{
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/v1"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: "backend-1", Port: 8080, Weight: 1},
+				},
+			},
+		},
+	}
+	dpConfig1, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
+		{Name: "tcp1", Port: tcpPort1, Protocol: gatewayv1.TCPProtocolType},
+	}, []state.InternalRoute{route1}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig 1 failed: %v", err)
+	}
+	dpConfig1.Revision, err = dpConfig1.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 1 failed: %v", err)
+	}
+	configBytes1, err := dpConfig1.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig1: %v", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: gwNamespace,
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			singlepod.DataplaneSecretDataKey: configBytes1,
+		},
+	}
+	if err := env.Client.Create(ctx, secret); err != nil {
+		t.Fatalf("failed to create secret: %v", err)
+	}
+
+	// Wait for Revision 1 to be ready and applied
+	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		return getReadyzStatus() == http.StatusOK && slices.Contains(getAppliedRevisions(), dpConfig1.Revision), nil
+	})
+	if err != nil {
+		t.Fatalf("timed out waiting for revision 1: %v", err)
+	}
+
+	// 2. Revision 2: removes TCP port 1, keeps HTTP, and adds TCP port 2 that fails to bind.
+	tcpAddr2 := allocatePort()
+	_, tcpPortStr2, _ := net.SplitHostPort(tcpAddr2)
+	tcpPortNum2, _ := strconv.Atoi(tcpPortStr2)
+	tcpPort2 := gatewayv1.PortNumber(tcpPortNum2)
+
+	server.Proxy().SetListenFunc(func(network, addr string) (net.Listener, error) {
+		if strings.HasSuffix(addr, tcpPortStr2) {
+			return nil, errors.New("port cannot bind")
+		}
+		return net.Listen(network, addr)
+	})
+
+	dpConfig2, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
+		{Name: "tcp2", Port: tcpPort2, Protocol: gatewayv1.TCPProtocolType},
+	}, []state.InternalRoute{route1}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig 2 failed: %v", err)
+	}
+	dpConfig2.Revision, err = dpConfig2.ComputeRevision()
+	if err != nil {
+		t.Fatalf("ComputeRevision 2 failed: %v", err)
+	}
+	configBytes2, err := dpConfig2.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dpConfig2: %v", err)
+	}
+
+	secret.Data[singlepod.DataplaneSecretDataKey] = configBytes2
+	if err := env.Client.Update(ctx, secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
+
+	// Once the proxy has applied config 2, tcpPort1 is closed.
+	// The shared listener between config 1 and config 2 is HTTP.
+	// /readyz must stay 200 OK because the shared listener (HTTP) is still served,
+	// and /_gari/applied keeps listing revision 1 while revision 2's port cannot bind.
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if code := getReadyzStatus(); code != http.StatusOK {
+			t.Fatalf("expected readyz 200 for shared listeners, got %d", code)
+		}
+		revs := getAppliedRevisions()
+		if !slices.Contains(revs, dpConfig1.Revision) {
+			t.Fatalf("expected previous revision 1 to stay listed, got %v", revs)
+		}
+		if slices.Contains(revs, dpConfig2.Revision) {
+			t.Fatalf("expected new revision 2 to be omitted, got %v", revs)
+		}
+	}
+}
+
+func TestController_ReadyAfterGatewayCreated(t *testing.T) {
+	env := testenv.Start(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate free port: %v", err)
+	}
+	healthAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	opts := DefaultOptions()
+	opts.RestConfig = env.Config
+	opts.Scheme = env.Scheme
+	opts.DataplaneMode = false
+	opts.HealthProbeBindAddress = healthAddr
+	opts.MetricsAddr = healthAddr
+	opts.ProxyAddr = ""
+	opts.ProxyHTTPSAddr = ""
+	opts.LeaderElection = false
+	opts.SkipNameValidation = true
+
+	server, err := New(opts)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("server exited with error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Errorf("timed out waiting for server to stop")
+		}
+	})
+
+	httpClient := &http.Client{Timeout: 1 * time.Second}
+	readyURL := fmt.Sprintf("http://%s/readyz", healthAddr)
+
+	// Wait until controller is ready initially
+	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		resp, err := httpClient.Get(readyURL)
+		if err != nil {
+			return false, nil
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode == http.StatusOK, nil
+	})
+	if err != nil {
+		t.Fatalf("timed out waiting for controller initial ready: %v", err)
+	}
+
+	// Create a Gateway with an HTTP listener
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "controller-mode-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gari",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+	if err := env.Client.Create(ctx, gw); err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
+	}
+
+	// Controller mode runs no in-process proxy, so it must stay ready
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond)
+		resp, err := httpClient.Get(readyURL)
+		if err != nil {
+			t.Fatalf("failed to query readyz: %v", err)
+		}
+		statusCode := resp.StatusCode
+		resp.Body.Close()
+		if statusCode != http.StatusOK {
+			t.Fatalf("expected readyz 200 after Gateway created in controller mode, got %d", statusCode)
+		}
 	}
 }

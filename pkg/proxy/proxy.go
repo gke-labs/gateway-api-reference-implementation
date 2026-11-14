@@ -127,14 +127,17 @@ type Proxy struct {
 	acmeTimeout           time.Duration
 	logForwarderErrorOnce sync.Once
 
-	closed bool
+	closed          bool
+	onListenerReady func()
 }
 
 type tcpPortListener struct {
-	port        gatewayv1.PortNumber
-	ln          net.Listener
-	backends    atomic.Pointer[[]state.InternalTCPBackend]
-	closed      atomic.Bool
+	port     gatewayv1.PortNumber
+	ln       net.Listener
+	backends atomic.Pointer[[]state.InternalTCPBackend]
+	closed   atomic.Bool
+	// accepting indicates that the TCP listener is actively accepting connections.
+	accepting   atomic.Bool
 	done        chan struct{}
 	activeConns atomic.Int64
 	maxConns    atomic.Int64
@@ -248,6 +251,22 @@ func (p *Proxy) SetListenFunc(fn func(network, addr string) (net.Listener, error
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.listenFunc = fn
+}
+
+// SetOnListenerReady sets an optional callback invoked when a listener begins accepting connections.
+func (p *Proxy) SetOnListenerReady(fn func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onListenerReady = fn
+}
+
+func (p *Proxy) notifyListenerReady() {
+	p.mu.RLock()
+	fn := p.onListenerReady
+	p.mu.RUnlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 func (p *Proxy) SetListenPacketFunc(fn func(network, addr string) (net.PacketConn, error)) {
@@ -370,6 +389,14 @@ func (p *Proxy) GetTCPListener(port gatewayv1.PortNumber) net.Listener {
 		return pl.ln
 	}
 	return nil
+}
+
+// IsTCPPortAccepting returns whether the TCP listener for port is accepting connections.
+func (p *Proxy) IsTCPPortAccepting(port gatewayv1.PortNumber) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	portListener, ok := p.tcpListeners[port]
+	return ok && portListener.accepting.Load() && !portListener.closed.Load()
 }
 
 func (p *Proxy) GetUDPListener(port gatewayv1.PortNumber) net.PacketConn {
@@ -508,7 +535,11 @@ func (p *Proxy) updateTCPListenersLocked(listeners []state.InternalListener) {
 }
 
 func (p *Proxy) tcpAcceptLoop(pl *tcpPortListener) {
+	defer pl.accepting.Store(false)
 	for {
+		if !pl.accepting.Swap(true) {
+			p.notifyListenerReady()
+		}
 		conn, err := pl.ln.Accept()
 		if err != nil {
 			if pl.closed.Load() || errors.Is(err, net.ErrClosed) {
