@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -205,4 +206,81 @@ func TestFrontendCLI_JWTFlags(t *testing.T) {
 			t.Fatalf("expected bare jwks file without issuer to fail, got: %v", err)
 		}
 	})
+}
+
+func TestFrontendCLI_ListenHTTPFlag(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "frontend-http-cli-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	certsA, err := certs.GenerateAll("snigateway.internal", "test-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certs: %v", err)
+	}
+
+	caPath := filepath.Join(tempDir, "ca.crt")
+	if err := os.WriteFile(caPath, certsA.CA.CertPEM, 0644); err != nil {
+		t.Fatalf("writing ca.crt: %v", err)
+	}
+	serverCertPath := filepath.Join(tempDir, "server.crt")
+	if err := os.WriteFile(serverCertPath, certsA.Server.CertPEM, 0644); err != nil {
+		t.Fatalf("writing server.crt: %v", err)
+	}
+	serverKeyPath := filepath.Join(tempDir, "server.key")
+	if err := os.WriteFile(serverKeyPath, certsA.Server.KeyPEM, 0600); err != nil {
+		t.Fatalf("writing server.key: %v", err)
+	}
+
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("picking free port for HTTP listener: %v", err)
+	}
+	httpAddr := httpListener.Addr().String()
+	if err := httpListener.Close(); err != nil {
+		t.Fatalf("closing port: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	args := []string{
+		"--listen=127.0.0.1:0",
+		"--listen-http=" + httpAddr,
+		"--ca-cert=" + caPath,
+		"--server-cert=" + serverCertPath,
+		"--server-key=" + serverKeyPath,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, args)
+	}()
+
+	// Wait until HTTP listener is accepting connections
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		conn, dialErr := net.DialTimeout("tcp", httpAddr, 50*time.Millisecond)
+		if dialErr == nil {
+			if err := conn.Close(); err != nil {
+				t.Fatalf("closing probe connection: %v", err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for HTTP listener to start: %v", dialErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for server shutdown")
+	}
 }

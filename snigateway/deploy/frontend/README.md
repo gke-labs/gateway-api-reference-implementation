@@ -147,4 +147,4 @@ Create DNS `A` (and/or `AAAA`) records for your domains pointing to the public I
 - `app.example.com` -> `<VM_PUBLIC_IP>`
 - `*.example.com` -> `<VM_PUBLIC_IP>` (optional, for wildcard routing)
 
-Once the in-cluster `snigateway` controller connects to the frontend, HTTPS requests sent to `https://app.example.com` will be multiplexed across the reverse tunnel and served by your Kubernetes workloads.
+Once the in-cluster `snigateway` controller connects to the frontend, HTTPS requests sent to `https://app.example.com` will be multiplexed across the reverse tunnel and served by your Kubernetes workloads. To also accept plaintext HTTP requests and route them by `Host` header (e.g. for HTTP-to-HTTPS redirects or ACME HTTP-01 challenges), specify `--listen-http :80`.

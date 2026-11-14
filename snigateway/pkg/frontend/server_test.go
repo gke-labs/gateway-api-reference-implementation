@@ -312,6 +312,288 @@ func TestEndToEndReverseTunnel(t *testing.T) {
 	})
 }
 
+func startHTTPBackendWorker(ctx context.Context, t *testing.T, c *client.Client, hostnames []string, onConn func(*proxyproto.Header, net.Conn)) string {
+	sessID, sessErrCh, err := c.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	if len(hostnames) > 0 {
+		if _, err := c.Register(ctx, sessID, hostnames); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+	}
+
+	for i := 0; i < 4; i++ {
+		go func() {
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				conn, err := c.DialTunnel(dialCtx, sessID)
+				cancel()
+				if err != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(50 * time.Millisecond):
+						continue
+					}
+				}
+
+				bufReader := bufio.NewReader(conn)
+				hdr, err := proxyproto.Decode(bufReader)
+				if err != nil {
+					// Discard tunnel connection on decode failure; ignore close error because peer may have dropped.
+					_ = conn.Close()
+					continue
+				}
+
+				var remaining []byte
+				if bufReader.Buffered() > 0 {
+					remaining = make([]byte, bufReader.Buffered())
+					if _, err := io.ReadFull(bufReader, remaining); err != nil {
+						// Discard tunnel connection on payload read failure; ignore close error because peer may have dropped.
+						_ = conn.Close()
+						continue
+					}
+				}
+
+				proxyConn := proxyproto.NewConn(conn, hdr.SrcAddr, hdr.DstAddr, remaining)
+
+				if onConn != nil {
+					go onConn(hdr, proxyConn)
+				}
+			}
+		}()
+	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-sessErrCh:
+		}
+	}()
+
+	return sessID
+}
+
+func TestHTTPHostRouting(t *testing.T) {
+	generated, err := certs.GenerateAll("snigateway.internal", "test-cluster-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certs failed: %v", err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	tlsListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen tlsListener failed: %v", err)
+	}
+	defer tlsListener.Close()
+
+	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen httpListener failed: %v", err)
+	}
+	defer httpListener.Close()
+
+	srv, err := NewServer(ServerConfig{
+		ServerTLSConfig:   serverTLS,
+		InternalHostname:  "snigateway.internal",
+		ConnectTimeout:    5 * time.Second,
+		PerAttemptTimeout: 500 * time.Millisecond,
+		ReadSNITimeout:    2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- srv.ServeWithHTTP([]net.Listener{tlsListener}, []net.Listener{httpListener})
+	}()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(tlsListener.Addr().String(), clientTLS)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	type receivedRequest struct {
+		authority string
+		srcAddr   string
+		reqBytes  string
+	}
+	receivedCh := make(chan receivedRequest, 10)
+
+	handleConn := func(hdr *proxyproto.Header, conn net.Conn) {
+		defer conn.Close()
+		buf := make([]byte, 2048)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+
+		// Send initial backend byte(s) back so routeToBackend commits and splices
+		if _, err := conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")); err != nil {
+			return
+		}
+
+		var src string
+		if hdr.SrcAddr != nil {
+			src = hdr.SrcAddr.String()
+		}
+		receivedCh <- receivedRequest{
+			authority: hdr.Authority,
+			srcAddr:   src,
+			reqBytes:  string(buf[:n]),
+		}
+	}
+
+	sessID := startHTTPBackendWorker(ctx, t, c, []string{"plain.example.com", "*.wildcard.org"}, handleConn)
+
+	// Wait for registration and idle pool connection
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if len(srv.RegistrationTable().MatchSessions("plain.example.com")) > 0 && srv.PoolTransport().HasIdleConn(sessID) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for session registration and idle pool connection")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 1. Valid HTTP/1.1 request reaches backend with correct PROXY header and request bytes
+	t.Run("Valid HTTP/1.1 request routed by Host", func(t *testing.T) {
+		conn, err := net.Dial("tcp", httpListener.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial httpListener failed: %v", err)
+		}
+		defer conn.Close()
+
+		httpRequest := "GET /.well-known/acme-challenge/test-token HTTP/1.1\r\nHost: plain.example.com\r\nUser-Agent: test\r\n\r\n"
+		if _, err := conn.Write([]byte(httpRequest)); err != nil {
+			t.Fatalf("Write httpRequest failed: %v", err)
+		}
+
+		select {
+		case req := <-receivedCh:
+			if req.authority != "plain.example.com" {
+				t.Fatalf("expected authority plain.example.com, got %q", req.authority)
+			}
+			clientHost, _, err := net.SplitHostPort(conn.LocalAddr().String())
+			if err != nil {
+				t.Fatalf("SplitHostPort(conn.LocalAddr): %v", err)
+			}
+			srcHost, _, err := net.SplitHostPort(req.srcAddr)
+			if err != nil {
+				t.Fatalf("SplitHostPort(req.srcAddr): %v", err)
+			}
+			if srcHost != clientHost {
+				t.Fatalf("expected srcHost %q, got %q", clientHost, srcHost)
+			}
+			if req.reqBytes != httpRequest {
+				t.Fatalf("expected reqBytes %q, got %q", httpRequest, req.reqBytes)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for backend to receive request")
+		}
+
+		// Read response from backend through splice
+		respBuf := make([]byte, 1024)
+		n, err := conn.Read(respBuf)
+		if err != nil {
+			t.Fatalf("reading response: %v", err)
+		}
+		if !strings.Contains(string(respBuf[:n]), "200 OK") {
+			t.Fatalf("unexpected response: %s", string(respBuf[:n]))
+		}
+	})
+
+	// 2. Request with Host containing port is stripped and routed properly
+	t.Run("Host with port is stripped and routed", func(t *testing.T) {
+		conn, err := net.Dial("tcp", httpListener.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial httpListener failed: %v", err)
+		}
+		defer conn.Close()
+
+		httpRequest := "GET /index.html HTTP/1.1\r\nHost: plain.example.com:80\r\n\r\n"
+		if _, err := conn.Write([]byte(httpRequest)); err != nil {
+			t.Fatalf("Write httpRequest failed: %v", err)
+		}
+
+		select {
+		case req := <-receivedCh:
+			if req.authority != "plain.example.com" {
+				t.Fatalf("expected authority plain.example.com, got %q", req.authority)
+			}
+			if req.reqBytes != httpRequest {
+				t.Fatalf("expected reqBytes %q, got %q", httpRequest, req.reqBytes)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for backend to receive request")
+		}
+	})
+
+	// 3. Request with unregistered Host is closed without contacting backend
+	t.Run("Unregistered Host closes connection", func(t *testing.T) {
+		conn, err := net.Dial("tcp", httpListener.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: unregistered.domain.com\r\n\r\n")); err != nil {
+			t.Fatalf("writing request: %v", err)
+		}
+		buf := make([]byte, 10)
+		_, err = conn.Read(buf)
+		if err == nil {
+			t.Fatal("expected connection to be closed for unregistered host")
+		}
+		select {
+		case req := <-receivedCh:
+			t.Fatalf("unexpected backend contact for unregistered host: %+v", req)
+		default:
+		}
+	})
+
+	// 4. Request without Host is closed without contacting backend
+	t.Run("Missing Host closes connection", func(t *testing.T) {
+		conn, err := net.Dial("tcp", httpListener.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nUser-Agent: curl\r\n\r\n")); err != nil {
+			t.Fatalf("writing request: %v", err)
+		}
+		buf := make([]byte, 10)
+		_, err = conn.Read(buf)
+		if err == nil {
+			t.Fatal("expected connection to be closed for missing host header")
+		}
+		select {
+		case req := <-receivedCh:
+			t.Fatalf("unexpected backend contact for missing host: %+v", req)
+		default:
+		}
+	})
+}
+
 func TestRejectionWithoutValidClientCertificate(t *testing.T) {
 	_, serverAddr, generated, cleanup := setupTestServerAndClient(t)
 	defer cleanup()
