@@ -51,13 +51,6 @@ func WithListener(lis *Listener) ManagerOption {
 	}
 }
 
-// WithHTTPListener sets a custom HTTP Listener for the Manager.
-func WithHTTPListener(lis *Listener) ManagerOption {
-	return func(m *Manager) {
-		m.httpListener = lis
-	}
-}
-
 // WithPoolSize sets the number of idle pooled reverse tunnel connections to maintain.
 func WithPoolSize(size int) ManagerOption {
 	return func(m *Manager) {
@@ -414,6 +407,11 @@ func (m *Manager) handleTunnelConn(conn net.Conn) error {
 		return err
 	}
 
+	// The frontend sends the peeked payload bytes straight after the PROXY header, so
+	// the first byte is normally already buffered. Peek(1) waits for this first byte
+	// with no local deadline; if a tunnel connection sends the header and nothing else,
+	// the wait is bounded by the frontend closing the connection when its attempt
+	// deadline expires, unblocking Peek with an error.
 	first, err := bufReader.Peek(1)
 	if err != nil {
 		closeConn(conn)
@@ -426,13 +424,13 @@ func (m *Manager) handleTunnelConn(conn net.Conn) error {
 		return err
 	}
 
-	targetLis := m.httpListener
+	targetListener := m.httpListener
 	if first[0] == recordTypeHandshake {
-		targetLis = m.listener
+		targetListener = m.listener
 	}
 
 	proxyConn := proxyproto.NewConn(conn, hdr.SrcAddr, hdr.DstAddr, remaining)
-	if err := targetLis.Enqueue(proxyConn); err != nil {
+	if err := targetListener.Enqueue(proxyConn); err != nil {
 		closeConn(conn)
 		return err
 	}
