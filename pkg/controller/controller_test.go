@@ -4270,11 +4270,11 @@ func TestGatewayReconciler_DataPlane_ACMEChallengeServing(t *testing.T) {
 		"test-source": fakeSource,
 	})
 
-	p := proxy.NewProxy()
-	p.SetDialFunc(func(network, addr string) (net.Conn, error) {
+	proxyInstance := proxy.NewProxy()
+	proxyInstance.SetDialFunc(func(network, address string) (net.Conn, error) {
 		return net.Dial(network, net.JoinHostPort(backendHost, backendPortStr))
 	})
-	st.SetProxy(p)
+	st.SetProxy(proxyInstance)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -4375,15 +4375,15 @@ func TestGatewayReconciler_DataPlane_ACMEChallengeServing(t *testing.T) {
 		WithStatusSubresource(gw, route).
 		Build()
 
-	r := &GatewayReconciler{
+	reconciler := &GatewayReconciler{
 		Client:         client,
 		Scheme:         scheme,
 		State:          st,
 		ControllerName: "test-controller",
 	}
 
-	req := ctrl.Request{NamespacedName: gwKey}
-	_, err = r.Reconcile(ctx, req)
+	reconcileRequest := ctrl.Request{NamespacedName: gwKey}
+	_, err = reconciler.Reconcile(ctx, reconcileRequest)
 	if err != nil {
 		t.Fatalf("unexpected error reconciling gateway: %v", err)
 	}
@@ -4391,31 +4391,31 @@ func TestGatewayReconciler_DataPlane_ACMEChallengeServing(t *testing.T) {
 	// 1. Acceptance Criteria: a fake certificate source reports a pending challenge,
 	// and an HTTP request for that token and hostname returns the key authorization.
 	pollUntil(t, 2*time.Second, func() bool {
-		httpReq := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/test-token-123", nil)
-		rec := httptest.NewRecorder()
-		p.ServeHTTP(rec, httpReq)
-		return rec.Code == http.StatusOK &&
-			rec.Header().Get("Content-Type") == "text/plain" &&
-			rec.Body.String() == "test-token-123.auth-key-456"
+		httpRequest := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/test-token-123", nil)
+		recorder := httptest.NewRecorder()
+		proxyInstance.ServeHTTP(recorder, httpRequest)
+		return recorder.Code == http.StatusOK &&
+			recorder.Header().Get("Content-Type") == "text/plain" &&
+			recorder.Body.String() == "test-token-123.auth-key-456"
 	})
 
 	// 2. Acceptance Criteria: A request for another token, or the same token on another hostname, gets normal routing.
 	// 2a. Request for another token on example.com gets normal routing
-	reqOtherToken := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/other-token", nil)
-	recOtherToken := httptest.NewRecorder()
-	p.ServeHTTP(recOtherToken, reqOtherToken)
-	if recOtherToken.Code != http.StatusOK {
-		t.Errorf("expected 200 OK from normal routing for other token, got %d", recOtherToken.Code)
+	requestOtherToken := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/other-token", nil)
+	recorderOtherToken := httptest.NewRecorder()
+	proxyInstance.ServeHTTP(recorderOtherToken, requestOtherToken)
+	if recorderOtherToken.Code != http.StatusOK {
+		t.Errorf("expected 200 OK from normal routing for other token, got %d", recorderOtherToken.Code)
 	}
-	if recOtherToken.Body.String() != "backend normal response" {
-		t.Errorf("expected normal route response for other token, got %q", recOtherToken.Body.String())
+	if recorderOtherToken.Body.String() != "backend normal response" {
+		t.Errorf("expected normal route response for other token, got %q", recorderOtherToken.Body.String())
 	}
 
 	// 2b. Request for the same token on another hostname gets normal routing (not the key authorization)
-	reqOtherHost := httptest.NewRequest(http.MethodGet, "http://other.com/.well-known/acme-challenge/test-token-123", nil)
-	recOtherHost := httptest.NewRecorder()
-	p.ServeHTTP(recOtherHost, reqOtherHost)
-	if recOtherHost.Body.String() == "test-token-123.auth-key-456" {
+	requestOtherHost := httptest.NewRequest(http.MethodGet, "http://other.com/.well-known/acme-challenge/test-token-123", nil)
+	recorderOtherHost := httptest.NewRecorder()
+	proxyInstance.ServeHTTP(recorderOtherHost, requestOtherHost)
+	if recorderOtherHost.Body.String() == "test-token-123.auth-key-456" {
 		t.Errorf("expected challenge NOT to be served on different hostname")
 	}
 
@@ -4423,9 +4423,9 @@ func TestGatewayReconciler_DataPlane_ACMEChallengeServing(t *testing.T) {
 	fakeSource.setChallenges(nil)
 
 	pollUntil(t, 2*time.Second, func() bool {
-		httpReq := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/test-token-123", nil)
-		rec := httptest.NewRecorder()
-		p.ServeHTTP(rec, httpReq)
-		return rec.Code == http.StatusOK && rec.Body.String() == "backend normal response"
+		httpRequest := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/test-token-123", nil)
+		recorder := httptest.NewRecorder()
+		proxyInstance.ServeHTTP(recorder, httpRequest)
+		return recorder.Code == http.StatusOK && recorder.Body.String() == "backend normal response"
 	})
 }

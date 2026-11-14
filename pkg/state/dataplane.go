@@ -64,8 +64,11 @@ const (
 
 // HTTP01Challenge represents an ACME HTTP-01 challenge to be served by the data plane.
 type HTTP01Challenge struct {
-	Hostname         string `json:"hostname"`
-	Token            string `json:"token"`
+	// Hostname is the domain name that the ACME challenge validates.
+	Hostname string `json:"hostname"`
+	// Token is the challenge token requested in the URL path.
+	Token string `json:"token"`
+	// KeyAuthorization is the key authorization content returned as the response body.
 	KeyAuthorization string `json:"keyAuthorization"`
 }
 
@@ -317,12 +320,12 @@ func BuildGatewayDataplaneConfig(cg *CompiledGateway) (*DataplaneConfig, error) 
 
 	var challenges []HTTP01Challenge
 	seen := make(map[string]bool)
-	for _, el := range cg.EffectiveListeners {
-		for _, ch := range el.Challenges {
-			key := ch.Hostname + "/" + ch.Token
+	for _, effectiveListener := range cg.EffectiveListeners {
+		for _, challenge := range effectiveListener.Challenges {
+			key := challenge.Hostname + "/" + challenge.Token
 			if !seen[key] {
 				seen[key] = true
-				challenges = append(challenges, ch)
+				challenges = append(challenges, challenge)
 			}
 		}
 	}
@@ -356,15 +359,12 @@ func UnmarshalDataplaneConfig(data []byte) (*DataplaneConfig, error) {
 	return &cfg, nil
 }
 
-// ChallengesUpdater defines an optional interface for proxies that can serve ACME HTTP-01 challenges.
-type ChallengesUpdater interface {
-	UpdateChallenges(challenges []HTTP01Challenge)
-}
-
-// ProxyConfigUpdater defines the interface needed to apply configuration and certificates to a proxy.
+// ProxyConfigUpdater defines the interface needed to apply configuration, certificates,
+// and ACME HTTP-01 challenges to a proxy.
 type ProxyConfigUpdater interface {
 	UpdateConfig(listeners []InternalListener, routes []InternalRoute)
 	UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate)
+	UpdateChallenges(challenges []HTTP01Challenge)
 }
 
 // ApplyDataplaneConfig deserializes JSON-encoded DataplaneConfig, extracts certificates,
@@ -442,9 +442,7 @@ func ApplyDataplaneConfig(updater ProxyConfigUpdater, data []byte) error {
 
 	updater.UpdateConfig(cfg.Listeners, cfg.Routes)
 	updater.UpdateCertificates(certsMap, defaultCert)
-	if cu, ok := updater.(ChallengesUpdater); ok {
-		cu.UpdateChallenges(cfg.Challenges)
-	}
+	updater.UpdateChallenges(cfg.Challenges)
 	return nil
 }
 
