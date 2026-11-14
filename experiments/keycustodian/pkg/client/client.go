@@ -149,8 +149,12 @@ func (client *Client) GetCertificateChain(ctx context.Context, keyName string) (
 	return response.CertificateChain, nil
 }
 
-// NewSigner creates a crypto.Signer for keyName using this client.
-func (client *Client) NewSigner(keyName string) (crypto.Signer, error) {
+// NewSigner creates a Signer for keyName using this client.
+//
+// It asks the daemon for one signature over a fixed digest to check that the
+// key matches the certificate, which adds one line to the daemon's audit log
+// for each signer.
+func (client *Client) NewSigner(keyName string) (*Signer, error) {
 	chainPEM, err := client.GetCertificateChain(context.Background(), keyName)
 	if err != nil {
 		return nil, fmt.Errorf("getting certificate chain for %q: %w", keyName, err)
@@ -183,14 +187,14 @@ func (client *Client) NewSigner(keyName string) (crypto.Signer, error) {
 }
 
 func verifySignature(publicKey crypto.PublicKey, digest []byte, signature []byte) error {
-	switch pub := publicKey.(type) {
+	switch typedPublicKey := publicKey.(type) {
 	case *ecdsa.PublicKey:
-		if !ecdsa.VerifyASN1(pub, digest, signature) {
+		if !ecdsa.VerifyASN1(typedPublicKey, digest, signature) {
 			return errors.New("signature verification failed")
 		}
 		return nil
 	case *rsa.PublicKey:
-		return rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest, signature)
+		return rsa.VerifyPKCS1v15(typedPublicKey, crypto.SHA256, digest, signature)
 	default:
 		return fmt.Errorf("unsupported public key type %T", publicKey)
 	}
@@ -209,7 +213,7 @@ func NewSigner(socketPath string, keyName string, clientOptions ...Option) (cryp
 		}
 		return nil, err
 	}
-	signer.(*Signer).ownsClient = true
+	signer.ownsClient = true
 	return signer, nil
 }
 
@@ -261,7 +265,7 @@ func (signer *Signer) Sign(_ io.Reader, digest []byte, signerOptions crypto.Sign
 	}
 
 	request := &keycustodianv1alpha1.SignRequest{
-		Key:               signer.keyName,
+		Key:              signer.keyName,
 		HashAlgorithm:    hashAlgorithm,
 		Digest:           digest,
 		RsaPssSaltLength: pssSaltLength,

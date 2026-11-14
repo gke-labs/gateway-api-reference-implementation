@@ -70,15 +70,9 @@ func (daemon *testDaemon) Close() error {
 	return err
 }
 
-func writeECDSAKeyAndCertificate(t *testing.T, directory, name string) *ecdsa.PrivateKey {
-	t.Helper()
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("failed to generate ECDSA key: %v", err)
-	}
-
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
+func certificateTemplate(name string, serialNumber int64) *x509.Certificate {
+	return &x509.Certificate{
+		SerialNumber: big.NewInt(serialNumber),
 		Subject:      pkix.Name{CommonName: name},
 		DNSNames:     []string{"localhost", name},
 		NotBefore:    time.Now().Add(-time.Hour),
@@ -86,25 +80,35 @@ func writeECDSAKeyAndCertificate(t *testing.T, directory, name string) *ecdsa.Pr
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
-	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+}
+
+func writeCertificate(t *testing.T, directory, name string, template *x509.Certificate, publicKey crypto.PublicKey, signer crypto.Signer) {
+	t.Helper()
+	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, signer)
 	if err != nil {
 		t.Fatalf("failed to create certificate: %v", err)
 	}
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
+	if err := os.WriteFile(filepath.Join(directory, name+".crt"), certificatePEM, 0644); err != nil {
+		t.Fatalf("failed to write certificate file: %v", err)
+	}
+}
 
+func writeECDSAKeyAndCertificate(t *testing.T, directory, name string) *ecdsa.PrivateKey {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate ECDSA key: %v", err)
+	}
 	keyDER, err := x509.MarshalECPrivateKey(privateKey)
 	if err != nil {
 		t.Fatalf("failed to marshal EC private key: %v", err)
 	}
-
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
-
 	if err := os.WriteFile(filepath.Join(directory, name+".key"), keyPEM, 0600); err != nil {
 		t.Fatalf("failed to write key file: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, name+".crt"), certificatePEM, 0644); err != nil {
-		t.Fatalf("failed to write certificate file: %v", err)
-	}
+	writeCertificate(t, directory, name, certificateTemplate(name, 1), &privateKey.PublicKey, privateKey)
 	return privateKey
 }
 
@@ -114,31 +118,12 @@ func writeRSAKeyAndCertificate(t *testing.T, directory, name string) *rsa.Privat
 	if err != nil {
 		t.Fatalf("failed to generate RSA key: %v", err)
 	}
-
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: name},
-		DNSNames:     []string{"localhost", name},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
-	if err != nil {
-		t.Fatalf("failed to create certificate: %v", err)
-	}
-
 	keyDER := x509.MarshalPKCS1PrivateKey(privateKey)
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyDER})
-	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
-
 	if err := os.WriteFile(filepath.Join(directory, name+".key"), keyPEM, 0600); err != nil {
 		t.Fatalf("failed to write key file: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, name+".crt"), certificatePEM, 0644); err != nil {
-		t.Fatalf("failed to write certificate file: %v", err)
-	}
+	writeCertificate(t, directory, name, certificateTemplate(name, 2), &privateKey.PublicKey, privateKey)
 	return privateKey
 }
 
@@ -152,41 +137,27 @@ func writeMismatchedKeyAndCertificate(t *testing.T, directory, name string) {
 	if err != nil {
 		t.Fatalf("failed to generate key B: %v", err)
 	}
-
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(3),
-		Subject:      pkix.Name{CommonName: name},
-		DNSNames:     []string{"localhost", name},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &keyB.PublicKey, keyB)
-	if err != nil {
-		t.Fatalf("failed to create certificate with key B: %v", err)
-	}
-
 	keyADER, err := x509.MarshalECPrivateKey(keyA)
 	if err != nil {
 		t.Fatalf("failed to marshal key A: %v", err)
 	}
-
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyADER})
-	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
-
 	if err := os.WriteFile(filepath.Join(directory, name+".key"), keyPEM, 0600); err != nil {
 		t.Fatalf("failed to write key file: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, name+".crt"), certificatePEM, 0644); err != nil {
-		t.Fatalf("failed to write certificate file: %v", err)
-	}
+	writeCertificate(t, directory, name, certificateTemplate(name, 3), &keyB.PublicKey, keyB)
 }
 
 func startTestDaemon(t *testing.T, keysDirectory string, signDelay time.Duration) *testDaemon {
 	t.Helper()
 
-	socketDirectory := t.TempDir()
+	socketDirectory, err := os.MkdirTemp("", "kc")
+	if err != nil {
+		t.Fatalf("failed to create socket temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(socketDirectory)
+	})
 	socketPath := filepath.Join(socketDirectory, "custodian.sock")
 
 	custodianServer, err := custodian.NewServer(keysDirectory)
@@ -245,32 +216,9 @@ func startTestDaemon(t *testing.T, keysDirectory string, signDelay time.Duration
 	return daemon
 }
 
-// Acceptance criterion: A tls.Server whose certificate uses the client's crypto.Signer
-// completes a TLS 1.3 handshake with a tls.Client, through a real Unix socket (ECDSA).
-func TestTLS13Handshake_ECDSA(t *testing.T) {
-	keysDirectory := t.TempDir()
-	writeECDSAKeyAndCertificate(t, keysDirectory, "p256")
-	daemon := startTestDaemon(t, keysDirectory, 0)
+func testTLSHandshake(t *testing.T, signer crypto.Signer, chainPEM []byte, tlsVersion uint16) {
+	t.Helper()
 
-	custodianClient, err := client.New(daemon.socketPath)
-	if err != nil {
-		t.Fatalf("client.New failed: %v", err)
-	}
-	defer func() {
-		if closeErr := custodianClient.Close(); closeErr != nil {
-			t.Logf("closing client: %v", closeErr)
-		}
-	}()
-
-	signer, err := custodianClient.NewSigner("p256")
-	if err != nil {
-		t.Fatalf("NewSigner failed: %v", err)
-	}
-
-	chainPEM, err := custodianClient.GetCertificateChain(t.Context(), "p256")
-	if err != nil {
-		t.Fatalf("GetCertificateChain failed: %v", err)
-	}
 	block, _ := pem.Decode(chainPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
 		t.Fatalf("failed to decode certificate PEM")
@@ -280,14 +228,15 @@ func TestTLS13Handshake_ECDSA(t *testing.T) {
 		t.Fatalf("ParseCertificate failed: %v", err)
 	}
 
-	tlsCert := tls.Certificate{
-		Certificate: [][]byte{certificate.Raw},
-		PrivateKey:  signer,
-	}
-
 	serverTLSConfig := &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{
+			{
+				Certificate: [][]byte{certificate.Raw},
+				PrivateKey:  signer,
+			},
+		},
+		MinVersion: tlsVersion,
+		MaxVersion: tlsVersion,
 	}
 
 	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -321,8 +270,8 @@ func TestTLS13Handshake_ECDSA(t *testing.T) {
 		}
 
 		state := tlsConn.ConnectionState()
-		if state.Version != tls.VersionTLS13 {
-			serverErrCh <- fmt.Errorf("expected TLS 1.3, got %x", state.Version)
+		if state.Version != tlsVersion {
+			serverErrCh <- fmt.Errorf("expected TLS version %x, got %x", tlsVersion, state.Version)
 			return
 		}
 
@@ -344,7 +293,8 @@ func TestTLS13Handshake_ECDSA(t *testing.T) {
 	clientTLSConfig := &tls.Config{
 		RootCAs:    certPool,
 		ServerName: "localhost",
-		MinVersion: tls.VersionTLS13,
+		MinVersion: tlsVersion,
+		MaxVersion: tlsVersion,
 	}
 
 	clientConn, err := tls.Dial("tcp", tlsListener.Addr().String(), clientTLSConfig)
@@ -374,136 +324,90 @@ func TestTLS13Handshake_ECDSA(t *testing.T) {
 	}
 }
 
-// Acceptance criterion: A tls.Server whose certificate uses the client's crypto.Signer
-// completes a TLS 1.3 handshake with a tls.Client, through a real Unix socket (RSA-PSS).
-func TestTLS13Handshake_RSAPSS(t *testing.T) {
-	keysDirectory := t.TempDir()
-	writeRSAKeyAndCertificate(t, keysDirectory, "rsa")
-	daemon := startTestDaemon(t, keysDirectory, 0)
-
-	signer, err := client.NewSigner(daemon.socketPath, "rsa")
-	if err != nil {
-		t.Fatalf("NewSigner failed: %v", err)
+func TestTLSHandshake_ECDSA(t *testing.T) {
+	testVersions := []struct {
+		name    string
+		version uint16
+	}{
+		{"TLS12", tls.VersionTLS12},
+		{"TLS13", tls.VersionTLS13},
 	}
-	defer func() {
-		if closer, ok := signer.(io.Closer); ok {
-			if closeErr := closer.Close(); closeErr != nil {
-				t.Logf("closing signer: %v", closeErr)
+
+	for _, tc := range testVersions {
+		t.Run(tc.name, func(t *testing.T) {
+			keysDirectory := t.TempDir()
+			writeECDSAKeyAndCertificate(t, keysDirectory, "p256")
+			daemon := startTestDaemon(t, keysDirectory, 0)
+
+			custodianClient, err := client.New(daemon.socketPath)
+			if err != nil {
+				t.Fatalf("client.New failed: %v", err)
 			}
-		}
-	}()
+			defer func() {
+				if closeErr := custodianClient.Close(); closeErr != nil {
+					t.Logf("closing client: %v", closeErr)
+				}
+			}()
 
-	custodianClient, err := client.New(daemon.socketPath)
-	if err != nil {
-		t.Fatalf("client.New failed: %v", err)
-	}
-	defer func() {
-		if closeErr := custodianClient.Close(); closeErr != nil {
-			t.Logf("closing client: %v", closeErr)
-		}
-	}()
-
-	chainPEM, err := custodianClient.GetCertificateChain(t.Context(), "rsa")
-	if err != nil {
-		t.Fatalf("GetCertificateChain failed: %v", err)
-	}
-	block, _ := pem.Decode(chainPEM)
-	certificate, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		t.Fatalf("ParseCertificate failed: %v", err)
-	}
-
-	tlsCert := tls.Certificate{
-		Certificate: [][]byte{certificate.Raw},
-		PrivateKey:  signer,
-	}
-
-	serverTLSConfig := &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		MinVersion:   tls.VersionTLS13,
-	}
-
-	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen failed: %v", err)
-	}
-	tlsListener := tls.NewListener(tcpListener, serverTLSConfig)
-	defer func() {
-		if closeErr := tlsListener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			t.Logf("closing tlsListener: %v", closeErr)
-		}
-	}()
-
-	serverErrCh := make(chan error, 1)
-	go func() {
-		conn, acceptErr := tlsListener.Accept()
-		if acceptErr != nil {
-			serverErrCh <- acceptErr
-			return
-		}
-		defer func() {
-			if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-				t.Logf("closing server conn: %v", closeErr)
+			signer, err := custodianClient.NewSigner("p256")
+			if err != nil {
+				t.Fatalf("NewSigner failed: %v", err)
 			}
-		}()
 
-		tlsConn := conn.(*tls.Conn)
-		if handshakeErr := tlsConn.HandshakeContext(t.Context()); handshakeErr != nil {
-			serverErrCh <- fmt.Errorf("server handshake: %w", handshakeErr)
-			return
-		}
+			chainPEM, err := custodianClient.GetCertificateChain(t.Context(), "p256")
+			if err != nil {
+				t.Fatalf("GetCertificateChain failed: %v", err)
+			}
 
-		state := tlsConn.ConnectionState()
-		if state.Version != tls.VersionTLS13 {
-			serverErrCh <- fmt.Errorf("expected TLS 1.3, got %x", state.Version)
-			return
-		}
+			testTLSHandshake(t, signer, chainPEM, tc.version)
+		})
+	}
+}
 
-		buf := make([]byte, 4)
-		if _, readErr := io.ReadFull(tlsConn, buf); readErr != nil {
-			serverErrCh <- fmt.Errorf("server read: %w", readErr)
-			return
-		}
-		if _, writeErr := tlsConn.Write([]byte("pong")); writeErr != nil {
-			serverErrCh <- fmt.Errorf("server write: %w", writeErr)
-			return
-		}
-		serverErrCh <- nil
-	}()
-
-	certPool := x509.NewCertPool()
-	certPool.AddCert(certificate)
-
-	clientTLSConfig := &tls.Config{
-		RootCAs:    certPool,
-		ServerName: "localhost",
-		MinVersion: tls.VersionTLS13,
+func TestTLSHandshake_RSA(t *testing.T) {
+	testVersions := []struct {
+		name    string
+		version uint16
+	}{
+		{"TLS12", tls.VersionTLS12},
+		{"TLS13", tls.VersionTLS13},
 	}
 
-	clientConn, err := tls.Dial("tcp", tlsListener.Addr().String(), clientTLSConfig)
-	if err != nil {
-		t.Fatalf("tls.Dial failed: %v", err)
-	}
-	defer func() {
-		if closeErr := clientConn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-			t.Logf("closing clientConn: %v", closeErr)
-		}
-	}()
+	for _, tc := range testVersions {
+		t.Run(tc.name, func(t *testing.T) {
+			keysDirectory := t.TempDir()
+			writeRSAKeyAndCertificate(t, keysDirectory, "rsa")
+			daemon := startTestDaemon(t, keysDirectory, 0)
 
-	if _, err := clientConn.Write([]byte("ping")); err != nil {
-		t.Fatalf("client write failed: %v", err)
-	}
+			signer, err := client.NewSigner(daemon.socketPath, "rsa")
+			if err != nil {
+				t.Fatalf("NewSigner failed: %v", err)
+			}
+			defer func() {
+				if closer, ok := signer.(io.Closer); ok {
+					if closeErr := closer.Close(); closeErr != nil {
+						t.Logf("closing signer: %v", closeErr)
+					}
+				}
+			}()
 
-	resp := make([]byte, 4)
-	if _, err := io.ReadFull(clientConn, resp); err != nil {
-		t.Fatalf("client read failed: %v", err)
-	}
-	if string(resp) != "pong" {
-		t.Fatalf("unexpected response: %q", string(resp))
-	}
+			custodianClient, err := client.New(daemon.socketPath)
+			if err != nil {
+				t.Fatalf("client.New failed: %v", err)
+			}
+			defer func() {
+				if closeErr := custodianClient.Close(); closeErr != nil {
+					t.Logf("closing client: %v", closeErr)
+				}
+			}()
 
-	if err := <-serverErrCh; err != nil {
-		t.Fatalf("server error: %v", err)
+			chainPEM, err := custodianClient.GetCertificateChain(t.Context(), "rsa")
+			if err != nil {
+				t.Fatalf("GetCertificateChain failed: %v", err)
+			}
+
+			testTLSHandshake(t, signer, chainPEM, tc.version)
+		})
 	}
 }
 
