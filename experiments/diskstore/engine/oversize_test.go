@@ -1514,6 +1514,9 @@ func TestOversize_Recovery_QuarantineBoundsApplied(t *testing.T) {
 // an unreferenced oversize file created by a failed Put is moved to lost+found after the next sweep,
 // without reopening the store.
 func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutReopen(t *testing.T) {
+	filesBefore := QuarantineSweepFilesCount()
+	bytesBefore := QuarantineSweepBytesCount()
+
 	memFS := NewMemFS()
 	hookFS := &oversizeHookFS{FS: memFS}
 	dir := "test_oversize_failed_put_quarantine_no_reopen"
@@ -1534,17 +1537,6 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutR
 	key := "targetKey"
 	oversizeVal := append([]byte("failed-put-payload"), make([]byte, 2100*1024)...)
 	oversizeDir := filepath.Join(dir, "oversize")
-	lostDir := filepath.Join(oversizeDir, "lost+found")
-
-	quarantinedCh := make(chan struct{}, 1)
-	hookFS.onSyncDir = func(dirname string) {
-		if filepath.Clean(dirname) == filepath.Clean(lostDir) {
-			select {
-			case quarantinedCh <- struct{}{}:
-			default:
-			}
-		}
-	}
 
 	// Inject an error on SyncDir for oversizeDir during the Put.
 	// This causes Put to write and rename the oversize file, but fail during the directory fsync,
@@ -1585,11 +1577,18 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutR
 
 	orphanPath := filepath.Join(oversizeDir, orphanName)
 
-	// Wait for the periodic background sweep to quarantine the unreferenced file without reopening
-	select {
-	case <-quarantinedCh:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timed out waiting for background sweep to quarantine %s in %s", orphanName, lostDir)
+	// Wait for the periodic background sweep to quarantine the unreferenced file
+	// and increment the process-wide metrics before asserting.
+	deadline := time.Now().Add(5 * time.Second)
+	for QuarantineSweepFilesCount() < filesBefore+1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := QuarantineSweepFilesCount() - filesBefore; got < 1 {
+		t.Fatalf("expected QuarantineSweepFilesCount increase >= 1, got %d", got)
+	}
+	if got := QuarantineSweepBytesCount() - bytesBefore; got < int64(len(oversizeVal)) {
+		t.Fatalf("expected QuarantineSweepBytesCount increase >= %d, got %d", len(oversizeVal), got)
 	}
 
 	// Verify the orphan file is no longer in oversize/
@@ -1600,14 +1599,6 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutR
 		t.Fatalf("expected orphan file %s to no longer exist in oversize dir", orphanPath)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("expected ErrNotExist for %s, got: %v", orphanPath, err)
-	}
-
-	// Metrics: count the files and bytes that sweep moved
-	if count := QuarantineSweepFilesCount(); count < 1 {
-		t.Fatalf("expected QuarantineSweepFilesCount >= 1, got %d", count)
-	}
-	if bytesCount := QuarantineSweepBytesCount(); bytesCount < int64(len(oversizeVal)) {
-		t.Fatalf("expected QuarantineSweepBytesCount >= %d, got %d", len(oversizeVal), bytesCount)
 	}
 
 	// Verify store is healthy and operational without reopening: a normal Put and Get succeed
@@ -1625,22 +1616,13 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutR
 // an unreferenced oversize file created by a crash point in the fault-injecting filesystem is moved
 // to lost+found after the next sweep, without reopening the store.
 func TestOversize_PeriodicSweep_UnreferencedFileFromCrashPointQuarantinedWithoutReopen(t *testing.T) {
+	filesBefore := QuarantineSweepFilesCount()
+
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 	hookFS := &oversizeHookFS{FS: faultFS}
 	dir := "test_oversize_crash_point_quarantine_no_reopen"
 	oversizeDir := filepath.Join(dir, "oversize")
-	lostDir := filepath.Join(oversizeDir, "lost+found")
-
-	quarantinedCh := make(chan struct{}, 1)
-	hookFS.onSyncDir = func(dirname string) {
-		if filepath.Clean(dirname) == filepath.Clean(lostDir) {
-			select {
-			case quarantinedCh <- struct{}{}:
-			default:
-			}
-		}
-	}
 
 	store, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate(),
 		WithQuarantine(QuarantineOptions{SweepInterval: 10 * time.Millisecond}))
@@ -1682,10 +1664,13 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromCrashPointQuarantinedWithout
 	}
 
 	// Wait for the next sweep to quarantine the unreferenced file without reopening
-	select {
-	case <-quarantinedCh:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timed out waiting for crash-point file %s to be quarantined in %s", orphanName, lostDir)
+	deadline := time.Now().Add(5 * time.Second)
+	for QuarantineSweepFilesCount() < filesBefore+1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := QuarantineSweepFilesCount() - filesBefore; got < 1 {
+		t.Fatalf("expected QuarantineSweepFilesCount increase >= 1, got %d", got)
 	}
 
 	// Verify the file is no longer in oversize/

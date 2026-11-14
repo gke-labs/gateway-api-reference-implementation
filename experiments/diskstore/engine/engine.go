@@ -1987,9 +1987,8 @@ func (s *Engine) backgroundQuarantineSweep() {
 			return
 		case <-ticker.C:
 			if !s.isFailed() {
-				if err := s.QuarantineSweep(); err != nil {
-					// Error is logged by QuarantineSweep at error level.
-				}
+				// QuarantineSweep logs its own error on failure.
+				_ = s.QuarantineSweep()
 			}
 		}
 	}
@@ -2006,10 +2005,10 @@ func (s *Engine) backgroundQuarantineSweep() {
 // sweep skips it.
 //
 // The sweep holds writerMu while it lists the directory, renames files, prunes lost+found,
-// and fsyncs directories. With 5,000 unreferenced files, holding writerMu across all moves
-// can hold the lock for over 500 milliseconds and stall concurrent writers. QuarantineSweep
-// bounds the number of files moved in a single pass to DefaultMaxQuarantineSweepBatch (100)
-// so that remaining files are moved in subsequent sweeps.
+// and fsyncs directories. Moving at most 100 files bounds writerMu lock hold time to around
+// 36 milliseconds even with thousands of unreferenced files, preventing concurrent writers
+// from being stalled. QuarantineSweep bounds the number of files moved in a single pass
+// to DefaultMaxQuarantineSweepBatch (100) so that remaining files are moved in subsequent sweeps.
 //
 // If moving a file to quarantine or syncing directories fails, QuarantineSweep logs the error
 // and returns it. The engine keeps running and remains operational, and the next sweep tries
@@ -2049,14 +2048,13 @@ func (s *Engine) QuarantineSweep() error {
 	}
 
 	count, bytesMoved, err := quarantineUnreferencedOversizeFiles(s.fs, s.dir, getReferenced, s.quarantine, DefaultMaxQuarantineSweepBatch)
-	if err != nil {
-		slog.Error("diskstore: oversize quarantine sweep failed", "error", err)
-		return err
-	}
-
 	if count > 0 {
 		GlobalMetrics.QuarantineSweepFilesCount.Add(int64(count))
 		GlobalMetrics.QuarantineSweepBytesCount.Add(bytesMoved)
+	}
+	if err != nil {
+		slog.Error("diskstore: oversize quarantine sweep failed", "error", err)
+		return err
 	}
 	return nil
 }

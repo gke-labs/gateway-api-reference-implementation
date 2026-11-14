@@ -223,7 +223,7 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		}
 		w.createdLSNs[seg.startLSN] = true
 	}
-	if _, err := quarantineFiles(w.fs, w.dir, abandoned, w.quarantine); err != nil {
+	if _, err := quarantineFiles(w.fs, w.dir, abandoned, w.quarantine, false); err != nil {
 		return nil, fmt.Errorf("failed to quarantine abandoned segments: %w", err)
 	}
 

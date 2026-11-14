@@ -186,9 +186,15 @@ func pruneLostFound(storeFS FS, opts QuarantineOptions) error {
 //
 // It creates lost+found once when moving files, renames each file to a unique quarantine path,
 // prunes lost+found, and fsyncs both directories when it moved anything.
-// If a file no longer exists when renaming (such as a temporary file renamed by a concurrent Put),
-// it is skipped.
-func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOptions) ([]string, error) {
+//
+// When skipNotExist is true (used exclusively during live oversize sweeps), a file that no
+// longer exists when renaming is skipped. In a live sweep, a concurrent Put can finish writing
+// an oversize file and rename its temporary file to its final name between the sweep's directory
+// listing and rename attempt; that file is legitimately gone and safe to skip.
+// When skipNotExist is false (used during crash recovery and WAL startup), no concurrent writers
+// exist, so an unreferenced or abandoned file vanishing between listing and rename is unexpected
+// and treated as an error.
+func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOptions, skipNotExist bool) ([]string, error) {
 	lostDir := filepath.Join(dir, "lost+found")
 	opts.Dir = lostDir
 
@@ -205,7 +211,7 @@ func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOpti
 			src := filepath.Join(dir, name)
 			dest := uniqueQuarantinePath(lostDir, name)
 			if err := storeFS.Rename(src, dest); err != nil {
-				if errors.Is(err, os.ErrNotExist) || errors.Is(err, fs.ErrNotExist) {
+				if skipNotExist && (errors.Is(err, os.ErrNotExist) || errors.Is(err, fs.ErrNotExist)) {
 					continue
 				}
 				return moved, fmt.Errorf("failed to quarantine %s to %s: %w", src, dest, err)
@@ -260,7 +266,6 @@ func quarantineUnreferencedOversizeFiles(storeFS FS, storeDir string, getReferen
 		if entry.IsDir() || referenced[entry.Name()] {
 			continue
 		}
-		unreferenced = append(unreferenced, entry.Name())
 		info, err := entry.Info()
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, fs.ErrNotExist) {
@@ -268,6 +273,7 @@ func quarantineUnreferencedOversizeFiles(storeFS FS, storeDir string, getReferen
 			}
 			return 0, 0, fmt.Errorf("failed to stat unreferenced oversize file %s: %w", entry.Name(), err)
 		}
+		unreferenced = append(unreferenced, entry.Name())
 		sizes[entry.Name()] = info.Size()
 		if maxBatch > 0 && len(unreferenced) >= maxBatch {
 			break
@@ -278,13 +284,14 @@ func quarantineUnreferencedOversizeFiles(storeFS FS, storeDir string, getReferen
 		return 0, 0, nil
 	}
 
-	movedFiles, err := quarantineFiles(storeFS, oversizeDir, unreferenced, opts)
-	if err != nil {
-		return len(movedFiles), 0, err
-	}
+	liveSweep := maxBatch > 0
+	movedFiles, err := quarantineFiles(storeFS, oversizeDir, unreferenced, opts, liveSweep)
 	var movedBytes int64
 	for _, name := range movedFiles {
 		movedBytes += sizes[name]
+	}
+	if err != nil {
+		return len(movedFiles), movedBytes, err
 	}
 	return len(movedFiles), movedBytes, nil
 }
