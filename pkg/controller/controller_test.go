@@ -3758,11 +3758,11 @@ func TestGatewayReconciler_CertificateSource_SnapshotImmutability(t *testing.T) 
 	testCert.Certificate[0][0] ^= 0xff
 
 	cg := outputs.CompiledGateways[types.NamespacedName{Namespace: "default", Name: "test-gw"}]
-	if cg == nil || len(cg.EffectiveListeners) == 0 || len(cg.EffectiveListeners[0].ResolvedCertificates) == 0 {
+	if cg == nil || len(cg.EffectiveListeners) == 0 || len(cg.EffectiveListeners[0].ListenerInfo.Certificates) == 0 {
 		t.Fatalf("expected compiled gateway with resolved certificates")
 	}
 
-	stateDER := cg.EffectiveListeners[0].ResolvedCertificates[0].Certificate[0]
+	stateDER := cg.EffectiveListeners[0].ListenerInfo.Certificates[0].Certificate[0]
 	if !bytes.Equal(stateDER, origDER) {
 		t.Errorf("state certificate was mutated after ResolveCertificates returned")
 	}

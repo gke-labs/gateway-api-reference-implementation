@@ -1588,15 +1588,15 @@ func TestCompileModel_PrecedenceAndConflicts(t *testing.T) {
 						t.Errorf("listener %s expected to be conflicted", qName)
 					}
 					var confCond, accCond, progCond *metav1.Condition
-					for i := range el.Conditions {
-						if el.Conditions[i].Type == string(gatewayv1.ListenerConditionConflicted) {
-							confCond = &el.Conditions[i]
+					for i := range el.ListenerInfo.Conditions {
+						if el.ListenerInfo.Conditions[i].Type == string(gatewayv1.ListenerConditionConflicted) {
+							confCond = &el.ListenerInfo.Conditions[i]
 						}
-						if el.Conditions[i].Type == string(gatewayv1.ListenerConditionAccepted) {
-							accCond = &el.Conditions[i]
+						if el.ListenerInfo.Conditions[i].Type == string(gatewayv1.ListenerConditionAccepted) {
+							accCond = &el.ListenerInfo.Conditions[i]
 						}
-						if el.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
-							progCond = &el.Conditions[i]
+						if el.ListenerInfo.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
+							progCond = &el.ListenerInfo.Conditions[i]
 						}
 					}
 					if confCond == nil || confCond.Status != metav1.ConditionTrue || confCond.Reason != string(expectedReason) {
@@ -4626,35 +4626,35 @@ func TestFrontendClientCertValidation_PerPortOverridesDefault(t *testing.T) {
 	}
 
 	// 1. https-default resolves default-ca
-	if elDefault.ClientValidation == nil {
+	if elDefault.ListenerInfo.ClientValidation == nil {
 		t.Fatalf("expected elDefault.ClientValidation != nil")
 	}
-	if len(elDefault.ClientValidation.CACertPEMs) != 1 || string(elDefault.ClientValidation.CACertPEMs[0]) != string(certPEMDefault) {
+	if len(elDefault.ListenerInfo.ClientValidation.CACertPEMs) != 1 || string(elDefault.ListenerInfo.ClientValidation.CACertPEMs[0]) != string(certPEMDefault) {
 		t.Errorf("elDefault did not resolve default-ca PEM")
 	}
-	if elDefault.ClientValidation.Mode != gatewayv1.AllowValidOnly {
-		t.Errorf("expected default mode AllowValidOnly, got %v", elDefault.ClientValidation.Mode)
+	if elDefault.ListenerInfo.ClientValidation.Mode != gatewayv1.AllowValidOnly {
+		t.Errorf("expected default mode AllowValidOnly, got %v", elDefault.ListenerInfo.ClientValidation.Mode)
 	}
 
 	// 2. https-port resolves port-ca (perPort overrides default)
-	if elPort.ClientValidation == nil {
+	if elPort.ListenerInfo.ClientValidation == nil {
 		t.Fatalf("expected elPort.ClientValidation != nil")
 	}
-	if len(elPort.ClientValidation.CACertPEMs) != 1 || string(elPort.ClientValidation.CACertPEMs[0]) != string(certPEMPort) {
+	if len(elPort.ListenerInfo.ClientValidation.CACertPEMs) != 1 || string(elPort.ListenerInfo.ClientValidation.CACertPEMs[0]) != string(certPEMPort) {
 		t.Errorf("elPort did not resolve port-ca PEM (perPort override)")
 	}
 
 	// 3. Both are Programmed=True in part 2 (AllowValidOnly)
 	for _, el := range []*EffectiveListener{elDefault, elPort} {
 		var progCond, accCond, refCond *metav1.Condition
-		for i := range el.Conditions {
-			switch el.Conditions[i].Type {
+		for i := range el.ListenerInfo.Conditions {
+			switch el.ListenerInfo.Conditions[i].Type {
 			case string(gatewayv1.ListenerConditionProgrammed):
-				progCond = &el.Conditions[i]
+				progCond = &el.ListenerInfo.Conditions[i]
 			case string(gatewayv1.ListenerConditionAccepted):
-				accCond = &el.Conditions[i]
+				accCond = &el.ListenerInfo.Conditions[i]
 			case string(gatewayv1.ListenerConditionResolvedRefs):
-				refCond = &el.Conditions[i]
+				refCond = &el.ListenerInfo.Conditions[i]
 			}
 		}
 		if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
@@ -4742,19 +4742,19 @@ func TestFrontendClientCertValidation_PerPortHTTPIgnored(t *testing.T) {
 	}
 
 	el := cg.EffectiveListeners[0]
-	if el.ClientValidation != nil {
-		t.Errorf("expected ClientValidation == nil on HTTP listener, got %v", el.ClientValidation)
+	if el.ListenerInfo.ClientValidation != nil {
+		t.Errorf("expected ClientValidation == nil on HTTP listener, got %v", el.ListenerInfo.ClientValidation)
 	}
 
 	var progCond, accCond, refCond *metav1.Condition
-	for i := range el.Conditions {
-		switch el.Conditions[i].Type {
+	for i := range el.ListenerInfo.Conditions {
+		switch el.ListenerInfo.Conditions[i].Type {
 		case string(gatewayv1.ListenerConditionProgrammed):
-			progCond = &el.Conditions[i]
+			progCond = &el.ListenerInfo.Conditions[i]
 		case string(gatewayv1.ListenerConditionAccepted):
-			accCond = &el.Conditions[i]
+			accCond = &el.ListenerInfo.Conditions[i]
 		case string(gatewayv1.ListenerConditionResolvedRefs):
-			refCond = &el.Conditions[i]
+			refCond = &el.ListenerInfo.Conditions[i]
 		}
 	}
 	if progCond == nil || progCond.Status != metav1.ConditionTrue {
@@ -4949,14 +4949,14 @@ func TestFrontendClientCertValidation_InvalidReasons(t *testing.T) {
 
 			el := cg.EffectiveListeners[0]
 			var progCond, accCond, refCond *metav1.Condition
-			for i := range el.Conditions {
-				switch el.Conditions[i].Type {
+			for i := range el.ListenerInfo.Conditions {
+				switch el.ListenerInfo.Conditions[i].Type {
 				case string(gatewayv1.ListenerConditionProgrammed):
-					progCond = &el.Conditions[i]
+					progCond = &el.ListenerInfo.Conditions[i]
 				case string(gatewayv1.ListenerConditionAccepted):
-					accCond = &el.Conditions[i]
+					accCond = &el.ListenerInfo.Conditions[i]
 				case string(gatewayv1.ListenerConditionResolvedRefs):
-					refCond = &el.Conditions[i]
+					refCond = &el.ListenerInfo.Conditions[i]
 				}
 			}
 
@@ -5036,21 +5036,21 @@ func TestFrontendClientCertValidation_AllowInsecureFallback_ProgrammedAndServed(
 	}
 
 	el := cg.EffectiveListeners[0]
-	if el.ClientValidation == nil {
+	if el.ListenerInfo.ClientValidation == nil {
 		t.Fatalf("expected ClientValidation != nil")
 	}
-	if el.ClientValidation.Mode != gatewayv1.AllowInsecureFallback {
-		t.Errorf("expected Mode %v, got %v", gatewayv1.AllowInsecureFallback, el.ClientValidation.Mode)
+	if el.ListenerInfo.ClientValidation.Mode != gatewayv1.AllowInsecureFallback {
+		t.Errorf("expected Mode %v, got %v", gatewayv1.AllowInsecureFallback, el.ListenerInfo.ClientValidation.Mode)
 	}
-	if len(el.ClientValidation.CACertPEMs) != 1 || string(el.ClientValidation.CACertPEMs[0]) != string(caCertPEM) {
+	if len(el.ListenerInfo.ClientValidation.CACertPEMs) != 1 || string(el.ListenerInfo.ClientValidation.CACertPEMs[0]) != string(caCertPEM) {
 		t.Errorf("CACertPEMs mismatch")
 	}
 
 	// Verify Programmed=True status
 	var progCond *metav1.Condition
-	for i := range el.Conditions {
-		if el.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
-			progCond = &el.Conditions[i]
+	for i := range el.ListenerInfo.Conditions {
+		if el.ListenerInfo.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
+			progCond = &el.ListenerInfo.Conditions[i]
 		}
 	}
 	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
@@ -5445,18 +5445,18 @@ func TestFrontendClientCertValidation_AllowValidOnly_ProgrammedAndServed(t *test
 	}
 
 	el := cg.EffectiveListeners[0]
-	if el.ClientValidation == nil {
+	if el.ListenerInfo.ClientValidation == nil {
 		t.Fatalf("expected ClientValidation != nil")
 	}
-	if el.ClientValidation.Mode != gatewayv1.AllowValidOnly {
-		t.Errorf("expected Mode %v, got %v", gatewayv1.AllowValidOnly, el.ClientValidation.Mode)
+	if el.ListenerInfo.ClientValidation.Mode != gatewayv1.AllowValidOnly {
+		t.Errorf("expected Mode %v, got %v", gatewayv1.AllowValidOnly, el.ListenerInfo.ClientValidation.Mode)
 	}
 
 	// Verify Programmed=True
 	var progCond *metav1.Condition
-	for i := range el.Conditions {
-		if el.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
-			progCond = &el.Conditions[i]
+	for i := range el.ListenerInfo.Conditions {
+		if el.ListenerInfo.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
+			progCond = &el.ListenerInfo.Conditions[i]
 		}
 	}
 	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
@@ -6724,7 +6724,7 @@ func TestCompileModel_CertificateSource(t *testing.T) {
 		if !el.IsProgrammed() {
 			t.Errorf("expected listener to be programmed")
 		}
-		refCond := FindCondition(el.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		refCond := FindCondition(el.ListenerInfo.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
 		if refCond == nil || refCond.Status != metav1.ConditionTrue || refCond.Reason != string(gatewayv1.ListenerReasonResolvedRefs) {
 			t.Errorf("expected ResolvedRefs=True/ResolvedRefs, got %+v", refCond)
 		}
@@ -6785,11 +6785,11 @@ func TestCompileModel_CertificateSource(t *testing.T) {
 		if el.IsProgrammed() {
 			t.Errorf("expected listener to NOT be programmed when pending")
 		}
-		refCond := FindCondition(el.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		refCond := FindCondition(el.ListenerInfo.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
 		if refCond == nil || refCond.Status != metav1.ConditionFalse || refCond.Reason != string(gatewayv1.ListenerReasonPending) {
 			t.Errorf("expected ResolvedRefs=False/Pending, got %+v", refCond)
 		}
-		progCond := FindCondition(el.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		progCond := FindCondition(el.ListenerInfo.Conditions, string(gatewayv1.ListenerConditionProgrammed))
 		if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonPending) {
 			t.Errorf("expected Programmed=False/Pending, got %+v", progCond)
 		}
@@ -6856,7 +6856,7 @@ func TestCompileModel_ValidatorHooks(t *testing.T) {
 		if el.IsAccepted() {
 			t.Errorf("expected listener IsAccepted to be false")
 		}
-		accCond := FindCondition(el.Conditions, string(gatewayv1.ListenerConditionAccepted))
+		accCond := FindCondition(el.ListenerInfo.Conditions, string(gatewayv1.ListenerConditionAccepted))
 		if accCond == nil || accCond.Status != metav1.ConditionFalse || accCond.Reason != string(gatewayv1.ListenerReasonUnsupportedValue) {
 			t.Errorf("expected Accepted=False/UnsupportedValue, got %+v", accCond)
 		}
