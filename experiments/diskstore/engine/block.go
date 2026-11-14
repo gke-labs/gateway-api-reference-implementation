@@ -111,20 +111,10 @@ func FinalizeBlockCRC(blockBuf []byte) uint32 {
 }
 
 // DecodeBlockHeader parses and validates the 32-byte header of blockBuf.
-// It verifies magic, version, and CRC32C.
+// It verifies CRC32C, magic, and version.
 func DecodeBlockHeader(blockBuf []byte) (BlockHeader, error) {
 	if len(blockBuf) < BlockSize {
 		return BlockHeader{}, errors.New("block buffer shorter than 4096 bytes")
-	}
-
-	magic := blockBuf[0]
-	if magic != BlockMagic {
-		return BlockHeader{}, ErrInvalidBlockMagic
-	}
-
-	ver := blockBuf[1]
-	if ver != FormatVersion {
-		return BlockHeader{}, ErrInvalidBlockVersion
 	}
 
 	storedCRC := binary.BigEndian.Uint32(blockBuf[4:8])
@@ -137,6 +127,16 @@ func DecodeBlockHeader(blockBuf []byte) (BlockHeader, error) {
 
 	if storedCRC != actualCRC {
 		return BlockHeader{}, ErrBlockCRCMismatch
+	}
+
+	magic := blockBuf[0]
+	if magic != BlockMagic {
+		return BlockHeader{}, ErrInvalidBlockMagic
+	}
+
+	ver := blockBuf[1]
+	if ver != FormatVersion {
+		return BlockHeader{}, ErrInvalidBlockVersion
 	}
 
 	logicalPage := binary.BigEndian.Uint64(blockBuf[8:16])

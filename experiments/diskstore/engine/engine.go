@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/scoped"
+	"golang.org/x/crypto/xts"
 )
 
 var (
@@ -159,10 +160,10 @@ func WithCipher(cipher Cipher) Option {
 
 // WithEncryptionKey sets the 32-byte caller's key for block-level encryption.
 //
-// At this stage of block-level encryption, this option only records the key-check
-// token in meta.db and verifies the key at Open. The engine does not yet encrypt
-// heap blocks, WAL blocks, or oversize files; values remain in plaintext on disk
-// even though meta.db records the store as encrypted.
+// At this stage of block-level encryption, the engine encrypts heap blocks only;
+// the WAL and oversize files are not yet encrypted. When configured, the block
+// pool encrypts each 4 KiB heap block with AES-256-XTS under the derived heap key
+// when flushing to disk, and decrypts it when reading.
 //
 // Interaction with WithCipher:
 // During the transition before the per-value cipher is removed:
@@ -369,11 +370,11 @@ func wipeStoreFiles(fs FS, dir string) error {
 }
 
 var (
-	// ErrStoreEncrypted is returned when opening an encrypted store without a cipher.
-	ErrStoreEncrypted = errors.New("store is encrypted: cipher option required")
+	// ErrStoreEncrypted is returned when opening an encrypted store without a cipher or encryption key.
+	ErrStoreEncrypted = errors.New("store is encrypted: cipher or encryption key option required")
 
-	// ErrStoreNotEncrypted is returned when opening an unencrypted store with a cipher.
-	ErrStoreNotEncrypted = errors.New("store is not encrypted: cipher option provided")
+	// ErrStoreNotEncrypted is returned when opening an unencrypted store with a cipher or encryption key.
+	ErrStoreNotEncrypted = errors.New("store is not encrypted: cipher or encryption key option provided")
 
 	// ErrInvalidKey is returned when the encryption key fails verification against the key-check token.
 	ErrInvalidKey = errors.New("invalid encryption key")
@@ -691,7 +692,7 @@ func Open(opts ...Option) (*Engine, error) {
 								isNewStore = true
 							}
 						} else if record.keyCheckToken != [32]byte{} {
-							return nil, errors.New("store is encrypted with a key: encryption key option required")
+							return nil, fmt.Errorf("%w: store is encrypted with a key: encryption key option required", ErrStoreEncrypted)
 						}
 					}
 				}
@@ -820,6 +821,16 @@ func Open(opts ...Option) (*Engine, error) {
 	walQuarantine := s.quarantine
 	walQuarantine.Dir = filepath.Join(walDir, "lost+found")
 
+	var heapCipher *xts.Cipher
+	if len(options.EncryptionKey) > 0 {
+		cipher, err := newHeapCipher(options.EncryptionKey, dbID)
+		if err != nil {
+			closeErr := heapFile.Close()
+			return nil, errors.Join(fmt.Errorf("failed to create heap cipher: %w", err), closeErr)
+		}
+		heapCipher = cipher
+	}
+
 	if isNewStore {
 		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{
 			OnFailure:  s.setFailed,
@@ -835,11 +846,15 @@ func Open(opts ...Option) (*Engine, error) {
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
 			Cipher:        options.Cipher,
+			HeapCipher:    heapCipher,
 		})
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 	} else {
 		// Existing store: perform crash recovery scan and WAL redo replay
-		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID, RecoveryOptions{Quarantine: options.Quarantine})
+		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID, RecoveryOptions{
+			Quarantine: options.Quarantine,
+			HeapCipher: heapCipher,
+		})
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("recovery failed: %w", err), closeErr)
@@ -868,6 +883,7 @@ func Open(opts ...Option) (*Engine, error) {
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
 			Cipher:        options.Cipher,
+			HeapCipher:    heapCipher,
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)

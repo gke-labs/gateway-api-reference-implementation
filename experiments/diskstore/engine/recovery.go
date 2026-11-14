@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/crypto/xts"
 )
 
 // KeyIndexEntry maps an object key to its location in a logical page.
@@ -59,9 +61,12 @@ type chunkBlockReader struct {
 	chunkBuf   []byte
 	chunkStart int64
 	chunkLen   int64
+	// heapCipher is the AES-256-XTS cipher used for heap block decryption during recovery.
+	// A nil cipher means the store is not encrypted.
+	heapCipher *xts.Cipher
 }
 
-func newChunkBlockReader(file File, totalSize int64) *chunkBlockReader {
+func newChunkBlockReader(file File, totalSize int64, heapCipher *xts.Cipher) *chunkBlockReader {
 	chunkSize := int64(256 * 1024) // 256 KiB chunk = 64 blocks
 	if chunkSize > totalSize {
 		chunkSize = totalSize
@@ -72,6 +77,7 @@ func newChunkBlockReader(file File, totalSize int64) *chunkBlockReader {
 		chunkSize:  chunkSize,
 		chunkBuf:   make([]byte, chunkSize),
 		chunkStart: -1,
+		heapCipher: heapCipher,
 	}
 }
 
@@ -102,6 +108,15 @@ func (r *chunkBlockReader) ReadBlock(b uint64) ([]byte, error) {
 		return nil, io.EOF
 	}
 
+	if r.heapCipher != nil {
+		chunkStartBlock := uint64(r.chunkStart / BlockSize)
+		numBlocksInChunk := int(r.chunkLen / BlockSize)
+		for i := 0; i < numBlocksInChunk; i++ {
+			block := r.chunkBuf[i*BlockSize : (i+1)*BlockSize]
+			decryptHeapBlock(block, block, chunkStartBlock+uint64(i), r.heapCipher)
+		}
+	}
+
 	return r.chunkBuf[0:BlockSize], nil
 }
 
@@ -109,6 +124,9 @@ func (r *chunkBlockReader) ReadBlock(b uint64) ([]byte, error) {
 type RecoveryOptions struct {
 	// Quarantine configures quarantine bounding and retention for lost+found directories.
 	Quarantine QuarantineOptions
+	// HeapCipher is the AES-256-XTS cipher used for decrypting heap blocks during recovery.
+	// A nil cipher means the store is not encrypted.
+	HeapCipher *xts.Cipher
 }
 
 // Recover scans the heap file, filters out foreign and torn copies, finds the WAL redo start LSN,
@@ -151,7 +169,8 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		totalBlocks = 512
 	}
 	buddy := NewBuddyAllocator(totalBlocks)
-	reader := newChunkBlockReader(heapFile, size)
+
+	reader := newChunkBlockReader(heapFile, size, options.HeapCipher)
 
 	// Step 1: Scan physical blocks in heap file sequentially to find valid candidate page copies
 	bestCandidates := make(map[uint64]candidatePageCopy) // logicalPage -> candidatePageCopy
