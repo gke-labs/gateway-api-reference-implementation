@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1758,5 +1759,86 @@ func TestRecovery_ReplayHeapWriteFailure_NoMarkerAndSucceedsOnReopen(t *testing.
 		if !bytes.Equal(gotVal, wantVal) {
 			t.Fatalf("Get(%q) value mismatch: got len=%d, want len=%d", k, len(gotVal), len(wantVal))
 		}
+	}
+}
+
+// TestRecovery_SmallBlockPoolReuseRule verifies that crash recovery and subsequent writes
+// with a small (16-block) block pool strictly preserve the Reuse Rule.
+//
+// Previously, Open pre-populated s.emptyPages with recoveryRes.EmptyLogicalPages before
+// calling replayWAL. An earlier WAL record being replayed could pop an empty page whose
+// durable copy carried a newer LSN, regressing its in-memory PageLSN. Under small block
+// pool memory pressure (16 blocks), eviction flushed the regressed page to a new physical
+// block. At FlushPages, the lower LSN prevented the new block from superseding the durable
+// block in FaultFS, but PromoteFlushedToDurable freed the durable block anyway, causing a
+// subsequent eviction write to panic with "reuse rule violation".
+func TestRecovery_SmallBlockPoolReuseRule(t *testing.T) {
+	for trial := 0; trial < 5; trial++ {
+		rng := rand.New(rand.NewSource(int64(trial)))
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := fmt.Sprintf("test_small_pool_reuse_%d", trial)
+
+		store, err := Open(WithFS(faultFS), WithDir(dir), WithNumPoolBlocks(16), WithCompressionCodec(CodecNone), WithCreate())
+		if err != nil {
+			t.Fatalf("trial %d: Open failed: %v", trial, err)
+		}
+
+		table := "TestTable"
+		keys := make([]string, 40)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("key-%d", i)
+		}
+
+		// Initial durable pages
+		for i := 0; i < 20; i++ {
+			if err := store.Put(table, keys[i], []byte(fmt.Sprintf("init-%d", i))); err != nil {
+				t.Fatalf("trial %d: Put failed: %v", trial, err)
+			}
+		}
+		if _, err := store.Checkpoint(); err != nil {
+			t.Fatalf("trial %d: Checkpoint failed: %v", trial, err)
+		}
+
+		currentStore := store
+		currentFS := faultFS
+
+		for cycle := 0; cycle < 10; cycle++ {
+			numOps := 30 + rng.Intn(50)
+			for op := 0; op < numOps; op++ {
+				k := keys[rng.Intn(len(keys))]
+				action := rng.Intn(10)
+				switch {
+				case action < 4: // small slotted
+					_ = currentStore.Put(table, k, []byte(fmt.Sprintf("v-%d-%d-%d", trial, cycle, op)))
+				case action < 7: // multi-block (2, 4, 8 blocks)
+					numBlks := 1 << (1 + rng.Intn(3))
+					sz := (numBlks-1)*BlockUsableSize + 100
+					payload := bytes.Repeat([]byte("x"), sz)
+					_ = currentStore.Put(table, k, payload)
+				case action < 9: // delete
+					_ = currentStore.Delete(table, k)
+				case action == 9: // occasional checkpoint
+					if rng.Intn(3) == 0 {
+						_, _ = currentStore.Checkpoint()
+					}
+				}
+			}
+
+			if err := currentStore.Sync(); err != nil {
+				t.Fatalf("trial %d cycle %d: Sync failed: %v", trial, cycle, err)
+			}
+
+			if err := currentFS.Crash(true, 0); err != nil {
+				t.Fatalf("trial %d cycle %d: Crash failed: %v", trial, cycle, err)
+			}
+
+			currentFS = NewFaultFS(memFS)
+			currentStore, err = Open(WithFS(currentFS), WithDir(dir), WithNumPoolBlocks(16), WithCompressionCodec(CodecNone))
+			if err != nil {
+				t.Fatalf("trial %d cycle %d: Reopen failed: %v", trial, cycle, err)
+			}
+		}
+		_ = currentStore.Close()
 	}
 }

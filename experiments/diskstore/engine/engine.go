@@ -847,7 +847,7 @@ func Open(opts ...Option) (*Engine, error) {
 
 		s.buddy = recoveryRes.Buddy
 		s.keyIndex = recoveryRes.KeyIndex
-		s.emptyPages = newEmptyPageTracker(recoveryRes.EmptyLogicalPages)
+		s.emptyPages = newEmptyPageTracker(nil)
 		s.nextLogicalPage = recoveryRes.NextLogicalPage
 		if s.nextLogicalPage == 0 {
 			s.nextLogicalPage = 1
@@ -876,6 +876,13 @@ func Open(opts ...Option) (*Engine, error) {
 		if err := s.replayWAL(options.FS, walDir, dbID, recoveryRes.RedoStartLSN); err != nil {
 			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
 			return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeErr)
+		}
+
+		// Track empty logical pages recovered from disk only after WAL replay completes,
+		// so replayed historical mutations never reuse an empty page whose durable copy
+		// carries a newer LSN and regress its LSN under small block pool eviction.
+		for _, p := range recoveryRes.EmptyLogicalPages {
+			s.emptyPages.Add(p)
 		}
 
 		// After replay, the engine flushes the changed pages as it does for a checkpoint,
