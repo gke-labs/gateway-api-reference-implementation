@@ -591,3 +591,113 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 		t.Fatalf("expected HasRegisteredHostnames=false after cancel")
 	}
 }
+
+func TestManager_WithdrawHostnameRegistration(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "snigateway-mgr-withdraw-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := certs.GenerateAndWriteCertificates(tempDir, "snigateway.internal", "mgr-client"); err != nil {
+		t.Fatalf("GenerateAndWriteCertificates failed: %v", err)
+	}
+
+	caCertPEM, _ := os.ReadFile(filepath.Join(tempDir, "ca.crt"))
+	serverCertPEM, _ := os.ReadFile(filepath.Join(tempDir, "server.crt"))
+	serverKeyPEM, _ := os.ReadFile(filepath.Join(tempDir, "server.key"))
+	clientCertPEM, _ := os.ReadFile(filepath.Join(tempDir, "client.crt"))
+	clientKeyPEM, _ := os.ReadFile(filepath.Join(tempDir, "client.key"))
+
+	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	srv, err := frontend.NewServer(frontend.ServerConfig{
+		ServerTLSConfig:  serverTLS,
+		InternalHostname: "snigateway.internal",
+		ConnectTimeout:   5 * time.Second,
+		ReadSNITimeout:   2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+	cli := client.NewClient(ln.Addr().String(), clientTLS)
+
+	mgr := NewManager(cli,
+		WithPoolSize(2),
+		WithBackoff(20*time.Millisecond, 100*time.Millisecond),
+	)
+
+	notifyCh := make(chan struct{}, 100)
+	mgr.AddStateChangeListener(func() {
+		select {
+		case notifyCh <- struct{}{}:
+		default:
+		}
+	})
+
+	go func() {
+		_ = mgr.Run(ctx)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !mgr.IsConnected() && time.Now().Before(deadline) {
+		select {
+		case <-notifyCh:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !mgr.IsConnected() {
+		t.Fatalf("timed out waiting for manager to connect")
+	}
+
+	// 1. Register two hostnames
+	mgr.UpdateHostnames([]string{"echo1.example.com", "echo2.example.com"})
+	deadline = time.Now().Add(5 * time.Second)
+	for !mgr.HasRegisteredHostnames([]string{"echo1.example.com", "echo2.example.com"}) && time.Now().Before(deadline) {
+		select {
+		case <-notifyCh:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !mgr.HasRegisteredHostnames([]string{"echo1.example.com", "echo2.example.com"}) {
+		t.Fatalf("expected both hostnames to be registered")
+	}
+
+	// 2. Withdraw echo2.example.com by updating hostnames to just echo1.example.com
+	mgr.UpdateHostnames([]string{"echo1.example.com"})
+	deadline = time.Now().Add(5 * time.Second)
+	for (!mgr.HasRegisteredAllHostnames() || mgr.HasRegisteredHostnames([]string{"echo2.example.com"})) && time.Now().Before(deadline) {
+		select {
+		case <-notifyCh:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !mgr.HasRegisteredHostnames([]string{"echo1.example.com"}) {
+		t.Fatalf("expected echo1.example.com to remain registered")
+	}
+	if mgr.HasRegisteredHostnames([]string{"echo2.example.com"}) {
+		t.Fatalf("expected echo2.example.com to be withdrawn, but it was still registered")
+	}
+}

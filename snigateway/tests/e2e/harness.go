@@ -17,6 +17,7 @@ package e2e
 import (
 	"encoding/base64"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -56,7 +57,7 @@ func (h *Harness) GetControllerLogs() string {
 	if ctrlPod == "" {
 		return ""
 	}
-	out, err := exec.Command("kubectl", "logs", ctrlPod, "--namespace=default").Output()
+	out, err := exec.Command("kubectl", "logs", ctrlPod, "--namespace=default", "--all-containers=true").Output()
 	if err != nil {
 		return ""
 	}
@@ -233,7 +234,18 @@ func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, f
 		"client.key": infraCerts.Client.KeyPEM,
 	})
 
-	h.KubectlApplyFile(filepath.Join(gitRoot, "snigateway/k8s/controller.yaml"))
+	controllerYAML, err := os.ReadFile(filepath.Join(gitRoot, "snigateway/k8s/controller.yaml"))
+	if err != nil {
+		h.T.Fatalf("reading controller.yaml: %v", err)
+	}
+	parts := strings.Split(string(controllerYAML), "\n---\n")
+	var rbacParts []string
+	for _, part := range parts {
+		if !strings.Contains(part, "kind: Deployment") {
+			rbacParts = append(rbacParts, part)
+		}
+	}
+	h.KubectlApplyContent(strings.Join(rbacParts, "\n---\n"))
 
 	manifest := fmt.Sprintf(`
 apiVersion: apps/v1
@@ -250,18 +262,64 @@ spec:
     metadata:
       labels:
         app: snigateway-controller
+      annotations:
+        kubectl.kubernetes.io/default-container: dataplane
     spec:
       serviceAccountName: snigateway-controller
       containers:
       - name: controller
         image: snigateway:e2e
         imagePullPolicy: Never
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
         args:
         - "--controller-name=github.com/gke-labs/gateway-api-reference-implementation/snigateway"
+        - "--gateway-name=snigateway-test"
+        - "--gateway-namespace=default"
+        - "--frontend=%s"
+        - "--health-probe-bind-address=:8082"
+        - "--metrics-bind-address=0"
+        ports:
+        - name: health
+          containerPort: 8082
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8082
+          initialDelaySeconds: 1
+          periodSeconds: 2
+      - name: dataplane
+        image: snigateway:e2e
+        imagePullPolicy: Never
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        args:
+        - "--dataplane-mode"
+        - "--gateway-name=snigateway-test"
+        - "--gateway-namespace=default"
         - "--frontend=%s"
         - "--ca-cert=/etc/snigateway/certs/ca.crt"
         - "--client-cert=/etc/snigateway/certs/client.crt"
         - "--client-key=/etc/snigateway/certs/client.key"
+        - "--health-probe-bind-address=:8081"
+        - "--metrics-bind-address=0"
+        ports:
+        - name: health
+          containerPort: 8081
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 1
+          periodSeconds: 2
         volumeMounts:
         - name: client-certs
           mountPath: /etc/snigateway/certs
@@ -270,7 +328,7 @@ spec:
       - name: client-certs
         secret:
           secretName: snigateway-client-cert
-`, replicas, frontendAddr)
+`, replicas, frontendAddr, frontendAddr)
 
 	h.KubectlApplyContent(manifest)
 	h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-controller", "--namespace=default", "--timeout=2m")

@@ -37,6 +37,6 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/downloa
 
 echo "Deploying snigateway controller..."
 kubectl apply -f snigateway/k8s/controller.yaml
-kubectl set image deployment/snigateway-controller controller="${IMAGE_NAME}:${IMAGE_TAG}"
+kubectl set image deployment/snigateway-controller controller="${IMAGE_NAME}:${IMAGE_TAG}" dataplane="${IMAGE_NAME}:${IMAGE_TAG}"
 
 echo "Deployment complete."

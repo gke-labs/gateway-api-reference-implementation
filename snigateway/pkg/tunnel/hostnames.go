@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -28,31 +29,58 @@ func ExtractHostnames(gateways []*gatewayv1.Gateway) []string {
 	seen := make(map[string]bool)
 	var hostnames []string
 
-	for _, gw := range gateways {
-		if gw == nil {
+	for _, gateway := range gateways {
+		if gateway == nil {
 			continue
 		}
-		for _, l := range gw.Spec.Listeners {
-			proto := string(l.Protocol)
-			if !strings.EqualFold(proto, string(gatewayv1.HTTPSProtocolType)) &&
-				!strings.EqualFold(proto, string(gatewayv1.TLSProtocolType)) {
+		for _, listener := range gateway.Spec.Listeners {
+			protocol := string(listener.Protocol)
+			if !strings.EqualFold(protocol, string(gatewayv1.HTTPSProtocolType)) &&
+				!strings.EqualFold(protocol, string(gatewayv1.TLSProtocolType)) {
 				continue
 			}
 
-			if l.Hostname == nil || strings.TrimSpace(string(*l.Hostname)) == "" {
+			if listener.Hostname == nil || strings.TrimSpace(string(*listener.Hostname)) == "" {
 				klog.Infof("Skipping listener %q on Gateway %s/%s: HTTPS/TLS listener has no hostname and cannot be routed by SNI",
-					l.Name, gw.Namespace, gw.Name)
+					listener.Name, gateway.Namespace, gateway.Name)
 				continue
 			}
 
-			h := strings.ToLower(strings.TrimSpace(string(*l.Hostname)))
-			if !seen[h] {
-				seen[h] = true
-				hostnames = append(hostnames, h)
+			hostname := strings.ToLower(strings.TrimSpace(string(*listener.Hostname)))
+			if !seen[hostname] {
+				seen[hostname] = true
+				hostnames = append(hostnames, hostname)
 			}
 		}
 	}
 
+	slices.Sort(hostnames)
+	return hostnames
+}
+
+// ExtractHostnamesFromConfig extracts unique SNI hostnames from HTTPS and TLS listeners in DataplaneConfig.
+func ExtractHostnamesFromConfig(config *state.DataplaneConfig) []string {
+	if config == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var hostnames []string
+	for _, listener := range config.Listeners {
+		protocol := string(listener.Protocol)
+		if !strings.EqualFold(protocol, string(gatewayv1.HTTPSProtocolType)) &&
+			!strings.EqualFold(protocol, string(gatewayv1.TLSProtocolType)) {
+			continue
+		}
+		trimmedHostname := strings.TrimSpace(listener.Hostname)
+		if trimmedHostname == "" {
+			continue
+		}
+		hostname := strings.ToLower(trimmedHostname)
+		if !seen[hostname] {
+			seen[hostname] = true
+			hostnames = append(hostnames, hostname)
+		}
+	}
 	slices.Sort(hostnames)
 	return hostnames
 }

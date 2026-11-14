@@ -13,7 +13,13 @@ rules:
   resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants", "listenersets", "tlsroutes", "grpcroutes", "tcproutes", "udproutes"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: [""]
-  resources: ["services", "configmaps", "secrets", "namespaces"]
+  resources: ["services", "configmaps", "namespaces"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status", "tlsroutes/status", "grpcroutes/status", "tcproutes/status", "udproutes/status"]
@@ -53,6 +59,10 @@ metadata:
 spec:
   controllerName: github.com/gke-labs/gateway-api-reference-implementation/snigateway
 ---
+# Note: Both the controller and data-plane containers run in a single pod under
+# the snigateway-controller ServiceAccount, sharing the pod's identity and permissions
+# (including create, update, and patch on Secrets). This is the operational trade-off
+# of running both processes in a single static pod without a per-Gateway provisioner.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -67,17 +77,64 @@ spec:
     metadata:
       labels:
         app: snigateway-controller
+      annotations:
+        kubectl.kubernetes.io/default-container: dataplane
     spec:
       serviceAccountName: snigateway-controller
       containers:
       - name: controller
         image: snigateway:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
         args:
         - "--controller-name=github.com/gke-labs/gateway-api-reference-implementation/snigateway"
+        - "--gateway-name=example-gateway"
+        - "--gateway-namespace=default"
+        - "--frontend=snigateway-frontend.example.com:443"
+        - "--health-probe-bind-address=:8082"
+        - "--metrics-bind-address=0"
+        ports:
+        - name: health
+          containerPort: 8082
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8082
+          initialDelaySeconds: 1
+          periodSeconds: 2
+      - name: dataplane
+        image: snigateway:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        args:
+        - "--dataplane-mode"
+        - "--gateway-name=example-gateway"
+        - "--gateway-namespace=default"
         - "--frontend=snigateway-frontend.example.com:443"
         - "--ca-cert=/etc/snigateway/certs/ca.crt"
         - "--client-cert=/etc/snigateway/certs/client.crt"
         - "--client-key=/etc/snigateway/certs/client.key"
+        - "--health-probe-bind-address=:8081"
+        - "--metrics-bind-address=0"
+        ports:
+        - name: health
+          containerPort: 8081
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 1
+          periodSeconds: 2
         volumeMounts:
         - name: client-certs
           mountPath: /etc/snigateway/certs
