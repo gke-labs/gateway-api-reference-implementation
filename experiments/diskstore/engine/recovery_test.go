@@ -1922,7 +1922,7 @@ func TestRecovery_EncryptedCrashAndReopen(t *testing.T) {
 	copy(key[:], []byte("enc-crash-reopen-test-32bytes-k"))
 
 	for seed := 0; seed < 100; seed++ {
-		rng := rand.New(rand.NewSource(int64(seed)))
+		random := rand.New(rand.NewSource(int64(seed)))
 		memFS := NewMemFS()
 		faultFS := NewFaultFS(memFS)
 		dir := fmt.Sprintf("test_enc_crash_%d", seed)
@@ -1941,17 +1941,17 @@ func TestRecovery_EncryptedCrashAndReopen(t *testing.T) {
 		table := "EncTable"
 		keys := make([]string, 20)
 		for i := range keys {
-			keys[i] = fmt.Sprintf("k-%d", i)
+			keys[i] = fmt.Sprintf("key-%d", i)
 		}
 		expectedValues := make(map[string][]byte)
 
 		// Initial durable pages
 		for i := 0; i < 10; i++ {
-			val := []byte(fmt.Sprintf("init-%d-%d", seed, i))
-			if err := store.Put(table, keys[i], val); err != nil {
+			value := []byte(fmt.Sprintf("init-%d-%d", seed, i))
+			if err := store.Put(table, keys[i], value); err != nil {
 				t.Fatalf("seed %d: Put failed: %v", seed, err)
 			}
-			expectedValues[keys[i]] = val
+			expectedValues[keys[i]] = value
 		}
 		if _, err := store.Checkpoint(); err != nil {
 			t.Fatalf("seed %d: Checkpoint failed: %v", seed, err)
@@ -1961,29 +1961,29 @@ func TestRecovery_EncryptedCrashAndReopen(t *testing.T) {
 		currentFS := faultFS
 
 		for cycle := 0; cycle < 3; cycle++ {
-			numOps := 20 + rng.Intn(30)
-			for op := 0; op < numOps; op++ {
-				k := keys[rng.Intn(len(keys))]
-				action := rng.Intn(10)
+			numOps := 20 + random.Intn(30)
+			for operation := 0; operation < numOps; operation++ {
+				chosenKey := keys[random.Intn(len(keys))]
+				action := random.Intn(10)
 				switch {
 				case action < 5: // small slotted (< 1 block)
-					val := []byte(fmt.Sprintf("v-%d-%d-%d", seed, cycle, op))
-					if err := currentStore.Put(table, k, val); err != nil {
-						t.Fatalf("seed %d cycle %d: Put %s failed: %v", seed, cycle, k, err)
+					value := []byte(fmt.Sprintf("value-%d-%d-%d", seed, cycle, operation))
+					if err := currentStore.Put(table, chosenKey, value); err != nil {
+						t.Fatalf("seed %d cycle %d: Put %s failed: %v", seed, cycle, chosenKey, err)
 					}
-					expectedValues[k] = val
+					expectedValues[chosenKey] = value
 				case action < 8: // values of 2 blocks or less
-					size := BlockUsableSize + 1 + rng.Intn(BlockUsableSize)
-					val := bytes.Repeat([]byte{byte(op)}, size)
-					if err := currentStore.Put(table, k, val); err != nil {
-						t.Fatalf("seed %d cycle %d: Put multi-block %s failed: %v", seed, cycle, k, err)
+					size := BlockUsableSize + 1 + random.Intn(BlockUsableSize)
+					value := bytes.Repeat([]byte{byte(operation)}, size)
+					if err := currentStore.Put(table, chosenKey, value); err != nil {
+						t.Fatalf("seed %d cycle %d: Put multi-block %s failed: %v", seed, cycle, chosenKey, err)
 					}
-					expectedValues[k] = val
+					expectedValues[chosenKey] = value
 				case action == 8: // delete
-					if err := currentStore.Delete(table, k); err != nil {
-						t.Fatalf("seed %d cycle %d: Delete %s failed: %v", seed, cycle, k, err)
+					if err := currentStore.Delete(table, chosenKey); err != nil {
+						t.Fatalf("seed %d cycle %d: Delete %s failed: %v", seed, cycle, chosenKey, err)
 					}
-					delete(expectedValues, k)
+					delete(expectedValues, chosenKey)
 				case action == 9: // occasional checkpoint
 					if _, err := currentStore.Checkpoint(); err != nil {
 						t.Fatalf("seed %d cycle %d: Checkpoint failed: %v", seed, cycle, err)
@@ -2006,21 +2006,21 @@ func TestRecovery_EncryptedCrashAndReopen(t *testing.T) {
 				t.Fatalf("seed %d cycle %d: Reopen failed: %v", seed, cycle, err)
 			}
 
-			for _, k := range keys {
-				gotVal, exists, err := currentStore.Get(table, k)
+			for _, key := range keys {
+				gotValue, exists, err := currentStore.Get(table, key)
 				if err != nil {
-					t.Fatalf("seed %d cycle %d: Get(%q) returned error: %v", seed, cycle, k, err)
+					t.Fatalf("seed %d cycle %d: Get(%q) returned error: %v", seed, cycle, key, err)
 				}
-				expectedVal, expectedExists := expectedValues[k]
+				expectedValue, expectedExists := expectedValues[key]
 				if expectedExists {
 					if !exists {
-						t.Fatalf("seed %d cycle %d: Get(%q) missing key after reopen", seed, cycle, k)
+						t.Fatalf("seed %d cycle %d: Get(%q) missing key after reopen", seed, cycle, key)
 					}
-					if !bytes.Equal(gotVal, expectedVal) {
-						t.Fatalf("seed %d cycle %d: Get(%q) value mismatch", seed, cycle, k)
+					if !bytes.Equal(gotValue, expectedValue) {
+						t.Fatalf("seed %d cycle %d: Get(%q) value mismatch", seed, cycle, key)
 					}
 				} else if exists {
-					t.Fatalf("seed %d cycle %d: Get(%q) found deleted key after reopen", seed, cycle, k)
+					t.Fatalf("seed %d cycle %d: Get(%q) found deleted key after reopen", seed, cycle, key)
 				}
 			}
 		}
