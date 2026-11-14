@@ -284,4 +284,3 @@ func TestCleanHostname(t *testing.T) {
 		})
 	}
 }
-
