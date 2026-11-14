@@ -37,6 +37,10 @@ const (
 	// for quarantined files in lost+found (7 days). Files younger than this retention
 	// are not deleted even if the file count exceeds MaxQuarantinedFiles.
 	DefaultMinQuarantinedRetention = 7 * 24 * time.Hour
+
+	// DefaultQuarantineSweepInterval is the default interval between background sweeps
+	// for unreferenced oversize files (10 minutes).
+	DefaultQuarantineSweepInterval = 10 * time.Minute
 )
 
 // QuarantineOptions configures quarantine bounding and retention for lost+found directories.
@@ -51,6 +55,10 @@ type QuarantineOptions struct {
 	// MinQuarantinedRetention is the minimum duration a quarantined file is kept.
 	// Files younger than this retention are not deleted even when MaxQuarantinedFiles is exceeded.
 	MinQuarantinedRetention time.Duration
+
+	// SweepInterval is the interval at which background sweeps quarantine unreferenced oversize files.
+	// Defaults to DefaultQuarantineSweepInterval (10 minutes) if <= 0.
+	SweepInterval time.Duration
 
 	// Now returns the current time for retention checks. If nil, time.Now is used.
 	Now func() time.Time
@@ -220,3 +228,41 @@ func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOpti
 
 	return nil
 }
+
+// quarantineUnreferencedOversizeFiles moves every unreferenced file in oversize/
+// to quarantine in lost+found. Subdirectories and files named in referenced are preserved.
+// It returns the count of files moved, total bytes moved, and any error encountered.
+func quarantineUnreferencedOversizeFiles(storeFS FS, storeDir string, referenced map[string]bool, opts QuarantineOptions) (int, int64, error) {
+	oversizeDir := filepath.Join(storeDir, "oversize")
+	oversizeEntries, err := storeFS.ReadDir(oversizeDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, fs.ErrNotExist) {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("failed to read oversize directory: %w", err)
+	}
+
+	var unreferenced []string
+	var unreferencedBytes int64
+	for _, entry := range oversizeEntries {
+		if entry.IsDir() || referenced[entry.Name()] {
+			continue
+		}
+		unreferenced = append(unreferenced, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to stat unreferenced oversize file %s: %w", entry.Name(), err)
+		}
+		unreferencedBytes += info.Size()
+	}
+
+	if len(unreferenced) == 0 {
+		return 0, 0, nil
+	}
+
+	if err := quarantineFiles(storeFS, oversizeDir, unreferenced, opts); err != nil {
+		return 0, 0, err
+	}
+	return len(unreferenced), unreferencedBytes, nil
+}
+

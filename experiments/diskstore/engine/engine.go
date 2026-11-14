@@ -23,6 +23,7 @@ import (
 	"hash/crc32"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -83,6 +85,10 @@ type Options struct {
 
 	// Quarantine configures quarantine bounding and retention for lost+found directories.
 	Quarantine QuarantineOptions
+
+	// QuarantineSweepInterval sets the interval between background unreferenced oversize sweeps.
+	// Defaults to DefaultQuarantineSweepInterval (10 minutes). A negative duration disables the sweep.
+	QuarantineSweepInterval time.Duration
 
 	compressionCodecSet bool
 }
@@ -207,6 +213,14 @@ func WithQuarantine(q QuarantineOptions) Option {
 	}
 }
 
+// WithQuarantineSweepInterval sets the interval for background unreferenced oversize file sweeps.
+// Defaults to DefaultQuarantineSweepInterval (10 minutes). A negative duration disables the sweep.
+func WithQuarantineSweepInterval(interval time.Duration) Option {
+	return func(o *Options) {
+		o.QuarantineSweepInterval = interval
+	}
+}
+
 // emptyPageTracker manages free logical page identifiers. It maintains a slice for LIFO
 // reuse order and a set for O(1) membership checks to prevent duplicate additions.
 type emptyPageTracker struct {
@@ -293,6 +307,10 @@ type Engine struct {
 
 	closed   atomic.Bool
 	closedCh chan struct{}
+
+	sweepInterval time.Duration
+	sweepStop     chan struct{}
+	sweepDone     chan struct{}
 }
 
 func removeDirRecursive(fs FS, dir string) error {
@@ -868,6 +886,18 @@ func Open(opts ...Option) (*Engine, error) {
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 	}
 
+	s.sweepInterval = DefaultQuarantineSweepInterval
+	if options.Quarantine.SweepInterval != 0 {
+		s.sweepInterval = options.Quarantine.SweepInterval
+	} else if options.QuarantineSweepInterval != 0 {
+		s.sweepInterval = options.QuarantineSweepInterval
+	}
+	if s.sweepInterval > 0 {
+		s.sweepStop = make(chan struct{})
+		s.sweepDone = make(chan struct{})
+		go s.backgroundQuarantineSweep()
+	}
+
 	return s, nil
 }
 
@@ -1066,6 +1096,16 @@ func (s *Engine) Path() string {
 // DirectIOFallbackCount returns the number of times direct I/O could not be used and fell back to buffered I/O.
 func (s *Engine) DirectIOFallbackCount() int64 {
 	return GlobalMetrics.DirectIOFallbackCount.Load()
+}
+
+// QuarantineSweepFilesCount returns the total number of unreferenced files moved by quarantine sweeps.
+func (s *Engine) QuarantineSweepFilesCount() int64 {
+	return GlobalMetrics.QuarantineSweepFilesCount.Load()
+}
+
+// QuarantineSweepBytesCount returns the total number of bytes moved by quarantine sweeps.
+func (s *Engine) QuarantineSweepBytesCount() int64 {
+	return GlobalMetrics.QuarantineSweepBytesCount.Load()
 }
 
 // CompressionCodec returns the engine's configured compression algorithm.
@@ -1917,6 +1957,10 @@ func (s *Engine) Close() error {
 		return nil
 	}
 	close(s.closedCh)
+	if s.sweepStop != nil {
+		close(s.sweepStop)
+		<-s.sweepDone
+	}
 
 	var errs []error
 	// If not failed, checkpoint on close to truncate WAL and speed up reopen
@@ -1953,3 +1997,73 @@ func (s *Engine) Close() error {
 
 	return errors.Join(errs...)
 }
+
+func (s *Engine) backgroundQuarantineSweep() {
+	defer close(s.sweepDone)
+	ticker := time.NewTicker(s.sweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.sweepStop:
+			return
+		case <-s.closedCh:
+			return
+		case <-ticker.C:
+			if !s.isFailed() {
+				if err := s.QuarantineSweep(); err != nil {
+					slog.Warn("diskstore: background quarantine sweep failed", "error", err)
+				}
+			}
+		}
+	}
+}
+
+// QuarantineSweep runs a sweep to quarantine unreferenced oversize files.
+// It acquires the writer lock, takes live pointers from the key index and
+// in-flight files from the registry, and moves all other oversize files to lost+found.
+func (s *Engine) QuarantineSweep() error {
+	if s.closed.Load() || s.isFailed() {
+		return nil
+	}
+
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+
+	if s.closed.Load() || s.isFailed() {
+		return nil
+	}
+
+	referenced := make(map[string]bool)
+	s.keyMu.RLock()
+	for _, entry := range s.keyIndex {
+		if entry.IsOversize && entry.OversizeFileName != "" {
+			referenced[entry.OversizeFileName] = true
+		}
+	}
+	s.keyMu.RUnlock()
+
+	s.inFlightMu.Lock()
+	for name := range s.inFlightOversize {
+		referenced[name] = true
+	}
+	s.inFlightMu.Unlock()
+
+	count, bytesMoved, err := quarantineUnreferencedOversizeFiles(s.fs, s.dir, referenced, s.quarantine)
+	if err != nil {
+		slog.Error("diskstore: oversize quarantine sweep failed", "error", err)
+		return err
+	}
+
+	if count > 0 {
+		GlobalMetrics.QuarantineSweepFilesCount.Add(int64(count))
+		GlobalMetrics.QuarantineSweepBytesCount.Add(bytesMoved)
+	}
+	return nil
+}
+
+// SweepOversize is an alias for QuarantineSweep.
+func (s *Engine) SweepOversize() error {
+	return s.QuarantineSweep()
+}
+

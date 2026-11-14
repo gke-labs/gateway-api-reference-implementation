@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -719,29 +718,14 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	// If quarantining an unreferenced file, pruning lost+found, or syncing the directories
 	// fails, recovery aborts and Open fails. Failing fast prevents operating on an unhealthy
 	// filesystem that cannot quarantine obsolete data or make directory updates durable.
-	oversizeDir := filepath.Join(storeDir, "oversize")
-	oversizeEntries, err := fs.ReadDir(oversizeDir)
-	if err == nil {
-		referenced := make(map[string]bool)
-		for _, entry := range keyIndex {
-			if entry.IsOversize && entry.OversizeFileName != "" {
-				referenced[entry.OversizeFileName] = true
-			}
+	referenced := make(map[string]bool)
+	for _, entry := range keyIndex {
+		if entry.IsOversize && entry.OversizeFileName != "" {
+			referenced[entry.OversizeFileName] = true
 		}
-
-		var unreferenced []string
-		for _, entry := range oversizeEntries {
-			if entry.IsDir() || referenced[entry.Name()] {
-				continue
-			}
-			unreferenced = append(unreferenced, entry.Name())
-		}
-
-		if err := quarantineFiles(fs, oversizeDir, unreferenced, options.Quarantine); err != nil {
-			return nil, fmt.Errorf("failed to quarantine unreferenced oversize files: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("failed to read oversize directory during recovery: %w", err)
+	}
+	if _, _, err := quarantineUnreferencedOversizeFiles(fs, storeDir, referenced, options.Quarantine); err != nil {
+		return nil, fmt.Errorf("failed to quarantine unreferenced oversize files: %w", err)
 	}
 
 	return &RecoveryResult{
