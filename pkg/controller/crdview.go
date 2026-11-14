@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -258,6 +259,7 @@ type CRDView struct {
 	snapshot               CRDSnapshot
 	onBundleVersionChanged func(newVersion string)
 	informers              []toolscache.SharedIndexInformer
+	logger                 logr.Logger
 
 	crdChanges atomic.Uint64
 }
@@ -404,6 +406,7 @@ func (v *CRDView) RegisterWithManager(mgr ctrl.Manager) error {
 	}
 
 	v.mu.Lock()
+	v.logger = mgr.GetLogger()
 	v.informers = informers
 	v.mu.Unlock()
 
@@ -480,7 +483,7 @@ func (v *CRDView) HandleAdd(obj any, isInInitialList bool) {
 		bvChanged = true
 		newBV = bv
 		cb = v.onBundleVersionChanged
-		setupLog.Info("Gateway API bundle-version changed; restart controller deployment to pick up newly served kinds or versions", "oldVersion", oldBV, "newVersion", newBV)
+		v.logger.Info("Gateway API bundle-version changed; restart controller deployment to pick up newly served kinds or versions", "oldVersion", oldBV, "newVersion", newBV)
 	}
 
 	if isUnservedAdd || bvChanged {
@@ -489,7 +492,7 @@ func (v *CRDView) HandleAdd(obj any, isInInitialList bool) {
 	v.mu.Unlock()
 
 	if isUnservedAdd {
-		setupLog.Info("Gateway API CRD added for unserved kind; restart controller deployment to serve it", "kind", kd.gk.Kind, "crd", metaObj.Name)
+		v.logger.Info("Gateway API CRD added for unserved kind; restart controller deployment to serve it", "kind", kd.gk.Kind, "crd", metaObj.Name)
 	}
 
 	if bvChanged && cb != nil {
@@ -533,7 +536,7 @@ func (v *CRDView) HandleUpdate(oldObj, newObj any) {
 		newBV = bv
 		cb = v.onBundleVersionChanged
 		v.crdChanges.Add(1)
-		setupLog.Info("Gateway API bundle-version changed; restart controller deployment to pick up newly served kinds or versions", "oldVersion", oldBV, "newVersion", newBV)
+		v.logger.Info("Gateway API bundle-version changed; restart controller deployment to pick up newly served kinds or versions", "oldVersion", oldBV, "newVersion", newBV)
 	}
 	v.mu.Unlock()
 
@@ -569,7 +572,7 @@ func (v *CRDView) HandleDelete(obj any) {
 		v.snapshot.BundleVersion = ""
 		bvChanged = true
 		cb = v.onBundleVersionChanged
-		setupLog.Info("Gateway API bundle-version changed; restart controller deployment to pick up newly served kinds or versions", "oldVersion", oldBV, "newVersion", "")
+		v.logger.Info("Gateway API bundle-version changed; restart controller deployment to pick up newly served kinds or versions", "oldVersion", oldBV, "newVersion", "")
 	}
 
 	if isServedDelete || bvChanged {
@@ -578,7 +581,7 @@ func (v *CRDView) HandleDelete(obj any) {
 	v.mu.Unlock()
 
 	if isServedDelete {
-		setupLog.Info("Gateway API CRD deleted for served kind; restart controller deployment to update served kinds", "kind", kd.gk.Kind, "crd", metaObj.Name)
+		v.logger.Info("Gateway API CRD deleted for served kind; restart controller deployment to update served kinds", "kind", kd.gk.Kind, "crd", metaObj.Name)
 	}
 
 	if bvChanged && cb != nil {
