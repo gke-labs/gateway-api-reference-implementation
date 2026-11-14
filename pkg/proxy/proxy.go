@@ -127,7 +127,8 @@ type Proxy struct {
 	acmeTimeout           time.Duration
 	logForwarderErrorOnce sync.Once
 
-	closed bool
+	closed            bool
+	tcpPendingRetries map[gatewayv1.PortNumber]bool
 }
 
 type tcpPortListener struct {
@@ -135,6 +136,7 @@ type tcpPortListener struct {
 	ln          net.Listener
 	backends    atomic.Pointer[[]state.InternalTCPBackend]
 	closed      atomic.Bool
+	// accepting indicates that the TCP listener is actively accepting connections.
 	accepting   atomic.Bool
 	done        chan struct{}
 	activeConns atomic.Int64
@@ -158,6 +160,7 @@ func NewProxy() *Proxy {
 		listeners:          []state.InternalListener{},
 		certificates:       make(map[string]*tls.Certificate),
 		tcpListeners:       make(map[gatewayv1.PortNumber]*tcpPortListener),
+		tcpPendingRetries:  make(map[gatewayv1.PortNumber]bool),
 		tcpIdleTimeout:     DefaultTCPIdleTimeout,
 		tcpMaxConnections:  DefaultTCPMaxConnections,
 		bodyReadTimeout:    DefaultBodyReadTimeout,
@@ -249,6 +252,13 @@ func (p *Proxy) SetListenFunc(fn func(network, addr string) (net.Listener, error
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.listenFunc = fn
+}
+
+// GetListenFunc returns the custom net.Listen function if set, or nil.
+func (p *Proxy) GetListenFunc() func(network, addr string) (net.Listener, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.listenFunc
 }
 
 func (p *Proxy) SetListenPacketFunc(fn func(network, addr string) (net.PacketConn, error)) {
@@ -377,8 +387,8 @@ func (p *Proxy) GetTCPListener(port gatewayv1.PortNumber) net.Listener {
 func (p *Proxy) IsTCPPortAccepting(port gatewayv1.PortNumber) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	pl, ok := p.tcpListeners[port]
-	return ok && pl.accepting.Load() && !pl.closed.Load()
+	portListener, ok := p.tcpListeners[port]
+	return ok && portListener.accepting.Load() && !portListener.closed.Load()
 }
 
 func (p *Proxy) GetUDPListener(port gatewayv1.PortNumber) net.PacketConn {
@@ -501,44 +511,133 @@ func (p *Proxy) updateTCPListenersLocked(listeners []state.InternalListener) {
 			ln, err := listenFn("tcp", addr)
 			if err != nil {
 				klog.Errorf("failed to listen on TCP port %d (%s): %v", port, addr, err)
+				if !p.tcpPendingRetries[port] {
+					p.tcpPendingRetries[port] = true
+					go p.retryTCPListen(port, addr, backendsCopy, maxConns)
+				}
 				continue
 			}
-			pl := &tcpPortListener{
+			portListener := &tcpPortListener{
 				port: port,
 				ln:   ln,
 				done: make(chan struct{}),
 			}
-			pl.backends.Store(&backendsCopy)
-			pl.maxConns.Store(int64(maxConns))
-			p.tcpListeners[port] = pl
-			go p.tcpAcceptLoop(pl)
+			portListener.backends.Store(&backendsCopy)
+			portListener.maxConns.Store(int64(maxConns))
+			p.tcpListeners[port] = portListener
+			go p.tcpAcceptLoop(portListener)
 		}
 	}
 }
 
-func (p *Proxy) tcpAcceptLoop(pl *tcpPortListener) {
-	defer pl.accepting.Store(false)
+func (p *Proxy) retryTCPListen(port gatewayv1.PortNumber, addr string, backends []state.InternalTCPBackend, maxConns int) {
+	defer func() {
+		p.mu.Lock()
+		delete(p.tcpPendingRetries, port)
+		p.mu.Unlock()
+	}()
+
+	backoff := 50 * time.Millisecond
+	const maxBackoff = 1 * time.Second
+
 	for {
-		pl.accepting.Store(true)
-		conn, err := pl.ln.Accept()
+		time.Sleep(backoff)
+
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return
+		}
+		stillDesired := false
+		for _, listener := range p.listeners {
+			if listener.Protocol == gatewayv1.TCPProtocolType && listener.Port == port {
+				stillDesired = true
+				break
+			}
+		}
+		if !stillDesired {
+			p.mu.Unlock()
+			return
+		}
+		if _, exists := p.tcpListeners[port]; exists {
+			p.mu.Unlock()
+			return
+		}
+		listenFn := p.listenFunc
+		if listenFn == nil {
+			listenFn = net.Listen
+		}
+		p.mu.Unlock()
+
+		ln, err := listenFn("tcp", addr)
 		if err != nil {
-			if pl.closed.Load() || errors.Is(err, net.ErrClosed) {
+			klog.Errorf("failed to listen on TCP port %d (%s): %v", port, addr, err)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		p.mu.Lock()
+		if p.closed {
+			if closeErr := ln.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				klog.V(2).Infof("failed to close TCP listener on port %d: %v", port, closeErr)
+			}
+			p.mu.Unlock()
+			return
+		}
+		stillDesired = false
+		for _, listener := range p.listeners {
+			if listener.Protocol == gatewayv1.TCPProtocolType && listener.Port == port {
+				stillDesired = true
+				break
+			}
+		}
+		if !stillDesired {
+			if closeErr := ln.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				klog.V(2).Infof("failed to close TCP listener on port %d: %v", port, closeErr)
+			}
+			p.mu.Unlock()
+			return
+		}
+		portListener := &tcpPortListener{
+			port: port,
+			ln:   ln,
+			done: make(chan struct{}),
+		}
+		portListener.backends.Store(&backends)
+		portListener.maxConns.Store(int64(maxConns))
+		p.tcpListeners[port] = portListener
+		go p.tcpAcceptLoop(portListener)
+		p.mu.Unlock()
+		return
+	}
+}
+
+func (p *Proxy) tcpAcceptLoop(portListener *tcpPortListener) {
+	defer portListener.accepting.Store(false)
+	for {
+		portListener.accepting.Store(true)
+		conn, err := portListener.ln.Accept()
+		if err != nil {
+			if portListener.closed.Load() || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			select {
-			case <-pl.done:
+			case <-portListener.done:
 				return
 			case <-time.After(5 * time.Millisecond):
 			}
 			continue
 		}
-		maxConns := pl.maxConns.Load()
-		if maxConns > 0 && pl.activeConns.Add(1) > maxConns {
-			pl.activeConns.Add(-1)
+		maxConns := portListener.maxConns.Load()
+		if maxConns > 0 && portListener.activeConns.Add(1) > maxConns {
+			portListener.activeConns.Add(-1)
 			closeConn(conn)
 			continue
 		}
-		go p.handleTCPConn(conn, pl)
+		go p.handleTCPConn(conn, portListener)
 	}
 }
 

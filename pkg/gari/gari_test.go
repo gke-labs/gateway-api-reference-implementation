@@ -3237,7 +3237,6 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	healthAddr := allocatePort()
 	proxyAddr := allocatePort()
 
-	unblockHTTP := make(chan struct{})
 	opts := DefaultOptions()
 	opts.RestConfig = env.Config
 	opts.Scheme = env.Scheme
@@ -3249,19 +3248,21 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 	opts.ProxyAddr = proxyAddr
 	opts.ProxyHTTPSAddr = ""
 	opts.LeaderElection = false
-	opts.BeforeStartProxyServers = func(ctx context.Context) error {
-		select {
-		case <-unblockHTTP:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
 
 	server, err := New(opts)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
+
+	unblockHTTP := make(chan struct{})
+	server.Proxy().SetListenFunc(func(network, addr string) (net.Listener, error) {
+		select {
+		case <-unblockHTTP:
+			return net.Listen(network, addr)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -3424,26 +3425,20 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 		t.Fatalf("failed to update secret: %v", err)
 	}
 
-	// Poll until revision 2 has been parsed by reconciler (reflected in internal appliedConfigs)
-	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
-		server.appliedMu.RLock()
-		defer server.appliedMu.RUnlock()
-		if cfg, ok := server.appliedConfigs[gwKey.String()]; ok && cfg.revision == dpConfig2.Revision {
-			return true, nil
+	// While the new TCP listener port cannot bind:
+	// /readyz must stay 200 OK (still serving applied revision 1) and /_gari/applied keeps listing revision 1.
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if code := getReadyzStatus(); code != http.StatusOK {
+			t.Errorf("expected readyz status 200 while previous revision is served, got %d", code)
 		}
-		return false, nil
-	})
-	if err != nil {
-		t.Fatalf("timed out waiting for revision 2 to be received: %v", err)
-	}
-
-	// While the new TCP listener port setup is delayed:
-	// /readyz must fail (500) and /_gari/applied must omit revision 2.
-	if code := getReadyzStatus(); code != http.StatusInternalServerError {
-		t.Errorf("expected readyz status 500 while new listener port delayed, got %d", code)
-	}
-	if revs := getAppliedRevisions(); slices.Contains(revs, dpConfig2.Revision) {
-		t.Errorf("expected /_gari/applied to omit revision 2 while new listener port delayed, got %v", revs)
+		revs := getAppliedRevisions()
+		if !slices.Contains(revs, dpConfig1.Revision) {
+			t.Errorf("expected previous revision 1 to stay listed, got %v", revs)
+		}
+		if slices.Contains(revs, dpConfig2.Revision) {
+			t.Errorf("expected new revision 2 to be omitted while listener port cannot bind, got %v", revs)
+		}
 	}
 
 	// Connection to tcpAddr must fail (connection refused)
@@ -3452,22 +3447,16 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 		t.Errorf("expected connection to %s to fail while listener port delayed", tcpAddr)
 	}
 
-	// Unblock TCP listener setup and trigger re-reconcile
+	// Unblock TCP listener setup without changing the Secret:
+	// Proxy's background retry loop will retry the bind with backoff.
 	tcpReady.Store(true)
-	if secret.Annotations == nil {
-		secret.Annotations = make(map[string]string)
-	}
-	secret.Annotations["test/reconcile"] = "1"
-	if err := env.Client.Update(ctx, secret); err != nil {
-		t.Fatalf("failed to trigger secret re-reconcile: %v", err)
-	}
 
-	// Wait for /readyz to return 200 OK and /_gari/applied to include revision 2.
+	// Wait for the new revision to appear in /_gari/applied and /readyz to be 200 OK.
 	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
 		return getReadyzStatus() == http.StatusOK && slices.Contains(getAppliedRevisions(), dpConfig2.Revision), nil
 	})
 	if err != nil {
-		t.Fatalf("timed out waiting for readyz OK and revision 2 applied: %v", err)
+		t.Fatalf("timed out waiting for revision 2 to appear without Secret change: %v", err)
 	}
 
 	// Connection made right after either signal succeeds.
@@ -3476,4 +3465,100 @@ func TestDataplane_ListenerReadinessAndRevisionReporting(t *testing.T) {
 		t.Fatalf("connection to %s failed right after ready signal: %v", tcpAddr, err)
 	}
 	tcpConn.Close()
+}
+
+func TestController_ReadyAfterGatewayCreated(t *testing.T) {
+	env := testenv.Start(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate free port: %v", err)
+	}
+	healthAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	opts := DefaultOptions()
+	opts.RestConfig = env.Config
+	opts.Scheme = env.Scheme
+	opts.DataplaneMode = false
+	opts.HealthProbeBindAddress = healthAddr
+	opts.MetricsAddr = healthAddr
+	opts.ProxyAddr = ""
+	opts.ProxyHTTPSAddr = ""
+	opts.LeaderElection = false
+
+	server, err := New(opts)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("server exited with error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("timed out waiting for server to stop")
+		}
+	})
+
+	httpClient := &http.Client{Timeout: 1 * time.Second}
+	readyURL := fmt.Sprintf("http://%s/readyz", healthAddr)
+
+	// Wait until controller is ready initially
+	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		resp, err := httpClient.Get(readyURL)
+		if err != nil {
+			return false, nil
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode == http.StatusOK, nil
+	})
+	if err != nil {
+		t.Fatalf("timed out waiting for controller initial ready: %v", err)
+	}
+
+	// Create a Gateway with an HTTP listener
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "controller-mode-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gari",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+	if err := env.Client.Create(ctx, gw); err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
+	}
+
+	// Controller mode runs no in-process proxy, so it must stay ready
+	for i := 0; i < 5; i++ {
+		time.Sleep(50 * time.Millisecond)
+		resp, err := httpClient.Get(readyURL)
+		if err != nil {
+			t.Fatalf("failed to query readyz: %v", err)
+		}
+		statusCode := resp.StatusCode
+		resp.Body.Close()
+		if statusCode != http.StatusOK {
+			t.Fatalf("expected readyz 200 after Gateway created in controller mode, got %d", statusCode)
+		}
+	}
 }

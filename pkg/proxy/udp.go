@@ -43,7 +43,8 @@ type udpPortListener struct {
 	conn      net.PacketConn
 	backends  atomic.Pointer[[]state.InternalUDPBackend]
 	closed    atomic.Bool
-	accepting atomic.Bool
+	// reading indicates that the UDP socket is bound and the read loop is running.
+	reading   atomic.Bool
 	done      chan struct{}
 
 	idleTimeout atomic.Int64 // nanoseconds
@@ -244,26 +245,27 @@ func (p *Proxy) updateUDPListenersLocked(listeners []state.InternalListener) {
 	}
 }
 
-// IsUDPPortAccepting returns whether the UDP listener for port is listening.
-func (p *Proxy) IsUDPPortAccepting(port gatewayv1.PortNumber) bool {
+// IsUDPPortListening returns whether the UDP listener socket for port is bound and its read loop is running.
+// Unlike TCP listeners, UDP has no connection accept; this reports that the socket is bound and actively reading packets.
+func (p *Proxy) IsUDPPortListening(port gatewayv1.PortNumber) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	pl, ok := p.udpListeners[port]
-	return ok && pl.accepting.Load() && !pl.closed.Load()
+	portListener, ok := p.udpListeners[port]
+	return ok && portListener.reading.Load() && !portListener.closed.Load()
 }
 
-func (p *Proxy) udpReadLoop(pl *udpPortListener) {
-	defer pl.accepting.Store(false)
+func (p *Proxy) udpReadLoop(portListener *udpPortListener) {
+	defer portListener.reading.Store(false)
 	buf := make([]byte, udpBufferSize)
 	for {
-		pl.accepting.Store(true)
-		n, clientAddr, err := pl.conn.ReadFrom(buf)
+		portListener.reading.Store(true)
+		n, clientAddr, err := portListener.conn.ReadFrom(buf)
 		if err != nil {
-			if pl.closed.Load() || errors.Is(err, net.ErrClosed) {
+			if portListener.closed.Load() || errors.Is(err, net.ErrClosed) {
 				return
 			}
 			select {
-			case <-pl.done:
+			case <-portListener.done:
 				return
 			case <-time.After(5 * time.Millisecond):
 			}
@@ -272,7 +274,7 @@ func (p *Proxy) udpReadLoop(pl *udpPortListener) {
 		if n == 0 {
 			continue
 		}
-		p.handleUDPDatagram(pl, clientAddr, buf[:n])
+		p.handleUDPDatagram(portListener, clientAddr, buf[:n])
 	}
 }
 
