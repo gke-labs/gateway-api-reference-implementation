@@ -15,14 +15,12 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"os"
 
 	"k8s.io/klog/v2/textlogger"
 	ctrl "sigs.k8s.io/controller-runtime"
-	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/address"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/dnsconfig"
@@ -105,21 +103,21 @@ func BuildOptions(args []string) (gari.Options, Config, error) {
 // WirePublisher connects an mDNS Publisher to GARI options and registers it as a manager Runnable.
 func WirePublisher(opts *gari.Options, pub *mdns.Publisher) {
 	opts.GatewayStatusHook = pub.StatusHook
-	var dnsPub *dnsconfig.Publisher
-	opts.OnGatewaysUpdate = func(gateways []*gatewayv1.Gateway) {
-		pub.OnGatewaysUpdate(gateways)
-		if dnsPub != nil {
-			if err := dnsPub.Publish(context.Background(), gateways); err != nil {
-				ctrl.Log.WithName("dns-publisher").Error(err, "failed to publish DNS data plane config")
-			}
-		}
-	}
+	opts.OnGatewaysUpdate = pub.OnGatewaysUpdate
 	opts.SetupWithManager = func(mgr ctrl.Manager, s *gari.Server) error {
 		pub.SetEnqueueGateway(s.EnqueueGateway)
 		if err := mgr.Add(pub); err != nil {
 			return fmt.Errorf("failed to register mDNS publisher with manager: %w", err)
 		}
-		dnsPub = dnsconfig.NewPublisher(mgr.GetClient(), dnsconfig.DefaultSecretNamespace, dnsconfig.DefaultSecretName, "localgateway")
+
+		controllerNamespace := os.Getenv("POD_NAMESPACE")
+		if controllerNamespace == "" {
+			controllerNamespace = "default"
+		}
+		dnsPublisher := dnsconfig.NewPublisher(mgr.GetClient(), controllerNamespace, "localgateway-dns", s.State())
+		if err := mgr.Add(dnsPublisher); err != nil {
+			return fmt.Errorf("failed to register dns config publisher with manager: %w", err)
+		}
 		return nil
 	}
 }

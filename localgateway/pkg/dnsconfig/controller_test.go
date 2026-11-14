@@ -15,27 +15,30 @@
 package dnsconfig
 
 import (
-	"net"
+	"context"
+	"encoding/json"
 	"slices"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/address"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
 
 const testControllerName = "github.com/gke-labs/gateway-api-reference-implementation/localgateway"
 
-func setupStateWithPublisher(t *testing.T, initialObjects ...runtime.Object) (*state.State, *Publisher) {
+func setupStateAndPublisher(t *testing.T, ctx context.Context) (*state.State, client.Client, *Publisher) {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
@@ -48,10 +51,7 @@ func setupStateWithPublisher(t *testing.T, initialObjects ...runtime.Object) (*s
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithRuntimeObjects(initialObjects...).
 		Build()
-
-	publisher := NewPublisher(fakeClient, DefaultSecretNamespace, DefaultSecretName, "localgateway")
 
 	st := state.NewState()
 	p := proxy.NewProxy()
@@ -60,25 +60,17 @@ func setupStateWithPublisher(t *testing.T, initialObjects ...runtime.Object) (*s
 	st.SetListenerValidator(validation.ValidateListener)
 	st.SetProxy(p)
 
-	return st, publisher
+	dnsPublisher := NewPublisher(fakeClient, "default", "localgateway-dns", st)
+	go func() {
+		_ = dnsPublisher.Start(ctx)
+	}()
+
+	return st, fakeClient, dnsPublisher
 }
 
-func resolveGatewaysFromState(st *state.State, outputs *state.Outputs) []*gatewayv1.Gateway {
-	var resolved []*gatewayv1.Gateway
-	for _, gw := range outputs.ResolvedGateways {
-		gwCopy := gw.DeepCopy()
-		gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
-		if status, ok := st.GetDesiredGatewayStatus(gwKey); ok {
-			gwCopy.Status = status
-		}
-		resolved = append(resolved, gwCopy)
-	}
-	return resolved
-}
-
-func makeTestGatewayWithTime(name, hostname, ip string, createdAt time.Time) (*gatewayv1.Gateway, *address.AddressProvider) {
+func makeTestGateway(name, hostname string, createdAt time.Time) *gatewayv1.Gateway {
 	hName := gatewayv1.Hostname(hostname)
-	gw := &gatewayv1.Gateway{
+	return &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         "default",
 			Name:              name,
@@ -96,17 +88,36 @@ func makeTestGatewayWithTime(name, hostname, ip string, createdAt time.Time) (*g
 			},
 		},
 	}
+}
 
-	addrProvider := address.NewAddressProvider(address.Options{
-		InterfaceName: "eth0",
-		InterfaceAddrsFunc: func(string) ([]net.Addr, error) {
-			return []net.Addr{
-				&net.IPNet{IP: net.ParseIP(ip), Mask: net.CIDRMask(24, 32)},
-			}, nil
-		},
-	})
+func waitForConfig(t *testing.T, ctx context.Context, cl client.Client, condition func(cfg *Config) bool) *Config {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		var secret corev1.Secret
+		err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: "localgateway-dns"}, &secret)
+		if err == nil {
+			payload, ok := secret.Data[singlepod.DataplaneSecretDataKey]
+			if ok && len(payload) > 0 {
+				var config Config
+				if err := json.Unmarshal(payload, &config); err == nil {
+					if condition(&config) {
+						return &config
+					}
+				}
+			}
+		} else if apierrors.IsNotFound(err) {
+			if condition(nil) {
+				return nil
+			}
+		}
 
-	return gw, addrProvider
+		select {
+		case <-deadline:
+			t.Fatalf("timeout waiting for expected DNS config in Secret")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // TestControllerThroughState_DeterministicConflictResolutionBothOrders verifies:
@@ -136,8 +147,10 @@ func TestControllerThroughState_DeterministicConflictResolutionBothOrders(t *tes
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := t.Context()
-			st, publisher := setupStateWithPublisher(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			st, fakeClient, _ := setupStateAndPublisher(t, ctx)
 
 			gc := &gatewayv1.GatewayClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "localgateway"},
@@ -148,8 +161,8 @@ func TestControllerThroughState_DeterministicConflictResolutionBothOrders(t *tes
 			gwOlderKey := types.NamespacedName{Namespace: "default", Name: "gw-older"}
 			gwNewerKey := types.NamespacedName{Namespace: "default", Name: "gw-newer"}
 
-			gwOlder, _ := makeTestGatewayWithTime("gw-older", "app.local", olderIP, olderTime)
-			gwNewer, _ := makeTestGatewayWithTime("gw-newer", "app.local", newerIP, newerTime)
+			gwOlder := makeTestGateway("gw-older", "app.local", olderTime)
+			gwNewer := makeTestGateway("gw-newer", "app.local", newerTime)
 
 			if tc.orderFirst == "older" {
 				st.UpsertGateway(gwOlder)
@@ -170,25 +183,11 @@ func TestControllerThroughState_DeterministicConflictResolutionBothOrders(t *tes
 				t.Fatalf("Recompute returned nil")
 			}
 
-			resolved := resolveGatewaysFromState(st, outputs)
-			if err := publisher.Publish(ctx, resolved); err != nil {
-				t.Fatalf("Publish failed: %v", err)
-			}
+			config := waitForConfig(t, ctx, fakeClient, func(c *Config) bool {
+				return c != nil && len(c.Records) == 1
+			})
 
-			var sec corev1.Secret
-			if err := publisher.client.Get(ctx, types.NamespacedName{Namespace: DefaultSecretNamespace, Name: DefaultSecretName}, &sec); err != nil {
-				t.Fatalf("Get Secret failed: %v", err)
-			}
-
-			cfg, err := Unmarshal(sec.Data[DefaultSecretDataKey])
-			if err != nil {
-				t.Fatalf("Unmarshal config failed: %v", err)
-			}
-
-			if len(cfg.Records) != 1 {
-				t.Fatalf("expected exactly 1 record, got %d", len(cfg.Records))
-			}
-			rec := cfg.Records[0]
+			rec := config.Records[0]
 			if rec.Name != "app.local" {
 				t.Errorf("expected name app.local, got %s", rec.Name)
 			}
@@ -202,8 +201,10 @@ func TestControllerThroughState_DeterministicConflictResolutionBothOrders(t *tes
 // TestControllerThroughState_GatewayLosingProgrammed verifies that when a Gateway
 // loses its Programmed condition, its records are withdrawn from the published Secret.
 func TestControllerThroughState_GatewayLosingProgrammed(t *testing.T) {
-	ctx := t.Context()
-	st, publisher := setupStateWithPublisher(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	st, fakeClient, _ := setupStateAndPublisher(t, ctx)
 
 	targetIP := "192.168.1.100"
 	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
@@ -214,56 +215,44 @@ func TestControllerThroughState_GatewayLosingProgrammed(t *testing.T) {
 	}
 	st.UpsertGatewayClass(gc)
 
-	gw, _ := makeTestGatewayWithTime("my-gw", "app.local", targetIP, time.Now())
+	gw := makeTestGateway("my-gw", "app.local", time.Now())
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: targetIP}})
 	st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
 	st.SetSynced(true)
 
 	outputs := st.Recompute()
-	resolved := resolveGatewaysFromState(st, outputs)
-	if err := publisher.Publish(ctx, resolved); err != nil {
-		t.Fatalf("Publish failed: %v", err)
+	if outputs == nil {
+		t.Fatalf("Recompute returned nil")
 	}
 
 	// 1. Initially Gateway is Programmed -> app.local published
-	var sec corev1.Secret
-	if err := publisher.client.Get(ctx, types.NamespacedName{Namespace: DefaultSecretNamespace, Name: DefaultSecretName}, &sec); err != nil {
-		t.Fatalf("Get Secret failed: %v", err)
-	}
-	cfg, err := Unmarshal(sec.Data[DefaultSecretDataKey])
-	if err != nil {
-		t.Fatalf("Unmarshal failed: %v", err)
-	}
-	if len(cfg.Records) != 1 || !slices.Contains(cfg.Records[0].Addresses, targetIP) {
-		t.Fatalf("expected Gateway to hold app.local, got %+v", cfg.Records)
+	config := waitForConfig(t, ctx, fakeClient, func(c *Config) bool {
+		return c != nil && len(c.Records) == 1 && slices.Contains(c.Records[0].Addresses, targetIP)
+	})
+	if config == nil {
+		t.Fatalf("expected Gateway to hold app.local")
 	}
 
-	// 2. Gateway loses Programmed (readiness becomes false) -> record withdrawn
+	// 2. Gateway loses Programmed (readiness becomes false) -> record withdrawn (Secret deleted or empty)
 	st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: false})
 	outputs = st.Recompute()
-	resolved = resolveGatewaysFromState(st, outputs)
-	if err := publisher.Publish(ctx, resolved); err != nil {
-		t.Fatalf("Publish after unprogrammed failed: %v", err)
+	if outputs == nil {
+		t.Fatalf("Recompute after unprogrammed returned nil")
 	}
 
-	if err := publisher.client.Get(ctx, types.NamespacedName{Namespace: DefaultSecretNamespace, Name: DefaultSecretName}, &sec); err != nil {
-		t.Fatalf("Get Secret failed: %v", err)
-	}
-	cfg, err = Unmarshal(sec.Data[DefaultSecretDataKey])
-	if err != nil {
-		t.Fatalf("Unmarshal failed: %v", err)
-	}
-	if len(cfg.Records) != 0 {
-		t.Fatalf("expected records to be withdrawn when Gateway loses Programmed, got %+v", cfg.Records)
-	}
+	waitForConfig(t, ctx, fakeClient, func(c *Config) bool {
+		return c == nil || len(c.Records) == 0
+	})
 }
 
 // TestControllerThroughState_ContestedNameDeletedGatewayTransfer verifies that when
 // the winning Gateway is deleted, the remaining Gateway's record is published.
 func TestControllerThroughState_ContestedNameDeletedGatewayTransfer(t *testing.T) {
-	ctx := t.Context()
-	st, publisher := setupStateWithPublisher(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	st, fakeClient, _ := setupStateAndPublisher(t, ctx)
 
 	now := time.Now()
 	olderTime := now.Add(-10 * time.Minute)
@@ -280,8 +269,8 @@ func TestControllerThroughState_ContestedNameDeletedGatewayTransfer(t *testing.T
 	gwOlderKey := types.NamespacedName{Namespace: "default", Name: "gw-older"}
 	gwNewerKey := types.NamespacedName{Namespace: "default", Name: "gw-newer"}
 
-	gwOlder, _ := makeTestGatewayWithTime("gw-older", "app.local", olderIP, olderTime)
-	gwNewer, _ := makeTestGatewayWithTime("gw-newer", "app.local", newerIP, newerTime)
+	gwOlder := makeTestGateway("gw-older", "app.local", olderTime)
+	gwNewer := makeTestGateway("gw-newer", "app.local", newerTime)
 
 	st.UpsertGateway(gwOlder)
 	st.UpsertGateway(gwNewer)
@@ -292,34 +281,23 @@ func TestControllerThroughState_ContestedNameDeletedGatewayTransfer(t *testing.T
 	st.SetSynced(true)
 
 	outputs := st.Recompute()
-	resolved := resolveGatewaysFromState(st, outputs)
-	if err := publisher.Publish(ctx, resolved); err != nil {
-		t.Fatalf("Publish failed: %v", err)
+	if outputs == nil {
+		t.Fatalf("Recompute returned nil")
 	}
 
 	// 1. Initially older Gateway holds app.local
-	var sec corev1.Secret
-	if err := publisher.client.Get(ctx, types.NamespacedName{Namespace: DefaultSecretNamespace, Name: DefaultSecretName}, &sec); err != nil {
-		t.Fatalf("Get Secret failed: %v", err)
-	}
-	cfg, _ := Unmarshal(sec.Data[DefaultSecretDataKey])
-	if len(cfg.Records) != 1 || !slices.Contains(cfg.Records[0].Addresses, olderIP) {
-		t.Fatalf("expected older Gateway to hold app.local, got %+v", cfg.Records)
-	}
+	waitForConfig(t, ctx, fakeClient, func(c *Config) bool {
+		return c != nil && len(c.Records) == 1 && slices.Contains(c.Records[0].Addresses, olderIP)
+	})
 
 	// 2. Older Gateway is deleted -> newer Gateway takes over app.local
 	st.DeleteGateway(gwOlderKey)
 	outputs = st.Recompute()
-	resolved = resolveGatewaysFromState(st, outputs)
-	if err := publisher.Publish(ctx, resolved); err != nil {
-		t.Fatalf("Publish after older deleted failed: %v", err)
+	if outputs == nil {
+		t.Fatalf("Recompute after delete returned nil")
 	}
 
-	if err := publisher.client.Get(ctx, types.NamespacedName{Namespace: DefaultSecretNamespace, Name: DefaultSecretName}, &sec); err != nil {
-		t.Fatalf("Get Secret failed: %v", err)
-	}
-	cfg, _ = Unmarshal(sec.Data[DefaultSecretDataKey])
-	if len(cfg.Records) != 1 || !slices.Contains(cfg.Records[0].Addresses, newerIP) {
-		t.Fatalf("expected newer Gateway to take over app.local, got %+v", cfg.Records)
-	}
+	waitForConfig(t, ctx, fakeClient, func(c *Config) bool {
+		return c != nil && len(c.Records) == 1 && slices.Contains(c.Records[0].Addresses, newerIP)
+	})
 }

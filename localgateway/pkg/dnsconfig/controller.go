@@ -16,39 +16,47 @@ package dnsconfig
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"sort"
 	"strings"
+	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
 
-// BuildRecords computes the deterministic list of DNS records from the compiled Gateways.
-// It includes only listeners that are accepted and programmed, only HTTP listeners,
+// BuildRecords computes the deterministic list of DNS records from the controller State.
+// It reads desired Gateway status computed by the state, includes only HTTP listeners
+// that are accepted and programmed, skips loopback and unspecified addresses,
 // and resolves conflicts deterministically by oldest creation time, then namespace and name.
-func BuildRecords(gateways []*gatewayv1.Gateway, gatewayClassName string) []Record {
+func BuildRecords(controllerState *state.State) []Record {
+	if controllerState == nil {
+		return nil
+	}
+
+	gatewayStates := controllerState.GetGateways()
 	var matchingGateways []*gatewayv1.Gateway
-	for _, gateway := range gateways {
-		if gateway == nil || gateway.DeletionTimestamp != nil {
+	for _, gatewayState := range gatewayStates {
+		if gatewayState == nil || gatewayState.Gateway == nil || gatewayState.Gateway.DeletionTimestamp != nil {
 			continue
 		}
-		if gatewayClassName != "" && string(gateway.Spec.GatewayClassName) != gatewayClassName {
-			continue
-		}
-		matchingGateways = append(matchingGateways, gateway)
+		matchingGateways = append(matchingGateways, gatewayState.Gateway)
 	}
 
 	// Beyond the Gateway API specification:
-	// When multiple Gateways claim the same hostname, the conflict resolution is deterministic:
-	// the oldest Gateway by creation time holds the name, breaking ties by namespace and name.
+	// The controller gives the hostname to the oldest Gateway by creation time, breaking ties
+	// by namespace and name, so that conflicting claims resolve deterministically across controllers.
 	sort.Slice(matchingGateways, func(i, j int) bool {
 		timeI := matchingGateways[i].CreationTimestamp
 		timeJ := matchingGateways[j].CreationTimestamp
@@ -65,17 +73,26 @@ func BuildRecords(gateways []*gatewayv1.Gateway, gatewayClassName string) []Reco
 	var records []Record
 
 	for _, gateway := range matchingGateways {
-		if !isGatewayProgrammed(gateway) {
+		gatewayKey := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
+		status, ok := controllerState.GetDesiredGatewayStatus(gatewayKey)
+		if !ok || !isGatewayProgrammed(status) {
 			continue
 		}
 
-		var ipStrings []string
-		for _, address := range gateway.Status.Addresses {
-			if ip := net.ParseIP(address.Value); ip != nil {
-				ipStrings = append(ipStrings, ip.String())
+		var addressStrings []string
+		for _, address := range status.Addresses {
+			ip := net.ParseIP(address.Value)
+			if ip == nil {
+				continue
 			}
+			// Skip loopback (127.0.0.0/8, ::1) and unspecified (0.0.0.0, ::) addresses
+			// because mDNS records advertise addresses reachable by other clients on the local network (RFC 6762).
+			if ip.IsLoopback() || ip.IsUnspecified() {
+				continue
+			}
+			addressStrings = append(addressStrings, ip.String())
 		}
-		if len(ipStrings) == 0 {
+		if len(addressStrings) == 0 {
 			continue
 		}
 
@@ -87,7 +104,7 @@ func BuildRecords(gateways []*gatewayv1.Gateway, gatewayClassName string) []Reco
 			if err := validation.ValidateSingleLabelLocalHostname(rawHostname); err != nil {
 				continue
 			}
-			if !isListenerAcceptedAndProgrammed(gateway, listener.Name) {
+			if !isListenerAcceptedAndProgrammed(status, listener.Name) {
 				continue
 			}
 
@@ -100,7 +117,7 @@ func BuildRecords(gateways []*gatewayv1.Gateway, gatewayClassName string) []Reco
 
 			records = append(records, Record{
 				Name:      canonicalHostname,
-				Addresses: append([]string(nil), ipStrings...),
+				Addresses: append([]string(nil), addressStrings...),
 			})
 		}
 	}
@@ -108,9 +125,8 @@ func BuildRecords(gateways []*gatewayv1.Gateway, gatewayClassName string) []Reco
 	return records
 }
 
-// isGatewayProgrammed returns true if the Gateway has a Programmed condition with status True.
-func isGatewayProgrammed(gateway *gatewayv1.Gateway) bool {
-	for _, condition := range gateway.Status.Conditions {
+func isGatewayProgrammed(status gatewayv1.GatewayStatus) bool {
+	for _, condition := range status.Conditions {
 		if condition.Type == string(gatewayv1.GatewayConditionProgrammed) && condition.Status == metav1.ConditionTrue {
 			return true
 		}
@@ -118,10 +134,8 @@ func isGatewayProgrammed(gateway *gatewayv1.Gateway) bool {
 	return false
 }
 
-// isListenerAcceptedAndProgrammed returns true if the specified listener has both Accepted
-// and Programmed conditions with status True.
-func isListenerAcceptedAndProgrammed(gateway *gatewayv1.Gateway, listenerName gatewayv1.SectionName) bool {
-	for _, listenerStatus := range gateway.Status.Listeners {
+func isListenerAcceptedAndProgrammed(status gatewayv1.GatewayStatus, listenerName gatewayv1.SectionName) bool {
+	for _, listenerStatus := range status.Listeners {
 		if listenerStatus.Name != listenerName {
 			continue
 		}
@@ -139,79 +153,91 @@ func isListenerAcceptedAndProgrammed(gateway *gatewayv1.Gateway, listenerName ga
 	return false
 }
 
-// Publisher publishes DNS data plane configuration into its dedicated Secret.
+// Publisher distributes DNS data plane configuration into a dedicated Secret.
+// The Secret is created in the controller's own namespace. When all Gateways are removed
+// or unprogrammed, the Secret is deleted; uninstalling the controller deployment or namespace
+// also removes the Secret.
 type Publisher struct {
-	client           client.Client
-	namespace        string
-	secretName       string
-	gatewayClassName string
-	lastRevision     string
+	// client is the Kubernetes client used to apply the configuration Secret.
+	client client.Client
+
+	// namespace is the controller's namespace where the Secret is written.
+	namespace string
+
+	// secretName is the name of the Secret holding the DNS config.
+	secretName string
+
+	// state is the controller State holding compiled Gateway statuses.
+	state *state.State
+
+	// queue rate-limits and retries publish operations in the background.
+	queue workqueue.TypedRateLimitingInterface[reconcile.Request]
 }
 
 // NewPublisher constructs a new DNS config Publisher.
-func NewPublisher(cl client.Client, namespace, secretName, gatewayClassName string) *Publisher {
+func NewPublisher(kubernetesClient client.Client, namespace, secretName string, controllerState *state.State) *Publisher {
 	if namespace == "" {
-		namespace = DefaultSecretNamespace
+		namespace = "default"
 	}
 	if secretName == "" {
-		secretName = DefaultSecretName
+		secretName = "localgateway-dns"
 	}
 	return &Publisher{
-		client:           cl,
-		namespace:        namespace,
-		secretName:       secretName,
-		gatewayClassName: gatewayClassName,
+		client:     kubernetesClient,
+		namespace:  namespace,
+		secretName: secretName,
+		state:      controllerState,
+		queue:      workqueue.NewTypedRateLimitingQueue[reconcile.Request](workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]()),
 	}
 }
 
-// Publish computes DNS records from the provided Gateways and writes them to the config Secret.
-func (p *Publisher) Publish(ctx context.Context, gateways []*gatewayv1.Gateway) error {
-	records := BuildRecords(gateways, p.gatewayClassName)
-	cfg := &Config{
-		Records: records,
-	}
-	rev, err := cfg.ComputeRevision()
-	if err != nil {
-		return fmt.Errorf("computing revision: %w", err)
-	}
-	cfg.Revision = rev
+// Start implements manager.Runnable to process publish requests asynchronously until ctx is canceled.
+func (p *Publisher) Start(ctx context.Context) error {
+	defer p.queue.ShutDown()
 
-	if p.lastRevision == rev {
-		return nil
+	if p.state != nil && p.state.GatewaySource() != nil {
+		if err := p.state.GatewaySource().Start(ctx, p.queue); err != nil {
+			return fmt.Errorf("starting gateway source: %w", err)
+		}
 	}
 
-	data, err := cfg.Marshal()
-	if err != nil {
-		return fmt.Errorf("marshaling dns config: %w", err)
+	p.queue.Add(reconcile.Request{})
+
+	for {
+		item, shutdown := p.queue.Get()
+		if shutdown {
+			return nil
+		}
+
+		if err := p.publishOnce(ctx); err != nil {
+			klog.Errorf("failed to publish DNS data plane config: %v", err)
+			p.queue.AddRateLimited(item)
+		} else {
+			p.queue.Forget(item)
+		}
+		p.queue.Done(item)
+	}
+}
+
+func (p *Publisher) publishOnce(ctx context.Context) error {
+	publishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	records := BuildRecords(p.state)
+	var payload []byte
+	if len(records) > 0 {
+		dnsConfig := &Config{Records: records}
+		revision, err := dnsConfig.ComputeRevision()
+		if err != nil {
+			return fmt.Errorf("computing revision: %w", err)
+		}
+		dnsConfig.Revision = revision
+
+		payload, err = json.Marshal(dnsConfig)
+		if err != nil {
+			return fmt.Errorf("marshaling dns config: %w", err)
+		}
 	}
 
-	var existing corev1.Secret
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: p.namespace, Name: p.secretName}, &existing)
-	if apierrors.IsNotFound(err) {
-		sec := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: p.namespace,
-				Name:      p.secretName,
-			},
-			Data: map[string][]byte{
-				DefaultSecretDataKey: data,
-			},
-		}
-		if err := p.client.Create(ctx, sec); err != nil {
-			return fmt.Errorf("creating dns config secret: %w", err)
-		}
-	} else if err == nil {
-		if existing.Data == nil {
-			existing.Data = make(map[string][]byte)
-		}
-		existing.Data[DefaultSecretDataKey] = data
-		if err := p.client.Update(ctx, &existing); err != nil {
-			return fmt.Errorf("updating dns config secret: %w", err)
-		}
-	} else {
-		return fmt.Errorf("getting dns config secret: %w", err)
-	}
-
-	p.lastRevision = rev
-	return nil
+	return singlepod.WriteConfigSecret(publishCtx, p.client, p.namespace, p.secretName, nil, payload)
 }
