@@ -23,7 +23,6 @@ import (
 	"sort"
 	"strings"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2/textlogger"
@@ -164,6 +163,7 @@ func (r *gatewayReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 	return ctrl.Result{}, nil
 }
 
+// isGatewayProgrammed returns true if the Gateway has a Programmed condition with status True.
 func isGatewayProgrammed(gateway *gatewayv1.Gateway) bool {
 	for _, condition := range gateway.Status.Conditions {
 		if condition.Type == string(gatewayv1.GatewayConditionProgrammed) && condition.Status == metav1.ConditionTrue {
@@ -173,6 +173,7 @@ func isGatewayProgrammed(gateway *gatewayv1.Gateway) bool {
 	return false
 }
 
+// hasIPAddress returns true if the Gateway status includes at least one valid IP address.
 func hasIPAddress(gateway *gatewayv1.Gateway) bool {
 	for _, address := range gateway.Status.Addresses {
 		if net.ParseIP(address.Value) != nil {
@@ -182,6 +183,8 @@ func hasIPAddress(gateway *gatewayv1.Gateway) bool {
 	return false
 }
 
+// isListenerAcceptedAndProgrammed returns true if the specified listener has both Accepted
+// and Programmed conditions with status True.
 func isListenerAcceptedAndProgrammed(gateway *gatewayv1.Gateway, listenerName gatewayv1.SectionName) bool {
 	for _, listenerStatus := range gateway.Status.Listeners {
 		if listenerStatus.Name != listenerName {
@@ -219,10 +222,6 @@ func main() {
 	setupLog.Info("Starting localgateway-dns", "gatewayClass", configuration.gatewayClass, "mdnsPort", configuration.mdnsPort)
 
 	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		setupLog.Error(err, "failed to add corev1 to scheme")
-		os.Exit(1)
-	}
 	if err := gatewayv1.Install(scheme); err != nil {
 		setupLog.Error(err, "failed to install gatewayv1 to scheme")
 		os.Exit(1)

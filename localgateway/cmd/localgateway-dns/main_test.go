@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -26,11 +27,9 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -42,30 +41,184 @@ import (
 func newTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("AddToScheme failed: %v", err)
-	}
 	if err := gatewayv1.Install(scheme); err != nil {
 		t.Fatalf("Install failed: %v", err)
 	}
 	return scheme
 }
 
-func startTestPublisher(t *testing.T, ctx context.Context, options mdns.PublisherOptions) (*mdns.Publisher, <-chan error) {
+func isNormalClose(err error) bool {
+	return err == nil || errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection")
+}
+
+func startTestPublisherWithTap(t *testing.T, ctx context.Context) (*mdns.Publisher, <-chan string, <-chan string) {
 	t.Helper()
-	publisher, err := mdns.NewPublisher(options)
+
+	rawConn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
+		t.Fatalf("failed to bind ephemeral socket: %v", err)
+	}
+	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
+
+	announcedChannel := make(chan string, 20)
+	withdrawnChannel := make(chan string, 20)
+
+	publisher, err := mdns.NewPublisher(mdns.PublisherOptions{
+		Interface:             "lo",
+		Port:                  ephemeralPort,
+		IPv4Conn:              rawConn,
+		DisableIPv6:           true,
+		TTL:                   120,
+		ProbeInterval:         10 * time.Millisecond,
+		ProbeCount:            1,
+		AnnounceInterval:      10 * time.Millisecond,
+		ConflictRetryInterval: 100 * time.Millisecond,
+		MulticastTap: func(raw []byte) {
+			var parser dnsmessage.Parser
+			if _, err := parser.Start(raw); err != nil {
+				return
+			}
+			if err := parser.SkipAllQuestions(); err != nil {
+				return
+			}
+			for {
+				header, err := parser.AnswerHeader()
+				if err != nil {
+					break
+				}
+				name := strings.TrimSuffix(header.Name.String(), ".")
+				if header.TTL == 0 {
+					withdrawnChannel <- name
+				} else {
+					announcedChannel <- name
+				}
+				if err := parser.SkipAnswer(); err != nil {
+					break
+				}
+			}
+		},
+	})
+	if err != nil {
+		_ = rawConn.Close()
 		t.Fatalf("NewPublisher failed: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = publisher.Close()
-	})
 
 	errChan := make(chan error, 1)
 	go func() {
 		errChan <- publisher.Start(ctx)
 	}()
-	return publisher, errChan
+
+	t.Cleanup(func() {
+		if err := publisher.Close(); err != nil && !isNormalClose(err) {
+			t.Errorf("publisher.Close failed: %v", err)
+		}
+		if err := rawConn.Close(); err != nil && !isNormalClose(err) {
+			t.Errorf("rawConn.Close failed: %v", err)
+		}
+		if err := <-errChan; err != nil {
+			t.Errorf("publisher.Start returned unexpected error: %v", err)
+		}
+	})
+
+	return publisher, announcedChannel, withdrawnChannel
+}
+
+func buildTestGateway(name, hostname, address string, creationTime time.Time, gatewayProgrammed, listenerAccepted, listenerProgrammed bool) *gatewayv1.Gateway {
+	hName := gatewayv1.Hostname(hostname)
+	ipAddrType := gatewayv1.IPAddressType
+
+	gwCondStatus := metav1.ConditionFalse
+	gwReason := "NotProgrammed"
+	if gatewayProgrammed {
+		gwCondStatus = metav1.ConditionTrue
+		gwReason = string(gatewayv1.GatewayReasonProgrammed)
+	}
+
+	lisAcceptedStatus := metav1.ConditionFalse
+	lisAcceptedReason := "NotAccepted"
+	if listenerAccepted {
+		lisAcceptedStatus = metav1.ConditionTrue
+		lisAcceptedReason = string(gatewayv1.ListenerReasonAccepted)
+	}
+
+	lisProgStatus := metav1.ConditionFalse
+	lisProgReason := "NotProgrammed"
+	if listenerProgrammed {
+		lisProgStatus = metav1.ConditionTrue
+		lisProgReason = string(gatewayv1.ListenerReasonProgrammed)
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      name,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: defaultGatewayClassName,
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Hostname: &hName,
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+		Status: gatewayv1.GatewayStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(gatewayv1.GatewayConditionProgrammed),
+					Status: gwCondStatus,
+					Reason: gwReason,
+				},
+			},
+			Listeners: []gatewayv1.ListenerStatus{
+				{
+					Name: "http",
+					Conditions: []metav1.Condition{
+						{
+							Type:   string(gatewayv1.ListenerConditionAccepted),
+							Status: lisAcceptedStatus,
+							Reason: lisAcceptedReason,
+						},
+						{
+							Type:   string(gatewayv1.ListenerConditionProgrammed),
+							Status: lisProgStatus,
+							Reason: lisProgReason,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if !creationTime.IsZero() {
+		gw.CreationTimestamp = metav1.NewTime(creationTime)
+	}
+	if address != "" {
+		gw.Status.Addresses = []gatewayv1.GatewayStatusAddress{
+			{
+				Type:  &ipAddrType,
+				Value: address,
+			},
+		}
+	}
+	return gw
+}
+
+func waitForName(t *testing.T, ch <-chan string, expectedName string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case name := <-ch:
+			if strings.EqualFold(name, expectedName) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timeout waiting for %s", expectedName)
+		}
+	}
 }
 
 func TestBuildOptions(t *testing.T) {
@@ -125,114 +278,11 @@ func TestBuildOptions(t *testing.T) {
 // 1. A Gateway with a .local hostname and an address causes the responder to announce that name and address.
 // 2. Removing the Gateway withdraws it (sends a goodbye packet and removes the record).
 func TestGatewayReconciler_AnnounceAndWithdraw(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
+	ctx := t.Context()
 	scheme := newTestScheme(t)
+	publisher, announcedChan, withdrawnChan := startTestPublisherWithTap(t, ctx)
 
-	announcedChannel := make(chan []byte, 10)
-	goodbyeChannel := make(chan []byte, 10)
-
-	rawConn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		t.Fatalf("failed to bind ephemeral socket: %v", err)
-	}
-	defer rawConn.Close()
-	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
-
-	publisher, errChan := startTestPublisher(t, ctx, mdns.PublisherOptions{
-		Interface:             "lo",
-		Port:                  ephemeralPort,
-		IPv4Conn:              rawConn,
-		DisableIPv6:           true,
-		TTL:                   120,
-		ProbeInterval:         10 * time.Millisecond,
-		ProbeCount:            1,
-		AnnounceInterval:      10 * time.Millisecond,
-		ConflictRetryInterval: 100 * time.Millisecond,
-		MulticastTap: func(raw []byte) {
-			var parser dnsmessage.Parser
-			if _, err := parser.Start(raw); err != nil {
-				return
-			}
-			if err := parser.SkipAllQuestions(); err != nil {
-				return
-			}
-			for {
-				header, err := parser.AnswerHeader()
-				if err != nil {
-					break
-				}
-				if strings.EqualFold(header.Name.String(), "app.local.") {
-					if header.TTL == 0 {
-						goodbyeChannel <- raw
-					} else {
-						announcedChannel <- raw
-					}
-				}
-				if err := parser.SkipAnswer(); err != nil {
-					break
-				}
-			}
-		},
-	})
-
-	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	hostname := gatewayv1.Hostname("app.local")
-	ipAddrType := gatewayv1.IPAddressType
-	targetIP := "192.168.1.100"
-
-	gateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:  gatewayKey.Namespace,
-			Name:       gatewayKey.Name,
-			Generation: 1,
-		},
-		Spec: gatewayv1.GatewaySpec{
-			GatewayClassName: defaultGatewayClassName,
-			Listeners: []gatewayv1.Listener{
-				{
-					Name:     "http",
-					Hostname: &hostname,
-					Port:     80,
-					Protocol: gatewayv1.HTTPProtocolType,
-				},
-			},
-		},
-		Status: gatewayv1.GatewayStatus{
-			Conditions: []metav1.Condition{
-				{
-					Type:   string(gatewayv1.GatewayConditionProgrammed),
-					Status: metav1.ConditionTrue,
-					Reason: string(gatewayv1.GatewayReasonProgrammed),
-				},
-			},
-			Listeners: []gatewayv1.ListenerStatus{
-				{
-					Name: "http",
-					Conditions: []metav1.Condition{
-						{
-							Type:   string(gatewayv1.ListenerConditionAccepted),
-							Status: metav1.ConditionTrue,
-							Reason: string(gatewayv1.ListenerReasonAccepted),
-						},
-						{
-							Type:   string(gatewayv1.ListenerConditionProgrammed),
-							Status: metav1.ConditionTrue,
-							Reason: string(gatewayv1.ListenerReasonProgrammed),
-						},
-					},
-				},
-			},
-			Addresses: []gatewayv1.GatewayStatusAddress{
-				{
-					Type:  &ipAddrType,
-					Value: targetIP,
-				},
-			},
-		},
-	}
-
+	gateway := buildTestGateway("my-gateway", "app.local", "192.168.1.100", time.Time{}, true, true, true)
 	testClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(gateway).
@@ -246,183 +296,52 @@ func TestGatewayReconciler_AnnounceAndWithdraw(t *testing.T) {
 	}
 
 	// 1. Reconcile with the Gateway present -> should probe and announce
-	request := ctrl.Request{NamespacedName: gatewayKey}
-	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{}); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	select {
-	case raw := <-announcedChannel:
-		var parser dnsmessage.Parser
-		if _, err := parser.Start(raw); err != nil {
-			t.Fatalf("parser.Start failed: %v", err)
-		}
-		if err := parser.SkipAllQuestions(); err != nil {
-			t.Fatalf("parser.SkipAllQuestions failed: %v", err)
-		}
-		header, err := parser.AnswerHeader()
-		if err != nil {
-			t.Fatalf("parser.AnswerHeader failed: %v", err)
-		}
-		if header.TTL == 0 {
-			t.Fatalf("expected non-zero TTL in announcement, got %+v", header)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for app.local announcement")
-	}
+	waitForName(t, announcedChan, "app.local")
 
 	record, ok := publisher.Responder().GetRecord("app.local")
 	if !ok {
 		t.Fatalf("expected responder to have record for app.local")
 	}
-	if len(record.A) == 0 || record.A[0].String() != targetIP {
-		t.Fatalf("expected responder record A to be %s, got %+v", targetIP, record.A)
+	if len(record.A) == 0 || record.A[0].String() != "192.168.1.100" {
+		t.Fatalf("expected responder record A to be 192.168.1.100, got %+v", record.A)
 	}
 
 	// 2. Remove the Gateway -> should withdraw
 	if err := testClient.Delete(ctx, gateway); err != nil {
-		t.Fatalf("failed to delete gateway: %v", err)
+		t.Fatalf("Delete failed: %v", err)
 	}
 
-	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{}); err != nil {
 		t.Fatalf("Reconcile on delete failed: %v", err)
 	}
 
-	select {
-	case raw := <-goodbyeChannel:
-		var parser dnsmessage.Parser
-		if _, err := parser.Start(raw); err != nil {
-			t.Fatalf("parser.Start failed: %v", err)
-		}
-		if err := parser.SkipAllQuestions(); err != nil {
-			t.Fatalf("parser.SkipAllQuestions failed: %v", err)
-		}
-		header, err := parser.AnswerHeader()
-		if err != nil {
-			t.Fatalf("parser.AnswerHeader failed: %v", err)
-		}
-		if header.TTL != 0 {
-			t.Fatalf("expected TTL 0 in goodbye answer, got %+v", header)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for app.local goodbye packet")
-	}
+	waitForName(t, withdrawnChan, "app.local")
 
 	if _, ok := publisher.Responder().GetRecord("app.local"); ok {
 		t.Fatalf("expected record for app.local to be withdrawn from responder")
-	}
-
-	cancel()
-	if err := <-errChan; err != nil {
-		t.Errorf("publisher.Start returned unexpected error: %v", err)
 	}
 }
 
 // TestGatewayReconciler_RequiresAcceptedAndProgrammed verifies that a listener is only published
 // when the Gateway's Programmed condition and the listener's Accepted and Programmed conditions are true.
+// A second fully-programmed sentinel Gateway is used in each negative step to ensure the reconcile batch
+// completes before asserting the absence of the candidate's record. A final step verifies withdrawal
+// when a published Gateway loses its Programmed condition.
 func TestGatewayReconciler_RequiresAcceptedAndProgrammed(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
+	ctx := t.Context()
 	scheme := newTestScheme(t)
+	publisher, announcedChan, withdrawnChan := startTestPublisherWithTap(t, ctx)
 
-	rawConn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		t.Fatalf("failed to bind ephemeral socket: %v", err)
-	}
-	defer rawConn.Close()
-	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
-
-	announcedChannel := make(chan []byte, 10)
-	publisher, errChan := startTestPublisher(t, ctx, mdns.PublisherOptions{
-		Interface:        "lo",
-		Port:             ephemeralPort,
-		IPv4Conn:         rawConn,
-		DisableIPv6:      true,
-		ProbeInterval:    10 * time.Millisecond,
-		ProbeCount:       1,
-		AnnounceInterval: 10 * time.Millisecond,
-		MulticastTap: func(raw []byte) {
-			var parser dnsmessage.Parser
-			if _, err := parser.Start(raw); err != nil {
-				return
-			}
-			if err := parser.SkipAllQuestions(); err != nil {
-				return
-			}
-			for {
-				header, err := parser.AnswerHeader()
-				if err != nil {
-					break
-				}
-				if strings.EqualFold(header.Name.String(), "test.local.") && header.TTL > 0 {
-					announcedChannel <- raw
-				}
-				if err := parser.SkipAnswer(); err != nil {
-					break
-				}
-			}
-		},
-	})
-
-	gatewayKey := types.NamespacedName{Namespace: "default", Name: "prog-gateway"}
-	hostname := gatewayv1.Hostname("test.local")
-	ipAddrType := gatewayv1.IPAddressType
-	targetIP := "192.168.1.10"
-
-	gateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: gatewayKey.Namespace,
-			Name:      gatewayKey.Name,
-		},
-		Spec: gatewayv1.GatewaySpec{
-			GatewayClassName: defaultGatewayClassName,
-			Listeners: []gatewayv1.Listener{
-				{
-					Name:     "http",
-					Hostname: &hostname,
-					Port:     80,
-					Protocol: gatewayv1.HTTPProtocolType,
-				},
-			},
-		},
-		Status: gatewayv1.GatewayStatus{
-			Addresses: []gatewayv1.GatewayStatusAddress{
-				{
-					Type:  &ipAddrType,
-					Value: targetIP,
-				},
-			},
-			Conditions: []metav1.Condition{
-				{
-					Type:   string(gatewayv1.GatewayConditionProgrammed),
-					Status: metav1.ConditionFalse,
-					Reason: "NotProgrammed",
-				},
-			},
-			Listeners: []gatewayv1.ListenerStatus{
-				{
-					Name: "http",
-					Conditions: []metav1.Condition{
-						{
-							Type:   string(gatewayv1.ListenerConditionAccepted),
-							Status: metav1.ConditionFalse,
-							Reason: "NotAccepted",
-						},
-						{
-							Type:   string(gatewayv1.ListenerConditionProgrammed),
-							Status: metav1.ConditionFalse,
-							Reason: "NotProgrammed",
-						},
-					},
-				},
-			},
-		},
-	}
+	candidate := buildTestGateway("candidate", "candidate.local", "192.168.1.10", time.Time{}, false, false, false)
+	witness := buildTestGateway("witness", "witness.local", "192.168.1.20", time.Time{}, true, true, true)
 
 	testClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gateway).
+		WithObjects(candidate, witness).
 		WithStatusSubresource(&gatewayv1.Gateway{}).
 		Build()
 
@@ -432,60 +351,73 @@ func TestGatewayReconciler_RequiresAcceptedAndProgrammed(t *testing.T) {
 		publisher:        publisher,
 	}
 
-	// 1. Both Gateway and listener are not programmed -> should not publish
-	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gatewayKey}); err != nil {
+	// 1. Both Gateway and listener are not programmed -> should not publish candidate
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{}); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
-	if _, ok := publisher.Responder().GetRecord("test.local"); ok {
-		t.Fatalf("expected test.local not to be published when Programmed=False")
+	waitForName(t, announcedChan, "witness.local")
+	if _, ok := publisher.Responder().GetRecord("candidate.local"); ok {
+		t.Fatalf("expected candidate.local not to be published when Programmed=False")
 	}
 
-	// 2. Gateway Programmed=True, but listener Accepted=False -> should not publish
-	gateway.Status.Conditions[0].Status = metav1.ConditionTrue
-	if err := testClient.Status().Update(ctx, gateway); err != nil {
-		t.Fatalf("Status update failed: %v", err)
+	// 2. Gateway Programmed=True, but listener Accepted=False -> should not publish candidate
+	candidate.Status.Conditions[0].Status = metav1.ConditionTrue
+	if err := testClient.Status().Update(ctx, candidate); err != nil {
+		t.Fatalf("Status update candidate failed: %v", err)
 	}
-	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gatewayKey}); err != nil {
+	witness2 := buildTestGateway("witness2", "witness2.local", "192.168.1.22", time.Time{}, true, true, true)
+	if err := testClient.Create(ctx, witness2); err != nil {
+		t.Fatalf("Create witness2 failed: %v", err)
+	}
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{}); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
-	if _, ok := publisher.Responder().GetRecord("test.local"); ok {
-		t.Fatalf("expected test.local not to be published when listener Accepted=False")
+	waitForName(t, announcedChan, "witness2.local")
+	if _, ok := publisher.Responder().GetRecord("candidate.local"); ok {
+		t.Fatalf("expected candidate.local not to be published when listener Accepted=False")
 	}
 
-	// 3. Gateway Programmed=True, listener Accepted=True, but listener Programmed=False -> should not publish
-	gateway.Status.Listeners[0].Conditions[0].Status = metav1.ConditionTrue
-	if err := testClient.Status().Update(ctx, gateway); err != nil {
-		t.Fatalf("Status update failed: %v", err)
+	// 3. Gateway Programmed=True, listener Accepted=True, but listener Programmed=False -> should not publish candidate
+	candidate.Status.Listeners[0].Conditions[0].Status = metav1.ConditionTrue
+	if err := testClient.Status().Update(ctx, candidate); err != nil {
+		t.Fatalf("Status update candidate failed: %v", err)
 	}
-	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gatewayKey}); err != nil {
+	witness3 := buildTestGateway("witness3", "witness3.local", "192.168.1.23", time.Time{}, true, true, true)
+	if err := testClient.Create(ctx, witness3); err != nil {
+		t.Fatalf("Create witness3 failed: %v", err)
+	}
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{}); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
-	if _, ok := publisher.Responder().GetRecord("test.local"); ok {
-		t.Fatalf("expected test.local not to be published when listener Programmed=False")
+	waitForName(t, announcedChan, "witness3.local")
+	if _, ok := publisher.Responder().GetRecord("candidate.local"); ok {
+		t.Fatalf("expected candidate.local not to be published when listener Programmed=False")
 	}
 
-	// 4. Gateway Programmed=True, listener Accepted=True AND Programmed=True -> should publish
-	gateway.Status.Listeners[0].Conditions[1].Status = metav1.ConditionTrue
-	if err := testClient.Status().Update(ctx, gateway); err != nil {
-		t.Fatalf("Status update failed: %v", err)
+	// 4. Gateway Programmed=True, listener Accepted=True AND Programmed=True -> should publish candidate
+	candidate.Status.Listeners[0].Conditions[1].Status = metav1.ConditionTrue
+	if err := testClient.Status().Update(ctx, candidate); err != nil {
+		t.Fatalf("Status update candidate failed: %v", err)
 	}
-	if _, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gatewayKey}); err != nil {
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{}); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
-
-	select {
-	case <-announcedChannel:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for announcement when both Gateway and listener are Programmed")
+	waitForName(t, announcedChan, "candidate.local")
+	if _, ok := publisher.Responder().GetRecord("candidate.local"); !ok {
+		t.Fatalf("expected candidate.local to be published when all conditions are True")
 	}
 
-	if _, ok := publisher.Responder().GetRecord("test.local"); !ok {
-		t.Fatalf("expected test.local to be published when Programmed=True")
+	// 5. Candidate loses Programmed condition -> should be withdrawn with a goodbye packet
+	candidate.Status.Conditions[0].Status = metav1.ConditionFalse
+	if err := testClient.Status().Update(ctx, candidate); err != nil {
+		t.Fatalf("Status update candidate failed: %v", err)
 	}
-
-	cancel()
-	if err := <-errChan; err != nil {
-		t.Errorf("publisher.Start returned unexpected error: %v", err)
+	if _, err := reconciler.Reconcile(ctx, ctrl.Request{}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	waitForName(t, withdrawnChan, "candidate.local")
+	if _, ok := publisher.Responder().GetRecord("candidate.local"); ok {
+		t.Fatalf("expected candidate.local to be withdrawn when Programmed condition is lost")
 	}
 }
 
@@ -495,124 +427,36 @@ func TestGatewayReconciler_DeterministicConflictResolutionBothOrders(t *testing.
 	scheme := newTestScheme(t)
 
 	now := time.Now()
-	olderTime := metav1.NewTime(now.Add(-10 * time.Minute))
-	newerTime := metav1.NewTime(now.Add(-5 * time.Minute))
+	olderTime := now.Add(-10 * time.Minute)
+	newerTime := now.Add(-5 * time.Minute)
 
-	hostname := gatewayv1.Hostname("shared.local")
-	ipAddrType := gatewayv1.IPAddressType
 	olderIP := "192.168.1.100"
 	newerIP := "192.168.1.200"
-
-	makeGateway := func(name string, createdAt metav1.Time, ip string) *gatewayv1.Gateway {
-		return &gatewayv1.Gateway{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:         "default",
-				Name:              name,
-				CreationTimestamp: createdAt,
-			},
-			Spec: gatewayv1.GatewaySpec{
-				GatewayClassName: defaultGatewayClassName,
-				Listeners: []gatewayv1.Listener{
-					{
-						Name:     "http",
-						Hostname: &hostname,
-						Port:     80,
-						Protocol: gatewayv1.HTTPProtocolType,
-					},
-				},
-			},
-			Status: gatewayv1.GatewayStatus{
-				Conditions: []metav1.Condition{
-					{
-						Type:   string(gatewayv1.GatewayConditionProgrammed),
-						Status: metav1.ConditionTrue,
-						Reason: "Programmed",
-					},
-				},
-				Listeners: []gatewayv1.ListenerStatus{
-					{
-						Name: "http",
-						Conditions: []metav1.Condition{
-							{
-								Type:   string(gatewayv1.ListenerConditionAccepted),
-								Status: metav1.ConditionTrue,
-								Reason: "Accepted",
-							},
-							{
-								Type:   string(gatewayv1.ListenerConditionProgrammed),
-								Status: metav1.ConditionTrue,
-								Reason: "Programmed",
-							},
-						},
-					},
-				},
-				Addresses: []gatewayv1.GatewayStatusAddress{
-					{
-						Type:  &ipAddrType,
-						Value: ip,
-					},
-				},
-			},
-		}
-	}
 
 	testCases := []struct {
 		name     string
 		gateways []*gatewayv1.Gateway
 	}{
 		{
-			name:     "older first in list order",
-			gateways: []*gatewayv1.Gateway{makeGateway("gw-older", olderTime, olderIP), makeGateway("gw-newer", newerTime, newerIP)},
+			name: "older first in list order",
+			gateways: []*gatewayv1.Gateway{
+				buildTestGateway("gw-older", "shared.local", olderIP, olderTime, true, true, true),
+				buildTestGateway("gw-newer", "shared.local", newerIP, newerTime, true, true, true),
+			},
 		},
 		{
-			name:     "newer first in list order",
-			gateways: []*gatewayv1.Gateway{makeGateway("gw-newer", newerTime, newerIP), makeGateway("gw-older", olderTime, olderIP)},
+			name: "newer first in list order",
+			gateways: []*gatewayv1.Gateway{
+				buildTestGateway("gw-newer", "shared.local", newerIP, newerTime, true, true, true),
+				buildTestGateway("gw-older", "shared.local", olderIP, olderTime, true, true, true),
+			},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-
-			rawConn, err := net.ListenPacket("udp4", ":0")
-			if err != nil {
-				t.Fatalf("failed to bind ephemeral socket: %v", err)
-			}
-			defer rawConn.Close()
-			ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
-
-			announcedChannel := make(chan []byte, 10)
-			publisher, errChan := startTestPublisher(t, ctx, mdns.PublisherOptions{
-				Interface:        "lo",
-				Port:             ephemeralPort,
-				IPv4Conn:         rawConn,
-				DisableIPv6:      true,
-				ProbeInterval:    10 * time.Millisecond,
-				ProbeCount:       1,
-				AnnounceInterval: 10 * time.Millisecond,
-				MulticastTap: func(raw []byte) {
-					var parser dnsmessage.Parser
-					if _, err := parser.Start(raw); err != nil {
-						return
-					}
-					if err := parser.SkipAllQuestions(); err != nil {
-						return
-					}
-					for {
-						header, err := parser.AnswerHeader()
-						if err != nil {
-							break
-						}
-						if strings.EqualFold(header.Name.String(), "shared.local.") && header.TTL > 0 {
-							announcedChannel <- raw
-						}
-						if err := parser.SkipAnswer(); err != nil {
-							break
-						}
-					}
-				},
-			})
+			ctx := t.Context()
+			publisher, announcedChan, _ := startTestPublisherWithTap(t, ctx)
 
 			testClient := fake.NewClientBuilder().
 				WithScheme(scheme).
@@ -630,11 +474,7 @@ func TestGatewayReconciler_DeterministicConflictResolutionBothOrders(t *testing.
 				t.Fatalf("Reconcile failed: %v", err)
 			}
 
-			select {
-			case <-announcedChannel:
-			case <-time.After(2 * time.Second):
-				t.Fatalf("timeout waiting for announcement")
-			}
+			waitForName(t, announcedChan, "shared.local")
 
 			record, ok := publisher.Responder().GetRecord("shared.local")
 			if !ok {
@@ -643,11 +483,6 @@ func TestGatewayReconciler_DeterministicConflictResolutionBothOrders(t *testing.
 			if len(record.A) == 0 || record.A[0].String() != olderIP {
 				t.Fatalf("expected deterministic winner to be older Gateway IP %s, got %+v", olderIP, record.A)
 			}
-
-			cancel()
-			if err := <-errChan; err != nil {
-				t.Errorf("publisher.Start returned unexpected error: %v", err)
-			}
 		})
 	}
 }
@@ -655,108 +490,14 @@ func TestGatewayReconciler_DeterministicConflictResolutionBothOrders(t *testing.
 // TestGatewayReconciler_IgnoresOtherGatewayClasses verifies that Gateways with a different
 // GatewayClassName are not published, using a tap wait rather than a fixed sleep.
 func TestGatewayReconciler_IgnoresOtherGatewayClasses(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
+	ctx := t.Context()
 	scheme := newTestScheme(t)
+	publisher, announcedChan, _ := startTestPublisherWithTap(t, ctx)
 
-	rawConn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		t.Fatalf("failed to bind ephemeral socket: %v", err)
-	}
-	defer rawConn.Close()
-	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
+	otherGateway := buildTestGateway("other-gw", "other.local", "192.168.1.50", time.Time{}, true, true, true)
+	otherGateway.Spec.GatewayClassName = "unrelated-class"
 
-	matchingAnnounced := make(chan []byte, 10)
-	otherAnnounced := make(chan []byte, 10)
-
-	publisher, errChan := startTestPublisher(t, ctx, mdns.PublisherOptions{
-		Interface:        "lo",
-		Port:             ephemeralPort,
-		IPv4Conn:         rawConn,
-		DisableIPv6:      true,
-		ProbeInterval:    10 * time.Millisecond,
-		ProbeCount:       1,
-		AnnounceInterval: 10 * time.Millisecond,
-		MulticastTap: func(raw []byte) {
-			var parser dnsmessage.Parser
-			if _, err := parser.Start(raw); err != nil {
-				return
-			}
-			if err := parser.SkipAllQuestions(); err != nil {
-				return
-			}
-			for {
-				header, err := parser.AnswerHeader()
-				if err != nil {
-					break
-				}
-				if strings.EqualFold(header.Name.String(), "matching.local.") {
-					matchingAnnounced <- raw
-				}
-				if strings.EqualFold(header.Name.String(), "other.local.") {
-					otherAnnounced <- raw
-				}
-				if err := parser.SkipAnswer(); err != nil {
-					break
-				}
-			}
-		},
-	})
-
-	ipAddrType := gatewayv1.IPAddressType
-	otherHostname := gatewayv1.Hostname("other.local")
-	matchingHostname := gatewayv1.Hostname("matching.local")
-
-	otherGateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "other-gateway"},
-		Spec: gatewayv1.GatewaySpec{
-			GatewayClassName: "unrelated-class",
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Hostname: &otherHostname, Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-			},
-		},
-		Status: gatewayv1.GatewayStatus{
-			Conditions: []metav1.Condition{
-				{Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed"},
-			},
-			Listeners: []gatewayv1.ListenerStatus{
-				{
-					Name: "http",
-					Conditions: []metav1.Condition{
-						{Type: string(gatewayv1.ListenerConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted"},
-						{Type: string(gatewayv1.ListenerConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed"},
-					},
-				},
-			},
-			Addresses: []gatewayv1.GatewayStatusAddress{{Type: &ipAddrType, Value: "192.168.1.50"}},
-		},
-	}
-
-	matchingGateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "matching-gateway"},
-		Spec: gatewayv1.GatewaySpec{
-			GatewayClassName: defaultGatewayClassName,
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Hostname: &matchingHostname, Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-			},
-		},
-		Status: gatewayv1.GatewayStatus{
-			Conditions: []metav1.Condition{
-				{Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed"},
-			},
-			Listeners: []gatewayv1.ListenerStatus{
-				{
-					Name: "http",
-					Conditions: []metav1.Condition{
-						{Type: string(gatewayv1.ListenerConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted"},
-						{Type: string(gatewayv1.ListenerConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed"},
-					},
-				},
-			},
-			Addresses: []gatewayv1.GatewayStatusAddress{{Type: &ipAddrType, Value: "192.168.1.100"}},
-		},
-	}
+	matchingGateway := buildTestGateway("matching-gw", "matching.local", "192.168.1.100", time.Time{}, true, true, true)
 
 	testClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -775,25 +516,10 @@ func TestGatewayReconciler_IgnoresOtherGatewayClasses(t *testing.T) {
 	}
 
 	// Wait on the tap for the matching Gateway to be announced, proving the batch has been processed
-	select {
-	case <-matchingAnnounced:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for matching.local on multicast tap")
-	}
-
-	select {
-	case raw := <-otherAnnounced:
-		t.Fatalf("unexpected packet observed on tap for other.local: %v", raw)
-	default:
-	}
+	waitForName(t, announcedChan, "matching.local")
 
 	if _, ok := publisher.Responder().GetRecord("other.local"); ok {
 		t.Fatalf("unrelated GatewayClass should not be published in responder")
-	}
-
-	cancel()
-	if err := <-errChan; err != nil {
-		t.Errorf("publisher.Start returned unexpected error: %v", err)
 	}
 }
 
@@ -801,83 +527,10 @@ func TestGatewayReconciler_IgnoresOtherGatewayClasses(t *testing.T) {
 // sends a goodbye packet for all published hostnames.
 func TestPublisher_ShutdownSendsGoodbye(t *testing.T) {
 	shutdownCtx, cancelShutdown := context.WithCancel(t.Context())
-
 	scheme := newTestScheme(t)
+	publisher, announcedChan, withdrawnChan := startTestPublisherWithTap(t, shutdownCtx)
 
-	rawConn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		t.Fatalf("failed to bind ephemeral socket: %v", err)
-	}
-	defer rawConn.Close()
-	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
-
-	announcedChannel := make(chan []byte, 10)
-	goodbyeChannel := make(chan []byte, 10)
-
-	publisher, errChan := startTestPublisher(t, shutdownCtx, mdns.PublisherOptions{
-		Interface:        "lo",
-		Port:             ephemeralPort,
-		IPv4Conn:         rawConn,
-		DisableIPv6:      true,
-		ProbeInterval:    10 * time.Millisecond,
-		ProbeCount:       1,
-		AnnounceInterval: 10 * time.Millisecond,
-		MulticastTap: func(raw []byte) {
-			var parser dnsmessage.Parser
-			if _, err := parser.Start(raw); err != nil {
-				return
-			}
-			if err := parser.SkipAllQuestions(); err != nil {
-				return
-			}
-			for {
-				header, err := parser.AnswerHeader()
-				if err != nil {
-					break
-				}
-				if strings.EqualFold(header.Name.String(), "shutdown.local.") {
-					if header.TTL == 0 {
-						goodbyeChannel <- raw
-					} else {
-						announcedChannel <- raw
-					}
-				}
-				if err := parser.SkipAnswer(); err != nil {
-					break
-				}
-			}
-		},
-	})
-
-	hostname := gatewayv1.Hostname("shutdown.local")
-	ipAddrType := gatewayv1.IPAddressType
-	targetIP := "192.168.1.100"
-
-	gateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-shutdown"},
-		Spec: gatewayv1.GatewaySpec{
-			GatewayClassName: defaultGatewayClassName,
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Hostname: &hostname, Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-			},
-		},
-		Status: gatewayv1.GatewayStatus{
-			Conditions: []metav1.Condition{
-				{Type: string(gatewayv1.GatewayConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed"},
-			},
-			Listeners: []gatewayv1.ListenerStatus{
-				{
-					Name: "http",
-					Conditions: []metav1.Condition{
-						{Type: string(gatewayv1.ListenerConditionAccepted), Status: metav1.ConditionTrue, Reason: "Accepted"},
-						{Type: string(gatewayv1.ListenerConditionProgrammed), Status: metav1.ConditionTrue, Reason: "Programmed"},
-					},
-				},
-			},
-			Addresses: []gatewayv1.GatewayStatusAddress{{Type: &ipAddrType, Value: targetIP}},
-		},
-	}
-
+	gateway := buildTestGateway("gw-shutdown", "shutdown.local", "192.168.1.100", time.Time{}, true, true, true)
 	testClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(gateway).
@@ -894,11 +547,7 @@ func TestPublisher_ShutdownSendsGoodbye(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	select {
-	case <-announcedChannel:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for announcement")
-	}
+	waitForName(t, announcedChan, "shutdown.local")
 
 	if _, ok := publisher.Responder().GetRecord("shutdown.local"); !ok {
 		t.Fatalf("expected record to be published before shutdown")
@@ -907,29 +556,7 @@ func TestPublisher_ShutdownSendsGoodbye(t *testing.T) {
 	// Cancel context to simulate manager stopping the publisher
 	cancelShutdown()
 
-	select {
-	case raw := <-goodbyeChannel:
-		var parser dnsmessage.Parser
-		if _, err := parser.Start(raw); err != nil {
-			t.Fatalf("parser.Start failed: %v", err)
-		}
-		if err := parser.SkipAllQuestions(); err != nil {
-			t.Fatalf("parser.SkipAllQuestions failed: %v", err)
-		}
-		header, err := parser.AnswerHeader()
-		if err != nil {
-			t.Fatalf("parser.AnswerHeader failed: %v", err)
-		}
-		if header.TTL != 0 {
-			t.Fatalf("expected TTL 0 in shutdown goodbye, got %+v", header)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for goodbye packet on shutdown")
-	}
-
-	if err := <-errChan; err != nil {
-		t.Errorf("publisher.Start returned unexpected error: %v", err)
-	}
+	waitForName(t, withdrawnChan, "shutdown.local")
 }
 
 // TestDNSManifest_RBACAndHostNetworking verifies acceptance criteria:
