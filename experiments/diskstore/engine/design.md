@@ -442,7 +442,7 @@ Under the new rule, every site that frees blocks behaves as follows:
 ### Eliminated State and Concurrency
 
 Deferred frees eliminate multi-stage location tracking and flusher wait loops from `PageDesc`:
-- **Descriptor fields:** `FlushedBeforeSync` is removed. `DurableLoc` and `FlushedLoc` collapse into a single disk location field tracking the page's current on-disk position.
+- **Descriptor fields:** `FlushedBeforeSync` is removed. `DurableLoc` and `FlushedLoc` collapse into a single disk location field tracking the page's current on-disk position. `RedoLSN` replaces `DirtyLSN` and tracks un-synced modifications across flushes until a heap fsync completes.
 - **Flusher concurrency:** Flushers never wait for a heap fsync. Eviction and idle sweeps proceed concurrently with fsyncs without stalling, because any block superseded during an fsync enters `current` rather than being freed prematurely. Flushers synchronize only on the direct I/O staging buffer and file write lock.
 
 ### Trade-offs and Failure Modes
@@ -455,7 +455,11 @@ The design trades disk space headroom for operational simplicity:
 
 ### Checkpoint and FaultFS Interaction
 
-- **Checkpoint and redo start LSN:** Once `DurableLoc` and `FlushedLoc` collapse into a single disk location, the dirty page table tracks all pages with un-synced modifications by retaining their `Dirty` flag (and earliest un-synced LSN) until a heap fsync completes, rather than clearing it upon direct I/O completion. When a checkpoint runs, `redoStartLSN` captures the earliest un-synced LSN across all dirty pages. For a page whose flush completes during the checkpoint's fsync, its superseded location enters `current` and is not freed. Its modifications occurred either before the checkpoint snapshot (bounding `redoStartLSN`) or after it (receiving LSNs above `redoStartLSN`). Because the checkpoint truncates only WAL segments strictly prior to `redoStartLSN`, the WAL retains all records needed to replay that page's modifications if a crash occurs before the next fsync makes the new copy durable.
+- **Checkpoint and redo start LSN:** The engine separates whether an in-memory copy still has to be written from the earliest LSN whose effect on the page is not yet durable on disk:
+  - `Dirty` (bool) on `PageDesc` indicates that the in-memory copy has unwritten modifications. It is set when a page is modified in memory and clears as soon as direct I/O flush completes, allowing eviction to reclaim pool blocks by LRU immediately without waiting for an fsync. If `Dirty` remained set until an fsync, a pool full of flushed pages could not evict without an fsync, reintroducing the stall this design removes.
+  - `RedoLSN` (uint64) on `PageDesc` records the earliest LSN whose effect on the page is not yet confirmed durable by a completed heap fsync. It is set to the mutating operation's LSN when a page without un-synced modifications (`RedoLSN == 0`) is dirtied. When direct I/O completes, `Dirty` clears, but `RedoLSN` remains set. If the page is modified again in memory before an fsync occurs, `Dirty` becomes true again while `RedoLSN` continues to hold the earlier LSN across subsequent flushes.
+  - `RedoLSN` clears at sync boundaries using the same two-generation rotation as the pending free list. When a flush completes, the page is recorded in `current`. At fsync start, `current` rotates to `prior`. When the fsync completes, the engine clears `RedoLSN` (to zero) for pages in `prior` that received no newer modifications, or resets `RedoLSN` to the earliest LSN of those newer modifications if they arrived while the fsync ran.
+  - When a checkpoint runs, `redoStartLSN` is computed from the minimum `RedoLSN` across all pages with `RedoLSN > 0`. Consider a page that was dirty at the checkpoint's snapshot with `RedoLSN` equal to `L1`, whose flush completes during the checkpoint's fsync. Because `L1` was captured in the snapshot, the checkpoint's `redoStartLSN` is at or below `L1`. Because the flush returned during the fsync (after generation rotation), the write is in `current`, so its superseded block remains held and this fsync does not clear its `RedoLSN`. The checkpoint appends its record to the WAL and truncates WAL segments strictly prior to `redoStartLSN`. Because `redoStartLSN` is at or below `L1`, all log records from `L1` onward remain in the WAL. If a crash occurs before the next fsync, recovery finds either the valid new copy on disk or the older durable copy (which was never freed), and replays WAL records from `redoStartLSN` forward to reconstruct the page.
 - **Fault filesystem reuse check:** `FaultFS` updates its durable page set during `heapFile.Sync()`. Under deferred frees, pending blocks are released to the allocator only after `Sync()` finishes. Any subsequent write to a reallocated block occurs after `FaultFS` has updated its durable set, satisfying the reuse rule assertion without timing dependencies or special cases.
 
 ### Maintainer Choices
@@ -475,12 +479,14 @@ The design trades disk space headroom for operational simplicity:
 
 ### Implementation Steps
 
-Migrate the engine in three small, testable steps:
+Migrate the engine in four small, testable steps:
 1. **Add pending lists:** Introduce the `prior` and `current` pending slices to the block pool, with rotation at sync start, batch freeing on sync completion, and no release on sync error. Leave the lists unused by free sites.
    - *Verification:* All existing unit tests in `blockpool_test.go` and `engine_test.go` pass.
 2. **Redirect free sites:** Route superseded flush locations to append to `current` upon write completion, carry forward prior locations on `AllocateNewPage` until the replacement flush completes, append deleted page locations to `current` when the empty page flush completes, and keep failed flushes freeing immediately.
    - *Verification:* The non-sweep torture configurations (`pool_9_clean_nosweep` through `pool_24_clean_nosweep`, `pool_16_crash_drop`, and `pool_32_val2_alt_crash_clean`) pass.
-3. **Remove legacy fields and flusher wait:** Remove `FlushedBeforeSync`, collapse `DurableLoc` and `FlushedLoc` into a single disk location in `PageDesc`, retain `Dirty` until fsync completion, and remove `bp.syncing` and flusher wait loops. Step 3 moves the deferred freeing text across to replace the three-stage lifecycle and flusher-skipping description in Invariant 2.
+3. **Track durability LSN separately from dirty state:** Introduce `RedoLSN` in `PageDesc`, keep `Dirty` clearing immediately upon flush completion to enable pool block eviction without fsync, and advance or clear `RedoLSN` across sync boundaries using generation rotation. Snapshot dirty page tables using `RedoLSN`.
+   - *Verification:* Checkpoint unit tests pass, and eviction continues to reclaim clean pool blocks without stalling behind heap fsyncs.
+4. **Remove legacy fields and flusher wait:** Remove `FlushedBeforeSync`, collapse `DurableLoc` and `FlushedLoc` into a single disk location in `PageDesc`, and remove `bp.syncing` and flusher wait loops. Step 4 moves the deferred freeing text across to replace the three-stage lifecycle and flusher-skipping description in Invariant 2.
    - *Verification:* The previously skipped concurrent sweep configurations (`pool_9_clean_sweep`, `pool_12_clean_sweep`, `pool_16_clean_sweep`, and `pool_24_clean_sweep`) in `TestTortureMatrix` pass for all seeds; remove their skips.
 
 ## File-Backed Values: ByteString
