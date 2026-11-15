@@ -283,3 +283,220 @@ func TestProber_WithdrawSendsGoodbye(t *testing.T) {
 		t.Fatalf("withdrawn name should not exist in prober")
 	}
 }
+
+func TestResponder_PreviousAddressAnnouncementNotConflict(t *testing.T) {
+	rawConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to bind ephemeral socket: %v", err)
+	}
+	defer rawConn.Close()
+	port := rawConn.LocalAddr().(*net.UDPAddr).Port
+
+	responder, err := NewResponder(ResponderOptions{
+		Port:        port,
+		IPv4Conn:    rawConn,
+		DisableIPv6: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create responder: %v", err)
+	}
+	defer responder.Close()
+
+	conflictCh := make(chan dnsmessage.Resource, 2)
+	responder.SetConflictHandler(func(fqdn string, conflictingRR dnsmessage.Resource) {
+		conflictCh <- conflictingRR
+	})
+
+	// 1. Initial publish: 192.168.1.100
+	responder.SetRecord(&RecordSet{
+		FQDN: "example.local.",
+		A:    []net.IP{net.ParseIP("192.168.1.100")},
+		TTL:  60,
+	})
+
+	// 2. Update address: 192.168.1.200
+	responder.SetRecord(&RecordSet{
+		FQDN: "example.local.",
+		A:    []net.IP{net.ParseIP("192.168.1.200")},
+		TTL:  60,
+	})
+
+	sender, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to create sender socket: %v", err)
+	}
+	defer sender.Close()
+	destination := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
+
+	buildResponsePacket := func(ip [4]byte) []byte {
+		builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+			Response:      true,
+			Authoritative: true,
+		})
+		builder.EnableCompression()
+		if err := builder.StartAnswers(); err != nil {
+			t.Fatalf("builder.StartAnswers: %v", err)
+		}
+		if err := builder.AResource(
+			dnsmessage.ResourceHeader{
+				Name:  dnsmessage.MustNewName("example.local."),
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | CacheFlushBit),
+				TTL:   60,
+			},
+			dnsmessage.AResource{A: ip},
+		); err != nil {
+			t.Fatalf("builder.AResource: %v", err)
+		}
+		data, err := builder.Finish()
+		if err != nil {
+			t.Fatalf("builder.Finish: %v", err)
+		}
+		return data
+	}
+
+	// 3. Send the old-address packet (192.168.1.100), then a foreign conflicting address (192.168.1.50).
+	// Under RFC 6762 section 9, the old address announcement must not be treated as a conflict.
+	oldData := buildResponsePacket([4]byte{192, 168, 1, 100})
+	if _, err := sender.WriteTo(oldData, destination); err != nil {
+		t.Fatalf("failed to send old announcement packet: %v", err)
+	}
+
+	foreignData := buildResponsePacket([4]byte{192, 168, 1, 50})
+	if _, err := sender.WriteTo(foreignData, destination); err != nil {
+		t.Fatalf("failed to send foreign conflict packet: %v", err)
+	}
+
+	// 4. Assert that the one conflict reported carries the foreign address without waiting on silence.
+	select {
+	case conflictingRR := <-conflictCh:
+		aResource, ok := conflictingRR.Body.(*dnsmessage.AResource)
+		if !ok {
+			t.Fatalf("expected AResource in conflict, got %+v", conflictingRR.Body)
+		}
+		expectedForeignIP := [4]byte{192, 168, 1, 50}
+		if aResource.A != expectedForeignIP {
+			t.Fatalf("expected conflict for foreign IP %v, got %v", expectedForeignIP, aResource.A)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("expected conflict to be detected for foreign address, but none reported")
+	}
+
+	select {
+	case extra := <-conflictCh:
+		t.Fatalf("unexpected additional conflict reported: %+v", extra)
+	default:
+	}
+}
+
+func TestProber_RepeatAnnouncementUsesUpdatedRecords(t *testing.T) {
+	rawConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to bind ephemeral socket: %v", err)
+	}
+	defer rawConn.Close()
+	port := rawConn.LocalAddr().(*net.UDPAddr).Port
+
+	announcementsCh := make(chan net.IP, 10)
+	responder, err := NewResponder(ResponderOptions{
+		Port:        port,
+		IPv4Conn:    rawConn,
+		DisableIPv6: true,
+		MulticastTap: func(raw []byte) {
+			var parser dnsmessage.Parser
+			if _, err := parser.Start(raw); err != nil {
+				return
+			}
+			if err := parser.SkipAllQuestions(); err != nil {
+				return
+			}
+			for {
+				ans, err := parser.Answer()
+				if err != nil {
+					break
+				}
+				if strings.EqualFold(ans.Header.Name.String(), "repeat.local.") && ans.Header.TTL > 0 {
+					if a, ok := ans.Body.(*dnsmessage.AResource); ok {
+						announcementsCh <- net.IP(a.A[:])
+					}
+				}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create responder: %v", err)
+	}
+	defer responder.Close()
+
+	publishedCh := make(chan struct{}, 1)
+	prober, err := NewProber(ProberOptions{
+		Responder:        responder,
+		TTL:              60,
+		ProbeInterval:    20 * time.Millisecond,
+		ProbeCount:       2,
+		AnnounceInterval: 80 * time.Millisecond,
+		OnStateChange: func(fqdn string, state HostnameState) {
+			if state == StatePublished {
+				select {
+				case publishedCh <- struct{}{}:
+				default:
+				}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create prober: %v", err)
+	}
+	defer func() {
+		if err := prober.Shutdown(); err != nil && !isNormalClose(err) {
+			t.Errorf("prober.Shutdown: %v", err)
+		}
+	}()
+
+	initialIP := net.ParseIP("127.0.0.1")
+	prober.SetNames(map[string][]net.IP{
+		"repeat.local": {initialIP},
+	})
+
+	select {
+	case <-publishedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for initial publish")
+	}
+
+	// Drain initial announcement
+	select {
+	case ip := <-announcementsCh:
+		if !ip.Equal(initialIP) {
+			t.Fatalf("expected initial announcement %v, got %v", initialIP, ip)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for initial announcement")
+	}
+
+	// Update address before repeat announcement fires
+	newIP := net.ParseIP("127.0.0.2")
+	prober.SetNames(map[string][]net.IP{
+		"repeat.local": {newIP},
+	})
+
+	// Address update triggers an announcement for newIP
+	select {
+	case ip := <-announcementsCh:
+		if !ip.Equal(newIP) {
+			t.Fatalf("expected re-announcement %v, got %v", newIP, ip)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for update announcement")
+	}
+
+	// Wait for the repeat announcement timer to fire (AnnounceInterval = 80ms)
+	select {
+	case ip := <-announcementsCh:
+		if !ip.Equal(newIP) {
+			t.Fatalf("expected repeat announcement to use updated IP %v, got stale IP %v", newIP, ip)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for repeat announcement")
+	}
+}

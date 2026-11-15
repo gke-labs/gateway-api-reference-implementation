@@ -54,6 +54,12 @@ const (
 
 	// QUBit is the unicast-response bit in question classes (RFC 6762 §5.4).
 	QUBit = CacheFlushBit
+
+	// PreviousAddressGracePeriod is the duration after an address update during which
+	// looped-back announcements containing the previous addresses are ignored rather
+	// than treated as LAN conflicts. Two seconds covers the announcements the prober
+	// sends before the update, which loop back within about one announce interval.
+	PreviousAddressGracePeriod = 2 * time.Second
 )
 
 // RecordSet represents the set of addresses published for an mDNS hostname.
@@ -69,6 +75,21 @@ type RecordSet struct {
 
 	// TTL is the record TTL in seconds (defaults to DefaultTTL if zero).
 	TTL uint32
+
+	// previousA holds the IPv4 addresses replaced by SetRecord when updating an existing record.
+	// SetRecord sets this only when replacing an existing record; a record is not changed
+	// after SetRecord stores it, which is why handleResponse can read it after releasing the lock.
+	previousA []net.IP
+
+	// previousAAAA holds the IPv6 addresses replaced by SetRecord when updating an existing record.
+	// SetRecord sets this only when replacing an existing record; a record is not changed
+	// after SetRecord stores it, which is why handleResponse can read it after releasing the lock.
+	previousAAAA []net.IP
+
+	// updatedAt is the timestamp when SetRecord replaced an existing record.
+	// SetRecord sets this only when replacing an existing record; a record is not changed
+	// after SetRecord stores it, which is why handleResponse can read it after releasing the lock.
+	updatedAt time.Time
 }
 
 // ConflictHandler is a callback invoked when a conflicting mDNS response or higher-priority probe is detected.
@@ -328,12 +349,18 @@ func (r *Responder) SetRecord(rs *RecordSet) {
 	fqdn := strings.ToLower(ToFQDN(rs.FQDN))
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.records[fqdn] = &RecordSet{
+	newRec := &RecordSet{
 		FQDN: fqdn,
 		A:    append([]net.IP(nil), rs.A...),
 		AAAA: append([]net.IP(nil), rs.AAAA...),
 		TTL:  rs.TTL,
 	}
+	if existing, found := r.records[fqdn]; found {
+		newRec.previousA = append([]net.IP(nil), existing.A...)
+		newRec.previousAAAA = append([]net.IP(nil), existing.AAAA...)
+		newRec.updatedAt = time.Now()
+	}
+	r.records[fqdn] = newRec
 }
 
 // RemoveRecord removes a published RecordSet by hostname.
@@ -511,6 +538,16 @@ func (r *Responder) handleResponse(p *dnsmessage.Parser, _ dnsmessage.Header) {
 			if err != nil {
 				klog.Warningf("failed to build records for %s: %v", pubRec.FQDN, err)
 				continue
+			}
+			// Under RFC 6762 section 9, a host updating record data should not treat its own
+			// recently sent announcements containing older addresses as external conflicts.
+			if (len(pubRec.previousA) > 0 || len(pubRec.previousAAAA) > 0) && time.Since(pubRec.updatedAt) < PreviousAddressGracePeriod {
+				oldRecords, err := BuildRecords(pubRec.FQDN, append(append([]net.IP(nil), pubRec.previousA...), pubRec.previousAAAA...), pubRec.TTL)
+				if err != nil {
+					klog.Warningf("failed to build previous records for %s: %v", pubRec.FQDN, err)
+					continue
+				}
+				proposed = append(proposed, oldRecords...)
 			}
 			if isConflictingRecord(rr, proposed) {
 				handler(name, rr)
