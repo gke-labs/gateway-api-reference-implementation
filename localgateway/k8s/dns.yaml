@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: localgateway-dns
+  namespace: default
+---
+# Role allowing localgateway-dns to read only its DNS data plane configuration Secret (localgateway-dns).
+# The program reads this single Secret object and nothing else.
+# The Role, RoleBinding, and controller share one namespace (default).
+# If installed into another namespace, update metadata.namespace on the ServiceAccount, Role, RoleBinding,
+# and Deployment, subjects[0].namespace on the RoleBinding, and the --secret-namespace flag on the container.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: localgateway-dns
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["localgateway-dns"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: localgateway-dns
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: localgateway-dns
+subjects:
+- kind: ServiceAccount
+  name: localgateway-dns
+  namespace: default
+---
+# localgateway-dns is deployed as a single-replica Deployment (replicas: 1) with strategy: Recreate.
+# Only one announcer runs across the cluster to avoid duplicate mDNS probes, duplicate announcements,
+# and intra-cluster conflict detection on the LAN for the same .local hostnames.
+# The Recreate strategy ensures the previous announcer pod shuts down and releases host port 5353
+# before a replacement starts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localgateway-dns
+  namespace: default
+  labels:
+    app: localgateway-dns
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: localgateway-dns
+  template:
+    metadata:
+      labels:
+        app: localgateway-dns
+    spec:
+      serviceAccountName: localgateway-dns
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+      - name: dns
+        image: localgateway-dns:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - --secret-namespace=default
+        ports:
+        - name: mdns
+          containerPort: 5353
+          protocol: UDP
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
