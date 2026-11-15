@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -2126,5 +2127,340 @@ func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 	valueFinal, exists, err := store2.Get(table, finalKey)
 	if err != nil || !exists || !bytes.Equal(valueFinal, finalPayload) {
 		t.Fatalf("finalKey mismatch: exists=%v, len=%d, err=%v", exists, len(valueFinal), err)
+	}
+}
+
+func TestRecovery_DamagedHeapBlockAfterCleanClose(t *testing.T) {
+	t.Run("Unencrypted", func(t *testing.T) {
+		testRecovery_DamagedHeapBlockAfterCleanClose(t, nil)
+	})
+	t.Run("Encrypted", func(t *testing.T) {
+		var key [32]byte
+		copy(key[:], []byte("damaged-block-test-key-32bytes-0"))
+		testRecovery_DamagedHeapBlockAfterCleanClose(t, key[:])
+	})
+}
+
+func testRecovery_DamagedHeapBlockAfterCleanClose(t *testing.T, key []byte) {
+	memFS := NewMemFS()
+	dir := "test_damaged_heap_block_clean_close"
+
+	openOptions := func() []Option {
+		options := []Option{WithFS(memFS), WithDir(dir)}
+		if len(key) > 0 {
+			options = append(options, WithEncryptionKey(key))
+		}
+		return options
+	}
+
+	store, err := Open(append(openOptions(), WithCreate())...)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if err := store.Put("ConfigMap", "key1", []byte("val1")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Put("ConfigMap", "key2", []byte("val2")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Change one byte in block 0 of heap.db
+	heapPath := filepath.Join(dir, "heap.db")
+	heapFile, err := memFS.OpenFile(heapPath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db failed: %v", err)
+	}
+	var singleByte [1]byte
+	if _, err := heapFile.ReadAt(singleByte[:], 100); err != nil {
+		t.Fatalf("ReadAt heap.db failed: %v", err)
+	}
+	singleByte[0] ^= 0xff
+	if _, err := heapFile.WriteAt(singleByte[:], 100); err != nil {
+		t.Fatalf("WriteAt heap.db failed: %v", err)
+	}
+	if err := heapFile.Close(); err != nil {
+		t.Fatalf("Close heap.db failed: %v", err)
+	}
+
+	// Reopen must fail and return an error naming damaged heap block 0
+	store2, err := Open(openOptions()...)
+	if err == nil {
+		if closeErr := store2.Close(); closeErr != nil {
+			t.Fatalf("Close failed: %v", closeErr)
+		}
+		t.Fatalf("expected Open to return error on damaged heap block, but succeeded")
+	}
+	if !errors.Is(err, ErrDamagedBlock) {
+		t.Fatalf("expected ErrDamagedBlock, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "damaged heap block 0") {
+		t.Fatalf("expected error to name damaged heap block 0, got %v", err)
+	}
+}
+
+func TestRecovery_DamagedMultiBlockAfterCleanClose(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_damaged_multi_block_clean_close"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// Write multi-block object (~10 KB -> spans 4 blocks: 0, 1, 2, 3)
+	largePayload := bytes.Repeat([]byte("multi-block-payload-"), 500)
+	if err := store.Put("ConfigMap", "large-key", largePayload); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Change one byte in block 2 of heap.db (offset 2 * 4096 + 100)
+	heapPath := filepath.Join(dir, "heap.db")
+	heapFile, err := memFS.OpenFile(heapPath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db failed: %v", err)
+	}
+	var singleByte [1]byte
+	corruptOffset := int64(2*BlockSize + 100)
+	if _, err := heapFile.ReadAt(singleByte[:], corruptOffset); err != nil {
+		t.Fatalf("ReadAt heap.db failed: %v", err)
+	}
+	singleByte[0] ^= 0xff
+	if _, err := heapFile.WriteAt(singleByte[:], corruptOffset); err != nil {
+		t.Fatalf("WriteAt heap.db failed: %v", err)
+	}
+	if err := heapFile.Close(); err != nil {
+		t.Fatalf("Close heap.db failed: %v", err)
+	}
+
+	// Reopen must fail and return an error naming damaged heap block 2
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err == nil {
+		if closeErr := store2.Close(); closeErr != nil {
+			t.Fatalf("Close failed: %v", closeErr)
+		}
+		t.Fatalf("expected Open to return error on damaged multi-block, but succeeded")
+	}
+	if !errors.Is(err, ErrDamagedBlock) {
+		t.Fatalf("expected ErrDamagedBlock, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "damaged heap block 2") {
+		t.Fatalf("expected error to name damaged heap block 2, got %v", err)
+	}
+}
+
+// TestRecovery_DamagedHeapBlockRepeatedOpenReturnsError verifies that when a heap block is damaged
+// after a clean close, repeated Open calls return ErrDamagedBlock each time and leave the heap file untouched.
+func TestRecovery_DamagedHeapBlockRepeatedOpenReturnsError(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_damaged_heap_block_repeated_open"
+
+	openOptions := func() []Option {
+		return []Option{WithFS(memFS), WithDir(dir)}
+	}
+
+	store, err := Open(append(openOptions(), WithCreate())...)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if err := store.Put("ConfigMap", "key1", []byte("val1")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Change one byte in block 0 of heap.db
+	heapPath := filepath.Join(dir, "heap.db")
+	heapFile, err := memFS.OpenFile(heapPath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db failed: %v", err)
+	}
+	var singleByte [1]byte
+	if _, err := heapFile.ReadAt(singleByte[:], 100); err != nil {
+		t.Fatalf("ReadAt heap.db failed: %v", err)
+	}
+	singleByte[0] ^= 0xff
+	if _, err := heapFile.WriteAt(singleByte[:], 100); err != nil {
+		t.Fatalf("WriteAt heap.db failed: %v", err)
+	}
+	if err := heapFile.Close(); err != nil {
+		t.Fatalf("Close heap.db failed: %v", err)
+	}
+
+	// Snapshot heap file contents after damage
+	heapFileAfterDamage, err := memFS.OpenFile(heapPath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db for snapshot failed: %v", err)
+	}
+	heapSize, err := heapFileAfterDamage.Size()
+	if err != nil {
+		t.Fatalf("Size heap.db failed: %v", err)
+	}
+	damagedHeapSnapshot := make([]byte, heapSize)
+	if _, err := heapFileAfterDamage.ReadAt(damagedHeapSnapshot, 0); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt heap.db failed: %v", err)
+	}
+	if err := heapFileAfterDamage.Close(); err != nil {
+		t.Fatalf("Close heapFileAfterDamage failed: %v", err)
+	}
+
+	// First Open attempt must return ErrDamagedBlock
+	store1, err := Open(openOptions()...)
+	if err == nil {
+		if closeErr := store1.Close(); closeErr != nil {
+			t.Fatalf("Close failed: %v", closeErr)
+		}
+		t.Fatalf("first Open: expected error on damaged heap block, but succeeded")
+	}
+	if !errors.Is(err, ErrDamagedBlock) {
+		t.Fatalf("first Open: expected ErrDamagedBlock, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "damaged heap block 0") {
+		t.Fatalf("first Open: expected error to name damaged heap block 0, got %v", err)
+	}
+
+	// Verify heap file is untouched after first failed Open
+	heapFileCheck1, err := memFS.OpenFile(heapPath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db check 1 failed: %v", err)
+	}
+	heapBytesCheck1 := make([]byte, heapSize)
+	if _, err := heapFileCheck1.ReadAt(heapBytesCheck1, 0); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt heap.db check 1 failed: %v", err)
+	}
+	if err := heapFileCheck1.Close(); err != nil {
+		t.Fatalf("Close heapFileCheck1 failed: %v", err)
+	}
+	if !bytes.Equal(heapBytesCheck1, damagedHeapSnapshot) {
+		t.Fatalf("heap file was modified after first failed Open")
+	}
+
+	// Second Open attempt must also return ErrDamagedBlock and leave heap file untouched
+	store2, err := Open(openOptions()...)
+	if err == nil {
+		if closeErr := store2.Close(); closeErr != nil {
+			t.Fatalf("Close failed: %v", closeErr)
+		}
+		t.Fatalf("second Open: expected error on damaged heap block, but succeeded")
+	}
+	if !errors.Is(err, ErrDamagedBlock) {
+		t.Fatalf("second Open: expected ErrDamagedBlock, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "damaged heap block 0") {
+		t.Fatalf("second Open: expected error to name damaged heap block 0, got %v", err)
+	}
+
+	// Verify heap file is still untouched after second failed Open
+	heapFileCheck2, err := memFS.OpenFile(heapPath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db check 2 failed: %v", err)
+	}
+	heapBytesCheck2 := make([]byte, heapSize)
+	if _, err := heapFileCheck2.ReadAt(heapBytesCheck2, 0); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt heap.db check 2 failed: %v", err)
+	}
+	if err := heapFileCheck2.Close(); err != nil {
+		t.Fatalf("Close heapFileCheck2 failed: %v", err)
+	}
+	if !bytes.Equal(heapBytesCheck2, damagedHeapSnapshot) {
+		t.Fatalf("heap file was modified after second failed Open")
+	}
+}
+
+// TestRecovery_CrashTornBlockReopenCleanCloseReopen verifies that after a crash with torn blocks,
+// reopening rebuilds the state from the WAL and zeroes the torn blocks so that a subsequent
+// clean close and reopen succeeds with every key readable.
+func TestRecovery_CrashTornBlockReopenCleanCloseReopen(t *testing.T) {
+	for iteration := 0; iteration < 20; iteration++ {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := fmt.Sprintf("test_crash_torn_clean_close_%d", iteration)
+
+		store, err := Open(WithFS(faultFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("iteration %d: Open failed: %v", iteration, err)
+		}
+
+		if err := store.Put("ConfigMap", "key1", []byte("val1-initial")); err != nil {
+			t.Fatalf("iteration %d: Put key1 failed: %v", iteration, err)
+		}
+		if err := store.Put("ConfigMap", "key2", []byte("val2-initial")); err != nil {
+			t.Fatalf("iteration %d: Put key2 failed: %v", iteration, err)
+		}
+		if _, err := store.Checkpoint(); err != nil {
+			t.Fatalf("iteration %d: Checkpoint failed: %v", iteration, err)
+		}
+
+		// Write uncheckpointed keys before crash
+		if err := store.Put("ConfigMap", "key3", []byte("val3-uncheckpointed")); err != nil {
+			t.Fatalf("iteration %d: Put key3 failed: %v", iteration, err)
+		}
+		if err := store.Sync(); err != nil {
+			t.Fatalf("iteration %d: Sync failed: %v", iteration, err)
+		}
+
+		// Simulate crash with tearing of un-fsynced writes
+		if err := faultFS.Crash(false, 0.5); err != nil {
+			t.Fatalf("iteration %d: Crash failed: %v", iteration, err)
+		}
+
+		// Reopen 1: crash recovery rebuilds torn blocks from WAL and zeroes torn blocks
+		faultFS2 := NewFaultFS(memFS)
+		store2, err := Open(WithFS(faultFS2), WithDir(dir), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("iteration %d: Reopen 1 failed: %v", iteration, err)
+		}
+
+		expected := map[string]string{
+			"key1": "val1-initial",
+			"key2": "val2-initial",
+			"key3": "val3-uncheckpointed",
+		}
+		for key, expectedValue := range expected {
+			value, exists, err := store2.Get("ConfigMap", key)
+			if err != nil || !exists || string(value) != expectedValue {
+				t.Fatalf("iteration %d: Reopen 1 Get(%s) mismatch: exists=%v, value=%q, err=%v", iteration, key, exists, string(value), err)
+			}
+		}
+
+		// Clean close
+		if err := store2.Close(); err != nil {
+			t.Fatalf("iteration %d: Clean close failed: %v", iteration, err)
+		}
+
+		// Reopen 2: clean close recovery must succeed with every key readable without reporting old torn blocks as damage
+		faultFS3 := NewFaultFS(memFS)
+		store3, err := Open(WithFS(faultFS3), WithDir(dir), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("iteration %d: Reopen 2 after clean close failed: %v", iteration, err)
+		}
+
+		for key, expectedValue := range expected {
+			value, exists, err := store3.Get("ConfigMap", key)
+			if err != nil || !exists || string(value) != expectedValue {
+				t.Fatalf("iteration %d: Reopen 2 Get(%s) mismatch: exists=%v, value=%q, err=%v", iteration, key, exists, string(value), err)
+			}
+		}
+
+		if err := store3.Close(); err != nil {
+			t.Fatalf("iteration %d: Close store3 failed: %v", iteration, err)
+		}
 	}
 }

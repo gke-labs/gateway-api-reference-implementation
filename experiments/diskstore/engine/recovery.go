@@ -25,6 +25,20 @@ import (
 	"golang.org/x/crypto/xts"
 )
 
+// ErrDamagedBlock is returned by Open after a clean close when a written block fails its check.
+var ErrDamagedBlock = errors.New("damaged heap block")
+
+// isZeroBlock reports whether every byte in blockBuffer is zero, identifying never-written
+// blocks without treating them as torn or damaged.
+func isZeroBlock(blockBuffer []byte) bool {
+	for _, byteValue := range blockBuffer {
+		if byteValue != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // KeyIndexEntry maps an object key to its location in a logical page.
 type KeyIndexEntry struct {
 	LogicalPage      uint64
@@ -112,8 +126,11 @@ func (r *chunkBlockReader) ReadBlock(b uint64) ([]byte, error) {
 		chunkStartBlock := uint64(r.chunkStart / BlockSize)
 		numBlocksInChunk := int(r.chunkLen / BlockSize)
 		for i := 0; i < numBlocksInChunk; i++ {
-			block := r.chunkBuf[i*BlockSize : (i+1)*BlockSize]
-			decryptHeapBlock(block, block, chunkStartBlock+uint64(i), r.heapCipher)
+			blockData := r.chunkBuf[i*BlockSize : (i+1)*BlockSize]
+			if isZeroBlock(blockData) {
+				continue
+			}
+			decryptHeapBlock(blockData, blockData, chunkStartBlock+uint64(i), r.heapCipher)
 		}
 	}
 
@@ -127,6 +144,10 @@ type RecoveryOptions struct {
 	// HeapCipher is the AES-256-XTS cipher used for decrypting heap blocks during recovery.
 	// A nil cipher means the store is not encrypted.
 	HeapCipher *xts.Cipher
+	// ClosedCleanly indicates whether the store was shut down cleanly. When set, any non-zero
+	// block that fails checksum or header validation is reported as ErrDamagedBlock rather
+	// than treated as a torn write from a crash.
+	ClosedCleanly bool
 }
 
 // Recover scans the heap file, filters out foreign and torn copies, finds the WAL redo start LSN,
@@ -175,6 +196,14 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	// Step 1: Scan physical blocks in heap file sequentially to find valid candidate page copies
 	bestCandidates := make(map[uint64]candidatePageCopy) // logicalPage -> candidatePageCopy
 
+	var tornBlocks []uint64
+	addTornBlock := func(blockNumber uint64) {
+		if len(tornBlocks) > 0 && tornBlocks[len(tornBlocks)-1] == blockNumber {
+			return
+		}
+		tornBlocks = append(tornBlocks, blockNumber)
+	}
+
 	b := uint64(0)
 	for b < uint64(size/BlockSize) {
 		blockBuf, err := reader.ReadBlock(b)
@@ -187,10 +216,18 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 
 		hdr, err := DecodeBlockHeader(blockBuf)
 		if err != nil {
+			if isZeroBlock(blockBuf) {
+				b++
+				continue
+			}
+			if options.ClosedCleanly {
+				return nil, fmt.Errorf("%w %d: %w", ErrDamagedBlock, b, err)
+			}
 			// Check if real error vs normal corrupt/non-block bytes
 			if !errors.Is(err, ErrInvalidBlockMagic) && !errors.Is(err, ErrInvalidBlockVersion) && !errors.Is(err, ErrBlockCRCMismatch) {
 				return nil, fmt.Errorf("corrupt block decode error at block %d: %w", b, err)
 			}
+			addTornBlock(b)
 			b++
 			continue
 		}
@@ -221,6 +258,12 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 			kHdr, err := DecodeBlockHeader(kbBuf)
 			if err != nil || kHdr.LogicalPage != hdr.LogicalPage || kHdr.LSN != hdr.LSN ||
 				kHdr.BlockIndex != uint32(k) || kHdr.NumBlocks != hdr.NumBlocks {
+				if options.ClosedCleanly && err != nil && !isZeroBlock(kbBuf) {
+					return nil, fmt.Errorf("%w %d: %w", ErrDamagedBlock, b+uint64(k), err)
+				}
+				if err != nil && !isZeroBlock(kbBuf) {
+					addTornBlock(b + uint64(k))
+				}
 				valid = false
 				break
 			}
@@ -240,6 +283,20 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 			b += uint64(numBlocks)
 		} else {
 			b++
+		}
+	}
+
+	// Zero blocks rejected as torn so invalid blocks do not linger in free space across a subsequent clean close.
+	if len(tornBlocks) > 0 {
+		directIO := NewDirectIO()
+		zeroBlock := AllocateAlignedBlock(BlockSize)
+		for _, blockNumber := range tornBlocks {
+			if err := directIO.Write(heapFile, int64(blockNumber*BlockSize), zeroBlock); err != nil {
+				return nil, fmt.Errorf("failed to zero torn heap block %d: %w", blockNumber, err)
+			}
+		}
+		if err := heapFile.Sync(); err != nil {
+			return nil, fmt.Errorf("failed to fsync heap file after zeroing torn blocks: %w", err)
 		}
 	}
 
