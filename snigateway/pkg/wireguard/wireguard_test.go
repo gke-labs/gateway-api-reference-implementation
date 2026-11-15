@@ -32,26 +32,26 @@ import (
 
 const requirePrivilegesEnv = "WIREGUARD_REQUIRE_PRIVILEGES"
 
-// isPermissionDenied reports whether err represents a missing permission or
+// lacksPrivilegeOrKernelSupport reports whether err represents a missing permission or
 // lack of kernel WireGuard support needed to create namespaces or links.
-func isPermissionDenied(err error) bool {
+func lacksPrivilegeOrKernelSupport(err error) bool {
 	return errors.Is(err, ErrPermission) ||
 		isPermissionError(err) ||
 		errors.Is(err, ErrNotSupported) ||
 		isNotSupportedError(err)
 }
 
-// skipIfPermissionDeniedOrFatal checks err:
+// skipWithoutPrivilegeOrKernelSupport checks err:
 //   - If err is nil, it returns immediately.
 //   - If err is a permission-denied or unsupported error, it skips the test unless
 //     WIREGUARD_REQUIRE_PRIVILEGES is set, in which case it fails the test.
 //   - If err is any other unexpected error, it fails the test immediately.
-func skipIfPermissionDeniedOrFatal(t *testing.T, err error, action string) {
+func skipWithoutPrivilegeOrKernelSupport(t *testing.T, err error, action string) {
 	t.Helper()
 	if err == nil {
 		return
 	}
-	if !isPermissionDenied(err) {
+	if !lacksPrivilegeOrKernelSupport(err) {
 		t.Fatalf("%s: unexpected error: %v", action, err)
 	}
 	if os.Getenv(requirePrivilegesEnv) != "" {
@@ -227,7 +227,7 @@ func TestOpenDevice_MissingPermissionsOrUnsupported(t *testing.T) {
 
 func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
 	worker, err := newTestNamespaceWorker()
-	skipIfPermissionDeniedOrFatal(t, err, "cannot create network namespace")
+	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create network namespace")
 	t.Cleanup(func() {
 		if closeErr := worker.Close(); closeErr != nil {
 			t.Errorf("closing worker namespace: %v", closeErr)
@@ -261,7 +261,7 @@ func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
 			return fmt.Errorf("expected OpenDevice to fail with invalid IP, but succeeded")
 		}
 
-		if isPermissionDenied(openErr) {
+		if lacksPrivilegeOrKernelSupport(openErr) {
 			return openErr
 		}
 
@@ -273,7 +273,7 @@ func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
 		return nil
 	})
 
-	skipIfPermissionDeniedOrFatal(t, err, "opening device in namespace")
+	skipWithoutPrivilegeOrKernelSupport(t, err, "opening device in namespace")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +328,7 @@ func openTestDevice(t *testing.T, worker *testNamespaceWorker, interfaceName str
 		port, portErr = device.Port()
 		return portErr
 	})
-	skipIfPermissionDeniedOrFatal(t, err, fmt.Sprintf("opening device %q", interfaceName))
+	skipWithoutPrivilegeOrKernelSupport(t, err, fmt.Sprintf("opening device %q", interfaceName))
 	t.Cleanup(func() {
 		if closeErr := worker.Do(func() error { return device.Close() }); closeErr != nil {
 			t.Errorf("closing device %q: %v", interfaceName, closeErr)
@@ -339,7 +339,7 @@ func openTestDevice(t *testing.T, worker *testNamespaceWorker, interfaceName str
 
 func TestWireGuard_NamespaceCommunication(t *testing.T) {
 	worker1, err := newTestNamespaceWorker()
-	skipIfPermissionDeniedOrFatal(t, err, "cannot create network namespace")
+	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create network namespace")
 	t.Cleanup(func() {
 		if closeErr := worker1.Close(); closeErr != nil {
 			t.Errorf("closing worker1 namespace: %v", closeErr)
@@ -347,7 +347,7 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 	})
 
 	worker2, err := newTestNamespaceWorker()
-	skipIfPermissionDeniedOrFatal(t, err, "cannot create second network namespace")
+	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create second network namespace")
 	t.Cleanup(func() {
 		if closeErr := worker2.Close(); closeErr != nil {
 			t.Errorf("closing worker2 namespace: %v", closeErr)
@@ -359,7 +359,7 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 		LinkAttrs: netlink.LinkAttrs{Name: "veth-test1"},
 		PeerName:  "veth-test2",
 	}
-	skipIfPermissionDeniedOrFatal(t, netlink.LinkAdd(veth), "cannot create veth pair")
+	skipWithoutPrivilegeOrKernelSupport(t, netlink.LinkAdd(veth), "cannot create veth pair")
 	t.Cleanup(func() {
 		if delErr := netlink.LinkDel(veth); delErr != nil && !errors.Is(delErr, syscall.ENODEV) {
 			t.Errorf("deleting veth link: %v", delErr)
@@ -530,7 +530,7 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 	}
 }
 
-func TestIsPermissionDenied(t *testing.T) {
+func TestLacksPrivilegeOrKernelSupport(t *testing.T) {
 	testCases := []struct {
 		name     string
 		err      error
@@ -552,8 +552,8 @@ func TestIsPermissionDenied(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isPermissionDenied(tc.err); got != tc.expected {
-				t.Errorf("isPermissionDenied(%v) = %v, want %v", tc.err, got, tc.expected)
+			if got := lacksPrivilegeOrKernelSupport(tc.err); got != tc.expected {
+				t.Errorf("lacksPrivilegeOrKernelSupport(%v) = %v, want %v", tc.err, got, tc.expected)
 			}
 		})
 	}
