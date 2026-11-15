@@ -172,7 +172,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	mux.HandleFunc("/v1/connections", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/connections/", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/tunnel", s.handleConnectionUpgrade)
-	mux.HandleFunc("PUT /v1/sessions/{id}/wireguard", s.handleWireGuard)
+	mux.HandleFunc("PUT /v1/sessions/{id}/wireguard", s.handlePutWireGuard)
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -1017,7 +1017,9 @@ func closeCloser(c io.Closer) {
 	}
 }
 
-func (s *Server) handleWireGuard(w http.ResponseWriter, r *http.Request) {
+// handlePutWireGuard handles WireGuard key exchange for a session.
+// The route pattern restricts it to PUT.
+func (s *Server) handlePutWireGuard(w http.ResponseWriter, r *http.Request) {
 	if s.wireguard == nil {
 		http.NotFound(w, r)
 		return
