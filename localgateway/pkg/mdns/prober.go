@@ -460,10 +460,13 @@ func (p *Prober) runProbe(ctx context.Context, fqdn string, proposedRecords []dn
 		case <-time.After(p.opts.AnnounceInterval):
 			p.mu.RLock()
 			currentEntry, exists := p.names[fqdn]
-			stillPublished := exists && currentEntry.state == StatePublished
+			var repeatRecords []dnsmessage.Resource
+			if exists && currentEntry.state == StatePublished {
+				repeatRecords = append([]dnsmessage.Resource(nil), currentEntry.records...)
+			}
 			p.mu.RUnlock()
-			if stillPublished {
-				if err := p.responder.SendAnnouncement(records); err != nil {
+			if len(repeatRecords) > 0 {
+				if err := p.responder.SendAnnouncement(repeatRecords); err != nil {
 					klog.Warningf("failed to send repeat announcement for %s: %v", fqdn, err)
 				}
 			}
