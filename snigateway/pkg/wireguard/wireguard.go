@@ -47,6 +47,11 @@ func GenerateKey() (Key, Key, error) {
 	return privateKey, privateKey.PublicKey(), nil
 }
 
+// ParseKey parses a base64-encoded WireGuard key.
+func ParseKey(encodedKey string) (Key, error) {
+	return wgtypes.ParseKey(encodedKey)
+}
+
 // Config specifies the configuration for opening a kernel WireGuard device.
 type Config struct {
 	// InterfaceName is the name of the network interface to create (e.g. "wg0").

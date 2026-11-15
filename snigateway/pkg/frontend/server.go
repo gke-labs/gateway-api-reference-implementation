@@ -37,6 +37,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 	"k8s.io/klog/v2"
 )
 
@@ -72,6 +73,14 @@ type ServerConfig struct {
 	LeaseReaperInterval      time.Duration
 	// TimeNow overrides time.Now for deterministic testing of lease expiration.
 	TimeNow func() time.Time
+	// WireGuardDevice manages peers on the WireGuard network interface.
+	WireGuardDevice WireGuardDevice
+	// WireGuardPublicKey is the public key of the frontend WireGuard interface.
+	WireGuardPublicKey wireguard.Key
+	// WireGuardPort is the UDP listen port of the frontend WireGuard device.
+	WireGuardPort int
+	// WireGuardPrefix is the IPv6 /64 prefix for addresses inside the WireGuard tunnel.
+	WireGuardPrefix *net.IPNet
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -93,6 +102,8 @@ type Server struct {
 	sessionsMu  sync.Mutex
 	sessions    map[string]*frontendSession
 	timeNow     func() time.Time
+
+	wireguard *WireGuardManager
 }
 
 // NewServer creates a new frontend Server with the given configuration.
@@ -153,6 +164,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		sessions:         make(map[string]*frontendSession),
 		timeNow:          timeNow,
 	}
+	s.wireguard = NewWireGuardManager(cfg.WireGuardDevice, cfg.WireGuardPublicKey, cfg.WireGuardPort, cfg.WireGuardPrefix, s.table)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/session", s.handleSession)
@@ -160,6 +172,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	mux.HandleFunc("/v1/connections", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/connections/", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/tunnel", s.handleConnectionUpgrade)
+	mux.HandleFunc("PUT /v1/sessions/{id}/wireguard", s.handleWireGuard)
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -344,6 +357,7 @@ func (s *Server) CloseSession(sessionID string) {
 
 	s.table.Unregister(sessionID)
 	s.pool.UnregisterSession(sessionID)
+	s.wireguard.RemoveSession(sessionID)
 
 	if sess.cancel != nil {
 		sess.cancel()
@@ -1000,5 +1014,66 @@ func closeCloser(c io.Closer) {
 	}
 	if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Printf("Frontend: failed to close: %v", err)
+	}
+}
+
+func (s *Server) handleWireGuard(w http.ResponseWriter, r *http.Request) {
+	if s.wireguard == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	sessionID := r.PathValue("id")
+	if sessionID == "" {
+		http.Error(w, "missing session ID", http.StatusBadRequest)
+		return
+	}
+
+	clientIdentity, err := s.extractClientIdentity(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if r.ContentLength > s.config.MaxRegistrationBodyBytes {
+		http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	var request api.WireGuardRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, s.config.MaxRegistrationBodyBytes)).Decode(&request); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if request.PublicKey == "" {
+		http.Error(w, "missing publicKey", http.StatusBadRequest)
+		return
+	}
+	clientPublicKey, err := wireguard.ParseKey(request.PublicKey)
+	if err != nil {
+		http.Error(w, "invalid publicKey: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	response, err := s.wireguard.ConfigureSessionPeer(sessionID, clientIdentity, clientPublicKey)
+	if err != nil {
+		switch {
+		case errors.Is(err, errSessionNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, errIdentityMismatch):
+			http.Error(w, err.Error(), http.StatusForbidden)
+		case errors.Is(err, errKeyInUse):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			klog.Errorf("Frontend: failed to configure WireGuard peer for session %s: %v", sessionID, err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		klog.Errorf("Frontend: failed to encode wireguard response: %v", err)
 	}
 }
