@@ -57,6 +57,7 @@ func (c *Checkpointer) flushPagesLocked() error {
 
 	// Fsync heap file
 	if err := c.heapFile.Sync(); err != nil {
+		c.bp.AbortSync()
 		return fmt.Errorf("failed to fsync heap file: %w", err)
 	}
 

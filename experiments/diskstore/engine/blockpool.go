@@ -130,6 +130,11 @@ type BlockPool struct {
 	pageTable      map[uint64]*PageDesc // logicalPage -> PageDesc
 	onFailure      func(error)
 
+	// syncing is true while a heap fsync is in progress (between SnapshotFlushedForSync
+	// and PromoteFlushedToDurable or AbortSync). While true, flushBlockRunUnlocked waits
+	// so no heap write lands on disk during the fsync without being recorded in the snapshot.
+	syncing bool
+
 	stagingBuf []byte     // Pointer-free aligned 2 MiB staging buffer for direct I/O flushes
 	flushMu    sync.Mutex // Serializes staging buffer usage and direct I/O heap writes
 
@@ -507,6 +512,17 @@ func (bp *BlockPool) FreePage(logicalPage uint64) {
 	}
 }
 
+// hasInFlightLocked reports whether any page descriptor currently has a flush in flight.
+// Must be called with bp.mu held.
+func (bp *BlockPool) hasInFlightLocked() bool {
+	for _, desc := range bp.pageTable {
+		if desc.InFlight {
+			return true
+		}
+	}
+	return false
+}
+
 // acquirePoolBlocksLocked acquires count pool blocks, evicting clean pages first by LRU, then flushing dirty pages.
 func (bp *BlockPool) acquirePoolBlocksLocked(count int) ([]int, error) {
 	for len(bp.freePoolBlocks) < count {
@@ -539,19 +555,13 @@ func (bp *BlockPool) acquirePoolBlocksLocked(count int) ([]int, error) {
 		}
 
 		var candidates []*PageDesc
-		hasInFlight := false
 		for _, desc := range bp.pageTable {
-			if len(desc.PoolBlocks) > 0 {
-				if desc.InFlight {
-					hasInFlight = true
-				}
-				if desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
-					candidates = append(candidates, desc)
-				}
+			if len(desc.PoolBlocks) > 0 && desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
+				candidates = append(candidates, desc)
 			}
 		}
 		if len(candidates) == 0 {
-			if hasInFlight {
+			if bp.hasInFlightLocked() {
 				// Waiting is safe because flushBlockRunUnlocked clears InFlight and
 				// broadcasts on bp.cond on both success and failure with bp.mu held,
 				// waking this waiter to re-check candidate pages.
@@ -680,6 +690,10 @@ func (bp *BlockPool) flushBatchUnlocked(batch []*PageDesc) error {
 }
 
 func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
+	for bp.syncing {
+		bp.cond.Wait()
+	}
+
 	orders := make([]int, len(chunk))
 	pageLSNs := make([]uint64, len(chunk))
 	var maxLSN uint64
@@ -825,23 +839,19 @@ func (bp *BlockPool) FlushAllDirty() error {
 
 // SnapshotFlushedForSync records all currently flushed locations before a heap fsync starts.
 // The snapshot holds every location that the following fsync can make durable.
+// To guarantee this rule, no heap flush may start between the snapshot and the end of the fsync
+// (when PromoteFlushedToDurable or AbortSync is called); flushers wait while a sync is in progress.
+// This ensures the snapshot holds every location that the following fsync can make durable, at the
+// cost that eviction and the idle sweep wait for the fsync to complete.
 func (bp *BlockPool) SnapshotFlushedForSync() {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
-	for {
-		hasInFlight := false
-		for _, desc := range bp.pageTable {
-			if desc.InFlight {
-				hasInFlight = true
-				break
-			}
-		}
-		if !hasInFlight {
-			break
-		}
+	for bp.hasInFlightLocked() || bp.syncing {
 		bp.cond.Wait()
 	}
+
+	bp.syncing = true
 
 	for _, desc := range bp.pageTable {
 		if desc.FlushedLoc != NoBlock {
@@ -850,11 +860,28 @@ func (bp *BlockPool) SnapshotFlushedForSync() {
 	}
 }
 
+// AbortSync clears the syncing state without promoting flushed locations if a heap fsync fails.
+func (bp *BlockPool) AbortSync() {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	for _, desc := range bp.pageTable {
+		desc.FlushedBeforeSync = NoBlock
+	}
+	bp.syncing = false
+	bp.cond.Broadcast()
+}
+
 // PromoteFlushedToDurable promotes only locations that were flushed before the heap fsync began.
 // Frees any superseded durable locations to the buddy allocator according to the Reuse Rule.
 func (bp *BlockPool) PromoteFlushedToDurable() error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
+
+	defer func() {
+		bp.syncing = false
+		bp.cond.Broadcast()
+	}()
 
 	var errs []error
 	for _, desc := range bp.pageTable {

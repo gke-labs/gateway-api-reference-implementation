@@ -822,6 +822,11 @@ func TestRegression_BlockPoolInFlightWait(t *testing.T) {
 	}
 }
 
+// TestBlockPool_InFlightFlushReuseViolation verifies that when a page flush is in flight
+// during SnapshotFlushedForSync, the snapshot waits for the flush to finish before
+// recording flushed locations. This ensures that the newly flushed location is recorded
+// as durable following heap fsync and promotion, so subsequent flushes do not prematurely
+// free it back to the allocator.
 func TestBlockPool_InFlightFlushReuseViolation(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
@@ -847,7 +852,9 @@ func TestBlockPool_InFlightFlushReuseViolation(t *testing.T) {
 	defer bp.Close()
 
 	// Initial write of page 1 at LSN 10
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k1", Payload: []byte("v1")})
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k1", Payload: []byte("v1")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
 	h1, err := bp.AllocateNewPage(1, 1, 10)
 	if err != nil {
 		t.Fatalf("AllocateNewPage failed: %v", err)
@@ -868,7 +875,9 @@ func TestBlockPool_InFlightFlushReuseViolation(t *testing.T) {
 	}
 
 	// Dirty page 1 again at LSN 20
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k1", Payload: []byte("v2")})
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k1", Payload: []byte("v2")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
 	h1Again, err := bp.PinPage(1)
 	if err != nil {
 		t.Fatalf("PinPage failed: %v", err)
@@ -921,7 +930,9 @@ func TestBlockPool_InFlightFlushReuseViolation(t *testing.T) {
 	}
 
 	// Dirty page 1 again at LSN 30 and flush it
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 30, Key: "k1", Payload: []byte("v3")})
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 30, Key: "k1", Payload: []byte("v3")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
 	h1Third, err := bp.PinPage(1)
 	if err != nil {
 		t.Fatalf("PinPage failed: %v", err)
@@ -933,13 +944,15 @@ func TestBlockPool_InFlightFlushReuseViolation(t *testing.T) {
 	// Clear the hook
 	faultFS.SetBeforeWriteAt(nil)
 
-	// Flush page 1: in the buggy version, this frees locB back to buddy allocator!
+	// Flush page 1 again to a new location
 	if err := bp.FlushPage(1); err != nil {
 		t.Fatalf("FlushPage failed: %v", err)
 	}
 
-	// Allocate a new page (page 2): buddy allocator hands out locB!
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 40, Key: "k2", Payload: []byte("v4")})
+	// Allocate a new page (page 2)
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 40, Key: "k2", Payload: []byte("v4")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
 	h2, err := bp.AllocateNewPage(2, 1, 40)
 	if err != nil {
 		t.Fatalf("AllocateNewPage failed: %v", err)
@@ -947,7 +960,137 @@ func TestBlockPool_InFlightFlushReuseViolation(t *testing.T) {
 	copy(h2.Block(0)[BlockHeaderSize:], []byte("v4-content"))
 	h2.Unpin()
 
-	// Flush page 2: overwrites locB, violating the reuse rule!
+	// Flush page 2 and confirm no reuse rule violation occurs
+	if err := bp.FlushPage(2); err != nil {
+		t.Fatalf("FlushPage(2) failed: %v", err)
+	}
+}
+
+// TestBlockPool_FlushDuringSyncBlocked verifies that flushers wait while a heap fsync
+// is in progress (between SnapshotFlushedForSync and PromoteFlushedToDurable).
+// This ensures no flush lands on disk during the fsync without being recorded in the snapshot,
+// preventing premature reuse of blocks that become durable during the fsync.
+func TestBlockPool_FlushDuringSyncBlocked(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	faultFS.SetAssertReuseRule(true)
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("bp-test-db-00005"))
+
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	heapFile, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	buddy := NewBuddyAllocator(512)
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
+	defer bp.Close()
+
+	// 1. Flush page 1 and checkpoint
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k1", Payload: []byte("v1")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+	h1, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	copy(h1.Block(0)[BlockHeaderSize:], []byte("v1-content"))
+	h1.Unpin()
+
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("FlushPage failed: %v", err)
+	}
+	bp.SnapshotFlushedForSync()
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := bp.PromoteFlushedToDurable(); err != nil {
+		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	}
+
+	// 2. Dirty page 1
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k1", Payload: []byte("v2")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+	h1Again, err := bp.PinPage(1)
+	if err != nil {
+		t.Fatalf("PinPage failed: %v", err)
+	}
+	copy(h1Again.Block(0)[BlockHeaderSize:], []byte("v2-content"))
+	h1Again.Unpin()
+	bp.MarkDirty(1, 20)
+
+	// 3. Call SnapshotFlushedForSync (starts sync)
+	bp.SnapshotFlushedForSync()
+
+	// 4. Flush page 1: must block while sync is in progress
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- bp.FlushPage(1)
+	}()
+
+	// Verify flush is waiting while sync is in progress
+	select {
+	case err := <-flushDone:
+		t.Fatalf("FlushPage returned while sync was in progress: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// 5. Sync heap file
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+
+	// 6. PromoteFlushedToDurable (completes sync and wakes waiting flushers)
+	if err := bp.PromoteFlushedToDurable(); err != nil {
+		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	}
+
+	// Flusher now unblocks and completes
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatalf("FlushPage failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for FlushPage after sync finished")
+	}
+
+	// 7. Dirty and flush page 1 again
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 30, Key: "k1", Payload: []byte("v3")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+	h1Third, err := bp.PinPage(1)
+	if err != nil {
+		t.Fatalf("PinPage failed: %v", err)
+	}
+	copy(h1Third.Block(0)[BlockHeaderSize:], []byte("v3-content"))
+	h1Third.Unpin()
+	bp.MarkDirty(1, 30)
+
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("FlushPage failed: %v", err)
+	}
+
+	// 8. Allocate and flush page 2: confirms no reuse rule violation
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 40, Key: "k2", Payload: []byte("v4")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+	h2, err := bp.AllocateNewPage(2, 1, 40)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	copy(h2.Block(0)[BlockHeaderSize:], []byte("v4-content"))
+	h2.Unpin()
+
 	if err := bp.FlushPage(2); err != nil {
 		t.Fatalf("FlushPage(2) failed: %v", err)
 	}

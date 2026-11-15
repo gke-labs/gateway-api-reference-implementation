@@ -214,19 +214,28 @@ func TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync(t *testing.T) {
 	// Snapshot for sync
 	store.bp.SnapshotFlushedForSync()
 
-	// Put page 2 and flush it AFTER snapshot was taken
+	// Put page 2 and initiate flush while sync is in progress; flusher waits for sync to end
 	_ = store.Put("ConfigMap", "k2", []byte("v2"))
 	store.bp.mu.Lock()
 	desc2 := store.bp.pageTable[store.keyIndex[qualifyKey("ConfigMap", "k2")].LogicalPage]
-	_ = store.bp.FlushPageLocked(desc2)
-	loc2 := desc2.FlushedLoc
 	store.bp.mu.Unlock()
 
-	// Now promote flushed locations
+	flushDone := make(chan error, 1)
+	go func() {
+		store.bp.mu.Lock()
+		defer store.bp.mu.Unlock()
+		flushDone <- store.bp.FlushPageLocked(desc2)
+	}()
+
+	// Now promote flushed locations (completes the sync and unblocks flush)
 	_ = store.bp.PromoteFlushedToDurable()
+	if err := <-flushDone; err != nil {
+		t.Fatalf("FlushPageLocked failed: %v", err)
+	}
 
 	store.bp.mu.Lock()
 	defer store.bp.mu.Unlock()
+	loc2 := desc2.FlushedLoc
 
 	// loc1 was before snapshot -> promoted to durable!
 	if desc.DurableLoc != loc1 {
