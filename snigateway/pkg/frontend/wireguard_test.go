@@ -15,6 +15,7 @@
 package frontend
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -25,15 +26,19 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
+	"golang.org/x/time/rate"
 )
 
 type fakeWireGuardDevice struct {
@@ -97,6 +102,7 @@ type testWireGuardServer struct {
 	publicKey  wireguard.Key
 	port       int
 	serverAddr string
+	httpAddr   string
 	generated  *certs.GeneratedCerts
 }
 
@@ -134,6 +140,11 @@ func setupTestWireGuardServer(t *testing.T, prefixStr string, clientCerts ...*ce
 		t.Fatalf("Listen failed: %v", err)
 	}
 
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen for HTTP failed: %v", err)
+	}
+
 	var dev WireGuardDevice
 	var fakeDev *fakeWireGuardDevice
 	var feKey wireguard.Key
@@ -169,8 +180,8 @@ func setupTestWireGuardServer(t *testing.T, prefixStr string, clientCerts ...*ce
 	}
 
 	go func() {
-		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
-			t.Logf("Serve exited: %v", serveErr)
+		if serveErr := srv.ServeWithHTTP([]net.Listener{ln}, []net.Listener{httpLn}); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+			t.Logf("ServeWithHTTP exited: %v", serveErr)
 		}
 	}()
 
@@ -186,6 +197,87 @@ func setupTestWireGuardServer(t *testing.T, prefixStr string, clientCerts ...*ce
 		publicKey:  feKey,
 		port:       fePort,
 		serverAddr: ln.Addr().String(),
+		httpAddr:   httpLn.Addr().String(),
+		generated:  defaultGenerated,
+	}, cleanup
+}
+
+func setupTestWireGuardServerWithDial(t *testing.T, prefixStr string, dialContext func(ctx context.Context, network, address string) (net.Conn, error)) (*testWireGuardServer, func()) {
+	t.Helper()
+
+	defaultGenerated, err := certs.GenerateAll("snigateway.internal", "test-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certs failed: %v", err)
+	}
+	serverTLS, err := certs.NewServerTLSConfig(defaultGenerated.CA.CertPEM, defaultGenerated.Server.CertPEM, defaultGenerated.Server.KeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen for HTTP failed: %v", err)
+	}
+
+	var dev WireGuardDevice
+	var fakeDev *fakeWireGuardDevice
+	var feKey wireguard.Key
+	var prefixNet *net.IPNet
+	fePort := 51820
+	if prefixStr != "" {
+		fakeDev = newFakeWireGuardDevice()
+		dev = fakeDev
+		_, feKey, err = wireguard.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		var cidrNet *net.IPNet
+		_, cidrNet, err = net.ParseCIDR(prefixStr)
+		if err != nil {
+			t.Fatalf("ParseCIDR failed: %v", err)
+		}
+		prefixNet = cidrNet
+	}
+
+	srv, err := NewServer(ServerConfig{
+		ServerTLSConfig:    serverTLS,
+		InternalHostname:   "snigateway.internal",
+		ConnectTimeout:     5 * time.Second,
+		ReadSNITimeout:     2 * time.Second,
+		WireGuardDevice:    dev,
+		WireGuardPublicKey: feKey,
+		WireGuardPort:      fePort,
+		WireGuardPrefix:    prefixNet,
+		DialContext:        dialContext,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	go func() {
+		if serveErr := srv.ServeWithHTTP([]net.Listener{ln}, []net.Listener{httpLn}); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+			t.Logf("ServeWithHTTP exited: %v", serveErr)
+		}
+	}()
+
+	cleanup := func() {
+		if closeErr := srv.Close(); closeErr != nil {
+			t.Logf("Close returned error: %v", closeErr)
+		}
+	}
+
+	return &testWireGuardServer{
+		server:     srv,
+		device:     fakeDev,
+		publicKey:  feKey,
+		port:       fePort,
+		serverAddr: ln.Addr().String(),
+		httpAddr:   httpLn.Addr().String(),
 		generated:  defaultGenerated,
 	}, cleanup
 }
@@ -882,4 +974,604 @@ func TestWireGuard_AllocateAddressLocked(t *testing.T) {
 	if device.PeerCount() != 3 {
 		t.Fatalf("expected 3 peers on device, got %d", device.PeerCount())
 	}
+}
+
+func localTCPConnPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("local TCP listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	clientCh := make(chan net.Conn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		clientCh <- conn
+	}()
+
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("local TCP dial failed: %v", err)
+	}
+
+	select {
+	case serverConn := <-clientCh:
+		return clientConn, serverConn
+	case err := <-errCh:
+		clientConn.Close()
+		t.Fatalf("local TCP accept failed: %v", err)
+		return nil, nil
+	}
+}
+
+func handleProxyConnection(t *testing.T, conn net.Conn, backendCert *tls.Certificate, reply []byte) (*proxyproto.Header, []byte) {
+	t.Helper()
+	defer conn.Close()
+
+	bufferReader := bufio.NewReader(conn)
+	header, err := proxyproto.Decode(bufferReader)
+	if err != nil {
+		t.Errorf("proxyproto.Decode failed: %v", err)
+		return nil, nil
+	}
+
+	var remaining []byte
+	if bufferReader.Buffered() > 0 {
+		remaining = make([]byte, bufferReader.Buffered())
+		if _, err := io.ReadFull(bufferReader, remaining); err != nil {
+			t.Errorf("io.ReadFull failed: %v", err)
+			return header, nil
+		}
+	}
+
+	proxyConn := proxyproto.NewConn(conn, header.SrcAddr, header.DstAddr, remaining)
+
+	var payloadConn net.Conn = proxyConn
+	if backendCert != nil {
+		tlsServer := tls.Server(proxyConn, &tls.Config{
+			Certificates: []tls.Certificate{*backendCert},
+		})
+		defer tlsServer.Close()
+		payloadConn = tlsServer
+	}
+
+	buffer := make([]byte, 1024)
+	n, err := payloadConn.Read(buffer)
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Errorf("reading client payload: %v", err)
+		return header, nil
+	}
+
+	if len(reply) > 0 {
+		if _, err := payloadConn.Write(reply); err != nil {
+			t.Errorf("writing backend reply: %v", err)
+		}
+	}
+
+	return header, buffer[:n]
+}
+
+func TestWireGuard_DialSession(t *testing.T) {
+	backendCert, err := generateTestBackendCert("tls.example.com", "pool.example.com", "fallback.example.com", "block.example.com", "multi.example.com")
+	if err != nil {
+		t.Fatalf("generateTestBackendCert failed: %v", err)
+	}
+
+	t.Run("session with peer dials tunnel with PROXY header and client bytes intact", func(t *testing.T) {
+		var (
+			dialMu             sync.Mutex
+			dials              []string
+			handledProxyHeader *proxyproto.Header
+			handledPayload     []byte
+			doneCh             chan struct{}
+		)
+
+		env, cleanup := setupTestWireGuardServerWithDial(t, "fd00:1234::/64", func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialMu.Lock()
+			dials = append(dials, address)
+			ch := doneCh
+			dialMu.Unlock()
+
+			clientSide, serverSide := localTCPConnPair(t)
+			go func() {
+				defer close(ch)
+				var cert *tls.Certificate
+				var reply []byte
+				if strings.Contains(address, strconv.Itoa(api.WireGuardTunnelPort)) {
+					cert = &backendCert
+					reply = []byte("backend-ok:hello-tls-backend")
+				}
+				hdr, payload := handleProxyConnection(t, serverSide, cert, reply)
+				dialMu.Lock()
+				handledProxyHeader = hdr
+				handledPayload = payload
+				dialMu.Unlock()
+			}()
+			return clientSide, nil
+		})
+		defer cleanup()
+
+		clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
+		if err != nil {
+			t.Fatalf("NewClientTLSConfig failed: %v", err)
+		}
+
+		apiClient := client.NewClient(env.serverAddr, clientTLS, client.WithInternalHostname("snigateway.internal"))
+		sessionID, _, err := apiClient.StartSession(t.Context())
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+		defer env.server.CloseSession(sessionID)
+
+		_, clientPublicKey, err := wireguard.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+
+		putResp, wireguardResponse := putWireGuard(t, clientTLS, env.serverAddr, sessionID, api.WireGuardRequest{
+			PublicKey: clientPublicKey.String(),
+		})
+		defer putResp.Body.Close()
+		if putResp.StatusCode != http.StatusOK {
+			t.Fatalf("putWireGuard status: %d", putResp.StatusCode)
+		}
+
+		if _, err := apiClient.Register(t.Context(), sessionID, []string{"tls.example.com", "http.example.com"}); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+
+		expectedTunnelAddress := net.JoinHostPort(wireguardResponse.PeerAddress, strconv.Itoa(api.WireGuardTunnelPort))
+
+		// A: Test TLS routing by SNI
+		dialMu.Lock()
+		doneCh = make(chan struct{})
+		dialMu.Unlock()
+
+		tlsConn, err := tls.Dial("tcp", env.serverAddr, &tls.Config{
+			ServerName:         "tls.example.com",
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			t.Fatalf("tls.Dial failed: %v", err)
+		}
+		defer tlsConn.Close()
+
+		tlsPayload := []byte("hello-tls-backend")
+		if _, err := tlsConn.Write(tlsPayload); err != nil {
+			t.Fatalf("write to tlsConn: %v", err)
+		}
+
+		tlsBuffer := make([]byte, 1024)
+		n, err := tlsConn.Read(tlsBuffer)
+		if err != nil {
+			t.Fatalf("read from tlsConn: %v", err)
+		}
+		expectedTLSResponse := "backend-ok:" + string(tlsPayload)
+		if string(tlsBuffer[:n]) != expectedTLSResponse {
+			t.Errorf("got %q, want %q", string(tlsBuffer[:n]), expectedTLSResponse)
+		}
+		<-doneCh
+
+		dialMu.Lock()
+		if len(dials) != 1 || dials[0] != expectedTunnelAddress {
+			t.Errorf("expected 1 dial to %s, got %v", expectedTunnelAddress, dials)
+		}
+		if handledProxyHeader == nil || handledProxyHeader.Authority != "tls.example.com" {
+			t.Errorf("expected Authority tls.example.com, got %v", handledProxyHeader)
+		}
+		if !bytes.Equal(handledPayload, tlsPayload) {
+			t.Errorf("expected payload %q, got %q", tlsPayload, handledPayload)
+		}
+		dials = nil
+		handledProxyHeader = nil
+		handledPayload = nil
+		dialMu.Unlock()
+
+		// Verify pool was never used
+		if env.server.PoolTransport().HasIdleConn(sessionID) {
+			t.Errorf("expected pool not to have connections")
+		}
+
+		// B: Test plain HTTP routing by Host
+		dialMu.Lock()
+		doneCh = make(chan struct{})
+		dialMu.Unlock()
+
+		env.server.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialMu.Lock()
+			dials = append(dials, address)
+			ch := doneCh
+			dialMu.Unlock()
+
+			clientSide, serverSide := localTCPConnPair(t)
+			go func() {
+				defer close(ch)
+				hdr, payload := handleProxyConnection(t, serverSide, nil, []byte("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello-http"))
+				dialMu.Lock()
+				handledProxyHeader = hdr
+				handledPayload = payload
+				dialMu.Unlock()
+			}()
+			return clientSide, nil
+		}
+
+		httpConn, err := net.Dial("tcp", env.httpAddr)
+		if err != nil {
+			t.Fatalf("dial httpAddr failed: %v", err)
+		}
+		defer httpConn.Close()
+
+		httpReq := "GET /test HTTP/1.1\r\nHost: http.example.com\r\n\r\n"
+		if _, err := httpConn.Write([]byte(httpReq)); err != nil {
+			t.Fatalf("write httpReq failed: %v", err)
+		}
+
+		httpBuffer := make([]byte, 1024)
+		n, err = httpConn.Read(httpBuffer)
+		if err != nil {
+			t.Fatalf("read httpBuffer failed: %v", err)
+		}
+		if !strings.Contains(string(httpBuffer[:n]), "hello-http") {
+			t.Errorf("got %q, want response containing hello-http", string(httpBuffer[:n]))
+		}
+		<-doneCh
+
+		dialMu.Lock()
+		if len(dials) != 1 || dials[0] != expectedTunnelAddress {
+			t.Errorf("expected dial to %s for plain HTTP, got %v", expectedTunnelAddress, dials)
+		}
+		if handledProxyHeader == nil || handledProxyHeader.Authority != "http.example.com" {
+			t.Errorf("expected Authority http.example.com, got %v", handledProxyHeader)
+		}
+		dialMu.Unlock()
+	})
+
+	t.Run("session without peer uses pool", func(t *testing.T) {
+		var dialCalled atomic.Bool
+		env, cleanup := setupTestWireGuardServerWithDial(t, "fd00:1234::/64", func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialCalled.Store(true)
+			return nil, errors.New("should not dial tunnel")
+		})
+		defer cleanup()
+
+		clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
+		if err != nil {
+			t.Fatalf("NewClientTLSConfig failed: %v", err)
+		}
+
+		apiClient := client.NewClient(env.serverAddr, clientTLS, client.WithInternalHostname("snigateway.internal"))
+		sessionID, _, err := apiClient.StartSession(t.Context())
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+		defer env.server.CloseSession(sessionID)
+
+		if _, err := apiClient.Register(t.Context(), sessionID, []string{"pool.example.com"}); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+
+		poolClient, poolBackend := localTCPConnPair(t)
+		if err := env.server.PoolTransport().AddConn(sessionID, poolClient); err != nil {
+			t.Fatalf("AddConn failed: %v", err)
+		}
+
+		poolDone := make(chan struct{})
+		var handledProxyHeader *proxyproto.Header
+		var handledPayload []byte
+		go func() {
+			defer close(poolDone)
+			hdr, payload := handleProxyConnection(t, poolBackend, &backendCert, []byte("pool-reply:hello-pool"))
+			handledProxyHeader = hdr
+			handledPayload = payload
+		}()
+
+		tlsConn, err := tls.Dial("tcp", env.serverAddr, &tls.Config{
+			ServerName:         "pool.example.com",
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			t.Fatalf("tls.Dial to pool.example.com failed: %v", err)
+		}
+		defer tlsConn.Close()
+
+		payload := []byte("hello-pool")
+		if _, err := tlsConn.Write(payload); err != nil {
+			t.Fatalf("write to tlsConn: %v", err)
+		}
+
+		buffer := make([]byte, 1024)
+		n, err := tlsConn.Read(buffer)
+		if err != nil {
+			t.Fatalf("read from tlsConn: %v", err)
+		}
+		<-poolDone
+
+		if string(buffer[:n]) != "pool-reply:hello-pool" {
+			t.Errorf("got %q, want %q", string(buffer[:n]), "pool-reply:hello-pool")
+		}
+		if dialCalled.Load() {
+			t.Errorf("expected dialContext not to be called for session without peer")
+		}
+		if handledProxyHeader == nil || handledProxyHeader.Authority != "pool.example.com" {
+			t.Errorf("expected Authority pool.example.com, got %v", handledProxyHeader)
+		}
+		if !bytes.Equal(handledPayload, payload) {
+			t.Errorf("expected payload %q, got %q", payload, handledPayload)
+		}
+	})
+
+	t.Run("failed dial falls back to pool", func(t *testing.T) {
+		var dialCount atomic.Int32
+		env, cleanup := setupTestWireGuardServerWithDial(t, "fd00:1234::/64", func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialCount.Add(1)
+			return nil, errors.New("simulated dial failure: host unreachable")
+		})
+		defer cleanup()
+
+		clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
+		if err != nil {
+			t.Fatalf("NewClientTLSConfig failed: %v", err)
+		}
+
+		apiClient := client.NewClient(env.serverAddr, clientTLS, client.WithInternalHostname("snigateway.internal"))
+		sessionID, _, err := apiClient.StartSession(t.Context())
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+		defer env.server.CloseSession(sessionID)
+
+		_, clientPublicKey, err := wireguard.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		putResp, _ := putWireGuard(t, clientTLS, env.serverAddr, sessionID, api.WireGuardRequest{
+			PublicKey: clientPublicKey.String(),
+		})
+		defer putResp.Body.Close()
+		if putResp.StatusCode != http.StatusOK {
+			t.Fatalf("putWireGuard status: %d", putResp.StatusCode)
+		}
+
+		if _, err := apiClient.Register(t.Context(), sessionID, []string{"fallback.example.com"}); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+
+		poolClient, poolBackend := localTCPConnPair(t)
+		if err := env.server.PoolTransport().AddConn(sessionID, poolClient); err != nil {
+			t.Fatalf("AddConn failed: %v", err)
+		}
+
+		poolDone := make(chan struct{})
+		var handledProxyHeader *proxyproto.Header
+		var handledPayload []byte
+		go func() {
+			defer close(poolDone)
+			hdr, payload := handleProxyConnection(t, poolBackend, &backendCert, []byte("fallback-reply:hello-fallback"))
+			handledProxyHeader = hdr
+			handledPayload = payload
+		}()
+
+		tlsConn, err := tls.Dial("tcp", env.serverAddr, &tls.Config{
+			ServerName:         "fallback.example.com",
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			t.Fatalf("tls.Dial to fallback.example.com failed: %v", err)
+		}
+		defer tlsConn.Close()
+
+		payload := []byte("hello-fallback")
+		if _, err := tlsConn.Write(payload); err != nil {
+			t.Fatalf("write to tlsConn: %v", err)
+		}
+
+		buffer := make([]byte, 1024)
+		n, err := tlsConn.Read(buffer)
+		if err != nil {
+			t.Fatalf("read from tlsConn: %v", err)
+		}
+		<-poolDone
+
+		if string(buffer[:n]) != "fallback-reply:hello-fallback" {
+			t.Errorf("got %q, want %q", string(buffer[:n]), "fallback-reply:hello-fallback")
+		}
+		if dialCount.Load() == 0 {
+			t.Errorf("expected dialContext to be attempted before fallback")
+		}
+		if handledProxyHeader == nil || handledProxyHeader.Authority != "fallback.example.com" {
+			t.Errorf("expected Authority fallback.example.com, got %v", handledProxyHeader)
+		}
+		if !bytes.Equal(handledPayload, payload) {
+			t.Errorf("expected payload %q, got %q", payload, handledPayload)
+		}
+	})
+
+	t.Run("blocking tunnel dial falls back to pool without starving", func(t *testing.T) {
+		var dialAttempted atomic.Bool
+		env, cleanup := setupTestWireGuardServerWithDial(t, "fd00:1234::/64", func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialAttempted.Store(true)
+			// Block until context deadline expires to simulate unresponsive WireGuard handshake
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		defer cleanup()
+
+		clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
+		if err != nil {
+			t.Fatalf("NewClientTLSConfig failed: %v", err)
+		}
+
+		apiClient := client.NewClient(env.serverAddr, clientTLS, client.WithInternalHostname("snigateway.internal"))
+		sessionID, _, err := apiClient.StartSession(t.Context())
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+		defer env.server.CloseSession(sessionID)
+
+		_, clientPublicKey, err := wireguard.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		putResp, _ := putWireGuard(t, clientTLS, env.serverAddr, sessionID, api.WireGuardRequest{
+			PublicKey: clientPublicKey.String(),
+		})
+		defer putResp.Body.Close()
+		if putResp.StatusCode != http.StatusOK {
+			t.Fatalf("putWireGuard status: %d", putResp.StatusCode)
+		}
+
+		if _, err := apiClient.Register(t.Context(), sessionID, []string{"block.example.com"}); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+
+		poolClient, poolBackend := localTCPConnPair(t)
+		if err := env.server.PoolTransport().AddConn(sessionID, poolClient); err != nil {
+			t.Fatalf("AddConn failed: %v", err)
+		}
+
+		poolDone := make(chan struct{})
+		go func() {
+			defer close(poolDone)
+			handleProxyConnection(t, poolBackend, &backendCert, []byte("block-fallback-reply"))
+		}()
+
+		tlsConn, err := tls.Dial("tcp", env.serverAddr, &tls.Config{
+			ServerName:         "block.example.com",
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			t.Fatalf("tls.Dial failed: %v", err)
+		}
+		defer tlsConn.Close()
+
+		if _, err := tlsConn.Write([]byte("ping-block")); err != nil {
+			t.Fatalf("write to tlsConn: %v", err)
+		}
+
+		buffer := make([]byte, 1024)
+		n, err := tlsConn.Read(buffer)
+		if err != nil {
+			t.Fatalf("read from tlsConn: %v", err)
+		}
+		<-poolDone
+
+		if string(buffer[:n]) != "block-fallback-reply" {
+			t.Errorf("got %q, want %q", string(buffer[:n]), "block-fallback-reply")
+		}
+		if !dialAttempted.Load() {
+			t.Errorf("expected tunnel dial to have been attempted")
+		}
+	})
+
+	t.Run("multiple matching sessions selects first session with peer", func(t *testing.T) {
+		var dialedAddress string
+		var dialMu sync.Mutex
+		doneCh := make(chan struct{})
+
+		env, cleanup := setupTestWireGuardServerWithDial(t, "fd00:1234::/64", func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialMu.Lock()
+			dialedAddress = address
+			dialMu.Unlock()
+
+			clientSide, serverSide := localTCPConnPair(t)
+			go func() {
+				defer close(doneCh)
+				handleProxyConnection(t, serverSide, &backendCert, []byte("multi-ok"))
+			}()
+			return clientSide, nil
+		})
+		defer cleanup()
+
+		clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
+		if err != nil {
+			t.Fatalf("NewClientTLSConfig failed: %v", err)
+		}
+
+		apiClient := client.NewClient(env.serverAddr, clientTLS, client.WithInternalHostname("snigateway.internal"))
+
+		// Session 1: No peer
+		sessionID1, _, err := apiClient.StartSession(t.Context())
+		if err != nil {
+			t.Fatalf("StartSession 1 failed: %v", err)
+		}
+		defer env.server.CloseSession(sessionID1)
+		if _, err := apiClient.Register(t.Context(), sessionID1, []string{"multi.example.com"}); err != nil {
+			t.Fatalf("Register 1 failed: %v", err)
+		}
+
+		// Session 2: Has peer
+		sessionID2, _, err := apiClient.StartSession(t.Context())
+		if err != nil {
+			t.Fatalf("StartSession 2 failed: %v", err)
+		}
+		defer env.server.CloseSession(sessionID2)
+		if _, err := apiClient.Register(t.Context(), sessionID2, []string{"multi.example.com"}); err != nil {
+			t.Fatalf("Register 2 failed: %v", err)
+		}
+
+		_, clientPublicKey, err := wireguard.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		putResp, wireguardResponse := putWireGuard(t, clientTLS, env.serverAddr, sessionID2, api.WireGuardRequest{
+			PublicKey: clientPublicKey.String(),
+		})
+		defer putResp.Body.Close()
+		if putResp.StatusCode != http.StatusOK {
+			t.Fatalf("putWireGuard 2 status: %d", putResp.StatusCode)
+		}
+
+		expectedAddress := net.JoinHostPort(wireguardResponse.PeerAddress, strconv.Itoa(api.WireGuardTunnelPort))
+
+		tlsConn, err := tls.Dial("tcp", env.serverAddr, &tls.Config{
+			ServerName:         "multi.example.com",
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			t.Fatalf("tls.Dial failed: %v", err)
+		}
+		defer tlsConn.Close()
+
+		if _, err := tlsConn.Write([]byte("ping-multi")); err != nil {
+			t.Fatalf("write to tlsConn: %v", err)
+		}
+
+		buffer := make([]byte, 1024)
+		n, err := tlsConn.Read(buffer)
+		if err != nil {
+			t.Fatalf("read from tlsConn: %v", err)
+		}
+		<-doneCh
+
+		if string(buffer[:n]) != "multi-ok" {
+			t.Errorf("got %q, want %q", string(buffer[:n]), "multi-ok")
+		}
+
+		dialMu.Lock()
+		if dialedAddress != expectedAddress {
+			t.Errorf("got dialed address %s, want %s (session 2 with peer)", dialedAddress, expectedAddress)
+		}
+		dialMu.Unlock()
+	})
+
+	t.Run("dial failure is rate limited", func(t *testing.T) {
+		env, cleanup := setupTestWireGuardServer(t, "fd00:1234::/64")
+		defer cleanup()
+
+		limiter := rate.NewLimiter(rate.Every(time.Hour), 1)
+		env.server.dialLogLimiter = limiter
+
+		if !env.server.dialLogLimiter.Allow() {
+			t.Errorf("expected first Allow to be true")
+		}
+		if env.server.dialLogLimiter.Allow() {
+			t.Errorf("expected immediate second Allow to be false (rate limited)")
+		}
+	})
 }

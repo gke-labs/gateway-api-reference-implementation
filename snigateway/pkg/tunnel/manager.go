@@ -52,9 +52,10 @@ func WithHTTPSListener(lis *Listener) ManagerOption {
 }
 
 // WithPoolSize sets the number of idle pooled reverse tunnel connections to maintain.
+// A pool size of zero disables pre-dialed reverse tunnel connections.
 func WithPoolSize(size int) ManagerOption {
 	return func(m *Manager) {
-		if size > 0 {
+		if size >= 0 {
 			m.poolSize = size
 		}
 	}
