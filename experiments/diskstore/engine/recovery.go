@@ -56,9 +56,13 @@ type RecoveryResult struct {
 	Buddy             *BuddyAllocator
 	KeyIndex          map[string]KeyIndexEntry
 	EmptyLogicalPages []uint64
-	MaxLSN            uint64
-	NextLogicalPage   uint64
-	RedoStartLSN      uint64
+	// SupersededPages maps a qualified key to older page copies discovered on disk
+	// where that key appeared on more than one page. replayWAL consumes it to clear
+	// each older page at the first record whose LSN is above the older page's LSN.
+	SupersededPages map[string][]KeyIndexEntry
+	MaxLSN          uint64
+	NextLogicalPage uint64
+	RedoStartLSN    uint64
 }
 
 type candidatePageCopy struct {
@@ -337,8 +341,11 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 
 	// Step 3: Scan recovered pages to rebuild key index and empty page list
 	// Item 4: Always keep the copy with the highest LSN when a key appears multiple times.
+	// Older copies on other pages are tracked as superseded so that WAL redo can clear
+	// them even if the key's current page is already up to date.
 	// Sort winning candidates by physical block so chunkBlockReader scans disk sequentially.
 	keyIndex := make(map[string]KeyIndexEntry)
+	supersededPages := make(map[string][]KeyIndexEntry)
 	var emptyPages []uint64
 
 	var sortedCandidates []candidatePageCopy
@@ -377,23 +384,32 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 						}
 						return nil, fmt.Errorf("failed to get slot %d from page %d: %w", s, logicalPage, err)
 					}
+					entry := KeyIndexEntry{
+						LogicalPage: logicalPage,
+						Slot:        s,
+						LSN:         recLSN,
+						NumBlocks:   1,
+						IsOversize:  isOversize,
+					}
+					if isOversize {
+						_, _, fileName, decodeErr := DecodeOversizePointer(val)
+						if decodeErr != nil {
+							return nil, fmt.Errorf("failed to decode oversize pointer in page %d slot %d: %w", logicalPage, s, decodeErr)
+						}
+						entry.OversizeFileName = fileName
+					}
 					existing, exists := keyIndex[k]
-					if !exists || recLSN > existing.LSN {
-						entry := KeyIndexEntry{
-							LogicalPage: logicalPage,
-							Slot:        s,
-							LSN:         recLSN,
-							NumBlocks:   1,
-							IsOversize:  isOversize,
-						}
-						if isOversize {
-							_, _, fileName, decodeErr := DecodeOversizePointer(val)
-							if decodeErr != nil {
-								return nil, fmt.Errorf("failed to decode oversize pointer in page %d slot %d: %w", logicalPage, s, decodeErr)
-							}
-							entry.OversizeFileName = fileName
-						}
+					if !exists {
 						keyIndex[k] = entry
+					} else if existing.LogicalPage == logicalPage {
+						if recLSN > existing.LSN {
+							keyIndex[k] = entry
+						}
+					} else if recLSN > existing.LSN {
+						supersededPages[k] = append(supersededPages[k], existing)
+						keyIndex[k] = entry
+					} else {
+						supersededPages[k] = append(supersededPages[k], entry)
 					}
 				}
 			}
@@ -403,14 +419,24 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 				return nil, fmt.Errorf("failed to decode recovered multi-block page %d: %w", logicalPage, err)
 			}
 			if k != "" { // Active record (not tombstone)
+				entry := KeyIndexEntry{
+					LogicalPage: logicalPage,
+					Slot:        0,
+					LSN:         recLSN,
+					NumBlocks:   cand.numBlocks,
+				}
 				existing, exists := keyIndex[k]
-				if !exists || recLSN > existing.LSN {
-					keyIndex[k] = KeyIndexEntry{
-						LogicalPage: logicalPage,
-						Slot:        0,
-						LSN:         recLSN,
-						NumBlocks:   cand.numBlocks,
+				if !exists {
+					keyIndex[k] = entry
+				} else if existing.LogicalPage == logicalPage {
+					if recLSN > existing.LSN {
+						keyIndex[k] = entry
 					}
+				} else if recLSN > existing.LSN {
+					supersededPages[k] = append(supersededPages[k], existing)
+					keyIndex[k] = entry
+				} else {
+					supersededPages[k] = append(supersededPages[k], entry)
 				}
 			} else {
 				emptyPages = append(emptyPages, logicalPage)
@@ -461,6 +487,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		Buddy:             buddy,
 		KeyIndex:          keyIndex,
 		EmptyLogicalPages: emptyPages,
+		SupersededPages:   supersededPages,
 		MaxLSN:            maxWAL_LSN,
 		NextLogicalPage:   maxRecoveredLogicalPage + 1,
 		RedoStartLSN:      redoStartLSN,
