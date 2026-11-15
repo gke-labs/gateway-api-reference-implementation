@@ -46,24 +46,18 @@ type RegistrationResponse struct {
 
 // WireGuardRequest is sent to PUT /v1/sessions/<id>/wireguard to configure WireGuard for a session.
 type WireGuardRequest struct {
-	Type      string `json:"type,omitempty"`
+	// PublicKey is the client peer's WireGuard public key.
 	PublicKey string `json:"publicKey"`
-	Token     string `json:"token,omitempty"`
 }
 
 // WireGuardResponse contains frontend WireGuard configuration for the session.
 type WireGuardResponse struct {
-	PublicKey   string `json:"publicKey"`
-	Port        int    `json:"port"`
-	ListenPort  int    `json:"listenPort,omitempty"`
-	Address     string `json:"address,omitempty"`
-	PeerAddress string `json:"peerAddress,omitempty"`
-	Prefix      string `json:"prefix"`
+	// PublicKey is the frontend device's WireGuard public key.
+	PublicKey string `json:"publicKey"`
+	// Port is the UDP listen port of the frontend WireGuard device.
+	Port int `json:"port"`
+	// PeerAddress is the IPv6 address inside the tunnel allocated to the client peer.
+	PeerAddress string `json:"peerAddress"`
+	// Prefix is the IPv6 tunnel network prefix.
+	Prefix string `json:"prefix"`
 }
-
-// WireGuardExchangeRequest is an alias for WireGuardRequest.
-type WireGuardExchangeRequest = WireGuardRequest
-
-// WireGuardExchangeResponse is an alias for WireGuardResponse.
-type WireGuardExchangeResponse = WireGuardResponse
-

@@ -36,6 +36,9 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 )
 
+// DefaultWireGuardInterfaceName is the network interface name used for the kernel WireGuard device.
+const DefaultWireGuardInterfaceName = "wg0"
+
 type stringSliceFlag []string
 
 func (f *stringSliceFlag) String() string {
@@ -253,10 +256,10 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("--wireguard-prefix is required when --wireguard-listen-port is set")
 	}
 
-	var wgDevice frontend.WireGuardDevice
-	var wgPubKey wireguard.Key
-	var wgPort int
-	var wgPrefixNet *net.IPNet
+	var wireguardDevice frontend.WireGuardDevice
+	var wireguardPublicKey wireguard.Key
+	var wireguardPort int
+	var wireguardPrefixNet *net.IPNet
 
 	if *wireguardListenPort > 0 {
 		prefixIP, prefixNet, err := net.ParseCIDR(*wireguardPrefix)
@@ -267,33 +270,40 @@ func run(ctx context.Context, args []string) error {
 			return fmt.Errorf("--wireguard-prefix %q must be a /64 prefix (got /%d)", *wireguardPrefix, ones)
 		}
 
-		privKey, pubKey, err := wireguard.GenerateKey()
+		privateKey, publicKey, err := wireguard.GenerateKey()
 		if err != nil {
 			return fmt.Errorf("generating wireguard key: %w", err)
 		}
 
-		firstAddr := make(net.IP, 16)
-		copy(firstAddr, prefixNet.IP.To16())
-		firstAddr[15] = 1
+		firstAddress := make(net.IP, 16)
+		copy(firstAddress, prefixNet.IP.To16())
+		firstAddress[15] = 1
 
-		dev, err := wireguard.OpenDevice(ctx, wireguard.Config{
-			InterfaceName: "wg0",
-			PrivateKey:    privKey,
+		device, err := wireguard.OpenDevice(ctx, wireguard.Config{
+			InterfaceName: DefaultWireGuardInterfaceName,
+			PrivateKey:    privateKey,
 			ListenPort:    *wireguardListenPort,
-			DeviceAddress: firstAddr,
+			DeviceAddress: firstAddress,
 			TunnelPrefix:  prefixNet,
 		})
 		if err != nil {
 			return err
 		}
-		defer dev.Close()
+		defer func() {
+			if err := device.Close(); err != nil {
+				log.Printf("failed to close WireGuard device: %v", err)
+			}
+		}()
 
-		actualPort, err := dev.Port()
+		actualPort, err := device.Port()
 		if err != nil {
 			return err
 		}
 
-		wgDevice, wgPubKey, wgPort, wgPrefixNet = dev, pubKey, actualPort, prefixNet
+		wireguardDevice = device
+		wireguardPublicKey = publicKey
+		wireguardPort = actualPort
+		wireguardPrefixNet = prefixNet
 	}
 
 	srv, err := frontend.NewServer(frontend.ServerConfig{
@@ -307,10 +317,10 @@ func run(ctx context.Context, args []string) error {
 		IdleTimeout:            *idleTimeout,
 		MaxHostnamesPerSession: *maxHostnames,
 		JWTVerifier:            jwtVerifier,
-		WireGuardDevice:        wgDevice,
-		WireGuardPublicKey:     wgPubKey,
-		WireGuardPort:          wgPort,
-		WireGuardPrefix:        wgPrefixNet,
+		WireGuardDevice:        wireguardDevice,
+		WireGuardPublicKey:     wireguardPublicKey,
+		WireGuardPort:          wireguardPort,
+		WireGuardPrefix:        wireguardPrefixNet,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing frontend server: %w", err)

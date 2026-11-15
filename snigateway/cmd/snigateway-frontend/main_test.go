@@ -353,10 +353,8 @@ func TestFrontendCLI_WireGuardFlags(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected run to fail in unprivileged environment, got nil")
 		}
-		// Error should come from wireguard package (e.g. ErrPermission or link creation failure)
-		if !errors.Is(err, wireguard.ErrPermission) && !strings.Contains(err.Error(), "operation not permitted") && !strings.Contains(err.Error(), "wireguard") {
-			t.Fatalf("expected wireguard package error, got: %v", err)
+		if !errors.Is(err, wireguard.ErrPermission) && !errors.Is(err, wireguard.ErrNotSupported) {
+			t.Fatalf("expected wireguard.ErrPermission or wireguard.ErrNotSupported, got: %v", err)
 		}
 	})
 }
-

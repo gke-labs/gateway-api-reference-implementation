@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -79,23 +80,48 @@ func (f *fakeWireGuardDevice) PeerCount() int {
 	return len(f.peers)
 }
 
-func setupTestWireGuardServer(t *testing.T, prefixStr string) (*Server, *fakeWireGuardDevice, wireguard.Key, int, string, *certs.GeneratedCerts, func()) {
-	t.Helper()
-	generated, err := certs.GenerateAll("snigateway.internal", "test-client")
-	if err != nil {
-		t.Fatalf("GenerateAll certs failed: %v", err)
-	}
+type testWireGuardServer struct {
+	server     *Server
+	device     *fakeWireGuardDevice
+	publicKey  wireguard.Key
+	port       int
+	serverAddr string
+	generated  *certs.GeneratedCerts
+}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
-	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+func setupTestWireGuardServer(t *testing.T, prefixStr string, clientCerts ...*certs.GeneratedCerts) (*testWireGuardServer, func()) {
+	t.Helper()
+
+	var defaultGenerated *certs.GeneratedCerts
+	var serverTLS *tls.Config
+
+	if len(clientCerts) == 0 {
+		var err error
+		defaultGenerated, err = certs.GenerateAll("snigateway.internal", "test-client")
+		if err != nil {
+			t.Fatalf("GenerateAll certs failed: %v", err)
+		}
+		serverTLS, err = certs.NewServerTLSConfig(defaultGenerated.CA.CertPEM, defaultGenerated.Server.CertPEM, defaultGenerated.Server.KeyPEM)
+		if err != nil {
+			t.Fatalf("NewServerTLSConfig failed: %v", err)
+		}
+	} else {
+		defaultGenerated = clientCerts[0]
+		caPool := x509.NewCertPool()
+		for _, certPair := range clientCerts {
+			caPool.AppendCertsFromPEM(certPair.CA.CertPEM)
+		}
+		var err error
+		serverTLS, err = certs.NewServerTLSConfigWithCertPool(caPool, clientCerts[0].Server.CertPEM, clientCerts[0].Server.KeyPEM)
+		if err != nil {
+			t.Fatalf("NewServerTLSConfigWithCertPool failed: %v", err)
+		}
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen failed: %v", err)
 	}
-	serverAddr := ln.Addr().String()
 
 	var dev WireGuardDevice
 	var fakeDev *fakeWireGuardDevice
@@ -109,10 +135,12 @@ func setupTestWireGuardServer(t *testing.T, prefixStr string) (*Server, *fakeWir
 		if err != nil {
 			t.Fatalf("GenerateKey failed: %v", err)
 		}
-		_, prefixNet, err = net.ParseCIDR(prefixStr)
+		var cidrNet *net.IPNet
+		_, cidrNet, err = net.ParseCIDR(prefixStr)
 		if err != nil {
 			t.Fatalf("ParseCIDR failed: %v", err)
 		}
+		prefixNet = cidrNet
 	}
 
 	srv, err := NewServer(ServerConfig{
@@ -130,14 +158,25 @@ func setupTestWireGuardServer(t *testing.T, prefixStr string) (*Server, *fakeWir
 	}
 
 	go func() {
-		_ = srv.Serve(ln)
+		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
+			t.Logf("Serve exited: %v", serveErr)
+		}
 	}()
 
 	cleanup := func() {
-		_ = srv.Close()
+		if closeErr := srv.Close(); closeErr != nil {
+			t.Logf("Close returned error: %v", closeErr)
+		}
 	}
 
-	return srv, fakeDev, feKey, fePort, serverAddr, generated, cleanup
+	return &testWireGuardServer{
+		server:     srv,
+		device:     fakeDev,
+		publicKey:  feKey,
+		port:       fePort,
+		serverAddr: ln.Addr().String(),
+		generated:  defaultGenerated,
+	}, cleanup
 }
 
 func putWireGuard(t *testing.T, clientTLS *tls.Config, serverAddr, sessionID string, req api.WireGuardRequest) (*http.Response, *api.WireGuardResponse) {
@@ -147,10 +186,11 @@ func putWireGuard(t *testing.T, clientTLS *tls.Config, serverAddr, sessionID str
 		t.Fatalf("Marshal request failed: %v", err)
 	}
 
-	httpTransport := &http.Transport{
-		TLSClientConfig: clientTLS,
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: clientTLS,
+		},
 	}
-	httpClient := &http.Client{Transport: httpTransport}
 
 	url := fmt.Sprintf("https://%s/v1/sessions/%s/wireguard", serverAddr, sessionID)
 	httpReq, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(body))
@@ -168,15 +208,11 @@ func putWireGuard(t *testing.T, clientTLS *tls.Config, serverAddr, sessionID str
 	var wgResp api.WireGuardResponse
 	if resp.StatusCode == http.StatusOK {
 		defer resp.Body.Close()
-		if err := json.NewDecoder(resp.Body).Decode(&wgResp); err != nil {
-			t.Fatalf("Decode response failed: %v", err)
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&wgResp); decodeErr != nil {
+			t.Fatalf("Decode response failed: %v", decodeErr)
 		}
 	}
 	return resp, &wgResp
-}
-
-func startClientSession(ctx context.Context, t *testing.T, generated *certs.GeneratedCerts, serverAddr string) (*client.Client, string) {
-	return startClientSessionWithCA(ctx, t, generated.CA.CertPEM, generated, serverAddr)
 }
 
 func startClientSessionWithCA(ctx context.Context, t *testing.T, caCertPEM []byte, clientCert *certs.GeneratedCerts, serverAddr string) (*client.Client, string) {
@@ -195,15 +231,15 @@ func startClientSessionWithCA(ctx context.Context, t *testing.T, caCertPEM []byt
 }
 
 func TestWireGuard_Off_Returns404(t *testing.T) {
-	_, _, _, _, serverAddr, generated, cleanup := setupTestWireGuardServer(t, "")
+	env, cleanup := setupTestWireGuardServer(t, "")
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	_, sessID := startClientSession(ctx, t, generated, serverAddr)
+	_, sessID := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
 
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
 	if err != nil {
 		t.Fatalf("NewClientTLSConfig failed: %v", err)
 	}
@@ -213,28 +249,31 @@ func TestWireGuard_Off_Returns404(t *testing.T) {
 		t.Fatalf("GenerateKey failed: %v", err)
 	}
 
-	resp, _ := putWireGuard(t, clientTLS, serverAddr, sessID, api.WireGuardRequest{
+	resp, _ := putWireGuard(t, clientTLS, env.serverAddr, sessID, api.WireGuardRequest{
 		PublicKey: peerKey.String(),
 	})
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusNotFound {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("ReadAll failed: %v", readErr)
+		}
 		t.Fatalf("expected 404 Not Found when WireGuard is off, got: %d, body: %q", resp.StatusCode, string(bodyBytes))
 	}
 }
 
 func TestWireGuard_AddressInsidePrefix(t *testing.T) {
 	prefixStr := "2001:db8:1234:5678::/64"
-	_, dev, feKey, fePort, serverAddr, generated, cleanup := setupTestWireGuardServer(t, prefixStr)
+	env, cleanup := setupTestWireGuardServer(t, prefixStr)
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	_, sessID := startClientSession(ctx, t, generated, serverAddr)
+	_, sessID := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
 
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
 	if err != nil {
 		t.Fatalf("NewClientTLSConfig failed: %v", err)
 	}
@@ -244,7 +283,7 @@ func TestWireGuard_AddressInsidePrefix(t *testing.T) {
 		t.Fatalf("GenerateKey failed: %v", err)
 	}
 
-	resp, wgResp := putWireGuard(t, clientTLS, serverAddr, sessID, api.WireGuardRequest{
+	resp, wgResp := putWireGuard(t, clientTLS, env.serverAddr, sessID, api.WireGuardRequest{
 		PublicKey: peerKey.String(),
 	})
 
@@ -252,28 +291,30 @@ func TestWireGuard_AddressInsidePrefix(t *testing.T) {
 		t.Fatalf("expected 200 OK, got: %d", resp.StatusCode)
 	}
 
-	if wgResp.PublicKey != feKey.String() {
-		t.Errorf("expected frontend public key %s, got %s", feKey.String(), wgResp.PublicKey)
+	if wgResp.PublicKey != env.publicKey.String() {
+		t.Errorf("expected frontend public key %s, got %s", env.publicKey.String(), wgResp.PublicKey)
 	}
-	if wgResp.Port != fePort {
-		t.Errorf("expected port %d, got %d", fePort, wgResp.Port)
+	if wgResp.Port != env.port {
+		t.Errorf("expected port %d, got %d", env.port, wgResp.Port)
 	}
 	if wgResp.Prefix != prefixStr {
 		t.Errorf("expected prefix %s, got %s", prefixStr, wgResp.Prefix)
 	}
 
-	peerIP := net.ParseIP(wgResp.Address)
+	peerIP := net.ParseIP(wgResp.PeerAddress)
 	if peerIP == nil {
-		t.Fatalf("failed to parse returned peer address: %q", wgResp.Address)
+		t.Fatalf("failed to parse returned peer address: %q", wgResp.PeerAddress)
 	}
 
-	_, prefixNet, _ := net.ParseCIDR(prefixStr)
+	_, prefixNet, err := net.ParseCIDR(prefixStr)
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
 	if !prefixNet.Contains(peerIP) {
 		t.Fatalf("returned address %s is not inside prefix %s", peerIP, prefixStr)
 	}
 
-	// Verify fake device received the peer configuration
-	peer, ok := dev.Peer(peerKey)
+	peer, ok := env.device.Peer(peerKey)
 	if !ok {
 		t.Fatalf("peer %s not found on fake device", peerKey)
 	}
@@ -291,16 +332,16 @@ func TestWireGuard_AddressInsidePrefix(t *testing.T) {
 
 func TestWireGuard_TwoSessionsDifferentAddresses(t *testing.T) {
 	prefixStr := "fd00:abcd::/64"
-	_, dev, _, _, serverAddr, generated, cleanup := setupTestWireGuardServer(t, prefixStr)
+	env, cleanup := setupTestWireGuardServer(t, prefixStr)
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	_, sess1 := startClientSession(ctx, t, generated, serverAddr)
-	_, sess2 := startClientSession(ctx, t, generated, serverAddr)
+	_, sess1 := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
+	_, sess2 := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
 
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
 	if err != nil {
 		t.Fatalf("NewClientTLSConfig failed: %v", err)
 	}
@@ -314,43 +355,43 @@ func TestWireGuard_TwoSessionsDifferentAddresses(t *testing.T) {
 		t.Fatalf("GenerateKey key2 failed: %v", err)
 	}
 
-	resp1, wgResp1 := putWireGuard(t, clientTLS, serverAddr, sess1, api.WireGuardRequest{
+	resp1, wgResp1 := putWireGuard(t, clientTLS, env.serverAddr, sess1, api.WireGuardRequest{
 		PublicKey: key1.String(),
 	})
 	if resp1.StatusCode != http.StatusOK {
 		t.Fatalf("session 1 wireguard put failed: %d", resp1.StatusCode)
 	}
 
-	resp2, wgResp2 := putWireGuard(t, clientTLS, serverAddr, sess2, api.WireGuardRequest{
+	resp2, wgResp2 := putWireGuard(t, clientTLS, env.serverAddr, sess2, api.WireGuardRequest{
 		PublicKey: key2.String(),
 	})
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("session 2 wireguard put failed: %d", resp2.StatusCode)
 	}
 
-	if wgResp1.Address == wgResp2.Address {
-		t.Fatalf("expected different addresses for two sessions, got %s for both", wgResp1.Address)
+	if wgResp1.PeerAddress == wgResp2.PeerAddress {
+		t.Fatalf("expected different addresses for two sessions, got %s for both", wgResp1.PeerAddress)
 	}
 
-	if !dev.HasPeer(key1) || !dev.HasPeer(key2) {
+	if !env.device.HasPeer(key1) || !env.device.HasPeer(key2) {
 		t.Fatal("expected fake device to have both peers")
 	}
-	if dev.PeerCount() != 2 {
-		t.Fatalf("expected 2 peers on fake device, got %d", dev.PeerCount())
+	if env.device.PeerCount() != 2 {
+		t.Fatalf("expected 2 peers on fake device, got %d", env.device.PeerCount())
 	}
 }
 
 func TestWireGuard_RepeatedCallKeepsAddressReplacesKey(t *testing.T) {
 	prefixStr := "fd00:1234::/64"
-	_, dev, _, _, serverAddr, generated, cleanup := setupTestWireGuardServer(t, prefixStr)
+	env, cleanup := setupTestWireGuardServer(t, prefixStr)
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	_, sessID := startClientSession(ctx, t, generated, serverAddr)
+	_, sessID := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
 
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
 	if err != nil {
 		t.Fatalf("NewClientTLSConfig failed: %v", err)
 	}
@@ -364,54 +405,50 @@ func TestWireGuard_RepeatedCallKeepsAddressReplacesKey(t *testing.T) {
 		t.Fatalf("GenerateKey key2 failed: %v", err)
 	}
 
-	// First call with key1
-	resp1, wgResp1 := putWireGuard(t, clientTLS, serverAddr, sessID, api.WireGuardRequest{
+	resp1, wgResp1 := putWireGuard(t, clientTLS, env.serverAddr, sessID, api.WireGuardRequest{
 		PublicKey: key1.String(),
 	})
 	if resp1.StatusCode != http.StatusOK {
 		t.Fatalf("initial wireguard call failed: %d", resp1.StatusCode)
 	}
 
-	if !dev.HasPeer(key1) {
+	if !env.device.HasPeer(key1) {
 		t.Fatal("expected device to have key1")
 	}
 
-	// Repeated call for the same session with key2
-	resp2, wgResp2 := putWireGuard(t, clientTLS, serverAddr, sessID, api.WireGuardRequest{
+	resp2, wgResp2 := putWireGuard(t, clientTLS, env.serverAddr, sessID, api.WireGuardRequest{
 		PublicKey: key2.String(),
 	})
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("repeated wireguard call failed: %d", resp2.StatusCode)
 	}
 
-	// Must keep the same address
-	if wgResp1.Address != wgResp2.Address {
-		t.Fatalf("expected address to be preserved across repeated calls, got %s then %s", wgResp1.Address, wgResp2.Address)
+	if wgResp1.PeerAddress != wgResp2.PeerAddress {
+		t.Fatalf("expected address to be preserved across repeated calls, got %s then %s", wgResp1.PeerAddress, wgResp2.PeerAddress)
 	}
 
-	// Old key must be removed, new key must be present on device
-	if dev.HasPeer(key1) {
+	if env.device.HasPeer(key1) {
 		t.Fatal("expected old key1 to be removed from fake device")
 	}
-	if !dev.HasPeer(key2) {
+	if !env.device.HasPeer(key2) {
 		t.Fatal("expected new key2 to be present on fake device")
 	}
-	if dev.PeerCount() != 1 {
-		t.Fatalf("expected exactly 1 peer on device, got %d", dev.PeerCount())
+	if env.device.PeerCount() != 1 {
+		t.Fatalf("expected exactly 1 peer on device, got %d", env.device.PeerCount())
 	}
 }
 
 func TestWireGuard_EndingSessionRemovesPeerAndFreesAddress(t *testing.T) {
 	prefixStr := "fd00:9999::/64"
-	srv, dev, _, _, serverAddr, generated, cleanup := setupTestWireGuardServer(t, prefixStr)
+	env, cleanup := setupTestWireGuardServer(t, prefixStr)
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	_, sess1 := startClientSession(ctx, t, generated, serverAddr)
+	_, sess1 := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
 
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
 	if err != nil {
 		t.Fatalf("NewClientTLSConfig failed: %v", err)
 	}
@@ -421,44 +458,82 @@ func TestWireGuard_EndingSessionRemovesPeerAndFreesAddress(t *testing.T) {
 		t.Fatalf("GenerateKey key1 failed: %v", err)
 	}
 
-	resp1, wgResp1 := putWireGuard(t, clientTLS, serverAddr, sess1, api.WireGuardRequest{
+	resp1, wgResp1 := putWireGuard(t, clientTLS, env.serverAddr, sess1, api.WireGuardRequest{
 		PublicKey: key1.String(),
 	})
 	if resp1.StatusCode != http.StatusOK {
 		t.Fatalf("session 1 wireguard put failed: %d", resp1.StatusCode)
 	}
 
-	if !dev.HasPeer(key1) {
+	if !env.device.HasPeer(key1) {
 		t.Fatal("expected fake device to have key1")
 	}
 
-	// Close session 1
-	srv.CloseSession(sess1)
+	env.server.CloseSession(sess1)
 
-	// Peer must be removed from device
-	if dev.HasPeer(key1) {
+	if env.device.HasPeer(key1) {
 		t.Fatal("expected peer to be removed from fake device when session ends")
 	}
-	if dev.PeerCount() != 0 {
-		t.Fatalf("expected 0 peers on fake device, got %d", dev.PeerCount())
+	if env.device.PeerCount() != 0 {
+		t.Fatalf("expected 0 peers on fake device, got %d", env.device.PeerCount())
 	}
 
-	// Start session 2 and verify it reuses the freed address
-	_, sess2 := startClientSession(ctx, t, generated, serverAddr)
+	_, sess2 := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
 	_, key2, err := wireguard.GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey key2 failed: %v", err)
 	}
 
-	resp2, wgResp2 := putWireGuard(t, clientTLS, serverAddr, sess2, api.WireGuardRequest{
+	resp2, wgResp2 := putWireGuard(t, clientTLS, env.serverAddr, sess2, api.WireGuardRequest{
 		PublicKey: key2.String(),
 	})
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("session 2 wireguard put failed: %d", resp2.StatusCode)
 	}
 
-	if wgResp2.Address != wgResp1.Address {
-		t.Fatalf("expected session 2 to allocate freed address %s, got %s", wgResp1.Address, wgResp2.Address)
+	if wgResp2.PeerAddress != wgResp1.PeerAddress {
+		t.Fatalf("expected session 2 to allocate freed address %s, got %s", wgResp1.PeerAddress, wgResp2.PeerAddress)
+	}
+}
+
+func TestWireGuard_SessionClosedDuringExchange_DoesNotLeakPeer(t *testing.T) {
+	prefixStr := "fd00:8888::/64"
+	env, cleanup := setupTestWireGuardServer(t, prefixStr)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	_, sessID := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
+
+	clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	_, peerKey, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+
+	// Close session right before the exchange runs.
+	env.server.CloseSession(sessID)
+
+	resp, _ := putWireGuard(t, clientTLS, env.serverAddr, sessID, api.WireGuardRequest{
+		PublicKey: peerKey.String(),
+	})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for session closed during/before exchange, got: %d", resp.StatusCode)
+	}
+
+	// Verify no peer was added to the device.
+	if env.device.HasPeer(peerKey) {
+		t.Fatal("expected no peer to be added to fake device when session is closed")
+	}
+	if env.device.PeerCount() != 0 {
+		t.Fatalf("expected 0 peers on device, got: %d", env.device.PeerCount())
 	}
 }
 
@@ -473,55 +548,14 @@ func TestWireGuard_SessionCannotSetAnotherSessionKey(t *testing.T) {
 		t.Fatalf("GenerateAll client-b failed: %v", err)
 	}
 
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(generatedA.CA.CertPEM)
-	caPool.AppendCertsFromPEM(generatedB.CA.CertPEM)
-
-	serverTLS, err := certs.NewServerTLSConfigWithCertPool(caPool, generatedA.Server.CertPEM, generatedA.Server.KeyPEM)
-	if err != nil {
-		t.Fatalf("NewServerTLSConfigWithCertPool failed: %v", err)
-	}
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen failed: %v", err)
-	}
-	serverAddr := ln.Addr().String()
-
-	fakeDev := newFakeWireGuardDevice()
-	_, feKey, err := wireguard.GenerateKey()
-	if err != nil {
-		t.Fatalf("GenerateKey failed: %v", err)
-	}
-	_, prefixNet, err := net.ParseCIDR(prefixStr)
-	if err != nil {
-		t.Fatalf("ParseCIDR failed: %v", err)
-	}
-
-	srv, err := NewServer(ServerConfig{
-		ServerTLSConfig:    serverTLS,
-		InternalHostname:   "snigateway.internal",
-		ConnectTimeout:     5 * time.Second,
-		ReadSNITimeout:     2 * time.Second,
-		WireGuardDevice:    fakeDev,
-		WireGuardPublicKey: feKey,
-		WireGuardPort:      51820,
-		WireGuardPrefix:    prefixNet,
-	})
-	if err != nil {
-		t.Fatalf("NewServer failed: %v", err)
-	}
-	defer srv.Close()
-
-	go func() {
-		_ = srv.Serve(ln)
-	}()
+	env, cleanup := setupTestWireGuardServer(t, prefixStr, generatedA, generatedB)
+	defer cleanup()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	_, sessA := startClientSessionWithCA(ctx, t, generatedA.CA.CertPEM, generatedA, serverAddr)
-	_, sessB := startClientSessionWithCA(ctx, t, generatedA.CA.CertPEM, generatedB, serverAddr)
+	_, sessA := startClientSessionWithCA(ctx, t, generatedA.CA.CertPEM, generatedA, env.serverAddr)
+	_, sessB := startClientSessionWithCA(ctx, t, generatedA.CA.CertPEM, generatedB, env.serverAddr)
 
 	clientTLSA, err := certs.NewClientTLSConfig(generatedA.CA.CertPEM, generatedA.Client.CertPEM, generatedA.Client.KeyPEM, "snigateway.internal")
 	if err != nil {
@@ -542,7 +576,7 @@ func TestWireGuard_SessionCannotSetAnotherSessionKey(t *testing.T) {
 	}
 
 	// Session A registers keyA
-	respA, _ := putWireGuard(t, clientTLSA, serverAddr, sessA, api.WireGuardRequest{
+	respA, _ := putWireGuard(t, clientTLSA, env.serverAddr, sessA, api.WireGuardRequest{
 		PublicKey: keyA.String(),
 	})
 	if respA.StatusCode != http.StatusOK {
@@ -550,7 +584,7 @@ func TestWireGuard_SessionCannotSetAnotherSessionKey(t *testing.T) {
 	}
 
 	// 1. Client B tries to call PUT /v1/sessions/<sessA>/wireguard (identity mismatch) -> 403 Forbidden
-	respMismatched, _ := putWireGuard(t, clientTLSB, serverAddr, sessA, api.WireGuardRequest{
+	respMismatched, _ := putWireGuard(t, clientTLSB, env.serverAddr, sessA, api.WireGuardRequest{
 		PublicKey: keyB.String(),
 	})
 	defer respMismatched.Body.Close()
@@ -559,7 +593,7 @@ func TestWireGuard_SessionCannotSetAnotherSessionKey(t *testing.T) {
 	}
 
 	// 2. Client B tries to register keyA (which belongs to session A) for session B -> 409 Conflict
-	respConflict, _ := putWireGuard(t, clientTLSB, serverAddr, sessB, api.WireGuardRequest{
+	respConflict, _ := putWireGuard(t, clientTLSB, env.serverAddr, sessB, api.WireGuardRequest{
 		PublicKey: keyA.String(),
 	})
 	defer respConflict.Body.Close()
@@ -568,7 +602,7 @@ func TestWireGuard_SessionCannotSetAnotherSessionKey(t *testing.T) {
 	}
 
 	// 3. Client A tries to configure non-existent session -> 404 Not Found
-	respNotFound, _ := putWireGuard(t, clientTLSA, serverAddr, "non-existent-session", api.WireGuardRequest{
+	respNotFound, _ := putWireGuard(t, clientTLSA, env.serverAddr, "non-existent-session", api.WireGuardRequest{
 		PublicKey: keyB.String(),
 	})
 	defer respNotFound.Body.Close()
@@ -579,15 +613,15 @@ func TestWireGuard_SessionCannotSetAnotherSessionKey(t *testing.T) {
 
 func TestWireGuard_InvalidPublicKey(t *testing.T) {
 	prefixStr := "fd00:5555::/64"
-	_, _, _, _, serverAddr, generated, cleanup := setupTestWireGuardServer(t, prefixStr)
+	env, cleanup := setupTestWireGuardServer(t, prefixStr)
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	_, sessID := startClientSession(ctx, t, generated, serverAddr)
+	_, sessID := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
 
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
 	if err != nil {
 		t.Fatalf("NewClientTLSConfig failed: %v", err)
 	}
@@ -603,7 +637,7 @@ func TestWireGuard_InvalidPublicKey(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, _ := putWireGuard(t, clientTLS, serverAddr, sessID, api.WireGuardRequest{
+			resp, _ := putWireGuard(t, clientTLS, env.serverAddr, sessID, api.WireGuardRequest{
 				PublicKey: tc.key,
 			})
 			defer resp.Body.Close()
