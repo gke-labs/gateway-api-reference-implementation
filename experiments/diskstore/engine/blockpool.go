@@ -148,18 +148,10 @@ type BlockPoolOptions struct {
 }
 
 // NewBlockPool initializes a fixed-size block pool backed by a single pointer-free byte arena.
-func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opts ...BlockPoolOptions) *BlockPool {
+func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, options BlockPoolOptions) *BlockPool {
 	numPoolBlocks := DefaultBlockPoolBlocks
-	var cipher Cipher
-	var heapCipher *xts.Cipher
-	var onFailure func(error)
-	if len(opts) > 0 {
-		if opts[0].NumPoolBlocks > 0 {
-			numPoolBlocks = opts[0].NumPoolBlocks
-		}
-		cipher = opts[0].Cipher
-		heapCipher = opts[0].HeapCipher
-		onFailure = opts[0].OnFailure
+	if options.NumPoolBlocks > 0 {
+		numPoolBlocks = options.NumPoolBlocks
 	}
 
 	// Allocate pointer-free byte arena aligned to 4096 bytes without mmap
@@ -182,15 +174,15 @@ func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opt
 		wal:            wal,
 		buddy:          buddy,
 		directIO:       NewDirectIO(),
-		cipher:         cipher,
-		heapCipher:     heapCipher,
+		cipher:         options.Cipher,
+		heapCipher:     options.HeapCipher,
 		dbID:           dbID,
 		numPoolBlocks:  numPoolBlocks,
 		arena:          arena,
 		freePoolBlocks: freePoolBlocks,
 		stagingBuf:     stagingBuf,
 		pageTable:      make(map[uint64]*PageDesc),
-		onFailure:      onFailure,
+		onFailure:      options.OnFailure,
 		bgStop:         make(chan struct{}),
 		bgDone:         make(chan struct{}),
 	}

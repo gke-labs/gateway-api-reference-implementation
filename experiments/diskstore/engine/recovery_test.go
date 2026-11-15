@@ -35,7 +35,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("rec-torn-db-0001"))
 
-	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	heapFile, _ := faultFS.Create("heap.db")
 	buddy := NewBuddyAllocator(512)
 	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
@@ -100,7 +100,7 @@ func TestRecovery_InvalidMagicBlocks(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("rec-foreign-db01"))
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("rec-no-res-db-01"))
 
-	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	heapFile, _ := faultFS.Create("heap.db")
 	buddy := NewBuddyAllocator(512)
 	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
@@ -205,7 +205,7 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("rec-forge-db-001"))
 
-	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	heapFile, _ := faultFS.Create("heap.db")
 	buddy := NewBuddyAllocator(512)
 	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
@@ -541,7 +541,7 @@ func TestRegression_Item4_HighestLSNKeySelection(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("rec-highest-lsn-"))
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -845,7 +845,7 @@ func TestRegression_RecoveryStep6ReuseRule(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("reuse-rule-test1"))
 
-	wal, err := OpenWAL(memFS, "wal", dbID, 0)
+	wal, err := OpenWAL(memFS, "wal", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}

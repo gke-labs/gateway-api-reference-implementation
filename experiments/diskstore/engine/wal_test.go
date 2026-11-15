@@ -61,7 +61,7 @@ func TestWAL_AppendAndIterate(t *testing.T) {
 	}
 
 	// Replay from beginning
-	it, err := NewWALIterator(fs, "wal_dir", dbID, 1)
+	it, err := NewWALIterator(fs, "wal_dir", dbID, 1, WALIteratorOptions{})
 	if err != nil {
 		t.Fatalf("NewWALIterator failed: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestWAL_StopAtBadCRC(t *testing.T) {
 	_ = file.Close()
 
 	// Replay should cleanly stop before corrupted record 4 or 5
-	it, err := NewWALIterator(fs, "wal_dir", dbID, 1)
+	it, err := NewWALIterator(fs, "wal_dir", dbID, 1, WALIteratorOptions{})
 	if err != nil {
 		t.Fatalf("NewWALIterator failed: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestWAL_AppendRecordCompletesWhileWriteOrSyncBlocked(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("wal-test-db-0004"))
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestWAL_AppendRecordCompletesWhileWriteOrSyncBlocked(t *testing.T) {
 	_ = wal.Close()
 
 	// Verify both records are present and recoverable in order
-	it, err := NewWALIterator(faultFS, "wal_dir", dbID, 1)
+	it, err := NewWALIterator(faultFS, "wal_dir", dbID, 1, WALIteratorOptions{})
 	if err != nil {
 		t.Fatalf("NewWALIterator failed: %v", err)
 	}
@@ -609,7 +609,7 @@ func TestWAL_RecordLargerThanBuffer(t *testing.T) {
 		t.Fatalf("Sync failed: %v", err)
 	}
 
-	it, err := NewWALIterator(fs, "wal_dir", dbID, 1)
+	it, err := NewWALIterator(fs, "wal_dir", dbID, 1, WALIteratorOptions{})
 	if err != nil {
 		t.Fatalf("NewWALIterator failed: %v", err)
 	}
@@ -677,7 +677,7 @@ func TestWAL_RecordSpanningBufferSwitch(t *testing.T) {
 	}
 
 	// Replay via iterator and verify exact data integrity
-	it, err := NewWALIterator(fs, "wal_dir", dbID, 1)
+	it, err := NewWALIterator(fs, "wal_dir", dbID, 1, WALIteratorOptions{})
 	if err != nil {
 		t.Fatalf("NewWALIterator failed: %v", err)
 	}
@@ -713,7 +713,7 @@ func TestWAL_PaddingAfterSync(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("wal-pad-sync-001"))
 
-	wal, err := OpenWAL(cfs, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(cfs, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -772,7 +772,7 @@ func TestWAL_PaddingAfterSync(t *testing.T) {
 	}
 
 	// Replay and verify
-	it, err := NewWALIterator(cfs, "wal_dir", dbID, 1)
+	it, err := NewWALIterator(cfs, "wal_dir", dbID, 1, WALIteratorOptions{})
 	if err != nil {
 		t.Fatalf("NewWALIterator failed: %v", err)
 	}
@@ -843,7 +843,7 @@ func TestWAL_SegmentRotation(t *testing.T) {
 	}
 
 	// Replay all records
-	it, err := NewWALIterator(fs, "wal_dir", dbID, 1)
+	it, err := NewWALIterator(fs, "wal_dir", dbID, 1, WALIteratorOptions{})
 	if err != nil {
 		t.Fatalf("NewWALIterator failed: %v", err)
 	}
@@ -1028,7 +1028,7 @@ func TestRegression_WALZeroPaddingRecovery(t *testing.T) {
 	copy(databaseID[:], []byte("wal-zeropad-test"))
 
 	walDirectory := "wal"
-	wal, err := OpenWAL(memoryFS, walDirectory, databaseID, 0)
+	wal, err := OpenWAL(memoryFS, walDirectory, databaseID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -1068,7 +1068,7 @@ func TestRegression_WALZeroPaddingRecovery(t *testing.T) {
 	}
 
 	// Replay WAL using iterator
-	iterator, err := NewWALIterator(memoryFS, walDirectory, databaseID, 1)
+	iterator, err := NewWALIterator(memoryFS, walDirectory, databaseID, 1, WALIteratorOptions{})
 	if err != nil {
 		t.Fatalf("NewWALIterator failed: %v", err)
 	}
