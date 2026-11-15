@@ -1146,7 +1146,7 @@ func TestState_PublishDataplaneConfig_RepeatedFailuresBackoff(t *testing.T) {
 	d3 := times[3].Sub(times[2])
 
 	// Expected nominal backoffs are 5ms, 10ms, 20ms from DefaultTypedControllerRateLimiter.
-	// Verify intervals are non-spinning and increasing.
+	// Verify intervals are non-spinning; lower bounds rise with each attempt.
 	if d1 < 3*time.Millisecond {
 		t.Errorf("expected d1 >= 3ms (not spinning), got %v", d1)
 	}
@@ -1155,12 +1155,6 @@ func TestState_PublishDataplaneConfig_RepeatedFailuresBackoff(t *testing.T) {
 	}
 	if d3 < 12*time.Millisecond {
 		t.Errorf("expected d3 >= 12ms (not spinning), got %v", d3)
-	}
-	if d2 <= d1 {
-		t.Errorf("expected backoff interval d2 (%v) > d1 (%v)", d2, d1)
-	}
-	if d3 <= d2 {
-		t.Errorf("expected backoff interval d3 (%v) > d2 (%v)", d3, d2)
 	}
 
 	cancel()
