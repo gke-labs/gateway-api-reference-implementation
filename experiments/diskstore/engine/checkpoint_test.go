@@ -239,14 +239,14 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		return exists
 	}
 
-	t.Run("checkpoint frees pending runs listed before fsync", func(t *testing.T) {
+	t.Run("checkpoint frees unneeded runs from before fsync", func(t *testing.T) {
 		memFS := NewMemFS()
 		faultFS := NewFaultFS(memFS)
 
 		var dbID [16]byte
 		copy(dbID[:], []byte("chk-df-test-0001"))
 
-		wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+		wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 		if err != nil {
 			t.Fatalf("OpenWAL failed: %v", err)
 		}
@@ -269,7 +269,7 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 			t.Fatalf("Allocate failed: %v", err)
 		}
 
-		bp.listPendingFree(blockRun{block: r1})
+		bp.deferFree(blockRun{block: r1})
 
 		// Checkpoint calls startHeapSync, Sync, and heapSyncSucceeded
 		if _, err := checkpointer.Checkpoint(); err != nil {
@@ -277,18 +277,18 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		}
 
 		if isAllocated(buddy, r1) {
-			t.Fatalf("pending run %d should have been freed by checkpoint fsync", r1)
+			t.Fatalf("run %d should have been freed by checkpoint fsync", r1)
 		}
 	})
 
-	t.Run("failed heap sync during checkpoint does not free pending runs", func(t *testing.T) {
+	t.Run("failed heap sync during checkpoint does not free deferred runs", func(t *testing.T) {
 		memFS := NewMemFS()
 		faultFS := NewFaultFS(memFS)
 
 		var dbID [16]byte
 		copy(dbID[:], []byte("chk-df-test-0002"))
 
-		wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+		wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 		if err != nil {
 			t.Fatalf("OpenWAL failed: %v", err)
 		}
@@ -311,10 +311,18 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 			t.Fatalf("Allocate failed: %v", err)
 		}
 
-		bp.listPendingFree(blockRun{block: r1})
+		bp.deferFree(blockRun{block: r1})
 
-		// Inject sync error into faultFS
-		faultFS.SetSyncError(fmt.Errorf("simulated disk sync error"))
+		// Fail only the heap file's sync
+		heapSyncFailedOnce := false
+		faultFS.SetBeforeSync(func(path string) {
+			if filepath.Base(path) == "heap.db" && !heapSyncFailedOnce {
+				faultFS.SetSyncError(fmt.Errorf("simulated heap sync error"))
+				heapSyncFailedOnce = true
+			} else {
+				faultFS.SetSyncError(nil)
+			}
+		})
 
 		// Checkpoint must fail at heap fsync
 		if _, err := checkpointer.Checkpoint(); err == nil {
@@ -323,11 +331,8 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 
 		// Verify r1 was NOT freed because heapSyncFailed was called
 		if !isAllocated(buddy, r1) {
-			t.Fatalf("pending run %d was freed despite checkpoint heap sync failure", r1)
+			t.Fatalf("run %d was freed despite checkpoint heap sync failure", r1)
 		}
-
-		// Clear sync error
-		faultFS.SetSyncError(nil)
 
 		// Next checkpoint must succeed and free r1
 		if _, err := checkpointer.Checkpoint(); err != nil {
@@ -335,7 +340,7 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		}
 
 		if isAllocated(buddy, r1) {
-			t.Fatalf("pending run %d should have been freed after successful checkpoint", r1)
+			t.Fatalf("run %d should have been freed after successful checkpoint", r1)
 		}
 	})
 }

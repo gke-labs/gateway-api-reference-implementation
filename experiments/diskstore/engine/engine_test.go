@@ -2531,3 +2531,42 @@ func TestOpen_WALMaxSegmentSizeOption(t *testing.T) {
 		}
 	}
 }
+
+func TestEngine_DeferredFreeFailureTransitionsToFailedState(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	storeDir := "test_deferred_free_fail"
+	store, err := Open(WithFS(faultFS), WithDir(storeDir), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	// Queue an unallocated block, which causes buddy.Free to fail during heapSyncSucceeded
+	store.bp.deferFree(blockRun{block: 99999})
+
+	// Checkpoint triggers startHeapSync, heap fsync, and heapSyncSucceeded
+	_, cpErr := store.Checkpoint()
+	if cpErr == nil {
+		t.Fatalf("expected Checkpoint to fail on failed buddy.Free, but it succeeded")
+	}
+
+	// Verify the engine transitioned into its permanent failed state
+	if !store.isFailed() {
+		t.Fatalf("expected store to be in failed state after failed buddy.Free")
+	}
+	if err := store.Err(); !errors.Is(err, ErrFailed) {
+		t.Fatalf("expected ErrFailed from store.Err(), got %v", err)
+	}
+
+	// Subsequent operations must fail with ErrFailed
+	if err := store.Put("table", "k", []byte("v")); !errors.Is(err, ErrFailed) {
+		t.Fatalf("expected ErrFailed from Put on failed store, got %v", err)
+	}
+
+	// Reopen without WithEraseOnError must return "store requires erase" due to FAILED marker
+	_, openErr := Open(WithFS(faultFS), WithDir(storeDir))
+	if openErr == nil || !strings.Contains(openErr.Error(), "store requires erase") {
+		t.Fatalf("expected 'store requires erase' error on reopen of failed store, got %v", openErr)
+	}
+}

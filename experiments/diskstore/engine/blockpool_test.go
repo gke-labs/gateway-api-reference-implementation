@@ -832,18 +832,24 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 		return exists
 	}
 
-	t.Run("listed before fsync starts is freed when that fsync succeeds", func(t *testing.T) {
+	setup := func(t *testing.T) (*BlockPool, *BuddyAllocator) {
+		t.Helper()
 		memFS := NewMemFS()
 		heapFile, err := memFS.Create("heap.db")
 		if err != nil {
 			t.Fatalf("Create heap file failed: %v", err)
 		}
-		defer heapFile.Close()
+		t.Cleanup(func() { _ = heapFile.Close() })
 
 		buddy := NewBuddyAllocator(512)
 		var dbID [16]byte
 		bp := NewBlockPool(heapFile, nil, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 4})
-		defer bp.Close()
+		t.Cleanup(func() { _ = bp.Close() })
+		return bp, buddy
+	}
+
+	t.Run("unneeded before fsync starts is freed when that fsync succeeds", func(t *testing.T) {
+		bp, buddy := setup(t)
 
 		r1, err := buddy.Allocate(0)
 		if err != nil {
@@ -853,15 +859,15 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 			t.Fatalf("expected block %d to be allocated", r1)
 		}
 
-		// List run as pending before fsync starts
-		bp.listPendingFree(blockRun{block: r1})
+		// Queue run to be freed before fsync starts
+		bp.deferFree(blockRun{block: r1})
 
 		// Run has not been freed yet
 		if !isAllocated(buddy, r1) {
 			t.Fatalf("run %d was freed prematurely before fsync started", r1)
 		}
 
-		// Fsync starts: current rotates to prior
+		// Fsync starts: unsynced rotates to syncing
 		bp.startHeapSync()
 
 		// Run is still not freed
@@ -869,7 +875,7 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 			t.Fatalf("run %d was freed prematurely before fsync succeeded", r1)
 		}
 
-		// Fsync succeeds: prior is freed
+		// Fsync succeeds: syncing is freed
 		if err := bp.heapSyncSucceeded(); err != nil {
 			t.Fatalf("heapSyncSucceeded failed: %v", err)
 		}
@@ -879,27 +885,17 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 			t.Fatalf("run %d should be freed after fsync succeeded", r1)
 		}
 
-		// Verify prior and current are empty
+		// Verify syncing and unsynced are empty
 		bp.mu.Lock()
-		priorLen, currLen := len(bp.prior), len(bp.current)
+		syncingLen, unsyncedLen := len(bp.deferredFreesSyncing), len(bp.deferredFreesUnsynced)
 		bp.mu.Unlock()
-		if priorLen != 0 || currLen != 0 {
-			t.Fatalf("expected prior=0, current=0, got prior=%d, current=%d", priorLen, currLen)
+		if syncingLen != 0 || unsyncedLen != 0 {
+			t.Fatalf("expected syncing=0, unsynced=0, got syncing=%d, unsynced=%d", syncingLen, unsyncedLen)
 		}
 	})
 
-	t.Run("listed while fsync runs is not freed by that fsync and is freed by the next", func(t *testing.T) {
-		memFS := NewMemFS()
-		heapFile, err := memFS.Create("heap.db")
-		if err != nil {
-			t.Fatalf("Create heap file failed: %v", err)
-		}
-		defer heapFile.Close()
-
-		buddy := NewBuddyAllocator(512)
-		var dbID [16]byte
-		bp := NewBlockPool(heapFile, nil, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 4})
-		defer bp.Close()
+	t.Run("unneeded while fsync runs is not freed by that fsync and is freed by the next", func(t *testing.T) {
+		bp, buddy := setup(t)
 
 		r1, err := buddy.Allocate(0)
 		if err != nil {
@@ -910,14 +906,14 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 			t.Fatalf("Allocate failed: %v", err)
 		}
 
-		// List r1 before fsync 1 starts
-		bp.listPendingFree(blockRun{block: r1})
+		// Queue r1 before fsync 1 starts
+		bp.deferFree(blockRun{block: r1})
 
-		// Fsync 1 starts: r1 moves to prior, current is empty
+		// Fsync 1 starts: r1 moves to syncing, unsynced is empty
 		bp.startHeapSync()
 
-		// List r2 while fsync 1 is running: r2 appends to current
-		bp.listPendingFree(blockRun{block: r2})
+		// Queue r2 while fsync 1 is running: r2 appends to unsynced
+		bp.deferFree(blockRun{block: r2})
 
 		// Fsync 1 succeeds: r1 is freed, r2 is not
 		if err := bp.heapSyncSucceeded(); err != nil {
@@ -931,7 +927,7 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 			t.Fatalf("r2 %d was freed prematurely by fsync 1", r2)
 		}
 
-		// Fsync 2 starts: r2 moves to prior
+		// Fsync 2 starts: r2 moves to syncing
 		bp.startHeapSync()
 
 		// Fsync 2 succeeds: r2 is freed
@@ -945,17 +941,7 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 	})
 
 	t.Run("failed fsync frees nothing and next successful fsync frees both generations", func(t *testing.T) {
-		memFS := NewMemFS()
-		heapFile, err := memFS.Create("heap.db")
-		if err != nil {
-			t.Fatalf("Create heap file failed: %v", err)
-		}
-		defer heapFile.Close()
-
-		buddy := NewBuddyAllocator(512)
-		var dbID [16]byte
-		bp := NewBlockPool(heapFile, nil, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 4})
-		defer bp.Close()
+		bp, buddy := setup(t)
 
 		r1, err := buddy.Allocate(0)
 		if err != nil {
@@ -966,14 +952,14 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 			t.Fatalf("Allocate failed: %v", err)
 		}
 
-		// List r1 before fsync 1 starts
-		bp.listPendingFree(blockRun{block: r1})
+		// Queue r1 before fsync 1 starts
+		bp.deferFree(blockRun{block: r1})
 
-		// Fsync 1 starts: r1 moves to prior
+		// Fsync 1 starts: r1 moves to syncing
 		bp.startHeapSync()
 
-		// List r2 while fsync 1 is running: r2 appends to current
-		bp.listPendingFree(blockRun{block: r2})
+		// Queue r2 while fsync 1 is running: r2 appends to unsynced
+		bp.deferFree(blockRun{block: r2})
 
 		// Fsync 1 fails: release nothing
 		bp.heapSyncFailed()
@@ -986,7 +972,7 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 			t.Fatalf("r2 %d was freed despite fsync 1 failure", r2)
 		}
 
-		// Fsync 2 starts: prior keeps r1, current (r2) is appended to prior
+		// Fsync 2 starts: syncing keeps r1, unsynced (r2) is appended to syncing
 		bp.startHeapSync()
 
 		// Fsync 2 succeeds: both r1 and r2 are freed
@@ -1003,17 +989,7 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 	})
 
 	t.Run("each run is freed once", func(t *testing.T) {
-		memFS := NewMemFS()
-		heapFile, err := memFS.Create("heap.db")
-		if err != nil {
-			t.Fatalf("Create heap file failed: %v", err)
-		}
-		defer heapFile.Close()
-
-		buddy := NewBuddyAllocator(512)
-		var dbID [16]byte
-		bp := NewBlockPool(heapFile, nil, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 4})
-		defer bp.Close()
+		bp, buddy := setup(t)
 
 		r1, err := buddy.Allocate(0)
 		if err != nil {
@@ -1024,9 +1000,9 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 			t.Fatalf("Allocate failed: %v", err)
 		}
 
-		bp.listPendingFree(blockRun{block: r1})
+		bp.deferFree(blockRun{block: r1})
 		bp.startHeapSync()
-		bp.listPendingFree(blockRun{block: r2})
+		bp.deferFree(blockRun{block: r2})
 		if err := bp.heapSyncSucceeded(); err != nil {
 			t.Fatalf("heapSyncSucceeded failed: %v", err)
 		}
@@ -1043,7 +1019,7 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Allocate failed: %v", err)
 		}
-		bp.listPendingFree(blockRun{block: r3})
+		bp.deferFree(blockRun{block: r3})
 		bp.startHeapSync()
 		if err := bp.heapSyncSucceeded(); err != nil {
 			t.Fatalf("heapSyncSucceeded failed: %v", err)
