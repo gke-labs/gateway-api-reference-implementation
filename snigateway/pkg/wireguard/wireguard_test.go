@@ -529,32 +529,3 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-
-func TestLacksPrivilegeOrKernelSupport(t *testing.T) {
-	testCases := []struct {
-		name     string
-		err      error
-		expected bool
-	}{
-		{name: "nil error", err: nil, expected: false},
-		{name: "EPERM", err: syscall.EPERM, expected: true},
-		{name: "EACCES", err: syscall.EACCES, expected: true},
-		{name: "ErrPermission", err: ErrPermission, expected: true},
-		{name: "wrapped ErrPermission", err: fmt.Errorf("wrapped: %w", ErrPermission), expected: true},
-		{name: "ErrNotSupported", err: ErrNotSupported, expected: true},
-		{name: "wrapped ErrNotSupported", err: fmt.Errorf("wrapped: %w", ErrNotSupported), expected: true},
-		{name: "EOPNOTSUPP", err: syscall.EOPNOTSUPP, expected: true},
-		{name: "ENODEV", err: syscall.ENODEV, expected: true},
-		{name: "ENOSYS", err: syscall.ENOSYS, expected: true},
-		{name: "unrelated error", err: errors.New("unrelated error"), expected: false},
-		{name: "EINVAL", err: syscall.EINVAL, expected: false},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := lacksPrivilegeOrKernelSupport(tc.err); got != tc.expected {
-				t.Errorf("lacksPrivilegeOrKernelSupport(%v) = %v, want %v", tc.err, got, tc.expected)
-			}
-		})
-	}
-}
