@@ -15,6 +15,7 @@
 package frontend
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -99,25 +100,25 @@ func (m *WireGuardManager) RemoveSession(sessionID string) {
 	}
 }
 
-func (m *WireGuardManager) isAddressUsedLocked(address net.IP) bool {
-	for _, peer := range m.peersBySession {
-		if peer.address.Equal(address) {
-			return true
-		}
-	}
-	return false
-}
-
 func (m *WireGuardManager) allocateAddressLocked() (net.IP, error) {
 	base := m.prefix.IP.To16()
 	if base == nil {
 		return nil, errors.New("invalid wireguard prefix")
 	}
+	// The prefix is a /64: the first 8 bytes match the network prefix, and the
+	// last 8 bytes are the host number used as the set's key, so all 16 bytes
+	// of each peer address are accounted for.
+	usedHosts := make(map[uint64]struct{}, len(m.peersBySession))
+	for _, peer := range m.peersBySession {
+		if ip := peer.address.To16(); ip != nil && bytes.Equal(ip[:8], base[:8]) {
+			usedHosts[binary.BigEndian.Uint64(ip[8:])] = struct{}{}
+		}
+	}
 	for host := uint64(2); host < math.MaxUint64; host++ {
-		address := make(net.IP, 16)
-		copy(address, base)
-		binary.BigEndian.PutUint64(address[8:], host)
-		if !m.isAddressUsedLocked(address) {
+		if _, used := usedHosts[host]; !used {
+			address := make(net.IP, 16)
+			copy(address, base)
+			binary.BigEndian.PutUint64(address[8:], host)
 			return address, nil
 		}
 	}
