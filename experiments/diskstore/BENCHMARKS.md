@@ -114,3 +114,52 @@ Engines evaluated:
   - Stock / In-Memory Informer stores plain Go structs in memory without encryption in both harnesses.
 - **Caching Semantics under Recompute:** In the measurement suite, BBolt reads use `bboltcache.LazyResolver`, which memoizes deserialized Go object pointers across recomputes by `key@resourceVersion` and evicts unreferenced entries via `FinishRecompute()`. DiskStore reads in the suite call `GetByKey` directly on `kubecache.Indexer`, deserializing and decrypting from disk / block pool on each lookup unless cached by the caller.
 - **Memory Classification & Accounting:** BBolt data pages reside in the operating system page cache via `mmap` (`file` memory in cgroup v2, reclaimable under kernel memory pressure), resulting in small Go heap usage but higher process RSS under load. DiskStore uses direct I/O with a bounded block pool arena, keeping RSS bounded while tracking secondary index keys in Go heap (`anon`).
+
+---
+
+## 4. Engine Write Volume and Amplification (`TestWriteMeasurement`)
+
+### Methodology
+
+Evaluates physical write volume, write operation counts, and sync operations in `experiments/diskstore/engine` using the seeded model-checked workload runner over 2,000 operations across 20 keys with clean closes:
+- **Test Command:**
+  ```bash
+  DISKSTORE_MEASURE=1 go test -v -run ^TestWriteMeasurement$ ./experiments/diskstore/engine
+  ```
+- **Machine & Environment:** AMD EPYC 9B14 (60 vCPUs, 235 GiB RAM, Linux 6.12.110+ x86_64, `go1.27.4 linux/amd64`).
+- **Filesystem Wrapper:** In-memory filesystem (`NewMemFS()`) wrapped by `MeasureFS`, tracking write bytes, write calls, and fsync calls separated by file kind (`heap`, `wal`, `oversize`, `other`).
+- **Engine Configuration:** Uncompressed store (`WithCompressionCodec(CodecNone)`), block pool of 4,096 blocks (16 MiB) sized large enough to hold all 20 keys without buffer eviction.
+- **Workload:** 2,000 random operations (Puts and Deletes) using seed 42. Tested for value sizes of 256 bytes, 2 KiB, 16 KiB, and 256 KiB, both without intermediate checkpoints and with a checkpoint every 1,000 operations. Each case ends with a clean sync and close, reopens the store, and verifies durable contents against an in-memory model map.
+
+### What the Numbers Leave Out
+
+These measurements record bytes handed to the filesystem layer via `File.WriteAt` calls and explicit `File.Sync` operations. They count filesystem-level I/O, not what physical storage devices write:
+- **Underlying File System Journaling & Metadata:** Ext4, XFS, and ZFS perform journaling, allocation bitmap updates, and inode metadata updates that add writes not tracked here.
+- **Device Flash Translation Layer (FTL) & Block Geometry:** Solid-state drives write in flash-page units (typically 4–16 KiB) and erase in flash-block units (several megabytes). Internal FTL garbage collection and wear leveling cause physical device write amplification that depends on drive firmware, wear, and over-provisioning.
+- **Operating System Page Cache:** In non-direct I/O environments, operating system page cache buffering may coalesce or defer flushes before physical syncs.
+
+### Results
+
+| Value Size | Checkpoint Mode | Payload Put | WAL Bytes | Heap Bytes | Write Ratio | Syncs / Op |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| 256 B | No Checkpoint | 357,120 B | 450,560 B | 20,480 B | 1.33 | 0.0050 |
+| 256 B | Checkpoint / 1k ops | 357,120 B | 462,848 B | 32,768 B | 1.40 | 0.0075 |
+| 2 KiB | No Checkpoint | 2,820,096 B | 2,916,352 B | 98,304 B | 1.07 | 0.0050 |
+| 2 KiB | Checkpoint / 1k ops | 2,820,096 B | 2,924,544 B | 167,936 B | 1.10 | 0.0075 |
+| 16 KiB | No Checkpoint | 23,166,976 B | 23,265,280 B | 819,200 B | 1.04 | 0.0055 |
+| 16 KiB | Checkpoint / 1k ops | 23,166,976 B | 23,273,472 B | 1,245,184 B | 1.06 | 0.0080 |
+| 256 KiB | No Checkpoint | 370,671,616 B | 370,810,880 B | 13,107,200 B | 1.04 | 0.0225 |
+| 256 KiB | Checkpoint / 1k ops | 370,671,616 B | 370,823,168 B | 19,922,944 B | 1.05 | 0.0185 |
+
+### Analysis & Comparison to Minimum Write Volume
+
+In a write-ahead logged database engine, the smallest possible write volume for durable storage is:
+1. Exactly one WAL record per modification (containing the operation header, key, and payload).
+2. Exactly one page flush per changed page when committing changes to durable heap storage.
+
+How the measured numbers compare to that minimum:
+
+- **WAL Framing Overhead:** Each WAL record includes a 28-byte record header, table name, key string, CRC32 checksum, and block padding. For 256 B values, this fixed framing overhead accounts for ~26% additional bytes over the raw payload (yielding a 1.33–1.40 write ratio). As value size increases to 2 KiB, 16 KiB, and 256 KiB, payload bytes dominate the WAL records, driving WAL write volume within 1% to 4% of payload bytes put.
+- **Heap Write Coalescing in Memory:** Because the block pool is sized to prevent eviction, dirty pages remain resident in RAM across repeated updates to the same page. Without intermediate checkpoints, pages are flushed to the heap file only once upon clean store shutdown. For 256 B values, 20 keys reside in just a few slotted pages; ~1,400 puts produce only 20,480 bytes of heap writes (~15 bytes per put instead of 4,096 bytes per put), illustrating significant write amortization.
+- **Checkpoint Impact on Heap Flushes:** Checkpoints every 1,000 operations flush and fsync all dirty pages to disk to establish a durability boundary and truncate earlier WAL segments. Keys modified across multiple checkpoint periods must be flushed once per checkpoint period, increasing heap write volume (e.g., from 20 KiB to 32 KiB for 256 B values, and from 13.1 MiB to 19.9 MiB for 256 KiB values).
+- **Amortized Syncs:** DiskStore buffers WAL and heap writes, issuing fsync only during periodic checkpoints and clean shutdown (plus WAL segment rollovers at 64 MiB boundaries for large 256 KiB workloads). Consequently, sync frequency stays extremely low at 0.0050–0.0225 syncs per operation.
