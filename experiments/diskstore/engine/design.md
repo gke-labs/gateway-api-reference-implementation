@@ -292,12 +292,17 @@ Because the engine writes pages out of place, each flush writes a modified page 
 - If a crash occurs before the heap file fsync completes, recovery relies on the older durable location. Overwriting or recycling that location prematurely risks data loss.
 - Only after the heap file fsync confirms that the new copy is durable does the engine release the superseded location back to the allocator for reuse.
 
-The engine enforces the reuse rule by deferring block frees to sync boundaries:
-- **Deferred freeing:** When a page flushes to a new location or is discarded, its superseded disk location moves to a pending free list rather than returning immediately to the allocator.
-- **Sync boundary release:** A pending location becomes reusable only after a heap fsync that started after the location was listed completes successfully. The engine separates pending locations into two generations: those listed before the current fsync started, and those listed since. Completed fsyncs release only the prior generation.
-- **Crash recovery:** If the system crashes before a heap fsync completes, recovery restores the previous durable copy from disk, while unreferenced superseded blocks are safely reclaimed into the allocator's free list.
+To coordinate concurrent flushes and fsyncs, the engine distinguishes three stages of a page's disk location:
+1. **Flushed:** Written to a new disk location, but not yet confirmed durable by a heap fsync.
+2. **Syncing:** Snapshotted at the start of an active heap fsync.
+3. **Durable:** Confirmed durable by a completed heap fsync.
 
-See [Deferred Block Frees](#deferred-block-frees) for the full invariant, race analysis, and implementation lifecycle.
+The engine applies the reuse rule through the following lifecycle:
+- **Flushing:** When a dirty page flushes, it writes to a new disk location. If the page previously wrote to an intermediate un-synced location, the engine frees that intermediate location immediately, unless that location is currently syncing. Keeping syncing locations allocated prevents newer flushes from releasing disk blocks that the ongoing fsync is making durable.
+- **Syncing and Promotion:** When syncing the heap file, the engine snapshots completed flushed locations for all pages that do not have a flush in flight. Skipping pages with an in-flight flush is safe because not promoting is always conservative: the page retains its older durable location on disk until a subsequent sync. Once the heap fsync completes, the engine promotes the snapshotted locations to durable and frees any superseded older locations to the allocator.
+- **Crash Recovery:** If the system crashes before a heap fsync completes, recovery restores the previous durable copy.
+
+A planned change simplifies this lifecycle by deferring block frees to sync boundaries (see [Deferred Block Frees](#deferred-block-frees)).
 
 ### 3. Natural Alignment of Block Runs
 
@@ -409,7 +414,7 @@ In a planned change, the engine frees unneeded disk blocks only at a sync bounda
 
 ### Invariant
 
-The engine frees a block to the allocator only after a heap fsync that started after the block became unneeded has completed successfully.
+The engine frees a block to the allocator only after a heap fsync that started after the block became unneeded has completed successfully. A location becomes unneeded—and is placed on the pending list—only after the write of the copy that supersedes it has returned from disk. Each disk location is listed exactly once.
 
 The engine maintains two generations of pending free locations:
 - **Prior:** locations listed before the current heap fsync started.
@@ -417,58 +422,65 @@ The engine maintains two generations of pending free locations:
 
 When a heap fsync starts, `current` moves to `prior`, and a new empty `current` list receives subsequent entries. When the heap fsync succeeds, the engine frees all locations in `prior` to the buddy allocator.
 
-This invariant implies the reuse rule: a block holding a page's newest durable copy cannot be listed as unneeded until a newer copy is written (or the page is discarded). Because the engine releases a pending block only after an fsync that started after that listing completes, that fsync is guaranteed to flush and make the newer copy durable before the old block is released to the allocator.
+This invariant implies the reuse rule: a block holding a page's newest durable copy cannot be listed as unneeded until a newer copy has been written to disk. Because the engine releases a pending block only after an fsync that started after that listing completes, that fsync writes dirty kernel pages to stable storage, making the newer copy durable before the allocator reassigns the old block.
 
 A reader can check this against three race scenarios:
-- **A page superseded more than once between two fsyncs:** If successive flushes write version 1 to block $A$ and then version 2 to block $B$ before an fsync starts, both the original durable block and block $A$ go to `current`. At the next fsync, both rotate to `prior` and are released together once version 2 is durable. Neither block is freed prematurely.
-- **A flush in flight when an fsync starts:** A flush active when an fsync begins finishes after generation rotation, so its superseded location enters `current`. The running fsync frees only `prior`. The superseded block waits for the subsequent fsync, which starts after the flush finished and makes the new write durable before releasing the old block.
-- **A flush starting while an fsync runs:** Any location superseded while an fsync runs enters `current`. It remains held when the running fsync completes and becomes reusable only after the following fsync finishes.
+- **A page superseded more than once between two fsyncs:** If successive flushes write version 1 to block `A` and then version 2 to block `B` before an fsync starts, the original durable block enters `current` when the flush of `A` completes, and block `A` enters `current` when the flush of `B` completes. At the next fsync, both rotate to `prior` and are released together after the fsync finishes, by which time version 2 is durable. Neither block is freed prematurely.
+- **A flush in flight when an fsync starts:** A flush active when an fsync begins finishes after generation rotation, so its superseded location enters `current`. The running fsync frees only `prior`. The superseded block waits for the subsequent fsync, which starts after the write returned and makes the new copy durable before releasing the old block.
+- **A flush starting while an fsync runs:** Any location superseded when a flush completes while an fsync runs enters `current`. It remains held when the running fsync completes and becomes reusable only after the following fsync finishes.
 
 ### Block Freeing Sites
 
 Under the new rule, every site that frees blocks behaves as follows:
-- **Superseded flushes:** When a page flush completes and supersedes an earlier location, the engine appends the superseded location to the `current` pending list instead of freeing it immediately.
+- **Superseded flushes:** When a page flush completes and supersedes an earlier location, the engine appends the superseded location to `current`.
+- **Reallocated pages (`AllocateNewPage`):** When a page is reallocated or resized in memory, the descriptor carries forward the prior on-disk location. The engine does not list the old location when the page is reallocated in memory; it appends the old location to `current` only when the first flush of the new contents completes on disk.
+- **Pages whose contents are deleted:** Under Invariant 5 (Retention of Logical Page Numbers), deleting all records from a page writes an empty slotted page carrying the deletion's newer LSN; the empty page is the replacement copy. The engine appends the prior location to `current` only when the empty page's flush completes on disk.
 - **Promotion after fsync:** The engine no longer inspects individual descriptors to promote locations or free old durable blocks. Instead, it frees the entire `prior` generation to the allocator at the sync boundary.
-- **Discarded or reallocated pages (`FreePage`, `AllocateNewPage`):** When a page is freed or reallocated with a new size, the engine appends its former disk locations to `current`. They become reusable only after a subsequent sync boundary.
-- **Failed flushes:** If a direct I/O flush returns an error, the engine frees the newly allocated target blocks immediately back to the allocator. Because those blocks were never written or confirmed durable, returning them immediately does not overwrite any durable copy.
-- **Recovery:** Recovery scans the heap, marks winning pages allocated in the buddy allocator, and frees all remaining blocks immediately. It initializes empty pending generations. Unreferenced or abandoned blocks from a prior crash are safe to reuse immediately because winning durable copies are already protected.
+- **Failed flushes:** If a direct I/O flush returns an error, the write did not succeed. The engine frees the newly allocated target blocks immediately back to the allocator. Because those blocks were never written or confirmed durable, returning them immediately does not overwrite any durable copy.
+- **Recovery:** Recovery scans the heap, marks winning pages allocated in the buddy allocator, and frees all remaining blocks immediately. It initializes empty pending generations. Unreferenced or abandoned blocks from a prior crash are reusable immediately because allocator reconstruction protects all winning durable copies.
 
 ### Eliminated State and Concurrency
 
-Deferred frees eliminate complex inference state from `PageDesc`:
+Deferred frees eliminate multi-stage location tracking and flusher wait loops from `PageDesc`:
 - **Descriptor fields:** `FlushedBeforeSync` is removed. `DurableLoc` and `FlushedLoc` collapse into a single disk location field tracking the page's current on-disk position.
-- **Flusher concurrency:** Flushers never wait for a heap fsync. Eviction and idle sweeps proceed concurrently with fsyncs without stalling, because any block superseded during an fsync safely enters `current` rather than being freed prematurely. Flushers synchronize only on the direct I/O staging buffer and file write lock.
+- **Flusher concurrency:** Flushers never wait for a heap fsync. Eviction and idle sweeps proceed concurrently with fsyncs without stalling, because any block superseded during an fsync enters `current` rather than being freed prematurely. Flushers synchronize only on the direct I/O staging buffer and file write lock.
 
 ### Trade-offs and Failure Modes
 
 The design trades disk space headroom for operational simplicity:
 - **Headroom costs:** Blocks remain unusable for up to one sync interval, increasing the heap file's high-water mark during high churn.
 - **Allocator exhaustion:** When the allocator is empty but locations are pending, the engine can either extend the heap file by allocating new blocks at the end, or force a heap fsync to release `prior` pending blocks.
-- **Crash artifacts:** A crash discards the volatile pending lists. Recovery safely reclaims unreferenced blocks into the allocator's free list without WAL logging or on-disk metadata leaks.
-- **Fsync failure:** If a heap fsync fails, the engine does not release `prior`. It merges `prior` back into `current` until a subsequent fsync succeeds, ensuring unconfirmed writes never expose their superseded copies to reuse.
+- **Crash artifacts:** A crash discards the volatile pending lists. Recovery reclaims unreferenced blocks into the allocator's free list without WAL logging or on-disk metadata leaks.
+- **Fsync failure:** If a heap fsync returns an error, the engine transitions to its permanent failed state, matching existing behavior. It does not release `prior`. In the failed state, the engine stops accepting writes and fsyncs, so the volatile pending lists no longer matter. Recovery on restart reconstructs the allocator free list from durable heap headers, preserving winning copies because `prior` was never freed.
 
 ### Checkpoint and FaultFS Interaction
 
-- **Checkpoint and redo start LSN:** Checkpoints compute `redoStartLSN` from dirty pages, flush dirty pages, fsync the heap, release `prior` pending blocks, and record the checkpoint in the WAL. Because blocks superseded before the fsync are freed only after the fsync succeeds, WAL records prior to `redoStartLSN` can be truncated safely: winning copies are durable, and freed blocks will never be needed by redo replay.
-- **Fault filesystem reuse check:** `FaultFS` updates its durable page set during `heapFile.Sync()`. Under deferred frees, pending blocks are released to the allocator only after `Sync()` finishes. Any subsequent write to a reallocated block occurs after `FaultFS` has updated its durable set, satisfying the reuse rule assertion unconditionally with no timing dependencies or special cases.
+- **Checkpoint and redo start LSN:** Once `DurableLoc` and `FlushedLoc` collapse into a single disk location, the dirty page table tracks all pages with un-synced modifications by retaining their `Dirty` flag (and earliest un-synced LSN) until a heap fsync completes, rather than clearing it upon direct I/O completion. When a checkpoint runs, `redoStartLSN` captures the earliest un-synced LSN across all dirty pages. For a page whose flush completes during the checkpoint's fsync, its superseded location enters `current` and is not freed. Its modifications occurred either before the checkpoint snapshot (bounding `redoStartLSN`) or after it (receiving LSNs above `redoStartLSN`). Because the checkpoint truncates only WAL segments strictly prior to `redoStartLSN`, the WAL retains all records needed to replay that page's modifications if a crash occurs before the next fsync makes the new copy durable.
+- **Fault filesystem reuse check:** `FaultFS` updates its durable page set during `heapFile.Sync()`. Under deferred frees, pending blocks are released to the allocator only after `Sync()` finishes. Any subsequent write to a reallocated block occurs after `FaultFS` has updated its durable set, satisfying the reuse rule assertion without timing dependencies or special cases.
 
 ### Maintainer Choices
 
-1. **Allocator exhaustion strategy:** Choose whether an empty allocator with pending blocks extends the heap file or forces an fsync.
-   - *Recommendation:* Extend the heap file when below a maximum configured size to keep write latency predictable; force an fsync only when file expansion is restricted.
-2. **Pending list representation:** Choose between a slice of block runs (`[]uint64` or `[]BlockRun`) versus a bitset.
-   - *Recommendation:* Use a slice of block numbers or runs guarded by the block pool mutex for minimal allocation overhead and $O(1)$ appends.
-3. **Threshold-triggered syncs:** Choose whether a high volume of pending blocks triggers an asynchronous fsync.
+1. **Allocator exhaustion strategy:**
+   - *Option A: Extend the heap file.* Gives up disk space efficiency by growing the file while unreleased blocks remain in pending lists.
+   - *Option B: Force a heap fsync.* Gives up predictable write latency by stalling the allocating writer behind an fsync to reclaim `prior` blocks.
+   - *Recommendation:* Extend the heap file when below a maximum configured size to preserve write latency; force an fsync when file growth is restricted.
+2. **Pending list representation:**
+   - *Option A: Slice of block runs (`[]uint64` or `[]BlockRun`).* Gives up bounded memory overhead under extreme write churn before an fsync runs.
+   - *Option B: Bitset over heap blocks.* Gives up fast slice appends and O(1) clears, requiring full-heap bit scans on sync completion.
+   - *Recommendation:* Use a slice of block numbers or runs guarded by the block pool mutex because typical workloads list fewer than several hundred runs per sync interval, making append and clear fast.
+3. **Threshold-triggered syncs:**
+   - *Option A: Trigger an asynchronous fsync on pending block volume.* Gives up I/O isolation by introducing unscheduled fsync I/O during heavy write bursts.
+   - *Option B: Wait strictly for checkpoint or eviction syncs.* Gives up heap file compactness by allowing pending blocks to accumulate across the entire checkpoint interval.
    - *Recommendation:* Have the idle sweep trigger an fsync if pending blocks exceed a set fraction (such as 25%) of pool capacity to bound disk growth during bursts.
 
 ### Implementation Steps
 
 Migrate the engine in three small, testable steps:
-1. **Add pending lists:** Introduce the `prior` and `current` pending slices to the block pool, with rotation at sync start, batch freeing on sync completion, and merge on sync error. Leave the lists unused by free sites.
+1. **Add pending lists:** Introduce the `prior` and `current` pending slices to the block pool, with rotation at sync start, batch freeing on sync completion, and no release on sync error. Leave the lists unused by free sites.
    - *Verification:* All existing unit tests in `blockpool_test.go` and `engine_test.go` pass.
-2. **Redirect free sites:** Route superseded flush locations, `FreePage`, and `AllocateNewPage` to append to `current`, while keeping failed flushes freeing immediately.
+2. **Redirect free sites:** Route superseded flush locations to append to `current` upon write completion, carry forward prior locations on `AllocateNewPage` until the replacement flush completes, append deleted page locations to `current` when the empty page flush completes, and keep failed flushes freeing immediately.
    - *Verification:* The non-sweep torture configurations (`pool_9_clean_nosweep` through `pool_24_clean_nosweep`, `pool_16_crash_drop`, and `pool_32_val2_alt_crash_clean`) pass.
-3. **Remove legacy fields and flusher wait:** Remove `FlushedBeforeSync`, collapse `DurableLoc` and `FlushedLoc` into a single disk location in `PageDesc`, and remove `bp.syncing` and flusher wait loops.
+3. **Remove legacy fields and flusher wait:** Remove `FlushedBeforeSync`, collapse `DurableLoc` and `FlushedLoc` into a single disk location in `PageDesc`, retain `Dirty` until fsync completion, and remove `bp.syncing` and flusher wait loops. Step 3 moves the deferred freeing text across to replace the three-stage lifecycle and flusher-skipping description in Invariant 2.
    - *Verification:* The previously skipped concurrent sweep configurations (`pool_9_clean_sweep`, `pool_12_clean_sweep`, `pool_16_clean_sweep`, and `pool_24_clean_sweep`) in `TestTortureMatrix` pass for all seeds; remove their skips.
 
 ## File-Backed Values: ByteString
