@@ -38,7 +38,8 @@ func lacksPrivilegeOrKernelSupport(err error) bool {
 	return errors.Is(err, ErrPermission) ||
 		isPermissionError(err) ||
 		errors.Is(err, ErrNotSupported) ||
-		isNotSupportedError(err)
+		isNotSupportedError(err) ||
+		errors.Is(err, errNetnsNotImplemented)
 }
 
 // skipWithoutPrivilegeOrKernelSupport checks err:
@@ -528,4 +529,44 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestLacksPrivilegeOrKernelSupport(t *testing.T) {
+	testCases := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{name: "nil error", err: nil, expected: false},
+		{name: "EPERM", err: syscall.EPERM, expected: true},
+		{name: "EACCES", err: syscall.EACCES, expected: true},
+		{name: "ErrPermission", err: ErrPermission, expected: true},
+		{name: "wrapped ErrPermission", err: fmt.Errorf("wrapped: %w", ErrPermission), expected: true},
+		{name: "ErrNotSupported", err: ErrNotSupported, expected: true},
+		{name: "wrapped ErrNotSupported", err: fmt.Errorf("wrapped: %w", ErrNotSupported), expected: true},
+		{name: "netlink ErrNotImplemented", err: netlink.ErrNotImplemented, expected: true},
+		{name: "netns not implemented", err: errNetnsNotImplemented, expected: true},
+		{name: "wrapped netns not implemented", err: fmt.Errorf("wrapped: %w", errNetnsNotImplemented), expected: true},
+		{name: "EOPNOTSUPP", err: syscall.EOPNOTSUPP, expected: true},
+		{name: "ENODEV", err: syscall.ENODEV, expected: true},
+		{name: "ENOSYS", err: syscall.ENOSYS, expected: true},
+		{name: "unrelated error", err: errors.New("unrelated error"), expected: false},
+		{name: "EINVAL", err: syscall.EINVAL, expected: false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lacksPrivilegeOrKernelSupport(tc.err); got != tc.expected {
+				t.Errorf("lacksPrivilegeOrKernelSupport(%v) = %v, want %v", tc.err, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestSkipWithoutPrivilegeOrKernelSupport_NetnsNotImplemented(t *testing.T) {
+	t.Run("skips when privileges not required", func(t *testing.T) {
+		t.Setenv(requirePrivilegesEnv, "")
+		skipWithoutPrivilegeOrKernelSupport(t, errNetnsNotImplemented, "creating network namespace")
+		t.Fatal("expected test to skip, but continued execution")
+	})
 }
