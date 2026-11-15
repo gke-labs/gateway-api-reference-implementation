@@ -35,8 +35,10 @@ type WireGuardDevice interface {
 
 // wireguardPeer holds the WireGuard key and allocated IPv6 address for a session.
 type wireguardPeer struct {
+	// publicKey is the WireGuard public key of the client peer.
 	publicKey wireguard.Key
-	address   net.IP
+	// address is the IPv6 tunnel address allocated to the client peer.
+	address net.IP
 }
 
 // WireGuardManager manages the WireGuard device, peer allocations, and per-session keys.
@@ -44,14 +46,21 @@ type WireGuardManager struct {
 	// mu guards peersBySession and sessionsByKey. It is not held on the data path.
 	mu sync.Mutex
 
-	device    WireGuardDevice
+	// device is the underlying WireGuard device on which peers are added and removed.
+	device WireGuardDevice
+	// publicKey is the frontend WireGuard interface's public key.
 	publicKey wireguard.Key
-	port      int
-	prefix    *net.IPNet
-	table     *RegistrationTable
+	// port is the UDP port the frontend WireGuard interface listens on.
+	port int
+	// prefix is the IPv6 /64 prefix for addresses inside the WireGuard tunnel.
+	prefix *net.IPNet
+	// table is the registration table tracking active sessions and identities.
+	table *RegistrationTable
 
+	// peersBySession maps each active session ID to its allocated WireGuard peer.
 	peersBySession map[string]wireguardPeer
-	sessionsByKey  map[wireguard.Key]string
+	// sessionsByKey indexes each registered WireGuard public key to its owning session ID.
+	sessionsByKey map[wireguard.Key]string
 }
 
 // NewWireGuardManager creates a new WireGuardManager.
@@ -122,6 +131,9 @@ var (
 )
 
 // ConfigureSessionPeer allocates or preserves a peer address and installs the peer key.
+// The session existence and identity check happens under mu because CloseSession removes
+// the session from the table before it calls RemoveSession, so a session that ends during
+// the exchange is either not found or has its peer removed afterwards.
 func (m *WireGuardManager) ConfigureSessionPeer(sessionID string, clientIdentity ClientIdentity, clientPublicKey wireguard.Key) (api.WireGuardResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

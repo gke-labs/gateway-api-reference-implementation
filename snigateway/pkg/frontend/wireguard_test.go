@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,8 +37,9 @@ import (
 )
 
 type fakeWireGuardDevice struct {
-	mu    sync.Mutex
-	peers map[wireguard.Key]wireguard.Peer
+	mu         sync.Mutex
+	peers      map[wireguard.Key]wireguard.Peer
+	addPeerErr error
 }
 
 func newFakeWireGuardDevice() *fakeWireGuardDevice {
@@ -46,9 +48,18 @@ func newFakeWireGuardDevice() *fakeWireGuardDevice {
 	}
 }
 
+func (f *fakeWireGuardDevice) SetAddPeerError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addPeerErr = err
+}
+
 func (f *fakeWireGuardDevice) AddPeer(peer wireguard.Peer) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.addPeerErr != nil {
+		return f.addPeerErr
+	}
 	f.peers[peer.PublicKey] = peer
 	return nil
 }
@@ -645,5 +656,115 @@ func TestWireGuard_InvalidPublicKey(t *testing.T) {
 				t.Fatalf("expected 400 Bad Request for %s, got: %d", tc.name, resp.StatusCode)
 			}
 		})
+	}
+}
+
+func TestWireGuard_FailedAddPeer(t *testing.T) {
+	prefixStr := "fd00:4444::/64"
+	env, cleanup := setupTestWireGuardServer(t, prefixStr)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	simulatedErr := errors.New("simulated add peer failure")
+
+	// 1. A first exchange that fails leaves no entry behind
+	env.device.SetAddPeerError(simulatedErr)
+
+	_, sess1 := startClientSessionWithCA(ctx, t, env.generated.CA.CertPEM, env.generated, env.serverAddr)
+
+	_, key1, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+
+	resp1, _ := putWireGuard(t, clientTLS, env.serverAddr, sess1, api.WireGuardRequest{
+		PublicKey: key1.String(),
+	})
+	defer resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error when AddPeer fails, got: %d", resp1.StatusCode)
+	}
+	bodyBytes, readErr := io.ReadAll(resp1.Body)
+	if readErr != nil {
+		t.Fatalf("ReadAll failed: %v", readErr)
+	}
+	if !strings.Contains(string(bodyBytes), "internal server error") {
+		t.Errorf("expected fixed internal server error message, got: %q", string(bodyBytes))
+	}
+
+	// Verify no entry was left in device or manager table
+	if env.device.HasPeer(key1) || env.device.PeerCount() != 0 {
+		t.Fatalf("expected no peer left in device after initial AddPeer failure, got %d peers", env.device.PeerCount())
+	}
+
+	// Now clear the error: initial call should succeed and claim the first address
+	env.device.SetAddPeerError(nil)
+
+	respSuccess, wgRespSuccess := putWireGuard(t, clientTLS, env.serverAddr, sess1, api.WireGuardRequest{
+		PublicKey: key1.String(),
+	})
+	if respSuccess.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK after clearing AddPeer error, got: %d", respSuccess.StatusCode)
+	}
+	if !env.device.HasPeer(key1) {
+		t.Fatal("expected device to have key1 after successful exchange")
+	}
+	initialAddr := wgRespSuccess.PeerAddress
+
+	// 2. Replace a session's key with the error set:
+	// check that the session keeps its old key and address in both the table and the device
+	env.device.SetAddPeerError(simulatedErr)
+
+	_, key2, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+
+	respReplaceFail, _ := putWireGuard(t, clientTLS, env.serverAddr, sess1, api.WireGuardRequest{
+		PublicKey: key2.String(),
+	})
+	defer respReplaceFail.Body.Close()
+
+	if respReplaceFail.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error on replacement failure, got: %d", respReplaceFail.StatusCode)
+	}
+
+	// Verify the session keeps its old key and address on the device
+	if !env.device.HasPeer(key1) {
+		t.Fatal("expected device to retain old key1 after failed key replacement")
+	}
+	if env.device.HasPeer(key2) {
+		t.Fatal("expected device not to have key2 after failed key replacement")
+	}
+	peer1, ok := env.device.Peer(key1)
+	if !ok || !peer1.AllowedIPs[0].IP.Equal(net.ParseIP(initialAddr)) {
+		t.Fatalf("expected device to retain old address %s, got: %v", initialAddr, peer1.AllowedIPs)
+	}
+
+	// Verify the manager table still retains key1 and address by attempting key replacement without error:
+	// it should know key1 was the old key and keep initialAddr!
+	env.device.SetAddPeerError(nil)
+	respReplaceOk, wgRespReplaceOk := putWireGuard(t, clientTLS, env.serverAddr, sess1, api.WireGuardRequest{
+		PublicKey: key2.String(),
+	})
+	if respReplaceOk.StatusCode != http.StatusOK {
+		t.Fatalf("expected replacement to succeed after clearing error, got: %d", respReplaceOk.StatusCode)
+	}
+	if wgRespReplaceOk.PeerAddress != initialAddr {
+		t.Fatalf("expected kept address %s, got %s", initialAddr, wgRespReplaceOk.PeerAddress)
+	}
+	if env.device.HasPeer(key1) {
+		t.Fatal("expected old key1 to be removed from device after successful replacement")
+	}
+	if !env.device.HasPeer(key2) {
+		t.Fatal("expected new key2 to be on device after successful replacement")
 	}
 }

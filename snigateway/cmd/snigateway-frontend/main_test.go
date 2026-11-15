@@ -288,11 +288,7 @@ func TestFrontendCLI_ListenHTTPFlag(t *testing.T) {
 }
 
 func TestFrontendCLI_WireGuardFlags(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "frontend-wg-cli-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	certsA, err := certs.GenerateAll("snigateway.internal", "test-client")
 	if err != nil {
@@ -347,6 +343,9 @@ func TestFrontendCLI_WireGuardFlags(t *testing.T) {
 	})
 
 	t.Run("valid flags attempt device open and exit with package error without privileges", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("skipping test that expects WireGuard device creation to fail because process is privileged (running as root); a test should not create links on the host")
+		}
 		args := append([]string{}, baseArgs...)
 		args = append(args, "--wireguard-listen-port=51820", "--wireguard-prefix=fd00::/64")
 		err := run(t.Context(), args)

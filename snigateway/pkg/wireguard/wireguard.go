@@ -48,8 +48,8 @@ func GenerateKey() (Key, Key, error) {
 }
 
 // ParseKey parses a base64-encoded WireGuard key.
-func ParseKey(s string) (Key, error) {
-	return wgtypes.ParseKey(s)
+func ParseKey(encodedKey string) (Key, error) {
+	return wgtypes.ParseKey(encodedKey)
 }
 
 // Config specifies the configuration for opening a kernel WireGuard device.

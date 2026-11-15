@@ -1066,7 +1066,8 @@ func (s *Server) handleWireGuard(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, errKeyInUse):
 			http.Error(w, err.Error(), http.StatusConflict)
 		default:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			klog.Errorf("Frontend: failed to configure WireGuard peer for session %s: %v", sessionID, err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
 		return
 	}
