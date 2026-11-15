@@ -389,6 +389,183 @@ func TestResponder_PreviousAddressAnnouncementNotConflict(t *testing.T) {
 	}
 }
 
+func TestResponder_MultipleAddressUpdatesWithinGracePeriodNotConflict(t *testing.T) {
+	rawConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to bind ephemeral socket: %v", err)
+	}
+	defer rawConn.Close()
+	port := rawConn.LocalAddr().(*net.UDPAddr).Port
+
+	responder, err := NewResponder(ResponderOptions{
+		Port:        port,
+		IPv4Conn:    rawConn,
+		DisableIPv6: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create responder: %v", err)
+	}
+	defer responder.Close()
+
+	conflictCh := make(chan dnsmessage.Resource, 2)
+	responder.SetConflictHandler(func(fqdn string, conflictingRR dnsmessage.Resource) {
+		conflictCh <- conflictingRR
+	})
+
+	// 1. Initial publish: 192.168.1.100 (address A)
+	responder.SetRecord(&RecordSet{
+		FQDN: "example.local.",
+		A:    []net.IP{net.ParseIP("192.168.1.100")},
+		TTL:  60,
+	})
+
+	// 2. First update: 192.168.1.200 (address B)
+	responder.SetRecord(&RecordSet{
+		FQDN: "example.local.",
+		A:    []net.IP{net.ParseIP("192.168.1.200")},
+		TTL:  60,
+	})
+
+	// 3. Second update: 192.168.1.201 (address C)
+	responder.SetRecord(&RecordSet{
+		FQDN: "example.local.",
+		A:    []net.IP{net.ParseIP("192.168.1.201")},
+		TTL:  60,
+	})
+
+	sender, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to create sender socket: %v", err)
+	}
+	defer sender.Close()
+	destination := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
+
+	buildResponsePacket := func(ip [4]byte) []byte {
+		builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+			Response:      true,
+			Authoritative: true,
+		})
+		builder.EnableCompression()
+		if err := builder.StartAnswers(); err != nil {
+			t.Fatalf("builder.StartAnswers: %v", err)
+		}
+		if err := builder.AResource(
+			dnsmessage.ResourceHeader{
+				Name:  dnsmessage.MustNewName("example.local."),
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | CacheFlushBit),
+				TTL:   60,
+			},
+			dnsmessage.AResource{A: ip},
+		); err != nil {
+			t.Fatalf("builder.AResource: %v", err)
+		}
+		data, err := builder.Finish()
+		if err != nil {
+			t.Fatalf("builder.Finish: %v", err)
+		}
+		return data
+	}
+
+	// 4. Send late announcement of the first address (192.168.1.100), then a foreign address (192.168.1.50).
+	// Under RFC 6762 section 9, recent own announcements from prior updates within the grace period
+	// must not be treated as conflicts, while an address never announced still must be.
+	firstAddressData := buildResponsePacket([4]byte{192, 168, 1, 100})
+	if _, err := sender.WriteTo(firstAddressData, destination); err != nil {
+		t.Fatalf("failed to send first address announcement packet: %v", err)
+	}
+
+	foreignData := buildResponsePacket([4]byte{192, 168, 1, 50})
+	if _, err := sender.WriteTo(foreignData, destination); err != nil {
+		t.Fatalf("failed to send foreign conflict packet: %v", err)
+	}
+
+	// 5. Assert that the one conflict reported carries the foreign address without waiting on silence.
+	select {
+	case conflictingRR := <-conflictCh:
+		aResource, ok := conflictingRR.Body.(*dnsmessage.AResource)
+		if !ok {
+			t.Fatalf("expected AResource in conflict, got %+v", conflictingRR.Body)
+		}
+		expectedForeignIP := [4]byte{192, 168, 1, 50}
+		if aResource.A != expectedForeignIP {
+			t.Fatalf("expected conflict for foreign IP %v, got %v", expectedForeignIP, aResource.A)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("expected conflict to be detected for foreign address, but none reported")
+	}
+
+	select {
+	case extra := <-conflictCh:
+		t.Fatalf("unexpected additional conflict reported: %+v", extra)
+	default:
+	}
+}
+
+func TestResponder_RecentAnnouncementsPruningAndBounding(t *testing.T) {
+	rawConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to bind ephemeral socket: %v", err)
+	}
+	defer rawConn.Close()
+
+	responder, err := NewResponder(ResponderOptions{
+		Port:        rawConn.LocalAddr().(*net.UDPAddr).Port,
+		IPv4Conn:    rawConn,
+		DisableIPv6: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create responder: %v", err)
+	}
+	defer responder.Close()
+
+	// Initial publish
+	responder.SetRecord(&RecordSet{
+		FQDN: "bound.local.",
+		A:    []net.IP{net.IPv4(10, 0, 0, 1)},
+		TTL:  60,
+	})
+
+	// Perform 10 address updates
+	for i := 2; i <= 11; i++ {
+		responder.SetRecord(&RecordSet{
+			FQDN: "bound.local.",
+			A:    []net.IP{net.IPv4(10, 0, 0, byte(i))},
+			TTL:  60,
+		})
+	}
+
+	responder.mu.RLock()
+	rec := responder.records["bound.local."]
+	recentCount := len(rec.recentAnnouncements)
+	responder.mu.RUnlock()
+
+	if recentCount > maxRecentAnnouncements {
+		t.Fatalf("expected at most %d recent announcements, got %d", maxRecentAnnouncements, recentCount)
+	}
+
+	// Simulate an entry older than PreviousAddressGracePeriod and ensure it is pruned on next update
+	responder.mu.Lock()
+	rec = responder.records["bound.local."]
+	rec.recentAnnouncements[0].time = time.Now().Add(-2 * PreviousAddressGracePeriod)
+	responder.mu.Unlock()
+
+	responder.SetRecord(&RecordSet{
+		FQDN: "bound.local.",
+		A:    []net.IP{net.IPv4(10, 0, 0, 100)},
+		TTL:  60,
+	})
+
+	responder.mu.RLock()
+	rec = responder.records["bound.local."]
+	for _, entry := range rec.recentAnnouncements {
+		if time.Since(entry.time) >= PreviousAddressGracePeriod {
+			t.Fatalf("found stale entry older than grace period: %+v", entry)
+		}
+	}
+	responder.mu.RUnlock()
+}
+
 func TestProber_RepeatAnnouncementUsesUpdatedRecords(t *testing.T) {
 	rawConn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
