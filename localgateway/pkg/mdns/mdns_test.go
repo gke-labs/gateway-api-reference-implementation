@@ -1191,3 +1191,102 @@ func TestMDNSQueryClassFiltering(t *testing.T) {
 		})
 	}
 }
+
+// TestMDNSSharedHostnameAcrossGateways verifies that when two Gateways claim the same hostname
+// with different IP addresses, the winner is determined deterministically without flapping across updates.
+func TestMDNSSharedHostnameAcrossGateways(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	gw1Key := types.NamespacedName{Namespace: "default", Name: "gw-1"}
+	gw2Key := types.NamespacedName{Namespace: "default", Name: "gw-2"}
+	reconcileCh := make(chan types.NamespacedName, 20)
+
+	rawConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to bind ephemeral socket: %v", err)
+	}
+	defer rawConn.Close()
+	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
+
+	pub, err := NewPublisher(PublisherOptions{
+		Interface:             "lo",
+		Port:                  ephemeralPort,
+		IPv4Conn:              rawConn,
+		DisableIPv6:           true,
+		TTL:                   120,
+		ProbeInterval:         20 * time.Millisecond,
+		ProbeCount:            2,
+		ConflictRetryInterval: 100 * time.Millisecond,
+		AnnounceInterval:      20 * time.Millisecond,
+		EnqueueGateway: func(req types.NamespacedName) {
+			reconcileCh <- req
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create publisher: %v", err)
+	}
+	defer pub.Close()
+	go func() { _ = pub.Start(ctx) }()
+
+	hName := gatewayv1.Hostname("shared.local")
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gw1Key.Namespace, Name: gw1Key.Name, Generation: 1},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Hostname: &hName, Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+		Status: gatewayv1.GatewayStatus{
+			Addresses: []gatewayv1.GatewayStatusAddress{{Type: &ipAddrType, Value: "10.0.0.1"}},
+		},
+	}
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gw2Key.Namespace, Name: gw2Key.Name, Generation: 1},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Hostname: &hName, Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+		Status: gatewayv1.GatewayStatus{
+			Addresses: []gatewayv1.GatewayStatusAddress{{Type: &ipAddrType, Value: "10.0.0.2"}},
+		},
+	}
+
+	// 1. Initial push with both Gateways.
+	// Since keys are sorted by namespace, then name ("gw-1" < "gw-2"):
+	// gw-2 comes last in sort order, so 10.0.0.2 wins deterministically.
+	pub.OnGatewaysUpdate([]*gatewayv1.Gateway{gw1, gw2})
+
+	select {
+	case <-reconcileCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for probe completion")
+	}
+
+	rec, ok := pub.Responder().GetRecord("shared.local.")
+	if !ok {
+		t.Fatalf("expected shared.local. to be published")
+	}
+	if len(rec.A) != 1 || !rec.A[0].Equal(net.ParseIP("10.0.0.2")) {
+		t.Fatalf("expected 10.0.0.2 to win deterministically, got %v", rec.A)
+	}
+
+	// 2. Push again in reverse slice order (gw2, gw1).
+	// Sorted listener keys must still pick gw-2's address without changing.
+	for i := 0; i < 5; i++ {
+		pub.OnGatewaysUpdate([]*gatewayv1.Gateway{gw2, gw1})
+		rec, ok = pub.Responder().GetRecord("shared.local.")
+		if !ok || len(rec.A) != 1 || !rec.A[0].Equal(net.ParseIP("10.0.0.2")) {
+			t.Fatalf("iteration %d: expected address 10.0.0.2 to stay stable, got %v", i, rec.A)
+		}
+	}
+
+	// 3. Remove gw2. gw1 is now the sole claimant, so address updates to 10.0.0.1.
+	pub.OnGatewaysUpdate([]*gatewayv1.Gateway{gw1})
+	rec, ok = pub.Responder().GetRecord("shared.local.")
+	if !ok || len(rec.A) != 1 || !rec.A[0].Equal(net.ParseIP("10.0.0.1")) {
+		t.Fatalf("expected address to update to gw-1's 10.0.0.1 after gw-2 removal, got %v", rec.A)
+	}
+}
+

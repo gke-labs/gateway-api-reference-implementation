@@ -43,14 +43,24 @@ const (
 
 // HostnamePublicationSnapshot provides a read-only snapshot of publication status for a hostname.
 type HostnamePublicationSnapshot struct {
-	FQDN            string
-	Hostname        string
-	State           HostnameState
+	// FQDN is the canonical lower-case hostname ending with a trailing dot.
+	FQDN string
+
+	// Hostname is the raw hostname without a trailing dot.
+	Hostname string
+
+	// State is the current publication state of the hostname.
+	State HostnameState
+
+	// ConflictMessage describes the LAN conflict when State is StateConflict.
 	ConflictMessage string
 }
 
 // ProberOptions configures the mDNS Prober.
 type ProberOptions struct {
+	// Context is an optional parent context for background probe routines.
+	Context context.Context
+
 	// Responder is the mDNS Responder used to send packets and answer queries.
 	Responder *Responder
 
@@ -70,31 +80,58 @@ type ProberOptions struct {
 	AnnounceInterval time.Duration
 
 	// OnStateChange is an optional callback invoked when a hostname changes publication state.
+	// The prober calls OnStateChange without holding its lock, and reports StatePublished and StateConflict only.
 	OnStateChange func(fqdn string, state HostnameState)
 }
 
 type proberEntry struct {
-	fqdn            string // canonical lower-case with trailing dot
-	hostname        string // name without trailing dot
-	state           HostnameState
-	addresses       []net.IP
-	records         []dnsmessage.Resource
+	// fqdn is the canonical lower-case hostname ending with a trailing dot.
+	fqdn string
+
+	// hostname is the raw hostname without a trailing dot.
+	hostname string
+
+	// state is the current publication state of this hostname.
+	state HostnameState
+
+	// addresses contains the IP addresses published for this hostname.
+	addresses []net.IP
+
+	// records contains the compiled DNS resource records for this hostname.
+	records []dnsmessage.Resource
+
+	// conflictMessage describes the LAN conflict when state is StateConflict.
 	conflictMessage string
-	lastConflict    time.Time
-	cancelProbe     context.CancelFunc
+
+	// lastConflict is the timestamp of the most recent conflict event.
+	lastConflict time.Time
+
+	// cancelProbe cancels the active probe context for this entry, if probing.
+	cancelProbe context.CancelFunc
 }
 
 // Prober manages mDNS probing, claiming, announcing, conflict resolution, and withdrawal
 // for a set of hostnames without any dependency on Kubernetes or Gateway API types.
 type Prober struct {
-	opts      ProberOptions
+	// opts holds configuration options for the prober.
+	opts ProberOptions
+
+	// responder is the mDNS responder used to send packets and answer queries.
 	responder *Responder
 
-	mu    sync.RWMutex
-	names map[string]*proberEntry // keyed by canonical lower-case FQDN
+	// mu guards names and serializes state transitions.
+	mu sync.RWMutex
 
-	ctx          context.Context
-	cancel       context.CancelFunc
+	// names maps canonical lower-case FQDNs to their publication state entries.
+	names map[string]*proberEntry
+
+	// ctx is the root context cancelled on shutdown.
+	ctx context.Context
+
+	// cancel cancels ctx to terminate background probe routines.
+	cancel context.CancelFunc
+
+	// shutdownOnce ensures Shutdown executes only once.
 	shutdownOnce sync.Once
 }
 
@@ -119,8 +156,12 @@ func NewProber(opts ProberOptions) (*Prober, error) {
 		opts.AnnounceInterval = 1 * time.Second
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	p := &Prober{
+	parentContext := opts.Context
+	if parentContext == nil {
+		parentContext = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parentContext)
+	prober := &Prober{
 		opts:      opts,
 		responder: opts.Responder,
 		names:     make(map[string]*proberEntry),
@@ -128,14 +169,9 @@ func NewProber(opts ProberOptions) (*Prober, error) {
 		cancel:    cancel,
 	}
 
-	p.responder.SetConflictHandler(p.onConflict)
+	prober.responder.SetConflictHandler(prober.onConflict)
 
-	return p, nil
-}
-
-// Responder returns the underlying mDNS Responder.
-func (p *Prober) Responder() *Responder {
-	return p.responder
+	return prober, nil
 }
 
 // SetNames updates the active set of hostnames and their addresses.
@@ -143,26 +179,26 @@ func (p *Prober) Responder() *Responder {
 // Names no longer in the set are withdrawn with goodbye packets.
 func (p *Prober) SetNames(names map[string][]net.IP) {
 	desired := make(map[string][]net.IP, len(names))
-	rawNames := make(map[string]string, len(names))
-	for name, ips := range names {
+	rawHostnames := make(map[string]string, len(names))
+	for name, addresses := range names {
 		fqdn := strings.ToLower(ToFQDN(name))
-		desired[fqdn] = ips
-		rawNames[fqdn] = strings.TrimSuffix(name, ".")
+		desired[fqdn] = addresses
+		rawHostnames[fqdn] = strings.TrimSuffix(name, ".")
 	}
 
 	p.mu.Lock()
 	// 1. Withdraw names that are no longer in the set
 	var goodbyes []dnsmessage.Resource
-	for fqdn, st := range p.names {
+	for fqdn, entry := range p.names {
 		if _, ok := desired[fqdn]; !ok {
-			if st.cancelProbe != nil {
-				st.cancelProbe()
-				st.cancelProbe = nil
+			if entry.cancelProbe != nil {
+				entry.cancelProbe()
+				entry.cancelProbe = nil
 			}
-			if st.state == StatePublished {
+			if entry.state == StatePublished {
 				p.responder.RemoveRecord(fqdn)
-				if len(st.records) > 0 {
-					goodbyes = append(goodbyes, st.records...)
+				if len(entry.records) > 0 {
+					goodbyes = append(goodbyes, entry.records...)
 				}
 			}
 			delete(p.names, fqdn)
@@ -170,34 +206,34 @@ func (p *Prober) SetNames(names map[string][]net.IP) {
 	}
 
 	// 2. Add new names or update existing names
-	type probeToStart struct {
+	type pendingProbe struct {
 		ctx     context.Context
 		fqdn    string
 		records []dnsmessage.Resource
 	}
-	var probes []probeToStart
-	var announcements [][]dnsmessage.Resource
+	var probesToStart []pendingProbe
+	var announcementsToStart [][]dnsmessage.Resource
 
-	for fqdn, ips := range desired {
-		records, err := BuildRecords(fqdn, ips, p.opts.TTL)
+	for fqdn, addresses := range desired {
+		records, err := BuildRecords(fqdn, addresses, p.opts.TTL)
 		if err != nil {
 			klog.Warningf("failed to build records for %s: %v", fqdn, err)
 			continue
 		}
 
-		st, exists := p.names[fqdn]
+		entry, exists := p.names[fqdn]
 		if !exists {
 			probeCtx, cancel := context.WithCancel(p.ctx)
-			st = &proberEntry{
+			entry = &proberEntry{
 				fqdn:        fqdn,
-				hostname:    rawNames[fqdn],
+				hostname:    rawHostnames[fqdn],
 				state:       StateProbing,
-				addresses:   append([]net.IP(nil), ips...),
+				addresses:   append([]net.IP(nil), addresses...),
 				records:     records,
 				cancelProbe: cancel,
 			}
-			p.names[fqdn] = st
-			probes = append(probes, probeToStart{
+			p.names[fqdn] = entry
+			probesToStart = append(probesToStart, pendingProbe{
 				ctx:     probeCtx,
 				fqdn:    fqdn,
 				records: records,
@@ -206,14 +242,14 @@ func (p *Prober) SetNames(names map[string][]net.IP) {
 		}
 
 		// Existing entry: check if addresses changed
-		if !ipsEqual(st.addresses, ips) {
-			st.addresses = append([]net.IP(nil), ips...)
-			st.records = records
+		if !ipsEqual(entry.addresses, addresses) {
+			entry.addresses = append([]net.IP(nil), addresses...)
+			entry.records = records
 
-			if st.state == StatePublished {
+			if entry.state == StatePublished {
 				var a []net.IP
 				var aaaa []net.IP
-				for _, ip := range ips {
+				for _, ip := range addresses {
 					if ip.To4() != nil {
 						a = append(a, ip.To4())
 					} else if ip.To16() != nil {
@@ -226,7 +262,7 @@ func (p *Prober) SetNames(names map[string][]net.IP) {
 					AAAA: aaaa,
 					TTL:  p.opts.TTL,
 				})
-				announcements = append(announcements, records)
+				announcementsToStart = append(announcementsToStart, records)
 			}
 		}
 	}
@@ -238,13 +274,13 @@ func (p *Prober) SetNames(names map[string][]net.IP) {
 			klog.Warningf("failed to send goodbye packets: %v", err)
 		}
 	}
-	for _, recs := range announcements {
-		if err := p.responder.SendAnnouncement(recs); err != nil {
+	for _, records := range announcementsToStart {
+		if err := p.responder.SendAnnouncement(records); err != nil {
 			klog.Warningf("failed to send announcement: %v", err)
 		}
 	}
-	for _, pr := range probes {
-		go p.runProbe(pr.ctx, pr.fqdn, pr.records)
+	for _, probe := range probesToStart {
+		go p.runProbe(probe.ctx, probe.fqdn, probe.records)
 	}
 }
 
@@ -253,24 +289,20 @@ func (p *Prober) GetHostnameState(fqdn string) (HostnamePublicationSnapshot, boo
 	name := strings.ToLower(ToFQDN(fqdn))
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	st, ok := p.names[name]
+	entry, ok := p.names[name]
 	if !ok {
 		return HostnamePublicationSnapshot{}, false
 	}
 	return HostnamePublicationSnapshot{
-		FQDN:            st.fqdn,
-		Hostname:        st.hostname,
-		State:           st.state,
-		ConflictMessage: st.conflictMessage,
+		FQDN:            entry.fqdn,
+		Hostname:        entry.hostname,
+		State:           entry.state,
+		ConflictMessage: entry.conflictMessage,
 	}, true
 }
 
-// State returns a snapshot of the current publication state for a hostname.
-func (p *Prober) State(fqdn string) (HostnamePublicationSnapshot, bool) {
-	return p.GetHostnameState(fqdn)
-}
-
 // Shutdown cancels active probes and sends goodbye packets for all published names.
+// It leaves records and names in place so that callers can continue to inspect the last state.
 func (p *Prober) Shutdown() error {
 	var err error
 	p.shutdownOnce.Do(func() {
@@ -279,28 +311,21 @@ func (p *Prober) Shutdown() error {
 
 		p.mu.Lock()
 		var allRecords []dnsmessage.Resource
-		for fqdn, st := range p.names {
-			if st.state == StatePublished && len(st.records) > 0 {
-				allRecords = append(allRecords, st.records...)
-				p.responder.RemoveRecord(fqdn)
+		for _, entry := range p.names {
+			if entry.state == StatePublished && len(entry.records) > 0 {
+				allRecords = append(allRecords, entry.records...)
 			}
 		}
-		p.names = make(map[string]*proberEntry)
 		p.mu.Unlock()
 
 		if len(allRecords) > 0 {
-			if gErr := p.responder.SendGoodbye(allRecords); gErr != nil && !isNormalClose(gErr) {
-				klog.Warningf("failed to send goodbye packets on shutdown: %v", gErr)
-				err = gErr
+			if goodbyeErr := p.responder.SendGoodbye(allRecords); goodbyeErr != nil && !isNormalClose(goodbyeErr) {
+				klog.Warningf("failed to send goodbye packets on shutdown: %v", goodbyeErr)
+				err = goodbyeErr
 			}
 		}
 	})
 	return err
-}
-
-// Close stops all active probing and sends goodbyes on shutdown.
-func (p *Prober) Close() error {
-	return p.Shutdown()
 }
 
 // onConflict is invoked by the Responder when a conflict is detected on the LAN.
@@ -308,29 +333,29 @@ func (p *Prober) onConflict(fqdn string, conflictingRR dnsmessage.Resource) {
 	name := strings.ToLower(ToFQDN(fqdn))
 
 	p.mu.Lock()
-	st, ok := p.names[name]
+	entry, ok := p.names[name]
 	if !ok {
 		p.mu.Unlock()
 		return
 	}
 
-	if st.state == StateConflict {
+	if entry.state == StateConflict {
 		p.mu.Unlock()
 		return
 	}
 
-	if st.cancelProbe != nil {
-		st.cancelProbe()
-		st.cancelProbe = nil
+	if entry.cancelProbe != nil {
+		entry.cancelProbe()
+		entry.cancelProbe = nil
 	}
 
-	if st.state == StatePublished {
+	if entry.state == StatePublished {
 		p.responder.RemoveRecord(name)
 	}
 
-	st.state = StateConflict
-	st.lastConflict = time.Now()
-	st.conflictMessage = fmt.Sprintf("Hostname %q conflicts with another host on the LAN: %v", st.hostname, conflictingRR)
+	entry.state = StateConflict
+	entry.lastConflict = time.Now()
+	entry.conflictMessage = fmt.Sprintf("Hostname %q conflicts with another host on the LAN: %v", entry.hostname, conflictingRR)
 	onStateChange := p.opts.OnStateChange
 	p.mu.Unlock()
 
@@ -350,18 +375,18 @@ func (p *Prober) onConflict(fqdn string, conflictingRR dnsmessage.Resource) {
 
 func (p *Prober) retryConflict(fqdn string) {
 	p.mu.Lock()
-	st, ok := p.names[fqdn]
-	if !ok || st.state != StateConflict {
+	entry, ok := p.names[fqdn]
+	if !ok || entry.state != StateConflict {
 		p.mu.Unlock()
 		return
 	}
 
-	st.state = StateProbing
-	st.conflictMessage = ""
+	entry.state = StateProbing
+	entry.conflictMessage = ""
 
 	probeCtx, cancel := context.WithCancel(p.ctx)
-	st.cancelProbe = cancel
-	records := append([]dnsmessage.Resource(nil), st.records...)
+	entry.cancelProbe = cancel
+	records := append([]dnsmessage.Resource(nil), entry.records...)
 	p.mu.Unlock()
 
 	go p.runProbe(probeCtx, fqdn, records)
@@ -396,18 +421,18 @@ func (p *Prober) runProbe(ctx context.Context, fqdn string, proposedRecords []dn
 	}
 
 	p.mu.Lock()
-	st, ok := p.names[fqdn]
-	if !ok || st.state != StateProbing {
+	entry, ok := p.names[fqdn]
+	if !ok || entry.state != StateProbing {
 		p.mu.Unlock()
 		return
 	}
 
-	st.state = StatePublished
-	st.cancelProbe = nil
+	entry.state = StatePublished
+	entry.cancelProbe = nil
 
 	var a []net.IP
 	var aaaa []net.IP
-	for _, ip := range st.addresses {
+	for _, ip := range entry.addresses {
 		if ip.To4() != nil {
 			a = append(a, ip.To4())
 		} else if ip.To16() != nil {
@@ -421,7 +446,7 @@ func (p *Prober) runProbe(ctx context.Context, fqdn string, proposedRecords []dn
 		AAAA: aaaa,
 		TTL:  p.opts.TTL,
 	})
-	records := append([]dnsmessage.Resource(nil), st.records...)
+	records := append([]dnsmessage.Resource(nil), entry.records...)
 	onStateChange := p.opts.OnStateChange
 	p.mu.Unlock()
 
@@ -434,8 +459,8 @@ func (p *Prober) runProbe(ctx context.Context, fqdn string, proposedRecords []dn
 			return
 		case <-time.After(p.opts.AnnounceInterval):
 			p.mu.RLock()
-			entry, exists := p.names[fqdn]
-			stillPublished := exists && entry.state == StatePublished
+			currentEntry, exists := p.names[fqdn]
+			stillPublished := exists && currentEntry.state == StatePublished
 			p.mu.RUnlock()
 			if stillPublished {
 				if err := p.responder.SendAnnouncement(records); err != nil {

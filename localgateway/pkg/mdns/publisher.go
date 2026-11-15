@@ -16,9 +16,9 @@ package mdns
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +111,11 @@ type listenerKey struct {
 	listener gatewayv1.SectionName
 }
 
+type listenerEndpoint struct {
+	fqdn      string
+	addresses []net.IP
+}
+
 // Publisher coordinates mDNS publishing for Kubernetes Gateways.
 // It maps Gateways and listeners to hostnames and addresses, and turns reported publication state into Gateway conditions.
 // Probing and conflict handling are delegated to Prober.
@@ -120,10 +125,9 @@ type Publisher struct {
 	ownResp   bool
 	prober    *Prober
 
-	mu            sync.RWMutex
-	listeners     map[listenerKey]string   // (gw, listenerName) -> FQDN
-	listenerAddrs map[listenerKey][]net.IP // (gw, listenerName) -> IPs
-	gateways      map[types.NamespacedName]map[string]struct{}
+	mu        sync.RWMutex
+	listeners map[listenerKey]listenerEndpoint // (gw, listenerName) -> endpoint
+	gateways  map[types.NamespacedName]map[string]struct{}
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -174,18 +178,18 @@ func NewPublisher(opts PublisherOptions) (*Publisher, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Publisher{
-		opts:          opts,
-		responder:     resp,
-		ownResp:       ownResp,
-		listeners:     make(map[listenerKey]string),
-		listenerAddrs: make(map[listenerKey][]net.IP),
-		gateways:      make(map[types.NamespacedName]map[string]struct{}),
-		ctx:           ctx,
-		cancel:        cancel,
-		done:          make(chan struct{}),
+		opts:      opts,
+		responder: resp,
+		ownResp:   ownResp,
+		listeners: make(map[listenerKey]listenerEndpoint),
+		gateways:  make(map[types.NamespacedName]map[string]struct{}),
+		ctx:       ctx,
+		cancel:    cancel,
+		done:      make(chan struct{}),
 	}
 
 	prober, err := NewProber(ProberOptions{
+		Context:               p.ctx,
 		Responder:             resp,
 		TTL:                   opts.TTL,
 		ProbeInterval:         opts.ProbeInterval,
@@ -211,11 +215,6 @@ func NewPublisher(opts PublisherOptions) (*Publisher, error) {
 // Responder returns the underlying mDNS Responder.
 func (p *Publisher) Responder() *Responder {
 	return p.responder
-}
-
-// Prober returns the underlying mDNS Prober.
-func (p *Publisher) Prober() *Prober {
-	return p.prober
 }
 
 // SetEnqueueGateway sets the callback to enqueue a Gateway for reconciliation.
@@ -250,8 +249,8 @@ func (p *Publisher) onHostnameStateChange(fqdn string, state HostnameState) {
 
 	p.mu.RLock()
 	var affectedGWs []types.NamespacedName
-	for lk, name := range p.listeners {
-		if name == fqdn {
+	for lk, endpoint := range p.listeners {
+		if endpoint.fqdn == fqdn {
 			affectedGWs = append(affectedGWs, lk.gw)
 		}
 	}
@@ -263,16 +262,10 @@ func (p *Publisher) onHostnameStateChange(fqdn string, state HostnameState) {
 // Close stops all active probing and closes the underlying responder.
 func (p *Publisher) Close() error {
 	p.cancel()
-	var errs []error
-	if err := p.prober.Close(); err != nil && !isNormalClose(err) {
-		errs = append(errs, err)
-	}
 	if p.ownResp {
-		if err := p.responder.Close(); err != nil && !isNormalClose(err) {
-			errs = append(errs, err)
-		}
+		return p.responder.Close()
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
 // Start implements manager.Runnable for controller-runtime.
@@ -310,21 +303,21 @@ func (p *Publisher) OnGatewaysUpdate(gateways []*gatewayv1.Gateway) {
 		activeGWs[gwKey] = true
 
 		// 1. Resolve LAN IP addresses from AddressProvider or Gateway status
-		var ips []net.IP
+		var addresses []net.IP
 		if p.opts.AddressProvider != nil {
 			addrs, ready, err := p.opts.AddressProvider.GatewayAddresses(p.ctx, gw, nil)
 			if err == nil && ready {
 				for _, a := range addrs {
 					if ip := net.ParseIP(a.Value); ip != nil {
-						ips = append(ips, ip)
+						addresses = append(addresses, ip)
 					}
 				}
 			}
 		}
-		if len(ips) == 0 {
+		if len(addresses) == 0 {
 			for _, a := range gw.Status.Addresses {
 				if ip := net.ParseIP(a.Value); ip != nil {
-					ips = append(ips, ip)
+					addresses = append(addresses, ip)
 				}
 			}
 		}
@@ -350,8 +343,10 @@ func (p *Publisher) OnGatewaysUpdate(gateways []*gatewayv1.Gateway) {
 			currentGWFQDNs[fqdn] = struct{}{}
 			lk := listenerKey{gw: gwKey, listener: l.Name}
 
-			p.listeners[lk] = fqdn
-			p.listenerAddrs[lk] = ips
+			p.listeners[lk] = listenerEndpoint{
+				fqdn:      fqdn,
+				addresses: addresses,
+			}
 		}
 
 		// 3. Clean up any listeners that were removed from this Gateway
@@ -360,7 +355,6 @@ func (p *Publisher) OnGatewaysUpdate(gateways []*gatewayv1.Gateway) {
 			if lk.gw == gwKey {
 				if _, stillPresent := currentGWListeners[lk.listener]; !stillPresent {
 					delete(p.listeners, lk)
-					delete(p.listenerAddrs, lk)
 				}
 			}
 		}
@@ -373,16 +367,29 @@ func (p *Publisher) OnGatewaysUpdate(gateways []*gatewayv1.Gateway) {
 			for lk := range p.listeners {
 				if lk.gw == gwKey {
 					delete(p.listeners, lk)
-					delete(p.listenerAddrs, lk)
 				}
 			}
 		}
 	}
 
-	// 5. Compute desired set of names with addresses
+	// 5. Compute desired set of names with addresses deterministically by sorting listener keys
+	keys := make([]listenerKey, 0, len(p.listeners))
+	for lk := range p.listeners {
+		keys = append(keys, lk)
+	}
+	slices.SortFunc(keys, func(a, b listenerKey) int {
+		if c := strings.Compare(a.gw.Namespace, b.gw.Namespace); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.gw.Name, b.gw.Name); c != 0 {
+			return c
+		}
+		return strings.Compare(string(a.listener), string(b.listener))
+	})
 	desired := make(map[string][]net.IP)
-	for lk, fqdn := range p.listeners {
-		desired[fqdn] = p.listenerAddrs[lk]
+	for _, lk := range keys {
+		endpoint := p.listeners[lk]
+		desired[endpoint.fqdn] = endpoint.addresses
 	}
 	p.mu.Unlock()
 
