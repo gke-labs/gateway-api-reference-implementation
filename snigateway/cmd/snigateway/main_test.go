@@ -44,6 +44,7 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "proxy-bind-address", DefValue: "", Usage: "Optional HTTP proxy bind address. Disabled by default."},
 		{Name: "token-file", DefValue: "", Usage: "Path to ServiceAccount token file for authentication."},
 		{Name: "tunnel-pool-size", DefValue: "4", Usage: "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend."},
+		{Name: "tunnel-wireguard", DefValue: "false", Usage: "Enable WireGuard tunnel transport to the frontend. Exists only until the TCP pool is removed."},
 	}
 
 	cfg := DefaultConfig()

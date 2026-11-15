@@ -33,6 +33,14 @@ import (
 	"k8s.io/klog/v2"
 )
 
+var (
+	// ErrWireGuardDisabled indicates that the frontend server has WireGuard disabled (returned HTTP 404).
+	ErrWireGuardDisabled = errors.New("frontend wireguard is disabled")
+
+	// ErrWireGuardOff is an alias for ErrWireGuardDisabled.
+	ErrWireGuardOff = ErrWireGuardDisabled
+)
+
 func closeConn(c io.Closer) {
 	if c == nil {
 		return
@@ -272,6 +280,59 @@ func (c *Client) Register(ctx context.Context, sessionID string, hostnames []str
 	}
 
 	return &regResp, nil
+}
+
+// ExchangeWireGuard registers the client WireGuard public key with the frontend for the session
+// and returns the frontend's WireGuard configuration.
+// If the frontend has WireGuard disabled (returns HTTP 404), it returns ErrWireGuardDisabled.
+func (c *Client) ExchangeWireGuard(ctx context.Context, sessionID, publicKey string) (*api.WireGuardResponse, error) {
+	token, err := c.GetToken()
+	if err != nil {
+		return nil, fmt.Errorf("resolving token for wireguard exchange: %w", err)
+	}
+
+	reqBody, err := json.Marshal(api.WireGuardRequest{
+		PublicKey: publicKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshaling wireguard request: %w", err)
+	}
+
+	url := fmt.Sprintf("https://%s/v1/sessions/%s/wireguard", c.internalHostname, sessionID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("creating wireguard request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(api.HeaderSessionID, sessionID)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("performing wireguard exchange request: %w", err)
+	}
+	defer closeConn(resp.Body)
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrWireGuardDisabled
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("wireguard exchange failed with status %d (failed to read body: %w)", resp.StatusCode, err)
+		}
+		return nil, fmt.Errorf("wireguard exchange failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var wgResp api.WireGuardResponse
+	if err := json.NewDecoder(resp.Body).Decode(&wgResp); err != nil {
+		return nil, fmt.Errorf("decoding wireguard response: %w", err)
+	}
+
+	return &wgResp, nil
 }
 
 // DialTunnel dials an mTLS pooled tunnel connection to the frontend for the given sessionID.

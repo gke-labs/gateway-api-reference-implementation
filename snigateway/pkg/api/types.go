@@ -23,6 +23,9 @@ const (
 
 	// HeaderSessionID is the HTTP header used to identify the backend session.
 	HeaderSessionID = "X-Session-ID"
+
+	// WireGuardTunnelPort is the TCP port on which the controller listens inside the WireGuard tunnel.
+	WireGuardTunnelPort = 51821
 )
 
 // SessionResponse is returned upon establishing a backend session.

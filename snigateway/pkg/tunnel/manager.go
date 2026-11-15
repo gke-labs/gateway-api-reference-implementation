@@ -21,13 +21,16 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -37,12 +40,42 @@ const (
 	// DefaultPoolSize is the default number of idle pooled reverse tunnel connections.
 	DefaultPoolSize = 4
 
+	// WireGuardTunnelPort is the TCP port on which the controller listens inside the WireGuard tunnel.
+	WireGuardTunnelPort = api.WireGuardTunnelPort
+
 	// recordTypeHandshake is the TLS record type for a handshake message (0x16).
 	recordTypeHandshake = 0x16
 )
 
+// WireGuardDevice manages peers and device lifecycle on a WireGuard network interface.
+type WireGuardDevice interface {
+	AddPeer(peer wireguard.Peer) error
+	Close() error
+}
+
 // ManagerOption configures a Manager.
 type ManagerOption func(*Manager)
+
+// WithWireGuard enables or disables WireGuard tunnel transport.
+func WithWireGuard(enabled bool) ManagerOption {
+	return func(m *Manager) {
+		m.wireguardEnabled = enabled
+	}
+}
+
+// WithWireGuardDeviceOpener sets a custom opener for the WireGuard device.
+func WithWireGuardDeviceOpener(opener func(ctx context.Context, cfg wireguard.Config) (WireGuardDevice, error)) ManagerOption {
+	return func(m *Manager) {
+		m.deviceOpener = opener
+	}
+}
+
+// WithListenFunc sets a custom network listener function.
+func WithListenFunc(fn func(network, address string) (net.Listener, error)) ManagerOption {
+	return func(m *Manager) {
+		m.listenFunc = fn
+	}
+}
 
 // WithHTTPSListener sets a custom HTTPS Listener for the Manager.
 func WithHTTPSListener(lis *Listener) ManagerOption {
@@ -105,6 +138,10 @@ type Manager struct {
 	lastRegisteredSessionID string
 	stateChangeListeners    []func()
 	reRegTimer              *time.Timer
+
+	wireguardEnabled bool
+	deviceOpener     func(ctx context.Context, cfg wireguard.Config) (WireGuardDevice, error)
+	listenFunc       func(network, address string) (net.Listener, error)
 }
 
 // NewManager creates a new Manager using the given client.
@@ -119,6 +156,10 @@ func NewManager(c *client.Client, opts ...ManagerOption) *Manager {
 		backoffMin:      200 * time.Millisecond,
 		backoffMax:      5 * time.Second,
 		updateCh:        make(chan struct{}, 1),
+		deviceOpener: func(ctx context.Context, cfg wireguard.Config) (WireGuardDevice, error) {
+			return wireguard.OpenDevice(ctx, cfg)
+		},
+		listenFunc: net.Listen,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -364,6 +405,18 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 
 	*backoff = m.backoffMin
 
+	var wgCleanup func()
+	if m.wireguardEnabled {
+		wgCleanup = m.setupWireGuard(sessCtx, sessID)
+		if wgCleanup != nil {
+			defer func() {
+				if wgCleanup != nil {
+					wgCleanup()
+				}
+			}()
+		}
+	}
+
 	m.mu.Lock()
 	m.connected = true
 	m.sessionID = sessID
@@ -375,7 +428,11 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 	m.triggerRegistration()
 
 	m.runPool(sessCtx, sessID, sessErrCh)
-	sessCancel()
+
+	if wgCleanup != nil {
+		wgCleanup()
+		wgCleanup = nil
+	}
 
 	m.mu.Lock()
 	m.connected = false
@@ -392,6 +449,107 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 	case <-ctx.Done():
 		return
 	case <-time.After(*backoff):
+	}
+}
+
+func (m *Manager) setupWireGuard(ctx context.Context, sessionID string) func() {
+	if m.client == nil {
+		return nil
+	}
+
+	privKey, pubKey, err := wireguard.GenerateKey()
+	if err != nil {
+		klog.Errorf("Failed to generate WireGuard key for session %s: %v; continuing with TCP pool only", sessionID, err)
+		return nil
+	}
+
+	resp, err := m.client.ExchangeWireGuard(ctx, sessionID, pubKey.String())
+	if err != nil {
+		if errors.Is(err, client.ErrWireGuardDisabled) {
+			klog.Errorf("Frontend has WireGuard disabled for session %s: %v; continuing with TCP pool only", sessionID, err)
+		} else {
+			klog.Errorf("Failed to exchange WireGuard key with frontend for session %s: %v; continuing with TCP pool only", sessionID, err)
+		}
+		return nil
+	}
+
+	deviceIP := net.ParseIP(resp.PeerAddress)
+	_, prefixNet, prefixErr := net.ParseCIDR(resp.Prefix)
+	if deviceIP == nil || prefixErr != nil || prefixNet == nil {
+		klog.Errorf("Invalid WireGuard configuration received from frontend for session %s (address: %q, prefix: %q); continuing with TCP pool only", sessionID, resp.PeerAddress, resp.Prefix)
+		return nil
+	}
+
+	dev, err := m.deviceOpener(ctx, wireguard.Config{
+		InterfaceName: "wg0",
+		PrivateKey:    privKey,
+		ListenPort:    0,
+		DeviceAddress: deviceIP,
+		TunnelPrefix:  prefixNet,
+	})
+	if err != nil {
+		klog.Errorf("Failed to open WireGuard device for session %s: %v; continuing with TCP pool only", sessionID, err)
+		return nil
+	}
+
+	fePubKey, keyErr := wireguard.ParseKey(resp.PublicKey)
+	feHost := ParseFrontendHost(m.client.ServerAddr())
+	feEndpoint, epErr := net.ResolveUDPAddr("udp", net.JoinHostPort(feHost, strconv.Itoa(resp.Port)))
+	if keyErr != nil || epErr != nil {
+		klog.Errorf("Failed to resolve frontend WireGuard peer for session %s (key err: %v, endpoint err: %v); continuing with TCP pool only", sessionID, keyErr, epErr)
+		_ = dev.Close()
+		return nil
+	}
+
+	feTunnelIP := make(net.IP, 16)
+	copy(feTunnelIP, prefixNet.IP.To16())
+	feTunnelIP[15] = 1
+
+	keepalive := 25 * time.Second
+	peer := wireguard.Peer{
+		PublicKey:           fePubKey,
+		Endpoint:            feEndpoint,
+		AllowedIPs:          []net.IPNet{{IP: feTunnelIP, Mask: net.CIDRMask(128, 128)}},
+		PersistentKeepalive: &keepalive,
+	}
+	if err := dev.AddPeer(peer); err != nil {
+		klog.Errorf("Failed to add frontend WireGuard peer for session %s: %v; continuing with TCP pool only", sessionID, err)
+		_ = dev.Close()
+		return nil
+	}
+
+	tunnelAddr := net.JoinHostPort(resp.PeerAddress, strconv.Itoa(WireGuardTunnelPort))
+	lis, err := m.listenFunc("tcp", tunnelAddr)
+	if err != nil {
+		klog.Errorf("Failed to listen on WireGuard address %s for session %s: %v; continuing with TCP pool only", tunnelAddr, sessionID, err)
+		_ = dev.Close()
+		return nil
+	}
+
+	klog.Infof("Listening on WireGuard tunnel address %s for session %s", tunnelAddr, sessionID)
+
+	go func() {
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				if err := m.handleTunnelConn(c); err != nil && ctx.Err() == nil {
+					klog.V(2).Infof("Error handling tunnel connection: %v", err)
+				}
+			}(conn)
+		}
+	}()
+
+	var closeOnce sync.Once
+	return func() {
+		closeOnce.Do(func() {
+			closeConn(lis)
+			if err := dev.Close(); err != nil {
+				klog.V(2).Infof("Error closing WireGuard device for session %s: %v", sessionID, err)
+			}
+		})
 	}
 }
 
