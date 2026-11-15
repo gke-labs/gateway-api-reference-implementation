@@ -381,11 +381,11 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 
 	// Wait until any in-flight flush finishes and all pins are released on the existing descriptor.
 	for {
-		oldDesc := bp.pageTable[logicalPage]
-		if oldDesc == nil {
+		oldDescriptor := bp.pageTable[logicalPage]
+		if oldDescriptor == nil {
 			break
 		}
-		if !oldDesc.InFlight && oldDesc.PinCount.Load() == 0 {
+		if !oldDescriptor.InFlight && oldDescriptor.PinCount.Load() == 0 {
 			break
 		}
 		bp.cond.Wait()
@@ -400,11 +400,11 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 	// to flush dirty pages. Loop on cond.Wait() while keeping the acquired pool blocks until
 	// the old descriptor is idle, and hold bp.mu without releasing it through the teardown.
 	for {
-		oldDesc := bp.pageTable[logicalPage]
-		if oldDesc == nil {
+		oldDescriptor := bp.pageTable[logicalPage]
+		if oldDescriptor == nil {
 			break
 		}
-		if !oldDesc.InFlight && oldDesc.PinCount.Load() == 0 {
+		if !oldDescriptor.InFlight && oldDescriptor.PinCount.Load() == 0 {
 			break
 		}
 		bp.cond.Wait()
@@ -414,22 +414,22 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 	var oldFlushedBeforeSync uint64 = NoBlock
 	var oldFlushedLoc uint64 = NoBlock
 
-	if oldDesc := bp.pageTable[logicalPage]; oldDesc != nil {
-		if len(oldDesc.PoolBlocks) > 0 {
-			bp.freePoolBlocks = append(bp.freePoolBlocks, oldDesc.PoolBlocks...)
-			oldDesc.PoolBlocks = nil
+	if oldDescriptor := bp.pageTable[logicalPage]; oldDescriptor != nil {
+		if len(oldDescriptor.PoolBlocks) > 0 {
+			bp.freePoolBlocks = append(bp.freePoolBlocks, oldDescriptor.PoolBlocks...)
+			oldDescriptor.PoolBlocks = nil
 		}
 
 		// Defer freeing the old durable location until the new copy is promoted to durable,
 		// fulfilling the Reuse Rule.
-		oldDurableLoc = oldDesc.DurableLoc
-		oldFlushedBeforeSync = oldDesc.FlushedBeforeSync
-		oldFlushedLoc = oldDesc.FlushedLoc
+		oldDurableLoc = oldDescriptor.DurableLoc
+		oldFlushedBeforeSync = oldDescriptor.FlushedBeforeSync
+		oldFlushedLoc = oldDescriptor.FlushedLoc
 
-		oldDesc.DurableLoc = NoBlock
-		oldDesc.FlushedBeforeSync = NoBlock
-		oldDesc.FlushedLoc = NoBlock
-		oldDesc.PhysicalBlock = NoBlock
+		oldDescriptor.DurableLoc = NoBlock
+		oldDescriptor.FlushedBeforeSync = NoBlock
+		oldDescriptor.FlushedLoc = NoBlock
+		oldDescriptor.PhysicalBlock = NoBlock
 	}
 
 	now := time.Now()
