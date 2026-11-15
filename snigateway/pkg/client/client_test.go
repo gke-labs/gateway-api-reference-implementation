@@ -17,6 +17,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"net/http"
 	"testing"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 )
 
 func TestClient_Registration(t *testing.T) {
@@ -157,4 +159,157 @@ func TestTLSSessionResumption_TunnelDial(t *testing.T) {
 		t.Errorf("dial 2 expected DidResume=true, got false")
 	}
 	conn2.Close()
+}
+
+type fakeClientTestWireGuardDevice struct {
+	peers map[wireguard.Key]wireguard.Peer
+}
+
+func (f *fakeClientTestWireGuardDevice) AddPeer(peer wireguard.Peer) error {
+	f.peers[peer.PublicKey] = peer
+	return nil
+}
+
+func (f *fakeClientTestWireGuardDevice) RemovePeer(key wireguard.Key) error {
+	delete(f.peers, key)
+	return nil
+}
+
+func TestClient_ExchangeWireGuard(t *testing.T) {
+	generated, err := certs.GenerateAll("snigateway.internal", "client-test")
+	if err != nil {
+		t.Fatalf("GenerateAll failed: %v", err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	t.Run("WireGuard enabled on frontend", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen failed: %v", err)
+		}
+		defer listener.Close()
+
+		_, feKey, err := wireguard.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		_, prefixNet, err := net.ParseCIDR("fd00::/64")
+		if err != nil {
+			t.Fatalf("ParseCIDR failed: %v", err)
+		}
+
+		fakeDev := &fakeClientTestWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}
+		server, err := frontend.NewServer(frontend.ServerConfig{
+			ServerTLSConfig:    serverTLS,
+			WireGuardDevice:    fakeDev,
+			WireGuardPublicKey: feKey,
+			WireGuardPort:      51820,
+			WireGuardPrefix:    prefixNet,
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		serverErrCh := make(chan error, 1)
+		go func() {
+			serverErrCh <- server.Serve(listener)
+		}()
+		defer func() {
+			if err := server.Close(); err != nil {
+				t.Errorf("server.Close failed: %v", err)
+			}
+			if err := <-serverErrCh; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+				t.Errorf("server.Serve failed: %v", err)
+			}
+		}()
+
+		c := NewClient(listener.Addr().String(), clientTLS)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		sessID, _, err := c.StartSession(ctx)
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+
+		_, clientKey, err := wireguard.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+
+		resp, err := c.ExchangeWireGuard(ctx, sessID, clientKey.String())
+		if err != nil {
+			t.Fatalf("ExchangeWireGuard failed: %v", err)
+		}
+
+		if resp.PublicKey != feKey.String() {
+			t.Errorf("expected PublicKey %s, got %s", feKey.String(), resp.PublicKey)
+		}
+		if resp.Port != 51820 {
+			t.Errorf("expected Port 51820, got %d", resp.Port)
+		}
+		if resp.Prefix != "fd00::/64" {
+			t.Errorf("expected Prefix fd00::/64, got %s", resp.Prefix)
+		}
+		if resp.PeerAddress == "" {
+			t.Errorf("expected non-empty PeerAddress")
+		}
+	})
+
+	t.Run("WireGuard disabled on frontend returns ErrWireGuardDisabled", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen failed: %v", err)
+		}
+		defer listener.Close()
+
+		server, err := frontend.NewServer(frontend.ServerConfig{
+			ServerTLSConfig: serverTLS,
+		})
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		serverErrCh := make(chan error, 1)
+		go func() {
+			serverErrCh <- server.Serve(listener)
+		}()
+		defer func() {
+			if err := server.Close(); err != nil {
+				t.Errorf("server.Close failed: %v", err)
+			}
+			if err := <-serverErrCh; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+				t.Errorf("server.Serve failed: %v", err)
+			}
+		}()
+
+		c := NewClient(listener.Addr().String(), clientTLS)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		sessID, _, err := c.StartSession(ctx)
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+
+		_, clientKey, err := wireguard.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+
+		_, err = c.ExchangeWireGuard(ctx, sessID, clientKey.String())
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, ErrWireGuardDisabled) {
+			t.Errorf("expected errors.Is(err, ErrWireGuardDisabled), got: %v", err)
+		}
+	})
 }

@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -32,6 +33,12 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"k8s.io/klog/v2"
 )
+
+// ErrWireGuardDisabled indicates that the frontend server returned HTTP 404 Not Found
+// during WireGuard key exchange. This occurs when the frontend has WireGuard disabled,
+// or when the session is unknown or has already ended. The tunnel manager treats both
+// cases the same way: the session continues using the TCP pool only.
+var ErrWireGuardDisabled = errors.New("frontend wireguard is disabled")
 
 func closeConn(c io.Closer) {
 	if c == nil {
@@ -272,6 +279,63 @@ func (c *Client) Register(ctx context.Context, sessionID string, hostnames []str
 	}
 
 	return &regResp, nil
+}
+
+// maxWireGuardResponseBytes limits the size of responses read during WireGuard key exchange.
+const maxWireGuardResponseBytes = 64 * 1024
+
+// ExchangeWireGuard registers the client WireGuard public key with the frontend for the session
+// and returns the frontend's WireGuard configuration.
+// If the frontend has WireGuard disabled or the session is unknown (returns HTTP 404), it returns ErrWireGuardDisabled.
+func (client *Client) ExchangeWireGuard(ctx context.Context, sessionID, publicKey string) (*api.WireGuardResponse, error) {
+	token, err := client.GetToken()
+	if err != nil {
+		return nil, fmt.Errorf("resolving token for wireguard exchange: %w", err)
+	}
+
+	requestBody, err := json.Marshal(api.WireGuardRequest{
+		PublicKey: publicKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshaling wireguard request: %w", err)
+	}
+
+	endpointURL := fmt.Sprintf("https://%s/v1/sessions/%s/wireguard", client.internalHostname, url.PathEscape(sessionID))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, endpointURL, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, fmt.Errorf("creating wireguard request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(api.HeaderSessionID, sessionID)
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	response, err := client.httpClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("performing wireguard exchange request: %w", err)
+	}
+	defer closeConn(response.Body)
+
+	if response.StatusCode == http.StatusNotFound {
+		return nil, ErrWireGuardDisabled
+	}
+
+	limitedReader := io.LimitReader(response.Body, maxWireGuardResponseBytes)
+	if response.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(limitedReader)
+		if err != nil {
+			return nil, fmt.Errorf("wireguard exchange failed with status %d (failed to read body: %w)", response.StatusCode, err)
+		}
+		return nil, fmt.Errorf("wireguard exchange failed with status %d: %s", response.StatusCode, string(body))
+	}
+
+	var wireguardResponse api.WireGuardResponse
+	if err := json.NewDecoder(limitedReader).Decode(&wireguardResponse); err != nil {
+		return nil, fmt.Errorf("decoding wireguard response: %w", err)
+	}
+
+	return &wireguardResponse, nil
 }
 
 // DialTunnel dials an mTLS pooled tunnel connection to the frontend for the given sessionID.
