@@ -99,8 +99,29 @@ type tortureConfig struct {
 	// noCheckpoint disables periodic checkpoints during the workload when true.
 	noCheckpoint bool
 
+	// checkpointInterval specifies the operation interval for periodic checkpoints.
+	// When positive, a checkpoint is performed every checkpointInterval operations instead of random checkpoints.
+	checkpointInterval int
+
+	// syncAfterOp issues a Sync on the store after each put and delete operation.
+	syncAfterOp bool
+
+	// fixedValueSize, when positive, fixes the payload size in bytes for each put operation.
+	fixedValueSize int
+
+	// wrapFS optionally wraps the underlying filesystem (e.g. with a measurement wrapper).
+	wrapFS func(FS) FS
+
 	// skipReason explains why this configuration is skipped during full test runs, or empty if enabled.
 	skipReason string
+}
+
+type workloadStats struct {
+	payloadBytesPut int64
+	puts            int
+	deletes         int
+	checkpoints     int
+	totalOps        int
 }
 
 var tortureConfigs = []tortureConfig{
@@ -217,8 +238,9 @@ func generateTortureValue(random *rand.Rand, maxValueBlocks int, existingLength 
 	return value
 }
 
-func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) {
+func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workloadStats {
 	t.Helper()
+	var stats workloadStats
 	random := rand.New(rand.NewSource(seed))
 
 	keys := make([]string, config.numKeys)
@@ -228,7 +250,11 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) {
 	model := make(map[string][]byte)
 
 	memFS := NewMemFS()
-	faultFS := NewFaultFS(memFS)
+	var baseFS FS = memFS
+	if config.wrapFS != nil {
+		baseFS = config.wrapFS(memFS)
+	}
+	faultFS := NewFaultFS(baseFS)
 	dir := "torture_store"
 	const tableName = "torture_table"
 
@@ -362,17 +388,21 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) {
 			checkViolation(cycle, "before_op")
 
 			operationNumber++
+			stats.totalOps++
 			action := random.Intn(10)
 			if len(model) == 0 {
 				action = 0 // force put when empty
 			}
 
+			triggerRandomCheckpoint := config.checkpointInterval == 0 && !config.noCheckpoint && action == 9
+
 			switch {
-			case !config.noCheckpoint && action == 9:
+			case triggerRandomCheckpoint:
 				if _, err := currentStore.Checkpoint(); err != nil {
 					checkViolation(cycle, "checkpoint")
 					fail(cycle, "checkpoint", err)
 				}
+				stats.checkpoints++
 			case action >= 7:
 				key := keys[random.Intn(len(keys))]
 				if err := currentStore.Delete(tableName, key); err != nil {
@@ -380,6 +410,7 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) {
 					fail(cycle, "delete", err)
 				}
 				delete(model, key)
+				stats.deletes++
 			default:
 				key := keys[random.Intn(len(keys))]
 				existingValue, exists := model[key]
@@ -387,12 +418,35 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) {
 				if exists {
 					existingLength = len(existingValue)
 				}
-				value := generateTortureValue(random, config.maxValueBlocks, existingLength)
+				var value []byte
+				if config.fixedValueSize > 0 {
+					value = make([]byte, config.fixedValueSize)
+					random.Read(value)
+				} else {
+					value = generateTortureValue(random, config.maxValueBlocks, existingLength)
+				}
 				if err := currentStore.Put(tableName, key, value); err != nil {
 					checkViolation(cycle, "put")
 					fail(cycle, "put", err)
 				}
 				model[key] = value
+				stats.payloadBytesPut += int64(len(value))
+				stats.puts++
+			}
+
+			if config.syncAfterOp {
+				if err := currentStore.Sync(); err != nil {
+					checkViolation(cycle, "sync_after_op")
+					fail(cycle, "sync_after_op", err)
+				}
+			}
+
+			if config.checkpointInterval > 0 && operationNumber%config.checkpointInterval == 0 {
+				if _, err := currentStore.Checkpoint(); err != nil {
+					checkViolation(cycle, "checkpoint")
+					fail(cycle, "checkpoint", err)
+				}
+				stats.checkpoints++
 			}
 
 			checkViolation(cycle, "after_op")
@@ -422,7 +476,7 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) {
 			}
 		}
 
-		faultFS = NewFaultFS(memFS)
+		faultFS = NewFaultFS(baseFS)
 		setViolationHandler(faultFS)
 		if heapCipher != nil {
 			faultFS.SetHeapCipher(heapCipher)
@@ -460,6 +514,8 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) {
 		}
 		currentStore = nil
 	}
+
+	return stats
 }
 
 func TestTortureMatrix(t *testing.T) {
