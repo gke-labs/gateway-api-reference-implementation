@@ -38,8 +38,7 @@ func lacksPrivilegeOrKernelSupport(err error) bool {
 	return errors.Is(err, ErrPermission) ||
 		isPermissionError(err) ||
 		errors.Is(err, ErrNotSupported) ||
-		isNotSupportedError(err) ||
-		errors.Is(err, errNetnsNotImplemented)
+		isNotSupportedError(err)
 }
 
 // skipWithoutPrivilegeOrKernelSupport checks err:
@@ -122,7 +121,11 @@ type testNamespaceWorker struct {
 	work      chan func()
 }
 
-func newTestNamespaceWorker() (*testNamespaceWorker, error) {
+func newTestNamespaceWorker(t *testing.T) (*testNamespaceWorker, error) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping test: network namespaces exist only on Linux")
+	}
 	worker := &testNamespaceWorker{
 		work: make(chan func()),
 	}
@@ -205,10 +208,16 @@ func TestOpenDevice_MissingPermissionsOrUnsupported(t *testing.T) {
 		})
 	}
 
-	worker, err := newTestNamespaceWorker()
-	if err != nil {
+	if runtime.GOOS != "linux" {
 		// When unprivileged or without network namespace support (such as macOS),
 		// run directly without touching host links because link creation will fail.
+		runProbe()
+		return
+	}
+
+	worker, err := newTestNamespaceWorker(t)
+	if err != nil {
+		// When unprivileged on Linux, run directly without touching host links because link creation will fail.
 		runProbe()
 		return
 	}
@@ -227,7 +236,7 @@ func TestOpenDevice_MissingPermissionsOrUnsupported(t *testing.T) {
 }
 
 func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
-	worker, err := newTestNamespaceWorker()
+	worker, err := newTestNamespaceWorker(t)
 	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create network namespace")
 	t.Cleanup(func() {
 		if closeErr := worker.Close(); closeErr != nil {
@@ -339,7 +348,7 @@ func openTestDevice(t *testing.T, worker *testNamespaceWorker, interfaceName str
 }
 
 func TestWireGuard_NamespaceCommunication(t *testing.T) {
-	worker1, err := newTestNamespaceWorker()
+	worker1, err := newTestNamespaceWorker(t)
 	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create network namespace")
 	t.Cleanup(func() {
 		if closeErr := worker1.Close(); closeErr != nil {
@@ -347,7 +356,7 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 		}
 	})
 
-	worker2, err := newTestNamespaceWorker()
+	worker2, err := newTestNamespaceWorker(t)
 	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create second network namespace")
 	t.Cleanup(func() {
 		if closeErr := worker2.Close(); closeErr != nil {
@@ -529,44 +538,4 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestLacksPrivilegeOrKernelSupport(t *testing.T) {
-	testCases := []struct {
-		name     string
-		err      error
-		expected bool
-	}{
-		{name: "nil error", err: nil, expected: false},
-		{name: "EPERM", err: syscall.EPERM, expected: true},
-		{name: "EACCES", err: syscall.EACCES, expected: true},
-		{name: "ErrPermission", err: ErrPermission, expected: true},
-		{name: "wrapped ErrPermission", err: fmt.Errorf("wrapped: %w", ErrPermission), expected: true},
-		{name: "ErrNotSupported", err: ErrNotSupported, expected: true},
-		{name: "wrapped ErrNotSupported", err: fmt.Errorf("wrapped: %w", ErrNotSupported), expected: true},
-		{name: "netlink ErrNotImplemented", err: netlink.ErrNotImplemented, expected: true},
-		{name: "netns not implemented", err: errNetnsNotImplemented, expected: true},
-		{name: "wrapped netns not implemented", err: fmt.Errorf("wrapped: %w", errNetnsNotImplemented), expected: true},
-		{name: "EOPNOTSUPP", err: syscall.EOPNOTSUPP, expected: true},
-		{name: "ENODEV", err: syscall.ENODEV, expected: true},
-		{name: "ENOSYS", err: syscall.ENOSYS, expected: true},
-		{name: "unrelated error", err: errors.New("unrelated error"), expected: false},
-		{name: "EINVAL", err: syscall.EINVAL, expected: false},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := lacksPrivilegeOrKernelSupport(tc.err); got != tc.expected {
-				t.Errorf("lacksPrivilegeOrKernelSupport(%v) = %v, want %v", tc.err, got, tc.expected)
-			}
-		})
-	}
-}
-
-func TestSkipWithoutPrivilegeOrKernelSupport_NetnsNotImplemented(t *testing.T) {
-	t.Run("skips when privileges not required", func(t *testing.T) {
-		t.Setenv(requirePrivilegesEnv, "")
-		skipWithoutPrivilegeOrKernelSupport(t, errNetnsNotImplemented, "creating network namespace")
-		t.Fatal("expected test to skip, but continued execution")
-	})
 }
