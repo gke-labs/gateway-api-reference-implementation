@@ -230,3 +230,112 @@ func runCountingCheckpointTest(t *testing.T, numPages int, expectedWrites int64)
 		h.Unpin()
 	}
 }
+
+func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
+	isAllocated := func(b *BuddyAllocator, block uint64) bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		_, exists := b.allocated[block]
+		return exists
+	}
+
+	t.Run("checkpoint frees pending runs listed before fsync", func(t *testing.T) {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+
+		var dbID [16]byte
+		copy(dbID[:], []byte("chk-df-test-0001"))
+
+		wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+		if err != nil {
+			t.Fatalf("OpenWAL failed: %v", err)
+		}
+		defer wal.Close()
+
+		heapFile, err := faultFS.Create("heap.db")
+		if err != nil {
+			t.Fatalf("Create heap file failed: %v", err)
+		}
+		defer heapFile.Close()
+
+		buddy := NewBuddyAllocator(512)
+		bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
+		defer bp.Close()
+
+		checkpointer := NewCheckpointer(bp, heapFile, wal)
+
+		r1, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+
+		bp.listPendingFree(blockRun{block: r1})
+
+		// Checkpoint calls startHeapSync, Sync, and heapSyncSucceeded
+		if _, err := checkpointer.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint failed: %v", err)
+		}
+
+		if isAllocated(buddy, r1) {
+			t.Fatalf("pending run %d should have been freed by checkpoint fsync", r1)
+		}
+	})
+
+	t.Run("failed heap sync during checkpoint does not free pending runs", func(t *testing.T) {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+
+		var dbID [16]byte
+		copy(dbID[:], []byte("chk-df-test-0002"))
+
+		wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+		if err != nil {
+			t.Fatalf("OpenWAL failed: %v", err)
+		}
+		defer wal.Close()
+
+		heapFile, err := faultFS.Create("heap.db")
+		if err != nil {
+			t.Fatalf("Create heap file failed: %v", err)
+		}
+		defer heapFile.Close()
+
+		buddy := NewBuddyAllocator(512)
+		bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
+		defer bp.Close()
+
+		checkpointer := NewCheckpointer(bp, heapFile, wal)
+
+		r1, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+
+		bp.listPendingFree(blockRun{block: r1})
+
+		// Inject sync error into faultFS
+		faultFS.SetSyncError(fmt.Errorf("simulated disk sync error"))
+
+		// Checkpoint must fail at heap fsync
+		if _, err := checkpointer.Checkpoint(); err == nil {
+			t.Fatalf("expected checkpoint to fail on sync error, but it succeeded")
+		}
+
+		// Verify r1 was NOT freed because heapSyncFailed was called
+		if !isAllocated(buddy, r1) {
+			t.Fatalf("pending run %d was freed despite checkpoint heap sync failure", r1)
+		}
+
+		// Clear sync error
+		faultFS.SetSyncError(nil)
+
+		// Next checkpoint must succeed and free r1
+		if _, err := checkpointer.Checkpoint(); err != nil {
+			t.Fatalf("subsequent checkpoint failed: %v", err)
+		}
+
+		if isAllocated(buddy, r1) {
+			t.Fatalf("pending run %d should have been freed after successful checkpoint", r1)
+		}
+	})
+}

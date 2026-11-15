@@ -54,10 +54,16 @@ func (c *Checkpointer) flushPagesLocked() error {
 
 	// Record locations flushed before fsync begins (Reuse Rule / Item 11)
 	c.bp.SnapshotFlushedForSync()
+	c.bp.startHeapSync()
 
 	// Fsync heap file
 	if err := c.heapFile.Sync(); err != nil {
+		c.bp.heapSyncFailed()
 		return fmt.Errorf("failed to fsync heap file: %w", err)
+	}
+
+	if err := c.bp.heapSyncSucceeded(); err != nil {
+		return fmt.Errorf("failed to free pending blocks: %w", err)
 	}
 
 	// Promote flushed locations to durable (frees superseded locations)

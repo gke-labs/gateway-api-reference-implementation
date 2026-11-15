@@ -100,6 +100,25 @@ func (h *PageHandle) Unpin() {
 	}
 }
 
+// blockRun identifies an allocated contiguous run of physical blocks in the heap file.
+// A run is freed only after a heap fsync that started after the run was listed has completed.
+type blockRun struct {
+	block uint64
+}
+
+// BlockRun is an alias for blockRun.
+type BlockRun = blockRun
+
+// Block returns the starting physical block number of the run.
+func (r blockRun) Block() uint64 {
+	return r.block
+}
+
+// Start returns the starting physical block number of the run.
+func (r blockRun) Start() uint64 {
+	return r.block
+}
+
 // BlockPool manages a fixed-size arena of 4 KiB pool blocks with direct I/O, out-of-place writes,
 // and write-ahead rule enforcement.
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
@@ -117,7 +136,7 @@ type BlockPool struct {
 	numPoolBlocks int
 	arena         []byte // Pointer-free byte arena aligned to 4096 bytes
 
-	// mu guards freePoolBlocks, pageTable, and onFailure.
+	// mu guards freePoolBlocks, pageTable, onFailure, prior, and current.
 	mu sync.Mutex
 
 	// cond uses mu. It is broadcast when an in-flight flush completes or when
@@ -129,6 +148,14 @@ type BlockPool struct {
 	freePoolBlocks []int
 	pageTable      map[uint64]*PageDesc // logicalPage -> PageDesc
 	onFailure      func(error)
+
+	// prior holds block runs listed before the current heap fsync started.
+	// Guarded by mu.
+	prior []blockRun
+
+	// current holds block runs listed since the current heap fsync started.
+	// Guarded by mu.
+	current []blockRun
 
 	stagingBuf []byte     // Pointer-free aligned 2 MiB staging buffer for direct I/O flushes
 	flushMu    sync.Mutex // Serializes staging buffer usage and direct I/O heap writes
@@ -851,6 +878,60 @@ func (bp *BlockPool) PromoteFlushedToDurable() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// listPendingFree records run in current as pending to be freed after a future heap fsync.
+func (bp *BlockPool) listPendingFree(run blockRun) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	bp.listPendingFreeLocked(run)
+}
+
+var _ = (*BlockPool).listPendingFree
+
+// listPendingFreeLocked records run in current as pending while holding bp.mu.
+func (bp *BlockPool) listPendingFreeLocked(run blockRun) {
+	bp.current = append(bp.current, run)
+}
+
+// startHeapSync rotates the current pending-free generation into prior at the start of a heap fsync.
+// If prior still holds runs from an uncompleted or failed fsync, they are retained in prior.
+// current starts empty.
+func (bp *BlockPool) startHeapSync() {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	bp.prior = append(bp.prior, bp.current...)
+	bp.current = nil
+}
+
+// heapSyncSucceeded frees every block run in prior to the buddy allocator and empties prior.
+func (bp *BlockPool) heapSyncSucceeded() error {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	var errs []error
+	if bp.buddy != nil {
+		for _, run := range bp.prior {
+			if err := bp.buddy.Free(run.block); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	bp.prior = nil
+	if len(errs) > 0 {
+		err := errors.Join(errs...)
+		if bp.onFailure != nil {
+			bp.onFailure(err)
+		}
+		return err
+	}
+	return nil
+}
+
+// heapSyncFailed handles a failed heap fsync by releasing nothing.
+// Pending runs remain in prior to be freed on a subsequent successful fsync.
+func (bp *BlockPool) heapSyncFailed() {
+	// A heap fsync failed: release nothing.
 }
 
 // DirtyPageTableAndLSN returns a map of logicalPage -> dirtyLSN and the current max LSN at snapshot time.
