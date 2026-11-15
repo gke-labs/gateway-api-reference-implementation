@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"syscall"
@@ -28,6 +29,16 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 )
+
+const requirePrivilegesEnv = "WIREGUARD_REQUIRE_PRIVILEGES"
+
+func skipOrFail(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv(requirePrivilegesEnv) != "" {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
+}
 
 func TestGenerateKey(t *testing.T) {
 	privateKey, publicKey, err := GenerateKey()
@@ -197,7 +208,7 @@ func TestOpenDevice_MissingPermissionsOrUnsupported(t *testing.T) {
 func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
 	worker, err := newTestNamespaceWorker()
 	if err != nil {
-		t.Skipf("skipping test: cannot create network namespace: %v", err)
+		skipOrFail(t, "skipping test: cannot create network namespace: %v", err)
 	}
 	t.Cleanup(func() {
 		if closeErr := worker.Close(); closeErr != nil {
@@ -245,7 +256,7 @@ func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
 	})
 
 	if errors.Is(err, ErrPermission) || errors.Is(err, ErrNotSupported) {
-		t.Skipf("skipping test: %v", err)
+		skipOrFail(t, "skipping test: %v", err)
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -303,7 +314,7 @@ func openTestDevice(t *testing.T, worker *testNamespaceWorker, interfaceName str
 	})
 	if err != nil {
 		if errors.Is(err, ErrPermission) || errors.Is(err, ErrNotSupported) {
-			t.Skipf("skipping test: cannot create WireGuard link: %v", err)
+			skipOrFail(t, "skipping test: cannot create WireGuard link: %v", err)
 		}
 		t.Fatalf("opening device %q: %v", interfaceName, err)
 	}
@@ -318,7 +329,7 @@ func openTestDevice(t *testing.T, worker *testNamespaceWorker, interfaceName str
 func TestWireGuard_NamespaceCommunication(t *testing.T) {
 	worker1, err := newTestNamespaceWorker()
 	if err != nil {
-		t.Skipf("skipping test: cannot create network namespace: %v", err)
+		skipOrFail(t, "skipping test: cannot create network namespace: %v", err)
 	}
 	t.Cleanup(func() {
 		if closeErr := worker1.Close(); closeErr != nil {
@@ -328,7 +339,7 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 
 	worker2, err := newTestNamespaceWorker()
 	if err != nil {
-		t.Skipf("skipping test: cannot create second network namespace: %v", err)
+		skipOrFail(t, "skipping test: cannot create second network namespace: %v", err)
 	}
 	t.Cleanup(func() {
 		if closeErr := worker2.Close(); closeErr != nil {
@@ -342,7 +353,7 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 		PeerName:  "veth-test2",
 	}
 	if err := netlink.LinkAdd(veth); err != nil {
-		t.Skipf("skipping test: cannot create veth pair: %v", err)
+		skipOrFail(t, "skipping test: cannot create veth pair: %v", err)
 	}
 	t.Cleanup(func() {
 		if delErr := netlink.LinkDel(veth); delErr != nil && !errors.Is(delErr, syscall.ENODEV) {
