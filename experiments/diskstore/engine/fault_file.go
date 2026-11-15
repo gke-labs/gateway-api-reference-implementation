@@ -72,6 +72,8 @@ type FaultFS struct {
 	beforeWriteAt func(path string, p []byte, off int64)
 	beforeSync    func(path string)
 
+	violationHandler func(err error)
+
 	// heapCipher is the AES-256-XTS cipher used for decrypting heap blocks.
 	// A nil cipher means the store is not encrypted.
 	heapCipher atomic.Pointer[xts.Cipher]
@@ -144,6 +146,25 @@ func (f *FaultFS) SetBeforeSync(fn func(path string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.beforeSync = fn
+}
+
+// SetViolationHandler sets a callback invoked when a write-ahead or reuse rule violation is detected.
+// If set, the handler is invoked and the violating write returns the error instead of panicking.
+func (f *FaultFS) SetViolationHandler(fn func(err error)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.violationHandler = fn
+}
+
+func (f *FaultFS) handleViolation(err error) bool {
+	f.mu.RLock()
+	handler := f.violationHandler
+	f.mu.RUnlock()
+	if handler != nil {
+		handler(err)
+		return true
+	}
+	return false
 }
 
 // SetHeapCipher sets the AES-256-XTS cipher used for decrypting heap blocks during invariant checks.
@@ -434,8 +455,12 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 					// Assert Write-Ahead Rule:
 					// Before writing any page whose LSN is L, log must be fsynced through L.
 					if assertWAL && lsn > maxFsyncedLSN {
-						panic(fmt.Sprintf("%v: page LSN %d > max fsynced WAL LSN %d (block %d)",
-							ErrWriteAheadRuleViolation, lsn, maxFsyncedLSN, blockIndex))
+						violationErr := fmt.Errorf("%w: page LSN %d > max fsynced WAL LSN %d (block %d)",
+							ErrWriteAheadRuleViolation, lsn, maxFsyncedLSN, blockIndex)
+						if f.fs.handleViolation(violationErr) {
+							return 0, violationErr
+						}
+						panic(violationErr.Error())
 					}
 				}
 			}
@@ -445,8 +470,12 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 			if assertReuse {
 				for pageID, durable := range f.durablePages {
 					if blockIndex >= durable.StartBlock && blockIndex < durable.StartBlock+uint64(durable.NumBlocks) {
-						panic(fmt.Sprintf("%v: writing to block %d which holds durable copy of page %d (LSN %d, blocks [%d..%d))",
-							ErrReuseRuleViolation, blockIndex, pageID, durable.LSN, durable.StartBlock, durable.StartBlock+uint64(durable.NumBlocks)))
+						violationErr := fmt.Errorf("%w: writing to block %d which holds durable copy of page %d (LSN %d, blocks [%d..%d))",
+							ErrReuseRuleViolation, blockIndex, pageID, durable.LSN, durable.StartBlock, durable.StartBlock+uint64(durable.NumBlocks))
+						if f.fs.handleViolation(violationErr) {
+							return 0, violationErr
+						}
+						panic(violationErr.Error())
 					}
 				}
 			}

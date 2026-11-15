@@ -419,3 +419,33 @@ func TestFaultFile_EncryptedStoreWriteAheadRuleViolation(t *testing.T) {
 		t.Fatalf("WriteAt returned unexpected error: %v", err)
 	}
 }
+
+func TestFaultFile_ViolationHandler(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	faultFS.SetMaxFsyncedLSN(50)
+
+	var recordedErr error
+	faultFS.SetViolationHandler(func(err error) {
+		recordedErr = err
+	})
+
+	file, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer file.Close()
+
+	// Write block with LSN 60 > maxFsyncedLSN 50: must return error without panic
+	b0 := makeTestBlock(1, 60, 0, 1)
+	_, writeErr := file.WriteAt(b0, 0)
+	if writeErr == nil {
+		t.Fatalf("expected write error from violation handler, got nil")
+	}
+	if !errors.Is(writeErr, ErrWriteAheadRuleViolation) {
+		t.Fatalf("expected ErrWriteAheadRuleViolation, got %v", writeErr)
+	}
+	if recordedErr == nil || !errors.Is(recordedErr, ErrWriteAheadRuleViolation) {
+		t.Fatalf("expected recorded violation error, got %v", recordedErr)
+	}
+}
