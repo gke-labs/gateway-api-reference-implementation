@@ -287,47 +287,47 @@ const maxWireGuardResponseBytes = 64 * 1024
 // ExchangeWireGuard registers the client WireGuard public key with the frontend for the session
 // and returns the frontend's WireGuard configuration.
 // If the frontend has WireGuard disabled or the session is unknown (returns HTTP 404), it returns ErrWireGuardDisabled.
-func (c *Client) ExchangeWireGuard(ctx context.Context, sessionID, publicKey string) (*api.WireGuardResponse, error) {
-	token, err := c.GetToken()
+func (client *Client) ExchangeWireGuard(ctx context.Context, sessionID, publicKey string) (*api.WireGuardResponse, error) {
+	token, err := client.GetToken()
 	if err != nil {
 		return nil, fmt.Errorf("resolving token for wireguard exchange: %w", err)
 	}
 
-	reqBody, err := json.Marshal(api.WireGuardRequest{
+	requestBody, err := json.Marshal(api.WireGuardRequest{
 		PublicKey: publicKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshaling wireguard request: %w", err)
 	}
 
-	url := fmt.Sprintf("https://%s/v1/sessions/%s/wireguard", c.internalHostname, url.PathEscape(sessionID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(reqBody))
+	endpointURL := fmt.Sprintf("https://%s/v1/sessions/%s/wireguard", client.internalHostname, url.PathEscape(sessionID))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, endpointURL, bytes.NewReader(requestBody))
 	if err != nil {
 		return nil, fmt.Errorf("creating wireguard request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(api.HeaderSessionID, sessionID)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(api.HeaderSessionID, sessionID)
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	response, err := client.httpClient.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("performing wireguard exchange request: %w", err)
 	}
-	defer closeConn(resp.Body)
+	defer closeConn(response.Body)
 
-	if resp.StatusCode == http.StatusNotFound {
+	if response.StatusCode == http.StatusNotFound {
 		return nil, ErrWireGuardDisabled
 	}
 
-	limitedReader := io.LimitReader(resp.Body, maxWireGuardResponseBytes)
-	if resp.StatusCode != http.StatusOK {
+	limitedReader := io.LimitReader(response.Body, maxWireGuardResponseBytes)
+	if response.StatusCode != http.StatusOK {
 		body, err := io.ReadAll(limitedReader)
 		if err != nil {
-			return nil, fmt.Errorf("wireguard exchange failed with status %d (failed to read body: %w)", resp.StatusCode, err)
+			return nil, fmt.Errorf("wireguard exchange failed with status %d (failed to read body: %w)", response.StatusCode, err)
 		}
-		return nil, fmt.Errorf("wireguard exchange failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("wireguard exchange failed with status %d: %s", response.StatusCode, string(body))
 	}
 
 	var wireguardResponse api.WireGuardResponse

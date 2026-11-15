@@ -192,11 +192,11 @@ func TestClient_ExchangeWireGuard(t *testing.T) {
 	}
 
 	t.Run("WireGuard enabled on frontend", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("Listen failed: %v", err)
 		}
-		defer ln.Close()
+		defer listener.Close()
 
 		_, feKey, err := wireguard.GenerateKey()
 		if err != nil {
@@ -208,7 +208,7 @@ func TestClient_ExchangeWireGuard(t *testing.T) {
 		}
 
 		fakeDev := &fakeClientTestWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}
-		srv, err := frontend.NewServer(frontend.ServerConfig{
+		server, err := frontend.NewServer(frontend.ServerConfig{
 			ServerTLSConfig:    serverTLS,
 			WireGuardDevice:    fakeDev,
 			WireGuardPublicKey: feKey,
@@ -218,13 +218,20 @@ func TestClient_ExchangeWireGuard(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
-		defer srv.Close()
-
+		serverErrCh := make(chan error, 1)
 		go func() {
-			_ = srv.Serve(ln)
+			serverErrCh <- server.Serve(listener)
+		}()
+		defer func() {
+			if err := server.Close(); err != nil {
+				t.Errorf("server.Close failed: %v", err)
+			}
+			if err := <-serverErrCh; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+				t.Errorf("server.Serve failed: %v", err)
+			}
 		}()
 
-		c := NewClient(ln.Addr().String(), clientTLS)
+		c := NewClient(listener.Addr().String(), clientTLS)
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 
@@ -258,25 +265,32 @@ func TestClient_ExchangeWireGuard(t *testing.T) {
 	})
 
 	t.Run("WireGuard disabled on frontend returns ErrWireGuardDisabled", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("Listen failed: %v", err)
 		}
-		defer ln.Close()
+		defer listener.Close()
 
-		srv, err := frontend.NewServer(frontend.ServerConfig{
+		server, err := frontend.NewServer(frontend.ServerConfig{
 			ServerTLSConfig: serverTLS,
 		})
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
 		}
-		defer srv.Close()
-
+		serverErrCh := make(chan error, 1)
 		go func() {
-			_ = srv.Serve(ln)
+			serverErrCh <- server.Serve(listener)
+		}()
+		defer func() {
+			if err := server.Close(); err != nil {
+				t.Errorf("server.Close failed: %v", err)
+			}
+			if err := <-serverErrCh; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+				t.Errorf("server.Serve failed: %v", err)
+			}
 		}()
 
-		c := NewClient(ln.Addr().String(), clientTLS)
+		c := NewClient(listener.Addr().String(), clientTLS)
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 
