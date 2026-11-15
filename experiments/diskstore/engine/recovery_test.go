@@ -308,6 +308,73 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	}
 }
 
+func readDBIDFromMeta(fs FS, dir string) ([16]byte, bool, error) {
+	metaFile, err := fs.Open(filepath.Join(dir, "meta.db"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return [16]byte{}, false, nil
+		}
+		return [16]byte{}, false, err
+	}
+
+	var metaBuf [metaFileSize]byte
+	if _, err := metaFile.ReadAt(metaBuf[:], 0); err != nil {
+		closeErr := metaFile.Close()
+		return [16]byte{}, false, errors.Join(err, closeErr)
+	}
+	if err := metaFile.Close(); err != nil {
+		return [16]byte{}, false, err
+	}
+
+	record, err := decodeMetaRecord(metaBuf[:])
+	if err != nil {
+		return [16]byte{}, false, err
+	}
+	return record.dbID, true, nil
+}
+
+// openStoreOnFaultFS opens a store on a FaultFS, setting the heap cipher on the
+// FaultFS so that invariant checks decrypt heap blocks rather than misinterpreting ciphertext.
+func openStoreOnFaultFS(faultFS *FaultFS, dir string, key []byte, opts ...Option) (*Engine, error) {
+	if len(key) > 0 {
+		faultFS.SetEncryptionKey(key)
+		dbID, exists, err := readDBIDFromMeta(faultFS, dir)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			cipher, err := newHeapCipher(key, dbID)
+			if err != nil {
+				return nil, err
+			}
+			faultFS.SetHeapCipher(cipher)
+		}
+	}
+
+	openOpts := make([]Option, 0, len(opts)+3)
+	openOpts = append(openOpts, WithFS(faultFS), WithDir(dir))
+	if len(key) > 0 {
+		openOpts = append(openOpts, WithEncryptionKey(key))
+	}
+	openOpts = append(openOpts, opts...)
+
+	store, err := Open(openOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(key) > 0 {
+		cipher, err := newHeapCipher(key, store.DBID())
+		if err != nil {
+			closeErr := store.Close()
+			return nil, errors.Join(err, closeErr)
+		}
+		faultFS.SetHeapCipher(cipher)
+	}
+
+	return store, nil
+}
+
 func TestRecovery_CrashConsistency(t *testing.T) {
 	t.Run("Unencrypted", func(t *testing.T) {
 		testRecovery_CrashConsistency(t, nil)
@@ -326,19 +393,11 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 	faultFS := NewFaultFS(memFS)
 	dir := "test_crash_consistency_store"
 
-	openOpts := func(fs FS) []Option {
-		opts := []Option{WithFS(fs), WithDir(dir)}
-		if len(key) > 0 {
-			opts = append(opts, WithEncryptionKey(key))
-		}
-		return opts
-	}
-
 	// Model mapping key -> expected payload value
 	model := make(map[string]string)
 
 	// Cycle 1: Open fresh store, put initial keys and a large multi-block object, checkpoint
-	store, err := Open(append(openOpts(faultFS), WithCreate())...)
+	store, err := openStoreOnFaultFS(faultFS, dir, key, WithCreate())
 	if err != nil {
 		t.Fatalf("Cycle 1 Open failed: %v", err)
 	}
@@ -389,7 +448,7 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 
 	// Cycle 2: Reopen store and verify full contents against model
 	faultFS2 := NewFaultFS(memFS)
-	store2, err := Open(openOpts(faultFS2)...)
+	store2, err := openStoreOnFaultFS(faultFS2, dir, key)
 	if err != nil {
 		t.Fatalf("Cycle 2 Open failed: %v", err)
 	}
@@ -432,7 +491,7 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 
 	// Cycle 3: Reopen store again and verify full contents against updated model
 	faultFS3 := NewFaultFS(memFS)
-	store3, err := Open(openOpts(faultFS3)...)
+	store3, err := openStoreOnFaultFS(faultFS3, dir, key)
 	if err != nil {
 		t.Fatalf("Cycle 3 Open failed: %v", err)
 	}
@@ -1430,15 +1489,7 @@ func testRecovery_UncheckpointedMixReopenTwice(t *testing.T, key []byte) {
 	faultFS := NewFaultFS(memFS)
 	dir := "test_uncheckpointed_mix_reopen_twice"
 
-	openOpts := func(fs FS) []Option {
-		opts := []Option{WithFS(fs), WithDir(dir), WithCompressionCodec(CodecNone)}
-		if len(key) > 0 {
-			opts = append(opts, WithEncryptionKey(key))
-		}
-		return opts
-	}
-
-	store, err := Open(append(openOpts(faultFS), WithCreate())...)
+	store, err := openStoreOnFaultFS(faultFS, dir, key, WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1651,7 +1702,7 @@ func testRecovery_UncheckpointedMixReopenTwice(t *testing.T, key []byte) {
 
 	// Reopen 1: replays WAL from redo start LSN through apply functions, then flushes pages.
 	faultFS2 := NewFaultFS(memFS)
-	store2, err := Open(openOpts(faultFS2)...)
+	store2, err := openStoreOnFaultFS(faultFS2, dir, key, WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen 1 failed: %v", err)
 	}
@@ -1667,7 +1718,7 @@ func testRecovery_UncheckpointedMixReopenTwice(t *testing.T, key []byte) {
 
 	// Reopen 2: reopen without any new writes following the crash.
 	faultFS3 := NewFaultFS(memFS)
-	store3, err := Open(openOpts(faultFS3)...)
+	store3, err := openStoreOnFaultFS(faultFS3, dir, key, WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen 2 failed: %v", err)
 	}
@@ -1699,7 +1750,7 @@ func testRecovery_UncheckpointedMixReopenTwice(t *testing.T, key []byte) {
 	}
 
 	faultFS4 := NewFaultFS(memFS)
-	store4, err := Open(openOpts(faultFS4)...)
+	store4, err := openStoreOnFaultFS(faultFS4, dir, key, WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen 3 failed: %v", err)
 	}
@@ -1709,7 +1760,7 @@ func testRecovery_UncheckpointedMixReopenTwice(t *testing.T, key []byte) {
 	}
 
 	faultFS5 := NewFaultFS(memFS)
-	store5, err := Open(openOpts(faultFS5)...)
+	store5, err := openStoreOnFaultFS(faultFS5, dir, key, WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen 4 failed: %v", err)
 	}
