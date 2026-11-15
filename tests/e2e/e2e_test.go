@@ -16,6 +16,9 @@ package e2e
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/wait"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
@@ -316,6 +320,90 @@ spec:
 	h.RunCmd("kubectl", "delete", "configmap", "live-switch-params", "--namespace=default")
 	h.WaitForResourceDeletion("svc", liveResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", liveResName, "default", 30*time.Second)
+
+	// 11. Verify Config Change Updates Applied Revision on Replicas
+	t.Log("Verifying config change updates applied revision on replicas")
+	secretName := singlepod.ResourceNameForGateway("reference-gateway")
+	var oldRevision string
+	secretData := runCmdAllowError(h, "kubectl", "get", "secret", secretName, "--namespace=default", "-o", "jsonpath={.data.config\\.json}")
+	if secretData != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(secretData)); err == nil {
+			var config map[string]any
+			if err := json.Unmarshal(decoded, &config); err == nil {
+				if revision, ok := config["revision"].(string); ok {
+					oldRevision = revision
+				}
+			}
+		}
+	}
+
+	// Apply real change to HTTPRoute
+	updatedRouteManifest := `
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: test-route
+  namespace: default
+spec:
+  parentRefs:
+  - name: reference-gateway
+  hostnames: ["example.com"]
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /updated-e2e
+    backendRefs:
+    - name: backend
+      port: 8080
+`
+	h.KubectlApplyContent(updatedRouteManifest)
+
+	// Wait for Secret to update with new revision
+	var newRevision string
+	if pollErr := wait.PollUntilContextTimeout(t.Context(), 500*time.Millisecond, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
+		currentSecretData := h.RunCmd("kubectl", "get", "secret", secretName, "--namespace=default", "-o", "jsonpath={.data.config\\.json}")
+		if currentSecretData == "" {
+			return false, nil
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(currentSecretData))
+		if err != nil {
+			return false, nil
+		}
+		var configuration map[string]any
+		if err := json.Unmarshal(decoded, &configuration); err != nil {
+			return false, nil
+		}
+		if revision, ok := configuration["revision"].(string); ok && revision != "" && revision != oldRevision {
+			newRevision = revision
+			return true, nil
+		}
+		return false, nil
+	}); pollErr != nil {
+		t.Fatalf("timed out waiting for config Secret %s to update with new revision (old was %q): %v", secretName, oldRevision, pollErr)
+	}
+
+	// Verify Gateway reaches Programmed=True
+	h.RunCmd("kubectl", "wait", "--namespace=default", "--for=condition=Programmed", "--timeout=1m", "gateway/reference-gateway")
+
+	// Verify each replica reports the new revision via /_gari/applied
+	podIPsStr := strings.TrimSpace(h.RunCmd("kubectl", "get", "pods", "--namespace=default", "-l", "gateway.networking.k8s.io/gateway-name=reference-gateway", "-o", "jsonpath={.items[*].status.podIP}"))
+	podIPs := strings.Fields(podIPsStr)
+	if len(podIPs) == 0 {
+		t.Fatalf("No data-plane pods found for reference-gateway")
+	}
+
+	for idx, podIP := range podIPs {
+		checkPodName := fmt.Sprintf("check-applied-%d", idx)
+		h.DeletePod(checkPodName)
+		h.KubectlApplyContent(h.ClientManifestWithArgs(checkPodName, fmt.Sprintf("http://%s:%d/_gari/applied", podIP, singlepod.DataPlaneHealthProbePort)))
+		h.WaitForPodSuccess(checkPodName, 1*time.Minute)
+		logs := h.GetPodLogs(checkPodName)
+		if !strings.Contains(logs, newRevision) {
+			t.Errorf("Expected replica %s /_gari/applied to contain revision %s, got: %s", podIP, newRevision, logs)
+		}
+		h.DeletePod(checkPodName)
+	}
 }
 
 func runCmdAllowError(h *Harness, name string, args ...string) string {

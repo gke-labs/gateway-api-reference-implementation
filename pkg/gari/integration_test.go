@@ -16,13 +16,17 @@ package gari_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
 	"slices"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -321,6 +325,63 @@ func TestGARI_Integration_SinglePodProvisioning(t *testing.T) {
 	dotSvc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "10.0.0.2"}}
 	if err := env.Client.Status().Update(ctx, &dotSvc); err != nil {
 		t.Fatalf("failed to update Service status: %v", err)
+	}
+
+	appliedServer := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			var sec corev1.Secret
+			dotResKey := types.NamespacedName{Namespace: gwNamespace, Name: dotResName}
+			if err := env.Client.Get(ctx, dotResKey, &sec); err == nil {
+				if dpCfg, err := state.UnmarshalDataplaneConfig(sec.Data[singlepod.DataplaneSecretDataKey]); err == nil {
+					_ = json.NewEncoder(w).Encode([]string{dpCfg.Revision})
+					return
+				}
+			}
+			_ = json.NewEncoder(w).Encode([]string{})
+		}),
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", state.DataPlaneHealthProbePort))
+	if err != nil {
+		t.Fatalf("failed to listen on health probe port: %v", err)
+	}
+	defer ln.Close()
+	defer appliedServer.Close()
+	go appliedServer.Serve(ln)
+
+	var endpointIP string
+	if ifAddrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range ifAddrs {
+			if ipNet, ok := a.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
+				endpointIP = ipNet.IP.String()
+				break
+			}
+		}
+	}
+	if endpointIP == "" {
+		endpointIP = "172.17.0.1"
+	}
+
+	dotSlice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      dotResName + "-slice",
+			Namespace: gwNamespace,
+			Labels: map[string]string{
+				discoveryv1.LabelServiceName: dotResName,
+			},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{
+			{
+				Addresses: []string{endpointIP},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: state.Ptr(true),
+				},
+			},
+		},
+	}
+	if err := env.Client.Create(ctx, dotSlice); err != nil {
+		t.Fatalf("failed to create EndpointSlice: %v", err)
 	}
 
 	dotGwKey := types.NamespacedName{Namespace: gwNamespace, Name: dotGwName}
