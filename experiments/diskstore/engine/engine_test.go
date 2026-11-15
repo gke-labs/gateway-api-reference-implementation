@@ -2448,3 +2448,86 @@ func TestEngine_MetaDBChecksumAndValidation(t *testing.T) {
 		}
 	})
 }
+
+func TestOpen_WALMaxSegmentSizeOption(t *testing.T) {
+	memFS := NewMemFS()
+
+	// 1. Negative segment size must return ErrWALSegmentSizeTooSmall
+	_, err := Open(WithFS(memFS), WithDir("neg_seg"), WithCreate(), WithWALMaxSegmentSize(-1))
+	if err == nil {
+		t.Fatalf("expected Open with negative WALMaxSegmentSize to fail")
+	}
+	if !errors.Is(err, ErrWALSegmentSizeTooSmall) {
+		t.Fatalf("expected ErrWALSegmentSizeTooSmall, got: %v", err)
+	}
+
+	// 2. Segment size below WALBlockSize (4096) must return ErrWALSegmentSizeTooSmall
+	_, err = Open(WithFS(memFS), WithDir("small_seg"), WithCreate(), WithWALMaxSegmentSize(WALBlockSize-1))
+	if err == nil {
+		t.Fatalf("expected Open with WALMaxSegmentSize < WALBlockSize to fail")
+	}
+	if !errors.Is(err, ErrWALSegmentSizeTooSmall) {
+		t.Fatalf("expected ErrWALSegmentSizeTooSmall, got: %v", err)
+	}
+
+	// 3. Valid segment size >= WALBlockSize must succeed and rotate by behavior
+	storeDir := "rotate_seg"
+	store, err := Open(WithFS(memFS), WithDir(storeDir), WithCreate(), WithCompressionCodec(CodecNone), WithWALMaxSegmentSize(WALBlockSize))
+	if err != nil {
+		t.Fatalf("expected Open with valid WALMaxSegmentSize to succeed, got: %v", err)
+	}
+
+	// Write payloads that exceed one segment (4096 bytes) to trigger segment rotation by behavior
+	payload := make([]byte, 1024)
+	for i := 0; i < 8; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		if err := store.Put("table", key, payload); err != nil {
+			t.Fatalf("Put(%q) failed: %v", key, err)
+		}
+	}
+
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Verify rotation by behavior: multiple .wal segment files must exist on disk
+	walEntries, readErr := memFS.ReadDir(filepath.Join(storeDir, "wal"))
+	if readErr != nil {
+		t.Fatalf("ReadDir wal failed: %v", readErr)
+	}
+	var walSegments []string
+	for _, entry := range walEntries {
+		if strings.HasSuffix(entry.Name(), ".wal") {
+			walSegments = append(walSegments, entry.Name())
+		}
+	}
+	if len(walSegments) <= 1 {
+		t.Fatalf("expected multiple WAL segments due to rotation, found %d: %v", len(walSegments), walSegments)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Reopen the store and verify all keys remain intact across rotated segments
+	reopenedStore, reopenErr := Open(WithFS(memFS), WithDir(storeDir))
+	if reopenErr != nil {
+		t.Fatalf("reopen failed: %v", reopenErr)
+	}
+	defer func() {
+		if closeErr := reopenedStore.Close(); closeErr != nil {
+			t.Fatalf("Close reopenedStore failed: %v", closeErr)
+		}
+	}()
+
+	for i := 0; i < 8; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		got, exists, getErr := reopenedStore.Get("table", key)
+		if getErr != nil || !exists {
+			t.Fatalf("Get(%q) failed: exists=%v err=%v", key, exists, getErr)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("Get(%q) payload mismatch", key)
+		}
+	}
+}

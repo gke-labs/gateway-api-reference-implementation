@@ -19,8 +19,10 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -112,16 +114,99 @@ type tortureConfig struct {
 	// wrapFS optionally wraps the underlying filesystem (e.g. with a measurement wrapper).
 	wrapFS func(FS) FS
 
+	// walMaxSegSize overrides DefaultMaxSegmentSize when non-zero.
+	walMaxSegSize int64
+
+	// onIO is an optional callback invoked on every WriteAt and Sync operation across all filesystem files.
+	// The boolean parameter is true for Sync operations and false for WriteAt operations.
+	onIO func(targetFS *FaultFS, path string, isSync bool)
+
+	// stopOnCrash specifies whether the workload loop should stop and return its collected state
+	// when a filesystem crash occurs, rather than failing the test.
+	stopOnCrash bool
+
 	// skipReason explains why this configuration is skipped during full test runs, or empty if enabled.
 	skipReason string
 }
 
-type workloadStats struct {
+// ioPhase represents the database subsystem performing I/O.
+type ioPhase int
+
+const (
+	// phaseNormal represents regular workload Put and Delete I/O.
+	phaseNormal ioPhase = iota
+
+	// phaseCheckpoint represents I/O performed during checkpoint execution.
+	phaseCheckpoint
+
+	// phaseSegmentRotation represents I/O performed during WAL segment creation and rotation.
+	phaseSegmentRotation
+
+	// phaseRecovery represents I/O performed during crash recovery replay and page flushing.
+	phaseRecovery
+)
+
+func (phase ioPhase) String() string {
+	switch phase {
+	case phaseCheckpoint:
+		return "checkpoint"
+	case phaseSegmentRotation:
+		return "wal_segment_rotation"
+	case phaseRecovery:
+		return "recovery_writes"
+	default:
+		return "normal"
+	}
+}
+
+// tortureWorkloadResult contains the execution artifacts, metrics, and model history from a torture workload run.
+type tortureWorkloadResult struct {
+	// payloadBytesPut is the total bytes of payload written across all Put operations.
 	payloadBytesPut int64
-	puts            int
-	deletes         int
-	checkpoints     int
-	totalOps        int
+
+	// puts is the count of successful Put operations.
+	puts int
+
+	// deletes is the count of successful Delete operations.
+	deletes int
+
+	// checkpoints is the count of successful Checkpoint operations.
+	checkpoints int
+
+	// totalOps is the total number of workload operations performed.
+	totalOps int
+
+	// totalIO is the total number of WriteAt and Sync operations observed during the workload.
+	totalIO int
+
+	// ioPhases records the subsystem phase (checkpoint, WAL segment rotation, recovery, or normal)
+	// for each sequential I/O operation observed during the baseline run.
+	ioPhases []ioPhase
+
+	// history holds sequential snapshots of the model state after each completed operation.
+	history []map[string][]byte
+
+	// inFlightModel holds the model state with the currently executing operation applied,
+	// representing the state if an in-flight mutation became durable before the crash.
+	inFlightModel map[string][]byte
+
+	// lastSyncOp is the index in history corresponding to the most recent returned Sync or Checkpoint.
+	lastSyncOp int
+
+	// lastCompletedOp is the index in history corresponding to the most recent returned workload operation.
+	lastCompletedOp int
+
+	// memFS is the underlying in-memory filesystem holding the durable storage state.
+	memFS *MemFS
+
+	// dbID is the database identifier generated during initialization.
+	dbID [16]byte
+
+	// encryptionKey is the 32-byte encryption key used when encryption is enabled.
+	encryptionKey [32]byte
+
+	// crashed indicates whether the workload halted due to an injected filesystem crash.
+	crashed bool
 }
 
 var tortureConfigs = []tortureConfig{
@@ -238,9 +323,19 @@ func generateTortureValue(random *rand.Rand, maxValueBlocks int, existingLength 
 	return value
 }
 
-func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workloadStats {
+func copyModel(original map[string][]byte) map[string][]byte {
+	copied := make(map[string][]byte, len(original))
+	for key, value := range original {
+		valueCopy := make([]byte, len(value))
+		copy(valueCopy, value)
+		copied[key] = valueCopy
+	}
+	return copied
+}
+
+func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *tortureWorkloadResult {
 	t.Helper()
-	var stats workloadStats
+	var stats tortureWorkloadResult
 	random := rand.New(rand.NewSource(seed))
 
 	keys := make([]string, config.numKeys)
@@ -248,6 +343,10 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workload
 		keys[keyIndex] = fmt.Sprintf("k%d", keyIndex)
 	}
 	model := make(map[string][]byte)
+	history := []map[string][]byte{copyModel(model)}
+	lastSyncOp := 0
+	lastCompletedOp := 0
+	var inFlightModel map[string][]byte
 
 	memFS := NewMemFS()
 	var baseFS FS = memFS
@@ -273,6 +372,9 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workload
 		if config.encryption {
 			options = append(options, WithEncryptionKey(encryptionKey[:]))
 		}
+		if config.walMaxSegSize > 0 {
+			options = append(options, WithWALMaxSegmentSize(config.walMaxSegSize))
+		}
 		return options
 	}
 
@@ -290,10 +392,64 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workload
 	}
 	setViolationHandler(faultFS)
 
+	var ioCount int
+	var ioMutex sync.Mutex
+	var ioPhases []ioPhase
+	var currentPhase ioPhase = phaseNormal
+	seenWALSegments := make(map[string]bool)
+
+	setPhase := func(phase ioPhase) {
+		ioMutex.Lock()
+		currentPhase = phase
+		ioMutex.Unlock()
+	}
+
+	installHooks := func(targetFS *FaultFS) {
+		if config.onIO == nil {
+			return
+		}
+		targetFS.SetBeforeWriteAt(func(path string, payload []byte, offset int64) {
+			ioMutex.Lock()
+			ioCount++
+			phase := currentPhase
+			if strings.HasSuffix(path, ".wal") && !seenWALSegments[path] {
+				seenWALSegments[path] = true
+				if currentPhase == phaseNormal {
+					phase = phaseSegmentRotation
+				}
+			}
+			ioPhases = append(ioPhases, phase)
+			ioMutex.Unlock()
+			config.onIO(targetFS, path, false)
+		})
+		targetFS.SetBeforeSync(func(path string) {
+			ioMutex.Lock()
+			ioCount++
+			phase := currentPhase
+			if strings.HasSuffix(path, ".wal") && !seenWALSegments[path] {
+				seenWALSegments[path] = true
+				if currentPhase == phaseNormal {
+					phase = phaseSegmentRotation
+				}
+			}
+			ioPhases = append(ioPhases, phase)
+			ioMutex.Unlock()
+			config.onIO(targetFS, path, true)
+		})
+	}
+
 	currentStore, err := Open(append(openOptions(faultFS), WithCreate())...)
 	if err != nil {
 		t.Fatalf("torture init failed: config=%s seed=%d: Open: %v", config.name, seed, err)
 	}
+
+	entries, readDirErr := memFS.ReadDir(filepath.Join(dir, "wal"))
+	if readDirErr == nil {
+		for _, entry := range entries {
+			seenWALSegments[filepath.Join(dir, "wal", entry.Name())] = true
+		}
+	}
+	installHooks(faultFS)
 
 	var failed bool
 	defer func() {
@@ -360,6 +516,12 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workload
 		}
 	}
 
+	isCrashed := func() bool {
+		faultFS.mu.RLock()
+		defer faultFS.mu.RUnlock()
+		return faultFS.crashed
+	}
+
 	for cycle := 0; cycle < config.numCycles; cycle++ {
 		checkViolation(cycle, "cycle_start")
 
@@ -398,19 +560,38 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workload
 
 			switch {
 			case triggerRandomCheckpoint:
-				if _, err := currentStore.Checkpoint(); err != nil {
+				inFlightModel = copyModel(model)
+				setPhase(phaseCheckpoint)
+				_, err := currentStore.Checkpoint()
+				setPhase(phaseNormal)
+				if err != nil {
+					if config.stopOnCrash && isCrashed() {
+						break
+					}
 					checkViolation(cycle, "checkpoint")
 					fail(cycle, "checkpoint", err)
 				}
+				history = append(history, copyModel(model))
+				lastCompletedOp = len(history) - 1
+				lastSyncOp = len(history) - 1
 				stats.checkpoints++
+
 			case action >= 7:
 				key := keys[random.Intn(len(keys))]
+				inFlightModel = copyModel(model)
+				delete(inFlightModel, key)
 				if err := currentStore.Delete(tableName, key); err != nil {
+					if config.stopOnCrash && isCrashed() {
+						break
+					}
 					checkViolation(cycle, "delete")
 					fail(cycle, "delete", err)
 				}
 				delete(model, key)
+				history = append(history, copyModel(model))
+				lastCompletedOp = len(history) - 1
 				stats.deletes++
+
 			default:
 				key := keys[random.Intn(len(keys))]
 				existingValue, exists := model[key]
@@ -425,30 +606,53 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workload
 				} else {
 					value = generateTortureValue(random, config.maxValueBlocks, existingLength)
 				}
+				inFlightModel = copyModel(model)
+				inFlightModel[key] = value
 				if err := currentStore.Put(tableName, key, value); err != nil {
+					if config.stopOnCrash && isCrashed() {
+						break
+					}
 					checkViolation(cycle, "put")
 					fail(cycle, "put", err)
 				}
 				model[key] = value
+				history = append(history, copyModel(model))
+				lastCompletedOp = len(history) - 1
 				stats.payloadBytesPut += int64(len(value))
 				stats.puts++
 			}
 
 			if config.syncAfterOp {
 				if err := currentStore.Sync(); err != nil {
+					if config.stopOnCrash && isCrashed() {
+						break
+					}
 					checkViolation(cycle, "sync_after_op")
 					fail(cycle, "sync_after_op", err)
 				}
 			}
 
 			if config.checkpointInterval > 0 && operationNumber%config.checkpointInterval == 0 {
-				if _, err := currentStore.Checkpoint(); err != nil {
+				inFlightModel = copyModel(model)
+				setPhase(phaseCheckpoint)
+				_, err := currentStore.Checkpoint()
+				setPhase(phaseNormal)
+				if err != nil {
+					if config.stopOnCrash && isCrashed() {
+						break
+					}
 					checkViolation(cycle, "checkpoint")
 					fail(cycle, "checkpoint", err)
 				}
+				history = append(history, copyModel(model))
+				lastCompletedOp = len(history) - 1
+				lastSyncOp = len(history) - 1
 				stats.checkpoints++
 			}
 
+			if config.stopOnCrash && isCrashed() {
+				break
+			}
 			checkViolation(cycle, "after_op")
 		}
 
@@ -457,23 +661,54 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workload
 			checkViolation(cycle, "sweep")
 		}
 
+		if config.stopOnCrash && isCrashed() {
+			break
+		}
+
 		isCrash, dropUnsynced, tearFraction := config.cycleEnd.endForCycle(cycle)
 		if isCrash {
+			inFlightModel = copyModel(model)
 			if err := currentStore.Sync(); err != nil {
+				if config.stopOnCrash && isCrashed() {
+					break
+				}
 				checkViolation(cycle, "sync_before_crash")
 				fail(cycle, "sync_before_crash", err)
 			}
+			history = append(history, copyModel(model))
+			lastCompletedOp = len(history) - 1
+			lastSyncOp = len(history) - 1
+
 			if err := faultFS.Crash(dropUnsynced, tearFraction); err != nil {
 				fail(cycle, "crash", err)
 			}
+			// Shut down the abandoned store after a crash to stop its background
+			// goroutines (such as wal.bgWriter) and release buffer pool memory.
+			// It is safe to close after a crash because TestHookFail marks the
+			// engine failed, ensuring Close skips taking a checkpoint and makes
+			// no further modifications to the disk state.
+			TestHookFail(currentStore, ErrCrashed)
+			if closeErr := currentStore.Close(); closeErr != nil {
+				// Close errors on a crashed filesystem are expected.
+			}
+			currentStore = nil
 		} else {
+			inFlightModel = copyModel(model)
 			if err := currentStore.Sync(); err != nil {
+				if config.stopOnCrash && isCrashed() {
+					break
+				}
 				checkViolation(cycle, "sync_before_close")
 				fail(cycle, "sync_before_close", err)
 			}
+			history = append(history, copyModel(model))
+			lastCompletedOp = len(history) - 1
+			lastSyncOp = len(history) - 1
+
 			if err := currentStore.Close(); err != nil {
 				fail(cycle, "close", err)
 			}
+			currentStore = nil
 		}
 
 		faultFS = NewFaultFS(baseFS)
@@ -482,40 +717,81 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) workload
 			faultFS.SetHeapCipher(heapCipher)
 			faultFS.SetEncryptionKey(encryptionKey[:])
 		}
+		installHooks(faultFS)
+
+		setPhase(phaseRecovery)
 		currentStore, err = Open(openOptions(faultFS)...)
+		setPhase(phaseNormal)
 		if err != nil {
+			if config.stopOnCrash && isCrashed() {
+				break
+			}
 			fail(cycle, "reopen", err)
 		}
+		history = append(history, copyModel(model))
+		lastCompletedOp = len(history) - 1
+		lastSyncOp = len(history) - 1
 
-		for _, key := range keys {
-			gotValue, exists, err := currentStore.Get(tableName, key)
-			if err != nil {
-				fail(cycle, "get", fmt.Errorf("Get(%q) error: %w", key, err))
-			}
-			expectedValue, expectedExists := model[key]
-			if expectedExists {
-				if !exists {
-					fail(cycle, "verify_missing", fmt.Errorf("key %q missing after reopen", key))
+		if !config.stopOnCrash {
+			for _, key := range keys {
+				gotValue, exists, getErr := currentStore.Get(tableName, key)
+				if getErr != nil {
+					fail(cycle, "get", fmt.Errorf("Get(%q) error: %w", key, getErr))
 				}
-				if !bytes.Equal(gotValue, expectedValue) {
-					fail(cycle, "verify_mismatch", fmt.Errorf("key %q value mismatch: got len=%d, want len=%d", key, len(gotValue), len(expectedValue)))
-				}
-			} else {
-				if exists {
-					fail(cycle, "verify_deleted", fmt.Errorf("key %q should be deleted but exists after reopen", key))
+				expectedValue, expectedExists := model[key]
+				if expectedExists {
+					if !exists {
+						fail(cycle, "verify_missing", fmt.Errorf("key %q missing after reopen", key))
+					}
+					if !bytes.Equal(gotValue, expectedValue) {
+						fail(cycle, "verify_mismatch", fmt.Errorf("key %q value mismatch: got len=%d, want len=%d", key, len(gotValue), len(expectedValue)))
+					}
+				} else {
+					if exists {
+						fail(cycle, "verify_deleted", fmt.Errorf("key %q should be deleted but exists after reopen", key))
+					}
 				}
 			}
 		}
 	}
 
+	var storeDBID [16]byte
 	if currentStore != nil {
-		if err := currentStore.Close(); err != nil {
-			fail(config.numCycles-1, "final_close", err)
+		storeDBID = currentStore.DBID()
+		if isCrashed() {
+			TestHookFail(currentStore, ErrCrashed)
+			if closeErr := currentStore.Close(); closeErr != nil {
+				// Close errors on a crashed filesystem are expected.
+			}
+		} else {
+			if closeErr := currentStore.Close(); closeErr != nil {
+				if config.stopOnCrash && isCrashed() {
+					// Injected crash occurred during Close's checkpoint flush.
+				} else {
+					fail(config.numCycles-1, "final_close", closeErr)
+				}
+			}
 		}
 		currentStore = nil
 	}
 
-	return stats
+	return &tortureWorkloadResult{
+		payloadBytesPut: stats.payloadBytesPut,
+		puts:            stats.puts,
+		deletes:         stats.deletes,
+		checkpoints:     stats.checkpoints,
+		totalOps:        stats.totalOps,
+		totalIO:         ioCount,
+		ioPhases:        ioPhases,
+		history:         history,
+		inFlightModel:   inFlightModel,
+		lastSyncOp:      lastSyncOp,
+		lastCompletedOp: lastCompletedOp,
+		memFS:           memFS,
+		dbID:            storeDBID,
+		encryptionKey:   encryptionKey,
+		crashed:         isCrashed(),
+	}
 }
 
 func TestTortureMatrix(t *testing.T) {

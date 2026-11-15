@@ -60,6 +60,9 @@ var (
 
 	// ErrBlockPoolTooSmall is returned by Put when a record requires more blocks than the block pool's total capacity.
 	ErrBlockPoolTooSmall = errors.New("block pool is too small for page")
+
+	// ErrWALSegmentSizeTooSmall indicates that the configured WAL segment size is less than WALBlockSize.
+	ErrWALSegmentSizeTooSmall = errors.New("WAL segment size is too small")
 )
 
 // TestHookFail is an internal hook used by tests to trigger the failed state without exposing a method on Engine.
@@ -98,10 +101,24 @@ type Options struct {
 	Quarantine QuarantineOptions
 
 	compressionCodecSet bool
+
+	// WALMaxSegmentSize is the maximum size in bytes of a WAL segment file before rotating.
+	// Must be at least WALBlockSize (4096 bytes) if set.
+	// Defaults to DefaultMaxSegmentSize (16 MiB) if unset or 0.
+	WALMaxSegmentSize int64
 }
 
 // Option is a functional option for configuring an Engine.
 type Option func(*Options)
+
+// WithWALMaxSegmentSize configures the maximum size in bytes of a WAL segment file before rotating.
+// The segment size must be at least WALBlockSize (4096 bytes).
+// When unset or 0, DefaultMaxSegmentSize (16 MiB) is used.
+func WithWALMaxSegmentSize(bytes int64) Option {
+	return func(options *Options) {
+		options.WALMaxSegmentSize = bytes
+	}
+}
 
 // WithCreate specifies that Open should create a new database when no store files exist.
 // Without it, Open returns an error if there is no existing database.
@@ -565,6 +582,13 @@ func Open(opts ...Option) (*Engine, error) {
 		return nil, fmt.Errorf("encryption key must be %d bytes, got %d", MasterKeySize, len(options.EncryptionKey))
 	}
 
+	if options.WALMaxSegmentSize < 0 {
+		return nil, fmt.Errorf("%w: max segment size cannot be negative (%d)", ErrWALSegmentSizeTooSmall, options.WALMaxSegmentSize)
+	}
+	if options.WALMaxSegmentSize > 0 && options.WALMaxSegmentSize < int64(WALBlockSize) {
+		return nil, fmt.Errorf("%w: max segment size must be at least %d bytes, got %d", ErrWALSegmentSizeTooSmall, WALBlockSize, options.WALMaxSegmentSize)
+	}
+
 	dir := options.Dir
 	isTemp := false
 	if dir == "" {
@@ -857,10 +881,11 @@ func Open(opts ...Option) (*Engine, error) {
 
 	if isNewStore {
 		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{
-			OnFailure:     s.setFailed,
-			Clock:         options.Clock,
-			Quarantine:    walQuarantine,
-			EncryptionKey: options.EncryptionKey,
+			MaxSegmentSize: options.WALMaxSegmentSize,
+			OnFailure:      s.setFailed,
+			Clock:          options.Clock,
+			Quarantine:     walQuarantine,
+			EncryptionKey:  options.EncryptionKey,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -912,10 +937,11 @@ func Open(opts ...Option) (*Engine, error) {
 
 		// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
 		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{
-			OnFailure:     s.setFailed,
-			Clock:         options.Clock,
-			Quarantine:    walQuarantine,
-			EncryptionKey: options.EncryptionKey,
+			MaxSegmentSize: options.WALMaxSegmentSize,
+			OnFailure:      s.setFailed,
+			Clock:          options.Clock,
+			Quarantine:     walQuarantine,
+			EncryptionKey:  options.EncryptionKey,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
