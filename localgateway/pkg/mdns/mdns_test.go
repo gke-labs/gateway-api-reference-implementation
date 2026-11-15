@@ -1227,7 +1227,10 @@ func TestMDNSSharedHostnameAcrossGateways(t *testing.T) {
 		t.Fatalf("failed to create publisher: %v", err)
 	}
 	defer pub.Close()
-	go func() { _ = pub.Start(ctx) }()
+	startErrCh := make(chan error, 1)
+	go func() {
+		startErrCh <- pub.Start(ctx)
+	}()
 
 	hName := gatewayv1.Hostname("shared.local")
 	gw1 := &gatewayv1.Gateway{
@@ -1288,5 +1291,14 @@ func TestMDNSSharedHostnameAcrossGateways(t *testing.T) {
 	if !ok || len(rec.A) != 1 || !rec.A[0].Equal(net.ParseIP("10.0.0.1")) {
 		t.Fatalf("expected address to update to gw-1's 10.0.0.1 after gw-2 removal, got %v", rec.A)
 	}
-}
 
+	cancel()
+	select {
+	case err := <-startErrCh:
+		if err != nil {
+			t.Fatalf("pub.Start returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for pub.Start to exit")
+	}
+}
