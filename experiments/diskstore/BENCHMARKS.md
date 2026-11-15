@@ -121,15 +121,19 @@ Engines evaluated:
 
 ### Methodology
 
-Evaluates physical write volume, write operation counts, and sync operations in `experiments/diskstore/engine` using the seeded model-checked workload runner over 2,000 operations across 20 keys with clean closes:
+Evaluates bytes handed to the filesystem, write operation counts, and sync operations in `experiments/diskstore/engine` using the seeded model-checked workload runner (`runTortureWorkload`) over 2,000 operations across 20 keys with clean closes:
 - **Test Command:**
   ```bash
   DISKSTORE_MEASURE=1 go test -v -run ^TestWriteMeasurement$ ./experiments/diskstore/engine
   ```
 - **Machine & Environment:** AMD EPYC 9B14 (60 vCPUs, 235 GiB RAM, Linux 6.12.110+ x86_64, `go1.27.4 linux/amd64`).
-- **Filesystem Wrapper:** In-memory filesystem (`NewMemFS()`) wrapped by `MeasureFS`, tracking write bytes, write calls, and fsync calls separated by file kind (`heap`, `wal`, `oversize`, `other`).
+- **Filesystem Wrapper:** In-memory filesystem (`NewMemFS()`) wrapped by a test wrapper (`measureFS`), tracking write bytes, write calls, and fsync calls separated by file kind (`heap`, `wal`, `oversize`, `other`).
 - **Engine Configuration:** Uncompressed store (`WithCompressionCodec(CodecNone)`), block pool of 4,096 blocks (16 MiB) sized large enough to hold all 20 keys without buffer eviction.
-- **Workload:** 2,000 random operations (Puts and Deletes) using seed 42. Tested for value sizes of 256 bytes, 2 KiB, 16 KiB, and 256 KiB, both without intermediate checkpoints and with a checkpoint every 1,000 operations. Each case ends with a clean sync and close, reopens the store, and verifies durable contents against an in-memory model map.
+- **Workload & Durability Modes:** 2,000 operations (Puts and Deletes) using seed 42. Evaluated for value sizes of 256 bytes, 2 KiB, 16 KiB, and 256 KiB across three durability modes:
+  1. *No Checkpoint:* No intermediate checkpoints or syncs; modifications are flushed and synced only on clean close.
+  2. *Checkpoint / 1k ops:* Store checkpoints every 1,000 operations, flushing dirty pages to the heap file, syncing the heap, appending a checkpoint record, and syncing the WAL.
+  3. *Sync after each op:* Store calls `Sync()` after every put and delete operation.
+  Each case concludes with a clean close, reopens the store, and verifies durable contents against the in-memory model map.
 
 ### What the Numbers Leave Out
 
@@ -140,26 +144,28 @@ These measurements record bytes handed to the filesystem layer via `File.WriteAt
 
 ### Results
 
-| Value Size | Checkpoint Mode | Payload Put | WAL Bytes | Heap Bytes | Write Ratio | Syncs / Op |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| 256 B | No Checkpoint | 357,120 B | 450,560 B | 20,480 B | 1.33 | 0.0050 |
-| 256 B | Checkpoint / 1k ops | 357,120 B | 462,848 B | 32,768 B | 1.40 | 0.0075 |
-| 2 KiB | No Checkpoint | 2,820,096 B | 2,916,352 B | 98,304 B | 1.07 | 0.0050 |
-| 2 KiB | Checkpoint / 1k ops | 2,820,096 B | 2,924,544 B | 167,936 B | 1.10 | 0.0075 |
-| 16 KiB | No Checkpoint | 23,166,976 B | 23,265,280 B | 819,200 B | 1.04 | 0.0055 |
-| 16 KiB | Checkpoint / 1k ops | 23,166,976 B | 23,273,472 B | 1,245,184 B | 1.06 | 0.0080 |
-| 256 KiB | No Checkpoint | 370,671,616 B | 370,810,880 B | 13,107,200 B | 1.04 | 0.0225 |
-| 256 KiB | Checkpoint / 1k ops | 370,671,616 B | 370,823,168 B | 19,922,944 B | 1.05 | 0.0185 |
+| Value Size | Durability Mode | Payload Put | WAL Bytes | Heap Bytes | Oversize Bytes | Write Ratio | Syncs / Op |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| 256 B | No Checkpoint | 357,120 B | 454,656 B | 20,480 B | 0 B | 1.34 | 0.0075 |
+| 256 B | Checkpoint / 1k ops | 357,120 B | 466,944 B | 32,768 B | 0 B | 1.41 | 0.0100 |
+| 256 B | Sync after each op | 357,120 B | 7,409,664 B | 20,480 B | 0 B | 20.82 | 0.9105 |
+| 2 KiB | No Checkpoint | 2,820,096 B | 2,920,448 B | 98,304 B | 0 B | 1.07 | 0.0075 |
+| 2 KiB | Checkpoint / 1k ops | 2,820,096 B | 2,928,640 B | 167,936 B | 0 B | 1.10 | 0.0100 |
+| 2 KiB | Sync after each op | 2,820,096 B | 7,430,144 B | 98,304 B | 0 B | 2.67 | 0.9130 |
+| 16 KiB | No Checkpoint | 23,166,976 B | 23,269,376 B | 819,200 B | 0 B | 1.04 | 0.0080 |
+| 16 KiB | Checkpoint / 1k ops | 23,166,976 B | 23,277,568 B | 1,245,184 B | 0 B | 1.06 | 0.0105 |
+| 16 KiB | Sync after each op | 23,166,976 B | 30,613,504 B | 819,200 B | 0 B | 1.36 | 0.9155 |
+| 256 KiB | No Checkpoint | 370,671,616 B | 370,814,976 B | 13,107,200 B | 0 B | 1.04 | 0.0250 |
+| 256 KiB | Checkpoint / 1k ops | 370,671,616 B | 370,827,264 B | 19,922,944 B | 0 B | 1.05 | 0.0210 |
+| 256 KiB | Sync after each op | 370,671,616 B | 378,179,584 B | 13,107,200 B | 0 B | 1.06 | 0.9400 |
 
 ### Analysis & Comparison to Minimum Write Volume
 
-In a write-ahead logged database engine, the smallest possible write volume for durable storage is:
-1. Exactly one WAL record per modification (containing the operation header, key, and payload).
-2. Exactly one page flush per changed page when committing changes to durable heap storage.
+The smallest possible write volume for durable storage in a write-ahead logged engine is one WAL record for each modification and one page flush for each changed page.
 
-How the measured numbers compare to that minimum:
+What the comparison shows and what it doesn't: the WAL carries each payload once plus framing, and heap writes depend on how often pages are flushed, which this workload makes rare.
 
-- **WAL Framing Overhead:** Each WAL record includes a 28-byte record header, table name, key string, CRC32 checksum, and block padding. For 256 B values, this fixed framing overhead accounts for ~26% additional bytes over the raw payload (yielding a 1.33–1.40 write ratio). As value size increases to 2 KiB, 16 KiB, and 256 KiB, payload bytes dominate the WAL records, driving WAL write volume within 1% to 4% of payload bytes put.
-- **Heap Write Coalescing in Memory:** Because the block pool is sized to prevent eviction, dirty pages remain resident in RAM across repeated updates to the same page. Without intermediate checkpoints, pages are flushed to the heap file only once upon clean store shutdown. For 256 B values, 20 keys reside in just a few slotted pages; ~1,400 puts produce only 20,480 bytes of heap writes (~15 bytes per put instead of 4,096 bytes per put), illustrating significant write amortization.
-- **Checkpoint Impact on Heap Flushes:** Checkpoints every 1,000 operations flush and fsync all dirty pages to disk to establish a durability boundary and truncate earlier WAL segments. Keys modified across multiple checkpoint periods must be flushed once per checkpoint period, increasing heap write volume (e.g., from 20 KiB to 32 KiB for 256 B values, and from 13.1 MiB to 19.9 MiB for 256 KiB values).
-- **Amortized Syncs:** DiskStore buffers WAL and heap writes, issuing fsync only during periodic checkpoints and clean shutdown (plus WAL segment rollovers at 64 MiB boundaries for large 256 KiB workloads). Consequently, sync frequency stays extremely low at 0.0050–0.0225 syncs per operation.
+- **WAL Framing Overhead:** Each WAL record includes a 32-byte record header (`RecordHeaderSize`), table name, key string, and CRC32 checksum. For 256 B values in buffered modes, this fixed framing overhead accounts for the 1.34–1.41 write ratio. As value size increases to 2 KiB, 16 KiB, and 256 KiB, payload bytes dominate the WAL records, keeping WAL write volume within 1% to 4% of payload bytes put.
+- **Durability Modes and Heap Flushes:** The workload without sync calls `Sync` only at checkpoints or close, so it makes nothing durable until a checkpoint or close. In that setting, with no checkpoint, 1,395 puts of 256 bytes wrote 20,480 bytes to the heap, because the resident pages were flushed once at close. Checkpointing every 1,000 operations flushes dirty pages at each checkpoint boundary, increasing heap write volume from 20,480 B to 32,768 B for 256 B values, and from 13,107,200 B to 19,922,944 B for 256 KiB values.
+- **Per-Operation Sync and WAL Block Padding:** In the "Sync after each op" mode, `Sync()` is called after each operation to make every modification immediately durable. Because WAL syncs pad unaligned trailing blocks with zeros up to the 4,096-byte boundary (`WALBlockSize`) before fsyncing, small 256 B puts write a full 4 KiB block per operation. This produces 7,409,664 bytes written to the WAL for 357,120 bytes of payload (a write ratio of 20.82 and 0.9105 syncs per operation). At 2 KiB values, block padding produces a 2.67 ratio. At 16 KiB and 256 KiB, values span multiple full blocks (4 and 64 blocks respectively), so trailing padding represents a much smaller fraction of total writes (ratios of 1.36 and 1.06).
+- **WAL Segment Rollover:** The default WAL segment size is 16 MiB (`DefaultMaxSegmentSize`). For 256 KiB values, accumulating ~370 MB of writes causes segment rollover every 16 MiB, which explains the 0.0210–0.0250 syncs per operation observed even without explicit per-operation syncs.
