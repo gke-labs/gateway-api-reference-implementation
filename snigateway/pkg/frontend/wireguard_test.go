@@ -768,3 +768,95 @@ func TestWireGuard_FailedAddPeer(t *testing.T) {
 		t.Fatal("expected new key2 to be on device after successful replacement")
 	}
 }
+
+func TestWireGuard_AllocateAddressLocked(t *testing.T) {
+	_, prefix, err := net.ParseCIDR("2001:db8:cafe::/64")
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
+
+	mgr := NewWireGuardManager(newFakeWireGuardDevice(), wireguard.Key{}, 51820, prefix, nil)
+	if mgr == nil {
+		t.Fatal("NewWireGuardManager returned nil")
+	}
+
+	// 1. First allocation returns host 2
+	addr1, err := mgr.allocateAddressLocked()
+	if err != nil {
+		t.Fatalf("allocateAddressLocked failed: %v", err)
+	}
+	expectedAddr1 := net.ParseIP("2001:db8:cafe::2")
+	if !addr1.Equal(expectedAddr1) {
+		t.Fatalf("expected first allocated address to be %s, got %s", expectedAddr1, addr1)
+	}
+
+	// Record addr1 in peersBySession
+	key1, _, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	mgr.peersBySession["sess-1"] = wireguardPeer{publicKey: key1, address: addr1}
+
+	// 2. Second allocation returns host 3
+	addr2, err := mgr.allocateAddressLocked()
+	if err != nil {
+		t.Fatalf("allocateAddressLocked failed: %v", err)
+	}
+	expectedAddr2 := net.ParseIP("2001:db8:cafe::3")
+	if !addr2.Equal(expectedAddr2) {
+		t.Fatalf("expected second allocated address to be %s, got %s", expectedAddr2, addr2)
+	}
+
+	// Record addr2 in peersBySession
+	key2, _, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	mgr.peersBySession["sess-2"] = wireguardPeer{publicKey: key2, address: addr2}
+
+	// 3. Third allocation returns host 4
+	addr3, err := mgr.allocateAddressLocked()
+	if err != nil {
+		t.Fatalf("allocateAddressLocked failed: %v", err)
+	}
+	expectedAddr3 := net.ParseIP("2001:db8:cafe::4")
+	if !addr3.Equal(expectedAddr3) {
+		t.Fatalf("expected third allocated address to be %s, got %s", expectedAddr3, addr3)
+	}
+
+	// Record addr3 in peersBySession
+	key3, _, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	mgr.peersBySession["sess-3"] = wireguardPeer{publicKey: key3, address: addr3}
+
+	// 4. Free sess-2 (host 3); next allocation should reuse host 3
+	delete(mgr.peersBySession, "sess-2")
+	addrReused, err := mgr.allocateAddressLocked()
+	if err != nil {
+		t.Fatalf("allocateAddressLocked failed: %v", err)
+	}
+	if !addrReused.Equal(expectedAddr2) {
+		t.Fatalf("expected reused address to be %s, got %s", expectedAddr2, addrReused)
+	}
+
+	// 5. Add a peer with an address from a different prefix; it should not affect host allocation
+	keyOther, _, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	mgr.peersBySession["sess-other"] = wireguardPeer{
+		publicKey: keyOther,
+		address:   net.ParseIP("2001:db8:other::2"),
+	}
+	// If sess-1 (host 2) is freed, host 2 in cafe prefix should still be allocated
+	delete(mgr.peersBySession, "sess-1")
+	addrHost2, err := mgr.allocateAddressLocked()
+	if err != nil {
+		t.Fatalf("allocateAddressLocked failed: %v", err)
+	}
+	if !addrHost2.Equal(expectedAddr1) {
+		t.Fatalf("expected allocated address to be %s, got %s", expectedAddr1, addrHost2)
+	}
+}
