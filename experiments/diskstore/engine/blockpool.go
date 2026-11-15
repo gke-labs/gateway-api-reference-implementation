@@ -824,13 +824,27 @@ func (bp *BlockPool) FlushAllDirty() error {
 }
 
 // SnapshotFlushedForSync records all currently flushed locations before a heap fsync starts.
-// This fulfills the Reuse Rule: only locations written before the fsync began may be promoted to durable.
+// The snapshot holds every location that the following fsync can make durable.
 func (bp *BlockPool) SnapshotFlushedForSync() {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
+	for {
+		hasInFlight := false
+		for _, desc := range bp.pageTable {
+			if desc.InFlight {
+				hasInFlight = true
+				break
+			}
+		}
+		if !hasInFlight {
+			break
+		}
+		bp.cond.Wait()
+	}
+
 	for _, desc := range bp.pageTable {
-		if !desc.InFlight && desc.FlushedLoc != NoBlock {
+		if desc.FlushedLoc != NoBlock {
 			desc.FlushedBeforeSync = desc.FlushedLoc
 		}
 	}

@@ -145,9 +145,10 @@ func TestBlockPool_MultiBlockPageNonAdjacentPoolBlocks(t *testing.T) {
 	}
 }
 
-// TestBlockPool_InFlightWriteNotPromoted asserts that in-flight page writes are not promoted
-// during a checkpoint, satisfying the Reuse Rule.
-func TestBlockPool_InFlightWriteNotPromoted(t *testing.T) {
+// TestBlockPool_InFlightWriteWaitedAndPromoted asserts that SnapshotFlushedForSync
+// waits for in-flight page flushes to finish before taking the snapshot, ensuring that
+// the following fsync covers the write and it is promoted to durable.
+func TestBlockPool_InFlightWriteWaitedAndPromoted(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 	// Reuse rule assertion stays enabled
@@ -238,34 +239,30 @@ func TestBlockPool_InFlightWriteNotPromoted(t *testing.T) {
 	}
 	bp.mu.Unlock()
 
-	// Checkpoint runs while the write is in flight
-	bp.SnapshotFlushedForSync()
-	if err := heapFile.Sync(); err != nil {
-		close(releaseWrite)
-		t.Fatalf("heapFile.Sync failed: %v", err)
-	}
-	if err := bp.PromoteFlushedToDurable(); err != nil {
-		close(releaseWrite)
-		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
-	}
+	// SnapshotFlushedForSync runs while the write is in flight.
+	// It must block until the in-flight write completes.
+	snapshotDone := make(chan struct{})
+	go func() {
+		bp.SnapshotFlushedForSync()
+		close(snapshotDone)
+	}()
 
-	// Assert that in-flight location was NOT promoted
-	bp.mu.Lock()
-	if desc.DurableLoc != initialDurableLoc {
-		bp.mu.Unlock()
+	// Verify SnapshotFlushedForSync does not complete while the flush is in flight
+	select {
+	case <-snapshotDone:
 		close(releaseWrite)
-		t.Fatalf("in-flight location was promoted to durable! DurableLoc=%d, expected=%d", desc.DurableLoc, initialDurableLoc)
+		t.Fatalf("SnapshotFlushedForSync returned while write was still in flight")
+	default:
 	}
-	bp.mu.Unlock()
 
 	// Release in-flight write to complete
 	close(releaseWrite)
 	if err := <-flushErrCh; err != nil {
 		t.Fatalf("FlushPage failed after unblocking write: %v", err)
 	}
+	<-snapshotDone
 
-	// Now that write completed, next checkpoint must promote it safely
-	bp.SnapshotFlushedForSync()
+	// Fsync heap and promote to durable
 	if err := heapFile.Sync(); err != nil {
 		t.Fatalf("heapFile.Sync failed: %v", err)
 	}
@@ -273,10 +270,11 @@ func TestBlockPool_InFlightWriteNotPromoted(t *testing.T) {
 		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
 	}
 
+	// Assert that newly written location WAS promoted to durable
 	bp.mu.Lock()
 	if desc.DurableLoc == initialDurableLoc {
 		bp.mu.Unlock()
-		t.Fatalf("expected DurableLoc to be promoted after write completed, still %d", desc.DurableLoc)
+		t.Fatalf("expected DurableLoc to be promoted to new location, still %d", desc.DurableLoc)
 	}
 	bp.mu.Unlock()
 }
@@ -821,5 +819,136 @@ func TestRegression_BlockPoolInFlightWait(t *testing.T) {
 		defer handle3.Unpin()
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for AllocateNewPage after flush completed")
+	}
+}
+
+func TestBlockPool_InFlightFlushReuseViolation(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	faultFS.SetAssertReuseRule(true)
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("bp-test-db-00004"))
+
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	heapFile, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	buddy := NewBuddyAllocator(512)
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
+	defer bp.Close()
+
+	// Initial write of page 1 at LSN 10
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k1", Payload: []byte("v1")})
+	h1, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	copy(h1.Block(0)[BlockHeaderSize:], []byte("v1-content"))
+	h1.Unpin()
+
+	// Flush and checkpoint to establish initial durable location (locA)
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("FlushPage failed: %v", err)
+	}
+	bp.SnapshotFlushedForSync()
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := bp.PromoteFlushedToDurable(); err != nil {
+		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	}
+
+	// Dirty page 1 again at LSN 20
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k1", Payload: []byte("v2")})
+	h1Again, err := bp.PinPage(1)
+	if err != nil {
+		t.Fatalf("PinPage failed: %v", err)
+	}
+	copy(h1Again.Block(0)[BlockHeaderSize:], []byte("v2-content"))
+	h1Again.Unpin()
+	bp.MarkDirty(1, 20)
+
+	// Pause the flush after InFlight=true, before SnapshotFlushedForSync
+	writeStarted := make(chan struct{})
+	releaseWrite := make(chan struct{})
+
+	faultFS.SetBeforeWriteAt(func(path string, p []byte, off int64) {
+		select {
+		case <-writeStarted:
+		default:
+			close(writeStarted)
+			<-releaseWrite
+		}
+	})
+
+	flushErrCh := make(chan error, 1)
+	go func() {
+		flushErrCh <- bp.FlushPage(1)
+	}()
+
+	<-writeStarted
+
+	// Checkpoint runs while the flush is in flight:
+	// SnapshotFlushedForSync is called and waits for the in-flight flush to finish.
+	snapshotDone := make(chan struct{})
+	go func() {
+		bp.SnapshotFlushedForSync()
+		close(snapshotDone)
+	}()
+
+	// Release in-flight write so flush completes and SnapshotFlushedForSync unblocks
+	close(releaseWrite)
+	if err := <-flushErrCh; err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+	<-snapshotDone
+
+	// Heap file fsync runs: this makes locB durable on disk!
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := bp.PromoteFlushedToDurable(); err != nil {
+		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	}
+
+	// Dirty page 1 again at LSN 30 and flush it
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 30, Key: "k1", Payload: []byte("v3")})
+	h1Third, err := bp.PinPage(1)
+	if err != nil {
+		t.Fatalf("PinPage failed: %v", err)
+	}
+	copy(h1Third.Block(0)[BlockHeaderSize:], []byte("v3-content"))
+	h1Third.Unpin()
+	bp.MarkDirty(1, 30)
+
+	// Clear the hook
+	faultFS.SetBeforeWriteAt(nil)
+
+	// Flush page 1: in the buggy version, this frees locB back to buddy allocator!
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("FlushPage failed: %v", err)
+	}
+
+	// Allocate a new page (page 2): buddy allocator hands out locB!
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 40, Key: "k2", Payload: []byte("v4")})
+	h2, err := bp.AllocateNewPage(2, 1, 40)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	copy(h2.Block(0)[BlockHeaderSize:], []byte("v4-content"))
+	h2.Unpin()
+
+	// Flush page 2: overwrites locB, violating the reuse rule!
+	if err := bp.FlushPage(2); err != nil {
+		t.Fatalf("FlushPage(2) failed: %v", err)
 	}
 }

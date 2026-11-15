@@ -299,7 +299,7 @@ To coordinate concurrent flushes and fsyncs, the engine distinguishes three stag
 
 The engine applies the reuse rule through the following lifecycle:
 - **Flushing:** When a dirty page flushes, it writes to a new disk location. If the page previously wrote to an intermediate un-synced location, the engine frees that intermediate location immediately, unless that location is currently syncing. Keeping syncing locations allocated prevents newer flushes from releasing disk blocks that the ongoing fsync is making durable.
-- **Syncing and Promotion:** When syncing the heap file, the engine snapshots completed flushed locations for all pages that do not have a flush in flight. Skipping pages with an in-flight flush is safe because not promoting is always conservative: the page retains its older durable location on disk until a subsequent sync. Once the heap fsync completes, the engine promotes the snapshotted locations to durable and frees any superseded older locations to the allocator.
+- **Syncing and Promotion:** When syncing the heap file, the engine waits for any in-flight flushes to complete so that the snapshot holds every location that the following fsync can make durable, then records all flushed locations. Once the heap fsync completes, the engine promotes the snapshotted locations to durable and frees any superseded older locations to the allocator.
 - **Crash Recovery:** If the system crashes before a heap fsync completes, recovery restores the previous durable copy.
 
 ### 3. Natural Alignment of Block Runs
