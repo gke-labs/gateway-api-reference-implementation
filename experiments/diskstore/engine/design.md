@@ -449,7 +449,7 @@ Deferred frees eliminate multi-stage location tracking and flusher wait loops fr
 
 The design trades disk space headroom for operational simplicity:
 - **Headroom costs:** Blocks remain unusable for up to one sync interval, increasing the heap file's high-water mark during high churn.
-- **Allocator exhaustion:** When the allocator is empty but locations are pending, the engine can either extend the heap file by allocating new blocks at the end, or force a heap fsync to release `prior` pending blocks.
+- **Allocator exhaustion:** When the allocator is empty but locations are pending, the engine grows the heap file. It forces an fsync to release `prior` pending blocks only when the file can't grow.
 - **Crash artifacts:** A crash discards the volatile pending lists. Recovery reclaims unreferenced blocks into the allocator's free list without WAL logging or on-disk metadata leaks.
 - **Fsync failure:** If a heap fsync returns an error, the engine transitions to its permanent failed state, matching existing behavior. It does not release `prior`. In the failed state, the engine stops accepting writes and fsyncs, so the volatile pending lists no longer matter. Recovery on restart reconstructs the allocator free list from durable heap headers, preserving winning copies because `prior` was never freed.
 
@@ -457,25 +457,17 @@ The design trades disk space headroom for operational simplicity:
 
 - **Checkpoint and redo start LSN:** The engine separates whether an in-memory copy still has to be written from the earliest LSN whose effect on the page is not yet durable on disk:
   - `Dirty` (bool) on `PageDesc` indicates that the in-memory copy has unwritten modifications. It is set when a page is modified in memory and clears as soon as direct I/O flush completes, allowing eviction to reclaim pool blocks by LRU immediately without waiting for an fsync. If `Dirty` remained set until an fsync, a pool full of flushed pages could not evict without an fsync, reintroducing the stall this design removes.
-  - `RedoLSN` (uint64) on `PageDesc` records the earliest LSN whose effect on the page is not yet confirmed durable by a completed heap fsync. It is set to the mutating operation's LSN when a page without un-synced modifications (`RedoLSN == 0`) is dirtied. When direct I/O completes, `Dirty` clears, but `RedoLSN` remains set. If the page is modified again in memory before an fsync occurs, `Dirty` becomes true again while `RedoLSN` continues to hold the earlier LSN across subsequent flushes.
+  - `RedoLSN` (uint64) on `PageDesc` records the earliest LSN whose effect on the page is not yet confirmed durable by a completed heap fsync. A page descriptor stays in the page table after its pool blocks are evicted, which is why the field can live there. `RedoLSN` replaces the existing `DirtyLSN` field: whereas `DirtyLSN` was tied to whether the in-memory copy was dirty, `RedoLSN` tracks durability independently of whether page blocks are resident or dirty in memory. It is set to the mutating operation's LSN when a page without un-synced modifications (`RedoLSN == 0`) is dirtied. When direct I/O completes, `Dirty` clears, but `RedoLSN` remains set. If the page is modified again in memory before an fsync occurs, `Dirty` becomes true again while `RedoLSN` continues to hold the earlier LSN across subsequent flushes.
   - `RedoLSN` clears at sync boundaries using the same two-generation rotation as the pending free list. When a flush completes, the page is recorded in `current`. At fsync start, `current` rotates to `prior`. When the fsync completes, the engine clears `RedoLSN` (to zero) for pages in `prior` that received no newer modifications, or resets `RedoLSN` to the earliest LSN of those newer modifications if they arrived while the fsync ran.
   - When a checkpoint runs, `redoStartLSN` is computed from the minimum `RedoLSN` across all pages with `RedoLSN > 0`. Consider a page that was dirty at the checkpoint's snapshot with `RedoLSN` equal to `L1`, whose flush completes during the checkpoint's fsync. Because `L1` was captured in the snapshot, the checkpoint's `redoStartLSN` is at or below `L1`. Because the flush returned during the fsync (after generation rotation), the write is in `current`, so its superseded block remains held and this fsync does not clear its `RedoLSN`. The checkpoint appends its record to the WAL and truncates WAL segments strictly prior to `redoStartLSN`. Because `redoStartLSN` is at or below `L1`, all log records from `L1` onward remain in the WAL. If a crash occurs before the next fsync, recovery finds either the valid new copy on disk or the older durable copy (which was never freed), and replays WAL records from `redoStartLSN` forward to reconstruct the page.
 - **Fault filesystem reuse check:** `FaultFS` updates its durable page set during `heapFile.Sync()`. Under deferred frees, pending blocks are released to the allocator only after `Sync()` finishes. Any subsequent write to a reallocated block occurs after `FaultFS` has updated its durable set, satisfying the reuse rule assertion without timing dependencies or special cases.
 
-### Maintainer Choices
+### Decisions
 
-1. **Allocator exhaustion strategy:**
-   - *Option A: Extend the heap file.* Gives up disk space efficiency by growing the file while unreleased blocks remain in pending lists.
-   - *Option B: Force a heap fsync.* Gives up predictable write latency by stalling the allocating writer behind an fsync to reclaim `prior` blocks.
-   - *Recommendation:* Extend the heap file when below a maximum configured size to preserve write latency; force an fsync when file growth is restricted.
-2. **Pending list representation:**
-   - *Option A: Slice of block runs (`[]uint64` or `[]BlockRun`).* Gives up bounded memory overhead under extreme write churn before an fsync runs.
-   - *Option B: Bitset over heap blocks.* Gives up fast slice appends and O(1) clears, requiring full-heap bit scans on sync completion.
-   - *Recommendation:* Use a slice of block numbers or runs guarded by the block pool mutex because typical workloads list fewer than several hundred runs per sync interval, making append and clear fast.
-3. **Threshold-triggered syncs:**
-   - *Option A: Trigger an asynchronous fsync on pending block volume.* Gives up I/O isolation by introducing unscheduled fsync I/O during heavy write bursts.
-   - *Option B: Wait strictly for checkpoint or eviction syncs.* Gives up heap file compactness by allowing pending blocks to accumulate across the entire checkpoint interval.
-   - *Recommendation:* Have the idle sweep trigger an fsync if pending blocks exceed a set fraction (such as 25%) of pool capacity to bound disk growth during bursts.
+The maintainer decided the three choices on 2026-11-15:
+- **Empty allocator with frees pending:** The engine grows the heap file. It forces an fsync only when the file can't grow. This gives up disk space under heavy churn between syncs.
+- **Pending list:** A slice of block runs for each generation, guarded by the block pool mutex. Memory grows with the number of frees between syncs.
+- **No fsync trigger from pending volume for now:** Pending blocks are released only at the fsyncs the engine already does. The file may grow over a checkpoint interval. A trigger is a later option if measurements show the growth matters.
 
 ### Implementation Steps
 
