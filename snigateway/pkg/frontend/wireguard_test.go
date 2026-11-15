@@ -274,6 +274,39 @@ func TestWireGuard_Off_Returns404(t *testing.T) {
 	}
 }
 
+func TestWireGuard_MethodNotAllowed(t *testing.T) {
+	env, cleanup := setupTestWireGuardServer(t, "fd00:1234::/64")
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: clientTLS,
+		},
+	}
+
+	url := fmt.Sprintf("https://%s/v1/sessions/test-session/wireguard", env.serverAddr)
+	httpReq, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	httpReq.Host = "snigateway.internal"
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("Do request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got: %d", resp.StatusCode)
+	}
+}
+
 func TestWireGuard_AddressInsidePrefix(t *testing.T) {
 	prefixStr := "2001:db8:1234:5678::/64"
 	env, cleanup := setupTestWireGuardServer(t, prefixStr)
