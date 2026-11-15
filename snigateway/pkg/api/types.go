@@ -43,3 +43,27 @@ type RegistrationResponse struct {
 	Status    string   `json:"status"`
 	Hostnames []string `json:"hostnames"`
 }
+
+// WireGuardRequest is sent to PUT /v1/sessions/<id>/wireguard to configure WireGuard for a session.
+type WireGuardRequest struct {
+	Type      string `json:"type,omitempty"`
+	PublicKey string `json:"publicKey"`
+	Token     string `json:"token,omitempty"`
+}
+
+// WireGuardResponse contains frontend WireGuard configuration for the session.
+type WireGuardResponse struct {
+	PublicKey   string `json:"publicKey"`
+	Port        int    `json:"port"`
+	ListenPort  int    `json:"listenPort,omitempty"`
+	Address     string `json:"address,omitempty"`
+	PeerAddress string `json:"peerAddress,omitempty"`
+	Prefix      string `json:"prefix"`
+}
+
+// WireGuardExchangeRequest is an alias for WireGuardRequest.
+type WireGuardExchangeRequest = WireGuardRequest
+
+// WireGuardExchangeResponse is an alias for WireGuardResponse.
+type WireGuardExchangeResponse = WireGuardResponse
+

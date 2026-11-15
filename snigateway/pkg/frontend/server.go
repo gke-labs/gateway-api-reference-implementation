@@ -19,13 +19,16 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -37,8 +40,15 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 	"k8s.io/klog/v2"
 )
+
+// WireGuardDevice manages peers on a WireGuard network interface.
+type WireGuardDevice interface {
+	AddPeer(peer wireguard.Peer) error
+	RemovePeer(publicKey wireguard.Key) error
+}
 
 const (
 	// DefaultMaxRegistrationBodyBytes is the default maximum allowed size (256 KiB) for a registration request body.
@@ -71,7 +81,11 @@ type ServerConfig struct {
 	JWTVerifier              jwt.TokenVerifier
 	LeaseReaperInterval      time.Duration
 	// TimeNow overrides time.Now for deterministic testing of lease expiration.
-	TimeNow func() time.Time
+	TimeNow            func() time.Time
+	WireGuardDevice    WireGuardDevice
+	WireGuardPublicKey wireguard.Key
+	WireGuardPort      int
+	WireGuardPrefix    *net.IPNet
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -93,6 +107,16 @@ type Server struct {
 	sessionsMu  sync.Mutex
 	sessions    map[string]*frontendSession
 	timeNow     func() time.Time
+
+	wireguardDevice       WireGuardDevice
+	wireguardPublicKey    wireguard.Key
+	wireguardPort         int
+	wireguardPrefix       *net.IPNet
+	wireguardMu           sync.Mutex
+	wireguardSessionAddr  map[string]net.IP
+	wireguardSessionKey   map[string]wireguard.Key
+	wireguardKeyToSession map[wireguard.Key]string
+	wireguardUsedAddrs    map[string]struct{}
 }
 
 // NewServer creates a new frontend Server with the given configuration.
@@ -143,15 +167,23 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		config:           cfg,
-		authorizer:       auth,
-		table:            NewRegistrationTable(),
-		pool:             pool,
-		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
-		shutdownCh:       make(chan struct{}),
-		jwtVerifier:      cfg.JWTVerifier,
-		sessions:         make(map[string]*frontendSession),
-		timeNow:          timeNow,
+		config:                cfg,
+		authorizer:            auth,
+		table:                 NewRegistrationTable(),
+		pool:                  pool,
+		internalListener:      newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
+		shutdownCh:            make(chan struct{}),
+		jwtVerifier:           cfg.JWTVerifier,
+		sessions:              make(map[string]*frontendSession),
+		timeNow:               timeNow,
+		wireguardDevice:       cfg.WireGuardDevice,
+		wireguardPublicKey:    cfg.WireGuardPublicKey,
+		wireguardPort:         cfg.WireGuardPort,
+		wireguardPrefix:       cfg.WireGuardPrefix,
+		wireguardSessionAddr:  make(map[string]net.IP),
+		wireguardSessionKey:   make(map[string]wireguard.Key),
+		wireguardKeyToSession: make(map[wireguard.Key]string),
+		wireguardUsedAddrs:    make(map[string]struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -160,6 +192,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	mux.HandleFunc("/v1/connections", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/connections/", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/tunnel", s.handleConnectionUpgrade)
+	mux.HandleFunc("/v1/sessions/{id}/wireguard", s.handleWireGuard)
+	mux.HandleFunc("/v1/sessions/", s.handleWireGuard)
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -287,6 +321,9 @@ func (s *Server) Close() error {
 
 	closeCloser(s.internalListener)
 	closeCloser(s.pool)
+	if closer, ok := s.wireguardDevice.(io.Closer); ok {
+		closeCloser(closer)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
@@ -344,6 +381,7 @@ func (s *Server) CloseSession(sessionID string) {
 
 	s.table.Unregister(sessionID)
 	s.pool.UnregisterSession(sessionID)
+	s.removeWireGuardSession(sessionID)
 
 	if sess.cancel != nil {
 		sess.cancel()
@@ -1001,4 +1039,173 @@ func closeCloser(c io.Closer) {
 	if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Printf("Frontend: failed to close: %v", err)
 	}
+}
+
+func (s *Server) removeWireGuardSession(sessionID string) {
+	s.wireguardMu.Lock()
+	defer s.wireguardMu.Unlock()
+	if s.wireguardDevice == nil {
+		return
+	}
+	if key, ok := s.wireguardSessionKey[sessionID]; ok {
+		_ = s.wireguardDevice.RemovePeer(key)
+		delete(s.wireguardKeyToSession, key)
+		delete(s.wireguardSessionKey, sessionID)
+	}
+	if addr, ok := s.wireguardSessionAddr[sessionID]; ok {
+		s.releaseWireGuardAddressLocked(addr)
+		delete(s.wireguardSessionAddr, sessionID)
+	}
+}
+
+func (s *Server) allocateWireGuardAddressLocked() (net.IP, error) {
+	if s.wireguardPrefix == nil || len(s.wireguardPrefix.IP) == 0 || s.wireguardPrefix.IP.To16() == nil {
+		return nil, errors.New("wireguard prefix is not configured")
+	}
+	base := s.wireguardPrefix.IP.To16()
+	for host := uint64(2); host < math.MaxUint64; host++ {
+		ip := make(net.IP, 16)
+		copy(ip, base)
+		binary.BigEndian.PutUint64(ip[8:], host)
+		key := ip.String()
+		if _, used := s.wireguardUsedAddrs[key]; !used {
+			s.wireguardUsedAddrs[key] = struct{}{}
+			return ip, nil
+		}
+	}
+	return nil, errors.New("no free wireguard addresses in prefix")
+}
+
+func (s *Server) releaseWireGuardAddressLocked(addr net.IP) {
+	if addr != nil {
+		delete(s.wireguardUsedAddrs, addr.String())
+	}
+}
+
+func (s *Server) handleWireGuard(w http.ResponseWriter, r *http.Request) {
+	if !strings.HasSuffix(r.URL.Path, "/wireguard") || s.wireguardDevice == nil || s.wireguardPrefix == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if v := reflect.ValueOf(s.wireguardDevice); v.Kind() == reflect.Pointer && v.IsNil() {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sessionID := r.PathValue("id")
+	if sessionID == "" {
+		sessionID = strings.Trim(strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/wireguard"), "/")
+	}
+	if sessionID == "" {
+		http.Error(w, "missing session ID", http.StatusBadRequest)
+		return
+	}
+
+	clientIdentity, err := s.extractClientIdentity(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	sessIdentity, ok := s.table.GetSessionIdentity(sessionID)
+	if !ok {
+		http.Error(w, "session not found or expired", http.StatusNotFound)
+		return
+	}
+	if sessIdentity.ID != clientIdentity.ID {
+		http.Error(w, "session identity mismatch", http.StatusForbidden)
+		return
+	}
+
+	if r.ContentLength > s.config.MaxRegistrationBodyBytes {
+		http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	var req api.WireGuardRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, s.config.MaxRegistrationBodyBytes)).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if clientIdentity.Issuer != "" && req.Token != "" {
+		regClaims, err := s.jwtVerifier.Verify(r.Context(), req.Token)
+		if err != nil {
+			http.Error(w, "token verification failed: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
+		if regClaims.Issuer != clientIdentity.Issuer || regClaims.Subject != clientIdentity.Subject {
+			http.Error(w, "session identity mismatch", http.StatusForbidden)
+			return
+		}
+		clientIdentity.TokenExpiry = regClaims.Expiry
+	}
+
+	if req.PublicKey == "" {
+		http.Error(w, "missing publicKey", http.StatusBadRequest)
+		return
+	}
+	clientPubKey, err := wireguard.ParseKey(req.PublicKey)
+	if err != nil {
+		http.Error(w, "invalid publicKey: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.wireguardMu.Lock()
+	defer s.wireguardMu.Unlock()
+
+	if existingSession, inUse := s.wireguardKeyToSession[clientPubKey]; inUse && existingSession != sessionID {
+		http.Error(w, "public key already in use by another session", http.StatusConflict)
+		return
+	}
+
+	peerAddr, hasAddr := s.wireguardSessionAddr[sessionID]
+	if !hasAddr {
+		addr, err := s.allocateWireGuardAddressLocked()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		peerAddr = addr
+	}
+
+	if oldKey, hasOldKey := s.wireguardSessionKey[sessionID]; hasOldKey && oldKey != clientPubKey {
+		_ = s.wireguardDevice.RemovePeer(oldKey)
+		delete(s.wireguardKeyToSession, oldKey)
+	}
+
+	peer := wireguard.Peer{
+		PublicKey:  clientPubKey,
+		AllowedIPs: []net.IPNet{{IP: peerAddr, Mask: net.CIDRMask(128, 128)}},
+	}
+	if err := s.wireguardDevice.AddPeer(peer); err != nil {
+		if !hasAddr {
+			s.releaseWireGuardAddressLocked(peerAddr)
+		}
+		http.Error(w, fmt.Sprintf("adding wireguard peer: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	s.wireguardSessionAddr[sessionID] = peerAddr
+	s.wireguardSessionKey[sessionID] = clientPubKey
+	s.wireguardKeyToSession[clientPubKey] = sessionID
+
+	prefixStr := ""
+	if s.wireguardPrefix != nil {
+		prefixStr = s.wireguardPrefix.String()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(api.WireGuardResponse{
+		PublicKey:   s.wireguardPublicKey.String(),
+		Port:        s.wireguardPort,
+		ListenPort:  s.wireguardPort,
+		Address:     peerAddr.String(),
+		PeerAddress: peerAddr.String(),
+		Prefix:      prefixStr,
+	})
 }

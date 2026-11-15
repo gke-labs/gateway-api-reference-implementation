@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -32,6 +33,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 )
 
 type stringSliceFlag []string
@@ -84,6 +86,9 @@ func run(ctx context.Context, args []string) error {
 	jwtAudience := fs.String("jwt-audience", jwt.DefaultAudience, "Required audience for ServiceAccount tokens")
 	var clientSubjects stringSliceFlag
 	fs.Var(&clientSubjects, "client-subject", "Client subject allowlist in format system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...] (repeatable, <ns>:* allowed)")
+
+	wireguardListenPort := fs.Int("wireguard-listen-port", 0, "UDP port for WireGuard tunnel (0 leaves WireGuard off)")
+	wireguardPrefix := fs.String("wireguard-prefix", "", "IPv6 /64 prefix for WireGuard tunnel addresses (required when --wireguard-listen-port is set)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -241,6 +246,56 @@ func run(ctx context.Context, args []string) error {
 		serverTLS.ClientAuth = tls.RequireAndVerifyClientCert
 	}
 
+	if *wireguardListenPort < 0 || *wireguardListenPort > 65535 {
+		return fmt.Errorf("invalid --wireguard-listen-port: %d", *wireguardListenPort)
+	}
+	if *wireguardListenPort > 0 && *wireguardPrefix == "" {
+		return fmt.Errorf("--wireguard-prefix is required when --wireguard-listen-port is set")
+	}
+
+	var wgDevice frontend.WireGuardDevice
+	var wgPubKey wireguard.Key
+	var wgPort int
+	var wgPrefixNet *net.IPNet
+
+	if *wireguardListenPort > 0 {
+		prefixIP, prefixNet, err := net.ParseCIDR(*wireguardPrefix)
+		if err != nil || prefixIP.To4() != nil || prefixIP.To16() == nil {
+			return fmt.Errorf("invalid --wireguard-prefix %q: must be an IPv6 prefix", *wireguardPrefix)
+		}
+		if ones, bits := prefixNet.Mask.Size(); ones != 64 || bits != 128 {
+			return fmt.Errorf("--wireguard-prefix %q must be a /64 prefix (got /%d)", *wireguardPrefix, ones)
+		}
+
+		privKey, pubKey, err := wireguard.GenerateKey()
+		if err != nil {
+			return fmt.Errorf("generating wireguard key: %w", err)
+		}
+
+		firstAddr := make(net.IP, 16)
+		copy(firstAddr, prefixNet.IP.To16())
+		firstAddr[15] = 1
+
+		dev, err := wireguard.OpenDevice(ctx, wireguard.Config{
+			InterfaceName: "wg0",
+			PrivateKey:    privKey,
+			ListenPort:    *wireguardListenPort,
+			DeviceAddress: firstAddr,
+			TunnelPrefix:  prefixNet,
+		})
+		if err != nil {
+			return err
+		}
+		defer dev.Close()
+
+		actualPort, err := dev.Port()
+		if err != nil {
+			return err
+		}
+
+		wgDevice, wgPubKey, wgPort, wgPrefixNet = dev, pubKey, actualPort, prefixNet
+	}
+
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ListenAddrs:            listenAddrs,
 		ListenHTTPAddrs:        listenHTTPAddrs,
@@ -252,6 +307,10 @@ func run(ctx context.Context, args []string) error {
 		IdleTimeout:            *idleTimeout,
 		MaxHostnamesPerSession: *maxHostnames,
 		JWTVerifier:            jwtVerifier,
+		WireGuardDevice:        wgDevice,
+		WireGuardPublicKey:     wgPubKey,
+		WireGuardPort:          wgPort,
+		WireGuardPrefix:        wgPrefixNet,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing frontend server: %w", err)
