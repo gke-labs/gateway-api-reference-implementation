@@ -155,7 +155,7 @@ type WALOptions struct {
 }
 
 // OpenWAL opens or creates a WAL in the given directory.
-func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOptions) (*WAL, error) {
+func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, options WALOptions) (*WAL, error) {
 	if err := fs.MkdirAll(dir, StoreDirMode); err != nil {
 		return nil, fmt.Errorf("failed to create WAL directory: %w", err)
 	}
@@ -164,65 +164,49 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	}
 
 	maxSegSize := int64(DefaultMaxSegmentSize)
+	if options.MaxSegmentSize > 0 {
+		maxSegSize = options.MaxSegmentSize
+	}
 	bufSize := DefaultWALBufferSize
-	var qOpts QuarantineOptions
-	var onFailure func(error)
-	var clock Clock = realClock{}
-	var tickInterval time.Duration
-	var encryptionKey []byte
-	if len(opts) > 0 {
-		if opts[0].MaxSegmentSize > 0 {
-			maxSegSize = opts[0].MaxSegmentSize
+	if options.BufferSize > 0 {
+		bufSize = options.BufferSize
+		if bufSize < WALBlockSize {
+			bufSize = WALBlockSize
 		}
-		qOpts = opts[0].Quarantine
-		if opts[0].BufferSize > 0 {
-			bufSize = opts[0].BufferSize
-			if bufSize < WALBlockSize {
-				bufSize = WALBlockSize
-			}
-			if rem := bufSize % WALBlockSize; rem != 0 {
-				bufSize += WALBlockSize - rem
-			}
+		if rem := bufSize % WALBlockSize; rem != 0 {
+			bufSize += WALBlockSize - rem
 		}
-		onFailure = opts[0].OnFailure
-		if opts[0].Clock != nil {
-			clock = opts[0].Clock
-		}
-		if opts[0].TickInterval > 0 {
-			tickInterval = opts[0].TickInterval
-		}
-		encryptionKey = opts[0].EncryptionKey
 	}
-
-	lostDir := filepath.Join(dir, "lost+found")
+	qOpts := options.Quarantine
 	if qOpts.Dir == "" {
-		qOpts.Dir = lostDir
+		qOpts.Dir = filepath.Join(dir, "lost+found")
 	}
-
-	var encryptionBuffer []byte
-	if len(encryptionKey) > 0 {
-		encryptionBuffer = AllocateAlignedBlock(bufSize)
+	clock := options.Clock
+	if clock == nil {
+		clock = realClock{}
 	}
 
 	w := &WAL{
-		fs:               fs,
-		dir:              dir,
-		dbID:             dbID,
-		bufSize:          bufSize,
-		bufs:             [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
-		encryptionKey:    encryptionKey,
-		encryptionBuffer: encryptionBuffer,
-		maxSegSize:       maxSegSize,
-		quarantine:       qOpts,
-		createdLSNs:      make(map[uint64]bool),
-		nextLSN:          initialLSN + 1,
-		lastAppendedLSN:  initialLSN,
-		clock:            clock,
-		tickInterval:     tickInterval,
-		wakeCh:           make(chan struct{}, 1),
-		bgStop:           make(chan struct{}),
-		bgDone:           make(chan struct{}),
-		onFailure:        onFailure,
+		fs:              fs,
+		dir:             dir,
+		dbID:            dbID,
+		bufSize:         bufSize,
+		bufs:            [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
+		encryptionKey:   options.EncryptionKey,
+		maxSegSize:      maxSegSize,
+		quarantine:      qOpts,
+		createdLSNs:     make(map[uint64]bool),
+		nextLSN:         initialLSN + 1,
+		lastAppendedLSN: initialLSN,
+		clock:           clock,
+		tickInterval:    options.TickInterval,
+		wakeCh:          make(chan struct{}, 1),
+		bgStop:          make(chan struct{}),
+		bgDone:          make(chan struct{}),
+		onFailure:       options.OnFailure,
+	}
+	if len(options.EncryptionKey) > 0 {
+		w.encryptionBuffer = AllocateAlignedBlock(bufSize)
 	}
 	w.syncCond = sync.NewCond(&w.mu)
 	w.writeCond = sync.NewCond(&w.mu)
@@ -969,7 +953,7 @@ type WALIterator struct {
 }
 
 // NewWALIterator creates an iterator to replay records from startLSN.
-func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, opts ...WALIteratorOptions) (*WALIterator, error) {
+func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, options WALIteratorOptions) (*WALIterator, error) {
 	entries, err := fs.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -1011,11 +995,6 @@ func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, opts ...W
 		}
 	}
 
-	var encryptionKey []byte
-	if len(opts) > 0 {
-		encryptionKey = opts[0].EncryptionKey
-	}
-
 	it := &WALIterator{
 		fs:               fs,
 		segments:         segments,
@@ -1023,7 +1002,7 @@ func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, opts ...W
 		currSegIdx:       startIdx - 1,
 		startLSN:         startLSN,
 		expectedLSN:      0,
-		encryptionKey:    encryptionKey,
+		encryptionKey:    options.EncryptionKey,
 		cachedBlock:      make([]byte, WALBlockSize),
 		rawBlock:         make([]byte, WALBlockSize),
 		cachedBlockIndex: -1,

@@ -140,7 +140,7 @@ func TestHeapEncryption_BlockCopiedToAnotherPositionFailsCRC32C(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("db-reloc-test-01"))
 
-	wal, err := OpenWAL(memFS, filepath.Join(dir, "wal"), dbID, 0)
+	wal, err := OpenWAL(memFS, filepath.Join(dir, "wal"), dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}

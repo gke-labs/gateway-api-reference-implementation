@@ -31,7 +31,7 @@ func TestBlockPool_PinAndEviction(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("bp-test-db-00001"))
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestBlockPool_MultiBlockPageNonAdjacentPoolBlocks(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("bp-test-db-00002"))
 
-	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	defer wal.Close()
 
 	heapFile, _ := faultFS.Create("heap.db")
@@ -156,7 +156,7 @@ func TestBlockPool_InFlightWriteNotPromoted(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("bp-test-db-00003"))
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestBlockPool_BatchedEviction(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("evict-batch-test"))
 
-	wal, err := OpenWAL(fs, filepath.Join(dir, "wal"), dbID, 0)
+	wal, err := OpenWAL(fs, filepath.Join(dir, "wal"), dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestBlockPool_ConcurrentReuseWhileFlushing(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("bp-test-reuse---"))
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -483,7 +483,7 @@ func TestBlockPool_ConcurrentReuseWhilePinned(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("bp-test-reuse2--"))
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestBlockPool_UnpinStress(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("bp-test-unpin---"))
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
@@ -614,7 +614,7 @@ func TestBlockPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("bp-test-evict---"))
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}

@@ -153,7 +153,7 @@ func runCountingCheckpointTest(t *testing.T, numPages int, expectedWrites int64)
 	var dbID [16]byte
 	copy(dbID[:], []byte("cnt-test-db-0001"))
 
-	wal, err := OpenWAL(fs, filepath.Join(dir, "wal"), dbID, 0)
+	wal, err := OpenWAL(fs, filepath.Join(dir, "wal"), dbID, 0, WALOptions{})
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
