@@ -100,6 +100,23 @@ func (m *WireGuardManager) RemoveSession(sessionID string) {
 	}
 }
 
+// PeerAddress returns a copy of the IPv6 tunnel address allocated to the session's WireGuard peer, if any.
+func (m *WireGuardManager) PeerAddress(sessionID string) (net.IP, bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	peer, ok := m.peersBySession[sessionID]
+	if !ok {
+		return nil, false
+	}
+	addr := make(net.IP, len(peer.address))
+	copy(addr, peer.address)
+	return addr, true
+}
+
 func (m *WireGuardManager) allocateAddressLocked() (net.IP, error) {
 	base := m.prefix.IP.To16()
 	if base == nil {
