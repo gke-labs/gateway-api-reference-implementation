@@ -8,7 +8,7 @@ metadata:
 # The program reads this single Secret object and nothing else.
 # The Role, RoleBinding, and controller share one namespace (default).
 # If installed into another namespace, update metadata.namespace on the ServiceAccount, Role, RoleBinding,
-# and DaemonSet, subjects[0].namespace on the RoleBinding, and the --secret-namespace flag on the container.
+# and Deployment, subjects[0].namespace on the RoleBinding, and the --secret-namespace flag on the container.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -34,14 +34,22 @@ subjects:
   name: localgateway-dns
   namespace: default
 ---
+# localgateway-dns is deployed as a single-replica Deployment (replicas: 1) with strategy: Recreate.
+# Only one announcer runs across the cluster to avoid duplicate mDNS probes, duplicate announcements,
+# and intra-cluster conflict detection on the LAN for the same .local hostnames.
+# The Recreate strategy ensures the previous announcer pod shuts down and releases host port 5353
+# before a replacement starts.
 apiVersion: apps/v1
-kind: DaemonSet
+kind: Deployment
 metadata:
   name: localgateway-dns
   namespace: default
   labels:
     app: localgateway-dns
 spec:
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: localgateway-dns
