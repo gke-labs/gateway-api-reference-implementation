@@ -39,28 +39,38 @@ const (
 	keyCheckTokenSize = 32
 )
 
+// EncryptionKey is the caller's master key for block-level encryption.
+// The engine derives the heap, WAL and key-check keys from it.
+// Code must not log it or put it in an error.
+type EncryptionKey []byte
+
+// String returns a fixed placeholder so that a stray %v or %s does not expose sensitive key material.
+func (EncryptionKey) String() string {
+	return "<redacted>"
+}
+
 // deriveHeapKey derives the 512-bit AES-XTS key for heap blocks from the caller's key.
-func deriveHeapKey(key []byte, dbID [16]byte) ([]byte, error) {
+func deriveHeapKey(key EncryptionKey, dbID [16]byte) ([]byte, error) {
 	return deriveKey(key, dbID, "diskstore/heap", derivedBlockKeySize)
 }
 
 // deriveWALKey derives the 512-bit AES-XTS key for a WAL segment starting at segmentStartLSN from the caller's key.
-func deriveWALKey(key []byte, dbID [16]byte, segmentStartLSN uint64) ([]byte, error) {
+func deriveWALKey(key EncryptionKey, dbID [16]byte, segmentStartLSN uint64) ([]byte, error) {
 	return deriveKey(key, dbID, "diskstore/wal/"+strconv.FormatUint(segmentStartLSN, 10), derivedBlockKeySize)
 }
 
 // deriveOversizeKey derives the 512-bit AES-XTS key for an oversize value file from the caller's key.
-func deriveOversizeKey(key []byte, dbID [16]byte, filename string) ([]byte, error) {
+func deriveOversizeKey(key EncryptionKey, dbID [16]byte, filename string) ([]byte, error) {
 	return deriveKey(key, dbID, "diskstore/oversize/"+filename, derivedBlockKeySize)
 }
 
 // deriveKeyCheckKey derives the 256-bit key used to compute the key-check token from the caller's key.
-func deriveKeyCheckKey(key []byte, dbID [16]byte) ([]byte, error) {
+func deriveKeyCheckKey(key EncryptionKey, dbID [16]byte) ([]byte, error) {
 	return deriveKey(key, dbID, "diskstore/keycheck", keyCheckKeySize)
 }
 
 // computeKeyCheckToken computes the HMAC-SHA256 token of the database ID using the derived key-check key.
-func computeKeyCheckToken(key []byte, dbID [16]byte) ([keyCheckTokenSize]byte, error) {
+func computeKeyCheckToken(key EncryptionKey, dbID [16]byte) ([keyCheckTokenSize]byte, error) {
 	k, err := deriveKeyCheckKey(key, dbID)
 	if err != nil {
 		return [keyCheckTokenSize]byte{}, err
@@ -73,7 +83,7 @@ func computeKeyCheckToken(key []byte, dbID [16]byte) ([keyCheckTokenSize]byte, e
 }
 
 // verifyKeyCheckToken verifies that the caller's key matches expectedToken for the database ID.
-func verifyKeyCheckToken(key []byte, dbID [16]byte, expectedToken [keyCheckTokenSize]byte) error {
+func verifyKeyCheckToken(key EncryptionKey, dbID [16]byte, expectedToken [keyCheckTokenSize]byte) error {
 	token, err := computeKeyCheckToken(key, dbID)
 	if err != nil {
 		return err
@@ -85,7 +95,7 @@ func verifyKeyCheckToken(key []byte, dbID [16]byte, expectedToken [keyCheckToken
 }
 
 // newHeapCipher creates an AES-256-XTS cipher for heap blocks using the derived heap key.
-func newHeapCipher(key []byte, dbID [16]byte) (*xts.Cipher, error) {
+func newHeapCipher(key EncryptionKey, dbID [16]byte) (*xts.Cipher, error) {
 	heapKey, err := deriveHeapKey(key, dbID)
 	if err != nil {
 		return nil, err
@@ -94,7 +104,7 @@ func newHeapCipher(key []byte, dbID [16]byte) (*xts.Cipher, error) {
 }
 
 // newWALSegmentCipher creates an AES-256-XTS cipher for a WAL segment starting at startLSN using the derived WAL key.
-func newWALSegmentCipher(key []byte, dbID [16]byte, startLSN uint64) (*xts.Cipher, error) {
+func newWALSegmentCipher(key EncryptionKey, dbID [16]byte, startLSN uint64) (*xts.Cipher, error) {
 	if len(key) == 0 {
 		return nil, nil
 	}
@@ -123,11 +133,11 @@ func decryptHeapBlock(dst, src []byte, blockNum uint64, cipher *xts.Cipher) {
 	}
 }
 
-func deriveKey(key []byte, dbID [16]byte, info string, length int) ([]byte, error) {
+func deriveKey(key EncryptionKey, dbID [16]byte, info string, length int) ([]byte, error) {
 	if len(key) != MasterKeySize {
 		return nil, fmt.Errorf("encryption key must be %d bytes, got %d", MasterKeySize, len(key))
 	}
-	return hkdf.Key(sha256.New, key, dbID[:], info, length)
+	return hkdf.Key(sha256.New, []byte(key), dbID[:], info, length)
 }
 
 // Suppress unused linter warning until oversize-file encryption uses deriveOversizeKey.

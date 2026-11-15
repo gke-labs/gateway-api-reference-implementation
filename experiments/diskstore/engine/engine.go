@@ -84,7 +84,7 @@ type Options struct {
 	Dir           string
 	FS            FS
 	Cipher        Cipher
-	EncryptionKey []byte
+	EncryptionKey EncryptionKey
 	NumPoolBlocks int
 	AutoDelete    bool
 	Clock         Clock
@@ -182,7 +182,7 @@ func WithCipher(cipher Cipher) Option {
 //     Opening such a store with WithEncryptionKey fails key verification and
 //     returns ErrInvalidKey, which will cause WithEraseOnError to erase and
 //     recreate the store.
-func WithEncryptionKey(key []byte) Option {
+func WithEncryptionKey(key EncryptionKey) Option {
 	return func(o *Options) {
 		o.EncryptionKey = key
 	}
@@ -273,7 +273,7 @@ type Engine struct {
 	autoDelete bool
 
 	cipher           Cipher
-	encryptionKey    []byte
+	encryptionKey    EncryptionKey
 	compressionCodec CompressionCodec
 	maxObjectSize    int
 
@@ -824,7 +824,7 @@ func Open(opts ...Option) (*Engine, error) {
 		isTemp:           isTemp,
 		autoDelete:       options.AutoDelete,
 		cipher:           options.Cipher,
-		encryptionKey:    bytes.Clone(options.EncryptionKey),
+		encryptionKey:    EncryptionKey(bytes.Clone(options.EncryptionKey)),
 		compressionCodec: options.CompressionCodec,
 		maxObjectSize:    options.MaxObjectSize,
 		quarantine:       options.Quarantine,

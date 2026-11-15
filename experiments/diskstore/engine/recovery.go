@@ -149,7 +149,7 @@ type RecoveryOptions struct {
 	// than treated as a torn write from a crash.
 	ClosedCleanly bool
 	// EncryptionKey is the 32-byte master key used for decrypting WAL segments during recovery.
-	EncryptionKey []byte
+	EncryptionKey EncryptionKey
 }
 
 // Recover scans the heap file, filters out foreign and torn copies, finds the WAL redo start LSN,
