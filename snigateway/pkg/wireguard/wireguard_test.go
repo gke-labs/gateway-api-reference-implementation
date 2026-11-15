@@ -121,7 +121,11 @@ type testNamespaceWorker struct {
 	work      chan func()
 }
 
-func newTestNamespaceWorker() (*testNamespaceWorker, error) {
+func newTestNamespaceWorker(t *testing.T) (*testNamespaceWorker, error) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping test: network namespaces exist only on Linux")
+	}
 	worker := &testNamespaceWorker{
 		work: make(chan func()),
 	}
@@ -204,10 +208,16 @@ func TestOpenDevice_MissingPermissionsOrUnsupported(t *testing.T) {
 		})
 	}
 
-	worker, err := newTestNamespaceWorker()
-	if err != nil {
+	if runtime.GOOS != "linux" {
 		// When unprivileged or without network namespace support (such as macOS),
 		// run directly without touching host links because link creation will fail.
+		runProbe()
+		return
+	}
+
+	worker, err := newTestNamespaceWorker(t)
+	if err != nil {
+		// When unprivileged on Linux, run directly without touching host links because link creation will fail.
 		runProbe()
 		return
 	}
@@ -226,7 +236,7 @@ func TestOpenDevice_MissingPermissionsOrUnsupported(t *testing.T) {
 }
 
 func TestOpenDevice_LeavesNoLinkBehindOnFailure(t *testing.T) {
-	worker, err := newTestNamespaceWorker()
+	worker, err := newTestNamespaceWorker(t)
 	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create network namespace")
 	t.Cleanup(func() {
 		if closeErr := worker.Close(); closeErr != nil {
@@ -338,7 +348,7 @@ func openTestDevice(t *testing.T, worker *testNamespaceWorker, interfaceName str
 }
 
 func TestWireGuard_NamespaceCommunication(t *testing.T) {
-	worker1, err := newTestNamespaceWorker()
+	worker1, err := newTestNamespaceWorker(t)
 	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create network namespace")
 	t.Cleanup(func() {
 		if closeErr := worker1.Close(); closeErr != nil {
@@ -346,7 +356,7 @@ func TestWireGuard_NamespaceCommunication(t *testing.T) {
 		}
 	})
 
-	worker2, err := newTestNamespaceWorker()
+	worker2, err := newTestNamespaceWorker(t)
 	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create second network namespace")
 	t.Cleanup(func() {
 		if closeErr := worker2.Close(); closeErr != nil {
