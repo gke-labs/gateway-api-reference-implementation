@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,10 +27,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
@@ -621,23 +624,49 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 	}
 }
 
-type fakeMgrTestWireGuardDevice struct {
-	mu     sync.Mutex
-	peers  map[wireguard.Key]wireguard.Peer
-	closed bool
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met before deadline")
 }
 
-func (f *fakeMgrTestWireGuardDevice) AddPeer(peer wireguard.Peer) error {
+type fakeFrontendWireGuardDevice struct {
+	mu    sync.Mutex
+	peers map[wireguard.Key]wireguard.Peer
+}
+
+func (f *fakeFrontendWireGuardDevice) AddPeer(peer wireguard.Peer) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.peers[peer.PublicKey] = peer
 	return nil
 }
 
-func (f *fakeMgrTestWireGuardDevice) RemovePeer(key wireguard.Key) error {
+func (f *fakeFrontendWireGuardDevice) RemovePeer(key wireguard.Key) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.peers, key)
+	return nil
+}
+
+type fakeMgrTestWireGuardDevice struct {
+	mu      sync.Mutex
+	peer    wireguard.Peer
+	hasPeer bool
+	closed  bool
+}
+
+func (f *fakeMgrTestWireGuardDevice) AddPeer(peer wireguard.Peer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.peer = peer
+	f.hasPeer = true
 	return nil
 }
 
@@ -648,20 +677,85 @@ func (f *fakeMgrTestWireGuardDevice) Close() error {
 	return nil
 }
 
-func (f *fakeMgrTestWireGuardDevice) IsClosed() bool {
+func (f *fakeMgrTestWireGuardDevice) isClosed() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.closed
 }
 
-func (f *fakeMgrTestWireGuardDevice) Peer(key wireguard.Key) (wireguard.Peer, bool) {
+func (f *fakeMgrTestWireGuardDevice) getPeer() (wireguard.Peer, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p, ok := f.peers[key]
-	return p, ok
+	return f.peer, f.hasPeer
 }
 
-func TestManager_WireGuard_Acceptance(t *testing.T) {
+type fakeTunnelConn struct {
+	net.Conn
+	remoteAddr net.Addr
+}
+
+func (c *fakeTunnelConn) RemoteAddr() net.Addr {
+	return c.remoteAddr
+}
+
+type fakeTunnelListener struct {
+	net.Listener
+	defaultRemoteIP    net.IP
+	mu                 sync.Mutex
+	overrideRemoteAddr net.Addr
+}
+
+func (l *fakeTunnelListener) setOverrideRemoteAddr(addr net.Addr) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.overrideRemoteAddr = addr
+}
+
+func (l *fakeTunnelListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.mu.Lock()
+	override := l.overrideRemoteAddr
+	l.mu.Unlock()
+
+	remoteAddr := override
+	if remoteAddr == nil {
+		remoteAddr = &net.TCPAddr{IP: l.defaultRemoteIP, Port: 51820}
+	}
+	return &fakeTunnelConn{Conn: conn, remoteAddr: remoteAddr}, nil
+}
+
+type fixtureOptions struct {
+	frontendWireGuard bool
+	managerWireGuard  bool
+}
+
+type wireguardFixture struct {
+	server           *frontend.Server
+	serverListener   net.Listener
+	frontendKey      wireguard.Key
+	prefixNet        *net.IPNet
+	frontendTunnelIP net.IP
+	manager          *Manager
+
+	devMu      sync.Mutex
+	devices    []*fakeMgrTestWireGuardDevice
+	devConfigs []wireguard.Config
+
+	listenMu        sync.Mutex
+	listenAddrs     []string
+	tunnelListeners []*fakeTunnelListener
+
+	srvErrCh  chan error
+	mgrErrCh  chan error
+	mgrCancel context.CancelFunc
+}
+
+func newWireGuardFixture(t *testing.T, opts fixtureOptions) *wireguardFixture {
+	t.Helper()
+
 	generated, err := certs.GenerateAll("snigateway.internal", "mgr-client")
 	if err != nil {
 		t.Fatalf("GenerateAll failed: %v", err)
@@ -677,175 +771,160 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 		t.Fatalf("NewClientTLSConfig failed: %v", err)
 	}
 
+	serverLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+
+	_, feKey, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	_, prefixNet, err := net.ParseCIDR("fd00:4444::/64")
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
+	feTunnelIP := make(net.IP, 16)
+	copy(feTunnelIP, prefixNet.IP.To16())
+	feTunnelIP[15] = 1
+
+	srvCfg := frontend.ServerConfig{
+		ServerTLSConfig:  serverTLS,
+		InternalHostname: "snigateway.internal",
+	}
+	if opts.frontendWireGuard {
+		srvCfg.WireGuardDevice = &fakeFrontendWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}
+		srvCfg.WireGuardPublicKey = feKey
+		srvCfg.WireGuardPort = 51820
+		srvCfg.WireGuardPrefix = prefixNet
+	}
+
+	srv, err := frontend.NewServer(srvCfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	f := &wireguardFixture{
+		server:           srv,
+		serverListener:   serverLn,
+		frontendKey:      feKey,
+		prefixNet:        prefixNet,
+		frontendTunnelIP: feTunnelIP,
+		srvErrCh:         make(chan error, 1),
+		mgrErrCh:         make(chan error, 1),
+	}
+
+	go func() {
+		f.srvErrCh <- srv.Serve(serverLn)
+	}()
+
+	opener := func(ctx context.Context, cfg wireguard.Config) (WireGuardDevice, error) {
+		f.devMu.Lock()
+		defer f.devMu.Unlock()
+		dev := &fakeMgrTestWireGuardDevice{}
+		f.devices = append(f.devices, dev)
+		f.devConfigs = append(f.devConfigs, cfg)
+		return dev, nil
+	}
+
+	listenFunc := func(network, address string) (net.Listener, error) {
+		f.listenMu.Lock()
+		defer f.listenMu.Unlock()
+		f.listenAddrs = append(f.listenAddrs, address)
+		rawLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+		tunLn := &fakeTunnelListener{Listener: rawLn, defaultRemoteIP: feTunnelIP}
+		f.tunnelListeners = append(f.tunnelListeners, tunLn)
+		return tunLn, nil
+	}
+
+	c := client.NewClient(serverLn.Addr().String(), clientTLS)
+	f.manager = NewManager(c,
+		WithWireGuard(opts.managerWireGuard),
+		WithWireGuardDeviceOpener(opener),
+		WithListenFunc(listenFunc),
+		WithBackoff(10*time.Millisecond, 50*time.Millisecond),
+	)
+
+	mgrCtx, mgrCancel := context.WithCancel(t.Context())
+	f.mgrCancel = mgrCancel
+	go func() {
+		f.mgrErrCh <- f.manager.Run(mgrCtx)
+	}()
+
+	return f
+}
+
+func (f *wireguardFixture) cleanup(t *testing.T) {
+	t.Helper()
+	f.mgrCancel()
+	if err := <-f.mgrErrCh; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("manager error: %v", err)
+	}
+	_ = f.server.Close()
+	_ = f.serverListener.Close()
+	if err := <-f.srvErrCh; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+		t.Errorf("server error: %v", err)
+	}
+}
+
+func TestManager_WireGuard_Acceptance(t *testing.T) {
 	t.Run("WireGuard session lifecycle and connection dispatching", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("net.Listen failed: %v", err)
+		f := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true, managerWireGuard: true})
+		defer f.cleanup(t)
+
+		waitFor(t, 5*time.Second, f.manager.IsConnected)
+
+		f.devMu.Lock()
+		if len(f.devices) != 1 {
+			f.devMu.Unlock()
+			t.Fatalf("expected 1 WireGuard device opened, got %d", len(f.devices))
 		}
-		defer ln.Close()
+		dev := f.devices[0]
+		devCfg := f.devConfigs[0]
+		f.devMu.Unlock()
 
-		_, feKey, err := wireguard.GenerateKey()
-		if err != nil {
-			t.Fatalf("GenerateKey failed: %v", err)
+		if devCfg.InterfaceName != defaultWireGuardInterfaceName {
+			t.Errorf("expected interface name %s, got %s", defaultWireGuardInterfaceName, devCfg.InterfaceName)
 		}
-		_, prefixNet, err := net.ParseCIDR("fd00:4444::/64")
-		if err != nil {
-			t.Fatalf("ParseCIDR failed: %v", err)
-		}
-
-		feDev := &fakeMgrTestWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}
-		srv, err := frontend.NewServer(frontend.ServerConfig{
-			ServerTLSConfig:    serverTLS,
-			InternalHostname:   "snigateway.internal",
-			WireGuardDevice:    feDev,
-			WireGuardPublicKey: feKey,
-			WireGuardPort:      51820,
-			WireGuardPrefix:    prefixNet,
-		})
-		if err != nil {
-			t.Fatalf("NewServer failed: %v", err)
-		}
-		defer srv.Close()
-
-		go func() {
-			_ = srv.Serve(ln)
-		}()
-
-		var (
-			devMu        sync.Mutex
-			mgrDevices   []*fakeMgrTestWireGuardDevice
-			devConfigs   []wireguard.Config
-			listenMu     sync.Mutex
-			listenAddrs  []string
-			tunListeners []net.Listener
-		)
-
-		opener := func(ctx context.Context, cfg wireguard.Config) (WireGuardDevice, error) {
-			devMu.Lock()
-			defer devMu.Unlock()
-			dev := &fakeMgrTestWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}
-			mgrDevices = append(mgrDevices, dev)
-			devConfigs = append(devConfigs, cfg)
-			return dev, nil
+		if !f.prefixNet.Contains(devCfg.DeviceAddress) {
+			t.Errorf("expected DeviceAddress in %s, got %v", f.prefixNet, devCfg.DeviceAddress)
 		}
 
-		listenFunc := func(network, address string) (net.Listener, error) {
-			listenMu.Lock()
-			defer listenMu.Unlock()
-			listenAddrs = append(listenAddrs, address)
-			tunLis, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				return nil, err
-			}
-			tunListeners = append(tunListeners, tunLis)
-			return tunLis, nil
+		peer, ok := dev.getPeer()
+		if !ok || peer.PublicKey != f.frontendKey {
+			t.Fatalf("expected frontend peer %s on device", f.frontendKey)
 		}
 
-		c := client.NewClient(ln.Addr().String(), clientTLS)
-		mgr := NewManager(c,
-			WithWireGuard(true),
-			WithWireGuardDeviceOpener(opener),
-			WithListenFunc(listenFunc),
-			WithBackoff(20*time.Millisecond, 100*time.Millisecond),
-		)
-
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-
-		sess1Ctx, sess1Cancel := context.WithCancel(ctx)
-		defer sess1Cancel()
-
-		mgrDone := make(chan error, 1)
-		go func() {
-			mgrDone <- mgr.Run(sess1Ctx)
-		}()
-
-		// Wait until session connects
-		deadline := time.Now().Add(5 * time.Second)
-		for !mgr.IsConnected() && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if !mgr.IsConnected() {
-			t.Fatalf("timed out waiting for manager to connect")
-		}
-
-		// 1. Verify exchange and device opening:
-		devMu.Lock()
-		numDevs := len(mgrDevices)
-		var dev1 *fakeMgrTestWireGuardDevice
-		var cfg1 wireguard.Config
-		if numDevs > 0 {
-			dev1 = mgrDevices[0]
-			cfg1 = devConfigs[0]
-		}
-		devMu.Unlock()
-
-		if numDevs != 1 {
-			t.Fatalf("expected 1 WireGuard device opened, got %d", numDevs)
-		}
-
-		if cfg1.InterfaceName != "wg0" {
-			t.Errorf("expected InterfaceName wg0, got %s", cfg1.InterfaceName)
-		}
-		if cfg1.DeviceAddress == nil || !prefixNet.Contains(cfg1.DeviceAddress) {
-			t.Errorf("expected DeviceAddress in prefix %s, got %v", prefixNet, cfg1.DeviceAddress)
-		}
-		if cfg1.TunnelPrefix.String() != prefixNet.String() {
-			t.Errorf("expected TunnelPrefix %s, got %s", prefixNet, cfg1.TunnelPrefix)
-		}
-
-		// Verify peer configuration on controller device:
-		peer1, ok := dev1.Peer(feKey)
-		if !ok {
-			t.Fatalf("expected frontend peer %s to be registered on device", feKey)
-		}
-
-		// Endpoint must be frontend host + UDP port 51820
-		feHost := ParseFrontendHost(ln.Addr().String())
-		expectedEndpoint, err := net.ResolveUDPAddr("udp", net.JoinHostPort(feHost, "51820"))
+		expectedEndpoint, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ParseFrontendHost(f.serverListener.Addr().String()), "51820"))
 		if err != nil {
 			t.Fatalf("ResolveUDPAddr failed: %v", err)
 		}
-		if peer1.Endpoint.String() != expectedEndpoint.String() {
-			t.Errorf("expected peer endpoint %s, got %s", expectedEndpoint, peer1.Endpoint)
+		if peer.Endpoint.String() != expectedEndpoint.String() {
+			t.Errorf("expected peer endpoint %s, got %s", expectedEndpoint, peer.Endpoint)
 		}
 
-		// Allowed IPs must be exactly the frontend's address in the tunnel (the first address of the prefix, as a /128)
-		if len(peer1.AllowedIPs) != 1 {
-			t.Fatalf("expected 1 AllowedIP, got %d (%v)", len(peer1.AllowedIPs), peer1.AllowedIPs)
+		if len(peer.AllowedIPs) != 1 || peer.AllowedIPs[0].String() != "fd00:4444::1/128" {
+			t.Errorf("expected AllowedIP fd00:4444::1/128, got %v", peer.AllowedIPs)
 		}
-		expectedAllowedIP := "fd00:4444::1/128"
-		if peer1.AllowedIPs[0].String() != expectedAllowedIP {
-			t.Errorf("expected AllowedIP %s, got %s", expectedAllowedIP, peer1.AllowedIPs[0].String())
+		if peer.PersistentKeepalive == nil || *peer.PersistentKeepalive != wireguardPersistentKeepalive {
+			t.Errorf("expected keepalive %v, got %v", wireguardPersistentKeepalive, peer.PersistentKeepalive)
 		}
 
-		// Persistent keepalive of 25 seconds
-		if peer1.PersistentKeepalive == nil || *peer1.PersistentKeepalive != 25*time.Second {
-			t.Errorf("expected PersistentKeepalive 25s, got %v", peer1.PersistentKeepalive)
+		f.listenMu.Lock()
+		tunLn := f.tunnelListeners[0]
+		listenAddr := f.listenAddrs[0]
+		f.listenMu.Unlock()
+
+		expectedListenAddr := net.JoinHostPort(devCfg.DeviceAddress.String(), strconv.Itoa(api.WireGuardTunnelPort))
+		if listenAddr != expectedListenAddr {
+			t.Errorf("expected listen addr %s, got %s", expectedListenAddr, listenAddr)
 		}
 
-		// Listener was opened at its own tunnel address on port 51821
-		listenMu.Lock()
-		numLis := len(listenAddrs)
-		var tunLisAddr string
-		var tunLis net.Listener
-		if numLis > 0 {
-			tunLisAddr = listenAddrs[0]
-			tunLis = tunListeners[0]
-		}
-		listenMu.Unlock()
-
-		if numLis != 1 {
-			t.Fatalf("expected 1 tunnel listener opened, got %d", numLis)
-		}
-		expectedListenAddr := net.JoinHostPort(cfg1.DeviceAddress.String(), "51821")
-		if tunLisAddr != expectedListenAddr {
-			t.Errorf("expected tunnel listener address %s, got %s", expectedListenAddr, tunLisAddr)
-		}
-
-		// 2. Test connections arriving on the tunnel listener reach HTTPS or HTTP listener by first byte:
-		// Case A: TLS connection (starts with 0x16) reaches HTTPSListener
-		tlsConn, err := net.Dial("tcp", tunLis.Addr().String())
+		// TLS dispatch to HTTPSListener
+		tlsConn, err := net.Dial("tcp", tunLn.Addr().String())
 		if err != nil {
 			t.Fatalf("dialing tunnel listener: %v", err)
 		}
@@ -856,38 +935,23 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 			SrcAddr: &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 12345},
 			DstAddr: &net.TCPAddr{IP: net.ParseIP("198.51.100.1"), Port: 443},
 		}
-		encodedHdrTLS, err := hdrTLS.Format()
+		encodedTLS, err := hdrTLS.Format()
 		if err != nil {
 			t.Fatalf("format PROXY header: %v", err)
 		}
 		tlsPayload := []byte("\x16\x03\x01\x00\x05hello")
-		if _, err := tlsConn.Write(append(encodedHdrTLS, tlsPayload...)); err != nil {
-			t.Fatalf("write TLS connection to tunnel: %v", err)
+		if _, err := tlsConn.Write(append(encodedTLS, tlsPayload...)); err != nil {
+			t.Fatalf("write TLS to tunnel: %v", err)
 		}
 
-		acceptedTLS, err := mgr.HTTPSListener().Accept()
+		acceptedTLS, err := f.manager.HTTPSListener().Accept()
 		if err != nil {
 			t.Fatalf("HTTPSListener.Accept failed: %v", err)
 		}
-		defer acceptedTLS.Close()
+		acceptedTLS.Close()
 
-		pConnTLS, ok := acceptedTLS.(*proxyproto.Conn)
-		if !ok {
-			t.Fatalf("expected *proxyproto.Conn, got %T", acceptedTLS)
-		}
-		if pConnTLS.RemoteAddr().String() != "192.0.2.10:12345" {
-			t.Errorf("expected remote addr 192.0.2.10:12345, got %s", pConnTLS.RemoteAddr())
-		}
-		readTLSBuf := make([]byte, len(tlsPayload))
-		if _, err := io.ReadFull(pConnTLS, readTLSBuf); err != nil {
-			t.Fatalf("read TLS payload failed: %v", err)
-		}
-		if !bytes.Equal(readTLSBuf, tlsPayload) {
-			t.Errorf("expected TLS payload %q, got %q", tlsPayload, readTLSBuf)
-		}
-
-		// Case B: Plain HTTP connection reaches HTTPListener
-		httpConn, err := net.Dial("tcp", tunLis.Addr().String())
+		// HTTP dispatch to HTTPListener
+		httpConn, err := net.Dial("tcp", tunLn.Addr().String())
 		if err != nil {
 			t.Fatalf("dialing tunnel listener for HTTP: %v", err)
 		}
@@ -898,301 +962,143 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 			SrcAddr: &net.TCPAddr{IP: net.ParseIP("192.0.2.20"), Port: 54321},
 			DstAddr: &net.TCPAddr{IP: net.ParseIP("198.51.100.1"), Port: 80},
 		}
-		encodedHdrHTTP, err := hdrHTTP.Format()
+		encodedHTTP, err := hdrHTTP.Format()
 		if err != nil {
 			t.Fatalf("format PROXY header: %v", err)
 		}
 		httpPayload := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
-		if _, err := httpConn.Write(append(encodedHdrHTTP, httpPayload...)); err != nil {
-			t.Fatalf("write HTTP connection to tunnel: %v", err)
+		if _, err := httpConn.Write(append(encodedHTTP, httpPayload...)); err != nil {
+			t.Fatalf("write HTTP to tunnel: %v", err)
 		}
 
-		acceptedHTTP, err := mgr.HTTPListener().Accept()
+		acceptedHTTP, err := f.manager.HTTPListener().Accept()
 		if err != nil {
 			t.Fatalf("HTTPListener.Accept failed: %v", err)
 		}
-		defer acceptedHTTP.Close()
+		acceptedHTTP.Close()
+	})
 
-		pConnHTTP, ok := acceptedHTTP.(*proxyproto.Conn)
-		if !ok {
-			t.Fatalf("expected *proxyproto.Conn, got %T", acceptedHTTP)
-		}
-		if pConnHTTP.RemoteAddr().String() != "192.0.2.20:54321" {
-			t.Errorf("expected remote addr 192.0.2.20:54321, got %s", pConnHTTP.RemoteAddr())
-		}
-		readHTTPBuf := make([]byte, len(httpPayload))
-		if _, err := io.ReadFull(pConnHTTP, readHTTPBuf); err != nil {
-			t.Fatalf("read HTTP payload failed: %v", err)
-		}
-		if !bytes.Equal(readHTTPBuf, httpPayload) {
-			t.Errorf("expected HTTP payload %q, got %q", httpPayload, readHTTPBuf)
-		}
+	t.Run("Unauthorized connection from another address is closed", func(t *testing.T) {
+		f := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true, managerWireGuard: true})
+		defer f.cleanup(t)
 
-		// 3. Ending session closes the device and listener:
-		sess1Cancel()
-		<-mgrDone
+		waitFor(t, 5*time.Second, f.manager.IsConnected)
 
-		if !dev1.IsClosed() {
-			t.Errorf("expected WireGuard device to be closed after ending session")
+		f.listenMu.Lock()
+		tunLn := f.tunnelListeners[0]
+		f.listenMu.Unlock()
+
+		tunLn.setOverrideRemoteAddr(&net.TCPAddr{IP: net.ParseIP("fd00:4444::99"), Port: 12345})
+
+		unauthConn, err := net.Dial("tcp", tunLn.Addr().String())
+		if err != nil {
+			t.Fatalf("dialing tunnel listener: %v", err)
 		}
+		defer unauthConn.Close()
 
-		dialClosedConn, err := net.DialTimeout("tcp", tunLis.Addr().String(), 100*time.Millisecond)
+		hdr := &proxyproto.Header{
+			Command: proxyproto.CommandProxy,
+			SrcAddr: &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 12345},
+			DstAddr: &net.TCPAddr{IP: net.ParseIP("198.51.100.1"), Port: 443},
+		}
+		encoded, err := hdr.Format()
+		if err != nil {
+			t.Fatalf("format PROXY header: %v", err)
+		}
+		_, _ = unauthConn.Write(append(encoded, []byte("\x16\x03\x01\x00\x05hello")...))
+
+		buf := make([]byte, 1)
+		_ = unauthConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_, err = unauthConn.Read(buf)
 		if err == nil {
-			dialClosedConn.Close()
-			t.Errorf("expected dial to closed tunnel listener to fail, but succeeded")
+			t.Errorf("expected read on rejected connection to fail or return EOF, got nil")
+		}
+
+		select {
+		case c := <-f.manager.HTTPSListener().connCh:
+			c.Close()
+			t.Errorf("HTTPSListener unexpectedly received connection from unauthorized address")
+		case c := <-f.manager.HTTPListener().connCh:
+			c.Close()
+			t.Errorf("HTTPListener unexpectedly received connection from unauthorized address")
+		case <-time.After(50 * time.Millisecond):
 		}
 	})
 
 	t.Run("Reconnecting session makes a new key and device", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("net.Listen failed: %v", err)
-		}
-		defer ln.Close()
+		f := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true, managerWireGuard: true})
+		defer f.cleanup(t)
 
-		_, feKey, err := wireguard.GenerateKey()
-		if err != nil {
-			t.Fatalf("GenerateKey failed: %v", err)
-		}
-		_, prefixNet, err := net.ParseCIDR("fd00:4444::/64")
-		if err != nil {
-			t.Fatalf("ParseCIDR failed: %v", err)
-		}
+		waitFor(t, 5*time.Second, f.manager.IsConnected)
 
-		feDev := &fakeMgrTestWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}
-		srv, err := frontend.NewServer(frontend.ServerConfig{
-			ServerTLSConfig:    serverTLS,
-			InternalHostname:   "snigateway.internal",
-			WireGuardDevice:    feDev,
-			WireGuardPublicKey: feKey,
-			WireGuardPort:      51820,
-			WireGuardPrefix:    prefixNet,
+		f.devMu.Lock()
+		if len(f.devices) != 1 {
+			f.devMu.Unlock()
+			t.Fatalf("expected 1 device, got %d", len(f.devices))
+		}
+		dev1 := f.devices[0]
+		key1 := f.devConfigs[0].PrivateKey
+		f.devMu.Unlock()
+
+		sessID1 := f.manager.SessionID()
+		f.server.CloseSession(sessID1)
+
+		waitFor(t, 5*time.Second, func() bool {
+			return f.manager.IsConnected() && f.manager.SessionID() != sessID1
 		})
-		if err != nil {
-			t.Fatalf("NewServer failed: %v", err)
-		}
-		defer srv.Close()
 
-		go func() {
-			_ = srv.Serve(ln)
-		}()
-
-		var (
-			devMu      sync.Mutex
-			mgrDevices []*fakeMgrTestWireGuardDevice
-			devConfigs []wireguard.Config
-		)
-
-		opener := func(ctx context.Context, cfg wireguard.Config) (WireGuardDevice, error) {
-			devMu.Lock()
-			defer devMu.Unlock()
-			dev := &fakeMgrTestWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}
-			mgrDevices = append(mgrDevices, dev)
-			devConfigs = append(devConfigs, cfg)
-			return dev, nil
+		if !dev1.isClosed() {
+			t.Errorf("expected device 1 to be closed when session ended")
 		}
 
-		listenFunc := func(network, address string) (net.Listener, error) {
-			return net.Listen("tcp", "127.0.0.1:0")
+		f.devMu.Lock()
+		if len(f.devices) < 2 {
+			f.devMu.Unlock()
+			t.Fatalf("expected at least 2 devices opened after reconnect, got %d", len(f.devices))
 		}
-
-		c := client.NewClient(ln.Addr().String(), clientTLS)
-		mgr := NewManager(c,
-			WithWireGuard(true),
-			WithWireGuardDeviceOpener(opener),
-			WithListenFunc(listenFunc),
-			WithBackoff(10*time.Millisecond, 50*time.Millisecond),
-		)
-
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-
-		go func() {
-			_ = mgr.Run(ctx)
-		}()
-
-		// Wait for session 1 to establish
-		deadline := time.Now().Add(5 * time.Second)
-		for !mgr.IsConnected() && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if !mgr.IsConnected() {
-			t.Fatalf("timed out waiting for session 1")
-		}
-
-		devMu.Lock()
-		if len(mgrDevices) != 1 {
-			devMu.Unlock()
-			t.Fatalf("expected 1 device, got %d", len(mgrDevices))
-		}
-		dev1 := mgrDevices[0]
-		key1 := devConfigs[0].PrivateKey
-		devMu.Unlock()
-
-		// Close session 1 on the server side to force reconnection
-		sessID1 := mgr.SessionID()
-		srv.CloseSession(sessID1)
-
-		// Wait for session 2 to establish
-		deadline = time.Now().Add(5 * time.Second)
-		for (mgr.SessionID() == sessID1 || !mgr.IsConnected()) && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-
-		if !dev1.IsClosed() {
-			t.Errorf("expected device 1 to be closed when session 1 ended")
-		}
-
-		devMu.Lock()
-		if len(mgrDevices) < 2 {
-			devMu.Unlock()
-			t.Fatalf("expected at least 2 devices opened after reconnection, got %d", len(mgrDevices))
-		}
-		key2 := devConfigs[1].PrivateKey
-		devMu.Unlock()
+		key2 := f.devConfigs[1].PrivateKey
+		f.devMu.Unlock()
 
 		if key1 == key2 {
-			t.Errorf("expected session 2 to generate a new key, got same key %s", key1)
+			t.Errorf("expected new key on reconnect, got same key %s", key1)
 		}
 	})
 
 	t.Run("WireGuard-off frontend leaves TCP pool working", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("net.Listen failed: %v", err)
-		}
-		defer ln.Close()
+		f := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: false, managerWireGuard: true})
+		defer f.cleanup(t)
 
-		// Frontend created without WireGuardDevice / WireGuardPort (WireGuard is OFF)
-		srv, err := frontend.NewServer(frontend.ServerConfig{
-			ServerTLSConfig:  serverTLS,
-			InternalHostname: "snigateway.internal",
+		waitFor(t, 5*time.Second, f.manager.IsConnected)
+
+		f.devMu.Lock()
+		numDevices := len(f.devices)
+		f.devMu.Unlock()
+		if numDevices != 0 {
+			t.Errorf("expected no devices opened when frontend WireGuard is off, got %d", numDevices)
+		}
+
+		f.manager.UpdateHostnames([]string{"pool-test.example.com"})
+		waitFor(t, 5*time.Second, func() bool {
+			return f.manager.HasRegisteredHostnames([]string{"pool-test.example.com"})
 		})
-		if err != nil {
-			t.Fatalf("NewServer failed: %v", err)
-		}
-		defer srv.Close()
-
-		go func() {
-			_ = srv.Serve(ln)
-		}()
-
-		var openCalled bool
-		opener := func(ctx context.Context, cfg wireguard.Config) (WireGuardDevice, error) {
-			openCalled = true
-			return &fakeMgrTestWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}, nil
-		}
-
-		c := client.NewClient(ln.Addr().String(), clientTLS)
-		mgr := NewManager(c,
-			WithWireGuard(true),
-			WithWireGuardDeviceOpener(opener),
-			WithBackoff(20*time.Millisecond, 100*time.Millisecond),
-		)
-
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-
-		go func() {
-			_ = mgr.Run(ctx)
-		}()
-
-		deadline := time.Now().Add(5 * time.Second)
-		for !mgr.IsConnected() && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if !mgr.IsConnected() {
-			t.Fatalf("timed out waiting for manager to connect with pool")
-		}
-
-		if openCalled {
-			t.Errorf("expected deviceOpener not to be called when frontend WireGuard is off")
-		}
-
-		// Register hostname over pool
-		mgr.UpdateHostnames([]string{"pool-test.example.com"})
-
-		deadline = time.Now().Add(5 * time.Second)
-		for !mgr.HasRegisteredHostnames([]string{"pool-test.example.com"}) && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if !mgr.HasRegisteredHostnames([]string{"pool-test.example.com"}) {
-			t.Fatalf("expected HasRegisteredHostnames([pool-test.example.com])=true")
-		}
 	})
 
 	t.Run("Flag off leaves behaviour unchanged", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("net.Listen failed: %v", err)
-		}
-		defer ln.Close()
+		f := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true, managerWireGuard: false})
+		defer f.cleanup(t)
 
-		_, feKey, err := wireguard.GenerateKey()
-		if err != nil {
-			t.Fatalf("GenerateKey failed: %v", err)
-		}
-		_, prefixNet, err := net.ParseCIDR("fd00:4444::/64")
-		if err != nil {
-			t.Fatalf("ParseCIDR failed: %v", err)
+		waitFor(t, 5*time.Second, f.manager.IsConnected)
+
+		f.devMu.Lock()
+		numDevices := len(f.devices)
+		f.devMu.Unlock()
+		if numDevices != 0 {
+			t.Errorf("expected no devices opened when flag is off, got %d", numDevices)
 		}
 
-		feDev := &fakeMgrTestWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}
-		srv, err := frontend.NewServer(frontend.ServerConfig{
-			ServerTLSConfig:    serverTLS,
-			InternalHostname:   "snigateway.internal",
-			WireGuardDevice:    feDev,
-			WireGuardPublicKey: feKey,
-			WireGuardPort:      51820,
-			WireGuardPrefix:    prefixNet,
+		f.manager.UpdateHostnames([]string{"flagoff.example.com"})
+		waitFor(t, 5*time.Second, func() bool {
+			return f.manager.HasRegisteredHostnames([]string{"flagoff.example.com"})
 		})
-		if err != nil {
-			t.Fatalf("NewServer failed: %v", err)
-		}
-		defer srv.Close()
-
-		go func() {
-			_ = srv.Serve(ln)
-		}()
-
-		var openCalled bool
-		opener := func(ctx context.Context, cfg wireguard.Config) (WireGuardDevice, error) {
-			openCalled = true
-			return &fakeMgrTestWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}, nil
-		}
-
-		c := client.NewClient(ln.Addr().String(), clientTLS)
-		mgr := NewManager(c,
-			WithWireGuardDeviceOpener(opener),
-			WithBackoff(20*time.Millisecond, 100*time.Millisecond),
-		)
-
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-
-		go func() {
-			_ = mgr.Run(ctx)
-		}()
-
-		deadline := time.Now().Add(5 * time.Second)
-		for !mgr.IsConnected() && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if !mgr.IsConnected() {
-			t.Fatalf("timed out waiting for manager to connect")
-		}
-
-		if openCalled {
-			t.Errorf("expected deviceOpener not to be called when flag is off")
-		}
-
-		mgr.UpdateHostnames([]string{"flagoff.example.com"})
-		deadline = time.Now().Add(5 * time.Second)
-		for !mgr.HasRegisteredHostnames([]string{"flagoff.example.com"}) && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if !mgr.HasRegisteredHostnames([]string{"flagoff.example.com"}) {
-			t.Fatalf("expected HasRegisteredHostnames([flagoff.example.com])=true")
-		}
 	})
 }

@@ -297,8 +297,5 @@ func TestClient_ExchangeWireGuard(t *testing.T) {
 		if !errors.Is(err, ErrWireGuardDisabled) {
 			t.Errorf("expected errors.Is(err, ErrWireGuardDisabled), got: %v", err)
 		}
-		if !errors.Is(err, ErrWireGuardOff) {
-			t.Errorf("expected errors.Is(err, ErrWireGuardOff), got: %v", err)
-		}
 	})
 }
