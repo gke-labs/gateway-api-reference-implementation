@@ -45,8 +45,6 @@ type WireGuardDevice interface {
 
 // wireguardManager manages the WireGuard device and tunnel listener for the controller.
 type wireguardManager struct {
-	// wireguardEnabled indicates whether WireGuard tunnel transport is enabled.
-	wireguardEnabled bool
 	// deviceOpener creates a WireGuardDevice for a session (injected in tests).
 	deviceOpener func(ctx context.Context, config wireguard.Config) (WireGuardDevice, error)
 	// listenFunc creates a net.Listener inside the WireGuard tunnel (injected in tests).
@@ -69,30 +67,31 @@ func newWireGuardManager() *wireguardManager {
 // WithWireGuard enables or disables WireGuard tunnel transport.
 func WithWireGuard(enabled bool) ManagerOption {
 	return func(m *Manager) {
-		if m.wireguard == nil {
-			m.wireguard = newWireGuardManager()
+		if enabled {
+			if m.wireguard == nil {
+				m.wireguard = newWireGuardManager()
+			}
+		} else {
+			m.wireguard = nil
 		}
-		m.wireguard.wireguardEnabled = enabled
 	}
 }
 
 // WithWireGuardDeviceOpener sets a custom opener for the WireGuard device.
 func WithWireGuardDeviceOpener(opener func(ctx context.Context, config wireguard.Config) (WireGuardDevice, error)) ManagerOption {
 	return func(m *Manager) {
-		if m.wireguard == nil {
-			m.wireguard = newWireGuardManager()
+		if m.wireguard != nil {
+			m.wireguard.deviceOpener = opener
 		}
-		m.wireguard.deviceOpener = opener
 	}
 }
 
 // WithListenFunc sets a custom network listener function.
 func WithListenFunc(fn func(network, address string) (net.Listener, error)) ManagerOption {
 	return func(m *Manager) {
-		if m.wireguard == nil {
-			m.wireguard = newWireGuardManager()
+		if m.wireguard != nil {
+			m.wireguard.listenFunc = fn
 		}
-		m.wireguard.listenFunc = fn
 	}
 }
 

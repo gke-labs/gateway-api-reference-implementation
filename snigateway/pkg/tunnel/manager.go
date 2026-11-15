@@ -127,9 +127,6 @@ func NewManager(client *client.Client, options ...ManagerOption) *Manager {
 	for _, opt := range options {
 		opt(m)
 	}
-	if m.wireguard != nil && !m.wireguard.wireguardEnabled {
-		m.wireguard = nil
-	}
 	return m
 }
 

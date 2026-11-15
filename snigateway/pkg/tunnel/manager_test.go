@@ -618,4 +618,3 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 		t.Fatalf("expected HasRegisteredHostnames=false after cancel")
 	}
 }
-
