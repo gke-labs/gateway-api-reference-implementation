@@ -285,6 +285,7 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) {
 			t.Fatalf("torture init failed: config=%s seed=%d: newHeapCipher: %v", config.name, seed, err)
 		}
 		faultFS.SetHeapCipher(heapCipher)
+		faultFS.SetEncryptionKey(encryptionKey[:])
 	}
 
 	operationNumber := 0
@@ -425,6 +426,7 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) {
 		setViolationHandler(faultFS)
 		if heapCipher != nil {
 			faultFS.SetHeapCipher(heapCipher)
+			faultFS.SetEncryptionKey(encryptionKey[:])
 		}
 		currentStore, err = Open(openOptions(faultFS)...)
 		if err != nil {

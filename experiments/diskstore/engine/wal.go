@@ -31,6 +31,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"golang.org/x/crypto/xts"
 )
 
 const (
@@ -103,9 +105,12 @@ type WAL struct {
 	bufSize int       // buffer capacity (e.g. 1 MiB), multiple of WALBlockSize
 	bufs    [2][]byte // two aligned buffers for contiguous double-buffering
 
-	activeFile     File
-	activePath     string
-	activeStartLSN uint64
+	activeFile       File
+	activeCipher     *xts.Cipher // AES-256-XTS cipher for active segment; nil if WAL is not encrypted
+	activePath       string
+	activeStartLSN   uint64
+	encryptionKey    []byte // 32-byte master key for segment key derivation; empty means WAL is not encrypted
+	encryptionBuffer []byte // Aligned 4 KiB staging buffer for encrypting blocks before direct I/O write
 
 	appendOff  int64 // physical file offset in active segment where next record appends
 	flushedOff int64 // physical file offset in active segment up to which data has been written to disk
@@ -144,6 +149,9 @@ type WALOptions struct {
 	TickInterval   time.Duration
 	BufferSize     int
 	Quarantine     QuarantineOptions
+	// EncryptionKey is the 32-byte master key for deriving per-segment AES-256-XTS keys.
+	// An empty key means the WAL is not encrypted.
+	EncryptionKey []byte
 }
 
 // OpenWAL opens or creates a WAL in the given directory.
@@ -161,6 +169,7 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	var onFailure func(error)
 	var clock Clock = realClock{}
 	var tickInterval time.Duration
+	var encryptionKey []byte
 	if len(opts) > 0 {
 		if opts[0].MaxSegmentSize > 0 {
 			maxSegSize = opts[0].MaxSegmentSize
@@ -182,6 +191,7 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		if opts[0].TickInterval > 0 {
 			tickInterval = opts[0].TickInterval
 		}
+		encryptionKey = opts[0].EncryptionKey
 	}
 
 	lostDir := filepath.Join(dir, "lost+found")
@@ -189,23 +199,30 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		qOpts.Dir = lostDir
 	}
 
+	var encryptionBuffer []byte
+	if len(encryptionKey) > 0 {
+		encryptionBuffer = AllocateAlignedBlock(bufSize)
+	}
+
 	w := &WAL{
-		fs:              fs,
-		dir:             dir,
-		dbID:            dbID,
-		bufSize:         bufSize,
-		bufs:            [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
-		maxSegSize:      maxSegSize,
-		quarantine:      qOpts,
-		createdLSNs:     make(map[uint64]bool),
-		nextLSN:         initialLSN + 1,
-		lastAppendedLSN: initialLSN,
-		clock:           clock,
-		tickInterval:    tickInterval,
-		wakeCh:          make(chan struct{}, 1),
-		bgStop:          make(chan struct{}),
-		bgDone:          make(chan struct{}),
-		onFailure:       onFailure,
+		fs:               fs,
+		dir:              dir,
+		dbID:             dbID,
+		bufSize:          bufSize,
+		bufs:             [2][]byte{AllocateAlignedBlock(bufSize), AllocateAlignedBlock(bufSize)},
+		encryptionKey:    encryptionKey,
+		encryptionBuffer: encryptionBuffer,
+		maxSegSize:       maxSegSize,
+		quarantine:       qOpts,
+		createdLSNs:      make(map[uint64]bool),
+		nextLSN:          initialLSN + 1,
+		lastAppendedLSN:  initialLSN,
+		clock:            clock,
+		tickInterval:     tickInterval,
+		wakeCh:           make(chan struct{}, 1),
+		bgStop:           make(chan struct{}),
+		bgDone:           make(chan struct{}),
+		onFailure:        onFailure,
 	}
 	w.syncCond = sync.NewCond(&w.mu)
 	w.writeCond = sync.NewCond(&w.mu)
@@ -364,6 +381,30 @@ func (w *WAL) collectWriteSlices(endOff int64) []writeSlice {
 	return slices
 }
 
+// encryptWALSlices encrypts the write slice's 4 KiB blocks using AES-256-XTS under the segment cipher.
+// If cipher is nil, the write slice data is returned unencrypted.
+// The segment header in the first 32 bytes of block 0 remains in plaintext on disk.
+func encryptWALSlices(cipher *xts.Cipher, encryptionBuffer []byte, ws writeSlice) []byte {
+	if cipher == nil {
+		return ws.data
+	}
+	encryptedData := encryptionBuffer[:len(ws.data)]
+	for blockByteOffset := 0; blockByteOffset < len(ws.data); blockByteOffset += WALBlockSize {
+		blockFileOffset := ws.offset + int64(blockByteOffset)
+		blockIndex := uint64(blockFileOffset / int64(WALBlockSize))
+		sourceBlock := ws.data[blockByteOffset : blockByteOffset+WALBlockSize]
+		destinationBlock := encryptedData[blockByteOffset : blockByteOffset+WALBlockSize]
+		cipher.Encrypt(destinationBlock, sourceBlock, blockIndex)
+		if blockIndex == 0 {
+			// SegmentHeaderSize (32 bytes) is a multiple of the 16-byte AES block size,
+			// so keeping the header in plaintext leaves subsequent 16-byte cipher blocks
+			// independently decryptable under AES-XTS.
+			copy(destinationBlock[:SegmentHeaderSize], sourceBlock[:SegmentHeaderSize])
+		}
+	}
+	return encryptedData
+}
+
 // flushQueueAndSync flushes queued blocks and syncs without holding w.mu during I/O.
 func (w *WAL) flushQueueAndSync(isStop bool) {
 	w.mu.Lock()
@@ -417,12 +458,14 @@ func (w *WAL) flushQueueAndSync(isStop bool) {
 
 	slices := w.collectWriteSlices(endOff)
 	syncFile := w.activeFile
+	syncCipher := w.activeCipher
 	w.writing = true
 	w.mu.Unlock()
 
 	var writeErr error
 	for _, ws := range slices {
-		if _, err := syncFile.WriteAt(ws.data, ws.offset); err != nil {
+		dataToWrite := encryptWALSlices(syncCipher, w.encryptionBuffer, ws)
+		if _, err := syncFile.WriteAt(dataToWrite, ws.offset); err != nil {
 			writeErr = fmt.Errorf("failed to write WAL block at offset %d: %w", ws.offset, err)
 			break
 		}
@@ -491,7 +534,8 @@ func (w *WAL) flushQueueAndSyncDirectLocked(doSync bool) error {
 
 	slices := w.collectWriteSlices(endOff)
 	for _, ws := range slices {
-		if _, err := w.activeFile.WriteAt(ws.data, ws.offset); err != nil {
+		dataToWrite := encryptWALSlices(w.activeCipher, w.encryptionBuffer, ws)
+		if _, err := w.activeFile.WriteAt(dataToWrite, ws.offset); err != nil {
 			w.setStickyErrLocked(fmt.Errorf("failed to write WAL block at offset %d: %w", ws.offset, err))
 			return w.stickyErr
 		}
@@ -540,6 +584,7 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 			return fmt.Errorf("failed to close superseded active segment: %w", err)
 		}
 		w.activeFile = nil
+		w.activeCipher = nil
 	}
 
 	name := segmentFileName(startLSN)
@@ -564,7 +609,14 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 		return errors.Join(fmt.Errorf("failed to fsync directory after segment creation: %w", err), closeErr)
 	}
 
+	segmentCipher, err := newWALSegmentCipher(w.encryptionKey, w.dbID, startLSN)
+	if err != nil {
+		closeErr := f.Close()
+		return errors.Join(fmt.Errorf("failed to create segment cipher: %w", err), closeErr)
+	}
+
 	w.activeFile = f
+	w.activeCipher = segmentCipher
 	w.activePath = path
 	w.activeStartLSN = startLSN
 	w.flushedOff = 0
@@ -841,14 +893,25 @@ func (w *WAL) Close() error {
 		syncErr := w.activeFile.Sync()
 		closeErr := w.activeFile.Close()
 		w.activeFile = nil
+		w.activeCipher = nil
 		if syncErr != nil || closeErr != nil {
 			errs = append(errs, errors.Join(syncErr, closeErr))
 		}
+	}
+	if w.encryptionBuffer != nil {
+		clearBytes(w.encryptionBuffer)
 	}
 	if w.stickyErr != nil {
 		errs = append(errs, w.stickyErr)
 	}
 	return errors.Join(errs...)
+}
+
+// WALIteratorOptions configures WAL iteration.
+type WALIteratorOptions struct {
+	// EncryptionKey is the 32-byte master key for decrypting WAL segment blocks.
+	// An empty key means the WAL is not encrypted.
+	EncryptionKey []byte
 }
 
 // WALIterator replays records across segment files starting from a given LSN.
@@ -895,10 +958,18 @@ type WALIterator struct {
 	startLSN    uint64
 	expectedLSN uint64
 	done        bool
+
+	encryptionKey []byte      // 32-byte master key for segment key derivation; empty means WAL is not encrypted
+	currCipher    *xts.Cipher // AES-256-XTS cipher for the current segment; nil if WAL is not encrypted
+
+	cachedBlock      []byte // Decrypted 4 KiB block cache for sequential record reading
+	rawBlock         []byte // Raw 4 KiB block read from disk before decryption
+	cachedBlockIndex int64  // Block index within current segment currently held in cachedBlock; -1 when empty
+	cachedBlockLen   int    // Valid bytes in cachedBlock (less than WALBlockSize only on torn tail)
 }
 
 // NewWALIterator creates an iterator to replay records from startLSN.
-func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64) (*WALIterator, error) {
+func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, opts ...WALIteratorOptions) (*WALIterator, error) {
 	entries, err := fs.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -940,13 +1011,23 @@ func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64) (*WALIter
 		}
 	}
 
+	var encryptionKey []byte
+	if len(opts) > 0 {
+		encryptionKey = opts[0].EncryptionKey
+	}
+
 	it := &WALIterator{
-		fs:          fs,
-		segments:    segments,
-		dbID:        dbID,
-		currSegIdx:  startIdx - 1,
-		startLSN:    startLSN,
-		expectedLSN: 0,
+		fs:               fs,
+		segments:         segments,
+		dbID:             dbID,
+		currSegIdx:       startIdx - 1,
+		startLSN:         startLSN,
+		expectedLSN:      0,
+		encryptionKey:    encryptionKey,
+		cachedBlock:      make([]byte, WALBlockSize),
+		rawBlock:         make([]byte, WALBlockSize),
+		cachedBlockIndex: -1,
+		cachedBlockLen:   0,
 	}
 
 	// Advance to first valid segment
@@ -1024,10 +1105,83 @@ func (it *WALIterator) nextSegment() error {
 		return errors.Join(fmt.Errorf("read error getting segment size in %s: %w", seg.name, sizeErr), closeErr)
 	}
 
+	segmentCipher, err := newWALSegmentCipher(it.encryptionKey, it.dbID, seg.startLSN)
+	if err != nil {
+		closeErr := file.Close()
+		it.done = true
+		return errors.Join(fmt.Errorf("failed to create WAL cipher for segment %s: %w", seg.name, err), closeErr)
+	}
+
 	it.currFile = file
+	it.currCipher = segmentCipher
+	it.cachedBlockIndex = -1
+	it.cachedBlockLen = 0
 	it.currOffset = int64(SegmentHeaderSize)
 	it.currSegSize = size
 	return nil
+}
+
+// loadBlock reads and decrypts the 4 KiB block at blockIndex within the current segment.
+func (it *WALIterator) loadBlock(blockIndex int64) error {
+	blockStart := blockIndex * WALBlockSize
+	n, err := it.currFile.ReadAt(it.rawBlock, blockStart)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return err
+	}
+	if n == 0 {
+		it.cachedBlockIndex = -1
+		it.cachedBlockLen = 0
+		return io.EOF
+	}
+
+	for i := n; i < WALBlockSize; i++ {
+		it.rawBlock[i] = 0
+	}
+
+	if it.currCipher != nil {
+		it.currCipher.Decrypt(it.cachedBlock, it.rawBlock, uint64(blockIndex))
+		if blockIndex == 0 {
+			// SegmentHeaderSize (32 bytes) is a multiple of the 16-byte AES block size,
+			// so the plaintext header on disk decrypts into scrambled bytes that we overwrite
+			// with the plaintext header while the remaining 16-byte blocks decrypt properly.
+			copy(it.cachedBlock[:SegmentHeaderSize], it.rawBlock[:SegmentHeaderSize])
+		}
+	} else {
+		copy(it.cachedBlock[:n], it.rawBlock[:n])
+	}
+
+	it.cachedBlockIndex = blockIndex
+	it.cachedBlockLen = n
+	return nil
+}
+
+// readAt reads len(p) decrypted bytes starting at logical offset off within the current segment.
+func (it *WALIterator) readAt(p []byte, off int64) (int, error) {
+	totalRead := 0
+	for len(p) > 0 {
+		if off >= it.currSegSize {
+			return totalRead, io.EOF
+		}
+		blockIndex := off / WALBlockSize
+		blockOffset := int(off % WALBlockSize)
+
+		if it.cachedBlockIndex != blockIndex {
+			if err := it.loadBlock(blockIndex); err != nil {
+				return totalRead, err
+			}
+		}
+
+		availableBytes := it.cachedBlockLen - blockOffset
+		if availableBytes <= 0 {
+			return totalRead, io.EOF
+		}
+		toCopy := min(len(p), availableBytes)
+		copy(p[:toCopy], it.cachedBlock[blockOffset:blockOffset+toCopy])
+		totalRead += toCopy
+		p = p[toCopy:]
+		off += int64(toCopy)
+	}
+	return totalRead, nil
 }
 
 // Next reads the next valid record in sequence.
@@ -1044,8 +1198,8 @@ func (it *WALIterator) Next() (Record, error) {
 		}
 
 		// Read record header at currOffset
-		hdr := make([]byte, RecordHeaderSize)
-		n, err := it.currFile.ReadAt(hdr, it.currOffset)
+		recordHeader := make([]byte, RecordHeaderSize)
+		n, err := it.readAt(recordHeader, it.currOffset)
 
 		// Check if at clean EOF of segment
 		if err == io.EOF && n == 0 {
@@ -1063,7 +1217,7 @@ func (it *WALIterator) Next() (Record, error) {
 
 		// Check for zero-padded block. Every record starts with non-zero RecordMagic,
 		// so a zero byte where a record should start must be padding.
-		if n > 0 && hdr[0] == 0 {
+		if n > 0 && recordHeader[0] == 0 {
 			// Skip zero padding to next 4 KiB block boundary within this segment
 			nextBlock := ((it.currOffset / WALBlockSize) + 1) * WALBlockSize
 			if nextBlock < it.currSegSize {
@@ -1086,8 +1240,8 @@ func (it *WALIterator) Next() (Record, error) {
 			return Record{}, io.EOF
 		}
 
-		keyLen := binary.BigEndian.Uint32(hdr[20:24])
-		payloadLen := binary.BigEndian.Uint32(hdr[24:28])
+		keyLen := binary.BigEndian.Uint32(recordHeader[20:24])
+		payloadLen := binary.BigEndian.Uint32(recordHeader[24:28])
 		// Stop a corrupted length field from triggering a huge allocation.
 		if keyLen > MaxRecordFieldLength || payloadLen > MaxRecordFieldLength {
 			it.done = true
@@ -1110,7 +1264,7 @@ func (it *WALIterator) Next() (Record, error) {
 		}
 
 		recordBytes := make([]byte, totalRecordLen)
-		n, err = it.currFile.ReadAt(recordBytes, it.currOffset)
+		n, err = it.readAt(recordBytes, it.currOffset)
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			it.done = true
 			return Record{}, fmt.Errorf("read error reading record body at offset %d: %w", it.currOffset, err)
@@ -1194,6 +1348,14 @@ func (it *WALIterator) advanceSegment() error {
 
 // Close closes the iterator.
 func (it *WALIterator) Close() error {
+	if it.cachedBlock != nil {
+		clearBytes(it.cachedBlock)
+	}
+	if it.rawBlock != nil {
+		clearBytes(it.rawBlock)
+	}
+	it.cachedBlockIndex = -1
+	it.cachedBlockLen = 0
 	if it.currFile != nil {
 		err := it.currFile.Close()
 		it.currFile = nil

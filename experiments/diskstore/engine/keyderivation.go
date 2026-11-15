@@ -93,6 +93,18 @@ func newHeapCipher(key []byte, dbID [16]byte) (*xts.Cipher, error) {
 	return xts.NewCipher(aes.NewCipher, heapKey)
 }
 
+// newWALSegmentCipher creates an AES-256-XTS cipher for a WAL segment starting at startLSN using the derived WAL key.
+func newWALSegmentCipher(key []byte, dbID [16]byte, startLSN uint64) (*xts.Cipher, error) {
+	if len(key) == 0 {
+		return nil, nil
+	}
+	walKey, err := deriveWALKey(key, dbID, startLSN)
+	if err != nil {
+		return nil, err
+	}
+	return xts.NewCipher(aes.NewCipher, walKey)
+}
+
 // encryptHeapBlock encrypts a 4 KiB heap block with AES-256-XTS using blockNum as tweak.
 func encryptHeapBlock(dst, src []byte, blockNum uint64, cipher *xts.Cipher) {
 	if cipher != nil {
@@ -118,8 +130,7 @@ func deriveKey(key []byte, dbID [16]byte, info string, length int) ([]byte, erro
 	return hkdf.Key(sha256.New, key, dbID[:], info, length)
 }
 
-// Suppress unused linter warnings until subsequent block encryption PRs (#1203, #1204) wire them into the engine.
+// Suppress unused linter warning until oversize-file encryption uses deriveOversizeKey.
 var (
-	_ = deriveWALKey
 	_ = deriveOversizeKey
 )

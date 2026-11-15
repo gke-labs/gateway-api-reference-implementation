@@ -148,6 +148,8 @@ type RecoveryOptions struct {
 	// block that fails checksum or header validation is reported as ErrDamagedBlock rather
 	// than treated as a torn write from a crash.
 	ClosedCleanly bool
+	// EncryptionKey is the 32-byte master key used for decrypting WAL segments during recovery.
+	EncryptionKey []byte
 }
 
 // Recover scans the heap file, filters out foreign and torn copies, finds the WAL redo start LSN,
@@ -420,7 +422,9 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	var redoStartLSN uint64 = 1
 	var maxWAL_LSN uint64
 
-	walScanIt, err := NewWALIterator(fs, walDir, dbID, 1)
+	walScanIt, err := NewWALIterator(fs, walDir, dbID, 1, WALIteratorOptions{
+		EncryptionKey: options.EncryptionKey,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WAL scan iterator: %w", err)
 	}

@@ -23,6 +23,8 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -78,6 +80,8 @@ type FaultFS struct {
 	// A nil cipher means the store is not encrypted.
 	heapCipher atomic.Pointer[xts.Cipher]
 
+	encryptionKey []byte
+
 	crashed bool
 }
 
@@ -89,6 +93,13 @@ func NewFaultFS(underlying FS) *FaultFS {
 		assertReuseRule:      true,
 		assertWriteAheadRule: true,
 	}
+}
+
+// SetEncryptionKey sets the master key used for decrypting WAL blocks in invariant checks.
+func (f *FaultFS) SetEncryptionKey(key []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.encryptionKey = bytes.Clone(key)
 }
 
 // SetMaxFsyncedLSN sets the highest LSN that has been fsynced in the WAL.
@@ -619,20 +630,53 @@ func (f *FaultFile) updateMaxFsyncedWAL_LSNLocked() {
 	if len(f.durableData) < SegmentHeaderSize {
 		return
 	}
+
+	data := f.durableData
+	f.fs.mu.RLock()
+	encKey := f.fs.encryptionKey
+	f.fs.mu.RUnlock()
+
+	if len(encKey) > 0 && len(f.durableData) >= DefaultBlockSize {
+		var dbID [16]byte
+		copy(dbID[:], f.durableData[16:32])
+		base := strings.TrimSuffix(filepath.Base(f.name), ".wal")
+		startLSN, err := strconv.ParseUint(base, 10, 64)
+		if err != nil {
+			return
+		}
+		segmentCipher, err := newWALSegmentCipher(encKey, dbID, startLSN)
+		if err != nil {
+			return
+		}
+		if segmentCipher != nil {
+			decrypted := make([]byte, len(f.durableData))
+			numBlocks := len(f.durableData) / DefaultBlockSize
+			for blockIndex := 0; blockIndex < numBlocks; blockIndex++ {
+				src := f.durableData[blockIndex*DefaultBlockSize : (blockIndex+1)*DefaultBlockSize]
+				dst := decrypted[blockIndex*DefaultBlockSize : (blockIndex+1)*DefaultBlockSize]
+				segmentCipher.Decrypt(dst, src, uint64(blockIndex))
+				if blockIndex == 0 {
+					copy(dst[:SegmentHeaderSize], src[:SegmentHeaderSize])
+				}
+			}
+			data = decrypted
+		}
+	}
+
 	offset := SegmentHeaderSize
 	var maxLSN uint64
-	for offset+RecordHeaderSize <= len(f.durableData) {
-		if f.durableData[offset] == 0 {
+	for offset+RecordHeaderSize <= len(data) {
+		if data[offset] == 0 {
 			// Zero padding in block: skip to next 4 KiB block boundary
 			nextBlock := ((offset / DefaultBlockSize) + 1) * DefaultBlockSize
-			if nextBlock <= offset || nextBlock >= len(f.durableData) {
+			if nextBlock <= offset || nextBlock >= len(data) {
 				break
 			}
 			offset = nextBlock
 			continue
 		}
 
-		r, err := DecodeRecord(bytes.NewReader(f.durableData[offset:]))
+		r, err := DecodeRecord(bytes.NewReader(data[offset:]))
 		if err != nil {
 			break
 		}
