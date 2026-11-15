@@ -1915,6 +1915,121 @@ func TestRecovery_SmallBlockPoolReuseRule(t *testing.T) {
 	}
 }
 
+// TestRecovery_EncryptedCrashAndReopen verifies that a randomized crash-and-reopen test
+// with an encryption key runs for at least 100 seeds with no false write-ahead or reuse rule violations.
+func TestRecovery_EncryptedCrashAndReopen(t *testing.T) {
+	var key [32]byte
+	copy(key[:], []byte("enc-crash-reopen-test-32bytes-k"))
+
+	for seed := 0; seed < 100; seed++ {
+		random := rand.New(rand.NewSource(int64(seed)))
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := fmt.Sprintf("test_enc_crash_%d", seed)
+
+		store, err := Open(WithFS(faultFS), WithDir(dir), WithEncryptionKey(key[:]), WithNumPoolBlocks(32), WithCompressionCodec(CodecNone), WithCreate())
+		if err != nil {
+			t.Fatalf("seed %d: Open failed: %v", seed, err)
+		}
+
+		heapCipher, err := newHeapCipher(key[:], store.DBID())
+		if err != nil {
+			t.Fatalf("seed %d: newHeapCipher failed: %v", seed, err)
+		}
+		faultFS.SetHeapCipher(heapCipher)
+
+		table := "EncTable"
+		keys := make([]string, 20)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("key-%d", i)
+		}
+		expectedValues := make(map[string][]byte)
+
+		// Initial durable pages
+		for i := 0; i < 10; i++ {
+			value := []byte(fmt.Sprintf("init-%d-%d", seed, i))
+			if err := store.Put(table, keys[i], value); err != nil {
+				t.Fatalf("seed %d: Put failed: %v", seed, err)
+			}
+			expectedValues[keys[i]] = value
+		}
+		if _, err := store.Checkpoint(); err != nil {
+			t.Fatalf("seed %d: Checkpoint failed: %v", seed, err)
+		}
+
+		currentStore := store
+		currentFS := faultFS
+
+		for cycle := 0; cycle < 3; cycle++ {
+			numOps := 20 + random.Intn(30)
+			for operation := 0; operation < numOps; operation++ {
+				chosenKey := keys[random.Intn(len(keys))]
+				action := random.Intn(10)
+				switch {
+				case action < 5: // small slotted (< 1 block)
+					value := []byte(fmt.Sprintf("value-%d-%d-%d", seed, cycle, operation))
+					if err := currentStore.Put(table, chosenKey, value); err != nil {
+						t.Fatalf("seed %d cycle %d: Put %s failed: %v", seed, cycle, chosenKey, err)
+					}
+					expectedValues[chosenKey] = value
+				case action < 8: // values of 2 blocks or less
+					size := BlockUsableSize + 1 + random.Intn(BlockUsableSize)
+					value := bytes.Repeat([]byte{byte(operation)}, size)
+					if err := currentStore.Put(table, chosenKey, value); err != nil {
+						t.Fatalf("seed %d cycle %d: Put multi-block %s failed: %v", seed, cycle, chosenKey, err)
+					}
+					expectedValues[chosenKey] = value
+				case action == 8: // delete
+					if err := currentStore.Delete(table, chosenKey); err != nil {
+						t.Fatalf("seed %d cycle %d: Delete %s failed: %v", seed, cycle, chosenKey, err)
+					}
+					delete(expectedValues, chosenKey)
+				case action == 9: // occasional checkpoint
+					if _, err := currentStore.Checkpoint(); err != nil {
+						t.Fatalf("seed %d cycle %d: Checkpoint failed: %v", seed, cycle, err)
+					}
+				}
+			}
+
+			if err := currentStore.Sync(); err != nil {
+				t.Fatalf("seed %d cycle %d: Sync failed: %v", seed, cycle, err)
+			}
+
+			if err := currentFS.Crash(true, 0); err != nil {
+				t.Fatalf("seed %d cycle %d: Crash failed: %v", seed, cycle, err)
+			}
+
+			currentFS = NewFaultFS(memFS)
+			currentFS.SetHeapCipher(heapCipher)
+			currentStore, err = Open(WithFS(currentFS), WithDir(dir), WithEncryptionKey(key[:]), WithNumPoolBlocks(32), WithCompressionCodec(CodecNone))
+			if err != nil {
+				t.Fatalf("seed %d cycle %d: Reopen failed: %v", seed, cycle, err)
+			}
+
+			for _, key := range keys {
+				gotValue, exists, err := currentStore.Get(table, key)
+				if err != nil {
+					t.Fatalf("seed %d cycle %d: Get(%q) returned error: %v", seed, cycle, key, err)
+				}
+				expectedValue, expectedExists := expectedValues[key]
+				if expectedExists {
+					if !exists {
+						t.Fatalf("seed %d cycle %d: Get(%q) missing key after reopen", seed, cycle, key)
+					}
+					if !bytes.Equal(gotValue, expectedValue) {
+						t.Fatalf("seed %d cycle %d: Get(%q) value mismatch", seed, cycle, key)
+					}
+				} else if exists {
+					t.Fatalf("seed %d cycle %d: Get(%q) found deleted key after reopen", seed, cycle, key)
+				}
+			}
+		}
+		if err := currentStore.Close(); err != nil {
+			t.Fatalf("seed %d: Close failed: %v", seed, err)
+		}
+	}
+}
+
 // TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds checks that recovery succeeds
 // when the last WAL record ends exactly on a block boundary, so the scan reads at an offset
 // equal to the file size.

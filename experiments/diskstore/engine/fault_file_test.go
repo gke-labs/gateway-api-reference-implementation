@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -26,16 +27,16 @@ import (
 )
 
 func makeTestBlock(logicalPage, lsn uint64, blockIndex, numBlocks uint32) []byte {
-	buf := make([]byte, DefaultBlockSize)
+	blockBuffer := make([]byte, DefaultBlockSize)
 	hdr := BlockHeader{
 		LogicalPage: logicalPage,
 		LSN:         lsn,
 		BlockIndex:  blockIndex,
 		NumBlocks:   numBlocks,
 	}
-	EncodeBlockHeader(hdr, buf)
-	FinalizeBlockCRC(buf)
-	return buf
+	EncodeBlockHeader(hdr, blockBuffer)
+	FinalizeBlockCRC(blockBuffer)
+	return blockBuffer
 }
 
 func TestFaultFile_WriteAndSync(t *testing.T) {
@@ -370,5 +371,51 @@ func TestFaultFile_ReadAt_EOF(t *testing.T) {
 	_, err = file.ReadAt(readBuffer, 0)
 	if err == nil {
 		t.Fatalf("ReadAt on closed file: expected error, got nil")
+	}
+}
+
+func TestFaultFile_EncryptedStoreWriteAheadRuleViolation(t *testing.T) {
+	var key [32]byte
+	copy(key[:], []byte("fault-test-cipher-key-32bytes-00"))
+	var databaseID [16]byte
+	copy(databaseID[:], []byte("db-id-fault-test"))
+
+	cipher, err := newHeapCipher(key[:], databaseID)
+	if err != nil {
+		t.Fatalf("newHeapCipher failed: %v", err)
+	}
+
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	faultFS.SetMaxFsyncedLSN(50)
+	faultFS.SetHeapCipher(cipher)
+
+	file, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			t.Errorf("Close failed: %v", closeErr)
+		}
+	}()
+
+	plainBlock := makeTestBlock(1, 100, 0, 1) // LSN 100 > maxFsyncedLSN 50
+	encryptedBlock := make([]byte, DefaultBlockSize)
+	encryptHeapBlock(encryptedBlock, plainBlock, 0, cipher)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected panic on write-ahead rule violation for encrypted block")
+		}
+		errMsg := fmt.Sprintf("%v", r)
+		if !strings.Contains(errMsg, "write-ahead rule violation") {
+			t.Fatalf("unexpected panic message: %v", r)
+		}
+	}()
+
+	if _, err := file.WriteAt(encryptedBlock, 0); err != nil {
+		t.Fatalf("WriteAt returned unexpected error: %v", err)
 	}
 }

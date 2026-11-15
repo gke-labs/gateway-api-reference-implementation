@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/crypto/xts"
 )
 
 var (
@@ -69,6 +71,10 @@ type FaultFS struct {
 
 	beforeWriteAt func(path string, p []byte, off int64)
 	beforeSync    func(path string)
+
+	// heapCipher is the AES-256-XTS cipher used for decrypting heap blocks.
+	// A nil cipher means the store is not encrypted.
+	heapCipher atomic.Pointer[xts.Cipher]
 
 	crashed bool
 }
@@ -140,6 +146,27 @@ func (f *FaultFS) SetBeforeSync(fn func(path string)) {
 	f.beforeSync = fn
 }
 
+// SetHeapCipher sets the AES-256-XTS cipher used for decrypting heap blocks during invariant checks.
+func (f *FaultFS) SetHeapCipher(cipher *xts.Cipher) {
+	f.heapCipher.Store(cipher)
+	f.mu.RLock()
+	files := make([]*FaultFile, 0, len(f.files))
+	for _, faultFile := range f.files {
+		if faultFile.isHeapFile {
+			files = append(files, faultFile)
+		}
+	}
+	f.mu.RUnlock()
+
+	for _, faultFile := range files {
+		faultFile.mu.Lock()
+		if len(faultFile.durableData) > 0 {
+			faultFile.rebuildDurablePagesLocked()
+		}
+		faultFile.mu.Unlock()
+	}
+}
+
 func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 	f.mu.RLock()
 	crashed := f.crashed
@@ -156,26 +183,26 @@ func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	ff, exists := f.files[cleaned]
+	faultFile, exists := f.files[cleaned]
 	if !exists {
 		var newErr error
-		ff, newErr = newFaultFile(f, cleaned, file)
+		faultFile, newErr = newFaultFile(f, cleaned, file)
 		if newErr != nil {
 			closeErr := file.Close()
 			return nil, errors.Join(newErr, closeErr)
 		}
 		if f.crashed {
-			ff.crashed = true
+			faultFile.crashed = true
 		}
-		f.files[cleaned] = ff
+		f.files[cleaned] = faultFile
 	} else {
-		ff.underlying = file
-		ff.closed = false
+		faultFile.underlying = file
+		faultFile.closed = false
 		if f.crashed {
-			ff.crashed = true
+			faultFile.crashed = true
 		}
 	}
-	return ff, nil
+	return faultFile, nil
 }
 
 func (f *FaultFS) Create(name string) (File, error) {
@@ -210,8 +237,8 @@ func (f *FaultFS) Rename(oldpath, newpath string) error {
 	}
 	oldClean := cleanPath(oldpath)
 	newClean := cleanPath(newpath)
-	if ff, exists := f.files[oldClean]; exists {
-		f.files[newClean] = ff
+	if faultFile, exists := f.files[oldClean]; exists {
+		f.files[newClean] = faultFile
 		delete(f.files, oldClean)
 	}
 	return f.underlying.Rename(oldpath, newpath)
@@ -243,8 +270,8 @@ func (f *FaultFS) Crash(dropUnsynced bool, tearFraction float64) error {
 	defer f.mu.Unlock()
 	f.crashed = true
 	var errs []error
-	for _, ff := range f.files {
-		if err := ff.Crash(dropUnsynced, tearFraction); err != nil {
+	for _, faultFile := range f.files {
+		if err := faultFile.Crash(dropUnsynced, tearFraction); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -300,7 +327,7 @@ func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error)
 		}
 	}
 
-	ff := &FaultFile{
+	faultFile := &FaultFile{
 		fs:            fs,
 		name:          name,
 		underlying:    underlying,
@@ -313,9 +340,9 @@ func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error)
 	}
 
 	if isHeap && len(initial) > 0 {
-		ff.rebuildDurablePagesLocked()
+		faultFile.rebuildDurablePagesLocked()
 	}
-	return ff, nil
+	return faultFile, nil
 }
 
 func (f *FaultFile) ReadAt(p []byte, off int64) (int, error) {
@@ -375,9 +402,10 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 	if f.isHeapFile {
 		startBlock := uint64(off / DefaultBlockSize)
 		numBlocksInWrite := (len(p) + DefaultBlockSize - 1) / DefaultBlockSize
+		cipher := f.fs.heapCipher.Load()
 
 		for i := 0; i < numBlocksInWrite; i++ {
-			bIdx := startBlock + uint64(i)
+			blockIndex := startBlock + uint64(i)
 			blockOff := i * DefaultBlockSize
 			blockEnd := blockOff + DefaultBlockSize
 			if blockEnd > len(p) {
@@ -385,16 +413,29 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 			}
 			blockBytes := p[blockOff:blockEnd]
 
+			headerBytes := blockBytes
+			if cipher != nil && len(blockBytes) == DefaultBlockSize {
+				var decryptedBlock [DefaultBlockSize]byte
+				decryptHeapBlock(decryptedBlock[:], blockBytes, blockIndex, cipher)
+				headerBytes = decryptedBlock[:]
+			}
+
 			// Parse block header if at least HeaderSize bytes
-			if len(blockBytes) >= BlockHeaderSize {
-				if blockBytes[0] == BlockMagic && blockBytes[1] == FormatVersion {
-					lsn := binary.BigEndian.Uint64(blockBytes[16:24])
+			if len(headerBytes) >= BlockHeaderSize {
+				valid := headerBytes[0] == BlockMagic && headerBytes[1] == FormatVersion
+				if valid && cipher != nil && len(headerBytes) == DefaultBlockSize {
+					if _, err := DecodeBlockHeader(headerBytes); err != nil {
+						valid = false
+					}
+				}
+				if valid {
+					lsn := binary.BigEndian.Uint64(headerBytes[16:24])
 
 					// Assert Write-Ahead Rule:
 					// Before writing any page whose LSN is L, log must be fsynced through L.
 					if assertWAL && lsn > maxFsyncedLSN {
 						panic(fmt.Sprintf("%v: page LSN %d > max fsynced WAL LSN %d (block %d)",
-							ErrWriteAheadRuleViolation, lsn, maxFsyncedLSN, bIdx))
+							ErrWriteAheadRuleViolation, lsn, maxFsyncedLSN, blockIndex))
 					}
 				}
 			}
@@ -403,14 +444,14 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 			// The location holding a page's newest durable (fsynced) copy must never be overwritten.
 			if assertReuse {
 				for pageID, durable := range f.durablePages {
-					if bIdx >= durable.StartBlock && bIdx < durable.StartBlock+uint64(durable.NumBlocks) {
+					if blockIndex >= durable.StartBlock && blockIndex < durable.StartBlock+uint64(durable.NumBlocks) {
 						panic(fmt.Sprintf("%v: writing to block %d which holds durable copy of page %d (LSN %d, blocks [%d..%d))",
-							ErrReuseRuleViolation, bIdx, pageID, durable.LSN, durable.StartBlock, durable.StartBlock+uint64(durable.NumBlocks)))
+							ErrReuseRuleViolation, blockIndex, pageID, durable.LSN, durable.StartBlock, durable.StartBlock+uint64(durable.NumBlocks)))
 					}
 				}
 			}
 
-			f.pendingBlocks[bIdx] = true
+			f.pendingBlocks[blockIndex] = true
 		}
 	}
 
@@ -478,6 +519,7 @@ func (f *FaultFile) Sync() error {
 func (f *FaultFile) rebuildDurablePagesLocked() {
 	f.durablePages = make(map[uint64]DurablePageRange)
 	totalBlocks := len(f.durableData) / DefaultBlockSize
+	cipher := f.fs.heapCipher.Load()
 
 	type candidatePage struct {
 		startBlock  uint64
@@ -491,7 +533,13 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 	for b < totalBlocks {
 		blockStart := b * DefaultBlockSize
 		blockBytes := f.durableData[blockStart : blockStart+DefaultBlockSize]
-		hdr, err := DecodeBlockHeader(blockBytes)
+		decryptedBlock := blockBytes
+		if cipher != nil {
+			var decrypted [DefaultBlockSize]byte
+			decryptHeapBlock(decrypted[:], blockBytes, uint64(b), cipher)
+			decryptedBlock = decrypted[:]
+		}
+		hdr, err := DecodeBlockHeader(decryptedBlock)
 		if err != nil || hdr.BlockIndex != 0 || hdr.NumBlocks == 0 || b+int(hdr.NumBlocks) > totalBlocks {
 			b++
 			continue
@@ -500,11 +548,17 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 		numBlocks := int(hdr.NumBlocks)
 		valid := true
 		for k := 0; k < numBlocks; k++ {
-			kbStart := (b + k) * DefaultBlockSize
-			kbBytes := f.durableData[kbStart : kbStart+DefaultBlockSize]
-			kHdr, err := DecodeBlockHeader(kbBytes)
-			if err != nil || kHdr.LogicalPage != hdr.LogicalPage || kHdr.LSN != hdr.LSN ||
-				kHdr.BlockIndex != uint32(k) || kHdr.NumBlocks != hdr.NumBlocks {
+			continuationStart := (b + k) * DefaultBlockSize
+			continuationBytes := f.durableData[continuationStart : continuationStart+DefaultBlockSize]
+			decryptedContinuation := continuationBytes
+			if cipher != nil {
+				var decrypted [DefaultBlockSize]byte
+				decryptHeapBlock(decrypted[:], continuationBytes, uint64(b+k), cipher)
+				decryptedContinuation = decrypted[:]
+			}
+			continuationHdr, err := DecodeBlockHeader(decryptedContinuation)
+			if err != nil || continuationHdr.LogicalPage != hdr.LogicalPage || continuationHdr.LSN != hdr.LSN ||
+				continuationHdr.BlockIndex != uint32(k) || continuationHdr.NumBlocks != hdr.NumBlocks {
 				valid = false
 				break
 			}
@@ -589,11 +643,11 @@ func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) error {
 
 	if tearFraction > 0 && len(f.pendingBlocks) > 0 {
 		// Partially write or tear random pending blocks
-		for bIdx := range f.pendingBlocks {
+		for blockIndex := range f.pendingBlocks {
 			r := rand.Float64()
 			if r < tearFraction {
 				// Tear block: corrupt random bytes or write only half block
-				start := int(bIdx) * DefaultBlockSize
+				start := int(blockIndex) * DefaultBlockSize
 				if start+DefaultBlockSize <= len(f.pendingData) {
 					// Corrupt last 128 bytes of block
 					for k := 0; k < 128; k++ {
