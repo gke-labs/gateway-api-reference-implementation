@@ -56,12 +56,13 @@ const (
 	QUBit = CacheFlushBit
 
 	// PreviousAddressGracePeriod is the duration after an address update during which
-	// looped-back announcements containing the previous addresses are ignored rather
-	// than treated as LAN conflicts. Two seconds covers the announcements the prober
-	// sends before the update, which loop back within about one announce interval.
+	// looped-back announcements containing recent addresses are ignored rather
+	// than treated as LAN conflicts. Two seconds covers every recent announcement
+	// the prober sends before the update, which loop back within about one announce interval.
 	PreviousAddressGracePeriod = 2 * time.Second
 
 	// maxRecentAnnouncements is the maximum number of recent announcement entries retained per record.
+	// Eight is enough because the prober sends at most a few announcements inside one grace period.
 	maxRecentAnnouncements = 8
 )
 
@@ -86,10 +87,13 @@ type RecordSet struct {
 	recentAnnouncements []recentAnnouncement
 }
 
+// recentAnnouncement represents a set of addresses announced for a hostname.
 type recentAnnouncement struct {
-	a    []net.IP
-	aaaa []net.IP
-	time time.Time
+	// addresses holds the IPv4 and IPv6 addresses announced together.
+	addresses []net.IP
+
+	// announcedAt is the timestamp when this set of addresses was announced or replaced.
+	announcedAt time.Time
 }
 
 // ConflictHandler is a callback invoked when a conflicting mDNS response or higher-priority probe is detected.
@@ -359,23 +363,23 @@ func (r *Responder) SetRecord(rs *RecordSet) {
 		now := time.Now()
 		var recent []recentAnnouncement
 		for _, entry := range existing.recentAnnouncements {
-			if now.Sub(entry.time) < PreviousAddressGracePeriod {
+			if now.Sub(entry.announcedAt) < PreviousAddressGracePeriod {
 				recent = append(recent, entry)
 			}
 		}
 		if len(existing.A) > 0 || len(existing.AAAA) > 0 {
+			addresses := make([]net.IP, 0, len(existing.A)+len(existing.AAAA))
+			addresses = append(addresses, existing.A...)
+			addresses = append(addresses, existing.AAAA...)
 			recent = append(recent, recentAnnouncement{
-				a:    append([]net.IP(nil), existing.A...),
-				aaaa: append([]net.IP(nil), existing.AAAA...),
-				time: now,
+				addresses:   addresses,
+				announcedAt: now,
 			})
 		}
 		if len(recent) > maxRecentAnnouncements {
 			recent = recent[len(recent)-maxRecentAnnouncements:]
 		}
 		newRec.recentAnnouncements = recent
-	} else if len(rs.recentAnnouncements) > 0 {
-		newRec.recentAnnouncements = append([]recentAnnouncement(nil), rs.recentAnnouncements...)
 	}
 	r.records[fqdn] = newRec
 }
@@ -553,7 +557,7 @@ func (r *Responder) handleResponse(p *dnsmessage.Parser, _ dnsmessage.Header) {
 		if pubRec, isPub := published[name]; isPub {
 			// Under RFC 6762 section 9, a host updating record data should not treat its own
 			// recently sent announcements containing older addresses as external conflicts.
-			if !r.announcedRecently(pubRec, rr) {
+			if !pubRec.announcedRecently(rr, time.Now()) {
 				handler(name, rr)
 			}
 		}
@@ -820,61 +824,45 @@ func isKnownAnswer(ourRR dnsmessage.Resource, knownAnswers []dnsmessage.Resource
 	return false
 }
 
-// announcedRecently reports whether the responder announced the resource record recently
-// for this published record set, either as a current address or within PreviousAddressGracePeriod.
-func (r *Responder) announcedRecently(rec *RecordSet, rr dnsmessage.Resource) bool {
-	if rec == nil {
-		return false
-	}
-	return rec.announcedRecently(rr)
-}
-
-func (rs *RecordSet) announcedRecently(rr dnsmessage.Resource) bool {
+// announcedRecently reports whether the resource record was announced by this record set,
+// either as a current address or as a recent announcement younger than PreviousAddressGracePeriod.
+func (rs *RecordSet) announcedRecently(rr dnsmessage.Resource, now time.Time) bool {
 	if rr.Header.TTL == 0 {
 		return true // A TTL of 0 is a goodbye, not an active conflict (RFC 6762 §10.1).
 	}
 	if !strings.EqualFold(ToFQDN(rr.Header.Name.String()), rs.FQDN) {
 		return false
 	}
-	now := time.Now()
+	var address net.IP
 	switch body := rr.Body.(type) {
 	case *dnsmessage.AResource:
-		ip := net.IP(body.A[:])
-		for _, a := range rs.A {
-			if a.Equal(ip) {
-				return true
-			}
-		}
-		for _, entry := range rs.recentAnnouncements {
-			if now.Sub(entry.time) < PreviousAddressGracePeriod {
-				for _, a := range entry.a {
-					if a.Equal(ip) {
-						return true
-					}
-				}
-			}
-		}
-		return false
+		address = net.IP(body.A[:])
 	case *dnsmessage.AAAAResource:
-		ip := net.IP(body.AAAA[:])
-		for _, aaaa := range rs.AAAA {
-			if aaaa.Equal(ip) {
-				return true
-			}
-		}
-		for _, entry := range rs.recentAnnouncements {
-			if now.Sub(entry.time) < PreviousAddressGracePeriod {
-				for _, aaaa := range entry.aaaa {
-					if aaaa.Equal(ip) {
-						return true
-					}
-				}
-			}
-		}
-		return false
+		address = net.IP(body.AAAA[:])
 	default:
 		return true // Non-address records do not conflict with address records.
 	}
+
+	for _, current := range rs.A {
+		if current.Equal(address) {
+			return true
+		}
+	}
+	for _, current := range rs.AAAA {
+		if current.Equal(address) {
+			return true
+		}
+	}
+	for _, entry := range rs.recentAnnouncements {
+		if now.Sub(entry.announcedAt) < PreviousAddressGracePeriod {
+			for _, announced := range entry.addresses {
+				if announced.Equal(address) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // isConflictingRecord determines whether a received record conflicts with our proposed records.

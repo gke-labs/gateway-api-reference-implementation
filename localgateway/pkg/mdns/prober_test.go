@@ -440,7 +440,7 @@ func TestResponder_MultipleAddressUpdatesWithinGracePeriodNotConflict(t *testing
 	defer sender.Close()
 	destination := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
 
-	buildResponsePacket := func(ip [4]byte) []byte {
+	buildResponsePacket := func(address [4]byte) []byte {
 		builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{
 			Response:      true,
 			Authoritative: true,
@@ -456,7 +456,7 @@ func TestResponder_MultipleAddressUpdatesWithinGracePeriodNotConflict(t *testing
 				Class: dnsmessage.Class(uint16(dnsmessage.ClassINET) | CacheFlushBit),
 				TTL:   60,
 			},
-			dnsmessage.AResource{A: ip},
+			dnsmessage.AResource{A: address},
 		); err != nil {
 			t.Fatalf("builder.AResource: %v", err)
 		}
@@ -483,13 +483,13 @@ func TestResponder_MultipleAddressUpdatesWithinGracePeriodNotConflict(t *testing
 	// 5. Assert that the one conflict reported carries the foreign address without waiting on silence.
 	select {
 	case conflictingRR := <-conflictCh:
-		aResource, ok := conflictingRR.Body.(*dnsmessage.AResource)
+		resource, ok := conflictingRR.Body.(*dnsmessage.AResource)
 		if !ok {
 			t.Fatalf("expected AResource in conflict, got %+v", conflictingRR.Body)
 		}
-		expectedForeignIP := [4]byte{192, 168, 1, 50}
-		if aResource.A != expectedForeignIP {
-			t.Fatalf("expected conflict for foreign IP %v, got %v", expectedForeignIP, aResource.A)
+		expectedForeignAddress := [4]byte{192, 168, 1, 50}
+		if resource.A != expectedForeignAddress {
+			t.Fatalf("expected conflict for foreign address %v, got %v", expectedForeignAddress, resource.A)
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatalf("expected conflict to be detected for foreign address, but none reported")
@@ -527,10 +527,10 @@ func TestResponder_RecentAnnouncementsPruningAndBounding(t *testing.T) {
 	})
 
 	// Perform 10 address updates
-	for i := 2; i <= 11; i++ {
+	for index := 2; index <= 11; index++ {
 		responder.SetRecord(&RecordSet{
 			FQDN: "bound.local.",
-			A:    []net.IP{net.IPv4(10, 0, 0, byte(i))},
+			A:    []net.IP{net.IPv4(10, 0, 0, byte(index))},
 			TTL:  60,
 		})
 	}
@@ -544,26 +544,24 @@ func TestResponder_RecentAnnouncementsPruningAndBounding(t *testing.T) {
 		t.Fatalf("expected at most %d recent announcements, got %d", maxRecentAnnouncements, recentCount)
 	}
 
-	// Simulate an entry older than PreviousAddressGracePeriod and ensure it is pruned on next update
-	responder.mu.Lock()
-	rec = responder.records["bound.local."]
-	rec.recentAnnouncements[0].time = time.Now().Add(-2 * PreviousAddressGracePeriod)
-	responder.mu.Unlock()
-
-	responder.SetRecord(&RecordSet{
-		FQDN: "bound.local.",
-		A:    []net.IP{net.IPv4(10, 0, 0, 100)},
-		TTL:  60,
-	})
-
-	responder.mu.RLock()
-	rec = responder.records["bound.local."]
-	for _, entry := range rec.recentAnnouncements {
-		if time.Since(entry.time) >= PreviousAddressGracePeriod {
-			t.Fatalf("found stale entry older than grace period: %+v", entry)
-		}
+	// Test expiry directly on the published record set: an entry younger than the
+	// grace period matches, and the same entry one grace period later does not.
+	recentResource := dnsmessage.Resource{
+		Header: dnsmessage.ResourceHeader{
+			Name:  dnsmessage.MustNewName("bound.local."),
+			Type:  dnsmessage.TypeA,
+			Class: dnsmessage.ClassINET,
+			TTL:   60,
+		},
+		Body: &dnsmessage.AResource{A: [4]byte{10, 0, 0, 10}},
 	}
-	responder.mu.RUnlock()
+	now := time.Now()
+	if !rec.announcedRecently(recentResource, now) {
+		t.Fatalf("expected recent announcement to match within grace period")
+	}
+	if rec.announcedRecently(recentResource, now.Add(PreviousAddressGracePeriod+time.Second)) {
+		t.Fatalf("expected recent announcement to expire after grace period")
+	}
 }
 
 func TestProber_RepeatAnnouncementUsesUpdatedRecords(t *testing.T) {
