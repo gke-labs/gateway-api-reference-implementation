@@ -9,12 +9,12 @@ The `snigateway` architecture consists of two main components:
    - Listens on TCP port `:443`.
    - Peeks at the TLS ClientHello of incoming connections to determine the requested SNI hostname without consuming stream bytes.
    - If the SNI hostname is `snigateway.internal`, it serves the mTLS management API.
-   - Manages session-scoped hostname registrations and routes across pooled TCP connections.
+   - Manages session-scoped hostname registrations and routes traffic over kernel WireGuard tunnels.
    - Sends PROXY protocol v2 headers (with `PP2_TYPE_AUTHORITY` SNI TLV) on activated connections, carrying real client source/dest IPs.
    - Implements replay-until-first-byte health checking and failover across healthy backend replicas.
 2. **`snigateway` (Controller)**: Runs inside a Kubernetes cluster (e.g. home lab, edge site, private network):
    - Embeds GARI (`pkg/gari`) in-process.
-   - Connects to frontend via a pre-dialed TCP pool (configured with `--tunnel-pool-size`).
+   - Connects to frontend via a kernel WireGuard tunnel.
    - Uses GARI's `OnGatewaysUpdate` hook to dynamically register SNI hostnames for its HTTPS/TLS listeners.
    - Feeds reverse-tunnelled connections to GARI's HTTPS proxy server via a custom tunnel `net.Listener`, parsing PROXY v2 headers to expose real client IPs.
 
@@ -297,12 +297,12 @@ The TLS handshake will be routed through the reverse tunnel and terminated insid
 ## Components & Packages
 
 - `snigateway/cmd/snigateway-frontend`: Frontend server binary with `generate-certs` subcommand.
-- `snigateway/cmd/snigateway`: In-cluster controller binary embedding GARI and reverse-tunnel client with `--tunnel-pool-size`.
+- `snigateway/cmd/snigateway`: In-cluster controller binary embedding GARI and WireGuard tunnel manager.
 - `snigateway/deploy/frontend/`: Systemd unit and VM deployment guide for `snigateway-frontend`.
 - `snigateway/pkg/proxyproto`: PROXY protocol v2 header encoding/decoding and `PP2_TYPE_AUTHORITY` TLV support.
 - `snigateway/pkg/sni`: TLS ClientHello sniffing and parsing.
-- `snigateway/pkg/frontend`: Registration table, session management, warm pool transport, and failover splicing.
+- `snigateway/pkg/frontend`: Registration table, session management, and WireGuard routing with failover splicing.
 - `snigateway/pkg/certs`: In-memory and on-disk CA/server/client certificate generation.
-- `snigateway/pkg/client`: Reusable client library for mTLS API and reverse-tunnel dialbacks.
-- `snigateway/pkg/tunnel`: Tunnel listener, hostname extraction from Gateways, and pool connection manager.
+- `snigateway/pkg/client`: Reusable client library for mTLS API and WireGuard key exchange.
+- `snigateway/pkg/tunnel`: Tunnel listener, hostname extraction from Gateways, and WireGuard tunnel manager.
 - `snigateway/k8s/`: Kubernetes manifests (RBAC, GatewayClass, Deployment, example Gateway/Route).

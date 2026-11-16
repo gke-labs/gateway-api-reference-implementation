@@ -166,15 +166,12 @@ func TestSNIGateway(t *testing.T) {
 		// Verify controller is listening inside the WireGuard tunnel and established the session.
 		wireguardLog := h.WaitForControllerLog("Listening on WireGuard tunnel address", 30*time.Second)
 		t.Logf("Controller WireGuard listener log: %s", wireguardLog)
-		ctrlLogs := h.WaitForControllerLog("Established TCP pool session", 30*time.Second)
+		ctrlLogs := h.WaitForControllerLog("Established session", 30*time.Second)
 		t.Logf("Controller session log: %s", ctrlLogs)
 
 		// After the request, verify that the frontend's log has no tunnel dial failure.
-		// Because the frontend falls back to the TCP pool when a WireGuard dial fails,
-		// checking that no dial failure was logged confirms the request used the tunnel.
-		// The future removal of the TCP pool is what makes a passing request prove the tunnel.
 		feLogs := h.GetFrontendLogs(frontendNS)
-		if strings.Contains(feLogs, "failed to dial WireGuard tunnel") || strings.Contains(feLogs, "falling back to pool") {
+		if strings.Contains(feLogs, "failed to dial WireGuard tunnel") {
 			t.Errorf("Frontend logged WireGuard tunnel dial failure: %s", feLogs)
 		}
 	})
@@ -286,7 +283,7 @@ func TestSNIGateway(t *testing.T) {
 			t.Fatalf("expected at least 2 running snigateway-controller pods, got %d: %v", len(pods), pods)
 		}
 
-		// Force-kill the first replica so its pooled connections become dead without clean session close
+		// Force-kill the first replica so its session becomes dead without clean session close
 		h.RunCmd("kubectl", "delete", "pod", pods[0], "--namespace=default", "--grace-period=0", "--force")
 
 		// Immediately send multiple requests with --retries=0 to verify frontend replay-until-first-byte failover
@@ -322,7 +319,7 @@ func TestSNIGateway(t *testing.T) {
 
 		wireguardLog := h.WaitForControllerLog("Listening on WireGuard tunnel address", 30*time.Second)
 		t.Logf("Controller WireGuard listener log: %s", wireguardLog)
-		ctrlLogs := h.WaitForControllerLog("Established TCP pool session", 30*time.Second)
+		ctrlLogs := h.WaitForControllerLog("Established session", 30*time.Second)
 		t.Logf("Controller session log: %s", ctrlLogs)
 
 		clientPod := "sni-client-1-replica"
@@ -343,7 +340,7 @@ func TestSNIGateway(t *testing.T) {
 		}
 
 		feLogs := h.GetFrontendLogs(frontendNS)
-		if strings.Contains(feLogs, "failed to dial WireGuard tunnel") || strings.Contains(feLogs, "falling back to pool") {
+		if strings.Contains(feLogs, "failed to dial WireGuard tunnel") {
 			t.Errorf("Frontend logged WireGuard tunnel dial failure: %s", feLogs)
 		}
 	})

@@ -648,26 +648,21 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 		}
 	})
 
-	t.Run("WireGuard-off frontend leaves TCP pool working", func(t *testing.T) {
+	t.Run("WireGuard-off frontend causes session setup to fail", func(t *testing.T) {
 		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: false})
 		defer fixture.cleanup(t)
 
-		waitFor(t, 5*time.Second, fixture.manager.IsConnected)
-
-		fixture.devMu.Lock()
-		numDevices := len(fixture.devices)
-		fixture.devMu.Unlock()
-		if numDevices != 0 {
-			t.Errorf("expected no devices opened when frontend WireGuard is off, got %d", numDevices)
-		}
-
-		fixture.manager.UpdateHostnames([]string{"pool-test.example.com"})
 		waitFor(t, 5*time.Second, func() bool {
-			return fixture.manager.HasRegisteredHostnames([]string{"pool-test.example.com"})
+			fixture.manager.wireguard.lastWireGuardErrMu.Lock()
+			defer fixture.manager.wireguard.lastWireGuardErrMu.Unlock()
+			return strings.Contains(fixture.manager.wireguard.lastWireGuardErr, "Frontend has WireGuard disabled")
 		})
+		if fixture.manager.IsConnected() {
+			t.Errorf("expected manager not to connect when frontend WireGuard is off")
+		}
 	})
 
-	t.Run("Device open error leaves TCP pool working", func(t *testing.T) {
+	t.Run("Device open error causes session setup to fail", func(t *testing.T) {
 		fixture := newWireGuardFixture(t, fixtureOptions{
 			frontendWireGuard: true,
 			deviceOpener: func(ctx context.Context, config wireguard.Config) (WireGuardDevice, error) {
@@ -676,18 +671,13 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 		})
 		defer fixture.cleanup(t)
 
-		waitFor(t, 5*time.Second, fixture.manager.IsConnected)
-
-		fixture.devMu.Lock()
-		numDevices := len(fixture.devices)
-		fixture.devMu.Unlock()
-		if numDevices != 0 {
-			t.Errorf("expected no devices opened when opener fails, got %d", numDevices)
-		}
-
-		fixture.manager.UpdateHostnames([]string{"fallback.example.com"})
 		waitFor(t, 5*time.Second, func() bool {
-			return fixture.manager.HasRegisteredHostnames([]string{"fallback.example.com"})
+			fixture.manager.wireguard.lastWireGuardErrMu.Lock()
+			defer fixture.manager.wireguard.lastWireGuardErrMu.Unlock()
+			return strings.Contains(fixture.manager.wireguard.lastWireGuardErr, "Failed to open WireGuard device")
 		})
+		if fixture.manager.IsConnected() {
+			t.Errorf("expected manager not to connect when device opener fails")
+		}
 	})
 }

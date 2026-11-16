@@ -85,12 +85,15 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	}
 	frontendAddr := frontendListener.Addr().String()
 
-	frontendServer, err := frontend.NewServer(frontend.ServerConfig{
+	applyWG, wgOpts := setupTestWireGuardPair(t)
+	feCfg := frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
 		ConnectTimeout:   5 * time.Second,
 		ReadSNITimeout:   2 * time.Second,
-	})
+	}
+	applyWG(&feCfg)
+	frontendServer, err := frontend.NewServer(feCfg)
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
 	}
@@ -107,7 +110,7 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	}
 
 	c := client.NewClient(frontendAddr, clientTLS)
-	mgr := tunnel.NewManager(c, tunnel.WithBackoff(50*time.Millisecond, 200*time.Millisecond))
+	mgr := tunnel.NewManager(c, append(wgOpts, tunnel.WithBackoff(50*time.Millisecond, 200*time.Millisecond))...)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -356,13 +359,16 @@ func TestTokenAuthentication_ProjectedVolumeAndRotationIntegration(t *testing.T)
 	}
 	frontendAddr := ln.Addr().String()
 
-	frontendServer, err := frontend.NewServer(frontend.ServerConfig{
+	applyWG, wgOpts := setupTestWireGuardPair(t)
+	feCfg := frontend.ServerConfig{
 		ServerTLSConfig:     serverTLS,
 		InternalHostname:    "snigateway.internal",
 		Authorizer:          authorizer,
 		JWTVerifier:         verifier,
 		LeaseReaperInterval: 50 * time.Millisecond,
-	})
+	}
+	applyWG(&feCfg)
+	frontendServer, err := frontend.NewServer(feCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +394,7 @@ func TestTokenAuthentication_ProjectedVolumeAndRotationIntegration(t *testing.T)
 	}
 
 	c := client.NewClient(frontendAddr, clientTLS, client.WithTokenFile(tokenFilePath))
-	mgr := tunnel.NewManager(c, tunnel.WithBackoff(50*time.Millisecond, 200*time.Millisecond))
+	mgr := tunnel.NewManager(c, append(wgOpts, tunnel.WithBackoff(50*time.Millisecond, 200*time.Millisecond))...)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()

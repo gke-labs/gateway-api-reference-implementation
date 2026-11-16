@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,7 +35,69 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 )
+
+func setupTestWireGuardPair(t *testing.T) (func(*frontend.ServerConfig), []ManagerOption) {
+	t.Helper()
+	_, prefixNet, err := net.ParseCIDR("fd00:4444::/64")
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
+	_, frontendKey, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	frontendTunnelIP := make(net.IP, 16)
+	copy(frontendTunnelIP, prefixNet.IP.To16())
+	frontendTunnelIP[15] = 1
+
+	var (
+		mu                   sync.Mutex
+		activeTunnelListener net.Listener
+	)
+
+	dialFunc := func(ctx context.Context, network, address string) (net.Conn, error) {
+		mu.Lock()
+		listener := activeTunnelListener
+		mu.Unlock()
+		if listener == nil {
+			return nil, errors.New("no active tunnel listener")
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", listener.Addr().String())
+	}
+
+	listenFunc := func(network, address string) (net.Listener, error) {
+		rawListener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+		listener := &fakeTunnelListener{Listener: rawListener, defaultRemoteIP: frontendTunnelIP}
+		mu.Lock()
+		activeTunnelListener = listener
+		mu.Unlock()
+		return listener, nil
+	}
+
+	opener := func(ctx context.Context, config wireguard.Config) (WireGuardDevice, error) {
+		return &fakeMgrTestWireGuardDevice{}, nil
+	}
+
+	applyFrontend := func(config *frontend.ServerConfig) {
+		config.WireGuardDevice = &fakeFrontendWireGuardDevice{peers: make(map[wireguard.Key]wireguard.Peer)}
+		config.WireGuardPublicKey = frontendKey
+		config.WireGuardPort = 51820
+		config.WireGuardPrefix = prefixNet
+		config.DialContext = dialFunc
+	}
+
+	mgrOpts := []ManagerOption{
+		WithWireGuardDeviceOpener(opener),
+		WithListenFunc(listenFunc),
+	}
+
+	return applyFrontend, mgrOpts
+}
 
 func TestManager_EndToEnd(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "snigateway-mgr-*")
@@ -78,12 +142,15 @@ func TestManager_EndToEnd(t *testing.T) {
 	}
 	serverAddr := ln.Addr().String()
 
-	srv, err := frontend.NewServer(frontend.ServerConfig{
+	applyWG, wgOpts := setupTestWireGuardPair(t)
+	feCfg := frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
 		ConnectTimeout:   5 * time.Second,
 		ReadSNITimeout:   2 * time.Second,
-	})
+	}
+	applyWG(&feCfg)
+	srv, err := frontend.NewServer(feCfg)
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
 	}
@@ -99,7 +166,7 @@ func TestManager_EndToEnd(t *testing.T) {
 	}
 
 	c := client.NewClient(serverAddr, clientTLS)
-	mgr := NewManager(c, WithBackoff(50*time.Millisecond, 200*time.Millisecond))
+	mgr := NewManager(c, append(wgOpts, WithBackoff(50*time.Millisecond, 200*time.Millisecond))...)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -274,12 +341,15 @@ func TestManager_SessionReconnect(t *testing.T) {
 	}
 	serverAddr := ln.Addr().String()
 
-	srv, err := frontend.NewServer(frontend.ServerConfig{
+	applyWG, wgOpts := setupTestWireGuardPair(t)
+	feCfg := frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
 		ConnectTimeout:   5 * time.Second,
 		ReadSNITimeout:   2 * time.Second,
-	})
+	}
+	applyWG(&feCfg)
+	srv, err := frontend.NewServer(feCfg)
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
 	}
@@ -295,7 +365,7 @@ func TestManager_SessionReconnect(t *testing.T) {
 	}
 
 	c := client.NewClient(serverAddr, clientTLS)
-	mgr := NewManager(c, WithBackoff(50*time.Millisecond, 100*time.Millisecond))
+	mgr := NewManager(c, append(wgOpts, WithBackoff(50*time.Millisecond, 100*time.Millisecond))...)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -524,12 +594,15 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 	}
 	defer ln.Close()
 
-	srv, err := frontend.NewServer(frontend.ServerConfig{
+	applyWG, wgOpts := setupTestWireGuardPair(t)
+	feCfg := frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
 		ConnectTimeout:   5 * time.Second,
 		ReadSNITimeout:   2 * time.Second,
-	})
+	}
+	applyWG(&feCfg)
+	srv, err := frontend.NewServer(feCfg)
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
 	}
@@ -548,10 +621,7 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 	}
 	cli := client.NewClient(ln.Addr().String(), clientTLS)
 
-	mgr := NewManager(cli,
-		WithPoolSize(2),
-		WithBackoff(20*time.Millisecond, 100*time.Millisecond),
-	)
+	mgr := NewManager(cli, append(wgOpts, WithBackoff(20*time.Millisecond, 100*time.Millisecond))...)
 
 	notifyCh := make(chan struct{}, 100)
 	mgr.AddStateChangeListener(func() {

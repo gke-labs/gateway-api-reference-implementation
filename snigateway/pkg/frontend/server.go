@@ -16,9 +16,11 @@ package frontend
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,8 +56,16 @@ const (
 	DefaultLeaseReaperInterval = 10 * time.Second
 
 	// DefaultTunnelDialTimeout is the timeout for dialing a session inside the WireGuard tunnel.
-	// It is kept short so a dead or unresponsive tunnel does not starve the TCP pool fallback.
 	DefaultTunnelDialTimeout = 500 * time.Millisecond
+
+	// DefaultTunnelRetryInterval is the pause between failed tunnel connection attempts,
+	// preventing tight retry spinning and local port exhaustion when backends accept and
+	// immediately reset connections.
+	DefaultTunnelRetryInterval = 50 * time.Millisecond
+
+	// DefaultMaxTunnelAttempts is the maximum number of tunnel connection attempts
+	// allowed for a single client connection before giving up.
+	DefaultMaxTunnelAttempts = 5
 )
 
 // ServerConfig holds configuration options for the frontend server.
@@ -70,7 +80,6 @@ type ServerConfig struct {
 	PerAttemptTimeout        time.Duration
 	ReadSNITimeout           time.Duration
 	Authorizer               Authorizer
-	PoolTransport            *PoolTransport
 	MaxConnections           int
 	IdleTimeout              time.Duration
 	MaxHostnamesPerSession   int
@@ -91,6 +100,9 @@ type ServerConfig struct {
 	// If nil, production defaults to (&net.Dialer{}).DialContext.
 	// Tests can pass a custom function to intercept or simulate dials inside the WireGuard tunnel.
 	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
+	// MaxTunnelAttempts is the maximum number of tunnel connection attempts allowed for
+	// a single client connection. Defaults to DefaultMaxTunnelAttempts (5) if <= 0.
+	MaxTunnelAttempts int
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -98,7 +110,6 @@ type Server struct {
 	config     ServerConfig
 	authorizer Authorizer
 	table      *RegistrationTable
-	pool       *PoolTransport
 
 	internalListener *chanListener
 	httpServer       *http.Server
@@ -149,6 +160,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.MaxRegistrationBodyBytes <= 0 {
 		cfg.MaxRegistrationBodyBytes = DefaultMaxRegistrationBodyBytes
 	}
+	if cfg.MaxTunnelAttempts <= 0 {
+		cfg.MaxTunnelAttempts = DefaultMaxTunnelAttempts
+	}
 	if cfg.ServerTLSConfig == nil {
 		return nil, errors.New("ServerTLSConfig is required")
 	}
@@ -156,11 +170,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	auth := cfg.Authorizer
 	if auth == nil {
 		auth = &AllowAllAuthorizer{}
-	}
-
-	pool := cfg.PoolTransport
-	if pool == nil {
-		pool = NewPoolTransport()
 	}
 
 	timeNow := cfg.TimeNow
@@ -178,7 +187,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		config:           cfg,
 		authorizer:       auth,
 		table:            NewRegistrationTable(),
-		pool:             pool,
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
 		jwtVerifier:      cfg.JWTVerifier,
@@ -192,9 +200,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/session", s.handleSession)
 	mux.HandleFunc("/v1/registration", s.handleRegistration)
-	mux.HandleFunc("/v1/connections", s.handleConnectionUpgrade)
-	mux.HandleFunc("/v1/connections/", s.handleConnectionUpgrade)
-	mux.HandleFunc("/v1/tunnel", s.handleConnectionUpgrade)
 	mux.HandleFunc("PUT /v1/sessions/{id}/wireguard", s.handlePutWireGuard)
 
 	s.httpServer = &http.Server{
@@ -207,11 +212,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 // RegistrationTable returns the server's registration table.
 func (s *Server) RegistrationTable() *RegistrationTable {
 	return s.table
-}
-
-// PoolTransport returns the server's TCP pool transport.
-func (s *Server) PoolTransport() *PoolTransport {
-	return s.pool
 }
 
 func closeListeners(listeners []net.Listener) {
@@ -322,7 +322,6 @@ func (s *Server) Close() error {
 	s.listenersMu.Unlock()
 
 	closeCloser(s.internalListener)
-	closeCloser(s.pool)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
@@ -379,7 +378,6 @@ func (s *Server) CloseSession(sessionID string) {
 	s.sessionsMu.Unlock()
 
 	s.table.Unregister(sessionID)
-	s.pool.UnregisterSession(sessionID)
 	s.wireguard.RemoveSession(sessionID)
 
 	if sess.cancel != nil {
@@ -472,12 +470,38 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 	deadline := time.Now().Add(s.config.ConnectTimeout)
 	var committedTunnel net.Conn
 	var initialBackendBytes []byte
-	tunnelFailed := false
 
-	for {
+	maxAttempts := s.config.MaxTunnelAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultMaxTunnelAttempts
+	}
+
+	waitBeforeRetry := func() bool {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		delay := DefaultTunnelRetryInterval
+		if remaining < delay {
+			delay = remaining
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
+		select {
+		case <-s.shutdownCh:
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+
+	for attempts := 0; attempts < maxAttempts; attempts++ {
 		now := time.Now()
 		if now.After(deadline) {
-			log.Printf("Frontend: connect timeout reached for host %q", hostname)
+			if s.dialLogLimiter.Allow() {
+				klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+			}
 			closeCloser(peekedConn)
 			return
 		}
@@ -495,90 +519,126 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 			return
 		}
 
+		targetSession, peerAddress, ok := s.findWireGuardPeer(sessions)
+		if !ok {
+			if s.dialLogLimiter.Allow() {
+				klog.Errorf("Frontend: session for host %q has no WireGuard peer", hostname)
+			}
+			closeCloser(peekedConn)
+			return
+		}
+
 		attemptDeadline := time.Now().Add(attemptTimeout)
-		var tunnelConn net.Conn
-		isWireGuard := false
-
-		// When multiple sessions match a hostname, the frontend selects the first
-		// candidate session that has an active WireGuard peer. If the tunnel dial or
-		// initial handshake fails, remaining attempts for this connection fall back to
-		// the pool across all sessions to prevent starving the connection.
-		if !tunnelFailed {
-			if targetSession, peerAddress, ok := s.findWireGuardPeer(sessions); ok {
-				tunnelDialTimeout := DefaultTunnelDialTimeout
-				if rem := time.Until(attemptDeadline); rem < tunnelDialTimeout {
-					tunnelDialTimeout = rem
+		tunnelDialTimeout := DefaultTunnelDialTimeout
+		if remainingAttempt := time.Until(attemptDeadline); remainingAttempt < tunnelDialTimeout {
+			tunnelDialTimeout = remainingAttempt
+		}
+		dialCtx, cancel := context.WithTimeout(context.Background(), tunnelDialTimeout)
+		tunnelAddress := net.JoinHostPort(peerAddress.String(), strconv.Itoa(api.WireGuardTunnelPort))
+		conn, err := s.dialContext(dialCtx, "tcp", tunnelAddress)
+		cancel()
+		if err != nil {
+			s.logDialError(targetSession, tunnelAddress, err)
+			if attempts+1 < maxAttempts && !waitBeforeRetry() {
+				if s.dialLogLimiter.Allow() {
+					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
 				}
-				dialCtx, cancel := context.WithTimeout(context.Background(), tunnelDialTimeout)
-				tunnelAddress := net.JoinHostPort(peerAddress.String(), strconv.Itoa(api.WireGuardTunnelPort))
-				conn, err := s.dialContext(dialCtx, "tcp", tunnelAddress)
-				cancel()
-				if err != nil {
-					s.logDialError(targetSession, tunnelAddress, err)
-					tunnelFailed = true
-				} else {
-					tunnelConn = conn
-					isWireGuard = true
-				}
+				closeCloser(peekedConn)
+				return
 			}
+			continue
 		}
 
-		if tunnelConn == nil {
-			poolCtx, cancel := context.WithDeadline(context.Background(), attemptDeadline)
-			conn, _, err := s.pool.GetConnForSessions(poolCtx, sessions)
-			cancel()
-
-			if err != nil {
-				// Pool/stream timeout on this attempt, continue until total deadline
-				continue
-			}
-			tunnelConn = conn
-		}
-
+		tunnelConn := conn
 		setTCPKeepAlive(tunnelConn)
 
-		dropConn := func() {
+		dropConnAndPace := func() bool {
 			closeCloser(tunnelConn)
-			if isWireGuard {
-				tunnelFailed = true
+			if attempts+1 < maxAttempts {
+				return waitBeforeRetry()
 			}
+			return false
 		}
 
 		// Set write deadline for PROXY header + peeked bytes
 		if err := tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout)); err != nil {
-			dropConn()
+			if !dropConnAndPace() && attempts+1 < maxAttempts {
+				if s.dialLogLimiter.Allow() {
+					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+				}
+				closeCloser(peekedConn)
+				return
+			}
 			continue
 		}
 		if _, err := tunnelConn.Write(proxyBytes); err != nil {
-			dropConn()
+			if !dropConnAndPace() && attempts+1 < maxAttempts {
+				if s.dialLogLimiter.Allow() {
+					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+				}
+				closeCloser(peekedConn)
+				return
+			}
 			continue
 		}
 		if _, err := tunnelConn.Write(peekedBytes); err != nil {
-			dropConn()
+			if !dropConnAndPace() && attempts+1 < maxAttempts {
+				if s.dialLogLimiter.Allow() {
+					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+				}
+				closeCloser(peekedConn)
+				return
+			}
 			continue
 		}
 
 		// Set read deadline to wait for the first byte from the backend
 		if err := tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout)); err != nil {
-			dropConn()
+			if !dropConnAndPace() && attempts+1 < maxAttempts {
+				if s.dialLogLimiter.Allow() {
+					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+				}
+				closeCloser(peekedConn)
+				return
+			}
 			continue
 		}
 		buffer := make([]byte, 4096)
 		n, err := tunnelConn.Read(buffer)
 		if err != nil || n == 0 {
 			// Failed or unresponsive backend/tunnel connection; drop and replay on next attempt
-			dropConn()
+			if !dropConnAndPace() && attempts+1 < maxAttempts {
+				if s.dialLogLimiter.Allow() {
+					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+				}
+				closeCloser(peekedConn)
+				return
+			}
 			continue
 		}
 
 		// First byte received from backend! Clear deadlines and commit splice
 		if err := tunnelConn.SetDeadline(time.Time{}); err != nil {
-			dropConn()
+			if !dropConnAndPace() && attempts+1 < maxAttempts {
+				if s.dialLogLimiter.Allow() {
+					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+				}
+				closeCloser(peekedConn)
+				return
+			}
 			continue
 		}
 		committedTunnel = tunnelConn
 		initialBackendBytes = buffer[:n]
 		break
+	}
+
+	if committedTunnel == nil {
+		if s.dialLogLimiter.Allow() {
+			klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+		}
+		closeCloser(peekedConn)
+		return
 	}
 
 	// Write initial backend byte(s) to client
@@ -600,8 +660,8 @@ func isNormalClose(err error) bool {
 
 var spliceBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 64*1024)
-		return &b
+		buffer := make([]byte, 64*1024)
+		return &buffer
 	},
 }
 
@@ -785,13 +845,16 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID := generateConnID()
+	sessionID, err := generateConnID()
+	if err != nil {
+		http.Error(w, "failed to generate session ID", http.StatusInternalServerError)
+		return
+	}
 	sessCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	s.createSession(sessionID, cancel, nil)
 
 	s.table.RegisterSession(sessionID, clientIdentity)
-	s.pool.RegisterSession(sessionID)
 	log.Printf("Frontend: created session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
@@ -906,101 +969,12 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func generateConnID() (string, error) {
+	buffer := make([]byte, 16)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", fmt.Errorf("reading random bytes: %w", err)
 	}
-
-	clientIdentity, err := s.extractClientIdentity(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	sessionID := r.Header.Get(api.HeaderSessionID)
-	if sessionID == "" {
-		sessionID = r.URL.Query().Get("sessionId")
-	}
-	if sessionID == "" {
-		sessionID = strings.TrimPrefix(r.URL.Path, "/v1/connections/")
-	}
-	if sessionID == "" {
-		http.Error(w, "missing session ID", http.StatusBadRequest)
-		return
-	}
-
-	sessIdentity, ok := s.table.GetSessionIdentity(sessionID)
-	if !ok {
-		http.Error(w, "session not found or expired", http.StatusNotFound)
-		return
-	}
-
-	if sessIdentity.ID != clientIdentity.ID {
-		http.Error(w, "session identity mismatch", http.StatusForbidden)
-		return
-	}
-
-	// Verify HTTP Upgrade header
-	if !strings.EqualFold(r.Header.Get("Connection"), "Upgrade") && !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
-		http.Error(w, "upgrade header required", http.StatusBadRequest)
-		return
-	}
-
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijack not supported", http.StatusInternalServerError)
-		return
-	}
-
-	rawConn, rw, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Send HTTP 101 Switching Protocols
-	resp := "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: " + api.UpgradeProtocol + "\r\n\r\n"
-	if _, err := rawConn.Write([]byte(resp)); err != nil {
-		closeCloser(rawConn)
-		return
-	}
-
-	var dialedConn net.Conn = rawConn
-	if rw != nil && rw.Reader.Buffered() > 0 {
-		buffered := make([]byte, rw.Reader.Buffered())
-		if _, err := io.ReadFull(rw.Reader, buffered); err != nil {
-			closeCloser(rawConn)
-			return
-		}
-		dialedConn = &bufferedConn{
-			Conn:     rawConn,
-			buffered: buffered,
-		}
-	}
-
-	if err := s.pool.AddConn(sessionID, dialedConn); err != nil {
-		closeCloser(dialedConn)
-		return
-	}
-}
-
-type bufferedConn struct {
-	net.Conn
-	buffered  []byte
-	bufOffset int
-}
-
-func (c *bufferedConn) Read(b []byte) (int, error) {
-	if c.buffered != nil {
-		n := copy(b, c.buffered[c.bufOffset:])
-		c.bufOffset += n
-		if c.bufOffset >= len(c.buffered) {
-			c.buffered = nil
-		}
-		return n, nil
-	}
-	return c.Conn.Read(b)
+	return hex.EncodeToString(buffer), nil
 }
 
 // chanListener implements net.Listener over an in-memory channel.
@@ -1148,9 +1122,9 @@ func (s *Server) findWireGuardPeer(sessions []string) (sessionID string, peerAdd
 	if s.wireguard == nil {
 		return "", nil, false
 	}
-	for _, sid := range sessions {
-		if addr, hasPeer := s.wireguard.PeerAddress(sid); hasPeer {
-			return sid, addr, true
+	for _, candidateSessionID := range sessions {
+		if peerIP, hasPeer := s.wireguard.PeerAddress(candidateSessionID); hasPeer {
+			return candidateSessionID, peerIP, true
 		}
 	}
 	return "", nil, false
@@ -1158,6 +1132,6 @@ func (s *Server) findWireGuardPeer(sessions []string) (sessionID string, peerAdd
 
 func (s *Server) logDialError(sessionID, address string, err error) {
 	if s.dialLogLimiter.Allow() {
-		klog.Errorf("Frontend: failed to dial WireGuard tunnel for session %s at %s: %v; falling back to pool", sessionID, address, err)
+		klog.Errorf("Frontend: failed to dial WireGuard tunnel for session %s at %s: %v", sessionID, address, err)
 	}
 }

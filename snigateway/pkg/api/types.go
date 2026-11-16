@@ -18,9 +18,6 @@ const (
 	// DefaultInternalHostname is the default SNI hostname used for frontend mTLS API.
 	DefaultInternalHostname = "snigateway.internal"
 
-	// UpgradeProtocol is the protocol value used in HTTP Upgrade for reverse tunnels.
-	UpgradeProtocol = "snigateway-tunnel"
-
 	// HeaderSessionID is the HTTP header used to identify the backend session.
 	HeaderSessionID = "X-Session-ID"
 
