@@ -30,6 +30,42 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 )
 
+type fakeDevice struct {
+	peers map[wireguard.Key]wireguard.Peer
+	port  int
+}
+
+func (f *fakeDevice) AddPeer(peer wireguard.Peer) error {
+	if f.peers == nil {
+		f.peers = make(map[wireguard.Key]wireguard.Peer)
+	}
+	f.peers[peer.PublicKey] = peer
+	return nil
+}
+
+func (f *fakeDevice) RemovePeer(key wireguard.Key) error {
+	delete(f.peers, key)
+	return nil
+}
+
+func (f *fakeDevice) Port() (int, error) {
+	return f.port, nil
+}
+
+func (f *fakeDevice) Close() error {
+	return nil
+}
+
+func newFakeDeviceOpener() deviceOpenerFunc {
+	return func(ctx context.Context, cfg wireguard.Config) (deviceCloser, error) {
+		port := cfg.ListenPort
+		if port == 0 {
+			port = 51820
+		}
+		return &fakeDevice{port: port}, nil
+	}
+}
+
 func TestFrontendCLI_ClientCAFlags(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "frontend-cli-*")
 	if err != nil {
@@ -71,7 +107,7 @@ func TestFrontendCLI_ClientCAFlags(t *testing.T) {
 	// Run frontend in background
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- run(ctx, args)
+		errCh <- run(ctx, args, withDeviceOpener(newFakeDeviceOpener()))
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -138,7 +174,7 @@ func TestFrontendCLI_JWTFlags(t *testing.T) {
 
 		errCh := make(chan error, 1)
 		go func() {
-			errCh <- run(ctx, args)
+			errCh <- run(ctx, args, withDeviceOpener(newFakeDeviceOpener()))
 		}()
 
 		time.Sleep(100 * time.Millisecond)
@@ -257,7 +293,7 @@ func TestFrontendCLI_ListenHTTPFlag(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- run(ctx, args)
+		errCh <- run(ctx, args, withDeviceOpener(newFakeDeviceOpener()))
 	}()
 
 	// Wait until HTTP listener is accepting connections
@@ -315,19 +351,19 @@ func TestFrontendCLI_WireGuardFlags(t *testing.T) {
 		"--server-key=" + serverKeyPath,
 	}
 
-	t.Run("port set without prefix fails", func(t *testing.T) {
+	t.Run("port 0 is refused with required message", func(t *testing.T) {
 		args := append([]string{}, baseArgs...)
-		args = append(args, "--wireguard-listen-port=51820")
-		err := run(t.Context(), args)
-		if err == nil || !strings.Contains(err.Error(), "--wireguard-prefix is required") {
-			t.Fatalf("expected error about required prefix, got: %v", err)
+		args = append(args, "--wireguard-listen-port=0")
+		err := run(t.Context(), args, withDeviceOpener(newFakeDeviceOpener()))
+		if err == nil || !strings.Contains(err.Error(), "wireguard is required") {
+			t.Fatalf("expected error containing 'wireguard is required', got: %v", err)
 		}
 	})
 
 	t.Run("IPv4 prefix fails", func(t *testing.T) {
 		args := append([]string{}, baseArgs...)
-		args = append(args, "--wireguard-listen-port=51820", "--wireguard-prefix=192.168.1.0/24")
-		err := run(t.Context(), args)
+		args = append(args, "--wireguard-prefix=192.168.1.0/24")
+		err := run(t.Context(), args, withDeviceOpener(newFakeDeviceOpener()))
 		if err == nil || !strings.Contains(err.Error(), "must be an IPv6 prefix") {
 			t.Fatalf("expected error about IPv6 prefix, got: %v", err)
 		}
@@ -335,25 +371,111 @@ func TestFrontendCLI_WireGuardFlags(t *testing.T) {
 
 	t.Run("non-64 IPv6 prefix fails", func(t *testing.T) {
 		args := append([]string{}, baseArgs...)
-		args = append(args, "--wireguard-listen-port=51820", "--wireguard-prefix=fd00::/48")
-		err := run(t.Context(), args)
+		args = append(args, "--wireguard-prefix=fd00::/48")
+		err := run(t.Context(), args, withDeviceOpener(newFakeDeviceOpener()))
 		if err == nil || !strings.Contains(err.Error(), "must be a /64 prefix") {
 			t.Fatalf("expected error about /64 prefix, got: %v", err)
 		}
 	})
 
-	t.Run("valid flags attempt device open and exit with package error without privileges", func(t *testing.T) {
+	t.Run("no flags attempt device open and exit with package error without privileges", func(t *testing.T) {
 		if os.Geteuid() == 0 {
 			t.Skip("skipping test that expects WireGuard device creation to fail because process is privileged (running as root); a test should not create links on the host")
 		}
 		args := append([]string{}, baseArgs...)
-		args = append(args, "--wireguard-listen-port=51820", "--wireguard-prefix=fd00::/64")
 		err := run(t.Context(), args)
 		if err == nil {
 			t.Fatal("expected run to fail in unprivileged environment, got nil")
 		}
 		if !errors.Is(err, wireguard.ErrPermission) && !errors.Is(err, wireguard.ErrNotSupported) {
 			t.Fatalf("expected wireguard.ErrPermission or wireguard.ErrNotSupported, got: %v", err)
+		}
+	})
+
+	t.Run("no WireGuard flags opens device on port 51820 with generated prefix differing between starts", func(t *testing.T) {
+		var capturedConfigs []wireguard.Config
+		opener := func(ctx context.Context, cfg wireguard.Config) (deviceCloser, error) {
+			capturedConfigs = append(capturedConfigs, cfg)
+			return &fakeDevice{port: cfg.ListenPort}, nil
+		}
+
+		for start := 0; start < 2; start++ {
+			ctx, cancel := context.WithCancel(t.Context())
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- run(ctx, baseArgs, withDeviceOpener(opener))
+			}()
+
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+
+			select {
+			case err := <-errCh:
+				if err != nil && !errors.Is(err, context.Canceled) {
+					t.Fatalf("start %d run returned error: %v", start, err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("start %d timeout waiting for server shutdown", start)
+			}
+		}
+
+		if len(capturedConfigs) != 2 {
+			t.Fatalf("expected 2 device opens, got %d", len(capturedConfigs))
+		}
+
+		for i, cfg := range capturedConfigs {
+			if cfg.ListenPort != 51820 {
+				t.Errorf("start %d: expected ListenPort 51820, got %d", i, cfg.ListenPort)
+			}
+			if cfg.TunnelPrefix == nil {
+				t.Fatalf("start %d: TunnelPrefix is nil", i)
+			}
+			if len(cfg.TunnelPrefix.IP) != 16 || cfg.TunnelPrefix.IP[0] != 0xfd {
+				t.Errorf("start %d: expected prefix inside fd00::/8, got %s", i, cfg.TunnelPrefix)
+			}
+			ones, bits := cfg.TunnelPrefix.Mask.Size()
+			if ones != 64 || bits != 128 {
+				t.Errorf("start %d: expected /64 prefix, got /%d", i, ones)
+			}
+		}
+
+		if capturedConfigs[0].TunnelPrefix.IP.Equal(capturedConfigs[1].TunnelPrefix.IP) {
+			t.Errorf("expected generated prefix to differ between starts, got %s for both", capturedConfigs[0].TunnelPrefix)
+		}
+	})
+
+	t.Run("custom prefix is respected", func(t *testing.T) {
+		var capturedConfig wireguard.Config
+		opener := func(ctx context.Context, cfg wireguard.Config) (deviceCloser, error) {
+			capturedConfig = cfg
+			return &fakeDevice{port: cfg.ListenPort}, nil
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		args := append([]string{}, baseArgs...)
+		args = append(args, "--wireguard-prefix=fd00:abcd:1234:1::/64")
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- run(ctx, args, withDeviceOpener(opener))
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+
+		select {
+		case err := <-errCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("run returned error: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for server shutdown")
+		}
+
+		if capturedConfig.TunnelPrefix == nil || capturedConfig.TunnelPrefix.String() != "fd00:abcd:1234:1::/64" {
+			t.Fatalf("expected custom prefix fd00:abcd:1234:1::/64, got %v", capturedConfig.TunnelPrefix)
 		}
 	})
 }

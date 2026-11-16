@@ -21,8 +21,8 @@ Wants=network-online.target
 Type=simple
 User=snigateway
 Group=snigateway
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
 # To also accept plaintext HTTP requests and route them by Host header,
 # add: --listen-http :80 \
 ExecStart=/usr/local/bin/snigateway-frontend \
