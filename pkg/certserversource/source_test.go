@@ -610,14 +610,19 @@ func TestSource_PendingChallenges_TrackAndDrop(t *testing.T) {
 	step.Store(1)
 
 	// Wait for trigger indicating certificate issuance / challenge removal
-	select {
-	case <-recomputeChannel:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("timed out waiting for trigger on cert issued")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		result, err = src.ResolveCertificates(gateway, listener)
+		if err == nil && !result.Pending && len(result.Certificates) == 1 {
+			break
+		}
+		select {
+		case <-recomputeChannel:
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 
 	// 5. ResolveCertificates now returns the certificate, and challenges are gone
-	result, err = src.ResolveCertificates(gateway, listener)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

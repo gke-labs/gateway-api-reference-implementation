@@ -551,26 +551,26 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		stCode := st.Code()
 
 		if err == nil {
-			var newChallenges []state.HTTP01Challenge
-			if info != nil && info.Certificate == nil && len(info.Challenges) > 0 {
-				newChallenges = validateChallenges(info.Challenges, hostnames)
-			}
-
-			s.mu.Lock()
-			previousGatewayChallenges := s.gatewayChallengesLocked(key.gateway)
-			entry, ok = s.cache[key]
-			if ok {
-				entry.challenges = newChallenges
-			}
-			currentGatewayChallenges := s.gatewayChallengesLocked(key.gateway)
-			challengesChanged := !slices.Equal(previousGatewayChallenges, currentGatewayChallenges)
-			s.mu.Unlock()
-
-			if challengesChanged {
-				s.notifyTrigger()
-			}
-
 			if info == nil || info.Certificate == nil {
+				var newChallenges []state.HTTP01Challenge
+				if info != nil && len(info.Challenges) > 0 {
+					newChallenges = validateChallenges(info.Challenges, hostnames)
+				}
+
+				s.mu.Lock()
+				previousGatewayChallenges := s.gatewayChallengesLocked(key.gateway)
+				entry, ok = s.cache[key]
+				if ok {
+					entry.challenges = newChallenges
+				}
+				currentGatewayChallenges := s.gatewayChallengesLocked(key.gateway)
+				challengesChanged := !slices.Equal(previousGatewayChallenges, currentGatewayChallenges)
+				s.mu.Unlock()
+
+				if challengesChanged {
+					s.notifyTrigger()
+				}
+
 				// A pending certificate is retried.
 				// Poll at a short fixed interval (minBackoff, 1 second by default) rather than
 				// backing off exponentially. This ensures the controller fetches challenges
