@@ -17,6 +17,7 @@ gofmt:
 govet:
   enabled: true
 lint:
-  droppedErrors:
-    baseline: .ap/droppederrors-baseline.txt
+  analyzers:
+    droppedErrors:
+      baseline: .ap/droppederrors-baseline.txt
 
