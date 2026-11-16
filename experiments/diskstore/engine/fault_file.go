@@ -80,7 +80,7 @@ type FaultFS struct {
 	// A nil cipher means the store is not encrypted.
 	heapCipher atomic.Pointer[xts.Cipher]
 
-	encryptionKey []byte
+	encryptionKey EncryptionKey
 
 	crashed bool
 }
@@ -96,10 +96,10 @@ func NewFaultFS(underlying FS) *FaultFS {
 }
 
 // SetEncryptionKey sets the master key used for decrypting WAL blocks in invariant checks.
-func (f *FaultFS) SetEncryptionKey(key []byte) {
+func (f *FaultFS) SetEncryptionKey(key EncryptionKey) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.encryptionKey = bytes.Clone(key)
+	f.encryptionKey = EncryptionKey(bytes.Clone(key))
 }
 
 // SetMaxFsyncedLSN sets the highest LSN that has been fsynced in the WAL.

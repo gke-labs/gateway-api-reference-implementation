@@ -109,8 +109,8 @@ type WAL struct {
 	activeCipher     *xts.Cipher // AES-256-XTS cipher for active segment; nil if WAL is not encrypted
 	activePath       string
 	activeStartLSN   uint64
-	encryptionKey    []byte // 32-byte master key for segment key derivation; empty means WAL is not encrypted
-	encryptionBuffer []byte // Aligned 4 KiB staging buffer for encrypting blocks before direct I/O write
+	encryptionKey    EncryptionKey // 32-byte master key for segment key derivation; empty means WAL is not encrypted
+	encryptionBuffer []byte        // Aligned 4 KiB staging buffer for encrypting blocks before direct I/O write
 
 	appendOff  int64 // physical file offset in active segment where next record appends
 	flushedOff int64 // physical file offset in active segment up to which data has been written to disk
@@ -151,7 +151,7 @@ type WALOptions struct {
 	Quarantine     QuarantineOptions
 	// EncryptionKey is the 32-byte master key for deriving per-segment AES-256-XTS keys.
 	// An empty key means the WAL is not encrypted.
-	EncryptionKey []byte
+	EncryptionKey EncryptionKey
 }
 
 // OpenWAL opens or creates a WAL in the given directory.
@@ -895,7 +895,7 @@ func (w *WAL) Close() error {
 type WALIteratorOptions struct {
 	// EncryptionKey is the 32-byte master key for decrypting WAL segment blocks.
 	// An empty key means the WAL is not encrypted.
-	EncryptionKey []byte
+	EncryptionKey EncryptionKey
 }
 
 // WALIterator replays records across segment files starting from a given LSN.
@@ -943,8 +943,8 @@ type WALIterator struct {
 	expectedLSN uint64
 	done        bool
 
-	encryptionKey []byte      // 32-byte master key for segment key derivation; empty means WAL is not encrypted
-	currCipher    *xts.Cipher // AES-256-XTS cipher for the current segment; nil if WAL is not encrypted
+	encryptionKey EncryptionKey // 32-byte master key for segment key derivation; empty means WAL is not encrypted
+	currCipher    *xts.Cipher   // AES-256-XTS cipher for the current segment; nil if WAL is not encrypted
 
 	cachedBlock      []byte // Decrypted 4 KiB block cache for sequential record reading
 	rawBlock         []byte // Raw 4 KiB block read from disk before decryption

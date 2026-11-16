@@ -24,6 +24,47 @@ import (
 	"testing"
 )
 
+func TestEncryptionKey_String(t *testing.T) {
+	key := EncryptionKey([]byte("super-secret-key-32bytes-1234567"))
+
+	// Verify %v outputs placeholder and does not leak key material
+	vOut := fmt.Sprintf("%v", key)
+	if vOut != "<redacted>" {
+		t.Errorf("%%v formatted key as %q, want %q", vOut, "<redacted>")
+	}
+	if strings.Contains(vOut, "super-secret") {
+		t.Errorf("%%v leaked key material: %s", vOut)
+	}
+
+	// Verify %s outputs placeholder and does not leak key material
+	sOut := fmt.Sprintf("%s", key)
+	if sOut != "<redacted>" {
+		t.Errorf("%%s formatted key as %q, want %q", sOut, "<redacted>")
+	}
+	if strings.Contains(sOut, "super-secret") {
+		t.Errorf("%%s leaked key material: %s", sOut)
+	}
+
+	// Verify nil key also returns the placeholder
+	var nilKey EncryptionKey
+	if got := fmt.Sprintf("%v", nilKey); got != "<redacted>" {
+		t.Errorf("%%v on nil key got %q, want %q", got, "<redacted>")
+	}
+	if got := fmt.Sprintf("%s", nilKey); got != "<redacted>" {
+		t.Errorf("%%s on nil key got %q, want %q", got, "<redacted>")
+	}
+
+	// Verify formatting a struct containing EncryptionKey does not leak the key
+	walOpts := WALOptions{EncryptionKey: key}
+	walOut := fmt.Sprintf("%v", walOpts)
+	if strings.Contains(walOut, "super-secret") {
+		t.Errorf("%%v on struct leaked key material: %s", walOut)
+	}
+	if !strings.Contains(walOut, "<redacted>") {
+		t.Errorf("%%v on struct should contain placeholder, got: %s", walOut)
+	}
+}
+
 func TestKeyDerivation_FixedVectors(t *testing.T) {
 	var callerKey [32]byte
 	for i := range callerKey {
