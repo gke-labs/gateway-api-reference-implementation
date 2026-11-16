@@ -1,0 +1,98 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package dataplane.push.v1;
+
+option go_package = "github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push;push";
+
+// PushService provides bidirectional streaming configuration push from the controller
+// to data planes. The data plane initiates the connection to the controller.
+service PushService {
+  // StreamConfig establishes a bidirectional configuration stream between a data plane
+  // and the controller. The data plane sends an initial Hello message naming the Gateway
+  // it serves and its applied revision, if any. The controller pushes Config messages,
+  // and the data plane replies to each with an Ack or Nack message.
+  rpc StreamConfig(stream DataplaneMessage) returns (stream ControllerMessage);
+}
+
+// DataplaneMessage is sent by the data plane to the controller over the bidirectional stream.
+// It carries either the initial Hello handshake, an Ack for an applied configuration, or
+// a Nack for a failed configuration.
+message DataplaneMessage {
+  // body is the message payload sent by the data plane.
+  oneof body {
+    // hello is the first message sent by the data plane upon establishing the stream. Sent by data plane.
+    Hello hello = 1;
+
+    // ack acknowledges successful application of a configuration revision. Sent by data plane.
+    Ack ack = 2;
+
+    // nack reports a failure to apply a configuration revision with a reason. Sent by data plane.
+    Nack nack = 3;
+  }
+}
+
+// Hello is the first message sent by the data plane to the controller upon establishing the stream.
+// It carries the identity of the Gateway the data plane claims to serve and its currently applied
+// revision. The Gateway identity is a claim: the controller validates this claim against the
+// caller's authenticated identity in the step that adds authentication, and sends nothing before
+// that check.
+message Hello {
+  // gateway_namespace is the Kubernetes namespace of the Gateway resource the data plane claims to serve. Sent by data plane.
+  string gateway_namespace = 1;
+
+  // gateway_name is the Kubernetes name of the Gateway resource the data plane claims to serve. Sent by data plane.
+  string gateway_name = 2;
+
+  // applied_revision is the configuration revision currently applied by the data plane, or empty if none. Sent by data plane.
+  string applied_revision = 3;
+}
+
+// Ack is sent by the data plane to the controller to acknowledge that a configuration revision
+// was successfully applied and its listeners are accepting traffic.
+message Ack {
+  // applied_revision is the configuration revision that was successfully applied. Sent by data plane.
+  string applied_revision = 1;
+}
+
+// Nack is sent by the data plane to the controller to report that a configuration revision
+// could not be applied.
+message Nack {
+  // revision is the configuration revision that failed to apply. Sent by data plane.
+  string revision = 1;
+
+  // reason is a human-readable explanation of why the configuration could not be applied. Sent by data plane.
+  string reason = 2;
+}
+
+// ControllerMessage is sent by the controller to the data plane over the bidirectional stream.
+// It carries configuration updates pushed from the controller to the data plane.
+message ControllerMessage {
+  // body is the message payload sent by the controller.
+  oneof body {
+    // config carries a compiled configuration snapshot to be applied by the data plane. Sent by controller.
+    Config config = 1;
+  }
+}
+
+// Config carries a compiled configuration snapshot pushed from the controller to the data plane.
+message Config {
+  // revision is the unique content-derived identifier for this configuration snapshot. Sent by controller.
+  string revision = 1;
+
+  // dataplane_config is the JSON-encoded DataplaneConfig payload. Sent by controller.
+  bytes dataplane_config = 2;
+}
