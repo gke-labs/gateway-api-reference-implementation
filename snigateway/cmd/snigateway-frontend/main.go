@@ -78,10 +78,6 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, opener deviceOpenerFunc) error {
-	if opener == nil {
-		opener = defaultDeviceOpener
-	}
-
 	if len(args) > 0 && args[0] == "generate-certs" {
 		return runGenerateCerts(args[1:])
 	}
