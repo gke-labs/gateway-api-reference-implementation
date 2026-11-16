@@ -927,6 +927,42 @@ func TestSNIListener_TerminateAndMixedAndMissingCert(t *testing.T) {
 	})
 }
 
+type handshakeSyncConn struct {
+	net.Conn
+	sniffStarted chan struct{}
+	once         sync.Once
+}
+
+func (s *handshakeSyncConn) SetReadDeadline(t time.Time) error {
+	s.once.Do(func() {
+		close(s.sniffStarted)
+	})
+	return s.Conn.SetReadDeadline(t)
+}
+
+func (s *handshakeSyncConn) CloseWrite() error {
+	type closeWriter interface {
+		CloseWrite() error
+	}
+	if cw, ok := s.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+type handshakeSyncListener struct {
+	net.Listener
+	sniffStarted chan struct{}
+}
+
+func (l *handshakeSyncListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &handshakeSyncConn{Conn: conn, sniffStarted: l.sniffStarted}, nil
+}
+
 func TestSNIListener_ConsistentConfigSnapshotDuringSwap(t *testing.T) {
 	// Subtest 1: Structural atomicity: flag and candidates can never disagree
 	t.Run("Snapshot flag and candidates never disagree", func(t *testing.T) {
@@ -1047,7 +1083,9 @@ func TestSNIListener_ConsistentConfigSnapshotDuringSwap(t *testing.T) {
 		}
 		defer rawLis.Close()
 
-		sniLis := p.NewSNIListener(rawLis)
+		sniffStarted := make(chan struct{})
+		syncLis := &handshakeSyncListener{Listener: rawLis, sniffStarted: sniffStarted}
+		sniLis := p.NewSNIListener(syncLis)
 		defer sniLis.Close()
 
 		addr := rawLis.Addr().String()
@@ -1059,8 +1097,12 @@ func TestSNIListener_ConsistentConfigSnapshotDuringSwap(t *testing.T) {
 		}
 		defer rawConn.Close()
 
-		// 2. Allow acceptLoop to accept the connection before TLS handshake begins
-		time.Sleep(20 * time.Millisecond)
+		// 2. Wait until acceptLoop accepts the connection and SniffSNI starts waiting for ClientHello
+		select {
+		case <-sniffStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for acceptLoop to handle connection")
+		}
 
 		// 3. Swap config to HTTPS-only (removing passthroughListener from proxy)
 		p.UpdateConfig([]state.InternalListener{httpsListener}, nil)
