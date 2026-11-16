@@ -1734,3 +1734,311 @@ func TestRegistration_DefaultHostnameCap(t *testing.T) {
 		t.Fatalf("expected 1000 hostnames in table, got %d", len(reg))
 	}
 }
+
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met before deadline")
+}
+
+func setupTestHTTPServerAndClient(t *testing.T) (*Server, string, string, *certs.GeneratedCerts, func()) {
+	t.Helper()
+
+	generated, err := certs.GenerateAll("snigateway.internal", "test-cluster-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certs failed: %v", err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	tlsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen tls failed: %v", err)
+	}
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen http failed: %v", err)
+	}
+
+	_, prefixNet, err := net.ParseCIDR("fd00:1234::/64")
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
+	_, feKey, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+
+	srv, err := NewServer(ServerConfig{
+		ServerTLSConfig:    serverTLS,
+		InternalHostname:   "snigateway.internal",
+		ConnectTimeout:     5 * time.Second,
+		PerAttemptTimeout:  200 * time.Millisecond,
+		ReadSNITimeout:     2 * time.Second,
+		WireGuardDevice:    newFakeWireGuardDevice(),
+		WireGuardPublicKey: feKey,
+		WireGuardPort:      51820,
+		WireGuardPrefix:    prefixNet,
+		DialContext:        testDialContext,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- srv.ServeWithHTTP([]net.Listener{tlsLn}, []net.Listener{httpLn})
+	}()
+
+	cleanup := func() {
+		if err := srv.Close(); err != nil {
+			t.Errorf("srv.Close failed: %v", err)
+		}
+		if err := <-serverErrCh; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("ServeWithHTTP failed: %v", err)
+		}
+	}
+
+	return srv, tlsLn.Addr().String(), httpLn.Addr().String(), generated, cleanup
+}
+
+type testHTTPBackend struct {
+	sessionID  string
+	tunnelAddr string
+	listener   net.Listener
+}
+
+func setupHTTPBackend(t *testing.T, ctx context.Context, clientInstance *client.Client, hostname string) *testHTTPBackend {
+	t.Helper()
+
+	sessID, _, err := clientInstance.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+	if _, err := clientInstance.Register(ctx, sessID, []string{hostname}); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	_, clientKey, err := wireguard.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	wgResp, err := clientInstance.ExchangeWireGuard(ctx, sessID, clientKey.String())
+	if err != nil {
+		t.Fatalf("ExchangeWireGuard failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	tunnelAddr := net.JoinHostPort(wgResp.PeerAddress, strconv.Itoa(api.WireGuardTunnelPort))
+	registerTestBackendListener(tunnelAddr, ln)
+	t.Cleanup(func() {
+		unregisterTestBackendListener(tunnelAddr)
+		if closeErr := ln.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Logf("failed to close listener: %v", closeErr)
+		}
+	})
+
+	return &testHTTPBackend{
+		sessionID:  sessID,
+		tunnelAddr: tunnelAddr,
+		listener:   ln,
+	}
+}
+
+func TestHTTPFailover_NoReplayAfterClientBytes(t *testing.T) {
+	srv, tlsAddr, httpAddr, generated, cleanup := setupTestHTTPServerAndClient(t)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	client1 := client.NewClient(tlsAddr, clientTLS)
+	client2 := client.NewClient(tlsAddr, clientTLS)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	b1ReceivedCh := make(chan string, 1)
+	b2ReceivedCh := make(chan string, 1)
+
+	// Backend 1: accepts connection, reads PROXY header and HTTP request head, then closes without replying
+	backend1 := setupHTTPBackend(t, ctx, client1, "noreplay.example.com")
+	go func() {
+		for {
+			conn, err := backend1.listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(backendConn net.Conn) {
+				defer backendConn.Close()
+				bufReader := bufio.NewReader(backendConn)
+				if _, err := proxyproto.Decode(bufReader); err != nil {
+					return
+				}
+				buf := make([]byte, 2048)
+				n, err := bufReader.Read(buf)
+				if err != nil && n == 0 {
+					return
+				}
+				b1ReceivedCh <- string(buf[:n])
+				// Close immediately without replying
+			}(conn)
+		}
+	}()
+
+	// Backend 2: second registered backend for the same hostname
+	backend2 := setupHTTPBackend(t, ctx, client2, "noreplay.example.com")
+	go func() {
+		for {
+			conn, err := backend2.listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(backendConn net.Conn) {
+				defer backendConn.Close()
+				bufReader := bufio.NewReader(backendConn)
+				if _, err := proxyproto.Decode(bufReader); err != nil {
+					return
+				}
+				buf := make([]byte, 2048)
+				n, err := bufReader.Read(buf)
+				if err != nil && n == 0 {
+					return
+				}
+				b2ReceivedCh <- string(buf[:n])
+			}(conn)
+		}
+	}()
+
+	// Wait for registrations to settle in table without advancing round-robin index
+	waitFor(t, 5*time.Second, func() bool {
+		return len(srv.RegistrationTable().GetRegisteredHostnames(backend1.sessionID)) > 0 &&
+			len(srv.RegistrationTable().GetRegisteredHostnames(backend2.sessionID)) > 0
+	})
+
+	// Client sends plain HTTP request
+	conn, err := net.Dial("tcp", httpAddr)
+	if err != nil {
+		t.Fatalf("Dial http failed: %v", err)
+	}
+	defer conn.Close()
+
+	httpRequest := "POST /transfer HTTP/1.1\r\nHost: noreplay.example.com\r\nContent-Length: 5\r\n\r\nhello"
+	if _, err := conn.Write([]byte(httpRequest)); err != nil {
+		t.Fatalf("Write request failed: %v", err)
+	}
+
+	// Verify Backend 1 accepted and read the request head
+	select {
+	case reqHead := <-b1ReceivedCh:
+		if !strings.Contains(reqHead, "POST /transfer") {
+			t.Fatalf("unexpected request on backend 1: %q", reqHead)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for backend 1 to receive request head")
+	}
+
+	// Verify client connection was closed
+	replyBuf := make([]byte, 1024)
+	n, readErr := conn.Read(replyBuf)
+	if readErr == nil && n > 0 {
+		t.Fatalf("expected client read to fail on closed connection, got %d bytes: %s", n, replyBuf[:n])
+	}
+
+	// Verify Backend 2 received NOTHING
+	select {
+	case req := <-b2ReceivedCh:
+		t.Fatalf("second backend unexpectedly received request: %q", req)
+	case <-time.After(300 * time.Millisecond):
+		// Success: second backend received nothing
+	}
+}
+
+func TestHTTPFailover_RefusedDial(t *testing.T) {
+	srv, tlsAddr, httpAddr, generated, cleanup := setupTestHTTPServerAndClient(t)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	client1 := client.NewClient(tlsAddr, clientTLS)
+	client2 := client.NewClient(tlsAddr, clientTLS)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Backend 1: registered first, but its tunnel listener is closed so dialing is refused
+	backend1 := setupHTTPBackend(t, ctx, client1, "refused.example.com")
+	if err := backend1.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("failed to close backend 1 listener: %v", err)
+	}
+
+	// Backend 2: registered second, healthy listener that responds 200 OK
+	backend2 := setupHTTPBackend(t, ctx, client2, "refused.example.com")
+	go func() {
+		for {
+			conn, err := backend2.listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(backendConn net.Conn) {
+				defer backendConn.Close()
+				bufReader := bufio.NewReader(backendConn)
+				if _, err := proxyproto.Decode(bufReader); err != nil {
+					return
+				}
+				buf := make([]byte, 2048)
+				n, err := bufReader.Read(buf)
+				if err != nil && n == 0 {
+					return
+				}
+				if _, err := backendConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nhello-backend")); err != nil {
+					t.Errorf("backendConn.Write failed: %v", err)
+				}
+			}(conn)
+		}
+	}()
+
+	// Wait for registrations to settle in table without advancing round-robin index
+	waitFor(t, 5*time.Second, func() bool {
+		return len(srv.RegistrationTable().GetRegisteredHostnames(backend1.sessionID)) > 0 &&
+			len(srv.RegistrationTable().GetRegisteredHostnames(backend2.sessionID)) > 0
+	})
+
+	// Client sends request
+	conn, err := net.Dial("tcp", httpAddr)
+	if err != nil {
+		t.Fatalf("Dial http failed: %v", err)
+	}
+	defer conn.Close()
+
+	httpRequest := "GET /test HTTP/1.1\r\nHost: refused.example.com\r\n\r\n"
+	if _, err := conn.Write([]byte(httpRequest)); err != nil {
+		t.Fatalf("Write request failed: %v", err)
+	}
+
+	// Client should successfully read 200 OK from Backend 2 via failover
+	replyBuf := make([]byte, 1024)
+	n, readErr := conn.Read(replyBuf)
+	if readErr != nil {
+		t.Fatalf("expected successful response after failover, got read err: %v", readErr)
+	}
+	gotResp := string(replyBuf[:n])
+	if !strings.Contains(gotResp, "200 OK") || !strings.Contains(gotResp, "hello-backend") {
+		t.Fatalf("unexpected response: %s", gotResp)
+	}
+}

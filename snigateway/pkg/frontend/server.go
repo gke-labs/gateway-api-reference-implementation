@@ -423,7 +423,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	s.routeToBackend(sniHostname, peekedConn)
+	s.routeToBackend(sniHostname, peekedConn, true)
 }
 
 // handleHTTPConnection peeks the HTTP/1.1 request head of an incoming plaintext connection,
@@ -441,10 +441,33 @@ func (s *Server) handleHTTPConnection(conn net.Conn) {
 		return
 	}
 
-	s.routeToBackend(hostname, peekedConn)
+	s.routeToBackend(hostname, peekedConn, false)
 }
 
-func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
+var (
+	errHostNotRegistered = errors.New("host not registered")
+	errNoWireGuardPeer   = errors.New("session has no WireGuard peer")
+)
+
+// routeToBackend routes an incoming connection to a backend session matching hostname.
+//
+// Routing and retry rule:
+// A connection attempt may fail before any of the client's bytes are written to the backend
+// (e.g. if dialing the tunnel is refused, or writing the synthetic PROXY header fails). Such
+// early failures may still be retried on another backend session.
+//
+// However, after the frontend has written any of the client's bytes to a backend, it does not
+// send them to another one; a failure after that point closes the client connection immediately.
+// This rule applies specifically to plain HTTP connections (isTLS=false), where the peeked bytes
+// contain the HTTP request head (method, URI, headers, and possibly body). Replaying an HTTP request
+// to a second backend after the first backend has already received it is unsafe because non-idempotent
+// requests (e.g. POST, PATCH) could run twice.
+//
+// For TLS connections (isTLS=true), the frontend peeks one TLS record, the ClientHello, which
+// carries no request. Because no application request has been sent, replaying the ClientHello to
+// another backend when the first backend is unresponsive or closes without sending a handshake
+// response is safe, so TLS may retry before the first backend byte.
+func (s *Server) routeToBackend(hostname string, peekedConn net.Conn, isTLS bool) {
 	cleanHost := CleanHostname(hostname)
 
 	var rawClientConn net.Conn = peekedConn
@@ -497,13 +520,8 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 	}
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
-		now := time.Now()
-		if now.After(deadline) {
-			if s.dialLogLimiter.Allow() {
-				klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-			}
-			closeCloser(peekedConn)
-			return
+		if time.Now().After(deadline) {
+			break
 		}
 
 		remaining := time.Until(deadline)
@@ -512,15 +530,19 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 			attemptTimeout = remaining
 		}
 
-		sessions := s.table.MatchSessions(cleanHost)
-		if len(sessions) == 0 {
+		conn, initialBytes, clientBytesWritten, err := s.attemptBackend(hostname, cleanHost, proxyBytes, peekedBytes, attemptTimeout)
+		if err == nil {
+			committedTunnel = conn
+			initialBackendBytes = initialBytes
+			break
+		}
+
+		if errors.Is(err, errHostNotRegistered) {
 			log.Printf("Frontend: rejecting connection with host %q (clean: %q): not registered", hostname, cleanHost)
 			closeCloser(peekedConn)
 			return
 		}
-
-		targetSession, peerAddress, ok := s.findWireGuardPeer(sessions)
-		if !ok {
+		if errors.Is(err, errNoWireGuardPeer) {
 			if s.dialLogLimiter.Allow() {
 				klog.Errorf("Frontend: session for host %q has no WireGuard peer", hostname)
 			}
@@ -528,114 +550,36 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 			return
 		}
 
-		attemptDeadline := time.Now().Add(attemptTimeout)
-		tunnelDialTimeout := DefaultTunnelDialTimeout
-		if remainingAttempt := time.Until(attemptDeadline); remainingAttempt < tunnelDialTimeout {
-			tunnelDialTimeout = remainingAttempt
-		}
-		dialCtx, cancel := context.WithTimeout(context.Background(), tunnelDialTimeout)
-		tunnelAddress := net.JoinHostPort(peerAddress.String(), strconv.Itoa(api.WireGuardTunnelPort))
-		conn, err := s.dialContext(dialCtx, "tcp", tunnelAddress)
-		cancel()
-		if err != nil {
-			s.logDialError(targetSession, tunnelAddress, err)
-			if attempts+1 < maxAttempts && !waitBeforeRetry() {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
+		// After the frontend has written any of the client's bytes to a backend,
+		// it does not send them to another one. For plain HTTP this prevents
+		// non-idempotent client requests from running twice.
+		if !isTLS && clientBytesWritten {
+			if s.dialLogLimiter.Allow() {
+				klog.Errorf("Frontend: closing connection for host %q: client request bytes were already sent to backend: %v", hostname, err)
 			}
-			continue
+			closeCloser(peekedConn)
+			return
 		}
 
-		tunnelConn := conn
-		setTCPKeepAlive(tunnelConn)
-
-		dropConnAndPace := func() bool {
-			closeCloser(tunnelConn)
-			if attempts+1 < maxAttempts {
-				return waitBeforeRetry()
+		if attempts+1 < maxAttempts {
+			if !waitBeforeRetry() {
+				break
 			}
-			return false
 		}
-
-		// Set write deadline for PROXY header + peeked bytes
-		if err := tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout)); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-		if _, err := tunnelConn.Write(proxyBytes); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-		if _, err := tunnelConn.Write(peekedBytes); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-
-		// Set read deadline to wait for the first byte from the backend
-		if err := tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout)); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-		buffer := make([]byte, 4096)
-		n, err := tunnelConn.Read(buffer)
-		if err != nil || n == 0 {
-			// Failed or unresponsive backend/tunnel connection; drop and replay on next attempt
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-
-		// First byte received from backend! Clear deadlines and commit splice
-		if err := tunnelConn.SetDeadline(time.Time{}); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-		committedTunnel = tunnelConn
-		initialBackendBytes = buffer[:n]
-		break
 	}
 
 	if committedTunnel == nil {
 		if s.dialLogLimiter.Allow() {
-			klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+			select {
+			case <-s.shutdownCh:
+				klog.Errorf("Frontend: server shutting down while routing host %q", hostname)
+			default:
+				if time.Now().After(deadline) {
+					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+				} else {
+					klog.Errorf("Frontend: maximum tunnel attempts reached for host %q: tunnel did not answer", hostname)
+				}
+			}
 		}
 		closeCloser(peekedConn)
 		return
@@ -649,6 +593,84 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 	}
 
 	spliceConnections(rawClientConn, committedTunnel, s.config.IdleTimeout)
+}
+
+// attemptBackend executes a single connection attempt to a backend session matching cleanHost.
+// It returns:
+//   - conn: the established tunnel connection to the backend, or nil on failure.
+//   - initialBytes: the first response bytes read from the backend to verify responsiveness.
+//   - clientBytesWritten: true once any of the client's bytes were written to the backend,
+//     including a partial write.
+//   - err: the error encountered during the attempt, or nil on success.
+func (s *Server) attemptBackend(hostname, cleanHost string, proxyBytes, peekedBytes []byte, attemptTimeout time.Duration) (net.Conn, []byte, bool, error) {
+	sessions := s.table.MatchSessions(cleanHost)
+	if len(sessions) == 0 {
+		return nil, nil, false, errHostNotRegistered
+	}
+
+	targetSession, peerAddress, ok := s.findWireGuardPeer(sessions)
+	if !ok {
+		return nil, nil, false, errNoWireGuardPeer
+	}
+
+	attemptDeadline := time.Now().Add(attemptTimeout)
+	tunnelDialTimeout := DefaultTunnelDialTimeout
+	if remainingAttempt := time.Until(attemptDeadline); remainingAttempt < tunnelDialTimeout {
+		tunnelDialTimeout = remainingAttempt
+	}
+	dialCtx, cancel := context.WithTimeout(context.Background(), tunnelDialTimeout)
+	tunnelAddress := net.JoinHostPort(peerAddress.String(), strconv.Itoa(api.WireGuardTunnelPort))
+	conn, err := s.dialContext(dialCtx, "tcp", tunnelAddress)
+	cancel()
+	if err != nil {
+		s.logDialError(targetSession, tunnelAddress, err)
+		return nil, nil, false, err
+	}
+
+	tunnelConn := conn
+	setTCPKeepAlive(tunnelConn)
+
+	if err := tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout)); err != nil {
+		closeCloser(tunnelConn)
+		return nil, nil, false, err
+	}
+	if _, err := tunnelConn.Write(proxyBytes); err != nil {
+		closeCloser(tunnelConn)
+		return nil, nil, false, err
+	}
+
+	var clientBytesWritten bool
+	if len(peekedBytes) > 0 {
+		n, writeErr := tunnelConn.Write(peekedBytes)
+		if n > 0 {
+			clientBytesWritten = true
+		}
+		if writeErr != nil {
+			closeCloser(tunnelConn)
+			return nil, nil, clientBytesWritten, writeErr
+		}
+	}
+
+	if err := tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout)); err != nil {
+		closeCloser(tunnelConn)
+		return nil, nil, clientBytesWritten, err
+	}
+	buffer := make([]byte, 4096)
+	n, err := tunnelConn.Read(buffer)
+	if err != nil || n == 0 {
+		closeCloser(tunnelConn)
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, nil, clientBytesWritten, err
+	}
+
+	if err := tunnelConn.SetDeadline(time.Time{}); err != nil {
+		closeCloser(tunnelConn)
+		return nil, nil, clientBytesWritten, err
+	}
+
+	return tunnelConn, buffer[:n], clientBytesWritten, nil
 }
 
 func isNormalClose(err error) bool {
