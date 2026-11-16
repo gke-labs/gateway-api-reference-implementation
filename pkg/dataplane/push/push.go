@@ -18,17 +18,17 @@ package push
 
 const (
 	// MaxConfigMessageBytes is the maximum allowed size in bytes of a serialized
-	// configuration message (4 MiB). This comfortably exceeds the 1 MiB Kubernetes
-	// Secret limit while fitting within gRPC's default 4 MiB frame size.
+	// DataplaneConfig payload (4 MiB). This comfortably exceeds the 1 MiB Kubernetes
+	// Secret limit. Because gRPC's default receive message limit applies to the
+	// entire message including envelope and framing overhead, the server and client
+	// raise their receive limit to cover it; the step that adds server and client
+	// logic does so.
 	MaxConfigMessageBytes = 4 * 1024 * 1024
 
 	// MaxNACKReasonBytes is the maximum allowed length in bytes of a NACK reason string (1 KiB).
 	// This bounds error message sizes while providing ample detail for diagnostics and Kubernetes
 	// condition messages.
 	MaxNACKReasonBytes = 1024
-
-	// MaxNackReasonBytes is an alias for MaxNACKReasonBytes.
-	MaxNackReasonBytes = MaxNACKReasonBytes
 )
 
 // HelloMessage wraps a Hello in a DataplaneMessage.

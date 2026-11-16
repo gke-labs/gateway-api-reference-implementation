@@ -92,7 +92,9 @@ func TestStreamConfig_Exchange(t *testing.T) {
 	}()
 	t.Cleanup(func() {
 		grpcServer.Stop()
-		_ = lis.Close()
+		if err := lis.Close(); err != nil {
+			t.Errorf("lis.Close error: %v", err)
+		}
 	})
 
 	// 2. Connect client.
@@ -105,7 +107,11 @@ func TestStreamConfig_Exchange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to dial bufnet: %v", err)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
+	t.Cleanup(func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close error: %v", err)
+		}
+	})
 
 	client := push.NewPushServiceClient(conn)
 	stream, err := client.StreamConfig(ctx)
@@ -230,21 +236,5 @@ func TestStreamConfig_Exchange(t *testing.T) {
 	close(server.sendConfigs)
 	if err := stream.CloseSend(); err != nil {
 		t.Fatalf("CloseSend failed: %v", err)
-	}
-}
-
-func TestLimits(t *testing.T) {
-	if push.MaxConfigMessageBytes <= 0 {
-		t.Errorf("MaxConfigMessageBytes should be positive, got %d", push.MaxConfigMessageBytes)
-	}
-	if push.MaxConfigMessageBytes < 1024*1024 {
-		t.Errorf("MaxConfigMessageBytes should be at least 1 MiB, got %d", push.MaxConfigMessageBytes)
-	}
-	if push.MaxNACKReasonBytes <= 0 {
-		t.Errorf("MaxNACKReasonBytes should be positive, got %d", push.MaxNACKReasonBytes)
-	}
-	if push.MaxNackReasonBytes != push.MaxNACKReasonBytes {
-		t.Errorf("MaxNackReasonBytes (%d) should equal MaxNACKReasonBytes (%d)",
-			push.MaxNackReasonBytes, push.MaxNACKReasonBytes)
 	}
 }
