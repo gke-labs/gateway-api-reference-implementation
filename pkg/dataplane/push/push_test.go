@@ -120,7 +120,14 @@ func TestStreamConfig_Exchange(t *testing.T) {
 	}
 
 	// 3. Data plane sends Hello message.
-	helloMsg := push.HelloMessage("prod-gateway", "external-lb", "")
+	helloMsg := &push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Hello{
+			Hello: &push.Hello{
+				GatewayNamespace: "prod-gateway",
+				GatewayName:      "external-lb",
+			},
+		},
+	}
 	if err := stream.Send(helloMsg); err != nil {
 		t.Fatalf("client failed to send Hello: %v", err)
 	}
@@ -149,7 +156,14 @@ func TestStreamConfig_Exchange(t *testing.T) {
 
 	// 4. Controller pushes Config message (rev-1).
 	configPayload := []byte(`{"listeners":[{"port":80,"protocol":"HTTP"}]}`)
-	server.sendConfigs <- push.ConfigMessage("rev-1", configPayload)
+	server.sendConfigs <- &push.ControllerMessage{
+		Body: &push.ControllerMessage_Config{
+			Config: &push.Config{
+				Revision:        "rev-1",
+				DataplaneConfig: configPayload,
+			},
+		},
+	}
 
 	// Verify client received Config.
 	resp, err := stream.Recv()
@@ -168,7 +182,13 @@ func TestStreamConfig_Exchange(t *testing.T) {
 	}
 
 	// 5. Data plane replies with ACK.
-	ackMsg := push.AckMessage("rev-1")
+	ackMsg := &push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Ack{
+			Ack: &push.Ack{
+				AppliedRevision: "rev-1",
+			},
+		},
+	}
 	if err := stream.Send(ackMsg); err != nil {
 		t.Fatalf("client failed to send Ack: %v", err)
 	}
@@ -191,7 +211,14 @@ func TestStreamConfig_Exchange(t *testing.T) {
 
 	// 6. Controller pushes another Config message (rev-2).
 	badPayload := []byte(`{"invalid"}`)
-	server.sendConfigs <- push.ConfigMessage("rev-2", badPayload)
+	server.sendConfigs <- &push.ControllerMessage{
+		Body: &push.ControllerMessage_Config{
+			Config: &push.Config{
+				Revision:        "rev-2",
+				DataplaneConfig: badPayload,
+			},
+		},
+	}
 
 	// Verify client received Config (rev-2).
 	resp2, err := stream.Recv()
@@ -208,7 +235,14 @@ func TestStreamConfig_Exchange(t *testing.T) {
 
 	// 7. Data plane replies with NACK.
 	const nackReason = "failed to parse DataplaneConfig: invalid JSON syntax"
-	nackMsg := push.NackMessage("rev-2", nackReason)
+	nackMsg := &push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Nack{
+			Nack: &push.Nack{
+				Revision: "rev-2",
+				Reason:   nackReason,
+			},
+		},
+	}
 	if err := stream.Send(nackMsg); err != nil {
 		t.Fatalf("client failed to send Nack: %v", err)
 	}
