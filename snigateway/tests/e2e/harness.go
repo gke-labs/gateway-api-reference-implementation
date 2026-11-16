@@ -63,6 +63,14 @@ func (h *Harness) GetControllerLogs() string {
 	return string(out)
 }
 
+func (h *Harness) GetFrontendLogs(namespace string) string {
+	out, err := exec.Command("kubectl", "logs", "deployment/snigateway-frontend", "--namespace="+namespace, "--all-containers=true").Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
 func (h *Harness) WaitForControllerLog(expectedSubstring string, timeout time.Duration) string {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -278,6 +286,14 @@ spec:
         - "--ca-cert=/etc/snigateway/certs/ca.crt"
         - "--client-cert=/etc/snigateway/certs/client.crt"
         - "--client-key=/etc/snigateway/certs/client.key"
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_ADMIN
         volumeMounts:
         - name: client-certs
           mountPath: /etc/snigateway/certs

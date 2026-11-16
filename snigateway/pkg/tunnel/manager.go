@@ -107,8 +107,7 @@ type Manager struct {
 	stateChangeListeners    []func()
 	reRegTimer              *time.Timer
 
-	// wireguard manages the WireGuard device and tunnel listener for the controller,
-	// or nil when --tunnel-wireguard is off.
+	// wireguard manages the WireGuard device and tunnel listener for the controller.
 	wireguard *wireguardManager
 }
 
@@ -124,6 +123,7 @@ func NewManager(client *client.Client, options ...ManagerOption) *Manager {
 		backoffMin:      200 * time.Millisecond,
 		backoffMax:      5 * time.Second,
 		updateCh:        make(chan struct{}, 1),
+		wireguard:       newWireGuardManager(),
 	}
 	for _, opt := range options {
 		opt(m)

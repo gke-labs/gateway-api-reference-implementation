@@ -163,9 +163,20 @@ func TestSNIGateway(t *testing.T) {
 			t.Errorf("Expected X-Forwarded-For to contain client pod IP %s, got logs: %s", clientPodIP, logs)
 		}
 
-		// Verify default deployment established TCP pool session
+		// Verify controller is listening inside the WireGuard tunnel and established the session.
+		wireguardLog := h.WaitForControllerLog("Listening on WireGuard tunnel address", 30*time.Second)
+		t.Logf("Controller WireGuard listener log: %s", wireguardLog)
 		ctrlLogs := h.WaitForControllerLog("Established TCP pool session", 30*time.Second)
-		t.Logf("Controller logs for default tcp mode: %s", ctrlLogs)
+		t.Logf("Controller session log: %s", ctrlLogs)
+
+		// After the request, verify that the frontend's log has no tunnel dial failure.
+		// Because the frontend falls back to the TCP pool when a WireGuard dial fails,
+		// checking that no dial failure was logged confirms the request used the tunnel.
+		// The future removal of the TCP pool is what makes a passing request prove the tunnel.
+		feLogs := h.GetFrontendLogs(frontendNS)
+		if strings.Contains(feLogs, "failed to dial WireGuard tunnel") || strings.Contains(feLogs, "falling back to pool") {
+			t.Errorf("Frontend logged WireGuard tunnel dial failure: %s", feLogs)
+		}
 	})
 
 	// Assertion 2: Unregistered SNI hostname is rejected (connection closed)
@@ -309,8 +320,10 @@ func TestSNIGateway(t *testing.T) {
 
 		h.DeploySNIGatewayController(infraCerts, frontendAddr, 1)
 
+		wireguardLog := h.WaitForControllerLog("Listening on WireGuard tunnel address", 30*time.Second)
+		t.Logf("Controller WireGuard listener log: %s", wireguardLog)
 		ctrlLogs := h.WaitForControllerLog("Established TCP pool session", 30*time.Second)
-		t.Logf("Controller logs: %s", ctrlLogs)
+		t.Logf("Controller session log: %s", ctrlLogs)
 
 		clientPod := "sni-client-1-replica"
 		h.DeletePod(clientPod)
@@ -327,6 +340,11 @@ func TestSNIGateway(t *testing.T) {
 
 		if !strings.Contains(logs, "Status: 200 OK") {
 			t.Errorf("Expected 200 OK, got: %s", logs)
+		}
+
+		feLogs := h.GetFrontendLogs(frontendNS)
+		if strings.Contains(feLogs, "failed to dial WireGuard tunnel") || strings.Contains(feLogs, "falling back to pool") {
+			t.Errorf("Frontend logged WireGuard tunnel dial failure: %s", feLogs)
 		}
 	})
 

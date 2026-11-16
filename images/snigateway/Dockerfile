@@ -13,6 +13,8 @@
 # limitations under the License.
 
 FROM --platform=$BUILDPLATFORM golang:1.27.4 AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY go.mod go.sum ./
 COPY certserver/api/go.mod certserver/api/go.sum ./certserver/api/
@@ -24,7 +26,8 @@ WORKDIR /app/snigateway
 ARG TARGETOS TARGETARCH
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o snigateway cmd/snigateway/main.go
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o snigateway cmd/snigateway/main.go \
+    && setcap cap_net_admin+ep snigateway
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /
