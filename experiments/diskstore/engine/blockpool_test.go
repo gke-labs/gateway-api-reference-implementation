@@ -1039,7 +1039,11 @@ func TestBlockPool_PageFlushedTwiceBeforeFsyncKeepsFirstRedoLSN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create heap file failed: %v", err)
 	}
-	defer heapFile.Close()
+	defer func() {
+		if err := heapFile.Close(); err != nil {
+			t.Errorf("heapFile.Close failed: %v", err)
+		}
+	}()
 
 	var dbID [16]byte
 	copy(dbID[:], []byte("redo-lsn-test-01"))
@@ -1048,14 +1052,24 @@ func TestBlockPool_PageFlushedTwiceBeforeFsyncKeepsFirstRedoLSN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWAL failed: %v", err)
 	}
-	defer wal.Close()
+	defer func() {
+		if err := wal.Close(); err != nil {
+			t.Errorf("wal.Close failed: %v", err)
+		}
+	}()
 
 	buddy := NewBuddyAllocator(512)
 	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 8})
-	defer bp.Close()
+	defer func() {
+		if err := bp.Close(); err != nil {
+			t.Errorf("bp.Close failed: %v", err)
+		}
+	}()
 
 	// 1. First modification at LSN 10
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")})
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
 	h1, err := bp.AllocateNewPage(1, 1, 10)
 	if err != nil {
 		t.Fatalf("AllocateNewPage failed: %v", err)
@@ -1083,7 +1097,9 @@ func TestBlockPool_PageFlushedTwiceBeforeFsyncKeepsFirstRedoLSN(t *testing.T) {
 	}
 
 	// 3. Second modification at LSN 20 before any fsync
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k", Payload: []byte("v2")})
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k", Payload: []byte("v2")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
 	h1Again, err := bp.PinPage(1)
 	if err != nil {
 		t.Fatalf("PinPage failed: %v", err)

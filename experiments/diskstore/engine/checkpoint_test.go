@@ -355,7 +355,6 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer store.Close()
 
 	// 1. Initial write and checkpoint to establish durable baseline
 	if err := store.Put("table", "k1", []byte("v1_initial")); err != nil {
@@ -402,6 +401,7 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	flushStarted := make(chan struct{})
 	allowFlushFinish := make(chan struct{})
 	flushDone := make(chan struct{})
+	var flushErr error
 
 	var once sync.Once
 	faultFS.SetBeforeWriteAt(func(path string, p []byte, off int64) {
@@ -414,7 +414,7 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	})
 
 	go func() {
-		_ = store.bp.FlushPage(pageID)
+		flushErr = store.bp.FlushPage(pageID)
 		close(flushDone)
 	}()
 
@@ -436,6 +436,9 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	if cpErr != nil {
 		t.Fatalf("Checkpoint failed: %v", cpErr)
 	}
+	if flushErr != nil {
+		t.Fatalf("FlushPage failed: %v", flushErr)
+	}
 
 	// 5. Verify acceptance criterion:
 	// "The checkpoint's redo start LSN is at or below that page's first un-synced LSN"
@@ -443,7 +446,11 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	if err != nil {
 		t.Fatalf("NewWALIterator failed: %v", err)
 	}
-	defer walScanIt.Close()
+	defer func() {
+		if err := walScanIt.Close(); err != nil {
+			t.Errorf("walScanIt.Close failed: %v", err)
+		}
+	}()
 
 	chkRecord, err := walScanIt.Next()
 	if err != nil {
@@ -477,7 +484,11 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	if err != nil {
 		t.Fatalf("Open after crash failed: %v", err)
 	}
-	defer store2.Close()
+	defer func() {
+		if err := store2.Close(); err != nil {
+			t.Errorf("store2.Close failed: %v", err)
+		}
+	}()
 
 	val, exists, err := store2.Get("table", "k1")
 	if err != nil {
@@ -488,5 +499,163 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	}
 	if !bytes.Equal(val, []byte("v2_updated")) {
 		t.Fatalf("expected k1 to be reconstructed to 'v2_updated', got %q", string(val))
+	}
+}
+
+func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	storeDir := "test_realloc_dirty_lsn"
+
+	store, err := Open(WithFS(faultFS), WithDir(storeDir), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// 1. Put a multi-block value and checkpoint to establish durable baseline
+	mbVal1 := bytes.Repeat([]byte("a"), 5000)
+	if err := store.Put("table", "mb1", mbVal1); err != nil {
+		t.Fatalf("initial multi-block Put failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("initial Checkpoint failed: %v", err)
+	}
+
+	store.keyMu.RLock()
+	entry, exists := store.keyIndex[qualifyKey("table", "mb1")]
+	store.keyMu.RUnlock()
+	if !exists {
+		t.Fatalf("expected mb1 in index")
+	}
+	pageID := entry.LogicalPage
+
+	// 2. Replace mb1 with another multi-block value to dirty the page
+	mbVal2 := bytes.Repeat([]byte("b"), 5000)
+	if err := store.Put("table", "mb1", mbVal2); err != nil {
+		t.Fatalf("replace Put failed: %v", err)
+	}
+
+	// 3. Start a checkpoint and, while its heap fsync runs:
+	//    - delete the key mb1 (dirtied at delete LSN)
+	//    - put another multi-block value mb2 that reuses pageID
+	deleteAndReallocDone := make(chan struct{})
+	var opErr error
+
+	faultFS.SetBeforeSync(func(path string) {
+		if filepath.Base(path) == "heap.db" {
+			// Inside heapFile.Sync(), after FlushAllDirty has flushed pageID and
+			// startHeapSync has rotated the flush into flushedPagesSyncing.
+			if err := store.Delete("table", "mb1"); err != nil {
+				opErr = fmt.Errorf("Delete failed: %w", err)
+				close(deleteAndReallocDone)
+				return
+			}
+			mbVal3 := bytes.Repeat([]byte("c"), 5000)
+			if err := store.Put("table", "mb2", mbVal3); err != nil {
+				opErr = fmt.Errorf("Put mb2 failed: %w", err)
+				close(deleteAndReallocDone)
+				return
+			}
+			close(deleteAndReallocDone)
+		}
+	})
+
+	chkLSN1, cpErr := store.Checkpoint()
+	if cpErr != nil {
+		t.Fatalf("Checkpoint failed: %v", cpErr)
+	}
+	<-deleteAndReallocDone
+	if opErr != nil {
+		t.Fatalf("concurrent operations during fsync failed: %v", opErr)
+	}
+	if chkLSN1 == 0 {
+		t.Fatalf("expected non-zero checkpoint LSN")
+	}
+
+	// Verify that pageID was reused for mb2
+	store.keyMu.RLock()
+	entry2, exists2 := store.keyIndex[qualifyKey("table", "mb2")]
+	store.keyMu.RUnlock()
+	if !exists2 {
+		t.Fatalf("expected mb2 in index")
+	}
+	if entry2.LogicalPage != pageID {
+		t.Fatalf("expected mb2 to reuse page %d, got %d", pageID, entry2.LogicalPage)
+	}
+
+	// Verify that after heapSyncSucceeded, pageID's RedoLSN carried forward the
+	// DirtyLSN from the delete operation rather than jumping ahead to mb2's Put LSN.
+	store.bp.mu.Lock()
+	desc := store.bp.pageTable[pageID]
+	if desc == nil {
+		store.bp.mu.Unlock()
+		t.Fatalf("expected descriptor for page %d", pageID)
+	}
+	redoLSN := desc.RedoLSN
+	dirtyLSN := desc.DirtyLSN
+	store.bp.mu.Unlock()
+
+	if redoLSN == 0 {
+		t.Fatalf("expected page RedoLSN > 0 for dirty reallocated page")
+	}
+	if redoLSN != dirtyLSN {
+		t.Fatalf("expected RedoLSN (%d) == DirtyLSN (%d) carried from delete", redoLSN, dirtyLSN)
+	}
+
+	// 4. Second checkpoint records redo start at or below pageID's RedoLSN
+	faultFS.SetBeforeSync(nil)
+	chkLSN2, cpErr2 := store.Checkpoint()
+	if cpErr2 != nil {
+		t.Fatalf("second Checkpoint failed: %v", cpErr2)
+	}
+
+	walScanIt, err := NewWALIterator(faultFS, filepath.Join(storeDir, "wal"), store.dbID, chkLSN2, WALIteratorOptions{})
+	if err != nil {
+		t.Fatalf("NewWALIterator failed: %v", err)
+	}
+	defer func() {
+		if err := walScanIt.Close(); err != nil {
+			t.Errorf("walScanIt.Close failed: %v", err)
+		}
+	}()
+
+	chkRecord, err := walScanIt.Next()
+	if err != nil {
+		t.Fatalf("reading second checkpoint record failed: %v", err)
+	}
+	if chkRecord.RedoStartLSN > redoLSN {
+		t.Fatalf("expected second checkpoint RedoStartLSN <= page RedoLSN (%d), got %d",
+			redoLSN, chkRecord.RedoStartLSN)
+	}
+
+	// 5. Crash and recover
+	if err := faultFS.Crash(true, 0); err != nil {
+		t.Fatalf("Crash failed: %v", err)
+	}
+
+	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(storeDir))
+	if err != nil {
+		t.Fatalf("Open after crash failed: %v", err)
+	}
+	defer func() {
+		if err := store2.Close(); err != nil {
+			t.Errorf("store2.Close failed: %v", err)
+		}
+	}()
+
+	val2, exists, err := store2.Get("table", "mb2")
+	if err != nil {
+		t.Fatalf("Get mb2 after recovery failed: %v", err)
+	}
+	if !exists || !bytes.Equal(val2, bytes.Repeat([]byte("c"), 5000)) {
+		t.Fatalf("mb2 not correctly recovered")
+	}
+
+	_, exists, err = store2.Get("table", "mb1")
+	if err != nil {
+		t.Fatalf("Get mb1 after recovery failed: %v", err)
+	}
+	if exists {
+		t.Fatalf("expected deleted mb1 to not exist after recovery")
 	}
 }
