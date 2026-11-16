@@ -32,13 +32,17 @@ chmod 755 /usr/local/bin/snigateway-frontend
 
 #### Option B: Run via Docker Container
 
-If using Docker, you can run the `snigateway-frontend` container image. Note that the container runs as a non-root user (`65532:65532`). To bind to port 443 on the host, use either `--network host` with capability `NET_BIND_SERVICE`, or port mapping `-p 443:8443` with `--listen :8443`:
+If using Docker, you can run the `snigateway-frontend` container image. Note that the container runs as a non-root user (`65532:65532`). A container that runs this image needs `NET_ADMIN` added, or it can't start (file capabilities like `cap_net_admin+ep` on the binary require `NET_ADMIN` in the bounding set, and in Kubernetes require `capabilities: {add: [NET_ADMIN]}` and `allowPrivilegeEscalation: true` because file capabilities do not apply under no-new-privileges). In addition, ensure the WireGuard UDP tunnel port (default `51820/udp`) is published.
+
+To run with port mapping:
 
 ```bash
 docker run -d \
   --name snigateway-frontend \
   --restart always \
+  --cap-add=NET_ADMIN \
   -p 443:8443 \
+  -p 51820:51820/udp \
   -v /etc/snigateway:/etc/snigateway:ro \
   snigateway-frontend:latest \
   --listen :8443 \
@@ -47,13 +51,14 @@ docker run -d \
   --server-key /etc/snigateway/server.key
 ```
 
-Or with `--network host` and `--cap-add=NET_BIND_SERVICE`:
+Or with `--network host` and capabilities:
 
 ```bash
 docker run -d \
   --name snigateway-frontend \
   --restart always \
   --network host \
+  --cap-add=NET_ADMIN \
   --cap-add=NET_BIND_SERVICE \
   -v /etc/snigateway:/etc/snigateway:ro \
   snigateway-frontend:latest \
@@ -105,7 +110,7 @@ Copy the systemd service file to `/etc/systemd/system/`:
 cp snigateway-frontend.service /etc/systemd/system/snigateway-frontend.service
 ```
 
-The systemd service utilizes `AmbientCapabilities=CAP_NET_BIND_SERVICE` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` to allow the unprivileged `snigateway` user to bind directly to privileged port `443`.
+The systemd service utilizes `AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN` to allow the unprivileged `snigateway` user to bind directly to privileged port `443` and configure the kernel WireGuard interface.
 
 Reload systemd, enable, and start the service:
 
