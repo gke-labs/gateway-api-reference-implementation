@@ -46,12 +46,15 @@ message DataplaneMessage {
 }
 
 // Hello is the first message sent by the data plane to the controller upon establishing the stream.
-// It carries the identity of the Gateway the data plane serves and its currently applied revision.
+// It carries the identity of the Gateway the data plane claims to serve and its currently applied
+// revision. The Gateway identity is a claim: the controller validates this claim against the
+// caller's authenticated identity in the step that adds authentication, and sends nothing before
+// that check.
 message Hello {
-  // gateway_namespace is the Kubernetes namespace of the Gateway resource served by the data plane. Sent by data plane.
+  // gateway_namespace is the Kubernetes namespace of the Gateway resource the data plane claims to serve. Sent by data plane.
   string gateway_namespace = 1;
 
-  // gateway_name is the Kubernetes name of the Gateway resource served by the data plane. Sent by data plane.
+  // gateway_name is the Kubernetes name of the Gateway resource the data plane claims to serve. Sent by data plane.
   string gateway_name = 2;
 
   // applied_revision is the configuration revision currently applied by the data plane, or empty if none. Sent by data plane.
@@ -90,6 +93,6 @@ message Config {
   // revision is the unique content-derived identifier for this configuration snapshot. Sent by controller.
   string revision = 1;
 
-  // dataplane_config is the serialized DataplaneConfig payload (e.g. JSON-encoded bytes). Sent by controller.
+  // dataplane_config is the JSON-encoded DataplaneConfig payload. Sent by controller.
   bytes dataplane_config = 2;
 }
