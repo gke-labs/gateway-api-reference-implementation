@@ -20,21 +20,23 @@ certificates. It only needs to:
 ## How it works
 
 ```
-client ──TLS──► front-end node (snigateway-frontend) ══TCP pool reverse tunnel (PROXY v2)══► GARI in cluster ──► backends
+client ──TLS──► front-end node (snigateway-frontend) ══WireGuard reverse tunnel (PROXY v2)══► GARI in cluster ──► backends
                  reads SNI only                                                              terminates TLS,
-                 manages sessions, transports & failover                                     does all routing
+                 manages sessions, routing & failover                                        does all routing
 ```
 
 1. **Announce.** GARI looks at the Gateway listeners it serves (HTTPS/TLS
    listeners with hostnames, and attached routes) and works out the set of
    SNI hostnames the cluster wants to receive.
 2. **Backend Sessions & Registration.** The in-cluster controller connects to `snigateway-frontend` at `snigateway.internal` using mTLS (authenticated via a trusted CA or ServiceAccount token). The backend establishes an HTTP mTLS session (`GET /v1/session`) and registers hostnames (`PUT /v1/registration`). Registrations are scoped to sessions and automatically cleaned up when the session ends.
-3. **Tunnel Transports: TCP Pool & HTTP/2.**
-   - **Warm Pre-Dialed TCP Pool (default):** Each backend maintains a warm pool of $N$ idle pre-dialed mTLS reverse tunnel connections (`POST /v1/tunnel` with `Upgrade: snigateway-tunnel`).
-   - **HTTP/2 CONNECT Multiplexing:** Client connections are tunnelled over multiplexed HTTP/2 streams across pre-dialed connections (`POST /v1/tunnel` with `Upgrade: snigateway-tunnel-h2`).
-4. **Route by SNI & Activation with PROXY Protocol v2.** When a client connects to the front-end node on `:443`, the SNI proxy peeks at the TLS ClientHello without consuming stream bytes and looks up matching sessions in the registration table (exact matches win over wildcards). The frontend establishes a tunnel connection to a matching session (popping a pooled TCP connection or opening an HTTP/2 stream), writes a PROXY protocol v2 header carrying the real client IP, destination IP, and `PP2_TYPE_AUTHORITY` SNI TLV, writes the peeked ClientHello bytes, and waits for the backend's first response byte.
+3. **Tunnel Transports: Kernel WireGuard.**
+   *(Note: Out of date. Kernel WireGuard is now the sole tunnel transport. The previous pre-dialed TCP pool and HTTP/2 multiplexing transports described below have been removed.)*
+   - **Kernel WireGuard (current):** Controller and frontend exchange WireGuard public keys over mTLS, configuring point-to-point WireGuard peers inside an IPv6 ULA prefix. Frontend connects to the controller inside the tunnel on port 51821.
+   - **Warm Pre-Dialed TCP Pool (historical/removed):** Each backend maintained a warm pool of $N$ idle pre-dialed mTLS reverse tunnel connections (`POST /v1/tunnel` with `Upgrade: snigateway-tunnel`).
+   - **HTTP/2 CONNECT Multiplexing (historical/removed):** Client connections were tunnelled over multiplexed HTTP/2 streams across pre-dialed connections (`POST /v1/tunnel` with `Upgrade: snigateway-tunnel-h2`).
+4. **Route by SNI & Activation with PROXY Protocol v2.** When a client connects to the front-end node on `:443`, the SNI proxy peeks at the TLS ClientHello without consuming stream bytes and looks up matching sessions in the registration table (exact matches win over wildcards). The frontend establishes a tunnel connection to a matching session inside the WireGuard tunnel, writes a PROXY protocol v2 header carrying the real client IP, destination IP, and `PP2_TYPE_AUTHORITY` SNI TLV, writes the peeked ClientHello bytes, and waits for the backend's first response byte.
 5. **Health Checking & Failover.** The PROXY header write and response check provide zero-overhead health checking:
-   - **Replay until first byte:** If a pooled connection fails or is unresponsive, the frontend drops it and replays the PROXY header and buffered ClientHello to another session (on the same or another healthy replica).
+   - **Replay until first byte:** If dialing or the initial first byte handshake fails, the frontend drops the tunnel connection and replays the PROXY header and buffered ClientHello to another session (on the same or another healthy replica).
    - **Load balancing:** Connections are distributed across active sessions registered for the hostname.
 6. **Terminate in the cluster.** GARI terminates TLS using the certificates
    from the Gateway listener, and then applies normal Gateway API routing. The backend tunnel listener exposes real client IP addresses via `RemoteAddr()`, ensuring correct `X-Forwarded-For` header population.
@@ -67,11 +69,11 @@ stays a simple, separate SNI proxy.
 
 The `snigateway` module contains the frontend and supporting packages:
 - `snigateway/cmd/snigateway-frontend`: The frontend server binary with `generate-certs` subcommand.
-- `snigateway/cmd/snigateway`: In-cluster controller binary embedding GARI and reverse-tunnel client with `--tunnel-pool-size`.
+- `snigateway/cmd/snigateway`: In-cluster controller binary embedding GARI and WireGuard tunnel manager.
 - `snigateway/pkg/proxyproto`: PROXY protocol v2 header encoding/decoding and `PP2_TYPE_AUTHORITY` TLV support.
 - `snigateway/pkg/sni`: TLS ClientHello sniffing and parsing.
-- `snigateway/pkg/frontend`: Registration table, session management, warm pool transport, and failover splicing.
+- `snigateway/pkg/frontend`: Registration table, session management, and WireGuard routing with failover splicing.
 - `snigateway/pkg/certs`: In-memory and on-disk CA/server/client certificate generation.
 - `snigateway/pkg/client`: Reusable client library for in-cluster controllers.
-- `snigateway/pkg/tunnel`: Tunnel listener, hostname extraction from Gateways, and pool connection manager.
+- `snigateway/pkg/tunnel`: Tunnel listener, hostname extraction from Gateways, and WireGuard tunnel manager.
 - `snigateway/k8s/`: Kubernetes manifests (RBAC, GatewayClass, Deployment, example Gateway/Route).

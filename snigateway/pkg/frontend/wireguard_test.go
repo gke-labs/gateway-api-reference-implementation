@@ -1106,7 +1106,7 @@ func handleProxyConnection(t *testing.T, conn net.Conn, backendCert *tls.Certifi
 }
 
 func TestWireGuard_DialSession(t *testing.T) {
-	backendCert, err := generateTestBackendCert("tls.example.com", "pool.example.com", "fallback.example.com", "block.example.com", "multi.example.com")
+	backendCert, err := generateTestBackendCert("tls.example.com", "nopeer.example.com", "fallback.example.com", "block.example.com", "multi.example.com", "bounded.example.com")
 	if err != nil {
 		t.Fatalf("generateTestBackendCert failed: %v", err)
 	}
@@ -1221,11 +1221,6 @@ func TestWireGuard_DialSession(t *testing.T) {
 		handledPayload = nil
 		dialMu.Unlock()
 
-		// Verify pool was never used
-		if env.server.PoolTransport().HasIdleConn(sessionID) {
-			t.Errorf("expected pool not to have connections")
-		}
-
 		// B: Test plain HTTP routing by Host
 		dialMu.Lock()
 		doneCh = make(chan struct{})
@@ -1280,13 +1275,16 @@ func TestWireGuard_DialSession(t *testing.T) {
 		dialMu.Unlock()
 	})
 
-	t.Run("session without peer uses pool", func(t *testing.T) {
+	t.Run("session without peer closes connection without waiting for whole connect timeout", func(t *testing.T) {
 		var dialCalled atomic.Bool
 		env, cleanup := setupTestWireGuardServerWithDial(t, "fd00:1234::/64", func(ctx context.Context, network, address string) (net.Conn, error) {
 			dialCalled.Store(true)
 			return nil, errors.New("should not dial tunnel")
 		})
 		defer cleanup()
+
+		// Set a long connect timeout so we can verify the frontend closes immediately without waiting for it
+		env.server.config.ConnectTimeout = 10 * time.Second
 
 		clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
 		if err != nil {
@@ -1300,67 +1298,46 @@ func TestWireGuard_DialSession(t *testing.T) {
 		}
 		defer env.server.CloseSession(sessionID)
 
-		if _, err := apiClient.Register(t.Context(), sessionID, []string{"pool.example.com"}); err != nil {
+		if _, err := apiClient.Register(t.Context(), sessionID, []string{"nopeer.example.com"}); err != nil {
 			t.Fatalf("Register failed: %v", err)
 		}
 
-		poolClient, poolBackend := localTCPConnPair(t)
-		if err := env.server.PoolTransport().AddConn(sessionID, poolClient); err != nil {
-			t.Fatalf("AddConn failed: %v", err)
-		}
-
-		poolDone := make(chan struct{})
-		var handledProxyHeader *proxyproto.Header
-		var handledPayload []byte
-		go func() {
-			defer close(poolDone)
-			hdr, payload := handleProxyConnection(t, poolBackend, &backendCert, []byte("pool-reply:hello-pool"))
-			handledProxyHeader = hdr
-			handledPayload = payload
-		}()
-
+		start := time.Now()
 		tlsConn, err := tls.Dial("tcp", env.serverAddr, &tls.Config{
-			ServerName:         "pool.example.com",
+			ServerName:         "nopeer.example.com",
 			InsecureSkipVerify: true,
 		})
-		if err != nil {
-			t.Fatalf("tls.Dial to pool.example.com failed: %v", err)
+		if err == nil {
+			buffer := make([]byte, 1024)
+			if err := tlsConn.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline failed: %v", err)
+			}
+			_, readErr := tlsConn.Read(buffer)
+			tlsConn.Close()
+			if readErr == nil {
+				t.Fatalf("expected client read to fail on closed connection")
+			}
 		}
-		defer tlsConn.Close()
+		elapsed := time.Since(start)
 
-		payload := []byte("hello-pool")
-		if _, err := tlsConn.Write(payload); err != nil {
-			t.Fatalf("write to tlsConn: %v", err)
-		}
-
-		buffer := make([]byte, 1024)
-		n, err := tlsConn.Read(buffer)
-		if err != nil {
-			t.Fatalf("read from tlsConn: %v", err)
-		}
-		<-poolDone
-
-		if string(buffer[:n]) != "pool-reply:hello-pool" {
-			t.Errorf("got %q, want %q", string(buffer[:n]), "pool-reply:hello-pool")
+		if elapsed >= 2*time.Second {
+			t.Errorf("expected immediate connection close without waiting for connect timeout (10s), took %v", elapsed)
 		}
 		if dialCalled.Load() {
 			t.Errorf("expected dialContext not to be called for session without peer")
 		}
-		if handledProxyHeader == nil || handledProxyHeader.Authority != "pool.example.com" {
-			t.Errorf("expected Authority pool.example.com, got %v", handledProxyHeader)
-		}
-		if !bytes.Equal(handledPayload, payload) {
-			t.Errorf("expected payload %q, got %q", payload, handledPayload)
-		}
 	})
 
-	t.Run("failed dial falls back to pool", func(t *testing.T) {
+	t.Run("failed dial closes connection after connect timeout", func(t *testing.T) {
 		var dialCount atomic.Int32
 		env, cleanup := setupTestWireGuardServerWithDial(t, "fd00:1234::/64", func(ctx context.Context, network, address string) (net.Conn, error) {
 			dialCount.Add(1)
 			return nil, errors.New("simulated dial failure: host unreachable")
 		})
 		defer cleanup()
+
+		env.server.config.ConnectTimeout = 150 * time.Millisecond
+		env.server.config.PerAttemptTimeout = 50 * time.Millisecond
 
 		clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
 		if err != nil {
@@ -1390,57 +1367,25 @@ func TestWireGuard_DialSession(t *testing.T) {
 			t.Fatalf("Register failed: %v", err)
 		}
 
-		poolClient, poolBackend := localTCPConnPair(t)
-		if err := env.server.PoolTransport().AddConn(sessionID, poolClient); err != nil {
-			t.Fatalf("AddConn failed: %v", err)
-		}
-
-		poolDone := make(chan struct{})
-		var handledProxyHeader *proxyproto.Header
-		var handledPayload []byte
-		go func() {
-			defer close(poolDone)
-			hdr, payload := handleProxyConnection(t, poolBackend, &backendCert, []byte("fallback-reply:hello-fallback"))
-			handledProxyHeader = hdr
-			handledPayload = payload
-		}()
-
 		tlsConn, err := tls.Dial("tcp", env.serverAddr, &tls.Config{
 			ServerName:         "fallback.example.com",
 			InsecureSkipVerify: true,
 		})
-		if err != nil {
-			t.Fatalf("tls.Dial to fallback.example.com failed: %v", err)
+		if err == nil {
+			buffer := make([]byte, 1024)
+			_, readErr := tlsConn.Read(buffer)
+			tlsConn.Close()
+			if readErr == nil {
+				t.Errorf("expected read to fail after connect timeout")
+			}
 		}
-		defer tlsConn.Close()
 
-		payload := []byte("hello-fallback")
-		if _, err := tlsConn.Write(payload); err != nil {
-			t.Fatalf("write to tlsConn: %v", err)
-		}
-
-		buffer := make([]byte, 1024)
-		n, err := tlsConn.Read(buffer)
-		if err != nil {
-			t.Fatalf("read from tlsConn: %v", err)
-		}
-		<-poolDone
-
-		if string(buffer[:n]) != "fallback-reply:hello-fallback" {
-			t.Errorf("got %q, want %q", string(buffer[:n]), "fallback-reply:hello-fallback")
-		}
 		if dialCount.Load() == 0 {
-			t.Errorf("expected dialContext to be attempted before fallback")
-		}
-		if handledProxyHeader == nil || handledProxyHeader.Authority != "fallback.example.com" {
-			t.Errorf("expected Authority fallback.example.com, got %v", handledProxyHeader)
-		}
-		if !bytes.Equal(handledPayload, payload) {
-			t.Errorf("expected payload %q, got %q", payload, handledPayload)
+			t.Errorf("expected dialContext to be attempted before timeout")
 		}
 	})
 
-	t.Run("blocking tunnel dial falls back to pool without starving", func(t *testing.T) {
+	t.Run("blocking tunnel dial closes connection after connect timeout", func(t *testing.T) {
 		var dialAttempted atomic.Bool
 		env, cleanup := setupTestWireGuardServerWithDial(t, "fd00:1234::/64", func(ctx context.Context, network, address string) (net.Conn, error) {
 			dialAttempted.Store(true)
@@ -1449,6 +1394,9 @@ func TestWireGuard_DialSession(t *testing.T) {
 			return nil, ctx.Err()
 		})
 		defer cleanup()
+
+		env.server.config.ConnectTimeout = 150 * time.Millisecond
+		env.server.config.PerAttemptTimeout = 50 * time.Millisecond
 
 		clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
 		if err != nil {
@@ -1478,40 +1426,19 @@ func TestWireGuard_DialSession(t *testing.T) {
 			t.Fatalf("Register failed: %v", err)
 		}
 
-		poolClient, poolBackend := localTCPConnPair(t)
-		if err := env.server.PoolTransport().AddConn(sessionID, poolClient); err != nil {
-			t.Fatalf("AddConn failed: %v", err)
-		}
-
-		poolDone := make(chan struct{})
-		go func() {
-			defer close(poolDone)
-			handleProxyConnection(t, poolBackend, &backendCert, []byte("block-fallback-reply"))
-		}()
-
 		tlsConn, err := tls.Dial("tcp", env.serverAddr, &tls.Config{
 			ServerName:         "block.example.com",
 			InsecureSkipVerify: true,
 		})
-		if err != nil {
-			t.Fatalf("tls.Dial failed: %v", err)
+		if err == nil {
+			buffer := make([]byte, 1024)
+			_, readErr := tlsConn.Read(buffer)
+			tlsConn.Close()
+			if readErr == nil {
+				t.Errorf("expected read to fail after connect timeout")
+			}
 		}
-		defer tlsConn.Close()
 
-		if _, err := tlsConn.Write([]byte("ping-block")); err != nil {
-			t.Fatalf("write to tlsConn: %v", err)
-		}
-
-		buffer := make([]byte, 1024)
-		n, err := tlsConn.Read(buffer)
-		if err != nil {
-			t.Fatalf("read from tlsConn: %v", err)
-		}
-		<-poolDone
-
-		if string(buffer[:n]) != "block-fallback-reply" {
-			t.Errorf("got %q, want %q", string(buffer[:n]), "block-fallback-reply")
-		}
 		if !dialAttempted.Load() {
 			t.Errorf("expected tunnel dial to have been attempted")
 		}
@@ -1606,6 +1533,88 @@ func TestWireGuard_DialSession(t *testing.T) {
 			t.Errorf("got dialed address %s, want %s (session 2 with peer)", dialedAddress, expectedAddress)
 		}
 		dialMu.Unlock()
+	})
+
+	t.Run("tunnel retry attempts are bounded and paced when backend closes immediately", func(t *testing.T) {
+		var dialCount atomic.Int32
+		env, cleanup := setupTestWireGuardServerWithDial(t, "fd00:1234::/64", func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialCount.Add(1)
+			clientSide, serverSide := localTCPConnPair(t)
+			go func() {
+				defer func() {
+					if closeErr := serverSide.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+						t.Logf("serverSide close error: %v", closeErr)
+					}
+				}()
+				// Read PROXY header and immediately close connection without sending response bytes
+				buffer := make([]byte, 1024)
+				if _, readErr := serverSide.Read(buffer); readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, net.ErrClosed) {
+					t.Logf("serverSide read error: %v", readErr)
+				}
+			}()
+			return clientSide, nil
+		})
+		defer cleanup()
+
+		env.server.config.ConnectTimeout = 5 * time.Second
+		env.server.config.PerAttemptTimeout = 50 * time.Millisecond
+		env.server.config.MaxTunnelAttempts = 5
+
+		clientTLS, err := certs.NewClientTLSConfig(env.generated.CA.CertPEM, env.generated.Client.CertPEM, env.generated.Client.KeyPEM, "snigateway.internal")
+		if err != nil {
+			t.Fatalf("NewClientTLSConfig failed: %v", err)
+		}
+
+		apiClient := client.NewClient(env.serverAddr, clientTLS, client.WithInternalHostname("snigateway.internal"))
+		sessionID, _, err := apiClient.StartSession(t.Context())
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+		defer env.server.CloseSession(sessionID)
+
+		_, clientPublicKey, err := wireguard.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		putResp, putWireGuardResponse := putWireGuard(t, clientTLS, env.serverAddr, sessionID, api.WireGuardRequest{
+			PublicKey: clientPublicKey.String(),
+		})
+		if putWireGuardResponse == nil {
+			t.Fatalf("putWireGuardResponse was nil")
+		}
+		defer putResp.Body.Close()
+		if putResp.StatusCode != http.StatusOK {
+			t.Fatalf("putWireGuard status: %d", putResp.StatusCode)
+		}
+
+		if _, err := apiClient.Register(t.Context(), sessionID, []string{"bounded.example.com"}); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+
+		start := time.Now()
+		tlsConn, err := tls.Dial("tcp", env.serverAddr, &tls.Config{
+			ServerName:         "bounded.example.com",
+			InsecureSkipVerify: true,
+		})
+		if err == nil {
+			buffer := make([]byte, 1024)
+			_, readErr := tlsConn.Read(buffer)
+			if closeErr := tlsConn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				t.Logf("tlsConn close error: %v", closeErr)
+			}
+			if readErr == nil {
+				t.Errorf("expected client read to fail on closed connection")
+			}
+		}
+		elapsed := time.Since(start)
+
+		if got := dialCount.Load(); got != 5 {
+			t.Errorf("expected exactly 5 bounded tunnel dials, got %d", got)
+		}
+		expectedMinDelay := 4 * DefaultTunnelRetryInterval
+		if elapsed < expectedMinDelay {
+			t.Errorf("expected paced retries to take at least %v, took %v", expectedMinDelay, elapsed)
+		}
 	})
 
 	t.Run("dial failure is rate limited", func(t *testing.T) {

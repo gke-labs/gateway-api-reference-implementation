@@ -412,19 +412,18 @@ func TestJWT_SessionBinding(t *testing.T) {
 		t.Fatalf("StartSession failed: %v", err)
 	}
 
-	// 2. Dial-back with rotated token for same sub succeeds
+	// 2. Register with rotated token for same sub succeeds
 	currentToken = tokenA2
-	conn, err := c.DialTunnel(t.Context(), sessID)
+	_, err = c.Register(t.Context(), sessID, []string{"app.example.com"})
 	if err != nil {
-		t.Fatalf("dial-back with rotated token for same sub failed: %v", err)
+		t.Fatalf("register with rotated token for same sub failed: %v", err)
 	}
-	_ = conn.Close()
 
-	// 3. Dial-back with token for different sub gets 403 identity mismatch
+	// 3. Register with token for different sub gets 403 identity mismatch
 	currentToken = tokenB
-	_, err = c.DialTunnel(t.Context(), sessID)
+	_, err = c.Register(t.Context(), sessID, []string{"app.example.com"})
 	if err == nil {
-		t.Fatal("expected dial-back with token for different sub to fail")
+		t.Fatal("expected register with token for different sub to fail")
 	}
 	if !strings.Contains(err.Error(), "status 403") && !strings.Contains(err.Error(), "session identity mismatch") {
 		t.Fatalf("expected 403 session identity mismatch, got: %v", err)

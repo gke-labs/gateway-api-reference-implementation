@@ -112,12 +112,15 @@ func TestE2ESmoke(t *testing.T) {
 	}
 	serverAddr := ln.Addr().String()
 
-	srv, err := frontend.NewServer(frontend.ServerConfig{
+	applyWG, wgOpts := setupTestWireGuardPair(t)
+	feCfg := frontend.ServerConfig{
 		ServerTLSConfig:  serverTLS,
 		InternalHostname: "snigateway.internal",
 		ConnectTimeout:   5 * time.Second,
 		ReadSNITimeout:   2 * time.Second,
-	})
+	}
+	applyWG(&feCfg)
+	srv, err := frontend.NewServer(feCfg)
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
 	}
@@ -134,7 +137,7 @@ func TestE2ESmoke(t *testing.T) {
 	}
 
 	c := client.NewClient(serverAddr, clientTLS)
-	mgr := tunnel.NewManager(c)
+	mgr := tunnel.NewManager(c, wgOpts...)
 
 	backendCert, err := generateBackendCert("app.example.com", "*.wildcard.org")
 	if err != nil {

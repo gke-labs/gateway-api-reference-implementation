@@ -490,9 +490,7 @@ func TestSNIGateway_WireGuardTunnel(t *testing.T) {
 		return lis, err
 	}
 
-	// tunnel.WithPoolSize(0) disables reverse tunnel pooled connections, verifying traffic is over WireGuard
 	mgr := tunnel.NewManager(ctrlClient,
-		tunnel.WithPoolSize(0),
 		tunnel.WithWireGuardDeviceOpener(ctrlOpener),
 		tunnel.WithListenFunc(ctrlListen),
 	)

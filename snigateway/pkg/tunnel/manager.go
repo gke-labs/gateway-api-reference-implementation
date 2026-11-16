@@ -34,9 +34,6 @@ import (
 )
 
 const (
-	// DefaultPoolSize is the default number of idle pooled reverse tunnel connections.
-	DefaultPoolSize = 4
-
 	// recordTypeHandshake is the TLS record type for a handshake message (0x16).
 	recordTypeHandshake = 0x16
 )
@@ -48,23 +45,6 @@ type ManagerOption func(*Manager)
 func WithHTTPSListener(lis *Listener) ManagerOption {
 	return func(m *Manager) {
 		m.httpsListener = lis
-	}
-}
-
-// WithPoolSize sets the number of idle pooled reverse tunnel connections to maintain.
-// A pool size of zero disables pre-dialed reverse tunnel connections.
-func WithPoolSize(size int) ManagerOption {
-	return func(m *Manager) {
-		if size >= 0 {
-			m.poolSize = size
-		}
-	}
-}
-
-// WithDialTimeout sets the timeout for dialing reverse tunnels.
-func WithDialTimeout(d time.Duration) ManagerOption {
-	return func(m *Manager) {
-		m.dialTimeout = d
 	}
 }
 
@@ -83,14 +63,12 @@ func WithBackoff(min, max time.Duration) ManagerOption {
 	}
 }
 
-// Manager manages communication with the snigateway frontend, maintaining a warm pool
-// of pre-dialed reverse tunnel connections and announcing SNI hostnames.
+// Manager manages communication with the snigateway frontend, setting up the WireGuard tunnel
+// and announcing SNI hostnames.
 type Manager struct {
 	client          *client.Client
 	httpsListener   *Listener
 	httpListener    *Listener
-	poolSize        int
-	dialTimeout     time.Duration
 	registerTimeout time.Duration
 	backoffMin      time.Duration
 	backoffMax      time.Duration
@@ -117,8 +95,6 @@ func NewManager(client *client.Client, options ...ManagerOption) *Manager {
 		client:          client,
 		httpsListener:   NewListener(),
 		httpListener:    NewListener(),
-		poolSize:        DefaultPoolSize,
-		dialTimeout:     10 * time.Second,
 		registerTimeout: 5 * time.Second,
 		backoffMin:      200 * time.Millisecond,
 		backoffMax:      5 * time.Second,
@@ -333,7 +309,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		}
 	})
 
-	// Main session loop managing TCP pool
+	// Main session loop
 	g.Go(func() error {
 		backoff := m.backoffMin
 
@@ -357,7 +333,23 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 		if ctx.Err() != nil {
 			return
 		}
-		klog.Warningf("Failed to start TCP session with frontend: %v. Reconnecting in %v...", err, *backoff)
+		klog.Warningf("Failed to start session with frontend: %v. Reconnecting in %v...", err, *backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(*backoff):
+		}
+		*backoff = min(*backoff*2, m.backoffMax)
+		return
+	}
+
+	wireguardCleanup, err := m.wireguard.setupWireGuard(sessCtx, sessID, m.client, m.handleTunnelConn)
+	if err != nil {
+		sessCancel()
+		if ctx.Err() != nil {
+			return
+		}
+		klog.Warningf("Failed to setup WireGuard tunnel for session %s: %v. Reconnecting in %v...", sessID, err, *backoff)
 		select {
 		case <-ctx.Done():
 			return
@@ -369,11 +361,6 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 
 	*backoff = m.backoffMin
 
-	wireguardCleanup := func() {}
-	if m.wireguard != nil {
-		wireguardCleanup = m.wireguard.setupWireGuard(sessCtx, sessID, m.client, m.handleTunnelConn)
-	}
-
 	m.mu.Lock()
 	m.connected = true
 	m.sessionID = sessID
@@ -381,10 +368,17 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 	m.mu.Unlock()
 	m.notifyListeners()
 
-	klog.Infof("Established TCP pool session %s with frontend", sessID)
+	klog.Infof("Established session %s with frontend", sessID)
 	m.triggerRegistration()
 
-	m.runPool(sessCtx, sessID, sessErrCh)
+	select {
+	case <-sessCtx.Done():
+	case err := <-sessErrCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			klog.Warningf("Session error from frontend: %v", err)
+		}
+	}
+
 	sessCancel()
 	wireguardCleanup()
 
@@ -398,7 +392,7 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 		return
 	}
 
-	klog.Warningf("TCP session %s ended. Reconnecting in %v...", sessID, *backoff)
+	klog.Warningf("Session %s ended. Reconnecting in %v...", sessID, *backoff)
 	select {
 	case <-ctx.Done():
 		return
@@ -446,98 +440,6 @@ func (m *Manager) handleTunnelConn(conn net.Conn) error {
 		return err
 	}
 	return nil
-}
-
-func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-chan error) {
-	refillCh := make(chan struct{}, m.poolSize*2)
-	activeIdleMu := sync.Mutex{}
-	activeIdle := 0
-
-	triggerRefill := func() {
-		select {
-		case refillCh <- struct{}{}:
-		default:
-		}
-	}
-
-	dialOne := func() {
-		activeIdleMu.Lock()
-		if activeIdle >= m.poolSize {
-			activeIdleMu.Unlock()
-			return
-		}
-		activeIdle++
-		activeIdleMu.Unlock()
-
-		go func() {
-			dialCtx, cancel := context.WithTimeout(ctx, m.dialTimeout)
-			conn, err := m.client.DialTunnel(dialCtx, sessionID)
-			cancel()
-
-			if err != nil {
-				activeIdleMu.Lock()
-				activeIdle--
-				activeIdleMu.Unlock()
-
-				if ctx.Err() == nil {
-					klog.Errorf("Failed to dial pooled tunnel connection for session %s: %v", sessionID, err)
-					time.Sleep(200 * time.Millisecond)
-					triggerRefill()
-				}
-				return
-			}
-
-			// Watch connection for activation via PROXY protocol header or drop.
-			notifyConn := &notifyFirstByteConn{
-				Conn: conn,
-				onFirstByte: func() {
-					activeIdleMu.Lock()
-					activeIdle--
-					activeIdleMu.Unlock()
-					triggerRefill()
-				},
-			}
-
-			if err := m.handleTunnelConn(notifyConn); err != nil {
-				if ctx.Err() == nil {
-					triggerRefill()
-				}
-			}
-		}()
-	}
-
-	// Initial fill of the pool
-	for i := 0; i < m.poolSize; i++ {
-		dialOne()
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case err := <-sessErrCh:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				klog.Warningf("Session error from frontend: %v", err)
-			}
-			return
-		case <-refillCh:
-			dialOne()
-		}
-	}
-}
-
-type notifyFirstByteConn struct {
-	net.Conn
-	onFirstByte func()
-	once        sync.Once
-}
-
-func (c *notifyFirstByteConn) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
-	if n > 0 || err != nil {
-		c.once.Do(c.onFirstByte)
-	}
-	return n, err
 }
 
 func closeConn(c io.Closer) {

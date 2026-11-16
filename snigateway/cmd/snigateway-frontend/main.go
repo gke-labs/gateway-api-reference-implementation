@@ -94,7 +94,7 @@ func run(ctx context.Context, args []string, opener deviceOpenerFunc) error {
 	serverCertPath := fs.String("server-cert", "server.crt", "Path to server certificate PEM file")
 	serverKeyPath := fs.String("server-key", "server.key", "Path to server private key PEM file")
 	internalHostname := fs.String("internal-hostname", api.DefaultInternalHostname, "Internal SNI hostname for mTLS management API")
-	connectTimeout := fs.Duration("connect-timeout", 10*time.Second, "Timeout for client to dial back and claim pending connection")
+	connectTimeout := fs.Duration("connect-timeout", 10*time.Second, "How long the frontend keeps trying the tunnel for one client connection before closing it")
 	maxConnections := fs.Int("tcp-max-connections", 10000, "Maximum number of concurrent client connections per listener")
 	idleTimeout := fs.Duration("tcp-idle-timeout", 0, "Idle timeout for spliced client connections (disabled by default)")
 	maxHostnames := fs.Int("max-hostnames-per-session", frontend.DefaultMaxHostnamesPerSession, "Maximum number of hostnames a session may register")
