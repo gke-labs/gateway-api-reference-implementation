@@ -568,7 +568,7 @@ func TestRegression_Item3_RedoAppliesPayload(t *testing.T) {
 	_ = store.Put("ConfigMap", "key-redo-2", []byte("payload-redo-2"))
 
 	// Sync WAL so records are durable, but do NOT sync heap
-	_ = store.wal.Sync()
+	_ = store.Sync()
 
 	// Simulate crash
 	_ = store.Close()
@@ -772,9 +772,10 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	}
 
 	// Roll segment so the segment containing key1 and its delete is completed and eligible for truncation
-	store.wal.mu.Lock()
-	_ = store.wal.createSegmentLocked(store.wal.nextLSN)
-	store.wal.mu.Unlock()
+	w := asWAL(store.wal)
+	w.mu.Lock()
+	_ = w.createSegmentLocked(w.nextLSN)
+	w.mu.Unlock()
 
 	if _, err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint delete failed: %v", err)
@@ -790,8 +791,8 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	t.Logf("empty page %d has DurableLoc %d (v1 was at %d, v2 was at %d)", entryK1.LogicalPage, durLoc, v1Loc, v2Loc)
 
 	// Step 8: Reuse the emptied logical page in the block pool
-	lsnNew := store.wal.NextLSN()
-	if err := store.wal.Append(Record{Type: RecordTypePut, LSN: lsnNew, Key: "new-key", Payload: []byte("new-val")}); err != nil {
+	lsnNew, err := store.wal.AppendRecord(&Record{Type: RecordTypePut, Key: "new-key", Payload: []byte("new-val")})
+	if err != nil {
 		t.Fatalf("Append new-key failed: %v", err)
 	}
 	hNew, err := store.bp.AllocateNewPage(entryK1.LogicalPage, 1, lsnNew)
@@ -802,8 +803,8 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 
 	// Step 9: Allocate a new page (filler) and flush it to disk.
 	// On main, AllocateNewPage freed durLoc (block 1), so filler page gets block 1 and overwrites it.
-	lsnFiller := store.wal.NextLSN()
-	if err := store.wal.Append(Record{Type: RecordTypePut, LSN: lsnFiller, Key: "filler", Payload: []byte("filler-val")}); err != nil {
+	lsnFiller, err := store.wal.AppendRecord(&Record{Type: RecordTypePut, Key: "filler", Payload: []byte("filler-val")})
+	if err != nil {
 		t.Fatalf("Append filler failed: %v", err)
 	}
 	hFiller, err := store.bp.AllocateNewPage(99, 1, lsnFiller)
@@ -1885,9 +1886,10 @@ func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 	}
 
 	// Calculate payload for a final Put so that wal.appendOff lands exactly on a 4 KiB block boundary.
-	store.wal.mu.Lock()
-	currentOffset := store.wal.appendOff
-	store.wal.mu.Unlock()
+	wBoundary := asWAL(store.wal)
+	wBoundary.mu.Lock()
+	currentOffset := wBoundary.appendOff
+	wBoundary.mu.Unlock()
 
 	finalKey := "key-boundary"
 	qualifiedFinalKey := qualifyKey(table, finalKey)
@@ -1901,9 +1903,9 @@ func TestRecovery_WALRecordEndingAtBlockBoundary_ReopenSucceeds(t *testing.T) {
 	}
 
 	// Verify that appendOff is on an exact block boundary
-	store.wal.mu.Lock()
-	appendOffset := store.wal.appendOff
-	store.wal.mu.Unlock()
+	wBoundary.mu.Lock()
+	appendOffset := wBoundary.appendOff
+	wBoundary.mu.Unlock()
 	if appendOffset%int64(WALBlockSize) != 0 {
 		t.Fatalf("expected appendOff to be a multiple of %d, got %d", WALBlockSize, appendOffset)
 	}

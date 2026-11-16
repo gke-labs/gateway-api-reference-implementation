@@ -148,7 +148,7 @@ type blockRun struct {
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
 type BlockPool struct {
 	file     File
-	wal      *WAL
+	wal      Log
 	buddy    *BuddyAllocator
 	directIO DirectIO
 	cipher   Cipher
@@ -216,7 +216,7 @@ type BlockPoolOptions struct {
 }
 
 // NewBlockPool initializes a fixed-size block pool backed by a single pointer-free byte arena.
-func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, options BlockPoolOptions) *BlockPool {
+func NewBlockPool(file File, wal Log, buddy *BuddyAllocator, dbID [16]byte, options BlockPoolOptions) *BlockPool {
 	numPoolBlocks := DefaultBlockPoolBlocks
 	if options.NumPoolBlocks > 0 {
 		numPoolBlocks = options.NumPoolBlocks
@@ -1071,7 +1071,7 @@ func (bp *BlockPool) DirtyPageTableAndLSN() (map[uint64]uint64, uint64) {
 	}
 	maxLSN := uint64(0)
 	if bp.wal != nil {
-		maxLSN = bp.wal.MaxLSN()
+		maxLSN = bp.wal.DurableLSN()
 	}
 	return dpt, maxLSN
 }

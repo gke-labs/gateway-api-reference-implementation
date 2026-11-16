@@ -1116,8 +1116,8 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 						}
 					} else {
 						// Ensure WAL is synced
-						if err := store.wal.Sync(); err != nil {
-							t.Fatalf("wal.Sync failed: %v", err)
+						if err := store.Sync(); err != nil {
+							t.Fatalf("Sync failed: %v", err)
 						}
 						// Prevent checkpoint during Close
 						store.cp = nil
@@ -1186,8 +1186,8 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 	if err := store.heapFile.Sync(); err != nil {
 		t.Fatalf("heapFile.Sync failed: %v", err)
 	}
-	if err := store.wal.Sync(); err != nil {
-		t.Fatalf("wal.Sync failed: %v", err)
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
 	}
 
 	// Prevent checkpoint on Close
@@ -2013,9 +2013,9 @@ func TestRegression_OversizeValueFileFirst(t *testing.T) {
 			if strings.HasSuffix(newpath, ".obj") && strings.Contains(newpath, "oversize") {
 				renamed = true
 				// Value file first: file must be renamed BEFORE the pointer record is appended to WAL
-				if store.wal != nil && store.wal.MaxLSN() > 0 {
+				if store.wal != nil && asWAL(store.wal).MaxLSN() > 0 {
 					t.Fatalf("value file first violation: oversize file renamed after WAL record was appended (max=%d)",
-						store.wal.MaxLSN())
+						asWAL(store.wal).MaxLSN())
 				}
 			}
 		},
@@ -2042,7 +2042,7 @@ func TestRegression_OversizeValueFileFirst(t *testing.T) {
 	if err := store.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
-	if store.wal.FsyncedLSN() < store.wal.MaxLSN() {
+	if asWAL(store.wal).FsyncedLSN() < asWAL(store.wal).MaxLSN() {
 		t.Fatalf("expected WAL to be durable after Sync")
 	}
 }

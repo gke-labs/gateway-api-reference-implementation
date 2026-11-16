@@ -297,7 +297,8 @@ type Engine struct {
 	quarantine QuarantineOptions
 
 	heapFile File
-	wal      *WAL
+	wal      Log
+	lastLSN  atomic.Uint64
 	buddy    *BuddyAllocator
 	bp       *BlockPool
 	cp       *Checkpointer
@@ -948,6 +949,7 @@ func Open(opts ...Option) (*Engine, error) {
 			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)
 		}
 		s.wal = wal
+		s.lastLSN.Store(recoveryRes.MaxLSN)
 
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
@@ -958,7 +960,7 @@ func Open(opts ...Option) (*Engine, error) {
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 
 		// Replay WAL records from redo start LSN through write path apply functions.
-		if err := s.replayWAL(options.FS, walDir, dbID, recoveryRes.RedoStartLSN, recoveryRes.SupersededPages); err != nil {
+		if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.SupersededPages); err != nil {
 			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
 			return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeErr)
 		}
@@ -1018,10 +1020,8 @@ func Open(opts ...Option) (*Engine, error) {
 // When recovery finds a key on more than one page, replay clears the older copy at the
 // first record for that key whose LSN is above the older page's LSN, even when the key's
 // current page is up to date.
-func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLSN uint64, superseded map[string][]KeyIndexEntry) error {
-	walRedoIt, err := NewWALIterator(storeFS, walDir, dbID, redoStartLSN, WALIteratorOptions{
-		EncryptionKey: s.encryptionKey,
-	})
+func (s *Engine) replayWAL(redoStartLSN uint64, superseded map[string][]KeyIndexEntry) error {
+	walRedoIt, err := s.wal.NewIterator(redoStartLSN)
 	if err != nil {
 		return fmt.Errorf("failed to create WAL redo iterator: %w", err)
 	}
@@ -1678,6 +1678,7 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		s.setFailed(err)
 		return s.failErr()
 	}
+	s.lastLSN.Store(lsn)
 
 	if err := s.applyPutLocked(qKey, rec.Payload, lsn, isOversize); err != nil {
 		if errors.Is(err, ErrObjectOversize) {
@@ -2047,6 +2048,7 @@ func (s *Engine) Delete(tableName, key string) error {
 		s.setFailed(err)
 		return s.failErr()
 	}
+	s.lastLSN.Store(lsn)
 
 	if err := s.applyDeleteLocked(qKey, lsn); err != nil {
 		s.setFailed(err)
@@ -2159,7 +2161,7 @@ func (s *Engine) Sync() error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if err := s.wal.Sync(); err != nil {
+	if err := s.wal.SyncThrough(s.lastLSN.Load()); err != nil {
 		s.setFailed(err)
 		return s.failErr()
 	}
@@ -2171,7 +2173,7 @@ func (s *Engine) Flush() error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if err := s.wal.Flush(); err != nil {
+	if err := s.wal.SyncThrough(s.lastLSN.Load()); err != nil {
 		s.setFailed(err)
 		return s.failErr()
 	}
@@ -2188,6 +2190,9 @@ func (s *Engine) Checkpoint() (uint64, error) {
 	if err != nil {
 		s.setFailed(err)
 		return 0, s.failErr()
+	}
+	if chkLSN > s.lastLSN.Load() {
+		s.lastLSN.Store(chkLSN)
 	}
 	return chkLSN, nil
 }

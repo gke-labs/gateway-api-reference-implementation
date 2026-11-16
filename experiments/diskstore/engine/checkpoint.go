@@ -23,12 +23,12 @@ import (
 type Checkpointer struct {
 	bp       *BlockPool
 	heapFile File
-	wal      *WAL
+	wal      Log
 	mu       sync.Mutex
 }
 
 // NewCheckpointer creates a new Checkpointer.
-func NewCheckpointer(bp *BlockPool, heapFile File, wal *WAL) *Checkpointer {
+func NewCheckpointer(bp *BlockPool, heapFile File, wal Log) *Checkpointer {
 	return &Checkpointer{
 		bp:       bp,
 		heapFile: heapFile,
@@ -123,7 +123,7 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 	}
 
 	// 7. Fsync WAL
-	if err := c.wal.Sync(); err != nil {
+	if err := c.wal.SyncThrough(chkLSN); err != nil {
 		return 0, fmt.Errorf("checkpoint failed to fsync WAL: %w", err)
 	}
 

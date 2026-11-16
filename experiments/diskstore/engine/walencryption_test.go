@@ -70,8 +70,8 @@ func TestWALEncryption_PlaintextNotExposedInWAL(t *testing.T) {
 	}
 
 	// Sync WAL to guarantee blocks are fsynced to disk
-	if err := store.wal.Sync(); err != nil {
-		t.Fatalf("wal.Sync failed: %v", err)
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
 	}
 	dbID := store.dbID
 
