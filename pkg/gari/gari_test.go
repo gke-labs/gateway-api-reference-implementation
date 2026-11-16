@@ -2376,21 +2376,6 @@ func TestHTTP_ReadHeaderTimeout_SlowlorisClosed(t *testing.T) {
 	}
 }
 
-type stallClientConn struct {
-	net.Conn
-	firstWriteDone bool
-	serverClosed   chan struct{}
-}
-
-func (c *stallClientConn) Write(b []byte) (int, error) {
-	if !c.firstWriteDone {
-		c.firstWriteDone = true
-		return c.Conn.Write(b)
-	}
-	<-c.serverClosed
-	return 0, net.ErrClosed
-}
-
 func TestHTTPS_TLSStallAfterClientHello_ClosedOnReadHeaderTimeout(t *testing.T) {
 	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -2420,55 +2405,46 @@ func TestHTTPS_TLSStallAfterClientHello_ClosedOnReadHeaderTimeout(t *testing.T) 
 		_ = server.StartProxyServers(ctx)
 	}()
 
+	clientPipe, serverPipe := net.Pipe()
+	go func() {
+		_ = tls.Client(clientPipe, &tls.Config{
+			ServerName:         "example.com",
+			InsecureSkipVerify: true,
+		}).Handshake()
+	}()
+	buf := make([]byte, 4096)
+	n, err := serverPipe.Read(buf)
+	_ = clientPipe.Close()
+	_ = serverPipe.Close()
+	if err != nil {
+		t.Fatalf("failed to generate ClientHello: %v", err)
+	}
+	clientHello := buf[:n]
+
 	rawConn, err := net.DialTimeout("tcp", httpsLis.Addr().String(), time.Second)
 	if err != nil {
 		t.Fatalf("failed to dial https listener: %v", err)
 	}
 	defer rawConn.Close()
 
-	stall := &stallClientConn{
-		Conn:         rawConn,
-		serverClosed: make(chan struct{}),
+	start := time.Now()
+	if _, err := rawConn.Write(clientHello); err != nil {
+		t.Fatalf("failed to write ClientHello: %v", err)
 	}
 
-	tlsClient := tls.Client(stall, &tls.Config{
-		ServerName:         "example.com",
-		InsecureSkipVerify: true,
-	})
-
-	errCh := make(chan error, 1)
-	start := time.Now()
-	go func() {
-		errCh <- tlsClient.Handshake()
-	}()
-
-	// Detect when server closes connection
-	go func() {
-		buf := make([]byte, 1024)
-		for {
-			_, err := rawConn.Read(buf)
-			if err != nil {
-				select {
-				case <-stall.serverClosed:
-				default:
-					close(stall.serverClosed)
-				}
-				return
-			}
+	// Read until connection is closed by server on ReadHeaderTimeout
+	_ = rawConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	readBuf := make([]byte, 1024)
+	for {
+		_, rerr := rawConn.Read(readBuf)
+		if rerr != nil {
+			break
 		}
-	}()
+	}
+	elapsed := time.Since(start)
 
-	select {
-	case err := <-errCh:
-		elapsed := time.Since(start)
-		if err == nil {
-			t.Fatalf("expected stalled TLS handshake to fail, but succeeded")
-		}
-		if elapsed < 80*time.Millisecond || elapsed > 1500*time.Millisecond {
-			t.Errorf("expected TLS handshake stall to be closed around 150ms, elapsed %v", elapsed)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("timed out waiting for stalled TLS connection to be closed")
+	if elapsed < 80*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Errorf("expected TLS handshake stall to be closed around 150ms, elapsed %v", elapsed)
 	}
 }
 
