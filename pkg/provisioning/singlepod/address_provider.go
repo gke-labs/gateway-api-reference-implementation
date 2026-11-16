@@ -172,6 +172,14 @@ func WithDataplaneImage(image string) Option {
 	}
 }
 
+// WithHostPorts enables host-port mapping on the data-plane Deployment without
+// creating a LoadBalancer Service for traffic.
+func WithHostPorts() Option {
+	return func(p *AddressProvider) {
+		p.useHostPorts = true
+	}
+}
+
 // WithEnableH2C configures whether H2C is enabled on data-plane instances.
 func WithEnableH2C(enable bool) Option {
 	return func(p *AddressProvider) {
@@ -220,10 +228,13 @@ type gatewayMirror struct {
 // A background prober continuously mirrors each ready endpoint's applied revisions from /_gari/applied.
 // The provider's reported readiness does not read the mirror yet.
 type AddressProvider struct {
-	client                        client.Client
-	apiReader                     client.Reader
-	dataplaneImage                string
-	enableH2C                     bool
+	client         client.Client
+	apiReader      client.Reader
+	dataplaneImage string
+	enableH2C      bool
+	// useHostPorts indicates whether the data-plane Deployment maps listener ports
+	// to host ports directly instead of provisioning a LoadBalancer Service.
+	useHostPorts                  bool
 	forwardedForMode              string
 	debugErrorResponses           bool
 	state                         *state.State
@@ -688,41 +699,110 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	sort.Ints(tcpPorts)
 	sort.Ints(udpPorts)
 
-	containerPorts := []*corev1ac.ContainerPortApplyConfiguration{
-		corev1ac.ContainerPort().
-			WithName("http").
-			WithContainerPort(DataPlaneHTTPPort).
-			WithProtocol(corev1.ProtocolTCP),
-		corev1ac.ContainerPort().
-			WithName("https").
-			WithContainerPort(DataPlaneHTTPSPort).
-			WithProtocol(corev1.ProtocolTCP),
-		corev1ac.ContainerPort().
-			WithName("http3").
-			WithContainerPort(DataPlaneHTTPSPort).
-			WithProtocol(corev1.ProtocolUDP),
+	var sortedPorts []int
+	for port := range uniquePorts {
+		sortedPorts = append(sortedPorts, int(port))
 	}
-	for _, portInt := range tcpPorts {
-		if state.IsReservedDataPlanePort(gatewayv1.PortNumber(portInt)) {
-			continue
+	sort.Ints(sortedPorts)
+
+	if p.useHostPorts {
+		var httpPorts, httpsPorts int
+		for _, protocol := range uniquePorts {
+			if protocol == gatewayv1.HTTPProtocolType {
+				httpPorts++
+			} else if protocol == gatewayv1.HTTPSProtocolType || protocol == gatewayv1.TLSProtocolType {
+				httpsPorts++
+			}
 		}
-		containerPorts = append(containerPorts,
+		if httpPorts > 1 || httpsPorts > 1 {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
+				Message: "host ports allow one HTTP and one HTTPS port",
+			}, nil
+		}
+	}
+
+	var containerPorts []*corev1ac.ContainerPortApplyConfiguration
+	if p.useHostPorts {
+		for _, portInt := range sortedPorts {
+			port := gatewayv1.PortNumber(portInt)
+			protocol := uniquePorts[port]
+			if protocol == gatewayv1.TCPProtocolType && state.IsReservedDataPlanePort(port) {
+				continue
+			}
+			name := fmt.Sprintf("%s-%d", strings.ToLower(string(protocol)), port)
+			containerPort := int32(port)
+			if protocol == gatewayv1.HTTPProtocolType {
+				containerPort = DataPlaneHTTPPort
+				if port == 80 {
+					name = "http"
+				}
+			} else if protocol == gatewayv1.HTTPSProtocolType || protocol == gatewayv1.TLSProtocolType {
+				containerPort = DataPlaneHTTPSPort
+				if port == 443 && protocol == gatewayv1.HTTPSProtocolType {
+					name = "https"
+				}
+			}
+			containerPorts = append(containerPorts,
+				corev1ac.ContainerPort().WithName(name).WithContainerPort(containerPort).WithHostPort(int32(port)).WithProtocol(corev1.ProtocolTCP),
+			)
+			if protocol == gatewayv1.HTTPSProtocolType {
+				http3Name := fmt.Sprintf("http3-%d", port)
+				if port == 443 {
+					http3Name = "http3"
+				}
+				containerPorts = append(containerPorts,
+					corev1ac.ContainerPort().WithName(http3Name).WithContainerPort(DataPlaneHTTPSPort).WithHostPort(int32(port)).WithProtocol(corev1.ProtocolUDP),
+				)
+			}
+		}
+		for _, portInt := range udpPorts {
+			port := gatewayv1.PortNumber(portInt)
+			if state.IsReservedDataPlanePort(port) {
+				continue
+			}
+			containerPorts = append(containerPorts,
+				corev1ac.ContainerPort().WithName(fmt.Sprintf("udp-%d", portInt)).WithContainerPort(int32(portInt)).WithHostPort(int32(portInt)).WithProtocol(corev1.ProtocolUDP),
+			)
+		}
+	} else {
+		containerPorts = []*corev1ac.ContainerPortApplyConfiguration{
 			corev1ac.ContainerPort().
-				WithName(fmt.Sprintf("tcp-%d", portInt)).
-				WithContainerPort(int32(portInt)).
+				WithName("http").
+				WithContainerPort(DataPlaneHTTPPort).
 				WithProtocol(corev1.ProtocolTCP),
-		)
-	}
-	for _, portInt := range udpPorts {
-		if state.IsReservedDataPlanePort(gatewayv1.PortNumber(portInt)) {
-			continue
-		}
-		containerPorts = append(containerPorts,
 			corev1ac.ContainerPort().
-				WithName(fmt.Sprintf("udp-%d", portInt)).
-				WithContainerPort(int32(portInt)).
+				WithName("https").
+				WithContainerPort(DataPlaneHTTPSPort).
+				WithProtocol(corev1.ProtocolTCP),
+			corev1ac.ContainerPort().
+				WithName("http3").
+				WithContainerPort(DataPlaneHTTPSPort).
 				WithProtocol(corev1.ProtocolUDP),
-		)
+		}
+		for _, portInt := range tcpPorts {
+			if state.IsReservedDataPlanePort(gatewayv1.PortNumber(portInt)) {
+				continue
+			}
+			containerPorts = append(containerPorts,
+				corev1ac.ContainerPort().
+					WithName(fmt.Sprintf("tcp-%d", portInt)).
+					WithContainerPort(int32(portInt)).
+					WithProtocol(corev1.ProtocolTCP),
+			)
+		}
+		for _, portInt := range udpPorts {
+			if state.IsReservedDataPlanePort(gatewayv1.PortNumber(portInt)) {
+				continue
+			}
+			containerPorts = append(containerPorts,
+				corev1ac.ContainerPort().
+					WithName(fmt.Sprintf("udp-%d", portInt)).
+					WithContainerPort(int32(portInt)).
+					WithProtocol(corev1.ProtocolUDP),
+			)
+		}
 	}
 
 	containerApply := corev1ac.Container().
@@ -811,19 +891,35 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		podTemplate.WithAnnotations(annotations)
 	}
 
+	deploySpec := appsv1ac.DeploymentSpec().
+		WithReplicas(1).
+		WithSelector(metav1ac.LabelSelector().
+			WithMatchLabels(map[string]string{
+				LabelGatewayName: labelGwName,
+				LabelAppName:     AppNameValue,
+			}),
+		).
+		WithTemplate(podTemplate)
+	if p.useHostPorts {
+		// Use RollingUpdate with maxSurge: 0 and maxUnavailable: 1 when host ports are on.
+		// On a one-node cluster, a new pod cannot bind the host port while the old pod
+		// holds it, so zero surge ensures the old pod terminates before the new pod is
+		// scheduled. Keeping the RollingUpdate strategy type avoids API server validation
+		// errors when switching an existing Deployment whose defaulted rollingUpdate
+		// parameters cannot coexist with strategy type Recreate.
+		deploySpec.WithStrategy(appsv1ac.DeploymentStrategy().
+			WithType(appsv1.RollingUpdateDeploymentStrategyType).
+			WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
+				WithMaxSurge(intstr.FromInt32(0)).
+				WithMaxUnavailable(intstr.FromInt32(1)),
+			),
+		)
+	}
+
 	deployApply := appsv1ac.Deployment(name, gwNamespace).
 		WithOwnerReferences(ownerRef).
 		WithLabels(labels).
-		WithSpec(appsv1ac.DeploymentSpec().
-			WithReplicas(1).
-			WithSelector(metav1ac.LabelSelector().
-				WithMatchLabels(map[string]string{
-					LabelGatewayName: labelGwName,
-					LabelAppName:     AppNameValue,
-				}),
-			).
-			WithTemplate(podTemplate),
-		)
+		WithSpec(deploySpec)
 	if len(annotations) > 0 {
 		deployApply.WithAnnotations(annotations)
 	}
@@ -840,15 +936,14 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				Message: fmt.Sprintf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
+		if p.useHostPorts {
+			if deleteErr := p.client.Delete(ctx, &existingSvc); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+				return nil, state.GatewayReadiness{}, fmt.Errorf("failed to delete Service for Gateway %s/%s: %w", gwNamespace, gw.Name, deleteErr)
+			}
+		}
 	} else if !apierrors.IsNotFound(err) {
 		return nil, state.GatewayReadiness{}, err
 	}
-
-	var sortedPorts []int
-	for port := range uniquePorts {
-		sortedPorts = append(sortedPorts, int(port))
-	}
-	sort.Ints(sortedPorts)
 
 	var svcPorts []*corev1ac.ServicePortApplyConfiguration
 	for _, portInt := range sortedPorts {
@@ -907,7 +1002,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	requestedIPs := requestedIPAddresses(gw)
 	requestedHostnames := requestedHostnameAddresses(gw)
 
-	if len(svcPorts) > 0 {
+	if !p.useHostPorts && len(svcPorts) > 0 {
 		svcSpec := corev1ac.ServiceSpec().
 			WithType(params.ServiceType).
 			WithSelector(map[string]string{
@@ -953,6 +1048,18 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		if existingDeploy.Status.AvailableReplicas > 0 || existingDeploy.Status.ReadyReplicas > 0 {
 			deployReady = true
 		}
+	}
+
+	if p.useHostPorts {
+		message := "Waiting for data-plane deployment to become available"
+		if deployReady {
+			message = "Waiting for node address to be assigned to host-port Gateway"
+		}
+		return nil, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+			Message: message,
+		}, nil
 	}
 
 	if params.ServiceType == corev1.ServiceTypeClusterIP {
@@ -1093,6 +1200,9 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 
 // SupportedAddressTypes returns the address types supported by singlepod.
 func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
+	if p.useHostPorts {
+		return nil
+	}
 	return []gatewayv1.AddressType{gatewayv1.IPAddressType, gatewayv1.HostnameAddressType}
 }
 

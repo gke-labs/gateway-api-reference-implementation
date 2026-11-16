@@ -5181,3 +5181,286 @@ func TestSinglePodAddressProvider_ProbeResponseExceedsLimit(t *testing.T) {
 		t.Fatalf("expected [rev-valid], got %v", revisions)
 	}
 }
+
+func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c, WithHostPorts())
+
+	if supported := p.SupportedAddressTypes(); supported != nil {
+		t.Fatalf("expected SupportedAddressTypes() to be nil with host ports, got %+v", supported)
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-hp",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-hp-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				{Name: "tcp", Port: 9000, Protocol: gatewayv1.TCPProtocolType},
+				{Name: "udp", Port: 5353, Protocol: gatewayv1.UDPProtocolType},
+			},
+		},
+	}
+
+	// 1. Initial reconciliation creates Deployment with host ports, but no Service
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false before pod is running")
+	}
+	if len(addrs) > 0 {
+		t.Errorf("expected no addresses set by this step, got %+v", addrs)
+	}
+
+	resName := ResourceNameForGateway("gw-hp")
+
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+
+	// Verify Deployment uses RollingUpdate strategy with maxSurge: 0 and maxUnavailable: 1
+	if deploy.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Errorf("expected Deployment strategy RollingUpdate, got %s", deploy.Spec.Strategy.Type)
+	}
+	if deploy.Spec.Strategy.RollingUpdate == nil {
+		t.Fatalf("expected RollingUpdate strategy configuration")
+	}
+	if deploy.Spec.Strategy.RollingUpdate.MaxSurge == nil || deploy.Spec.Strategy.RollingUpdate.MaxSurge.IntValue() != 0 {
+		t.Errorf("expected maxSurge=0, got %v", deploy.Spec.Strategy.RollingUpdate.MaxSurge)
+	}
+	if deploy.Spec.Strategy.RollingUpdate.MaxUnavailable == nil || deploy.Spec.Strategy.RollingUpdate.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("expected maxUnavailable=1, got %v", deploy.Spec.Strategy.RollingUpdate.MaxUnavailable)
+	}
+
+	ports := deploy.Spec.Template.Spec.Containers[0].Ports
+	portMap := make(map[string]corev1.ContainerPort)
+	for _, cp := range ports {
+		portMap[fmt.Sprintf("%s/%s", cp.Name, cp.Protocol)] = cp
+	}
+
+	// Verify HTTP mapping: containerPort 8080, hostPort 80
+	if cp, ok := portMap["http/TCP"]; !ok {
+		t.Errorf("missing http/TCP port in container")
+	} else if cp.ContainerPort != 8080 || cp.HostPort != 80 {
+		t.Errorf("http/TCP: expected containerPort=8080 hostPort=80, got containerPort=%d hostPort=%d", cp.ContainerPort, cp.HostPort)
+	}
+
+	// Verify HTTPS TCP mapping: containerPort 8443, hostPort 443
+	if cp, ok := portMap["https/TCP"]; !ok {
+		t.Errorf("missing https/TCP port in container")
+	} else if cp.ContainerPort != 8443 || cp.HostPort != 443 {
+		t.Errorf("https/TCP: expected containerPort=8443 hostPort=443, got containerPort=%d hostPort=%d", cp.ContainerPort, cp.HostPort)
+	}
+
+	// Verify HTTP/3 UDP mapping: containerPort 8443, hostPort 443
+	if cp, ok := portMap["http3/UDP"]; !ok {
+		t.Errorf("missing http3/UDP port in container")
+	} else if cp.ContainerPort != 8443 || cp.HostPort != 443 {
+		t.Errorf("http3/UDP: expected containerPort=8443 hostPort=443, got containerPort=%d hostPort=%d", cp.ContainerPort, cp.HostPort)
+	}
+
+	// Verify TCP mapping: containerPort 9000, hostPort 9000
+	if cp, ok := portMap["tcp-9000/TCP"]; !ok {
+		t.Errorf("missing tcp-9000/TCP port in container")
+	} else if cp.ContainerPort != 9000 || cp.HostPort != 9000 {
+		t.Errorf("tcp-9000/TCP: expected containerPort=9000 hostPort=9000, got containerPort=%d hostPort=%d", cp.ContainerPort, cp.HostPort)
+	}
+
+	// Verify UDP mapping: containerPort 5353, hostPort 5353
+	if cp, ok := portMap["udp-5353/UDP"]; !ok {
+		t.Errorf("missing udp-5353/UDP port in container")
+	} else if cp.ContainerPort != 5353 || cp.HostPort != 5353 {
+		t.Errorf("udp-5353/UDP: expected containerPort=5353 hostPort=5353, got containerPort=%d hostPort=%d", cp.ContainerPort, cp.HostPort)
+	}
+
+	// Verify no traffic Service exists
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
+		t.Errorf("expected Service to not exist, got err: %v", err)
+	}
+
+	// When deployment has ready replicas, still reports AddressNotAssigned until address follows the node
+	deploy.Status.ReadyReplicas = 1
+	if err := c.Status().Update(ctx, &deploy); err != nil {
+		t.Fatalf("failed to update deployment status: %v", err)
+	}
+	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error when deployment is ready: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false until address follows the node, got ready=true")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected reason=AddressNotAssigned, got %s", readiness.Reason)
+	}
+	if len(addrs) > 0 {
+		t.Errorf("expected no addresses set by this step, got %+v", addrs)
+	}
+
+	// 2. Switching from Service mode to host-port mode deletes existing owned Service
+	pDefault := NewAddressProvider(c)
+	_, _, err = pDefault.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error creating Service with default provider: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("expected Service to exist after default provider reconcile: %v", err)
+	}
+
+	// Reconcile with host-port provider again
+	_, _, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error with host-port provider: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
+		t.Errorf("expected existing Service to be deleted when host ports are enabled, got err: %v", err)
+	}
+
+	// Verify the existing Deployment was updated to have maxSurge: 0 and maxUnavailable: 1
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment after host-port reconcile: %v", err)
+	}
+	if deploy.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Errorf("expected RollingUpdate strategy after switch, got %s", deploy.Spec.Strategy.Type)
+	}
+	if deploy.Spec.Strategy.RollingUpdate == nil || deploy.Spec.Strategy.RollingUpdate.MaxSurge == nil || deploy.Spec.Strategy.RollingUpdate.MaxSurge.IntValue() != 0 {
+		t.Errorf("expected maxSurge=0 after switch, got %v", deploy.Spec.Strategy.RollingUpdate)
+	}
+	if deploy.Spec.Strategy.RollingUpdate == nil || deploy.Spec.Strategy.RollingUpdate.MaxUnavailable == nil || deploy.Spec.Strategy.RollingUpdate.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("expected maxUnavailable=1 after switch, got %v", deploy.Spec.Strategy.RollingUpdate)
+	}
+}
+
+func TestSinglePodAddressProvider_HostPorts_MultipleHTTPListenersConflict(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c, WithHostPorts())
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-two-http",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-two-http-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http-80", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "http-8081", Port: 8081, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false for two HTTP listeners on different ports")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	}
+	expectedMsg := "host ports allow one HTTP and one HTTPS port"
+	if readiness.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	}
+	if len(addrs) > 0 {
+		t.Errorf("expected no addresses, got %+v", addrs)
+	}
+
+	// Verify no Deployment was created for the invalid listener configuration
+	var deploy appsv1.Deployment
+	resName := ResourceNameForGateway("gw-two-http")
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); !apierrors.IsNotFound(err) {
+		t.Errorf("expected Deployment to not exist for invalid configuration, got err: %v", err)
+	}
+}
+
+func TestSinglePodAddressProvider_HostPorts_MultipleHTTPSListenersConflict(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c, WithHostPorts())
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-two-https",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-two-https-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "https-443", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				{Name: "https-8443", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false for two HTTPS listeners on different ports")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	}
+	expectedMsg := "host ports allow one HTTP and one HTTPS port"
+	if readiness.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	}
+	if len(addrs) > 0 {
+		t.Errorf("expected no addresses, got %+v", addrs)
+	}
+}
+
+func TestSinglePodAddressProvider_HostPorts_ReservedPortsSkipped(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c, WithHostPorts())
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-reserved",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-reserved-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "tcp-reserved", Port: 8080, Protocol: gatewayv1.TCPProtocolType},
+				{Name: "udp-reserved", Port: 8443, Protocol: gatewayv1.UDPProtocolType},
+				{Name: "health-reserved", Port: 8999, Protocol: gatewayv1.TCPProtocolType},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var deploy appsv1.Deployment
+	resName := ResourceNameForGateway("gw-reserved")
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+
+	// Only port 80 should be in container ports; 8080 TCP, 8443 UDP, and 8999 TCP should be skipped
+	ports := deploy.Spec.Template.Spec.Containers[0].Ports
+	if len(ports) != 1 {
+		t.Fatalf("expected exactly 1 container port (port 80), got %d: %+v", len(ports), ports)
+	}
+	if ports[0].HostPort != 80 || ports[0].ContainerPort != 8080 {
+		t.Errorf("expected port 80 mapping, got %+v", ports[0])
+	}
+}
