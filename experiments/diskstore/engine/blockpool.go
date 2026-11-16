@@ -62,6 +62,12 @@ type PageDesc struct {
 	// I/O flush completes without concurrent modifications. Unlike RedoLSN, which
 	// tracks durability across completed heap fsyncs, DirtyLSN reflects in-memory
 	// dirty state since the last write.
+	//
+	// If a flush fails, MarkDirty may already have moved DirtyLSN past changes
+	// that the failed flush did not write, so RedoLSN can then be too high. That
+	// is acceptable only because a failed flush puts the engine in its failed
+	// state, no checkpoint runs after it, and the store is erased or refused on
+	// the next open.
 	DirtyLSN uint64
 
 	// RedoLSN is the earliest LSN whose effect on this page is not yet confirmed
@@ -183,13 +189,13 @@ type BlockPool struct {
 	deferredFreesUnsynced []blockRun
 
 	// Both flushedPages maps track pages whose flush has returned and whose
-	// RedoLSN the next successful heap fsync may clear. Map values are the
-	// first LSN changed since the page's previous flush. Guarded by mu.
+	// RedoLSN the next successful heap fsync may clear. Guarded by mu.
 
-	// flushedPagesSyncing holds pages flushed before the current heap fsync started.
-	flushedPagesSyncing map[uint64]uint64
+	// flushedPagesSyncing holds pages flushed before the heap fsync in progress started.
+	flushedPagesSyncing map[uint64]struct{}
 
-	// flushedPagesUnsynced holds pages flushed since the current heap fsync started.
+	// flushedPagesUnsynced holds pages flushed since the heap fsync in progress started.
+	// Map values are the first LSN changed since the page's previous flush.
 	flushedPagesUnsynced map[uint64]uint64
 
 	stagingBuf []byte     // Pointer-free aligned 2 MiB staging buffer for direct I/O flushes
@@ -244,7 +250,7 @@ func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opt
 		freePoolBlocks:       freePoolBlocks,
 		stagingBuf:           stagingBuf,
 		pageTable:            make(map[uint64]*PageDesc),
-		flushedPagesSyncing:  make(map[uint64]uint64),
+		flushedPagesSyncing:  make(map[uint64]struct{}),
 		flushedPagesUnsynced: make(map[uint64]uint64),
 		onFailure:            options.OnFailure,
 		bgStop:               make(chan struct{}),
@@ -907,8 +913,8 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 
 // recordFlushedPageLocked records a completed flush for a logical page in flushedPagesUnsynced.
 // firstChangedSinceLastFlush is the earliest LSN changed since the page's prior flush.
-// If the page was already flushed in this unsynced generation, the earlier firstChangedSinceLastFlush
-// is preserved so durability tracking covers the entire unsynced generation.
+// If the page was already flushed since the heap fsync in progress started, the earlier
+// firstChangedSinceLastFlush is preserved so durability tracking covers all changes since that fsync started.
 func (bp *BlockPool) recordFlushedPageLocked(logicalPage uint64, firstChangedSinceLastFlush uint64) {
 	if _, exists := bp.flushedPagesUnsynced[logicalPage]; !exists {
 		bp.flushedPagesUnsynced[logicalPage] = firstChangedSinceLastFlush
@@ -980,8 +986,9 @@ var _ = (*BlockPool).deferFree
 
 // startHeapSync rotates deferredFreesUnsynced into deferredFreesSyncing,
 // and flushedPagesUnsynced into flushedPagesSyncing at the start of a heap fsync.
-// If syncing generations still hold entries from an uncompleted or failed fsync, they are retained.
-// flushedPagesUnsynced starts empty.
+// If pages or block runs flushed before the heap fsync in progress started are still
+// held from an uncompleted or failed fsync, they are retained.
+// flushedPagesUnsynced starts empty for pages flushed since this fsync started.
 func (bp *BlockPool) startHeapSync() {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
@@ -989,18 +996,17 @@ func (bp *BlockPool) startHeapSync() {
 	bp.deferredFreesUnsynced = nil
 
 	if bp.flushedPagesSyncing == nil {
-		bp.flushedPagesSyncing = make(map[uint64]uint64)
+		bp.flushedPagesSyncing = make(map[uint64]struct{})
 	}
-	for logicalPage, unsyncedFirstLSN := range bp.flushedPagesUnsynced {
-		if _, exists := bp.flushedPagesSyncing[logicalPage]; !exists {
-			bp.flushedPagesSyncing[logicalPage] = unsyncedFirstLSN
-		}
+	for logicalPage := range bp.flushedPagesUnsynced {
+		bp.flushedPagesSyncing[logicalPage] = struct{}{}
 	}
 	bp.flushedPagesUnsynced = make(map[uint64]uint64)
 }
 
 // heapSyncSucceeded frees every block run in deferredFreesSyncing to the buddy allocator,
-// advances or clears RedoLSN for pages flushed before this fsync started, and empties the syncing generations.
+// advances or clears RedoLSN for pages flushed before the heap fsync in progress started,
+// and clears those tracking structures.
 func (bp *BlockPool) heapSyncSucceeded() error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
@@ -1032,7 +1038,7 @@ func (bp *BlockPool) heapSyncSucceeded() error {
 			desc.RedoLSN = 0
 		}
 	}
-	bp.flushedPagesSyncing = make(map[uint64]uint64)
+	bp.flushedPagesSyncing = make(map[uint64]struct{})
 
 	if len(errs) > 0 {
 		err := errors.Join(errs...)
