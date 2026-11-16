@@ -538,6 +538,7 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 	// 3. Start a checkpoint and, while its heap fsync runs:
 	//    - delete the key mb1 (dirtied at delete LSN)
 	//    - put another multi-block value mb2 that reuses pageID
+	var deleteLSN, putLSN uint64
 	deleteAndReallocDone := make(chan struct{})
 	var opErr error
 
@@ -550,12 +551,14 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 				close(deleteAndReallocDone)
 				return
 			}
+			deleteLSN = store.wal.MaxLSN()
 			mbVal3 := bytes.Repeat([]byte("c"), 5000)
 			if err := store.Put("table", "mb2", mbVal3); err != nil {
 				opErr = fmt.Errorf("Put mb2 failed: %w", err)
 				close(deleteAndReallocDone)
 				return
 			}
+			putLSN = store.wal.MaxLSN()
 			close(deleteAndReallocDone)
 		}
 	})
@@ -570,6 +573,9 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 	}
 	if chkLSN1 == 0 {
 		t.Fatalf("expected non-zero checkpoint LSN")
+	}
+	if deleteLSN == 0 || putLSN == 0 || deleteLSN >= putLSN {
+		t.Fatalf("expected deleteLSN (%d) < putLSN (%d)", deleteLSN, putLSN)
 	}
 
 	// Verify that pageID was reused for mb2
@@ -595,14 +601,14 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 	dirtyLSN := desc.DirtyLSN
 	store.bp.mu.Unlock()
 
-	if redoLSN == 0 {
-		t.Fatalf("expected page RedoLSN > 0 for dirty reallocated page")
+	if redoLSN != deleteLSN {
+		t.Fatalf("expected page RedoLSN == deleteLSN (%d), got %d (putLSN=%d)", deleteLSN, redoLSN, putLSN)
 	}
-	if redoLSN != dirtyLSN {
-		t.Fatalf("expected RedoLSN (%d) == DirtyLSN (%d) carried from delete", redoLSN, dirtyLSN)
+	if dirtyLSN != deleteLSN {
+		t.Fatalf("expected page DirtyLSN == deleteLSN (%d), got %d (putLSN=%d)", deleteLSN, dirtyLSN, putLSN)
 	}
 
-	// 4. Second checkpoint records redo start at or below pageID's RedoLSN
+	// 4. Second checkpoint records redo start at or below deleteLSN
 	faultFS.SetBeforeSync(nil)
 	chkLSN2, cpErr2 := store.Checkpoint()
 	if cpErr2 != nil {
@@ -623,9 +629,9 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading second checkpoint record failed: %v", err)
 	}
-	if chkRecord.RedoStartLSN > redoLSN {
-		t.Fatalf("expected second checkpoint RedoStartLSN <= page RedoLSN (%d), got %d",
-			redoLSN, chkRecord.RedoStartLSN)
+	if chkRecord.RedoStartLSN > deleteLSN {
+		t.Fatalf("expected second checkpoint RedoStartLSN <= deleteLSN (%d), got %d (putLSN=%d)",
+			deleteLSN, chkRecord.RedoStartLSN, putLSN)
 	}
 
 	// 5. Crash and recover

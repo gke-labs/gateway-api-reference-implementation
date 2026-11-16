@@ -90,6 +90,13 @@ type PageDesc struct {
 	// while a flush was in flight.
 	flushingLSN uint64
 
+	// flushingFirstLSN is the first LSN covered by the direct I/O flush currently in flight.
+	// Set by flushBlockRunUnlocked when InFlight becomes true, and cleared to 0 when
+	// InFlight becomes false. When a prior heap fsync completes while this flush is in flight,
+	// heapSyncSucceeded uses flushingFirstLSN to advance RedoLSN to this in-flight change
+	// rather than jumping ahead to DirtyLSN for newer changes that arrived while in flight.
+	flushingFirstLSN uint64
+
 	Mu sync.RWMutex // Per-page latch for safe read/write access to pool block data
 }
 
@@ -800,6 +807,7 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 	for i, desc := range chunk {
 		desc.InFlight = true
 		desc.flushingLSN = pageLSNs[i]
+		desc.flushingFirstLSN = flushFirstChangedLSNs[i]
 		desc.PinCount.Add(1)
 	}
 
@@ -852,6 +860,7 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 	for _, desc := range chunk {
 		desc.InFlight = false
 		desc.flushingLSN = 0
+		desc.flushingFirstLSN = 0
 		desc.PinCount.Add(-1)
 	}
 	bp.cond.Broadcast()
@@ -1015,6 +1024,8 @@ func (bp *BlockPool) heapSyncSucceeded() error {
 		}
 		if unsyncedFirstLSN, ok := bp.flushedPagesUnsynced[logicalPage]; ok {
 			desc.RedoLSN = unsyncedFirstLSN
+		} else if desc.InFlight && desc.flushingFirstLSN > 0 {
+			desc.RedoLSN = desc.flushingFirstLSN
 		} else if desc.Dirty && desc.DirtyLSN > 0 {
 			desc.RedoLSN = desc.DirtyLSN
 		} else {
