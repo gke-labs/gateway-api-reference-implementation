@@ -382,36 +382,40 @@ func isOwnedByGateway(obj metav1.Object, gw *gatewayv1.Gateway) bool {
 }
 
 // podBelongsToDeployment checks whether pod belongs to the given Deployment through owner references
-// (either directly or through its owning ReplicaSet).
-func podBelongsToDeployment(ctx context.Context, reader client.Reader, pod *corev1.Pod, deployment *appsv1.Deployment) bool {
-	if pod == nil || deployment == nil {
-		return false
+// (specifically through its owning ReplicaSet).
+func podBelongsToDeployment(ctx context.Context, reader client.Reader, pod *corev1.Pod, deployment *appsv1.Deployment) (bool, error) {
+	if pod == nil || deployment == nil || deployment.UID == "" {
+		return false, nil
 	}
 	controllerRef := metav1.GetControllerOf(pod)
 	if controllerRef == nil {
-		return false
-	}
-	if controllerRef.Kind == "Deployment" && controllerRef.Name == deployment.Name {
-		return deployment.UID == "" || controllerRef.UID == deployment.UID
+		return false, nil
 	}
 	if controllerRef.Kind == "ReplicaSet" {
 		var replicaSet appsv1.ReplicaSet
 		err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: controllerRef.Name}, &replicaSet)
 		if err != nil {
-			// In case the direct reader does not have get access to ReplicaSets, verify that the ReplicaSet
-			// name was generated from this Deployment (<deployment-name>-<hash>).
-			if strings.HasPrefix(controllerRef.Name, deployment.Name+"-") {
-				return true
+			if apierrors.IsNotFound(err) {
+				return false, nil
 			}
-			return false
+			return false, fmt.Errorf("getting ReplicaSet %s/%s for pod %s: %w", pod.Namespace, controllerRef.Name, pod.Name, err)
+		}
+		if replicaSet.UID == "" || controllerRef.UID != replicaSet.UID {
+			return false, nil
 		}
 		rsControllerRef := metav1.GetControllerOf(&replicaSet)
-		if rsControllerRef != nil && rsControllerRef.Kind == "Deployment" && rsControllerRef.Name == deployment.Name {
-			return deployment.UID == "" || rsControllerRef.UID == deployment.UID
+		if rsControllerRef == nil {
+			return false, nil
 		}
-		return false
+		if rsControllerRef.Kind == "Deployment" && rsControllerRef.Name == deployment.Name && rsControllerRef.UID == deployment.UID {
+			return true, nil
+		}
+		return false, nil
 	}
-	return false
+	if controllerRef.Kind == "Deployment" && controllerRef.Name == deployment.Name && controllerRef.UID == deployment.UID {
+		return true, nil
+	}
+	return false, nil
 }
 
 func buildLabelsAndAnnotations(gw *gatewayv1.Gateway) (map[string]string, map[string]string) {
@@ -1090,7 +1094,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		// starting unbounded cluster-wide cache informers for all Pods and Nodes.
 		reader := p.apiReader
 		if reader == nil {
-			reader = p.client
+			return nil, state.GatewayReadiness{}, fmt.Errorf("apiReader is required for host-ports address provider")
 		}
 
 		var podList corev1.PodList
@@ -1104,7 +1108,14 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		var selectedPod *corev1.Pod
 		for index := range podList.Items {
 			pod := &podList.Items[index]
-			if !podBelongsToDeployment(ctx, reader, pod, &existingDeploy) {
+			if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+				continue
+			}
+			belongs, err := podBelongsToDeployment(ctx, reader, pod, &existingDeploy)
+			if err != nil {
+				return nil, state.GatewayReadiness{}, err
+			}
+			if !belongs {
 				continue
 			}
 			if selectedPod == nil {
@@ -1171,10 +1182,10 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}
 
 		slices.SortFunc(internalIPs, func(firstAddress, secondAddress string) int {
-			ipAddrA, errA := netip.ParseAddr(firstAddress)
-			ipAddrB, errB := netip.ParseAddr(secondAddress)
-			if errA == nil && errB == nil {
-				return ipAddrA.Compare(ipAddrB)
+			firstIP, firstParseErr := netip.ParseAddr(firstAddress)
+			secondIP, secondParseErr := netip.ParseAddr(secondAddress)
+			if firstParseErr == nil && secondParseErr == nil {
+				return firstIP.Compare(secondIP)
 			}
 			return strings.Compare(firstAddress, secondAddress)
 		})

@@ -5188,7 +5188,7 @@ func TestSinglePodAddressProvider_ProbeResponseExceedsLimit(t *testing.T) {
 func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithHostPorts())
+	p := NewAddressProvider(c, WithHostPorts(), WithAPIReader(c))
 
 	if supported := p.SupportedAddressTypes(); supported != nil {
 		t.Fatalf("expected SupportedAddressTypes() to be nil with host ports, got %+v", supported)
@@ -5346,7 +5346,7 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 func TestSinglePodAddressProvider_HostPorts_MultipleHTTPListenersConflict(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithHostPorts())
+	p := NewAddressProvider(c, WithHostPorts(), WithAPIReader(c))
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5391,7 +5391,7 @@ func TestSinglePodAddressProvider_HostPorts_MultipleHTTPListenersConflict(t *tes
 func TestSinglePodAddressProvider_HostPorts_MultipleHTTPSListenersConflict(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithHostPorts())
+	p := NewAddressProvider(c, WithHostPorts(), WithAPIReader(c))
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5429,7 +5429,7 @@ func TestSinglePodAddressProvider_HostPorts_MultipleHTTPSListenersConflict(t *te
 func TestSinglePodAddressProvider_HostPorts_ReservedPortsSkipped(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithHostPorts())
+	p := NewAddressProvider(c, WithHostPorts(), WithAPIReader(c))
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5472,6 +5472,7 @@ type hostPortsFixture struct {
 	client     client.Client
 	gateway    *gatewayv1.Gateway
 	deployment *appsv1.Deployment
+	replicaSet *appsv1.ReplicaSet
 	node1      *corev1.Node
 	node2      *corev1.Node
 	provider   *AddressProvider
@@ -5523,7 +5524,7 @@ func setupHostPortsFixture(t *testing.T) (*hostPortsFixture, context.Context) {
 		},
 	}
 
-	provider := NewAddressProvider(testClient, WithHostPorts())
+	provider := NewAddressProvider(testClient, WithHostPorts(), WithAPIReader(testClient))
 
 	if _, _, err := provider.GatewayAddressesWithReadiness(ctx, gateway, nil); err != nil {
 		t.Fatalf("initial reconciliation failed: %v", err)
@@ -5534,11 +5535,40 @@ func setupHostPortsFixture(t *testing.T) (*hostPortsFixture, context.Context) {
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: deploymentName}, &deployment); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
 	}
+	if deployment.UID == "" {
+		deployment.UID = types.UID("deploy-uid-hp")
+		if err := testClient.Update(ctx, &deployment); err != nil {
+			t.Fatalf("failed to set deployment UID: %v", err)
+		}
+	}
+
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      deployment.Name + "-6d487f589b",
+			Namespace: deployment.Namespace,
+			UID:       types.UID("rs-uid-hp"),
+			Labels:    deployment.Labels,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         "apps/v1",
+					Kind:               "Deployment",
+					Name:               deployment.Name,
+					UID:                deployment.UID,
+					Controller:         state.Ptr(true),
+					BlockOwnerDeletion: state.Ptr(true),
+				},
+			},
+		},
+	}
+	if err := testClient.Create(ctx, replicaSet); err != nil {
+		t.Fatalf("failed to create ReplicaSet: %v", err)
+	}
 
 	return &hostPortsFixture{
 		client:     testClient,
 		gateway:    gateway,
 		deployment: &deployment,
+		replicaSet: replicaSet,
 		node1:      node1,
 		node2:      node2,
 		provider:   provider,
@@ -5564,11 +5594,12 @@ func (fixture *hostPortsFixture) createPod(t *testing.T, ctx context.Context, po
 	if owned {
 		pod.OwnerReferences = []metav1.OwnerReference{
 			{
-				APIVersion: "apps/v1",
-				Kind:       "Deployment",
-				Name:       fixture.deployment.Name,
-				UID:        fixture.deployment.UID,
-				Controller: state.Ptr(true),
+				APIVersion:         "apps/v1",
+				Kind:               "ReplicaSet",
+				Name:               fixture.replicaSet.Name,
+				UID:                fixture.replicaSet.UID,
+				Controller:         state.Ptr(true),
+				BlockOwnerDeletion: state.Ptr(true),
 			},
 		}
 	}
@@ -5673,7 +5704,7 @@ func TestSinglePodAddressProvider_HostPorts_OwnerReferenceRequired(t *testing.T)
 	fixture, ctx := setupHostPortsFixture(t)
 	fixture.setDeploymentReady(t, ctx, true)
 
-	// Create an unowned pod that matches the labels but lacks owner references
+	// 1. Unowned pod with no owner references -> ignored
 	unownedPod := fixture.createPod(t, ctx, "spoofed-pod", "node-1", false)
 
 	addresses, readiness, err := fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
@@ -5683,21 +5714,50 @@ func TestSinglePodAddressProvider_HostPorts_OwnerReferenceRequired(t *testing.T)
 	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
 		t.Errorf("expected unowned pod copying labels to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
 	}
+	if err := fixture.client.Delete(ctx, unownedPod); err != nil {
+		t.Fatalf("failed to delete unowned pod: %v", err)
+	}
 
-	// Add owner reference to the deployment -> pod is now recognized
-	unownedPod.OwnerReferences = []metav1.OwnerReference{
-		{
-			APIVersion: "apps/v1",
-			Kind:       "Deployment",
-			Name:       fixture.deployment.Name,
-			UID:        fixture.deployment.UID,
-			Controller: state.Ptr(true),
+	// 2. Pod naming a ReplicaSet that the Deployment doesn't own -> ignored
+	foreignReplicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foreign-rs",
+			Namespace: fixture.gateway.Namespace,
+			UID:       types.UID("foreign-rs-uid"),
 		},
 	}
-	if err := fixture.client.Update(ctx, unownedPod); err != nil {
-		t.Fatalf("failed to update pod owner references: %v", err)
+	if err := fixture.client.Create(ctx, foreignReplicaSet); err != nil {
+		t.Fatalf("failed to create foreign ReplicaSet: %v", err)
 	}
 
+	foreignPod := fixture.createPod(t, ctx, "foreign-rs-pod", "node-1", false)
+	foreignPod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion:         "apps/v1",
+			Kind:               "ReplicaSet",
+			Name:               foreignReplicaSet.Name,
+			UID:                foreignReplicaSet.UID,
+			Controller:         state.Ptr(true),
+			BlockOwnerDeletion: state.Ptr(true),
+		},
+	}
+	if err := fixture.client.Update(ctx, foreignPod); err != nil {
+		t.Fatalf("failed to update foreign pod owner reference: %v", err)
+	}
+
+	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected pod owned by foreign ReplicaSet to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
+	}
+	if err := fixture.client.Delete(ctx, foreignPod); err != nil {
+		t.Fatalf("failed to delete foreign pod: %v", err)
+	}
+
+	// 3. Pod owned by the Deployment's ReplicaSet -> accepted
+	ownedPod := fixture.createPod(t, ctx, "valid-rs-pod", "node-1", true)
 	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -5705,6 +5765,7 @@ func TestSinglePodAddressProvider_HostPorts_OwnerReferenceRequired(t *testing.T)
 	if !readiness.Ready || len(addresses) != 2 {
 		t.Errorf("expected owned pod to be accepted, got ready=%v addresses=%+v", readiness.Ready, addresses)
 	}
+	_ = ownedPod
 }
 
 func TestSinglePodAddressProvider_HostPorts_EdgeCases(t *testing.T) {
@@ -5757,6 +5818,40 @@ func TestSinglePodAddressProvider_HostPorts_EdgeCases(t *testing.T) {
 	}
 	if len(addresses) != 2 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonPending) {
 		t.Errorf("expected 2 addresses and Pending when deployment not ready, got addresses=%+v readiness=%+v", addresses, readiness)
+	}
+
+	// 4. Pod in Failed phase (e.g. evicted) with a node assigned -> skipped
+	fixture.setDeploymentReady(t, ctx, true)
+	failedPod := fixture.createPod(t, ctx, "failed-pod", "node-1", true)
+	failedPod.Status.Phase = corev1.PodFailed
+	if err := fixture.client.Status().Update(ctx, failedPod); err != nil {
+		t.Fatalf("failed to update failed pod status: %v", err)
+	}
+	// Delete active pod so only failedPod remains
+	if err := fixture.client.Delete(ctx, pod); err != nil {
+		t.Fatalf("failed to delete active pod: %v", err)
+	}
+
+	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected Failed pod to be skipped, got addresses=%+v readiness=%+v", addresses, readiness)
+	}
+
+	// 5. Pod in Succeeded phase -> skipped
+	failedPod.Status.Phase = corev1.PodSucceeded
+	if err := fixture.client.Status().Update(ctx, failedPod); err != nil {
+		t.Fatalf("failed to update succeeded pod status: %v", err)
+	}
+
+	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected Succeeded pod to be skipped, got addresses=%+v readiness=%+v", addresses, readiness)
 	}
 }
 
@@ -5822,7 +5917,7 @@ func TestSinglePodAddressProvider_HostPorts_GatewayReconciler_EndToEnd(t *testin
 		Build()
 
 	ctx := t.Context()
-	provider := NewAddressProvider(testClient, WithHostPorts())
+	provider := NewAddressProvider(testClient, WithHostPorts(), WithAPIReader(testClient))
 	stateStore.SetSupportedAddressTypes(provider.SupportedAddressTypes())
 
 	reconciler := &controller.GatewayReconciler{
@@ -5845,9 +5940,38 @@ func TestSinglePodAddressProvider_HostPorts_GatewayReconciler_EndToEnd(t *testin
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deployment); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
 	}
+	if deployment.UID == "" {
+		deployment.UID = types.UID("deploy-uid-hp-e2e")
+		if err := testClient.Update(ctx, &deployment); err != nil {
+			t.Fatalf("failed to update Deployment UID: %v", err)
+		}
+	}
 	deployment.Status.ReadyReplicas = 1
 	if err := testClient.Status().Update(ctx, &deployment); err != nil {
 		t.Fatalf("failed to update Deployment status: %v", err)
+	}
+
+	// Create ReplicaSet owned by Deployment
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      deployment.Name + "-6d487f589b",
+			Namespace: deployment.Namespace,
+			UID:       types.UID("rs-uid-hp-e2e"),
+			Labels:    deployment.Labels,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         "apps/v1",
+					Kind:               "Deployment",
+					Name:               deployment.Name,
+					UID:                deployment.UID,
+					Controller:         state.Ptr(true),
+					BlockOwnerDeletion: state.Ptr(true),
+				},
+			},
+		},
+	}
+	if err := testClient.Create(ctx, replicaSet); err != nil {
+		t.Fatalf("failed to create ReplicaSet: %v", err)
 	}
 
 	stateStore.Recompute()
@@ -5867,7 +5991,7 @@ func TestSinglePodAddressProvider_HostPorts_GatewayReconciler_EndToEnd(t *testin
 		t.Fatalf("expected Programmed=False/AddressNotAssigned, got %+v", programCondition)
 	}
 
-	// 2. Pod is scheduled on worker-1 and owned by deployment
+	// 2. Pod is scheduled on worker-1 and owned by ReplicaSet
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-gw-dataplane-pod",
@@ -5878,11 +6002,12 @@ func TestSinglePodAddressProvider_HostPorts_GatewayReconciler_EndToEnd(t *testin
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
-					APIVersion: "apps/v1",
-					Kind:       "Deployment",
-					Name:       deployment.Name,
-					UID:        deployment.UID,
-					Controller: state.Ptr(true),
+					APIVersion:         "apps/v1",
+					Kind:               "ReplicaSet",
+					Name:               replicaSet.Name,
+					UID:                replicaSet.UID,
+					Controller:         state.Ptr(true),
+					BlockOwnerDeletion: state.Ptr(true),
 				},
 			},
 		},

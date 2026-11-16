@@ -22,6 +22,10 @@ rules:
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# ReplicaSet read access (get) is required for the singlepod host-ports address provider to verify owner references from data-plane pods to their owning Deployment.
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get"]
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["roles", "rolebindings"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
