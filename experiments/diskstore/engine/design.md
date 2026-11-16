@@ -1,6 +1,6 @@
 # Design: Disk-Store Engine
 
-This document describes the architecture, terminology, on-disk formats, storage invariants, recovery process, concurrency model, value representation, and read-only mode of the disk-store engine (`experiments/diskstore/engine`).
+This document describes the architecture, terminology, on-disk formats, storage invariants, recovery process, concurrency model, value representation, read-only mode, and fault handling of the disk-store engine (`experiments/diskstore/engine`).
 For benchmark results and performance measurements, see [diskstore-experiment.md](../../../docs/diskstore-experiment.md).
 
 ## Terminology
@@ -587,3 +587,64 @@ A wrong key never erases a store in read-only mode, whatever the erase option (`
 Recovery will replay the WAL through the functions that `Put` and `Delete` use to apply a record. Read-only replay should use the same functions.
 
 Calling the write path's record-application functions allows read-only recovery to update in-memory pool pages, slotted page directories, and the key index through the same code path as normal writes and recovery. The difference is that read-only mode suppresses the post-replay flush and heap fsync, keeping the updated pages in memory.
+
+## Fault Handling: In-Memory and Disk Faults
+
+Today every engine failure writes a `FAILED` marker, which causes the next `Open` to require store erasure. The engine distinguishes two kinds of failure to avoid erasing an intact store:
+- **Disk faults:** Storage corruption, unreadable blocks, failed fsyncs, or corrupt WAL segments. The data on disk cannot be trusted.
+- **In-memory faults:** Internal bookkeeping inconsistencies while the disk remains uncorrupted, such as allocator double-frees or invariant violations detected before writing.
+
+### Failure Classification
+
+The engine classifies every call to `setFailed` and every `onFailure` path across all subsystems:
+
+| Subsystem | Failure Site / Path | Fault Class | Next `Open` | Rationale / Safe Side |
+|---|---|---|---|---|
+| Allocator | Buddy `Free` of unallocated block (`FreePage`, flush completion, `PromoteFlushed`) | In-memory | Normal recovery | Bookkeeping inconsistency; on-disk heap and WAL remain valid. |
+| Allocator / Pool | Allocation or block validation detects reuse-rule violation before write | In-memory | Normal recovery | Engine halts before issuing write; durable on-disk blocks remain intact. |
+| Engine (`Put`) | Payload compression (`compress`) or cipher encryption (`cipher.Encrypt`) failure | In-memory | Normal recovery | In-memory compute error before WAL append or block allocation; zero disk writes. |
+| WAL | WAL segment append, write, or fsync failure (`AppendRecord`, `Sync`, `Flush`, `SyncThrough`) | Disk | Erase / `ErrFailed` | Log durability or record ordering unconfirmed; WAL on disk cannot be trusted. |
+| Block pool | Direct I/O write error or heap fsync failure (`flushPageDirectLocked`, `FlushPages`, idle sweep) | Disk | Erase / `ErrFailed` | Heap block write was torn or unconfirmed durable by fsync. |
+| Block pool | Direct I/O read error or block header CRC32C failure (`PinPage`) | Disk | Erase / `ErrFailed` | Physical block on disk is unreadable or corrupt. |
+| Engine (`Put`, `Delete`) | Oversize file unlink error (`removeOversizeFileByName`) or truncation error | Disk | Erase / `ErrFailed` | Filesystem metadata inconsistent; file reference state on disk cannot be trusted. |
+| Engine (`Get`) | Decompression failure or record key/LSN mismatch against index entry | Disk | Erase / `ErrFailed` | Unclear whether corruption originated from disk bit-rot or memory; safe side chooses disk fault. |
+| Engine (`Put`, `Delete`) | Target page missing in page table during mutation (`applyPutLocked`, `applyDeleteLocked`) | Disk | Erase / `ErrFailed` | Unclear whether in-memory table corrupted or disk read failed; safe side chooses disk fault. |
+
+### The Rule for an In-Memory Fault
+
+When an in-memory fault occurs, the engine stops immediately, records the sticky error, and closes the failed channel. It writes no `FAILED` marker to disk. The next `Open` runs ordinary crash recovery.
+
+This rule is safe because:
+- **Zero corrupted writes:** The engine halts before writing corrupted state to disk. Compression, encryption, and reuse-rule checks halt before any disk or WAL append occurs.
+- **Allocator reconstruction:** For allocator double-frees, recovery does not read allocator free lists from disk; it reconstructs allocator state entirely from scratch by scanning durable heap block headers.
+- **Invariant protection:** The write-ahead rule and reuse rule guarantee that existing durable copies remain untouched on disk until new copies are fully fsynced. Any in-flight torn write from the moment of halting is discarded by standard newest-LSN recovery.
+
+Reopening after an in-memory fault is identical to recovering from an abrupt power failure at that instant.
+
+### The Rule for a Disk Fault
+
+The rule for a disk fault stays as today. The engine transitions to the failed state, writes the `FAILED` marker to disk, and fsyncs the directory. The next `Open` discovers the marker: if configured with `WithEraseOnError`, it wipes the store directory and starts afresh; otherwise, it refuses startup and returns `ErrFailed`.
+
+### Relation to Read-Only Mode
+
+A failed engine continues to refuse all operations, including reads. An in-memory fault does not allow reads of durable data on the running instance. Once in-memory bookkeeping is corrupted, process memory cannot be trusted to locate or decode records safely without risking data corruption or panics. Serving durable data waits for the caller to close the instance and reopen: either via normal `Open` (rebuilding clean state through crash recovery) or via read-only mode.
+
+### Caller Visibility
+
+Callers distinguish the two failure kinds:
+- **`Engine.Err()` on the running instance:** Returns an error wrapping `ErrDiskFault` on disk faults, or `ErrMemoryFault` on in-memory faults. Both wrap `ErrFailed` for backwards compatibility.
+- **`Open` on subsequent restart:** After a disk fault, `Open` encounters the `FAILED` marker and returns `ErrFailed` (requiring erase) or erases the store. After an in-memory fault, `Open` finds no marker, runs standard crash recovery, and returns `nil`.
+
+### Maintainer Decisions
+
+- **Marker on in-memory fault:** The recommendation is to write no marker. This gives up post-mortem identification of in-memory faults from disk files alone, relying on process logs.
+- **Ambiguous read/decompression faults:** The recommendation is to classify decompression errors and key/LSN mismatches as disk faults. This gives up restart survival if the fault was caused by transient RAM corruption, but prevents trusting corrupted storage.
+- **Reopen recovery path:** The recommendation is to run standard read-write recovery by default, leaving read-only mode as an explicit caller option if recovery fails.
+
+### Implementation Steps
+
+1. **Define error types:** Add `ErrDiskFault` and `ErrMemoryFault` wrapping `ErrFailed`.
+2. **Split failure paths:** Update `setFailed` to accept fault classification; write the `FAILED` marker only for disk faults.
+3. **Classify subsystem callbacks:** Pass fault classifications from WAL, block pool, and engine failure sites.
+4. **Verify recovery on in-memory faults:** Ensure `Open` cleanly recovers stores after in-memory faults without requiring erasure.
+5. **Add tests:** Verify that simulated allocator double-frees allow restart and data recovery, while disk I/O and checksum faults write `FAILED` and require erasure.
