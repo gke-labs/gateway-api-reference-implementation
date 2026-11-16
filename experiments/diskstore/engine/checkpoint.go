@@ -96,9 +96,9 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 	dpt, snapshotLSN := c.bp.DirtyPageTableAndLSN()
 	var redoStartLSN uint64
 
-	for _, dirtyLSN := range dpt {
-		if redoStartLSN == 0 || dirtyLSN < redoStartLSN {
-			redoStartLSN = dirtyLSN
+	for _, redoLSN := range dpt {
+		if redoStartLSN == 0 || redoLSN < redoStartLSN {
+			redoStartLSN = redoLSN
 		}
 	}
 	if redoStartLSN == 0 {

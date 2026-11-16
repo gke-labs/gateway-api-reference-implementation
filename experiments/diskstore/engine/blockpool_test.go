@@ -1028,7 +1028,290 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 		// Once more verify no leftover runs or double frees
 		bp.startHeapSync()
 		if err := bp.heapSyncSucceeded(); err != nil {
-			t.Fatalf("heapSyncSucceeded on empty lists failed: %v", err)
+			t.Fatalf("heapSyncSucceeded on empty lists failed (possible double free): %v", err)
 		}
 	})
+}
+
+func TestBlockPool_PageFlushedTwiceBeforeFsyncKeepsFirstRedoLSN(t *testing.T) {
+	memFS := NewMemFS()
+	heapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer func() {
+		if err := heapFile.Close(); err != nil {
+			t.Errorf("heapFile.Close failed: %v", err)
+		}
+	}()
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("redo-lsn-test-01"))
+
+	wal, err := OpenWAL(memFS, "wal_dir", dbID, 0, WALOptions{})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer func() {
+		if err := wal.Close(); err != nil {
+			t.Errorf("wal.Close failed: %v", err)
+		}
+	}()
+
+	buddy := NewBuddyAllocator(512)
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 8})
+	defer func() {
+		if err := bp.Close(); err != nil {
+			t.Errorf("bp.Close failed: %v", err)
+		}
+	}()
+
+	// 1. First modification at LSN 10
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+	h1, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	copy(h1.Block(0)[BlockHeaderSize:], []byte("v1-content"))
+	h1.Unpin()
+
+	desc := bp.pageTable[1]
+	if desc.RedoLSN != 10 {
+		t.Fatalf("expected RedoLSN=10 after first modification, got %d", desc.RedoLSN)
+	}
+	if !desc.Dirty {
+		t.Fatalf("expected page 1 to be dirty")
+	}
+
+	// 2. First flush of page 1
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("first FlushPage failed: %v", err)
+	}
+	if desc.Dirty {
+		t.Fatalf("expected page 1 Dirty to clear after first flush")
+	}
+	if desc.RedoLSN != 10 {
+		t.Fatalf("expected RedoLSN=10 to be kept across first flush, got %d", desc.RedoLSN)
+	}
+
+	// 3. Second modification at LSN 20 before any fsync
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k", Payload: []byte("v2")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+	h1Again, err := bp.PinPage(1)
+	if err != nil {
+		t.Fatalf("PinPage failed: %v", err)
+	}
+	copy(h1Again.Block(0)[BlockHeaderSize:], []byte("v2-content"))
+	h1Again.Unpin()
+	bp.MarkDirty(1, 20)
+
+	if !desc.Dirty {
+		t.Fatalf("expected page 1 to be dirty after second modification")
+	}
+	if desc.RedoLSN != 10 {
+		t.Fatalf("expected RedoLSN=10 to remain unchanged after second modification, got %d", desc.RedoLSN)
+	}
+
+	// 4. Second flush of page 1 before any fsync
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("second FlushPage failed: %v", err)
+	}
+	if desc.Dirty {
+		t.Fatalf("expected page 1 Dirty to clear after second flush")
+	}
+	// Acceptance criterion: A test that a page flushed twice before any fsync keeps its first RedoLSN.
+	if desc.RedoLSN != 10 {
+		t.Fatalf("expected RedoLSN=10 after second flush before fsync, got %d", desc.RedoLSN)
+	}
+
+	// 5. Heap fsync occurs and succeeds
+	bp.startHeapSync()
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("heapSyncSucceeded failed: %v", err)
+	}
+
+	// 6. After fsync covering both flushes, RedoLSN clears to 0
+	if desc.RedoLSN != 0 {
+		t.Fatalf("expected RedoLSN=0 after heap sync covering second flush, got %d", desc.RedoLSN)
+	}
+}
+
+func TestBlockPool_FsyncSucceedsWhileLaterFlushInFlight(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	heapFile, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer func() {
+		if err := heapFile.Close(); err != nil {
+			t.Errorf("heapFile.Close failed: %v", err)
+		}
+	}()
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("redo-inflight-01"))
+
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer func() {
+		if err := wal.Close(); err != nil {
+			t.Errorf("wal.Close failed: %v", err)
+		}
+	}()
+
+	buddy := NewBuddyAllocator(512)
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 8})
+	defer func() {
+		if err := bp.Close(); err != nil {
+			t.Errorf("bp.Close failed: %v", err)
+		}
+	}()
+
+	// 1. Initial modification at LSN 10
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+	h1, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	copy(h1.Block(0)[BlockHeaderSize:], []byte("v1-content"))
+	h1.Unpin()
+
+	desc := bp.pageTable[1]
+	if desc.RedoLSN != 10 {
+		t.Fatalf("expected RedoLSN=10 after first modification, got %d", desc.RedoLSN)
+	}
+
+	// 2. Flush page 1 at LSN 10
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("first FlushPage failed: %v", err)
+	}
+	if desc.Dirty {
+		t.Fatalf("expected Dirty to clear after first flush")
+	}
+	if desc.RedoLSN != 10 {
+		t.Fatalf("expected RedoLSN=10 kept across first flush, got %d", desc.RedoLSN)
+	}
+
+	// 3. Start a heap fsync (rotates flush of LSN 10 into flushedPagesSyncing)
+	bp.startHeapSync()
+
+	// 4. Change page at LSN 20
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k", Payload: []byte("v2")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+	h1Again, err := bp.PinPage(1)
+	if err != nil {
+		t.Fatalf("PinPage failed: %v", err)
+	}
+	copy(h1Again.Block(0)[BlockHeaderSize:], []byte("v2-content"))
+	h1Again.Unpin()
+	bp.MarkDirty(1, 20)
+
+	// 5. Start a second flush and hold its write in the fault filesystem hook
+	secondFlushStarted := make(chan struct{})
+	allowSecondFlush := make(chan struct{})
+	secondFlushDone := make(chan struct{})
+	var secondFlushErr error
+
+	var once sync.Once
+	faultFS.SetBeforeWriteAt(func(path string, p []byte, off int64) {
+		if filepath.Base(path) == "heap.db" {
+			once.Do(func() {
+				close(secondFlushStarted)
+				<-allowSecondFlush
+			})
+		}
+	})
+
+	go func() {
+		secondFlushErr = bp.FlushPage(1)
+		close(secondFlushDone)
+	}()
+
+	<-secondFlushStarted
+
+	// Verify the second flush is in flight and covers LSN 20
+	bp.mu.Lock()
+	if !desc.InFlight || desc.flushingFirstLSN != 20 {
+		bp.mu.Unlock()
+		t.Fatalf("expected InFlight=true and flushingFirstLSN=20, got InFlight=%v, flushingFirstLSN=%d",
+			desc.InFlight, desc.flushingFirstLSN)
+	}
+	bp.mu.Unlock()
+
+	// 6. Change the page at LSN 30 while the second flush is in flight
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 30, Key: "k", Payload: []byte("v3")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+	bp.MarkDirty(1, 30)
+
+	bp.mu.Lock()
+	if desc.DirtyLSN != 30 {
+		bp.mu.Unlock()
+		t.Fatalf("expected DirtyLSN=30 for change during in-flight flush, got %d", desc.DirtyLSN)
+	}
+	bp.mu.Unlock()
+
+	// 7. The fsync succeeds while the second flush is still in flight
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("heapSyncSucceeded failed: %v", err)
+	}
+
+	// 8. Verify RedoLSN is 20 (from flushingFirstLSN), NOT 30 (DirtyLSN)
+	bp.mu.Lock()
+	if desc.RedoLSN != 20 {
+		bp.mu.Unlock()
+		t.Fatalf("expected RedoLSN=20 (in-flight flush's first LSN), got %d", desc.RedoLSN)
+	}
+	bp.mu.Unlock()
+
+	// 9. Verify DirtyPageTableAndLSN reports 20 for the page
+	dpt, _ := bp.DirtyPageTableAndLSN()
+	if dpt[1] != 20 {
+		t.Fatalf("expected DirtyPageTableAndLSN to report 20, got %d", dpt[1])
+	}
+
+	// 10. Complete the in-flight flush
+	close(allowSecondFlush)
+	<-secondFlushDone
+	if secondFlushErr != nil {
+		t.Fatalf("second FlushPage failed: %v", secondFlushErr)
+	}
+
+	bp.mu.Lock()
+	if desc.RedoLSN != 20 {
+		bp.mu.Unlock()
+		t.Fatalf("expected RedoLSN=20 after in-flight flush completes, got %d", desc.RedoLSN)
+	}
+	bp.mu.Unlock()
+
+	// 11. Next fsync succeeds, advancing RedoLSN to 30 (since change 30 arrived while flush 2 was in flight)
+	bp.startHeapSync()
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("heapSyncSucceeded failed: %v", err)
+	}
+
+	bp.mu.Lock()
+	if desc.RedoLSN != 30 {
+		bp.mu.Unlock()
+		t.Fatalf("expected RedoLSN=30 after second fsync, got %d", desc.RedoLSN)
+	}
+	bp.mu.Unlock()
 }
