@@ -23,8 +23,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -377,6 +379,18 @@ func isOwnedByGateway(obj metav1.Object, gw *gatewayv1.Gateway) bool {
 		return false
 	}
 	return ref.Kind == "Gateway" && ref.Name == gw.Name && gw.UID != "" && ref.UID == gw.UID
+}
+
+func isPodReady(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func buildLabelsAndAnnotations(gw *gatewayv1.Gateway) (map[string]string, map[string]string) {
@@ -1051,14 +1065,113 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	if p.useHostPorts {
-		message := "Waiting for data-plane deployment to become available"
-		if deployReady {
-			message = "Waiting for node address to be assigned to host-port Gateway"
+		var podList corev1.PodList
+		if err := p.client.List(ctx, &podList, client.InNamespace(gwNamespace), client.MatchingLabels{
+			LabelGatewayName: labelGwName,
+			LabelAppName:     AppNameValue,
+		}); err != nil {
+			return nil, state.GatewayReadiness{}, fmt.Errorf("listing data-plane pods for Gateway %s/%s: %w", gwNamespace, gw.Name, err)
 		}
-		return nil, state.GatewayReadiness{
-			Ready:   false,
-			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
-			Message: message,
+
+		var selectedPod *corev1.Pod
+		for i := range podList.Items {
+			pod := &podList.Items[i]
+			if selectedPod == nil {
+				selectedPod = pod
+				continue
+			}
+			if selectedPod.DeletionTimestamp != nil && pod.DeletionTimestamp == nil {
+				selectedPod = pod
+				continue
+			}
+			if selectedPod.DeletionTimestamp == nil && pod.DeletionTimestamp != nil {
+				continue
+			}
+			if selectedPod.Spec.NodeName == "" && pod.Spec.NodeName != "" {
+				selectedPod = pod
+				continue
+			}
+			if selectedPod.Spec.NodeName != "" && pod.Spec.NodeName == "" {
+				continue
+			}
+			if pod.CreationTimestamp.After(selectedPod.CreationTimestamp.Time) {
+				selectedPod = pod
+			}
+		}
+
+		if selectedPod != nil && isPodReady(selectedPod) {
+			deployReady = true
+		}
+
+		if selectedPod == nil || selectedPod.Spec.NodeName == "" {
+			message := "Waiting for data-plane deployment to become available"
+			if deployReady {
+				message = "Waiting for node address to be assigned to host-port Gateway"
+			}
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+				Message: message,
+			}, nil
+		}
+
+		var node corev1.Node
+		if err := p.client.Get(ctx, types.NamespacedName{Name: selectedPod.Spec.NodeName}, &node); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, state.GatewayReadiness{
+					Ready:   false,
+					Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+					Message: fmt.Sprintf("Node %s not found", selectedPod.Spec.NodeName),
+				}, nil
+			}
+			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Node %s for Gateway %s/%s: %w", selectedPod.Spec.NodeName, gwNamespace, gw.Name, err)
+		}
+
+		var internalIPs []string
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+				internalIPs = append(internalIPs, strings.TrimSpace(addr.Address))
+			}
+		}
+
+		if len(internalIPs) == 0 {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+				Message: fmt.Sprintf("Node %s has no NodeInternalIP addresses", selectedPod.Spec.NodeName),
+			}, nil
+		}
+
+		slices.SortFunc(internalIPs, func(a, b string) int {
+			ipa, errA := netip.ParseAddr(a)
+			ipb, errB := netip.ParseAddr(b)
+			if errA == nil && errB == nil {
+				return ipa.Compare(ipb)
+			}
+			return strings.Compare(a, b)
+		})
+		internalIPs = slices.Compact(internalIPs)
+
+		var addresses []gatewayv1.GatewayStatusAddress
+		for _, ip := range internalIPs {
+			addresses = append(addresses, gatewayv1.GatewayStatusAddress{
+				Type:  state.Ptr(gatewayv1.IPAddressType),
+				Value: ip,
+			})
+		}
+
+		if !deployReady {
+			return addresses, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonPending),
+				Message: "Waiting for data-plane deployment to become available",
+			}, nil
+		}
+
+		return addresses, state.GatewayReadiness{
+			Ready:   true,
+			Reason:  string(gatewayv1.GatewayReasonProgrammed),
+			Message: "Gateway programmed by reference implementation",
 		}, nil
 	}
 

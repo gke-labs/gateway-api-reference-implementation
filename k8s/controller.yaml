@@ -31,6 +31,10 @@ rules:
 - apiGroups: ["discovery.k8s.io"]
   resources: ["endpointslices"]
   verbs: ["get", "list", "watch"]
+# Node read access is required for the singlepod address provider with host ports to resolve the data-plane pod's node address.
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status", "tlsroutes/status", "grpcroutes/status", "tcproutes/status", "udproutes/status"]
   verbs: ["update", "patch"]
