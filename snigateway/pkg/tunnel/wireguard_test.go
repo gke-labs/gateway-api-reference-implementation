@@ -424,8 +424,11 @@ func (f *wireguardFixture) cleanup(t *testing.T) {
 		}
 	}
 	f.clientConnsMu.Lock()
-	for _, c := range f.clientConns {
-		_ = c.Close()
+	for _, conn := range f.clientConns {
+		// Most recorded client connections are already closed by this point; ignore net.ErrClosed.
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("client connection Close error: %v", err)
+		}
 	}
 	f.clientConnsMu.Unlock()
 	if err := f.server.Close(); err != nil {
