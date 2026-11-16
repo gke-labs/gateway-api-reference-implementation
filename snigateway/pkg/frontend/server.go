@@ -444,6 +444,11 @@ func (s *Server) handleHTTPConnection(conn net.Conn) {
 	s.routeToBackend(hostname, peekedConn)
 }
 
+var (
+	errHostNotRegistered = errors.New("host not registered")
+	errNoWireGuardPeer   = errors.New("session has no WireGuard peer")
+)
+
 func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 	cleanHost := CleanHostname(hostname)
 
@@ -497,13 +502,8 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 	}
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
-		now := time.Now()
-		if now.After(deadline) {
-			if s.dialLogLimiter.Allow() {
-				klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-			}
-			closeCloser(peekedConn)
-			return
+		if time.Now().After(deadline) {
+			break
 		}
 
 		remaining := time.Until(deadline)
@@ -512,15 +512,19 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 			attemptTimeout = remaining
 		}
 
-		sessions := s.table.MatchSessions(cleanHost)
-		if len(sessions) == 0 {
+		conn, initialBytes, err := s.attemptBackend(hostname, cleanHost, proxyBytes, peekedBytes, attemptTimeout)
+		if err == nil {
+			committedTunnel = conn
+			initialBackendBytes = initialBytes
+			break
+		}
+
+		if errors.Is(err, errHostNotRegistered) {
 			log.Printf("Frontend: rejecting connection with host %q (clean: %q): not registered", hostname, cleanHost)
 			closeCloser(peekedConn)
 			return
 		}
-
-		targetSession, peerAddress, ok := s.findWireGuardPeer(sessions)
-		if !ok {
+		if errors.Is(err, errNoWireGuardPeer) {
 			if s.dialLogLimiter.Allow() {
 				klog.Errorf("Frontend: session for host %q has no WireGuard peer", hostname)
 			}
@@ -528,114 +532,25 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 			return
 		}
 
-		attemptDeadline := time.Now().Add(attemptTimeout)
-		tunnelDialTimeout := DefaultTunnelDialTimeout
-		if remainingAttempt := time.Until(attemptDeadline); remainingAttempt < tunnelDialTimeout {
-			tunnelDialTimeout = remainingAttempt
-		}
-		dialCtx, cancel := context.WithTimeout(context.Background(), tunnelDialTimeout)
-		tunnelAddress := net.JoinHostPort(peerAddress.String(), strconv.Itoa(api.WireGuardTunnelPort))
-		conn, err := s.dialContext(dialCtx, "tcp", tunnelAddress)
-		cancel()
-		if err != nil {
-			s.logDialError(targetSession, tunnelAddress, err)
-			if attempts+1 < maxAttempts && !waitBeforeRetry() {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
+		if attempts+1 < maxAttempts {
+			if !waitBeforeRetry() {
+				break
 			}
-			continue
 		}
-
-		tunnelConn := conn
-		setTCPKeepAlive(tunnelConn)
-
-		dropConnAndPace := func() bool {
-			closeCloser(tunnelConn)
-			if attempts+1 < maxAttempts {
-				return waitBeforeRetry()
-			}
-			return false
-		}
-
-		// Set write deadline for PROXY header + peeked bytes
-		if err := tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout)); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-		if _, err := tunnelConn.Write(proxyBytes); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-		if _, err := tunnelConn.Write(peekedBytes); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-
-		// Set read deadline to wait for the first byte from the backend
-		if err := tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout)); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-		buffer := make([]byte, 4096)
-		n, err := tunnelConn.Read(buffer)
-		if err != nil || n == 0 {
-			// Failed or unresponsive backend/tunnel connection; drop and replay on next attempt
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-
-		// First byte received from backend! Clear deadlines and commit splice
-		if err := tunnelConn.SetDeadline(time.Time{}); err != nil {
-			if !dropConnAndPace() && attempts+1 < maxAttempts {
-				if s.dialLogLimiter.Allow() {
-					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
-				}
-				closeCloser(peekedConn)
-				return
-			}
-			continue
-		}
-		committedTunnel = tunnelConn
-		initialBackendBytes = buffer[:n]
-		break
 	}
 
 	if committedTunnel == nil {
 		if s.dialLogLimiter.Allow() {
-			klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+			select {
+			case <-s.shutdownCh:
+				klog.Errorf("Frontend: server shutting down while routing host %q", hostname)
+			default:
+				if time.Now().After(deadline) {
+					klog.Errorf("Frontend: connect timeout reached for host %q: tunnel did not answer", hostname)
+				} else {
+					klog.Errorf("Frontend: maximum tunnel attempts reached for host %q: tunnel did not answer", hostname)
+				}
+			}
 		}
 		closeCloser(peekedConn)
 		return
@@ -649,6 +564,69 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 	}
 
 	spliceConnections(rawClientConn, committedTunnel, s.config.IdleTimeout)
+}
+
+func (s *Server) attemptBackend(hostname, cleanHost string, proxyBytes, peekedBytes []byte, attemptTimeout time.Duration) (net.Conn, []byte, error) {
+	sessions := s.table.MatchSessions(cleanHost)
+	if len(sessions) == 0 {
+		return nil, nil, errHostNotRegistered
+	}
+
+	targetSession, peerAddress, ok := s.findWireGuardPeer(sessions)
+	if !ok {
+		return nil, nil, errNoWireGuardPeer
+	}
+
+	attemptDeadline := time.Now().Add(attemptTimeout)
+	tunnelDialTimeout := DefaultTunnelDialTimeout
+	if remainingAttempt := time.Until(attemptDeadline); remainingAttempt < tunnelDialTimeout {
+		tunnelDialTimeout = remainingAttempt
+	}
+	dialCtx, cancel := context.WithTimeout(context.Background(), tunnelDialTimeout)
+	tunnelAddress := net.JoinHostPort(peerAddress.String(), strconv.Itoa(api.WireGuardTunnelPort))
+	conn, err := s.dialContext(dialCtx, "tcp", tunnelAddress)
+	cancel()
+	if err != nil {
+		s.logDialError(targetSession, tunnelAddress, err)
+		return nil, nil, err
+	}
+
+	tunnelConn := conn
+	setTCPKeepAlive(tunnelConn)
+
+	if err := tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout)); err != nil {
+		closeCloser(tunnelConn)
+		return nil, nil, err
+	}
+	if _, err := tunnelConn.Write(proxyBytes); err != nil {
+		closeCloser(tunnelConn)
+		return nil, nil, err
+	}
+	if _, err := tunnelConn.Write(peekedBytes); err != nil {
+		closeCloser(tunnelConn)
+		return nil, nil, err
+	}
+
+	if err := tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout)); err != nil {
+		closeCloser(tunnelConn)
+		return nil, nil, err
+	}
+	buffer := make([]byte, 4096)
+	n, err := tunnelConn.Read(buffer)
+	if err != nil || n == 0 {
+		closeCloser(tunnelConn)
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, nil, err
+	}
+
+	if err := tunnelConn.SetDeadline(time.Time{}); err != nil {
+		closeCloser(tunnelConn)
+		return nil, nil, err
+	}
+
+	return tunnelConn, buffer[:n], nil
 }
 
 func isNormalClose(err error) bool {
