@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
@@ -39,6 +40,8 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -46,6 +49,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
@@ -297,6 +301,27 @@ type Options struct {
 	// ACMEChallengeTokenPath is the path to the projected service-account token file for data-plane identity.
 	ACMEChallengeTokenPath string
 
+	// PushBindAddress is the address the configuration push stream gRPC server binds to.
+	// Defaults to "" (disabled). Ignored if PushListener is provided.
+	PushBindAddress string
+
+	// PushTLSCertFile is the path to the TLS server certificate file for the push server.
+	PushTLSCertFile string
+
+	// PushTLSKeyFile is the path to the TLS server private key file for the push server.
+	PushTLSKeyFile string
+
+	// PushTLSConfig is an optional custom TLS configuration for the push server.
+	PushTLSConfig *tls.Config
+
+	// PushListener is an optional custom net.Listener for the push server.
+	// If set, PushBindAddress is ignored.
+	PushListener net.Listener
+
+	// PushTokenReviewer is an optional custom token reviewer for the push server.
+	// If nil and push is enabled, a KubeTokenReviewer is created using Kubernetes client.
+	PushTokenReviewer push.TokenReviewer
+
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
 	// is created, allowing callers to register additional reconcilers or runnables before
 	// the manager starts. If non-nil, it is passed the manager and the GARI Server.
@@ -372,6 +397,8 @@ type Server struct {
 	manager ctrl.Manager
 	state   *state.State
 	proxy   *proxy.Proxy
+
+	pushServer *push.Server
 
 	proxySynced atomic.Bool
 
@@ -606,6 +633,35 @@ func New(opts Options) (*Server, error) {
 		if err := s.opts.SetupWithManager(mgr, s); err != nil {
 			return nil, fmt.Errorf("custom SetupWithManager failed: %w", err)
 		}
+	}
+
+	if !opts.DataplaneMode && (opts.PushListener != nil || opts.PushBindAddress != "") {
+		tokenReviewer := opts.PushTokenReviewer
+		if tokenReviewer == nil {
+			cfg := opts.RestConfig
+			if cfg == nil && mgr != nil {
+				cfg = mgr.GetConfig()
+			}
+			if cfg == nil {
+				var err error
+				cfg, err = ctrl.GetConfig()
+				if err != nil {
+					return nil, fmt.Errorf("unable to get kubeconfig for push server: %w", err)
+				}
+			}
+			clientset, err := kubernetes.NewForConfig(cfg)
+			if err != nil {
+				return nil, fmt.Errorf("creating kubernetes clientset for push server: %w", err)
+			}
+			tokenReviewer = push.NewKubeTokenReviewer(clientset.AuthenticationV1().TokenReviews(), push.DefaultAudience)
+		}
+		pushServer, err := push.NewServer(push.ServerOptions{
+			TokenReviewer: tokenReviewer,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("creating push server: %w", err)
+		}
+		s.pushServer = pushServer
 	}
 
 	return s, nil
@@ -1089,13 +1145,68 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 	return g.Wait()
 }
 
-// Start starts both the proxy servers and the controller manager, running until ctx is canceled.
+// PushServer returns the configuration push Server if one was configured.
+func (s *Server) PushServer() *push.Server {
+	return s.pushServer
+}
+
+// StartPushServer starts the configuration push gRPC server and blocks until ctx is canceled.
+func (s *Server) StartPushServer(ctx context.Context) error {
+	if s.pushServer == nil {
+		return nil
+	}
+
+	var listener net.Listener
+	var grpcOptions []grpc.ServerOption
+
+	if s.opts.PushListener != nil {
+		listener = s.opts.PushListener
+		if s.opts.PushTLSConfig != nil {
+			grpcOptions = append(grpcOptions, grpc.Creds(credentials.NewTLS(s.opts.PushTLSConfig)))
+		}
+	} else if s.opts.PushBindAddress != "" {
+		tlsConfig := s.opts.PushTLSConfig
+		if tlsConfig == nil {
+			if s.opts.PushTLSCertFile == "" || s.opts.PushTLSKeyFile == "" {
+				return errors.New("TLS configuration required for push server; plaintext and self-signed certificates are not permitted")
+			}
+			cert, err := tls.LoadX509KeyPair(s.opts.PushTLSCertFile, s.opts.PushTLSKeyFile)
+			if err != nil {
+				return fmt.Errorf("loading TLS key pair for push server: %w", err)
+			}
+			tlsConfig = &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				MinVersion:   tls.VersionTLS12,
+			}
+		}
+		grpcOptions = append(grpcOptions, grpc.Creds(credentials.NewTLS(tlsConfig)))
+
+		var err error
+		listener, err = net.Listen("tcp", s.opts.PushBindAddress)
+		if err != nil {
+			return fmt.Errorf("listening on push bind address %q: %w", s.opts.PushBindAddress, err)
+		}
+	} else {
+		return nil
+	}
+
+	setupLog.Info("starting configuration push server", "addr", listener.Addr().String())
+	return s.pushServer.Serve(ctx, listener, grpcOptions...)
+}
+
+// Start starts the proxy servers, push server, and controller manager, running until ctx is canceled.
 func (s *Server) Start(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		return s.StartProxyServers(ctx)
 	})
+
+	if s.pushServer != nil && (s.opts.PushListener != nil || s.opts.PushBindAddress != "") {
+		g.Go(func() error {
+			return s.StartPushServer(ctx)
+		})
+	}
 
 	if s.manager != nil {
 		g.Go(func() error {

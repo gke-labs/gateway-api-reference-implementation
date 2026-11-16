@@ -16,24 +16,25 @@ package push
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	authenticationv1client "k8s.io/client-go/kubernetes/typed/authentication/v1"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -47,182 +48,210 @@ const (
 	MaxMessageBytes = MaxConfigMessageBytes + 1024*1024
 )
 
-// TokenReviewer verifies a projected ServiceAccount token and returns the caller's namespace and ServiceAccount.
+// TokenReviewer verifies a projected ServiceAccount token and returns the caller's namespace and ServiceAccount name.
 type TokenReviewer interface {
-	ReviewToken(ctx context.Context, token string) (namespace, serviceAccount string, err error)
+	ReviewToken(ctx context.Context, token string) (callerNamespace, callerServiceAccount string, err error)
 }
 
-// TokenReviewFunc adapts an ordinary function to the TokenReviewer interface.
-type TokenReviewFunc func(ctx context.Context, token string) (string, string, error)
-
-func (f TokenReviewFunc) ReviewToken(ctx context.Context, token string) (string, string, error) {
-	return f(ctx, token)
+// KubeTokenReviewer validates projected ServiceAccount tokens against the Kubernetes TokenReview API.
+type KubeTokenReviewer struct {
+	// client is the Kubernetes TokenReviews API client.
+	client authenticationv1client.TokenReviewInterface
+	// audience is the expected audience for projected tokens.
+	audience string
 }
 
-// ParseServiceAccount parses a Kubernetes service account username ("system:serviceaccount:<ns>:<sa>" or "<ns>/<sa>").
-func ParseServiceAccount(username string) (string, string, error) {
-	const prefix = "system:serviceaccount:"
-	if strings.HasPrefix(username, prefix) {
-		rest := strings.TrimPrefix(username, prefix)
-		ns, sa, ok := strings.Cut(rest, ":")
-		if !ok || ns == "" || sa == "" {
-			return "", "", fmt.Errorf("malformed service account username %q", username)
-		}
-		return ns, sa, nil
+// NewKubeTokenReviewer creates a new KubeTokenReviewer for the specified client and audience.
+// If audience is empty, DefaultAudience is used.
+func NewKubeTokenReviewer(client authenticationv1client.TokenReviewInterface, audience string) *KubeTokenReviewer {
+	if audience == "" {
+		audience = DefaultAudience
 	}
-	if ns, sa, ok := strings.Cut(username, "/"); ok && ns != "" && sa != "" {
-		return ns, sa, nil
+	return &KubeTokenReviewer{
+		client:   client,
+		audience: audience,
 	}
-	return "", "", fmt.Errorf("invalid service account username %q", username)
 }
 
-// ReplyType indicates whether a reply is an ACK or NACK.
-type ReplyType string
+// ReviewToken submits a TokenReview to the Kubernetes API and extracts the caller's namespace and ServiceAccount.
+func (reviewer *KubeTokenReviewer) ReviewToken(ctx context.Context, token string) (string, string, error) {
+	if reviewer.client == nil {
+		return "", "", errors.New("kubernetes TokenReview client is not configured")
+	}
 
-const (
-	ReplyTypeAck  ReplyType = "ACK"
-	ReplyTypeNack ReplyType = "NACK"
-)
+	review := &authenticationv1.TokenReview{
+		Spec: authenticationv1.TokenReviewSpec{
+			Token:     token,
+			Audiences: []string{reviewer.audience},
+		},
+	}
 
-// Reply records the last ACK or NACK received from a data plane.
-type Reply struct {
-	Type            ReplyType
-	AppliedRevision string
-	Revision        string
-	Reason          string
+	result, err := reviewer.client.Create(ctx, review, metav1.CreateOptions{})
+	if err != nil {
+		return "", "", fmt.Errorf("creating token review: %w", err)
+	}
+	if result.Status.Error != "" {
+		return "", "", fmt.Errorf("token review status error: %s", result.Status.Error)
+	}
+	if !result.Status.Authenticated {
+		return "", "", errors.New("token is not authenticated")
+	}
+
+	username := result.Status.User.Username
+	const serviceAccountPrefix = "system:serviceaccount:"
+	if !strings.HasPrefix(username, serviceAccountPrefix) {
+		return "", "", fmt.Errorf("user %q is not a service account", username)
+	}
+	rest := strings.TrimPrefix(username, serviceAccountPrefix)
+	callerNamespace, callerServiceAccount, ok := strings.Cut(rest, ":")
+	if !ok || callerNamespace == "" || callerServiceAccount == "" {
+		return "", "", fmt.Errorf("malformed service account username %q", username)
+	}
+
+	return callerNamespace, callerServiceAccount, nil
 }
 
 // ServerOptions configures the push Server.
 type ServerOptions struct {
-	TokenReviewer          TokenReviewer
-	State                  *state.State
-	Downstream             state.DataplanePublisher
-	MaxStreamsPerGateway   int
-	ResourceNameForGateway func(gwName string) string
+	// TokenReviewer is the required token reviewer used to authenticate data planes.
+	TokenReviewer TokenReviewer
+
+	// MaxStreamsPerGateway is the maximum number of concurrent streams allowed for a single Gateway.
+	// If <= 0, DefaultMaxStreamsPerGateway is used.
+	MaxStreamsPerGateway int
 }
 
+// activeStream represents a connected data plane stream.
 type activeStream struct {
-	ch   chan *ControllerMessage
+	// done signals when the active stream is terminating.
 	done chan struct{}
 }
 
-// Server implements PushServiceServer and state.DataplanePublisher.
+// Server implements PushServiceServer for configuration push.
 type Server struct {
 	UnimplementedPushServiceServer
 
-	tokenReviewer          TokenReviewer
-	state                  *state.State
-	downstream             state.DataplanePublisher
-	maxStreamsPerGateway   int
-	resourceNameForGateway func(string) string
+	// tokenReviewer verifies incoming ServiceAccount tokens against the TokenReview API.
+	tokenReviewer TokenReviewer
 
-	mu          sync.Mutex
-	nextConnID  uint64
-	configs     map[types.NamespacedName]*state.DataplaneConfig
-	streams     map[types.NamespacedName]map[*activeStream]struct{}
-	connReplies map[uint64]Reply
-	gwReplies   map[types.NamespacedName]Reply
-	allReplies  []Reply
+	// maxStreamsPerGateway bounds the number of concurrent streams permitted for one Gateway.
+	maxStreamsPerGateway int
+
+	// mu guards streams.
+	mu sync.Mutex
+
+	// streams tracks active streams grouped by Gateway namespace and name.
+	streams map[types.NamespacedName]map[*activeStream]struct{}
 }
 
 var _ PushServiceServer = (*Server)(nil)
-var _ state.DataplanePublisher = (*Server)(nil)
 
 // NewServer creates a new push configuration Server.
-func NewServer(opts ServerOptions) *Server {
-	maxStreams := opts.MaxStreamsPerGateway
+// tokenReviewer is required; if nil, an error is returned.
+func NewServer(options ServerOptions) (*Server, error) {
+	if options.TokenReviewer == nil {
+		return nil, errors.New("TokenReviewer is required")
+	}
+	maxStreams := options.MaxStreamsPerGateway
 	if maxStreams <= 0 {
 		maxStreams = DefaultMaxStreamsPerGateway
 	}
-	resNameFn := opts.ResourceNameForGateway
-	if resNameFn == nil {
-		resNameFn = singlepod.ResourceNameForGateway
-	}
 	return &Server{
-		tokenReviewer:          opts.TokenReviewer,
-		state:                  opts.State,
-		downstream:             opts.Downstream,
-		maxStreamsPerGateway:   maxStreams,
-		resourceNameForGateway: resNameFn,
-		configs:                make(map[types.NamespacedName]*state.DataplaneConfig),
-		streams:                make(map[types.NamespacedName]map[*activeStream]struct{}),
-		connReplies:            make(map[uint64]Reply),
-		gwReplies:              make(map[types.NamespacedName]Reply),
-	}
+		tokenReviewer:        options.TokenReviewer,
+		maxStreamsPerGateway: maxStreams,
+		streams:              make(map[types.NamespacedName]map[*activeStream]struct{}),
+	}, nil
 }
 
-// DefaultServerOptions returns gRPC server options with receive/send limits raised to cover config payloads.
+// DefaultServerOptions returns gRPC server options with keepalive settings and raised message limits.
+// The total number of streams across all Gateways is not bounded by this server and is left to the listener,
+// while per-Gateway streams are bounded by MaxStreamsPerGateway.
 func DefaultServerOptions() []grpc.ServerOption {
 	return []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(MaxMessageBytes),
 		grpc.MaxSendMsgSize(MaxMessageBytes),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 15 * time.Minute,
+			Time:              2 * time.Minute,
+			Timeout:           20 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             30 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	}
 }
 
 // GRPCServer creates and returns a *grpc.Server with DefaultServerOptions and this service registered.
-func (s *Server) GRPCServer(opt ...grpc.ServerOption) *grpc.Server {
-	opts := append(DefaultServerOptions(), opt...)
-	srv := grpc.NewServer(opts...)
-	RegisterPushServiceServer(srv, s)
-	return srv
+func (server *Server) GRPCServer(options ...grpc.ServerOption) *grpc.Server {
+	mergedOptions := append(DefaultServerOptions(), options...)
+	grpcServer := grpc.NewServer(mergedOptions...)
+	RegisterPushServiceServer(grpcServer, server)
+	return grpcServer
 }
 
-// Serve runs the gRPC server on lis until ctx is canceled.
-func (s *Server) Serve(ctx context.Context, lis net.Listener, opt ...grpc.ServerOption) error {
-	srv := s.GRPCServer(opt...)
-	errCh := make(chan error, 1)
+// Serve runs the gRPC server on the given listener until the context is canceled.
+// When ctx is canceled, a bounded graceful shutdown is performed: streams are given
+// 5 seconds to drain before forceful termination via Stop.
+func (server *Server) Serve(ctx context.Context, listener net.Listener, options ...grpc.ServerOption) error {
+	grpcServer := server.GRPCServer(options...)
+	serverStopped := make(chan struct{})
+
 	go func() {
-		if err := srv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-			errCh <- err
+		select {
+		case <-ctx.Done():
+			const shutdownTimeout = 5 * time.Second
+			timer := time.AfterFunc(shutdownTimeout, func() {
+				grpcServer.Stop()
+			})
+			grpcServer.GracefulStop()
+			timer.Stop()
+		case <-serverStopped:
 		}
-		close(errCh)
 	}()
 
-	select {
-	case <-ctx.Done():
-		srv.GracefulStop()
+	err := grpcServer.Serve(listener)
+	close(serverStopped)
+	if errors.Is(err, grpc.ErrServerStopped) {
 		return nil
-	case err := <-errCh:
-		return err
 	}
+	return err
 }
 
-// ListenAndServe listens on addr with TLS and serves until ctx is canceled.
-func (s *Server) ListenAndServe(ctx context.Context, addr string, tlsConfig *tls.Config) error {
-	if tlsConfig == nil {
-		return errors.New("tlsConfig must not be nil")
-	}
-	creds := credentials.NewTLS(tlsConfig)
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-	return s.Serve(ctx, lis, grpc.Creds(creds))
+// ActiveStreams returns the number of active streams currently connected for the given Gateway.
+func (server *Server) ActiveStreams(gatewayKey types.NamespacedName) int {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	return len(server.streams[gatewayKey])
 }
 
-// StreamConfig handles bidirectional streaming configuration push.
-func (s *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMessage, ControllerMessage]) error {
+// StreamConfig establishes a bidirectional stream with a data plane.
+// A data plane stream is authenticated once when the stream opens using its projected
+// ServiceAccount token. If the projected token expires while the stream is open, the
+// existing stream remains active; token expiration is enforced when the stream reconnects.
+func (server *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMessage, ControllerMessage]) error {
 	ctx := stream.Context()
+	logger := klog.FromContext(ctx)
 
 	// 1. Authentication
 	token := extractToken(ctx)
 	if token == "" {
-		return status.Errorf(codes.Unauthenticated, "missing service account token")
+		logger.Error(errors.New("missing or invalid authorization header"), "authentication failed")
+		return status.Errorf(codes.Unauthenticated, "authentication failed")
 	}
-	if s.tokenReviewer == nil {
-		return status.Errorf(codes.Internal, "token reviewer not configured")
-	}
-	callerNS, callerSA, err := s.tokenReviewer.ReviewToken(ctx, token)
+
+	callerNamespace, callerServiceAccount, err := server.tokenReviewer.ReviewToken(ctx, token)
 	if err != nil {
-		return status.Errorf(codes.Unauthenticated, "authentication failed: %v", err)
+		logger.Error(err, "authentication failed")
+		return status.Errorf(codes.Unauthenticated, "authentication failed")
 	}
 
 	// 2. Initial Hello
-	firstMsg, err := stream.Recv()
+	firstMessage, err := stream.Recv()
 	if err != nil {
 		return err
 	}
-	hello := firstMsg.GetHello()
+	hello := firstMessage.GetHello()
 	if hello == nil {
 		return status.Errorf(codes.InvalidArgument, "first message must be Hello")
 	}
@@ -231,262 +260,67 @@ func (s *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMessage, 
 	}
 
 	// 3. Scoping check
-	expectedSA := s.resourceNameForGateway(hello.GatewayName)
-	if callerNS != hello.GatewayNamespace || callerSA != expectedSA {
-		return status.Errorf(codes.PermissionDenied, "caller %s/%s is not authorized for gateway %s/%s", callerNS, callerSA, hello.GatewayNamespace, hello.GatewayName)
+	expectedServiceAccount := singlepod.ResourceNameForGateway(hello.GatewayName)
+	if callerNamespace != hello.GatewayNamespace || callerServiceAccount != expectedServiceAccount {
+		logger.Error(fmt.Errorf("caller %s/%s does not match expected %s/%s", callerNamespace, callerServiceAccount, hello.GatewayNamespace, expectedServiceAccount), "permission denied")
+		return status.Errorf(codes.PermissionDenied, "permission denied")
 	}
 
 	// 4. Stream limits and registration
-	gwKey := types.NamespacedName{Namespace: hello.GatewayNamespace, Name: hello.GatewayName}
-	s.mu.Lock()
-	if len(s.streams[gwKey]) >= s.maxStreamsPerGateway {
-		s.mu.Unlock()
-		return status.Errorf(codes.ResourceExhausted, "stream limit exceeded for gateway %s", gwKey)
+	gatewayKey := types.NamespacedName{Namespace: hello.GatewayNamespace, Name: hello.GatewayName}
+	server.mu.Lock()
+	if len(server.streams[gatewayKey]) >= server.maxStreamsPerGateway {
+		server.mu.Unlock()
+		return status.Errorf(codes.ResourceExhausted, "stream limit exceeded for gateway %s", gatewayKey)
 	}
-	connID := s.nextConnID
-	s.nextConnID++
-	active := &activeStream{
-		ch:   make(chan *ControllerMessage, 16),
+
+	streamHandle := &activeStream{
 		done: make(chan struct{}),
 	}
-	if s.streams[gwKey] == nil {
-		s.streams[gwKey] = make(map[*activeStream]struct{})
+	if server.streams[gatewayKey] == nil {
+		server.streams[gatewayKey] = make(map[*activeStream]struct{})
 	}
-	s.streams[gwKey][active] = struct{}{}
-
-	// Check current config
-	cfg := s.configs[gwKey]
-	if cfg == nil && s.state != nil {
-		cfg = s.state.GetDataplaneConfig(gwKey)
-	}
-	var initialMsg *ControllerMessage
-	if cfg != nil && cfg.Revision != "" && cfg.Revision != hello.AppliedRevision {
-		initialMsg, err = buildConfigMessage(cfg)
-		if err != nil {
-			delete(s.streams[gwKey], active)
-			if len(s.streams[gwKey]) == 0 {
-				delete(s.streams, gwKey)
-			}
-			s.mu.Unlock()
-			return fmt.Errorf("building initial config message: %w", err)
-		}
-	}
-	s.mu.Unlock()
-
-	var closeOnce sync.Once
-	closeActive := func() {
-		closeOnce.Do(func() {
-			close(active.done)
-		})
-	}
+	server.streams[gatewayKey][streamHandle] = struct{}{}
+	server.mu.Unlock()
 
 	defer func() {
-		closeActive()
-		s.mu.Lock()
-		delete(s.streams[gwKey], active)
-		if len(s.streams[gwKey]) == 0 {
-			delete(s.streams, gwKey)
+		close(streamHandle.done)
+		server.mu.Lock()
+		delete(server.streams[gatewayKey], streamHandle)
+		if len(server.streams[gatewayKey]) == 0 {
+			delete(server.streams, gatewayKey)
 		}
-		s.mu.Unlock()
+		server.mu.Unlock()
 	}()
 
-	if initialMsg != nil {
-		active.ch <- initialMsg
-	}
-
-	// Sender goroutine
-	sendErrCh := make(chan error, 1)
-	go func() {
-		for {
-			select {
-			case <-active.done:
-				sendErrCh <- nil
-				return
-			case <-ctx.Done():
-				sendErrCh <- ctx.Err()
-				return
-			case msg := <-active.ch:
-				if err := stream.Send(msg); err != nil {
-					sendErrCh <- err
-					return
-				}
-			}
-		}
-	}()
-
-	// Receiver loop
-	var recvErr error
+	// 5. Message loop: read and enforce protocol rules until connection terminates.
 	for {
-		msg, err := stream.Recv()
+		message, err := stream.Recv()
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				recvErr = err
+			if errors.Is(err, io.EOF) {
+				return nil
 			}
-			break
-		}
-		if msg.GetHello() != nil {
-			recvErr = status.Errorf(codes.InvalidArgument, "unexpected second Hello message")
-			break
-		}
-		if ack := msg.GetAck(); ack != nil {
-			s.recordReply(connID, gwKey, Reply{
-				Type:            ReplyTypeAck,
-				AppliedRevision: ack.AppliedRevision,
-			})
-		} else if nack := msg.GetNack(); nack != nil {
-			reason := nack.Reason
-			if len(reason) > MaxNACKReasonBytes {
-				reason = reason[:MaxNACKReasonBytes]
-			}
-			s.recordReply(connID, gwKey, Reply{
-				Type:     ReplyTypeNack,
-				Revision: nack.Revision,
-				Reason:   reason,
-			})
-		}
-	}
-
-	closeActive()
-	sendErr := <-sendErrCh
-	if recvErr != nil {
-		return recvErr
-	}
-	if sendErr != nil && !errors.Is(sendErr, context.Canceled) && !errors.Is(sendErr, io.EOF) {
-		return sendErr
-	}
-	return nil
-}
-
-// Begin implements state.DataplanePublisher.
-func (s *Server) Begin(ctx context.Context) error {
-	if s.downstream != nil {
-		return s.downstream.Begin(ctx)
-	}
-	return nil
-}
-
-// Commit implements state.DataplanePublisher.
-func (s *Server) Commit(ctx context.Context) error {
-	if s.downstream != nil {
-		return s.downstream.Commit(ctx)
-	}
-	return nil
-}
-
-// PublishDataplaneConfig implements state.DataplanePublisher.
-func (s *Server) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
-	if gw == nil {
-		return nil
-	}
-	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
-
-	var msg *ControllerMessage
-	var targets []*activeStream
-
-	s.mu.Lock()
-	if config == nil {
-		delete(s.configs, gwKey)
-	} else {
-		s.configs[gwKey] = config
-		var err error
-		msg, err = buildConfigMessage(config)
-		if err != nil {
-			s.mu.Unlock()
 			return err
 		}
-		for st := range s.streams[gwKey] {
-			targets = append(targets, st)
+		if message.GetHello() != nil {
+			return status.Errorf(codes.InvalidArgument, "unexpected second Hello message")
 		}
 	}
-	s.mu.Unlock()
-
-	if msg != nil {
-		for _, st := range targets {
-			select {
-			case st.ch <- msg:
-			case <-st.done:
-			default:
-				select {
-				case <-st.ch:
-				default:
-				}
-				select {
-				case st.ch <- msg:
-				default:
-				}
-			}
-		}
-	}
-
-	if s.downstream != nil {
-		return s.downstream.PublishDataplaneConfig(ctx, gw, config)
-	}
-	return nil
-}
-
-func (s *Server) recordReply(connID uint64, gwKey types.NamespacedName, r Reply) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.connReplies[connID] = r
-	s.gwReplies[gwKey] = r
-	s.allReplies = append(s.allReplies, r)
-}
-
-// LastReplyForConnection returns the last reply recorded for the given connection ID.
-func (s *Server) LastReplyForConnection(connID uint64) (Reply, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r, ok := s.connReplies[connID]
-	return r, ok
-}
-
-// LastReplyForGateway returns the last reply recorded for the given Gateway.
-func (s *Server) LastReplyForGateway(gwKey types.NamespacedName) (Reply, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r, ok := s.gwReplies[gwKey]
-	return r, ok
-}
-
-// RecordedReplies returns a copy of all replies received across connections.
-func (s *Server) RecordedReplies() []Reply {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return slices.Clone(s.allReplies)
-}
-
-func buildConfigMessage(cfg *state.DataplaneConfig) (*ControllerMessage, error) {
-	data, err := cfg.Marshal()
-	if err != nil {
-		return nil, fmt.Errorf("marshaling dataplane config: %w", err)
-	}
-	return &ControllerMessage{
-		Body: &ControllerMessage_Config{
-			Config: &Config{
-				Revision:        cfg.Revision,
-				DataplaneConfig: data,
-			},
-		},
-	}, nil
 }
 
 func extractToken(ctx context.Context) string {
-	md, ok := metadata.FromIncomingContext(ctx)
+	incomingMetadata, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return ""
 	}
-	authHeaders := md.Get("authorization")
-	if len(authHeaders) > 0 {
-		raw := strings.TrimSpace(authHeaders[0])
-		const prefix = "bearer "
-		if strings.HasPrefix(strings.ToLower(raw), prefix) {
-			return strings.TrimSpace(raw[len(prefix):])
-		}
-		return raw
+	authHeaders := incomingMetadata.Get("authorization")
+	if len(authHeaders) == 0 {
+		return ""
 	}
-	tokens := md.Get("token")
-	if len(tokens) > 0 {
-		return strings.TrimSpace(tokens[0])
+	raw := strings.TrimSpace(authHeaders[0])
+	const prefix = "bearer "
+	if strings.HasPrefix(strings.ToLower(raw), prefix) {
+		return strings.TrimSpace(raw[len(prefix):])
 	}
 	return ""
 }
