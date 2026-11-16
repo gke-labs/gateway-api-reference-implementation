@@ -42,28 +42,18 @@ const DefaultWireGuardInterfaceName = "wg0"
 // DefaultWireGuardListenPort is the default UDP port on which WireGuard listens.
 const DefaultWireGuardListenPort = 51820
 
+// deviceCloser is a WireGuard network device that can report its listen port and be closed.
 type deviceCloser interface {
 	frontend.WireGuardDevice
 	Port() (int, error)
 	Close() error
 }
 
-type deviceOpenerFunc func(ctx context.Context, cfg wireguard.Config) (deviceCloser, error)
+// deviceOpenerFunc creates and configures a deviceCloser for a given configuration.
+type deviceOpenerFunc func(ctx context.Context, configuration wireguard.Config) (deviceCloser, error)
 
-func defaultDeviceOpener(ctx context.Context, cfg wireguard.Config) (deviceCloser, error) {
-	return wireguard.OpenDevice(ctx, cfg)
-}
-
-type runOption func(*runOptions)
-
-type runOptions struct {
-	deviceOpener deviceOpenerFunc
-}
-
-func withDeviceOpener(opener deviceOpenerFunc) runOption {
-	return func(o *runOptions) {
-		o.deviceOpener = opener
-	}
+func defaultDeviceOpener(ctx context.Context, configuration wireguard.Config) (deviceCloser, error) {
+	return wireguard.OpenDevice(ctx, configuration)
 }
 
 type stringSliceFlag []string
@@ -81,18 +71,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := run(ctx, os.Args[1:]); err != nil {
+	if err := run(ctx, os.Args[1:], defaultDeviceOpener); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, args []string, opts ...runOption) error {
-	var options runOptions
-	for _, opt := range opts {
-		opt(&options)
-	}
-	opener := options.deviceOpener
+func run(ctx context.Context, args []string, opener deviceOpenerFunc) error {
 	if opener == nil {
 		opener = defaultDeviceOpener
 	}
@@ -126,7 +111,7 @@ func run(ctx context.Context, args []string, opts ...runOption) error {
 	var clientSubjects stringSliceFlag
 	fs.Var(&clientSubjects, "client-subject", "Client subject allowlist in format system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...] (repeatable, <ns>:* allowed)")
 
-	wireguardListenPort := fs.Int("wireguard-listen-port", DefaultWireGuardListenPort, "UDP port for WireGuard tunnel (wireguard is required)")
+	wireguardListenPort := fs.Int("wireguard-listen-port", DefaultWireGuardListenPort, "UDP port for WireGuard tunnel. A value of 0 is refused, because WireGuard is the only tunnel transport.")
 	wireguardPrefix := fs.String("wireguard-prefix", "", "IPv6 /64 prefix for WireGuard tunnel addresses (if omitted, an RFC 4193 ULA /64 is generated at startup; a new prefix on each start is fine, because controllers exchange keys again when they reconnect)")
 
 	if err := fs.Parse(args); err != nil {
@@ -341,10 +326,6 @@ func run(ctx context.Context, args []string, opts ...runOption) error {
 		return err
 	}
 
-	wireguardDevice := device
-	wireguardPublicKey := publicKey
-	wireguardPort := actualPort
-
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ListenAddrs:            listenAddrs,
 		ListenHTTPAddrs:        listenHTTPAddrs,
@@ -356,9 +337,9 @@ func run(ctx context.Context, args []string, opts ...runOption) error {
 		IdleTimeout:            *idleTimeout,
 		MaxHostnamesPerSession: *maxHostnames,
 		JWTVerifier:            jwtVerifier,
-		WireGuardDevice:        wireguardDevice,
-		WireGuardPublicKey:     wireguardPublicKey,
-		WireGuardPort:          wireguardPort,
+		WireGuardDevice:        device,
+		WireGuardPublicKey:     publicKey,
+		WireGuardPort:          actualPort,
 		WireGuardPrefix:        wireguardPrefixNet,
 	})
 	if err != nil {
