@@ -100,6 +100,11 @@ func (h *PageHandle) Unpin() {
 	}
 }
 
+// blockRun is a run of heap blocks identified by its first block.
+type blockRun struct {
+	block uint64
+}
+
 // BlockPool manages a fixed-size arena of 4 KiB pool blocks with direct I/O, out-of-place writes,
 // and write-ahead rule enforcement.
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
@@ -117,7 +122,7 @@ type BlockPool struct {
 	numPoolBlocks int
 	arena         []byte // Pointer-free byte arena aligned to 4096 bytes
 
-	// mu guards freePoolBlocks, pageTable, and onFailure.
+	// mu guards freePoolBlocks, pageTable, onFailure, deferredFreesSyncing, and deferredFreesUnsynced.
 	mu sync.Mutex
 
 	// cond uses mu. It is broadcast when an in-flight flush completes or when
@@ -129,6 +134,20 @@ type BlockPool struct {
 	freePoolBlocks []int
 	pageTable      map[uint64]*PageDesc // logicalPage -> PageDesc
 	onFailure      func(error)
+
+	// Both deferred-free slices hold blocks that no page uses any more,
+	// because a newer copy of the page has been written elsewhere, and that
+	// the engine has not yet returned to the allocator. Guarded by mu.
+
+	// deferredFreesSyncing holds blocks that became unneeded before the heap
+	// fsync now in progress started. When that fsync succeeds, the newer copies
+	// are durable, and the engine frees these blocks. If it fails, they stay.
+	deferredFreesSyncing []blockRun
+
+	// deferredFreesUnsynced holds blocks that became unneeded after that fsync
+	// started. That fsync may not cover their newer copies, so they wait for
+	// the next one.
+	deferredFreesUnsynced []blockRun
 
 	stagingBuf []byte     // Pointer-free aligned 2 MiB staging buffer for direct I/O flushes
 	flushMu    sync.Mutex // Serializes staging buffer usage and direct I/O heap writes
@@ -852,6 +871,61 @@ func (bp *BlockPool) PromoteFlushedToDurable() error {
 	}
 	return errors.Join(errs...)
 }
+
+// deferFree queues run to be freed after a future heap fsync confirms its newer copy is durable.
+func (bp *BlockPool) deferFree(run blockRun) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	bp.deferredFreesUnsynced = append(bp.deferredFreesUnsynced, run)
+}
+
+// The next step calls deferFree from the free sites and removes this line.
+var _ = (*BlockPool).deferFree
+
+// startHeapSync rotates deferredFreesUnsynced into deferredFreesSyncing at the start of a heap fsync.
+// If deferredFreesSyncing still holds runs from an uncompleted or failed fsync, they are retained.
+// deferredFreesUnsynced starts empty.
+func (bp *BlockPool) startHeapSync() {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	bp.deferredFreesSyncing = append(bp.deferredFreesSyncing, bp.deferredFreesUnsynced...)
+	bp.deferredFreesUnsynced = nil
+}
+
+// heapSyncSucceeded frees every block run in deferredFreesSyncing to the buddy allocator
+// and empties deferredFreesSyncing.
+func (bp *BlockPool) heapSyncSucceeded() error {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	var errs []error
+	for _, run := range bp.deferredFreesSyncing {
+		if err := bp.buddy.Free(run.block); err != nil {
+			// A failed Free means the block was not in the allocator's map of allocated blocks,
+			// so it was freed twice or never allocated. Retrying can't help, so the block is
+			// dropped from the list. The engine enters its failed state because it can no longer
+			// trust the allocator, not because space is lost.
+			errs = append(errs, err)
+		}
+	}
+	bp.deferredFreesSyncing = nil
+	if len(errs) > 0 {
+		err := errors.Join(errs...)
+		if bp.onFailure != nil {
+			bp.onFailure(err)
+		}
+		return err
+	}
+	return nil
+}
+
+// heapSyncFailed handles a failed heap fsync by releasing nothing.
+// The blocks stay in deferredFreesSyncing so that their older copies are not overwritten.
+// If a subsequent fsync succeeds, they are freed then. If the engine enters its failed
+// state, it writes the FAILED marker, and the next Open erases the store when WithEraseOnError
+// is set, or returns "store requires erase" when it is not. The allocator is rebuilt from
+// block headers only after a crash that leaves no marker.
+func (bp *BlockPool) heapSyncFailed() {}
 
 // DirtyPageTableAndLSN returns a map of logicalPage -> dirtyLSN and the current max LSN at snapshot time.
 func (bp *BlockPool) DirtyPageTableAndLSN() (map[uint64]uint64, uint64) {

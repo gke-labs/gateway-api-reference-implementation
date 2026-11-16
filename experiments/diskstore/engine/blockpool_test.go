@@ -823,3 +823,212 @@ func TestRegression_BlockPoolInFlightWait(t *testing.T) {
 		t.Fatalf("timed out waiting for AllocateNewPage after flush completed")
 	}
 }
+
+func TestBlockPool_DeferredFreeLists(t *testing.T) {
+	isAllocated := func(b *BuddyAllocator, block uint64) bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		_, exists := b.allocated[block]
+		return exists
+	}
+
+	setup := func(t *testing.T) (*BlockPool, *BuddyAllocator) {
+		t.Helper()
+		memFS := NewMemFS()
+		heapFile, err := memFS.Create("heap.db")
+		if err != nil {
+			t.Fatalf("Create heap file failed: %v", err)
+		}
+		t.Cleanup(func() { _ = heapFile.Close() })
+
+		buddy := NewBuddyAllocator(512)
+		var dbID [16]byte
+		bp := NewBlockPool(heapFile, nil, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 4})
+		t.Cleanup(func() { _ = bp.Close() })
+		return bp, buddy
+	}
+
+	t.Run("unneeded before fsync starts is freed when that fsync succeeds", func(t *testing.T) {
+		bp, buddy := setup(t)
+
+		r1, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+		if !isAllocated(buddy, r1) {
+			t.Fatalf("expected block %d to be allocated", r1)
+		}
+
+		// Queue run to be freed before fsync starts
+		bp.deferFree(blockRun{block: r1})
+
+		// Run has not been freed yet
+		if !isAllocated(buddy, r1) {
+			t.Fatalf("run %d was freed prematurely before fsync started", r1)
+		}
+
+		// Fsync starts: unsynced rotates to syncing
+		bp.startHeapSync()
+
+		// Run is still not freed
+		if !isAllocated(buddy, r1) {
+			t.Fatalf("run %d was freed prematurely before fsync succeeded", r1)
+		}
+
+		// Fsync succeeds: syncing is freed
+		if err := bp.heapSyncSucceeded(); err != nil {
+			t.Fatalf("heapSyncSucceeded failed: %v", err)
+		}
+
+		// Run must now be freed
+		if isAllocated(buddy, r1) {
+			t.Fatalf("run %d should be freed after fsync succeeded", r1)
+		}
+
+		// Verify syncing and unsynced are empty
+		bp.mu.Lock()
+		syncingLen, unsyncedLen := len(bp.deferredFreesSyncing), len(bp.deferredFreesUnsynced)
+		bp.mu.Unlock()
+		if syncingLen != 0 || unsyncedLen != 0 {
+			t.Fatalf("expected syncing=0, unsynced=0, got syncing=%d, unsynced=%d", syncingLen, unsyncedLen)
+		}
+	})
+
+	t.Run("unneeded while fsync runs is not freed by that fsync and is freed by the next", func(t *testing.T) {
+		bp, buddy := setup(t)
+
+		r1, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+		r2, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+
+		// Queue r1 before fsync 1 starts
+		bp.deferFree(blockRun{block: r1})
+
+		// Fsync 1 starts: r1 moves to syncing, unsynced is empty
+		bp.startHeapSync()
+
+		// Queue r2 while fsync 1 is running: r2 appends to unsynced
+		bp.deferFree(blockRun{block: r2})
+
+		// Fsync 1 succeeds: r1 is freed, r2 is not
+		if err := bp.heapSyncSucceeded(); err != nil {
+			t.Fatalf("heapSyncSucceeded failed: %v", err)
+		}
+
+		if isAllocated(buddy, r1) {
+			t.Fatalf("r1 %d should be freed by fsync 1", r1)
+		}
+		if !isAllocated(buddy, r2) {
+			t.Fatalf("r2 %d was freed prematurely by fsync 1", r2)
+		}
+
+		// Fsync 2 starts: r2 moves to syncing
+		bp.startHeapSync()
+
+		// Fsync 2 succeeds: r2 is freed
+		if err := bp.heapSyncSucceeded(); err != nil {
+			t.Fatalf("heapSyncSucceeded failed: %v", err)
+		}
+
+		if isAllocated(buddy, r2) {
+			t.Fatalf("r2 %d should be freed by fsync 2", r2)
+		}
+	})
+
+	t.Run("failed fsync frees nothing and next successful fsync frees both generations", func(t *testing.T) {
+		bp, buddy := setup(t)
+
+		r1, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+		r2, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+
+		// Queue r1 before fsync 1 starts
+		bp.deferFree(blockRun{block: r1})
+
+		// Fsync 1 starts: r1 moves to syncing
+		bp.startHeapSync()
+
+		// Queue r2 while fsync 1 is running: r2 appends to unsynced
+		bp.deferFree(blockRun{block: r2})
+
+		// Fsync 1 fails: release nothing
+		bp.heapSyncFailed()
+
+		// Neither r1 nor r2 is freed
+		if !isAllocated(buddy, r1) {
+			t.Fatalf("r1 %d was freed despite fsync 1 failure", r1)
+		}
+		if !isAllocated(buddy, r2) {
+			t.Fatalf("r2 %d was freed despite fsync 1 failure", r2)
+		}
+
+		// Fsync 2 starts: syncing keeps r1, unsynced (r2) is appended to syncing
+		bp.startHeapSync()
+
+		// Fsync 2 succeeds: both r1 and r2 are freed
+		if err := bp.heapSyncSucceeded(); err != nil {
+			t.Fatalf("heapSyncSucceeded failed: %v", err)
+		}
+
+		if isAllocated(buddy, r1) {
+			t.Fatalf("r1 %d should be freed after fsync 2 succeeded", r1)
+		}
+		if isAllocated(buddy, r2) {
+			t.Fatalf("r2 %d should be freed after fsync 2 succeeded", r2)
+		}
+	})
+
+	t.Run("each run is freed once", func(t *testing.T) {
+		bp, buddy := setup(t)
+
+		r1, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+		r2, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+
+		bp.deferFree(blockRun{block: r1})
+		bp.startHeapSync()
+		bp.deferFree(blockRun{block: r2})
+		if err := bp.heapSyncSucceeded(); err != nil {
+			t.Fatalf("heapSyncSucceeded failed: %v", err)
+		}
+
+		// Subsequent fsync with empty lists:
+		// If r1 or r2 was freed twice, buddy.Free would error with "block %d not allocated".
+		bp.startHeapSync()
+		if err := bp.heapSyncSucceeded(); err != nil {
+			t.Fatalf("heapSyncSucceeded on empty lists failed (possible double free): %v", err)
+		}
+
+		// Next cycle with a third run:
+		r3, err := buddy.Allocate(0)
+		if err != nil {
+			t.Fatalf("Allocate failed: %v", err)
+		}
+		bp.deferFree(blockRun{block: r3})
+		bp.startHeapSync()
+		if err := bp.heapSyncSucceeded(); err != nil {
+			t.Fatalf("heapSyncSucceeded failed: %v", err)
+		}
+
+		// Once more verify no leftover runs or double frees
+		bp.startHeapSync()
+		if err := bp.heapSyncSucceeded(); err != nil {
+			t.Fatalf("heapSyncSucceeded on empty lists failed: %v", err)
+		}
+	})
+}
