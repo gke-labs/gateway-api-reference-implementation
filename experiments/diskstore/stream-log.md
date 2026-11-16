@@ -16,19 +16,20 @@ We consider two arrangements for integrating the engine with a stream:
 1. **Engine keeps a log behind an interface:** The engine maintains its existing write-ahead log contract, and a stream acts as one log implementation. The engine writes records to the stream and controls checkpoints.
 2. **Stream is the redo log, engine has no log of its own:** Callers commit changes to the stream first. The engine applies committed changes directly to heap pages as a projection and records the stream position reached, writing no WAL of its own.
 
-We recommend building **arrangement 2** first. Structured data streams define the stream as the single source of truth (`docs/structured-data-streams.md#overview`). Arrangement 1 reverses this relationship, forces the engine to own stream record framing, and causes double-logging. In `experiments/diskstore/BENCHMARKS.md`, local WAL writes add a 1.04x to 20.82x write amplification over payload bytes. Arrangement 2 writes no local WAL records, enables multiple projection replicas to tail the same stream, and directly implements `pkg/sds.LocalIndex`.
+We recommend building **arrangement 2** first. Structured data streams define the stream as the single source of truth (`docs/structured-data-streams.md#overview`). Arrangement 1 reverses this relationship, forces the engine to own stream record framing, and causes double-logging. In `experiments/diskstore/BENCHMARKS.md`, local WAL writes add a 1.04x to 20.82x write amplification over payload bytes. Arrangement 2 writes no local WAL records, enables multiple projection replicas to tail the same stream, and directly implements `pkg/sds.LocalIndex`. Standalone deployments without the distributed Streams infrastructure will also use arrangement 2, relying on an embedded local stream rather than a separate engine log.
 
 ## 2. Invariants for the Engine with No Log of Its Own
 
-### Positions and LSNs
+### Positions, LSNs, and Keys
 A page's LSN is the 64-bit stream position (`stream_seq`) of the last change applied to it. The engine requires stream positions to be strictly increasing 64-bit unsigned integers assigned by a single writer (`docs/streams.md#overview`).
 When the engine has no log of its own, derivations from LSNs change as follows:
 - **WAL segment names (`%020d.wal`):** Eliminated. The engine creates no local WAL files.
-- **Per-segment encryption keys (`diskstore/wal/<LSN>`):** Eliminated. Stream records are encrypted at the stream transport layer (`docs/structured-data-streams.md#encryption`). The engine only derives heap keys (`diskstore/heap`) and oversize keys (`diskstore/oversize/<filename>`).
+- **Per-segment encryption keys (`diskstore/wal/<LSN>`):** Eliminated. The engine has no WAL segments to encrypt.
+- **Heap and oversize encryption keys:** The engine still requires a master encryption key (`EncryptionKey`) for block-level encryption of heap blocks (`diskstore/heap`) and oversize files (`diskstore/oversize/<filename>`). The design assumes the caller provides a master key to the stream or SDS layer, and the engine derives its storage keys from that stream key (or the caller provides it directly to `engine.Open`). Whether the stream layer distributes keys to projections or callers configure the engine independently remains open.
 - **Lost-tail check (`maxWAL_LSN < maxHeapLSN`):** Replaced by a stream watermark check. Recovery reads the stream's tail sequence from `Stream.Watermarks()` (`docs/streams.md#durability-levels--watermarks`). If `streamTailLSN < maxHeapLSN`, recovery aborts with an error because the stream lost committed records or the heap outran the log.
 
 ### Write-Ahead Rule
-Before the engine applies a change in memory, the change must reach `Local` durability (written and fsynced on the client node) or `Witness` durability (fsynced to the central buffer) in the stream (`docs/streams.md#durability-levels--watermarks`). Before the engine flushes a page with LSN `P` to the heap file, position `P` must be durable in the stream (`stream.Wait(ctx, P, level, false)`). When flushing a batch of dirty pages, the engine waits once for the highest LSN in the batch. Crash recovery does not encounter heap pages that outrun durable stream history because the engine waits for stream durability before flushing.
+Before the engine applies a change in memory, the change must reach `Local` durability (written and fsynced on the client node) or `Witness` durability (fsynced to the central buffer) in the stream (`docs/streams.md#durability-levels--watermarks`). Before the engine flushes a page with LSN `P` to the heap file, position `P` must be durable in the stream (`stream.Wait(ctx, P, level, false)`). By default, flushes require `Witness` durability; callers may configure `Local` or lower (for caches). When flushing a batch of dirty pages, the engine waits once for the highest LSN in the batch. Crash recovery does not encounter heap pages that outrun durable stream history because the engine waits for stream durability before flushing.
 
 ### Recovery Rule
 Recovery reconstructs state in two stages without reading a local WAL:
@@ -80,10 +81,16 @@ Under deferred block frees (`design.md#deferred-block-frees`), blocks that no pa
 - **Large values:** Streams enforce record size limits. SDS offloads values to a content-addressed blob store referenced by SHA-256 (`docs/structured-data-streams.md#value-types`). *Does not block v1:* large objects are externalized before reaching the stream.
 - **Transaction rollback:** SQLite supports statement-level rollbacks. The engine has no undo log. *Does not block v1:* the stream only delivers committed transactions.
 
-## 7. The Cache Use Stays
+## 7. Standalone Cache and Retiring the Engine WAL
 
-The Kubernetes cache (`experiments/diskstore/kubecache`) has no stream and runs standalone. It retains its local WAL.
-To avoid duplicate redo logic, the engine abstracts redo replay over a record iterator (`iter.Seq2[uint64, Record]`). For kubecache, the iterator reads local `.wal` segment files. For the stream projection, the iterator reads from `Stream.Tail`. Both pass records through the same per-page LSN check, `applyPutLocked`, and `applyDeleteLocked` functions. There is one redo path, not two.
+The maintainer wants to use the engine without the central Streams infrastructure for standalone deployments like the Kubernetes cache (`experiments/diskstore/kubecache`). Rather than maintaining a separate WAL in the engine indefinitely, the design achieves this by enhancing the stream's local mode, allowing the engine's internal WAL to eventually be retired.
+To replace the engine's WAL in standalone mode, the local stream must provide:
+1. **Zero-dependency embedded operation:** Run directly in-process without network communication to `wal-buffer` or object storage.
+2. **Direct I/O (`O_DIRECT`):** Support aligned direct I/O for local appends, matching the engine WAL's latency and avoiding kernel page cache pollution.
+3. **Ephemeral key binding and clean wipe:** Support per-process ephemeral encryption keys and clean directory wipes across restarts (`WithEraseOnError()`).
+4. **Local segment pruning:** Truncate segments prior to `recoveryPosition` upon heap sync, preventing unbounded disk usage without cloud archival.
+
+Until the local stream satisfies these criteria, the engine retains its existing WAL behind the `Log` interface, sharing the unified logical replay path (`iter.Seq2[uint64, Record]`).
 
 ## 8. Failure Handling
 
@@ -102,24 +109,13 @@ In SDS, the stream and object snapshots are authoritative (`docs/structured-data
 - **Network recovery latency:** Replaying un-synced tail records requires network transfers via `Stream.Tail`. Streams client nodes retain recent uncompacted records in local segments (`docs/streams.md#key-components`), but `docs/streams.md` does not specify whether local clients can replay directly from node storage without contacting `wal-buffer`. We list this as an open question for `in-cluster-storage`.
 - **Flush coordination:** Heap page flushes must coordinate with stream durability watermarks.
 
-## 10. Open Choices for the Maintainer
+## 10. Decisions and Direction
 
-1. **Durability watermark for page flushes:**
-   - *Choice:* Require `Local` vs `Witness` watermark before flushing dirty pages.
-   - *Recommendation:* Require `Witness`.
-   - *Gives up:* Adds 2–10 ms network round-trip latency to flushes (`docs/streams.md#durability-levels--watermarks`), but ensures the cluster witness confirms log order before pages reach local disk, preventing state divergence if a node fails.
-2. **Durable recovery position storage:**
-   - *Choice:* Store alternating slots in `meta.db` reserved header vs a dedicated `checkpoint.db` file.
-   - *Recommendation:* Store in `meta.db`.
-   - *Gives up:* Consumes reserved bytes in `meta.db` and bumps `StoreFormatVersion`. In return, it avoids creating an extra file and extra directory fsyncs on every sync.
-3. **Prefix scan implementation:**
-   - *Choice:* Filter and sort in-memory keys vs introducing an ordered index.
-   - *Recommendation:* Filter and sort in memory for v1; add an ordered tree later if benchmarks require it.
-   - *Gives up:* Optimal scan latency on large key sets ($O(N \log N)$ vs $O(K)$), but avoids changing index structures for the first version.
-4. **Where the adapter lives:**
-   - *Choice:* Place `sds.LocalIndex` in this repository (e.g. `experiments/diskstore/sds`) vs in `in-cluster-storage` (e.g. `pkg/sds/projection/diskstore`) importing the engine.
-   - *Recommendation:* Place the adapter in `in-cluster-storage`.
-   - *Gives up:* Cross-repo development requires consuming engine releases in `in-cluster-storage`, but keeps this module independent of `in-cluster-storage` dependencies.
+The maintainer has decided the key architectural choices:
+1. **Durability watermark for page flushes:** Flushes require `Witness` durability by default in distributed deployments (`docs/streams.md#durability-levels--watermarks`), ensuring cluster buffer confirmation before writing heap blocks. Callers can explicitly configure `Local` or lower (e.g., for `kubecache` where memory buffering suffices).
+2. **Durable recovery position storage:** Store alternating slots with generation counters and CRC32C in `meta.db`'s reserved space, updated after heap fsync. Avoids creating extra files or directory sync overhead.
+3. **Prefix scan implementation:** Filter and sort in-memory keys for v1. Evaluate ordered tree strategies (such as an Adaptive Radix Tree or B-tree) as concrete use-case benchmarks require.
+4. **Where the adapter lives:** Implement wherever easiest for current development (in `in-cluster-storage` or this repository). The long-term architectural direction is that structured data streams will move into a dedicated repository, making an external projection package natural.
 
 ## 11. Implementation Steps
 
