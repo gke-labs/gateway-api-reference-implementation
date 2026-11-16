@@ -319,7 +319,8 @@ type Options struct {
 	PushListener net.Listener
 
 	// PushTokenReviewer is an optional custom token reviewer for the push server.
-	// If nil and push is enabled, a KubeTokenReviewer is created using Kubernetes client.
+	// If nil and push is enabled, a KubeTokenReviewer is created targeting the
+	// Kubernetes TokenReview API with the gari-controller audience (push.DefaultAudience).
 	PushTokenReviewer push.TokenReviewer
 
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
@@ -1145,11 +1146,6 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 	return g.Wait()
 }
 
-// PushServer returns the configuration push Server if one was configured.
-func (s *Server) PushServer() *push.Server {
-	return s.pushServer
-}
-
 // StartPushServer starts the configuration push gRPC server and blocks until ctx is canceled.
 func (s *Server) StartPushServer(ctx context.Context) error {
 	if s.pushServer == nil {
@@ -1157,30 +1153,26 @@ func (s *Server) StartPushServer(ctx context.Context) error {
 	}
 
 	var listener net.Listener
-	var grpcOptions []grpc.ServerOption
+
+	tlsConfig := s.opts.PushTLSConfig
+	if tlsConfig == nil {
+		if s.opts.PushTLSCertFile == "" || s.opts.PushTLSKeyFile == "" {
+			return errors.New("TLS configuration required for push server; plaintext and self-signed certificates are not permitted")
+		}
+		cert, err := tls.LoadX509KeyPair(s.opts.PushTLSCertFile, s.opts.PushTLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("loading TLS key pair for push server: %w", err)
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
+	grpcOptions := []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsConfig))}
 
 	if s.opts.PushListener != nil {
 		listener = s.opts.PushListener
-		if s.opts.PushTLSConfig != nil {
-			grpcOptions = append(grpcOptions, grpc.Creds(credentials.NewTLS(s.opts.PushTLSConfig)))
-		}
 	} else if s.opts.PushBindAddress != "" {
-		tlsConfig := s.opts.PushTLSConfig
-		if tlsConfig == nil {
-			if s.opts.PushTLSCertFile == "" || s.opts.PushTLSKeyFile == "" {
-				return errors.New("TLS configuration required for push server; plaintext and self-signed certificates are not permitted")
-			}
-			cert, err := tls.LoadX509KeyPair(s.opts.PushTLSCertFile, s.opts.PushTLSKeyFile)
-			if err != nil {
-				return fmt.Errorf("loading TLS key pair for push server: %w", err)
-			}
-			tlsConfig = &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS12,
-			}
-		}
-		grpcOptions = append(grpcOptions, grpc.Creds(credentials.NewTLS(tlsConfig)))
-
 		var err error
 		listener, err = net.Listen("tcp", s.opts.PushBindAddress)
 		if err != nil {

@@ -45,7 +45,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -561,7 +561,7 @@ func TestServerPushServer_RequiresTLSWhenBindAddressSet(t *testing.T) {
 	}
 }
 
-func TestServerPushServer_CustomListener(t *testing.T) {
+func TestServerPushServer_RequiresTLSWhenListenerSet(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
@@ -583,8 +583,44 @@ func TestServerPushServer_CustomListener(t *testing.T) {
 		pushServer: pushServer,
 	}
 
-	if server.PushServer() == nil {
-		t.Fatal("expected PushServer to be initialized")
+	err = server.StartPushServer(t.Context())
+	if err == nil {
+		t.Fatal("expected error when PushListener is set without TLS config, got nil")
+	}
+	if !strings.Contains(err.Error(), "TLS configuration required for push server") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestServerPushServer_CustomListener(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	cert, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+
+	opts := Options{
+		PushListener:      listener,
+		PushTLSConfig:     tlsConfig,
+		PushTokenReviewer: &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
+	}
+	pushServer, err := push.NewServer(push.ServerOptions{
+		TokenReviewer: opts.PushTokenReviewer,
+	})
+	if err != nil {
+		t.Fatalf("push.NewServer failed: %v", err)
+	}
+	server := &Server{
+		opts:       opts,
+		pushServer: pushServer,
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -595,8 +631,9 @@ func TestServerPushServer_CustomListener(t *testing.T) {
 		errCh <- server.StartPushServer(ctx)
 	}()
 
+	clientCreds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
 	clientConn, err := grpc.NewClient(listener.Addr().String(),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(clientCreds),
 	)
 	if err != nil {
 		t.Fatalf("failed to connect to push server: %v", err)

@@ -201,7 +201,7 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "proxy-protocol", DefValue: "", Usage: "Enable PROXY protocol ('enabled')."},
 		{Name: "proxy-protocol-trusted-cidrs", DefValue: "", Usage: "Comma-separated list of trusted CIDRs for PROXY protocol."},
 		{Name: "push-bind-address", DefValue: "", Usage: "The address the configuration push stream gRPC server binds to (disabled by default)."},
-		{Name: "push-tls-cert-file", DefValue: "", Usage: "Path to TLS server certificate file for configuration push gRPC endpoint."},
+		{Name: "push-tls-cert-file", DefValue: "", Usage: "Path to TLS server certificate file for configuration push gRPC endpoint. The listener stays off until a certificate that data planes can verify is provided, and how it is provided is not settled."},
 		{Name: "push-tls-key-file", DefValue: "", Usage: "Path to TLS server private key file for configuration push gRPC endpoint."},
 		{Name: "read-header-timeout", DefValue: "10s", Usage: "The amount of time allowed to read request headers on HTTP and HTTPS servers."},
 		{Name: "read-timeout", DefValue: "0s", Usage: "The maximum duration for reading the entire request, including the body (disabled by default)."},

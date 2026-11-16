@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,28 @@ const (
 
 	// MaxMessageBytes is the maximum message size covering MaxConfigMessageBytes plus framing overhead.
 	MaxMessageBytes = MaxConfigMessageBytes + 1024*1024
+
+	// serverKeepaliveIdle is the maximum duration an idle connection may remain open
+	// before the server sends a GOAWAY to reclaim unused connection resources.
+	serverKeepaliveIdle = 15 * time.Minute
+
+	// serverKeepalivePingTime is the duration of client inactivity after which the server
+	// pings the client to verify connection liveness and detect dead peers.
+	serverKeepalivePingTime = 2 * time.Minute
+
+	// serverKeepalivePingTimeout is the time the server waits for a keepalive ping acknowledgment
+	// before considering the connection dead and terminating it.
+	serverKeepalivePingTimeout = 20 * time.Second
+
+	// clientKeepaliveMinPingInterval is the minimum interval between client keepalive pings
+	// that the server permits, protecting against aggressive client ping flooding.
+	clientKeepaliveMinPingInterval = 30 * time.Second
+
+	// serverShutdownTimeout is the maximum duration GracefulStop waits for active streams
+	// to drain before Stop forcefully closes them. Because configuration push streams are
+	// long-lived, 5 seconds allows in-flight RPCs to finish while completing controller
+	// termination well within standard Kubernetes pod shutdown grace periods (typically 30s).
+	serverShutdownTimeout = 5 * time.Second
 )
 
 // TokenReviewer verifies a projected ServiceAccount token and returns the caller's namespace and ServiceAccount name.
@@ -96,6 +119,9 @@ func (reviewer *KubeTokenReviewer) ReviewToken(ctx context.Context, token string
 	if !result.Status.Authenticated {
 		return "", "", errors.New("token is not authenticated")
 	}
+	if !slices.Contains(result.Status.Audiences, reviewer.audience) {
+		return "", "", fmt.Errorf("token audiences %v do not contain audience %q", result.Status.Audiences, reviewer.audience)
+	}
 
 	username := result.Status.User.Username
 	const serviceAccountPrefix = "system:serviceaccount:"
@@ -121,12 +147,6 @@ type ServerOptions struct {
 	MaxStreamsPerGateway int
 }
 
-// activeStream represents a connected data plane stream.
-type activeStream struct {
-	// done signals when the active stream is terminating.
-	done chan struct{}
-}
-
 // Server implements PushServiceServer for configuration push.
 type Server struct {
 	UnimplementedPushServiceServer
@@ -140,8 +160,8 @@ type Server struct {
 	// mu guards streams.
 	mu sync.Mutex
 
-	// streams tracks active streams grouped by Gateway namespace and name.
-	streams map[types.NamespacedName]map[*activeStream]struct{}
+	// streams tracks the number of active streams grouped by Gateway namespace and name.
+	streams map[types.NamespacedName]int
 }
 
 var _ PushServiceServer = (*Server)(nil)
@@ -159,32 +179,32 @@ func NewServer(options ServerOptions) (*Server, error) {
 	return &Server{
 		tokenReviewer:        options.TokenReviewer,
 		maxStreamsPerGateway: maxStreams,
-		streams:              make(map[types.NamespacedName]map[*activeStream]struct{}),
+		streams:              make(map[types.NamespacedName]int),
 	}, nil
 }
 
-// DefaultServerOptions returns gRPC server options with keepalive settings and raised message limits.
+// defaultServerOptions returns gRPC server options with keepalive settings and raised message limits.
 // The total number of streams across all Gateways is not bounded by this server and is left to the listener,
 // while per-Gateway streams are bounded by MaxStreamsPerGateway.
-func DefaultServerOptions() []grpc.ServerOption {
+func defaultServerOptions() []grpc.ServerOption {
 	return []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(MaxMessageBytes),
 		grpc.MaxSendMsgSize(MaxMessageBytes),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionIdle: 15 * time.Minute,
-			Time:              2 * time.Minute,
-			Timeout:           20 * time.Second,
+			MaxConnectionIdle: serverKeepaliveIdle,
+			Time:              serverKeepalivePingTime,
+			Timeout:           serverKeepalivePingTimeout,
 		}),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             30 * time.Second,
+			MinTime:             clientKeepaliveMinPingInterval,
 			PermitWithoutStream: true,
 		}),
 	}
 }
 
-// GRPCServer creates and returns a *grpc.Server with DefaultServerOptions and this service registered.
-func (server *Server) GRPCServer(options ...grpc.ServerOption) *grpc.Server {
-	mergedOptions := append(DefaultServerOptions(), options...)
+// grpcServer creates and returns a *grpc.Server with defaultServerOptions and this service registered.
+func (server *Server) grpcServer(options ...grpc.ServerOption) *grpc.Server {
+	mergedOptions := append(defaultServerOptions(), options...)
 	grpcServer := grpc.NewServer(mergedOptions...)
 	RegisterPushServiceServer(grpcServer, server)
 	return grpcServer
@@ -192,16 +212,15 @@ func (server *Server) GRPCServer(options ...grpc.ServerOption) *grpc.Server {
 
 // Serve runs the gRPC server on the given listener until the context is canceled.
 // When ctx is canceled, a bounded graceful shutdown is performed: streams are given
-// 5 seconds to drain before forceful termination via Stop.
+// serverShutdownTimeout to drain before forceful termination via Stop.
 func (server *Server) Serve(ctx context.Context, listener net.Listener, options ...grpc.ServerOption) error {
-	grpcServer := server.GRPCServer(options...)
+	grpcServer := server.grpcServer(options...)
 	serverStopped := make(chan struct{})
 
 	go func() {
 		select {
 		case <-ctx.Done():
-			const shutdownTimeout = 5 * time.Second
-			timer := time.AfterFunc(shutdownTimeout, func() {
+			timer := time.AfterFunc(serverShutdownTimeout, func() {
 				grpcServer.Stop()
 			})
 			grpcServer.GracefulStop()
@@ -218,13 +237,6 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener, options 
 	return err
 }
 
-// ActiveStreams returns the number of active streams currently connected for the given Gateway.
-func (server *Server) ActiveStreams(gatewayKey types.NamespacedName) int {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-	return len(server.streams[gatewayKey])
-}
-
 // StreamConfig establishes a bidirectional stream with a data plane.
 // A data plane stream is authenticated once when the stream opens using its projected
 // ServiceAccount token. If the projected token expires while the stream is open, the
@@ -236,7 +248,7 @@ func (server *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMess
 	// 1. Authentication
 	token := extractToken(ctx)
 	if token == "" {
-		logger.Error(errors.New("missing or invalid authorization header"), "authentication failed")
+		logger.Error(nil, "authentication failed", "reason", "missing or invalid authorization header")
 		return status.Errorf(codes.Unauthenticated, "authentication failed")
 	}
 
@@ -262,32 +274,29 @@ func (server *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMess
 	// 3. Scoping check
 	expectedServiceAccount := singlepod.ResourceNameForGateway(hello.GatewayName)
 	if callerNamespace != hello.GatewayNamespace || callerServiceAccount != expectedServiceAccount {
-		logger.Error(fmt.Errorf("caller %s/%s does not match expected %s/%s", callerNamespace, callerServiceAccount, hello.GatewayNamespace, expectedServiceAccount), "permission denied")
+		logger.Error(nil, "permission denied",
+			"callerNamespace", callerNamespace,
+			"callerServiceAccount", callerServiceAccount,
+			"gatewayNamespace", hello.GatewayNamespace,
+			"expectedServiceAccount", expectedServiceAccount,
+		)
 		return status.Errorf(codes.PermissionDenied, "permission denied")
 	}
 
 	// 4. Stream limits and registration
 	gatewayKey := types.NamespacedName{Namespace: hello.GatewayNamespace, Name: hello.GatewayName}
 	server.mu.Lock()
-	if len(server.streams[gatewayKey]) >= server.maxStreamsPerGateway {
+	if server.streams[gatewayKey] >= server.maxStreamsPerGateway {
 		server.mu.Unlock()
 		return status.Errorf(codes.ResourceExhausted, "stream limit exceeded for gateway %s", gatewayKey)
 	}
-
-	streamHandle := &activeStream{
-		done: make(chan struct{}),
-	}
-	if server.streams[gatewayKey] == nil {
-		server.streams[gatewayKey] = make(map[*activeStream]struct{})
-	}
-	server.streams[gatewayKey][streamHandle] = struct{}{}
+	server.streams[gatewayKey]++
 	server.mu.Unlock()
 
 	defer func() {
-		close(streamHandle.done)
 		server.mu.Lock()
-		delete(server.streams[gatewayKey], streamHandle)
-		if len(server.streams[gatewayKey]) == 0 {
+		server.streams[gatewayKey]--
+		if server.streams[gatewayKey] <= 0 {
 			delete(server.streams, gatewayKey)
 		}
 		server.mu.Unlock()

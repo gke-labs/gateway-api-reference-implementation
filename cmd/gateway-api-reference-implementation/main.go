@@ -66,7 +66,7 @@ func BindFlags(fs *flag.FlagSet, opts *gari.Options, cfg *Config) {
 	fs.StringVar(&opts.ProxyHTTPSAddr, "proxy-https-bind-address", opts.ProxyHTTPSAddr, "The address the proxy binds to for HTTPS.")
 	fs.StringVar(&opts.ProxyHTTP3Addr, "proxy-http3-bind-address", opts.ProxyHTTP3Addr, "The UDP address the proxy binds to for HTTP/3 (disabled by default).")
 	fs.StringVar(&opts.PushBindAddress, "push-bind-address", opts.PushBindAddress, "The address the configuration push stream gRPC server binds to (disabled by default).")
-	fs.StringVar(&opts.PushTLSCertFile, "push-tls-cert-file", opts.PushTLSCertFile, "Path to TLS server certificate file for configuration push gRPC endpoint.")
+	fs.StringVar(&opts.PushTLSCertFile, "push-tls-cert-file", opts.PushTLSCertFile, "Path to TLS server certificate file for configuration push gRPC endpoint. The listener stays off until a certificate that data planes can verify is provided, and how it is provided is not settled.")
 	fs.StringVar(&opts.PushTLSKeyFile, "push-tls-key-file", opts.PushTLSKeyFile, "Path to TLS server private key file for configuration push gRPC endpoint.")
 	fs.IntVar(&opts.ProxyHTTP3AdvertisedPort, "proxy-http3-advertised-port", opts.ProxyHTTP3AdvertisedPort, "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address).")
 	fs.BoolVar(&opts.EnableH2C, "enable-h2c", opts.EnableH2C, "Enable H2C support on the proxy server.")

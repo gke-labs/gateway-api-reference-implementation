@@ -17,6 +17,7 @@ package push_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -62,15 +63,15 @@ func startInProcessServer(t *testing.T, server *push.Server) push.PushServiceCli
 	t.Helper()
 	const bufferSize = 1024 * 1024
 	listener := bufconn.Listen(bufferSize)
-	grpcServer := server.GRPCServer()
 
+	ctx, cancel := context.WithCancel(t.Context())
 	go func() {
-		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-			t.Errorf("grpcServer.Serve error: %v", err)
+		if err := server.Serve(ctx, listener); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("server.Serve error: %v", err)
 		}
 	}()
 	t.Cleanup(func() {
-		grpcServer.Stop()
+		cancel()
 		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Errorf("listener.Close error: %v", err)
 		}
@@ -92,20 +93,6 @@ func startInProcessServer(t *testing.T, server *push.Server) push.PushServiceCli
 	return push.NewPushServiceClient(clientConn)
 }
 
-func pollUntil(t *testing.T, timeout time.Duration, condition func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !condition() {
-		t.Fatalf("condition not met within %v", timeout)
-	}
-}
-
 func TestKubeTokenReviewer(t *testing.T) {
 	t.Run("ValidToken", func(t *testing.T) {
 		client := &fakeTokenReviewClient{
@@ -119,6 +106,7 @@ func TestKubeTokenReviewer(t *testing.T) {
 				return &authenticationv1.TokenReview{
 					Status: authenticationv1.TokenReviewStatus{
 						Authenticated: true,
+						Audiences:     []string{push.DefaultAudience},
 						User: authenticationv1.UserInfo{
 							Username: "system:serviceaccount:gateway-ns:my-gateway-sa",
 						},
@@ -134,6 +122,27 @@ func TestKubeTokenReviewer(t *testing.T) {
 		}
 		if namespace != "gateway-ns" || serviceAccount != "my-gateway-sa" {
 			t.Fatalf("expected gateway-ns/my-gateway-sa, got %s/%s", namespace, serviceAccount)
+		}
+	})
+
+	t.Run("OtherAudience", func(t *testing.T) {
+		client := &fakeTokenReviewClient{
+			createFunc: func(ctx context.Context, tokenReview *authenticationv1.TokenReview, options metav1.CreateOptions) (*authenticationv1.TokenReview, error) {
+				return &authenticationv1.TokenReview{
+					Status: authenticationv1.TokenReviewStatus{
+						Authenticated: true,
+						Audiences:     []string{"other-audience"},
+						User: authenticationv1.UserInfo{
+							Username: "system:serviceaccount:gateway-ns:my-gateway-sa",
+						},
+					},
+				}, nil
+			},
+		}
+		reviewer := push.NewKubeTokenReviewer(client, push.DefaultAudience)
+		_, _, err := reviewer.ReviewToken(t.Context(), "other-audience-token")
+		if err == nil {
+			t.Fatal("expected audience mismatch error, got nil")
 		}
 	})
 
@@ -177,6 +186,7 @@ func TestKubeTokenReviewer(t *testing.T) {
 				return &authenticationv1.TokenReview{
 					Status: authenticationv1.TokenReviewStatus{
 						Authenticated: true,
+						Audiences:     []string{push.DefaultAudience},
 						User: authenticationv1.UserInfo{
 							Username: "system:admin",
 						},
@@ -254,19 +264,14 @@ func TestStreamConfig_Success_AuthenticationAndScoping(t *testing.T) {
 		t.Fatalf("Send Hello failed: %v", err)
 	}
 
-	// Verify stream is registered
-	pollUntil(t, 2*time.Second, func() bool {
-		return server.ActiveStreams(gatewayKey) == 1
-	})
-
 	if err := stream.CloseSend(); err != nil {
 		t.Errorf("CloseSend error: %v", err)
 	}
 
-	// Verify stream is unregistered when closed
-	pollUntil(t, 2*time.Second, func() bool {
-		return server.ActiveStreams(gatewayKey) == 0
-	})
+	message, err := stream.Recv()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF on clean stream termination, got message=%v err=%v", message, err)
+	}
 }
 
 func TestStreamConfig_Scoping_Refused(t *testing.T) {
@@ -453,11 +458,6 @@ func TestStreamConfig_Ordering_SecondHello(t *testing.T) {
 		t.Fatalf("Send first Hello failed: %v", err)
 	}
 
-	// Wait for stream to register
-	pollUntil(t, 2*time.Second, func() bool {
-		return server.ActiveStreams(gatewayKey) == 1
-	})
-
 	// Second Hello
 	if err := stream.Send(&push.DataplaneMessage{
 		Body: &push.DataplaneMessage_Hello{
@@ -482,8 +482,16 @@ func TestStreamConfig_Ordering_SecondHello(t *testing.T) {
 
 func TestStreamConfig_Limits_MaxStreams(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
+
+	stream1Reviewed := make(chan struct{})
+	stream2CanProceed := make(chan struct{})
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
+			if token == "token1" {
+				close(stream1Reviewed)
+				return gatewayKey.Namespace, singlepod.ResourceNameForGateway(gatewayKey.Name), nil
+			}
+			<-stream2CanProceed
 			return gatewayKey.Namespace, singlepod.ResourceNameForGateway(gatewayKey.Name), nil
 		},
 	}
@@ -497,7 +505,7 @@ func TestStreamConfig_Limits_MaxStreams(t *testing.T) {
 	}
 	client := startInProcessServer(t, server)
 
-	outgoingContext1 := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer token"))
+	outgoingContext1 := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer token1"))
 	stream1, err := client.StreamConfig(outgoingContext1)
 	if err != nil {
 		t.Fatalf("StreamConfig 1 failed: %v", err)
@@ -513,13 +521,14 @@ func TestStreamConfig_Limits_MaxStreams(t *testing.T) {
 		t.Fatalf("Send Hello 1 failed: %v", err)
 	}
 
-	// Wait for stream 1 to be registered before opening stream 2
-	pollUntil(t, 2*time.Second, func() bool {
-		return server.ActiveStreams(gatewayKey) == 1
-	})
+	// Wait for stream 1 to be authenticated and in flight before letting stream 2 proceed.
+	<-stream1Reviewed
+	// Allow stream 2 to proceed; stream 1 has sent Hello and will register before stream 2 finishes auth.
+	time.Sleep(10 * time.Millisecond)
+	close(stream2CanProceed)
 
-	// Stream 2 should exceed limit
-	outgoingContext2 := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer token"))
+	// Stream 2 should exceed limit and receive ResourceExhausted.
+	outgoingContext2 := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer token2"))
 	stream2, err := client.StreamConfig(outgoingContext2)
 	if err != nil {
 		t.Fatalf("StreamConfig 2 failed: %v", err)
@@ -542,6 +551,35 @@ func TestStreamConfig_Limits_MaxStreams(t *testing.T) {
 	rpcStatus, ok := status.FromError(err)
 	if !ok || rpcStatus.Code() != codes.ResourceExhausted {
 		t.Fatalf("expected codes.ResourceExhausted, got: %v", err)
+	}
+
+	// Closing stream 1 unregisters it, allowing subsequent streams to succeed.
+	if err := stream1.CloseSend(); err != nil {
+		t.Fatalf("stream1.CloseSend error: %v", err)
+	}
+	_, _ = stream1.Recv()
+
+	outgoingContext3 := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer token3"))
+	stream3, err := client.StreamConfig(outgoingContext3)
+	if err != nil {
+		t.Fatalf("StreamConfig 3 failed: %v", err)
+	}
+	if err := stream3.Send(&push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Hello{
+			Hello: &push.Hello{
+				GatewayNamespace: gatewayKey.Namespace,
+				GatewayName:      gatewayKey.Name,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Hello 3 failed: %v", err)
+	}
+	if err := stream3.CloseSend(); err != nil {
+		t.Fatalf("stream3.CloseSend error: %v", err)
+	}
+	_, err = stream3.Recv()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF on stream 3, got: %v", err)
 	}
 }
 
