@@ -274,7 +274,7 @@ func (l *fakeTunnelListener) Accept() (net.Conn, error) {
 
 type fixtureOptions struct {
 	frontendWireGuard bool
-	managerWireGuard  bool
+	deviceOpener      func(ctx context.Context, config wireguard.Config) (WireGuardDevice, error)
 }
 
 type wireguardFixture struct {
@@ -365,13 +365,16 @@ func newWireGuardFixture(t *testing.T, options fixtureOptions) *wireguardFixture
 		fixture.srvErrCh <- server.Serve(serverListener)
 	}()
 
-	opener := func(ctx context.Context, config wireguard.Config) (WireGuardDevice, error) {
-		fixture.devMu.Lock()
-		defer fixture.devMu.Unlock()
-		device := &fakeMgrTestWireGuardDevice{}
-		fixture.devices = append(fixture.devices, device)
-		fixture.devConfigs = append(fixture.devConfigs, config)
-		return device, nil
+	opener := options.deviceOpener
+	if opener == nil {
+		opener = func(ctx context.Context, config wireguard.Config) (WireGuardDevice, error) {
+			fixture.devMu.Lock()
+			defer fixture.devMu.Unlock()
+			device := &fakeMgrTestWireGuardDevice{}
+			fixture.devices = append(fixture.devices, device)
+			fixture.devConfigs = append(fixture.devConfigs, config)
+			return device, nil
+		}
 	}
 
 	listenFunc := func(network, address string) (net.Listener, error) {
@@ -400,7 +403,6 @@ func newWireGuardFixture(t *testing.T, options fixtureOptions) *wireguardFixture
 
 	managerClient := client.NewClient(serverListener.Addr().String(), clientTLS, client.WithDialFunc(dialFunc))
 	fixture.manager = NewManager(managerClient,
-		WithWireGuard(options.managerWireGuard),
 		WithWireGuardDeviceOpener(opener),
 		WithListenFunc(listenFunc),
 		WithBackoff(10*time.Millisecond, 50*time.Millisecond),
@@ -444,7 +446,7 @@ func (f *wireguardFixture) cleanup(t *testing.T) {
 
 func TestManager_WireGuard_Acceptance(t *testing.T) {
 	t.Run("WireGuard session lifecycle and connection dispatching", func(t *testing.T) {
-		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true, managerWireGuard: true})
+		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true})
 		defer fixture.cleanup(t)
 
 		waitFor(t, 5*time.Second, fixture.manager.IsConnected)
@@ -557,7 +559,7 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 	})
 
 	t.Run("Unauthorized connection from another address is closed", func(t *testing.T) {
-		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true, managerWireGuard: true})
+		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true})
 		defer fixture.cleanup(t)
 
 		waitFor(t, 5*time.Second, fixture.manager.IsConnected)
@@ -608,7 +610,7 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 	})
 
 	t.Run("Reconnecting session makes a new key and device", func(t *testing.T) {
-		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true, managerWireGuard: true})
+		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true})
 		defer fixture.cleanup(t)
 
 		waitFor(t, 5*time.Second, fixture.manager.IsConnected)
@@ -647,7 +649,7 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 	})
 
 	t.Run("WireGuard-off frontend leaves TCP pool working", func(t *testing.T) {
-		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: false, managerWireGuard: true})
+		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: false})
 		defer fixture.cleanup(t)
 
 		waitFor(t, 5*time.Second, fixture.manager.IsConnected)
@@ -665,8 +667,13 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 		})
 	})
 
-	t.Run("Flag off leaves behaviour unchanged", func(t *testing.T) {
-		fixture := newWireGuardFixture(t, fixtureOptions{frontendWireGuard: true, managerWireGuard: false})
+	t.Run("Device open error leaves TCP pool working", func(t *testing.T) {
+		fixture := newWireGuardFixture(t, fixtureOptions{
+			frontendWireGuard: true,
+			deviceOpener: func(ctx context.Context, config wireguard.Config) (WireGuardDevice, error) {
+				return nil, errors.New("simulated device opener failure")
+			},
+		})
 		defer fixture.cleanup(t)
 
 		waitFor(t, 5*time.Second, fixture.manager.IsConnected)
@@ -675,12 +682,12 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 		numDevices := len(fixture.devices)
 		fixture.devMu.Unlock()
 		if numDevices != 0 {
-			t.Errorf("expected no devices opened when flag is off, got %d", numDevices)
+			t.Errorf("expected no devices opened when opener fails, got %d", numDevices)
 		}
 
-		fixture.manager.UpdateHostnames([]string{"flagoff.example.com"})
+		fixture.manager.UpdateHostnames([]string{"fallback.example.com"})
 		waitFor(t, 5*time.Second, func() bool {
-			return fixture.manager.HasRegisteredHostnames([]string{"flagoff.example.com"})
+			return fixture.manager.HasRegisteredHostnames([]string{"fallback.example.com"})
 		})
 	})
 }

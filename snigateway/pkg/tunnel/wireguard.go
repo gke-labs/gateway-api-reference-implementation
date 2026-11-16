@@ -64,19 +64,6 @@ func newWireGuardManager() *wireguardManager {
 	}
 }
 
-// WithWireGuard enables or disables WireGuard tunnel transport.
-func WithWireGuard(enabled bool) ManagerOption {
-	return func(m *Manager) {
-		if enabled {
-			if m.wireguard == nil {
-				m.wireguard = newWireGuardManager()
-			}
-		} else {
-			m.wireguard = nil
-		}
-	}
-}
-
 // WithWireGuardDeviceOpener sets a custom opener for the WireGuard device.
 func WithWireGuardDeviceOpener(opener func(ctx context.Context, config wireguard.Config) (WireGuardDevice, error)) ManagerOption {
 	return func(m *Manager) {

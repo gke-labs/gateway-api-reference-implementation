@@ -78,6 +78,24 @@ spec:
         - "--ca-cert=/etc/snigateway/certs/ca.crt"
         - "--client-cert=/etc/snigateway/certs/client.crt"
         - "--client-key=/etc/snigateway/certs/client.key"
+        # The container runs as non-root (65532) and the snigateway binary carries
+        # file capability cap_net_admin+ep. allowPrivilegeEscalation: true is
+        # required because setting allowPrivilegeEscalation: false (no_new_privs)
+        # prevents non-root processes from gaining file capabilities on execve.
+        # CAP_NET_ADMIN is required to configure the WireGuard wg0 interface and
+        # kernel routes in the pod's network namespace. The namespace must use a
+        # non-restricted Pod Security level (e.g. privileged or an exemption)
+        # because the restricted level disallows CAP_NET_ADMIN and requires
+        # allowPrivilegeEscalation: false. The cluster network must allow outbound
+        # UDP traffic to the frontend's WireGuard listen port.
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_ADMIN
         volumeMounts:
         - name: client-certs
           mountPath: /etc/snigateway/certs
