@@ -280,6 +280,8 @@ type fixtureOptions struct {
 type wireguardFixture struct {
 	server           *frontend.Server
 	serverListener   net.Listener
+	clientConnsMu    sync.Mutex
+	clientConns      []net.Conn
 	frontendKey      wireguard.Key
 	prefixNet        *net.IPNet
 	frontendTunnelIP net.IP
@@ -385,7 +387,18 @@ func newWireGuardFixture(t *testing.T, options fixtureOptions) *wireguardFixture
 		return tunnelListener, nil
 	}
 
-	managerClient := client.NewClient(serverListener.Addr().String(), clientTLS)
+	dialFunc := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		fixture.clientConnsMu.Lock()
+		fixture.clientConns = append(fixture.clientConns, conn)
+		fixture.clientConnsMu.Unlock()
+		return conn, nil
+	}
+
+	managerClient := client.NewClient(serverListener.Addr().String(), clientTLS, client.WithDialFunc(dialFunc))
 	fixture.manager = NewManager(managerClient,
 		WithWireGuard(options.managerWireGuard),
 		WithWireGuardDeviceOpener(opener),
@@ -404,10 +417,20 @@ func newWireGuardFixture(t *testing.T, options fixtureOptions) *wireguardFixture
 
 func (f *wireguardFixture) cleanup(t *testing.T) {
 	t.Helper()
-	f.mgrCancel()
-	if err := <-f.mgrErrCh; err != nil && !errors.Is(err, context.Canceled) {
-		t.Errorf("manager error: %v", err)
+	if f.mgrCancel != nil {
+		f.mgrCancel()
+		if err := <-f.mgrErrCh; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("manager error: %v", err)
+		}
 	}
+	f.clientConnsMu.Lock()
+	for _, conn := range f.clientConns {
+		// Most recorded client connections are already closed by this point; ignore net.ErrClosed.
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("client connection Close error: %v", err)
+		}
+	}
+	f.clientConnsMu.Unlock()
 	if err := f.server.Close(); err != nil {
 		t.Errorf("server.Close error: %v", err)
 	}
@@ -477,7 +500,6 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dialing tunnel listener: %v", err)
 		}
-		defer tlsConn.Close()
 
 		hdrTLS := &proxyproto.Header{
 			Command: proxyproto.CommandProxy,
@@ -498,13 +520,13 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 			t.Fatalf("HTTPSListener.Accept failed: %v", err)
 		}
 		acceptedTLS.Close()
+		tlsConn.Close()
 
 		// HTTP dispatch to HTTPListener
 		httpConn, err := net.Dial("tcp", tunnelListener.Addr().String())
 		if err != nil {
 			t.Fatalf("dialing tunnel listener for HTTP: %v", err)
 		}
-		defer httpConn.Close()
 
 		hdrHTTP := &proxyproto.Header{
 			Command: proxyproto.CommandProxy,
@@ -525,6 +547,13 @@ func TestManager_WireGuard_Acceptance(t *testing.T) {
 			t.Fatalf("HTTPListener.Accept failed: %v", err)
 		}
 		acceptedHTTP.Close()
+		httpConn.Close()
+
+		fixture.mgrCancel()
+		if err := <-fixture.mgrErrCh; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("manager error: %v", err)
+		}
+		fixture.mgrCancel = nil
 	})
 
 	t.Run("Unauthorized connection from another address is closed", func(t *testing.T) {
