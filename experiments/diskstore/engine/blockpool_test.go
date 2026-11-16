@@ -848,23 +848,33 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 		return bp, buddy
 	}
 
+	deferBlockThroughReplacement := func(t *testing.T, bp *BlockPool, pageID uint64) uint64 {
+		h, err := bp.AllocateNewPage(pageID, 1, 10)
+		if err != nil {
+			t.Fatalf("AllocateNewPage failed: %v", err)
+		}
+		copy(h.Block(0)[BlockHeaderSize:], []byte("v1"))
+		h.Unpin()
+		if err := bp.FlushPage(pageID); err != nil {
+			t.Fatalf("first FlushPage failed: %v", err)
+		}
+		bp.mu.Lock()
+		origBlock := bp.pageTable[pageID].PhysicalBlock
+		bp.mu.Unlock()
+
+		bp.MarkDirty(pageID, 20)
+		if err := bp.FlushPage(pageID); err != nil {
+			t.Fatalf("replacement FlushPage failed: %v", err)
+		}
+		return origBlock
+	}
+
 	t.Run("unneeded before fsync starts is freed when that fsync succeeds", func(t *testing.T) {
 		bp, buddy := setup(t)
 
-		r1, err := buddy.Allocate(0)
-		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
-		}
+		r1 := deferBlockThroughReplacement(t, bp, 1)
 		if !isAllocated(buddy, r1) {
 			t.Fatalf("expected block %d to be allocated", r1)
-		}
-
-		// Queue run to be freed before fsync starts
-		bp.deferFree(blockRun{block: r1})
-
-		// Run has not been freed yet
-		if !isAllocated(buddy, r1) {
-			t.Fatalf("run %d was freed prematurely before fsync started", r1)
 		}
 
 		// Fsync starts: unsynced rotates to syncing
@@ -897,23 +907,13 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 	t.Run("unneeded while fsync runs is not freed by that fsync and is freed by the next", func(t *testing.T) {
 		bp, buddy := setup(t)
 
-		r1, err := buddy.Allocate(0)
-		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
-		}
-		r2, err := buddy.Allocate(0)
-		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
-		}
-
-		// Queue r1 before fsync 1 starts
-		bp.deferFree(blockRun{block: r1})
+		r1 := deferBlockThroughReplacement(t, bp, 1)
 
 		// Fsync 1 starts: r1 moves to syncing, unsynced is empty
 		bp.startHeapSync()
 
-		// Queue r2 while fsync 1 is running: r2 appends to unsynced
-		bp.deferFree(blockRun{block: r2})
+		// Defer r2 while fsync 1 is running: r2 appends to unsynced
+		r2 := deferBlockThroughReplacement(t, bp, 2)
 
 		// Fsync 1 succeeds: r1 is freed, r2 is not
 		if err := bp.heapSyncSucceeded(); err != nil {
@@ -943,23 +943,13 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 	t.Run("failed fsync frees nothing and next successful fsync frees both generations", func(t *testing.T) {
 		bp, buddy := setup(t)
 
-		r1, err := buddy.Allocate(0)
-		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
-		}
-		r2, err := buddy.Allocate(0)
-		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
-		}
-
-		// Queue r1 before fsync 1 starts
-		bp.deferFree(blockRun{block: r1})
+		r1 := deferBlockThroughReplacement(t, bp, 1)
 
 		// Fsync 1 starts: r1 moves to syncing
 		bp.startHeapSync()
 
-		// Queue r2 while fsync 1 is running: r2 appends to unsynced
-		bp.deferFree(blockRun{block: r2})
+		// Defer r2 while fsync 1 is running: r2 appends to unsynced
+		r2 := deferBlockThroughReplacement(t, bp, 2)
 
 		// Fsync 1 fails: release nothing
 		bp.heapSyncFailed()
@@ -991,38 +981,36 @@ func TestBlockPool_DeferredFreeLists(t *testing.T) {
 	t.Run("each run is freed once", func(t *testing.T) {
 		bp, buddy := setup(t)
 
-		r1, err := buddy.Allocate(0)
-		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
-		}
-		r2, err := buddy.Allocate(0)
-		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
-		}
-
-		bp.deferFree(blockRun{block: r1})
+		r1 := deferBlockThroughReplacement(t, bp, 1)
 		bp.startHeapSync()
-		bp.deferFree(blockRun{block: r2})
+		r2 := deferBlockThroughReplacement(t, bp, 2)
 		if err := bp.heapSyncSucceeded(); err != nil {
 			t.Fatalf("heapSyncSucceeded failed: %v", err)
 		}
+		if isAllocated(buddy, r1) {
+			t.Fatalf("r1 %d should be freed after first fsync", r1)
+		}
+		if !isAllocated(buddy, r2) {
+			t.Fatalf("r2 %d should remain allocated before its fsync", r2)
+		}
 
-		// Subsequent fsync with empty lists:
-		// If r1 or r2 was freed twice, buddy.Free would error with "block %d not allocated".
+		// Subsequent fsync frees r2:
 		bp.startHeapSync()
 		if err := bp.heapSyncSucceeded(); err != nil {
-			t.Fatalf("heapSyncSucceeded on empty lists failed (possible double free): %v", err)
+			t.Fatalf("heapSyncSucceeded on second fsync failed: %v", err)
+		}
+		if isAllocated(buddy, r2) {
+			t.Fatalf("r2 %d should be freed after second fsync", r2)
 		}
 
 		// Next cycle with a third run:
-		r3, err := buddy.Allocate(0)
-		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
-		}
-		bp.deferFree(blockRun{block: r3})
+		r3 := deferBlockThroughReplacement(t, bp, 3)
 		bp.startHeapSync()
 		if err := bp.heapSyncSucceeded(); err != nil {
 			t.Fatalf("heapSyncSucceeded failed: %v", err)
+		}
+		if isAllocated(buddy, r3) {
+			t.Fatalf("r3 %d should be freed after third fsync", r3)
 		}
 
 		// Once more verify no leftover runs or double frees
@@ -1314,4 +1302,153 @@ func TestBlockPool_FsyncSucceedsWhileLaterFlushInFlight(t *testing.T) {
 		t.Fatalf("expected RedoLSN=30 after second fsync, got %d", desc.RedoLSN)
 	}
 	bp.mu.Unlock()
+}
+
+// TestBlockPool_DeferredFrees_NoRunDeferredOrFreedTwice asserts that no run is deferred or freed twice.
+func TestBlockPool_DeferredFrees_NoRunDeferredOrFreedTwice(t *testing.T) {
+	memFS := NewMemFS()
+	heapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("no-double-list01"))
+	wal, err := OpenWAL(memFS, "wal_dir", dbID, 0, WALOptions{})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	buddy := NewBuddyAllocator(512)
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
+	defer bp.Close()
+
+	assertNoDuplicates := func() {
+		t.Helper()
+		bp.mu.Lock()
+		defer bp.mu.Unlock()
+		seen := make(map[uint64]bool)
+		for _, blockRun := range bp.deferredFreesUnsynced {
+			if seen[blockRun.block] {
+				t.Fatalf("block %d deferred more than once in unsynced", blockRun.block)
+			}
+			seen[blockRun.block] = true
+		}
+		for _, blockRun := range bp.deferredFreesSyncing {
+			if seen[blockRun.block] {
+				t.Fatalf("block %d deferred more than once across syncing and unsynced", blockRun.block)
+			}
+			seen[blockRun.block] = true
+		}
+	}
+
+	// 1. Allocate and flush page 1
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("val1")}); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+	h1, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	copy(h1.Block(0)[BlockHeaderSize:], []byte("data-1"))
+	h1.Unpin()
+
+	// Flush 1: brand new page, no prior block superseded
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("FlushPage failed: %v", err)
+	}
+	bp.mu.Lock()
+	loc1 := bp.pageTable[1].PhysicalBlock
+	bp.mu.Unlock()
+	assertNoDuplicates()
+
+	// Promote loc1 to durable
+	bp.SnapshotFlushedForSync()
+	bp.startHeapSync()
+	assertNoDuplicates()
+	if err := bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("heapSyncSucceeded failed: %v", err)
+	}
+	if err := bp.PromoteFlushedToDurable(); err != nil {
+		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	}
+	assertNoDuplicates()
+
+	// 2. Reallocate page 1 via AllocateNewPage (carries loc1 forward in replacedBlocks)
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k", Payload: []byte("val2")}); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+	h2, err := bp.AllocateNewPage(1, 1, 20)
+	if err != nil {
+		t.Fatalf("AllocateNewPage realloc failed: %v", err)
+	}
+	copy(h2.Block(0)[BlockHeaderSize:], []byte("data-2"))
+	h2.Unpin()
+
+	// Before flush of new contents, loc1 must NOT yet be deferred
+	bp.mu.Lock()
+	for _, blockRun := range bp.deferredFreesUnsynced {
+		if blockRun.block == loc1 {
+			bp.mu.Unlock()
+			t.Fatalf("loc1 %d deferred before replacement flush completed", loc1)
+		}
+	}
+	bp.mu.Unlock()
+	assertNoDuplicates()
+
+	// 3. Flush replacement contents: loc1 must now be deferred exactly once
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("FlushPage replacement failed: %v", err)
+	}
+	bp.mu.Lock()
+	loc2 := bp.pageTable[1].PhysicalBlock
+	count := 0
+	for _, blockRun := range bp.deferredFreesUnsynced {
+		if blockRun.block == loc1 {
+			count++
+		}
+	}
+	bp.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("expected loc1 %d to be deferred exactly once, found %d times", loc1, count)
+	}
+	assertNoDuplicates()
+
+	// 4. Second flush of same incarnation to loc3: loc2 must be deferred exactly once, loc1 must still appear once
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 30, Key: "k", Payload: []byte("val3")}); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+	bp.MarkDirty(1, 30)
+	if err := bp.FlushPage(1); err != nil {
+		t.Fatalf("second FlushPage failed: %v", err)
+	}
+	bp.mu.Lock()
+	loc1Count := 0
+	loc2Count := 0
+	for _, blockRun := range bp.deferredFreesUnsynced {
+		if blockRun.block == loc1 {
+			loc1Count++
+		}
+		if blockRun.block == loc2 {
+			loc2Count++
+		}
+	}
+	bp.mu.Unlock()
+	if loc1Count != 1 {
+		t.Fatalf("expected loc1 %d to be deferred exactly once, found %d times", loc1, loc1Count)
+	}
+	if loc2Count != 1 {
+		t.Fatalf("expected loc2 %d to be deferred exactly once, found %d times", loc2, loc2Count)
+	}
+	assertNoDuplicates()
+
+	// 5. Sync releases loc1 and loc2 safely
+	bp.startHeapSync()
+	assertNoDuplicates()
+	if err := bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("heapSyncSucceeded freeing loc1 and loc2 failed: %v", err)
+	}
+	assertNoDuplicates()
 }

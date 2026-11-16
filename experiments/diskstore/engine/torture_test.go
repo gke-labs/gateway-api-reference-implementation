@@ -217,20 +217,18 @@ var tortureConfigs = []tortureConfig{
 	{name: "pool_24_clean_nosweep", poolBlocks: 24, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean},
 
 	// Pools of 9, 12, 16 and 24 blocks with values up to 8 blocks, clean close, with sweep goroutine.
-	// Skipped due to production bugs: concurrent background sweep flushes dirty pages during
-	// multi-block page reallocation, triggering reuse rule violations in FaultFS.
-	{name: "pool_9_clean_sweep", poolBlocks: 9, maxValueBlocks: 8, numKeys: 12, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean, sweep: true, skipReason: "skipping: seed 11 fails with reuse rule violation in FaultFile.WriteAt during concurrent background sweep on a 9-block pool with 8-block values; the engine fault is tracked separately"},
-	{name: "pool_12_clean_sweep", poolBlocks: 12, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean, sweep: true, skipReason: "skipping: seed 2 fails with reuse rule violation in FaultFile.WriteAt during concurrent background sweep on a 12-block pool with 8-block values; the engine fault is tracked separately"},
-	{name: "pool_16_clean_sweep", poolBlocks: 16, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean, sweep: true, skipReason: "skipping: seed 18 fails with reuse rule violation in FaultFile.WriteAt during concurrent background sweep on a 16-block pool with 8-block values; the engine fault is tracked separately"},
-	{name: "pool_24_clean_sweep", poolBlocks: 24, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean, sweep: true, skipReason: "skipping: seed 17 fails with reuse rule violation in FaultFile.WriteAt during concurrent background sweep on a 24-block pool with 8-block values; the engine fault is tracked separately"},
+	{name: "pool_9_clean_sweep", poolBlocks: 9, maxValueBlocks: 8, numKeys: 12, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean, sweep: true},
+	{name: "pool_12_clean_sweep", poolBlocks: 12, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean, sweep: true},
+	{name: "pool_16_clean_sweep", poolBlocks: 16, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean, sweep: true},
+	{name: "pool_24_clean_sweep", poolBlocks: 24, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean, sweep: true},
 
 	// Crashes that tear unsynced writes with values up to 8 blocks on small pools (12 and 24 blocks, four cycles).
 	{name: "pool_12_val8_crash_tear", poolBlocks: 12, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear},
 	{name: "pool_24_val8_crash_tear", poolBlocks: 24, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear},
 
 	// The same with the sweep goroutine.
-	{name: "pool_12_val8_crash_tear_sweep", poolBlocks: 12, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear, sweep: true, skipReason: "skipping: seed 1 fails because deleted key k12 is resurrected after crash recovery on a 12-block pool with 8-block values; the engine fault is tracked separately"},
-	{name: "pool_24_val8_crash_tear_sweep", poolBlocks: 24, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear, sweep: true, skipReason: "skipping: seed 1 fails because deleted key k12 is resurrected after crash recovery on a 24-block pool with 8-block values; the engine fault is tracked separately"},
+	{name: "pool_12_val8_crash_tear_sweep", poolBlocks: 12, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear, sweep: true},
+	{name: "pool_24_val8_crash_tear_sweep", poolBlocks: 24, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear, sweep: true},
 
 	// 16-block pool with values up to 8 blocks, crash that drops unsynced writes (replaces TestRecovery_SmallBlockPoolReuseRule).
 	{name: "pool_16_crash_drop", poolBlocks: 16, maxValueBlocks: 8, numKeys: 20, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashDrop},
