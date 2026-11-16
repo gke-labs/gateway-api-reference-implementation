@@ -41,11 +41,11 @@ Two topology choices exist for establishing the configuration stream:
   elected leader. This avoids proxying between controllers or managing dynamic
   Service endpoints during failovers.
 
-The choice is the maintainer's. The recommendation is **data planes dial the
-controller**: it requires only standard pod egress rather than opening inbound
-firewall ports into data planes across workload namespaces, avoids pod endpoint
-discovery in the controller, and synchronizes restarting data planes immediately
-when they dial on startup.
+**Decision:** Data planes dial the controller. The maintainer chose this
+direction for its compelling latency. It requires only standard pod egress
+rather than opening inbound firewall ports into data planes across workload
+namespaces, avoids pod endpoint discovery in the controller, and synchronizes
+restarting data planes immediately when they dial on startup.
 
 ## 2. Authentication and Authorization
 
@@ -74,11 +74,14 @@ Trade-offs: Serving nothing avoids storing private keys in container volumes
 and prevents routing traffic to stale backends. Local caching preserves uptime
 during controller outages but increases attack surface and risks split brain.
 
-The choice is the maintainer's. The recommendation is **serve nothing (fail closed)**.
-The cost is that if the controller stays down during an extended upgrade, outage,
-or crash loop, any data-plane container that restarts during that window serves
-nothing until the controller returns. In return, fail-closed keeps TLS private
-keys off local disk and guarantees that proxies never serve outdated routes.
+**Decision:** Fail closed; the data plane serves nothing while the controller is
+unreachable, with no serving from a local cache. The maintainer chose this
+because it is simpler and eliminates the risk that a local cache serves stale
+config at the worst possible moment. The cost is that if the controller stays
+down during an extended upgrade, outage, or crash loop, any data-plane container
+that restarts during that window serves nothing until the controller returns.
+In return, fail-closed keeps TLS private keys off local disk and guarantees that
+proxies never serve outdated routes.
 
 ## 4. Acknowledgement
 
@@ -115,8 +118,8 @@ Non-standard data planes receive configuration through the same mechanism:
 
 ## 7. Order of Work
 
-The migration proceeds in small, backward-compatible steps for the recommended
-direction where the controller serves and data planes connect and receive:
+The migration proceeds in small, backward-compatible steps where the controller
+serves and data planes connect and receive:
 
 1. **Protocol library.** Add the push transport package (`pkg/dataplane/push`)
    defining the gRPC service, token authentication, and ACK and NACK types.
@@ -132,6 +135,8 @@ direction where the controller serves and data planes connect and receive:
 5. **Remove Secret path.** Remove `PublishDataplaneConfig` Secret generation,
    delete `dataplaneSecretReconciler`, and drop data-plane Secret RBAC.
 
-If the maintainer picks the controller-dials direction instead, steps 2 and 3
-invert: step 2 adds an administrative push listener and pod endpoint discovery
-to data planes, and step 3 adds the dialing client to the controller.
+## Open Questions
+
+- **Unifying address providers.** Can we unify the different address providers
+  (`singlepod`, `localgateway`, and `snigateway`) around the shared push
+  transport and lifecycle mechanism?
