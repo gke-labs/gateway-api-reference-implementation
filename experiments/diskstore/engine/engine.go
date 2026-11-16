@@ -298,7 +298,6 @@ type Engine struct {
 
 	heapFile File
 	wal      Log
-	lastLSN  atomic.Uint64
 	buddy    *BuddyAllocator
 	bp       *BlockPool
 	cp       *Checkpointer
@@ -949,7 +948,6 @@ func Open(opts ...Option) (*Engine, error) {
 			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)
 		}
 		s.wal = wal
-		s.lastLSN.Store(recoveryRes.MaxLSN)
 
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
@@ -1678,7 +1676,6 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		s.setFailed(err)
 		return s.failErr()
 	}
-	s.lastLSN.Store(lsn)
 
 	if err := s.applyPutLocked(qKey, rec.Payload, lsn, isOversize); err != nil {
 		if errors.Is(err, ErrObjectOversize) {
@@ -2048,7 +2045,6 @@ func (s *Engine) Delete(tableName, key string) error {
 		s.setFailed(err)
 		return s.failErr()
 	}
-	s.lastLSN.Store(lsn)
 
 	if err := s.applyDeleteLocked(qKey, lsn); err != nil {
 		s.setFailed(err)
@@ -2161,7 +2157,7 @@ func (s *Engine) Sync() error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if err := s.wal.SyncThrough(s.lastLSN.Load()); err != nil {
+	if err := s.wal.Sync(); err != nil {
 		s.setFailed(err)
 		return s.failErr()
 	}
@@ -2173,7 +2169,7 @@ func (s *Engine) Flush() error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if err := s.wal.SyncThrough(s.lastLSN.Load()); err != nil {
+	if err := s.wal.Flush(); err != nil {
 		s.setFailed(err)
 		return s.failErr()
 	}
@@ -2190,9 +2186,6 @@ func (s *Engine) Checkpoint() (uint64, error) {
 	if err != nil {
 		s.setFailed(err)
 		return 0, s.failErr()
-	}
-	if chkLSN > s.lastLSN.Load() {
-		s.lastLSN.Store(chkLSN)
 	}
 	return chkLSN, nil
 }

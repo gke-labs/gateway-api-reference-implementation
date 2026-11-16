@@ -568,7 +568,7 @@ func TestRegression_Item3_RedoAppliesPayload(t *testing.T) {
 	_ = store.Put("ConfigMap", "key-redo-2", []byte("payload-redo-2"))
 
 	// Sync WAL so records are durable, but do NOT sync heap
-	_ = store.Sync()
+	_ = store.wal.Sync()
 
 	// Simulate crash
 	_ = store.Close()

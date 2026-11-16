@@ -469,8 +469,8 @@ func TestCompression_RecoveryWALReplay(t *testing.T) {
 	_ = store.Put("ConfigMap", "cm-3", p3)
 
 	// Ensure WAL records are durable, but do not checkpoint
-	if err := store.Sync(); err != nil {
-		t.Fatalf("Sync failed: %v", err)
+	if err := store.wal.Sync(); err != nil {
+		t.Fatalf("wal.Sync failed: %v", err)
 	}
 
 	// Simulate crash

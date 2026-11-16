@@ -1071,7 +1071,7 @@ func (bp *BlockPool) DirtyPageTableAndLSN() (map[uint64]uint64, uint64) {
 	}
 	maxLSN := uint64(0)
 	if bp.wal != nil {
-		maxLSN = bp.wal.DurableLSN()
+		maxLSN = bp.wal.MaxLSN()
 	}
 	return dpt, maxLSN
 }

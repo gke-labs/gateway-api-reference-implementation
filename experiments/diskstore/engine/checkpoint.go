@@ -123,7 +123,7 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 	}
 
 	// 7. Fsync WAL
-	if err := c.wal.SyncThrough(chkLSN); err != nil {
+	if err := c.wal.Sync(); err != nil {
 		return 0, fmt.Errorf("checkpoint failed to fsync WAL: %w", err)
 	}
 

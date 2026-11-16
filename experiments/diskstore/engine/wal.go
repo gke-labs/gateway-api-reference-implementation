@@ -964,7 +964,7 @@ type WALIterator struct {
 var _ LogIterator = (*WALIterator)(nil)
 
 // NewWALIterator creates an iterator to replay records from startLSN.
-func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, options WALIteratorOptions) (LogIterator, error) {
+func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, options WALIteratorOptions) (*WALIterator, error) {
 	entries, err := fs.ReadDir(dir)
 	if err != nil {
 		return nil, err
