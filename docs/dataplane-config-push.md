@@ -62,26 +62,22 @@ Each side proves its identity to ensure TLS private keys remain secure:
 
 ## 3. Start and Restart
 
-When a data plane restarts while the controller is unreachable:
+A running data plane keeps serving the configuration it holds in memory if the
+controller becomes unreachable. When a data plane starts or restarts while the
+controller is down:
 
-- **Serve nothing (fail closed).** The data plane binds no listeners and reports
-  unready until it connects to the controller and receives its first config.
+- **Serve nothing (fail closed).** The restarted data plane has no local cache,
+  so it binds no listeners and reports unready until it reaches the controller
+  and receives its configuration.
 - **Serve from local cache.** The data plane writes applied config to an
   in-memory `emptyDir` volume (`/var/run/gari/cached-config.json`). On container
   restarts within the same pod, it loads the cache; fresh pods start empty.
 
-Trade-offs: Serving nothing avoids storing private keys in container volumes
-and prevents routing traffic to stale backends. Local caching preserves uptime
-during controller outages but increases attack surface and risks split brain.
-
-**Decision:** Fail closed; the data plane serves nothing while the controller is
-unreachable, with no serving from a local cache. The maintainer chose this
-because it is simpler and eliminates the risk that a local cache serves stale
-config at the worst possible moment. The cost is that if the controller stays
-down during an extended upgrade, outage, or crash loop, any data-plane container
-that restarts during that window serves nothing until the controller returns.
-In return, fail-closed keeps TLS private keys off local disk and guarantees that
-proxies never serve outdated routes.
+**Decision:** Fail closed, with no serving from a local cache. The maintainer
+chose this because it is simpler and avoids serving from a local cache at the
+worst possible moment. The trade-off is in plain terms: no TLS private keys on
+local disk and no stale config after a restart, at the cost of serving nothing
+after a restart while the controller is down.
 
 ## 4. Acknowledgement
 
