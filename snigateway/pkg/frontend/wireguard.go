@@ -15,12 +15,10 @@
 package frontend
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
@@ -39,7 +37,7 @@ type wireguardPeer struct {
 	// publicKey is the WireGuard public key of the client peer.
 	publicKey wireguard.Key
 	// address is the IPv6 tunnel address allocated to the client peer.
-	address net.IP
+	address netip.Addr
 }
 
 // WireGuardManager manages the WireGuard device, peer allocations, and per-session keys.
@@ -112,34 +110,31 @@ func (m *WireGuardManager) PeerAddress(sessionID string) (net.IP, bool) {
 	if !ok {
 		return nil, false
 	}
-	addr := make(net.IP, len(peer.address))
-	copy(addr, peer.address)
-	return addr, true
+	return peer.address.AsSlice(), true
 }
 
-func (m *WireGuardManager) allocateAddressLocked() (net.IP, error) {
-	base := m.prefix.IP.To16()
-	if base == nil {
-		return nil, errors.New("invalid wireguard prefix")
+func (m *WireGuardManager) allocateAddressLocked() (netip.Addr, error) {
+	if m.prefix == nil {
+		return netip.Addr{}, errors.New("invalid wireguard prefix")
 	}
-	// The prefix is a /64: the first 8 bytes match the network prefix, and the
-	// last 8 bytes are the host number used as the set's key, so all 16 bytes
-	// of each peer address are accounted for.
-	usedHosts := make(map[uint64]struct{}, len(m.peersBySession))
+	prefix, err := netip.ParsePrefix(m.prefix.String())
+	if err != nil {
+		return netip.Addr{}, errors.New("invalid wireguard prefix")
+	}
+	prefix = prefix.Masked()
+
+	used := make(map[netip.Addr]struct{}, len(m.peersBySession))
 	for _, peer := range m.peersBySession {
-		if ip := peer.address.To16(); ip != nil && bytes.Equal(ip[:8], base[:8]) {
-			usedHosts[binary.BigEndian.Uint64(ip[8:])] = struct{}{}
+		used[peer.address] = struct{}{}
+	}
+
+	first := prefix.Addr()
+	for candidate := first.Next().Next(); prefix.Contains(candidate); candidate = candidate.Next() {
+		if _, inUse := used[candidate]; !inUse {
+			return candidate, nil
 		}
 	}
-	for host := uint64(2); host < math.MaxUint64; host++ {
-		if _, used := usedHosts[host]; !used {
-			address := make(net.IP, 16)
-			copy(address, base)
-			binary.BigEndian.PutUint64(address[8:], host)
-			return address, nil
-		}
-	}
-	return nil, errors.New("no free wireguard addresses in prefix")
+	return netip.Addr{}, errors.New("no free wireguard addresses in prefix")
 }
 
 var (
@@ -185,7 +180,7 @@ func (m *WireGuardManager) ConfigureSessionPeer(sessionID string, clientIdentity
 		PublicKey: clientPublicKey,
 		AllowedIPs: []net.IPNet{
 			{
-				IP:   peerAddress,
+				IP:   net.IP(peerAddress.AsSlice()),
 				Mask: net.CIDRMask(128, 128),
 			},
 		},

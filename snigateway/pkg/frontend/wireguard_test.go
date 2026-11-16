@@ -976,6 +976,54 @@ func TestWireGuard_AllocateAddressLocked(t *testing.T) {
 	}
 }
 
+func TestWireGuard_AllocateAddressLocked_PrefixExhausted(t *testing.T) {
+	_, prefix, err := net.ParseCIDR("2001:db8:cafe::/126")
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
+
+	device := newFakeWireGuardDevice()
+	table := NewRegistrationTable()
+	mgr := NewWireGuardManager(device, wireguard.Key{}, 51820, prefix, table)
+	if mgr == nil {
+		t.Fatal("NewWireGuardManager returned nil")
+	}
+
+	identity := ClientIdentity{ID: "client-1"}
+	table.RegisterSession("sess-1", identity)
+	table.RegisterSession("sess-2", identity)
+	table.RegisterSession("sess-3", identity)
+
+	_, key1, _ := wireguard.GenerateKey()
+	_, key2, _ := wireguard.GenerateKey()
+	_, key3, _ := wireguard.GenerateKey()
+
+	resp1, err := mgr.ConfigureSessionPeer("sess-1", identity, key1)
+	if err != nil {
+		t.Fatalf("ConfigureSessionPeer sess-1 failed: %v", err)
+	}
+	if expected := "2001:db8:cafe::2"; resp1.PeerAddress != expected {
+		t.Fatalf("expected session 1 address %s, got %s", expected, resp1.PeerAddress)
+	}
+
+	resp2, err := mgr.ConfigureSessionPeer("sess-2", identity, key2)
+	if err != nil {
+		t.Fatalf("ConfigureSessionPeer sess-2 failed: %v", err)
+	}
+	if expected := "2001:db8:cafe::3"; resp2.PeerAddress != expected {
+		t.Fatalf("expected session 2 address %s, got %s", expected, resp2.PeerAddress)
+	}
+
+	// /126 has 4 addresses (hosts 0, 1, 2, 3). Hosts 2 and 3 are taken, host 4 is outside prefix.
+	_, err = mgr.ConfigureSessionPeer("sess-3", identity, key3)
+	if err == nil {
+		t.Fatal("expected error when prefix is exhausted, got nil")
+	}
+	if !strings.Contains(err.Error(), "no free wireguard addresses in prefix") {
+		t.Fatalf("expected 'no free wireguard addresses in prefix', got: %v", err)
+	}
+}
+
 func localTCPConnPair(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
