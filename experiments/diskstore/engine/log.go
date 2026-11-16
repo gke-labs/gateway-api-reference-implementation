@@ -34,12 +34,22 @@ type Log interface {
 	// page with LSN P is never flushed to disk until the log confirms durability through P.
 	SyncThrough(lsn uint64) error
 
-	// Sync flushes and ensures durability for all appended records.
-	// The engine calls this on Engine.Sync and during checkpoints.
+	// Sync flushes all buffered records and makes them durable with an fsync.
+	// When Sync returns, all appended records have been written and made durable
+	// on storage (for the WAL, via a local fsync). Records survive process crashes,
+	// operating system crashes, and node power loss. The engine calls Sync on
+	// Engine.Sync when durable persistence is requested, and during checkpoints
+	// to ensure the checkpoint record and earlier operations are durable before
+	// truncating finished log segments.
 	Sync() error
 
-	// Flush flushes buffered records to the underlying storage.
-	// The engine calls this on Engine.Flush.
+	// Flush writes buffered records out to the operating system without an fsync.
+	// When Flush returns, buffered records have been handed to the operating system
+	// (for example, written to the OS page cache), but not made durable on physical
+	// storage. Records survive a process crash, but do not survive an operating
+	// system crash or node power loss. The engine calls Flush on Engine.Flush when
+	// the caller wants buffered writes pushed to the operating system without
+	// paying the latency cost of an fsync.
 	Flush() error
 
 	// MaxLSN reports the highest LSN appended to the log.
