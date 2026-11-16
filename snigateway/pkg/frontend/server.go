@@ -423,7 +423,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	s.routeToBackend(sniHostname, peekedConn)
+	s.routeToBackend(sniHostname, peekedConn, true)
 }
 
 // handleHTTPConnection peeks the HTTP/1.1 request head of an incoming plaintext connection,
@@ -441,7 +441,7 @@ func (s *Server) handleHTTPConnection(conn net.Conn) {
 		return
 	}
 
-	s.routeToBackend(hostname, peekedConn)
+	s.routeToBackend(hostname, peekedConn, false)
 }
 
 var (
@@ -449,7 +449,25 @@ var (
 	errNoWireGuardPeer   = errors.New("session has no WireGuard peer")
 )
 
-func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
+// routeToBackend routes an incoming connection to a backend session matching hostname.
+//
+// Routing and retry rule:
+// A connection attempt may fail before any of the client's bytes are written to the backend
+// (e.g. if dialing the tunnel is refused, or writing the synthetic PROXY header fails). Such
+// early failures may still be retried on another backend session.
+//
+// However, after the frontend has written any of the client's bytes to a backend, it does not
+// send them to another one; a failure after that point closes the client connection immediately.
+// This rule applies specifically to plain HTTP connections (isTLS=false), where the peeked bytes
+// contain the HTTP request head (method, URI, headers, and possibly body). Replaying an HTTP request
+// to a second backend after the first backend has already received it is unsafe because non-idempotent
+// requests (e.g. POST, PATCH) could run twice.
+//
+// For TLS connections (isTLS=true), the rule does not prevent failover before the first byte: the
+// peeked bytes are strictly a TLS ClientHello, which carries no application request. Replaying a
+// ClientHello to a secondary backend when the first backend is unresponsive or closes without
+// sending a handshake response is safe and allows zero-downtime failover across healthy replicas.
+func (s *Server) routeToBackend(hostname string, peekedConn net.Conn, isTLS bool) {
 	cleanHost := CleanHostname(hostname)
 
 	var rawClientConn net.Conn = peekedConn
@@ -512,7 +530,7 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 			attemptTimeout = remaining
 		}
 
-		conn, initialBytes, err := s.attemptBackend(hostname, cleanHost, proxyBytes, peekedBytes, attemptTimeout)
+		conn, initialBytes, clientBytesWritten, err := s.attemptBackend(hostname, cleanHost, proxyBytes, peekedBytes, attemptTimeout)
 		if err == nil {
 			committedTunnel = conn
 			initialBackendBytes = initialBytes
@@ -528,6 +546,14 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 			if s.dialLogLimiter.Allow() {
 				klog.Errorf("Frontend: session for host %q has no WireGuard peer", hostname)
 			}
+			closeCloser(peekedConn)
+			return
+		}
+
+		// After the frontend has written any of the client's bytes to a backend,
+		// it does not send them to another one. For plain HTTP this prevents
+		// non-idempotent client requests from running twice.
+		if !isTLS && clientBytesWritten {
 			closeCloser(peekedConn)
 			return
 		}
@@ -566,15 +592,15 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn) {
 	spliceConnections(rawClientConn, committedTunnel, s.config.IdleTimeout)
 }
 
-func (s *Server) attemptBackend(hostname, cleanHost string, proxyBytes, peekedBytes []byte, attemptTimeout time.Duration) (net.Conn, []byte, error) {
+func (s *Server) attemptBackend(hostname, cleanHost string, proxyBytes, peekedBytes []byte, attemptTimeout time.Duration) (net.Conn, []byte, bool, error) {
 	sessions := s.table.MatchSessions(cleanHost)
 	if len(sessions) == 0 {
-		return nil, nil, errHostNotRegistered
+		return nil, nil, false, errHostNotRegistered
 	}
 
 	targetSession, peerAddress, ok := s.findWireGuardPeer(sessions)
 	if !ok {
-		return nil, nil, errNoWireGuardPeer
+		return nil, nil, false, errNoWireGuardPeer
 	}
 
 	attemptDeadline := time.Now().Add(attemptTimeout)
@@ -588,7 +614,7 @@ func (s *Server) attemptBackend(hostname, cleanHost string, proxyBytes, peekedBy
 	cancel()
 	if err != nil {
 		s.logDialError(targetSession, tunnelAddress, err)
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 
 	tunnelConn := conn
@@ -596,20 +622,28 @@ func (s *Server) attemptBackend(hostname, cleanHost string, proxyBytes, peekedBy
 
 	if err := tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout)); err != nil {
 		closeCloser(tunnelConn)
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	if _, err := tunnelConn.Write(proxyBytes); err != nil {
 		closeCloser(tunnelConn)
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	if _, err := tunnelConn.Write(peekedBytes); err != nil {
-		closeCloser(tunnelConn)
-		return nil, nil, err
+
+	var clientBytesWritten bool
+	if len(peekedBytes) > 0 {
+		n, writeErr := tunnelConn.Write(peekedBytes)
+		if n > 0 {
+			clientBytesWritten = true
+		}
+		if writeErr != nil {
+			closeCloser(tunnelConn)
+			return nil, nil, clientBytesWritten, writeErr
+		}
 	}
 
 	if err := tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout)); err != nil {
 		closeCloser(tunnelConn)
-		return nil, nil, err
+		return nil, nil, clientBytesWritten, err
 	}
 	buffer := make([]byte, 4096)
 	n, err := tunnelConn.Read(buffer)
@@ -618,15 +652,15 @@ func (s *Server) attemptBackend(hostname, cleanHost string, proxyBytes, peekedBy
 		if err == nil {
 			err = io.ErrUnexpectedEOF
 		}
-		return nil, nil, err
+		return nil, nil, clientBytesWritten, err
 	}
 
 	if err := tunnelConn.SetDeadline(time.Time{}); err != nil {
 		closeCloser(tunnelConn)
-		return nil, nil, err
+		return nil, nil, clientBytesWritten, err
 	}
 
-	return tunnelConn, buffer[:n], nil
+	return tunnelConn, buffer[:n], clientBytesWritten, nil
 }
 
 func isNormalClose(err error) bool {
