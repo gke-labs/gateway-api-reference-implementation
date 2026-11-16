@@ -16,6 +16,7 @@ package wireguard
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"net"
@@ -45,6 +46,23 @@ func GenerateKey() (Key, Key, error) {
 		return Key{}, Key{}, fmt.Errorf("generating private key: %w", err)
 	}
 	return privateKey, privateKey.PublicKey(), nil
+}
+
+// GeneratePrefix generates a random IPv6 Unique Local Address (ULA) /64 prefix
+// as specified in RFC 4193, with the fd00::/8 prefix, a pseudo-random 40-bit
+// Global ID, and a 16-bit subnet identifier (subnet 1).
+func GeneratePrefix() (*net.IPNet, error) {
+	ip := make(net.IP, 16)
+	ip[0] = 0xfd
+	if _, err := rand.Read(ip[1:6]); err != nil {
+		return nil, fmt.Errorf("generating random global ID: %w", err)
+	}
+	ip[6] = 0x00
+	ip[7] = 0x01
+	return &net.IPNet{
+		IP:   ip,
+		Mask: net.CIDRMask(64, 128),
+	}, nil
 }
 
 // ParseKey parses a base64-encoded WireGuard key.

@@ -76,6 +76,39 @@ func TestGenerateKey(t *testing.T) {
 	}
 }
 
+func TestGeneratePrefix(t *testing.T) {
+	prefix1, err := GeneratePrefix()
+	if err != nil {
+		t.Fatalf("GeneratePrefix failed: %v", err)
+	}
+	if prefix1 == nil {
+		t.Fatal("GeneratePrefix returned nil prefix")
+	}
+	if len(prefix1.IP) != 16 {
+		t.Fatalf("expected 16-byte IPv6 address, got %d bytes", len(prefix1.IP))
+	}
+	if prefix1.IP[0] != 0xfd {
+		t.Fatalf("expected prefix inside fd00::/8 (first byte 0xfd), got 0x%02x", prefix1.IP[0])
+	}
+	ones, bits := prefix1.Mask.Size()
+	if ones != 64 || bits != 128 {
+		t.Fatalf("expected /64 mask, got /%d (bits=%d)", ones, bits)
+	}
+	for i := 8; i < 16; i++ {
+		if prefix1.IP[i] != 0 {
+			t.Fatalf("expected trailing interface bits to be 0, got byte %d = 0x%02x", i, prefix1.IP[i])
+		}
+	}
+
+	prefix2, err := GeneratePrefix()
+	if err != nil {
+		t.Fatalf("GeneratePrefix second call failed: %v", err)
+	}
+	if prefix1.IP.Equal(prefix2.IP) {
+		t.Fatalf("expected two generated prefixes to differ, both were %s", prefix1)
+	}
+}
+
 func TestOpenDevice_InvalidInterfaceName(t *testing.T) {
 	privateKey, _, err := GenerateKey()
 	if err != nil {

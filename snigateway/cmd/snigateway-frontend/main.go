@@ -39,6 +39,23 @@ import (
 // DefaultWireGuardInterfaceName is the network interface name used for the kernel WireGuard device.
 const DefaultWireGuardInterfaceName = "wg0"
 
+// DefaultWireGuardListenPort is the default UDP port on which WireGuard listens.
+const DefaultWireGuardListenPort = 51820
+
+// deviceCloser is a WireGuard network device that can report its listen port and be closed.
+type deviceCloser interface {
+	frontend.WireGuardDevice
+	Port() (int, error)
+	Close() error
+}
+
+// deviceOpenerFunc creates and configures a deviceCloser for a given configuration.
+type deviceOpenerFunc func(ctx context.Context, configuration wireguard.Config) (deviceCloser, error)
+
+func defaultDeviceOpener(ctx context.Context, configuration wireguard.Config) (deviceCloser, error) {
+	return wireguard.OpenDevice(ctx, configuration)
+}
+
 type stringSliceFlag []string
 
 func (f *stringSliceFlag) String() string {
@@ -54,13 +71,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := run(ctx, os.Args[1:]); err != nil {
+	if err := run(ctx, os.Args[1:], defaultDeviceOpener); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, args []string) error {
+func run(ctx context.Context, args []string, opener deviceOpenerFunc) error {
 	if len(args) > 0 && args[0] == "generate-certs" {
 		return runGenerateCerts(args[1:])
 	}
@@ -90,8 +107,8 @@ func run(ctx context.Context, args []string) error {
 	var clientSubjects stringSliceFlag
 	fs.Var(&clientSubjects, "client-subject", "Client subject allowlist in format system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...] (repeatable, <ns>:* allowed)")
 
-	wireguardListenPort := fs.Int("wireguard-listen-port", 0, "UDP port for WireGuard tunnel (0 leaves WireGuard off)")
-	wireguardPrefix := fs.String("wireguard-prefix", "", "IPv6 /64 prefix for WireGuard tunnel addresses (required when --wireguard-listen-port is set)")
+	wireguardListenPort := fs.Int("wireguard-listen-port", DefaultWireGuardListenPort, "UDP port for WireGuard tunnel. A value of 0 is refused, because WireGuard is the only tunnel transport.")
+	wireguardPrefix := fs.String("wireguard-prefix", "", "IPv6 /64 prefix for WireGuard tunnel addresses (if omitted, an RFC 4193 ULA /64 is generated at startup; a new prefix on each start is fine, because controllers exchange keys again when they reconnect)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -252,16 +269,12 @@ func run(ctx context.Context, args []string) error {
 	if *wireguardListenPort < 0 || *wireguardListenPort > 65535 {
 		return fmt.Errorf("invalid --wireguard-listen-port: %d", *wireguardListenPort)
 	}
-	if *wireguardListenPort > 0 && *wireguardPrefix == "" {
-		return fmt.Errorf("--wireguard-prefix is required when --wireguard-listen-port is set")
+	if *wireguardListenPort == 0 {
+		return fmt.Errorf("wireguard is required: --wireguard-listen-port cannot be 0")
 	}
 
-	var wireguardDevice frontend.WireGuardDevice
-	var wireguardPublicKey wireguard.Key
-	var wireguardPort int
 	var wireguardPrefixNet *net.IPNet
-
-	if *wireguardListenPort > 0 {
+	if *wireguardPrefix != "" {
 		prefixIP, prefixNet, err := net.ParseCIDR(*wireguardPrefix)
 		if err != nil || prefixIP.To4() != nil || prefixIP.To16() == nil {
 			return fmt.Errorf("invalid --wireguard-prefix %q: must be an IPv6 prefix", *wireguardPrefix)
@@ -269,41 +282,44 @@ func run(ctx context.Context, args []string) error {
 		if ones, bits := prefixNet.Mask.Size(); ones != 64 || bits != 128 {
 			return fmt.Errorf("--wireguard-prefix %q must be a /64 prefix (got /%d)", *wireguardPrefix, ones)
 		}
-
-		privateKey, publicKey, err := wireguard.GenerateKey()
-		if err != nil {
-			return fmt.Errorf("generating wireguard key: %w", err)
-		}
-
-		firstAddress := make(net.IP, 16)
-		copy(firstAddress, prefixNet.IP.To16())
-		firstAddress[15] = 1
-
-		device, err := wireguard.OpenDevice(ctx, wireguard.Config{
-			InterfaceName: DefaultWireGuardInterfaceName,
-			PrivateKey:    privateKey,
-			ListenPort:    *wireguardListenPort,
-			DeviceAddress: firstAddress,
-			TunnelPrefix:  prefixNet,
-		})
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := device.Close(); err != nil {
-				log.Printf("failed to close WireGuard device: %v", err)
-			}
-		}()
-
-		actualPort, err := device.Port()
-		if err != nil {
-			return err
-		}
-
-		wireguardDevice = device
-		wireguardPublicKey = publicKey
-		wireguardPort = actualPort
 		wireguardPrefixNet = prefixNet
+	} else {
+		prefixNet, err := wireguard.GeneratePrefix()
+		if err != nil {
+			return fmt.Errorf("generating wireguard prefix: %w", err)
+		}
+		wireguardPrefixNet = prefixNet
+		log.Printf("Generated WireGuard prefix: %s", wireguardPrefixNet)
+	}
+
+	privateKey, publicKey, err := wireguard.GenerateKey()
+	if err != nil {
+		return fmt.Errorf("generating wireguard key: %w", err)
+	}
+
+	firstAddress := make(net.IP, 16)
+	copy(firstAddress, wireguardPrefixNet.IP.To16())
+	firstAddress[15] = 1
+
+	device, err := opener(ctx, wireguard.Config{
+		InterfaceName: DefaultWireGuardInterfaceName,
+		PrivateKey:    privateKey,
+		ListenPort:    *wireguardListenPort,
+		DeviceAddress: firstAddress,
+		TunnelPrefix:  wireguardPrefixNet,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := device.Close(); err != nil {
+			log.Printf("failed to close WireGuard device: %v", err)
+		}
+	}()
+
+	actualPort, err := device.Port()
+	if err != nil {
+		return err
 	}
 
 	srv, err := frontend.NewServer(frontend.ServerConfig{
@@ -317,9 +333,9 @@ func run(ctx context.Context, args []string) error {
 		IdleTimeout:            *idleTimeout,
 		MaxHostnamesPerSession: *maxHostnames,
 		JWTVerifier:            jwtVerifier,
-		WireGuardDevice:        wireguardDevice,
-		WireGuardPublicKey:     wireguardPublicKey,
-		WireGuardPort:          wireguardPort,
+		WireGuardDevice:        device,
+		WireGuardPublicKey:     publicKey,
+		WireGuardPort:          actualPort,
 		WireGuardPrefix:        wireguardPrefixNet,
 	})
 	if err != nil {

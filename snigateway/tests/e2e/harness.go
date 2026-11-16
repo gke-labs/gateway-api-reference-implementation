@@ -186,6 +186,15 @@ spec:
       - name: frontend
         image: snigateway-frontend:e2e
         imagePullPolicy: Never
+        # allowPrivilegeEscalation is required because file capabilities
+        # (cap_net_admin+ep) don't apply under no-new-privileges.
+        securityContext:
+          allowPrivilegeEscalation: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_ADMIN
         args:
         - "--client-ca=/etc/snigateway-frontend/certs/ca.crt=*.snigateway.test"
         - "--server-cert=/etc/snigateway-frontend/certs/server.crt"
@@ -196,6 +205,9 @@ spec:
         - containerPort: 443
           name: https
           protocol: TCP
+        - containerPort: 51820
+          name: wireguard
+          protocol: UDP
         volumeMounts:
         - name: frontend-certs
           mountPath: /etc/snigateway-frontend/certs
@@ -218,6 +230,10 @@ spec:
     targetPort: 443
     protocol: TCP
     name: https
+  - port: 51820
+    targetPort: 51820
+    protocol: UDP
+    name: wireguard
 `, namespace, namespace))
 
 	h.RunCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+namespace, "--timeout=2m")

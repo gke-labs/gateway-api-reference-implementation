@@ -344,9 +344,9 @@ func TestSNIGateway_WireGuardTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
 	}
-	_, fePrefixNet, err := net.ParseCIDR("fd00:5182::/64")
+	fePrefixNet, err := wireguard.GeneratePrefix()
 	if err != nil {
-		t.Fatalf("ParseCIDR failed: %v", err)
+		t.Fatalf("GeneratePrefix failed: %v", err)
 	}
 	feAddress := make(net.IP, 16)
 	copy(feAddress, fePrefixNet.IP.To16())

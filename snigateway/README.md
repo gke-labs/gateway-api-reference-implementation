@@ -83,12 +83,14 @@ go run ./cmd/snigateway-frontend \
 
 #### Option B: Docker Container
 
-Because the container runs as a non-root user (`65532:65532`), binding to privileged port `:443` inside the container directly requires extra capabilities. We recommend running the container with `--listen :8443` and using Docker port mapping `-p 443:8443`:
+Note that the container runs as a non-root user (`65532:65532`). A container that runs this image needs `NET_ADMIN` added, or it can't start (file capabilities like `cap_net_admin+ep` on the binary require `NET_ADMIN` in the bounding set). In addition, ensure the WireGuard UDP tunnel port (default `51820/udp`) is published. To bind port 443 without host network, use Docker port mapping `-p 443:8443` with `--listen :8443`:
 
 ```bash
 docker run -d \
   --name snigateway-frontend \
+  --cap-add=NET_ADMIN \
   -p 443:8443 \
+  -p 51820:51820/udp \
   -v $(pwd)/certs:/certs:ro \
   snigateway-frontend:latest \
   --listen :8443 \
@@ -97,12 +99,13 @@ docker run -d \
   --server-key /certs/server.key
 ```
 
-Alternatively, if running with `--network host` or directly binding `:443`, grant `NET_BIND_SERVICE`:
+Alternatively, if running with `--network host` and directly binding `:443`, grant both `NET_ADMIN` and `NET_BIND_SERVICE`:
 
 ```bash
 docker run -d \
   --name snigateway-frontend \
   --network host \
+  --cap-add=NET_ADMIN \
   --cap-add=NET_BIND_SERVICE \
   -v $(pwd)/certs:/certs:ro \
   snigateway-frontend:latest \
@@ -114,7 +117,7 @@ docker run -d \
 
 #### Option C: Production Linux VM (systemd)
 
-For running on a standalone public Linux VM, see [deploy/frontend/README.md](deploy/frontend/README.md) for full instructions and a systemd unit configuration that uses `CAP_NET_BIND_SERVICE` to bind port `443` securely as a non-root system user.
+For running on a standalone public Linux VM, see [deploy/frontend/README.md](deploy/frontend/README.md) for full instructions and a systemd unit configuration that uses `CAP_NET_BIND_SERVICE` and `CAP_NET_ADMIN` to bind port `443` and configure WireGuard securely as a non-root system user.
 
 ---
 
