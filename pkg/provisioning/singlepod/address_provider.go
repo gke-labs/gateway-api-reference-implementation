@@ -381,14 +381,35 @@ func isOwnedByGateway(obj metav1.Object, gw *gatewayv1.Gateway) bool {
 	return ref.Kind == "Gateway" && ref.Name == gw.Name && gw.UID != "" && ref.UID == gw.UID
 }
 
-func isPodReady(pod *corev1.Pod) bool {
-	if pod == nil {
+// podBelongsToDeployment checks whether pod belongs to the given Deployment through owner references
+// (either directly or through its owning ReplicaSet).
+func podBelongsToDeployment(ctx context.Context, reader client.Reader, pod *corev1.Pod, deployment *appsv1.Deployment) bool {
+	if pod == nil || deployment == nil {
 		return false
 	}
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-			return true
+	controllerRef := metav1.GetControllerOf(pod)
+	if controllerRef == nil {
+		return false
+	}
+	if controllerRef.Kind == "Deployment" && controllerRef.Name == deployment.Name {
+		return deployment.UID == "" || controllerRef.UID == deployment.UID
+	}
+	if controllerRef.Kind == "ReplicaSet" {
+		var replicaSet appsv1.ReplicaSet
+		err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: controllerRef.Name}, &replicaSet)
+		if err != nil {
+			// In case the direct reader does not have get access to ReplicaSets, verify that the ReplicaSet
+			// name was generated from this Deployment (<deployment-name>-<hash>).
+			if strings.HasPrefix(controllerRef.Name, deployment.Name+"-") {
+				return true
+			}
+			return false
 		}
+		rsControllerRef := metav1.GetControllerOf(&replicaSet)
+		if rsControllerRef != nil && rsControllerRef.Kind == "Deployment" && rsControllerRef.Name == deployment.Name {
+			return deployment.UID == "" || rsControllerRef.UID == deployment.UID
+		}
+		return false
 	}
 	return false
 }
@@ -1065,8 +1086,15 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	if p.useHostPorts {
+		// Use the direct, uncached reader (p.apiReader) for Pod and Node lookups to avoid
+		// starting unbounded cluster-wide cache informers for all Pods and Nodes.
+		reader := p.apiReader
+		if reader == nil {
+			reader = p.client
+		}
+
 		var podList corev1.PodList
-		if err := p.client.List(ctx, &podList, client.InNamespace(gwNamespace), client.MatchingLabels{
+		if err := reader.List(ctx, &podList, client.InNamespace(gwNamespace), client.MatchingLabels{
 			LabelGatewayName: labelGwName,
 			LabelAppName:     AppNameValue,
 		}); err != nil {
@@ -1074,8 +1102,11 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}
 
 		var selectedPod *corev1.Pod
-		for i := range podList.Items {
-			pod := &podList.Items[i]
+		for index := range podList.Items {
+			pod := &podList.Items[index]
+			if !podBelongsToDeployment(ctx, reader, pod, &existingDeploy) {
+				continue
+			}
 			if selectedPod == nil {
 				selectedPod = pod
 				continue
@@ -1099,10 +1130,6 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			}
 		}
 
-		if selectedPod != nil && isPodReady(selectedPod) {
-			deployReady = true
-		}
-
 		if selectedPod == nil || selectedPod.Spec.NodeName == "" {
 			message := "Waiting for data-plane deployment to become available"
 			if deployReady {
@@ -1116,7 +1143,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}
 
 		var node corev1.Node
-		if err := p.client.Get(ctx, types.NamespacedName{Name: selectedPod.Spec.NodeName}, &node); err != nil {
+		if err := reader.Get(ctx, types.NamespacedName{Name: selectedPod.Spec.NodeName}, &node); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil, state.GatewayReadiness{
 					Ready:   false,
@@ -1128,9 +1155,10 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}
 
 		var internalIPs []string
-		for _, addr := range node.Status.Addresses {
-			if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
-				internalIPs = append(internalIPs, strings.TrimSpace(addr.Address))
+		for index := range node.Status.Addresses {
+			nodeAddress := node.Status.Addresses[index]
+			if nodeAddress.Type == corev1.NodeInternalIP && nodeAddress.Address != "" {
+				internalIPs = append(internalIPs, strings.TrimSpace(nodeAddress.Address))
 			}
 		}
 
@@ -1142,21 +1170,22 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			}, nil
 		}
 
-		slices.SortFunc(internalIPs, func(a, b string) int {
-			ipa, errA := netip.ParseAddr(a)
-			ipb, errB := netip.ParseAddr(b)
+		slices.SortFunc(internalIPs, func(firstAddress, secondAddress string) int {
+			ipAddrA, errA := netip.ParseAddr(firstAddress)
+			ipAddrB, errB := netip.ParseAddr(secondAddress)
 			if errA == nil && errB == nil {
-				return ipa.Compare(ipb)
+				return ipAddrA.Compare(ipAddrB)
 			}
-			return strings.Compare(a, b)
+			return strings.Compare(firstAddress, secondAddress)
 		})
 		internalIPs = slices.Compact(internalIPs)
 
 		var addresses []gatewayv1.GatewayStatusAddress
-		for _, ip := range internalIPs {
+		for index := range internalIPs {
+			ipAddress := internalIPs[index]
 			addresses = append(addresses, gatewayv1.GatewayStatusAddress{
 				Type:  state.Ptr(gatewayv1.IPAddressType),
-				Value: ip,
+				Value: ipAddress,
 			})
 		}
 
@@ -1311,7 +1340,13 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	return addrs, readiness.Ready, err
 }
 
-// SupportedAddressTypes returns the address types supported by singlepod.
+// SupportedAddressTypes returns the address types supported by singlepod in Gateway.spec.addresses.
+//
+// When host ports are enabled (WithHostPorts), this returns nil because host-port Gateways assign node LAN
+// IP addresses dynamically from the node running the data-plane pod and do not support user-requested
+// spec.addresses. Returning nil causes GARI to reject requested spec.addresses with Accepted=False and
+// reason UnsupportedAddress. Even though Gateway.status.addresses publishes IPAddress values discovered
+// from the node, requested addresses in spec.addresses remain unsupported.
 func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
 	if p.useHostPorts {
 		return nil
@@ -1355,6 +1390,12 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 	ownerHandler := handler.EnqueueRequestForOwner(scheme, mapper, &gatewayv1.Gateway{}, handler.OnlyControllerOwner())
 
 	bldr.Watches(&corev1.Service{}, ownerHandler, builder.WithPredicates(pred))
+	// In host-ports mode, the provider watches Deployments (and Services) only rather than
+	// watching all Pods in the cluster. When the data-plane pod is scheduled or moves to another node,
+	// the Kubernetes Deployment controller observes the ReplicaSet/Pod status changes and updates
+	// the Deployment's status (such as ReadyReplicas or AvailableReplicas). That status change fires
+	// the Deployment watch below and enqueues the owning Gateway for reconciliation, allowing a
+	// sub-second delay while the Deployment controller converges.
 	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
 
 	return nil

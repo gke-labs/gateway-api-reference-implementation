@@ -31,10 +31,14 @@ rules:
 - apiGroups: ["discovery.k8s.io"]
   resources: ["endpointslices"]
   verbs: ["get", "list", "watch"]
-# Node read access is required for the singlepod address provider with host ports to resolve the data-plane pod's node address.
+# Pod read access (get, list) is required for the singlepod host-ports address provider to find the Gateway's data-plane pod via the uncached direct API reader.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+# Node read access (get) is required for the singlepod host-ports address provider to look up the data-plane pod's node address directly by name via the uncached direct API reader.
 - apiGroups: [""]
   resources: ["nodes"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status", "tlsroutes/status", "grpcroutes/status", "tcproutes/status", "udproutes/status"]
   verbs: ["update", "patch"]
