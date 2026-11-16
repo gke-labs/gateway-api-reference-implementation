@@ -142,12 +142,15 @@ func (*DataplaneMessage_Ack) isDataplaneMessage_Body() {}
 func (*DataplaneMessage_Nack) isDataplaneMessage_Body() {}
 
 // Hello is the first message sent by the data plane to the controller upon establishing the stream.
-// It carries the identity of the Gateway the data plane serves and its currently applied revision.
+// It carries the identity of the Gateway the data plane claims to serve and its currently applied
+// revision. The Gateway identity is a claim: the controller validates this claim against the
+// caller's authenticated identity in the step that adds authentication, and sends nothing before
+// that check.
 type Hello struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// gateway_namespace is the Kubernetes namespace of the Gateway resource served by the data plane. Sent by data plane.
+	// gateway_namespace is the Kubernetes namespace of the Gateway resource the data plane claims to serve. Sent by data plane.
 	GatewayNamespace string `protobuf:"bytes,1,opt,name=gateway_namespace,json=gatewayNamespace,proto3" json:"gateway_namespace,omitempty"`
-	// gateway_name is the Kubernetes name of the Gateway resource served by the data plane. Sent by data plane.
+	// gateway_name is the Kubernetes name of the Gateway resource the data plane claims to serve. Sent by data plane.
 	GatewayName string `protobuf:"bytes,2,opt,name=gateway_name,json=gatewayName,proto3" json:"gateway_name,omitempty"`
 	// applied_revision is the configuration revision currently applied by the data plane, or empty if none. Sent by data plane.
 	AppliedRevision string `protobuf:"bytes,3,opt,name=applied_revision,json=appliedRevision,proto3" json:"applied_revision,omitempty"`
@@ -385,7 +388,7 @@ type Config struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// revision is the unique content-derived identifier for this configuration snapshot. Sent by controller.
 	Revision string `protobuf:"bytes,1,opt,name=revision,proto3" json:"revision,omitempty"`
-	// dataplane_config is the serialized DataplaneConfig payload (e.g. JSON-encoded bytes). Sent by controller.
+	// dataplane_config is the JSON-encoded DataplaneConfig payload. Sent by controller.
 	DataplaneConfig []byte `protobuf:"bytes,2,opt,name=dataplane_config,json=dataplaneConfig,proto3" json:"dataplane_config,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
