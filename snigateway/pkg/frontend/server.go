@@ -463,10 +463,10 @@ var (
 // to a second backend after the first backend has already received it is unsafe because non-idempotent
 // requests (e.g. POST, PATCH) could run twice.
 //
-// For TLS connections (isTLS=true), the rule does not prevent failover before the first byte: the
-// peeked bytes are strictly a TLS ClientHello, which carries no application request. Replaying a
-// ClientHello to a secondary backend when the first backend is unresponsive or closes without
-// sending a handshake response is safe and allows zero-downtime failover across healthy replicas.
+// For TLS connections (isTLS=true), the frontend peeks one TLS record, the ClientHello, which
+// carries no request. Because no application request has been sent, replaying the ClientHello to
+// another backend when the first backend is unresponsive or closes without sending a handshake
+// response is safe, so TLS may retry before the first backend byte.
 func (s *Server) routeToBackend(hostname string, peekedConn net.Conn, isTLS bool) {
 	cleanHost := CleanHostname(hostname)
 
@@ -554,6 +554,9 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn, isTLS bool
 		// it does not send them to another one. For plain HTTP this prevents
 		// non-idempotent client requests from running twice.
 		if !isTLS && clientBytesWritten {
+			if s.dialLogLimiter.Allow() {
+				klog.Errorf("Frontend: closing connection for host %q: client request bytes were already sent to backend: %v", hostname, err)
+			}
 			closeCloser(peekedConn)
 			return
 		}
@@ -592,6 +595,13 @@ func (s *Server) routeToBackend(hostname string, peekedConn net.Conn, isTLS bool
 	spliceConnections(rawClientConn, committedTunnel, s.config.IdleTimeout)
 }
 
+// attemptBackend executes a single connection attempt to a backend session matching cleanHost.
+// It returns:
+//   - conn: the established tunnel connection to the backend, or nil on failure.
+//   - initialBytes: the first response bytes read from the backend to verify responsiveness.
+//   - clientBytesWritten: true once any of the client's bytes were written to the backend,
+//     including a partial write.
+//   - err: the error encountered during the attempt, or nil on success.
 func (s *Server) attemptBackend(hostname, cleanHost string, proxyBytes, peekedBytes []byte, attemptTimeout time.Duration) (net.Conn, []byte, bool, error) {
 	sessions := s.table.MatchSessions(cleanHost)
 	if len(sessions) == 0 {
