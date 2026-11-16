@@ -4837,18 +4837,16 @@ func TestSinglePodAddressProvider_AppliedRevisionMirror(t *testing.T) {
 	}
 	failingEndpoints := map[string]bool{}
 	var httpLockHeld atomic.Bool
-	var probeMu sync.Mutex
+	var checkHTTPLockOnce sync.Once
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if p != nil {
-			probeMu.Lock()
-			if !p.mirrorMu.TryLock() {
+		checkHTTPLockOnce.Do(func() {
+			if p != nil && !p.mirrorMu.TryLock() {
 				httpLockHeld.Store(true)
-			} else {
+			} else if p != nil {
 				p.mirrorMu.Unlock()
 			}
-			probeMu.Unlock()
-		}
+		})
 
 		if r.URL.Path != "/_gari/applied" {
 			http.NotFound(w, r)
