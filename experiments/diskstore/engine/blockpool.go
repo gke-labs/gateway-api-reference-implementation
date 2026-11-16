@@ -54,6 +54,7 @@ type PageDesc struct {
 	PinCount   atomic.Int32
 	Dirty      bool
 	DirtyLSN   uint64        // ARIES: first LSN that dirtied page since last flush
+	RedoLSN    uint64        // earliest LSN not yet confirmed durable by completed heap fsync
 	PageLSN    atomic.Uint64 // latest LSN that modified this page
 	DirtyTime  time.Time     // Timestamp when page became dirty
 	LastAccess time.Time     // Timestamp for LRU eviction tracking
@@ -63,7 +64,8 @@ type PageDesc struct {
 	FlushedBeforeSync uint64 // location written before current heap fsync started
 	DurableLoc        uint64 // location confirmed durable by heap fsync
 
-	InFlight bool // true when a direct I/O flush is active for this page
+	InFlight    bool   // true when a direct I/O flush is active for this page
+	flushingLSN uint64 // LSN being flushed while InFlight is true
 
 	Mu sync.RWMutex // Per-page latch for safe read/write access to pool block data
 }
@@ -105,6 +107,12 @@ type blockRun struct {
 	block uint64
 }
 
+// flushedPage records a page flush and its earliest un-synced LSN for durability tracking.
+type flushedPage struct {
+	redoLSN    uint64
+	flushedLSN uint64
+}
+
 // BlockPool manages a fixed-size arena of 4 KiB pool blocks with direct I/O, out-of-place writes,
 // and write-ahead rule enforcement.
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
@@ -122,7 +130,8 @@ type BlockPool struct {
 	numPoolBlocks int
 	arena         []byte // Pointer-free byte arena aligned to 4096 bytes
 
-	// mu guards freePoolBlocks, pageTable, onFailure, deferredFreesSyncing, and deferredFreesUnsynced.
+	// mu guards freePoolBlocks, pageTable, onFailure, deferredFreesSyncing, deferredFreesUnsynced,
+	// flushedPagesSyncing, and flushedPagesUnsynced.
 	mu sync.Mutex
 
 	// cond uses mu. It is broadcast when an in-flight flush completes or when
@@ -148,6 +157,12 @@ type BlockPool struct {
 	// started. That fsync may not cover their newer copies, so they wait for
 	// the next one.
 	deferredFreesUnsynced []blockRun
+
+	// flushedPagesSyncing holds pages flushed before the current heap fsync started. Guarded by mu.
+	flushedPagesSyncing map[uint64]flushedPage
+
+	// flushedPagesUnsynced holds pages flushed since the current heap fsync started. Guarded by mu.
+	flushedPagesUnsynced map[uint64]flushedPage
 
 	stagingBuf []byte     // Pointer-free aligned 2 MiB staging buffer for direct I/O flushes
 	flushMu    sync.Mutex // Serializes staging buffer usage and direct I/O heap writes
@@ -198,12 +213,14 @@ func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opt
 		dbID:           dbID,
 		numPoolBlocks:  numPoolBlocks,
 		arena:          arena,
-		freePoolBlocks: freePoolBlocks,
-		stagingBuf:     stagingBuf,
-		pageTable:      make(map[uint64]*PageDesc),
-		onFailure:      options.OnFailure,
-		bgStop:         make(chan struct{}),
-		bgDone:         make(chan struct{}),
+		freePoolBlocks:       freePoolBlocks,
+		stagingBuf:           stagingBuf,
+		pageTable:            make(map[uint64]*PageDesc),
+		flushedPagesSyncing:  make(map[uint64]flushedPage),
+		flushedPagesUnsynced: make(map[uint64]flushedPage),
+		onFailure:            options.OnFailure,
+		bgStop:               make(chan struct{}),
+		bgDone:               make(chan struct{}),
 	}
 	bp.cond = sync.NewCond(&bp.mu)
 
@@ -424,6 +441,7 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 	var oldDurableLoc uint64 = NoBlock
 	var oldFlushedBeforeSync uint64 = NoBlock
 	var oldFlushedLoc uint64 = NoBlock
+	var oldRedoLSN uint64
 
 	if oldDescriptor := bp.pageTable[logicalPage]; oldDescriptor != nil {
 		if len(oldDescriptor.PoolBlocks) > 0 {
@@ -436,11 +454,17 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 		oldDurableLoc = oldDescriptor.DurableLoc
 		oldFlushedBeforeSync = oldDescriptor.FlushedBeforeSync
 		oldFlushedLoc = oldDescriptor.FlushedLoc
+		oldRedoLSN = oldDescriptor.RedoLSN
 
 		oldDescriptor.DurableLoc = NoBlock
 		oldDescriptor.FlushedBeforeSync = NoBlock
 		oldDescriptor.FlushedLoc = NoBlock
 		oldDescriptor.PhysicalBlock = NoBlock
+	}
+
+	redoLSN := lsn
+	if oldRedoLSN != 0 {
+		redoLSN = oldRedoLSN
 	}
 
 	now := time.Now()
@@ -450,6 +474,7 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 		PoolBlocks:        poolBlocks,
 		Dirty:             true,
 		DirtyLSN:          lsn,
+		RedoLSN:           redoLSN,
 		DirtyTime:         now,
 		LastAccess:        now,
 		PhysicalBlock:     NoBlock,
@@ -623,6 +648,12 @@ func (bp *BlockPool) MarkDirty(logicalPage uint64, lsn uint64) {
 			desc.Dirty = true
 			desc.DirtyLSN = lsn
 			desc.DirtyTime = time.Now()
+		} else if desc.InFlight && desc.DirtyLSN <= desc.flushingLSN {
+			desc.DirtyLSN = lsn
+			desc.DirtyTime = time.Now()
+		}
+		if desc.RedoLSN == 0 {
+			desc.RedoLSN = lsn
 		}
 		desc.PageLSN.Store(lsn)
 	}
@@ -693,6 +724,7 @@ func (bp *BlockPool) flushBatchUnlocked(batch []*PageDesc) error {
 func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 	orders := make([]int, len(chunk))
 	pageLSNs := make([]uint64, len(chunk))
+	flushRedoLSNs := make([]uint64, len(chunk))
 	var maxLSN uint64
 	totalBlocks := 0
 
@@ -708,6 +740,15 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 			maxLSN = lsn
 		}
 		totalBlocks += 1 << order
+
+		redoLSN := desc.DirtyLSN
+		if redoLSN == 0 {
+			redoLSN = desc.RedoLSN
+		}
+		if redoLSN == 0 {
+			redoLSN = lsn
+		}
+		flushRedoLSNs[i] = redoLSN
 	}
 
 	// Allocate contiguous block run from buddy allocator under bp.mu
@@ -724,8 +765,9 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 	}
 
 	// Mark all pages in chunk as InFlight and pin them under bp.mu
-	for _, desc := range chunk {
+	for i, desc := range chunk {
 		desc.InFlight = true
+		desc.flushingLSN = pageLSNs[i]
 		desc.PinCount.Add(1)
 	}
 
@@ -777,6 +819,7 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 
 	for _, desc := range chunk {
 		desc.InFlight = false
+		desc.flushingLSN = 0
 		desc.PinCount.Add(-1)
 	}
 	bp.cond.Broadcast()
@@ -813,10 +856,26 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 		}
 		if desc.PageLSN.Load() == pageLSNs[i] {
 			desc.Dirty = false
+			desc.DirtyLSN = 0
 		}
+		bp.recordFlushedPageLocked(desc.LogicalPage, flushRedoLSNs[i], pageLSNs[i])
 	}
 
 	return nil
+}
+
+func (bp *BlockPool) recordFlushedPageLocked(logicalPage uint64, flushRedoLSN uint64, flushedLSN uint64) {
+	if existing, ok := bp.flushedPagesUnsynced[logicalPage]; ok {
+		bp.flushedPagesUnsynced[logicalPage] = flushedPage{
+			redoLSN:    existing.redoLSN,
+			flushedLSN: flushedLSN,
+		}
+	} else {
+		bp.flushedPagesUnsynced[logicalPage] = flushedPage{
+			redoLSN:    flushRedoLSN,
+			flushedLSN: flushedLSN,
+		}
+	}
 }
 
 // FlushAllDirty flushes all dirty pages currently in the block pool.
@@ -882,18 +941,34 @@ func (bp *BlockPool) deferFree(run blockRun) {
 // The next step calls deferFree from the free sites and removes this line.
 var _ = (*BlockPool).deferFree
 
-// startHeapSync rotates deferredFreesUnsynced into deferredFreesSyncing at the start of a heap fsync.
-// If deferredFreesSyncing still holds runs from an uncompleted or failed fsync, they are retained.
-// deferredFreesUnsynced starts empty.
+// startHeapSync rotates deferredFreesUnsynced into deferredFreesSyncing,
+// and flushedPagesUnsynced into flushedPagesSyncing at the start of a heap fsync.
+// If syncing generations still hold entries from an uncompleted or failed fsync, they are retained.
+// flushedPagesUnsynced starts empty.
 func (bp *BlockPool) startHeapSync() {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 	bp.deferredFreesSyncing = append(bp.deferredFreesSyncing, bp.deferredFreesUnsynced...)
 	bp.deferredFreesUnsynced = nil
+
+	if bp.flushedPagesSyncing == nil {
+		bp.flushedPagesSyncing = make(map[uint64]flushedPage)
+	}
+	for pID, unsynced := range bp.flushedPagesUnsynced {
+		if syncing, ok := bp.flushedPagesSyncing[pID]; ok {
+			bp.flushedPagesSyncing[pID] = flushedPage{
+				redoLSN:    syncing.redoLSN,
+				flushedLSN: unsynced.flushedLSN,
+			}
+		} else {
+			bp.flushedPagesSyncing[pID] = unsynced
+		}
+	}
+	bp.flushedPagesUnsynced = make(map[uint64]flushedPage)
 }
 
-// heapSyncSucceeded frees every block run in deferredFreesSyncing to the buddy allocator
-// and empties deferredFreesSyncing.
+// heapSyncSucceeded frees every block run in deferredFreesSyncing to the buddy allocator,
+// advances or clears RedoLSN for pages flushed before this fsync started, and empties the syncing generations.
 func (bp *BlockPool) heapSyncSucceeded() error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
@@ -909,6 +984,22 @@ func (bp *BlockPool) heapSyncSucceeded() error {
 		}
 	}
 	bp.deferredFreesSyncing = nil
+
+	for pID := range bp.flushedPagesSyncing {
+		desc := bp.pageTable[pID]
+		if desc == nil {
+			continue
+		}
+		if unsynced, ok := bp.flushedPagesUnsynced[pID]; ok {
+			desc.RedoLSN = unsynced.redoLSN
+		} else if desc.Dirty && desc.DirtyLSN > 0 {
+			desc.RedoLSN = desc.DirtyLSN
+		} else {
+			desc.RedoLSN = 0
+		}
+	}
+	bp.flushedPagesSyncing = make(map[uint64]flushedPage)
+
 	if len(errs) > 0 {
 		err := errors.Join(errs...)
 		if bp.onFailure != nil {
@@ -927,15 +1018,15 @@ func (bp *BlockPool) heapSyncSucceeded() error {
 // block headers only after a crash that leaves no marker.
 func (bp *BlockPool) heapSyncFailed() {}
 
-// DirtyPageTableAndLSN returns a map of logicalPage -> dirtyLSN and the current max LSN at snapshot time.
+// DirtyPageTableAndLSN returns a map of logicalPage -> redoLSN and the current max LSN at snapshot time.
 func (bp *BlockPool) DirtyPageTableAndLSN() (map[uint64]uint64, uint64) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
 	dpt := make(map[uint64]uint64)
 	for pID, desc := range bp.pageTable {
-		if desc.Dirty && desc.DirtyLSN > 0 {
-			dpt[pID] = desc.DirtyLSN
+		if desc.RedoLSN > 0 {
+			dpt[pID] = desc.RedoLSN
 		}
 	}
 	maxLSN := uint64(0)
