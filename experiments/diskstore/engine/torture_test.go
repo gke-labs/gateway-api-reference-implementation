@@ -225,8 +225,8 @@ var tortureConfigs = []tortureConfig{
 	{name: "pool_24_clean_sweep", poolBlocks: 24, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 3, cycleEnd: cycleEndClean, sweep: true, skipReason: "skipping: seed 17 fails with reuse rule violation in FaultFile.WriteAt during concurrent background sweep on a 24-block pool with 8-block values; the engine fault is tracked separately"},
 
 	// Crashes that tear unsynced writes with values up to 8 blocks on small pools (12 and 24 blocks, four cycles).
-	{name: "pool_12_val8_crash_tear", poolBlocks: 12, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear, skipReason: "skipping: seed 1 fails because deleted key k12 is resurrected after crash recovery on a 12-block pool with 8-block values; the engine fault is tracked separately"},
-	{name: "pool_24_val8_crash_tear", poolBlocks: 24, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear, skipReason: "skipping: seed 36 fails because deleted key k12 is resurrected after crash recovery on a 24-block pool with 8-block values; the engine fault is tracked separately"},
+	{name: "pool_12_val8_crash_tear", poolBlocks: 12, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear},
+	{name: "pool_24_val8_crash_tear", poolBlocks: 24, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear},
 
 	// The same with the sweep goroutine.
 	{name: "pool_12_val8_crash_tear_sweep", poolBlocks: 12, maxValueBlocks: 8, numKeys: 15, operationsPerCycle: 25, numCycles: 4, cycleEnd: cycleEndCrashTear, sweep: true, skipReason: "skipping: seed 1 fails because deleted key k12 is resurrected after crash recovery on a 12-block pool with 8-block values; the engine fault is tracked separately"},

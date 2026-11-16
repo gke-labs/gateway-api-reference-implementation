@@ -2288,3 +2288,139 @@ func TestRecovery_CrashTornBlockReopenCleanCloseReopen(t *testing.T) {
 		}
 	}
 }
+
+func testTornReplaceDeletedKeyStaysDeleted(t *testing.T, directory string, initialValue []byte, replacementValue []byte) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+
+	store, err := Open(WithFS(faultFS), WithDir(directory), WithCreate(), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	table := "ConfigMap"
+	targetKey := "target-key"
+
+	// Fill the first slotted page with a dummy record (1800 bytes) so that if
+	// initialValue or replacementValue is also a large slotted record (~1800 bytes),
+	// it will not fit on the same slotted page and is forced onto a new page.
+	dummyValue := bytes.Repeat([]byte("d"), 1800)
+	if err := store.Put(table, "dummy-key", dummyValue); err != nil {
+		t.Fatalf("Put dummy-key failed: %v", err)
+	}
+
+	// 1. Put target key with initial value
+	if err := store.Put(table, targetKey, initialValue); err != nil {
+		t.Fatalf("Put initial value failed: %v", err)
+	}
+
+	// 2. Checkpoint: initial record becomes durable on disk
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	store.keyMu.RLock()
+	initialEntry := store.keyIndex[qualifyKey(table, targetKey)]
+	store.keyMu.RUnlock()
+
+	// 3. Replace target key with replacement value
+	if err := store.Put(table, targetKey, replacementValue); err != nil {
+		t.Fatalf("Put replacement value failed: %v", err)
+	}
+
+	store.keyMu.RLock()
+	replacementEntry := store.keyIndex[qualifyKey(table, targetKey)]
+	store.keyMu.RUnlock()
+
+	if replacementEntry.LogicalPage == initialEntry.LogicalPage {
+		t.Fatalf("expected replacement to move to a different page, but both are on page %d", initialEntry.LogicalPage)
+	}
+
+	// 4. A crash that keeps the replacement page's flush and loses the old page's flush:
+	// Flush only the replacement page to the heap file.
+	if err := store.bp.FlushPage(replacementEntry.LogicalPage); err != nil {
+		t.Fatalf("FlushPage replacement page %d failed: %v", replacementEntry.LogicalPage, err)
+	}
+	// Sync WAL so the replace record is durable.
+	if err := store.Sync(); err != nil {
+		t.Fatalf("Sync WAL failed: %v", err)
+	}
+
+	// Crash: keeps un-fsynced writes from the replacement page flush, loses the old page's flush.
+	if err := faultFS.Crash(false, 0); err != nil {
+		t.Fatalf("Crash failed: %v", err)
+	}
+
+	// 5. Reopen
+	faultFS2 := NewFaultFS(memFS)
+	store2, err := Open(WithFS(faultFS2), WithDir(directory), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen 1 failed: %v", err)
+	}
+
+	// Verify key has the replacement value after first reopen
+	retrievedValue, exists, err := store2.Get(table, targetKey)
+	if err != nil || !exists || !bytes.Equal(retrievedValue, replacementValue) {
+		t.Fatalf("Reopen 1 Get mismatch: exists=%v, val len=%d, err=%v", exists, len(retrievedValue), err)
+	}
+
+	// 6. Delete
+	if err := store2.Delete(table, targetKey); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	if _, err := store2.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint store2 failed: %v", err)
+	}
+
+	// 7. Clean close (checkpoints again with clean block pool, advancing redoStartLSN)
+	if err := store2.Close(); err != nil {
+		t.Fatalf("Close store2 failed: %v", err)
+	}
+
+	// 8. Reopen
+	faultFS3 := NewFaultFS(memFS)
+	store3, err := Open(WithFS(faultFS3), WithDir(directory), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen 2 failed: %v", err)
+	}
+	defer store3.Close()
+
+	// The key must stay deleted!
+	finalValue, finalExists, err := store3.Get(table, targetKey)
+	if err != nil {
+		t.Fatalf("Reopen 2 Get error: %v", err)
+	}
+	if finalExists {
+		t.Fatalf("deleted key returned after recovery: got len=%d, value=%q", len(finalValue), string(finalValue))
+	}
+
+	// dummy-key must still exist!
+	dummyRetrieved, dummyExists, err := store3.Get(table, "dummy-key")
+	if err != nil || !dummyExists || !bytes.Equal(dummyRetrieved, dummyValue) {
+		t.Fatalf("dummy-key corrupted or missing: exists=%v, err=%v", dummyExists, err)
+	}
+}
+
+// TestRecovery_TornReplaceDeletedKeyStayDeleted verifies that after a crash that keeps
+// a replacement page's flush and loses the old page's flush across all replacement directions
+// (multi-block to slotted, slotted to slotted on a different page, and slotted to multi-block),
+// reopening the store clears the old page's copy so that a subsequent delete, clean close,
+// and reopen leaves the key deleted.
+func TestRecovery_TornReplaceDeletedKeyStayDeleted(t *testing.T) {
+	multiBlockValue := bytes.Repeat([]byte("multi-block-value-content-"), 400) // ~10 KB -> 4 blocks
+	slottedValue1 := bytes.Repeat([]byte("a"), 1800)
+	slottedValue2 := bytes.Repeat([]byte("b"), 1800)
+
+	t.Run("MultiBlockToSlotted", func(t *testing.T) {
+		testTornReplaceDeletedKeyStaysDeleted(t, "test_torn_replace_mb_to_slotted", multiBlockValue, slottedValue1)
+	})
+
+	t.Run("SlottedToSlottedDifferentPage", func(t *testing.T) {
+		testTornReplaceDeletedKeyStaysDeleted(t, "test_torn_replace_slotted_to_slotted", slottedValue1, slottedValue2)
+	})
+
+	t.Run("SlottedToMultiBlock", func(t *testing.T) {
+		testTornReplaceDeletedKeyStaysDeleted(t, "test_torn_replace_slotted_to_mb", slottedValue1, multiBlockValue)
+	})
+}

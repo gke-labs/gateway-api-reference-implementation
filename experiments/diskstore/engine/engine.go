@@ -958,7 +958,7 @@ func Open(opts ...Option) (*Engine, error) {
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 
 		// Replay WAL records from redo start LSN through write path apply functions.
-		if err := s.replayWAL(options.FS, walDir, dbID, recoveryRes.RedoStartLSN); err != nil {
+		if err := s.replayWAL(options.FS, walDir, dbID, recoveryRes.RedoStartLSN, recoveryRes.SupersededPages); err != nil {
 			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
 			return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeErr)
 		}
@@ -1015,7 +1015,10 @@ func Open(opts ...Option) (*Engine, error) {
 // Replay skips a record when the page that holds the key carries that LSN or a newer one,
 // because a page image at LSN L holds every record up to L that touched it, and a record
 // that replay applies again leaves the key with the same value.
-func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLSN uint64) error {
+// When recovery finds a key on more than one page, replay clears the older copy at the
+// first record for that key whose LSN is above the older page's LSN, even when the key's
+// current page is up to date.
+func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLSN uint64, superseded map[string][]KeyIndexEntry) error {
 	walRedoIt, err := NewWALIterator(storeFS, walDir, dbID, redoStartLSN, WALIteratorOptions{
 		EncryptionKey: s.encryptionKey,
 	})
@@ -1038,6 +1041,36 @@ func (s *Engine) replayWAL(storeFS FS, walDir string, dbID [16]byte, redoStartLS
 		s.keyMu.RLock()
 		existing, inIndex := s.keyIndex[rec.Key]
 		s.keyMu.RUnlock()
+
+		// Replay applies each page's part of a record by that page's own LSN:
+		// an older superseded page is cleared when its LSN is below the record's,
+		// even when the key's current page is already up to date.
+		if oldEntries := superseded[rec.Key]; len(oldEntries) > 0 {
+			var remaining []KeyIndexEntry
+			for _, oldEntry := range oldEntries {
+				oldLSN, ok := s.bp.PageLSN(oldEntry.LogicalPage)
+				if ok && oldLSN < rec.LSN {
+					if oldEntry.NumBlocks > 1 {
+						if err := s.clearLogicalPageLocked(oldEntry.LogicalPage, rec.LSN); err != nil {
+							return errors.Join(err, walRedoIt.Close())
+						}
+					} else {
+						// When the older copy is an oversize pointer, replay removes the slot
+						// and leaves the old oversize file for the quarantine pass.
+						if err := s.deleteSlotFromPageLocked(oldEntry.LogicalPage, oldEntry.Slot, rec.LSN); err != nil {
+							return errors.Join(err, walRedoIt.Close())
+						}
+					}
+				} else {
+					remaining = append(remaining, oldEntry)
+				}
+			}
+			if len(remaining) > 0 {
+				superseded[rec.Key] = remaining
+			} else {
+				delete(superseded, rec.Key)
+			}
+		}
 
 		// Replay skips a record when the page that holds the key carries that LSN
 		// or a newer one, because a page image at LSN L holds every record up to L
