@@ -27,7 +27,7 @@ type Checkpointer struct {
 	// metaFile is the open handle to meta.db used to update recovery start slots.
 	metaFile File
 	// mu serializes concurrent checkpoints and protects activeSlot and slotCounter.
-	mu       sync.Mutex
+	mu sync.Mutex
 
 	activeSlot  int    // 0 or 1: index of slot holding latest valid recovery position
 	slotCounter uint64 // counter in the latest valid slot
