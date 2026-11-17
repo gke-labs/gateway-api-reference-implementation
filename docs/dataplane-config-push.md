@@ -126,8 +126,6 @@ serves and data planes connect and receive:
    dial the controller Service, receive configuration streams, and send ACKs,
    while keeping Secret watching active as a fallback.
 4. **Switch status derivation.** Derive `Programmed` from direct push ACKs.
-   The in-flight applied-revision mirror and `/applied` polling continue until
-   this step, which replaces them.
 5. **Remove Secret path.** Remove `PublishDataplaneConfig` Secret generation,
    delete `dataplaneSecretReconciler`, and drop data-plane Secret RBAC.
 
