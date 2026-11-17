@@ -618,17 +618,11 @@ func TestInProcessDataplanePublisher_MultipleGatewaysClientCertIsolation(t *test
 
 	updater := &mockProxyUpdater{}
 	pub := NewInProcessDataplanePublisher(updater)
-	if err := pub.Begin(ctx); err != nil {
-		t.Fatalf("Begin failed: %v", err)
-	}
 	if err := pub.PublishDataplaneConfig(ctx, gwA, cfgA); err != nil {
 		t.Fatalf("PublishDataplaneConfig gwA failed: %v", err)
 	}
 	if err := pub.PublishDataplaneConfig(ctx, gwB, cfgB); err != nil {
 		t.Fatalf("PublishDataplaneConfig gwB failed: %v", err)
-	}
-	if err := pub.Commit(ctx); err != nil {
-		t.Fatalf("Commit failed: %v", err)
 	}
 
 	// Check top-level routes applied to proxy
@@ -863,17 +857,11 @@ func TestInProcessDataplanePublisher_ConflictingHostnameCertificates(t *testing.
 	// Publish both configs to InProcessDataplanePublisher
 	updater := &mockProxyUpdater{}
 	pub := NewInProcessDataplanePublisher(updater)
-	if err := pub.Begin(ctx); err != nil {
-		t.Fatalf("Begin failed: %v", err)
-	}
 	if err := pub.PublishDataplaneConfig(ctx, gwA, cfgA); err != nil {
 		t.Fatalf("PublishDataplaneConfig gwA failed: %v", err)
 	}
 	if err := pub.PublishDataplaneConfig(ctx, gwB, cfgB); err != nil {
 		t.Fatalf("PublishDataplaneConfig gwB failed: %v", err)
-	}
-	if err := pub.Commit(ctx); err != nil {
-		t.Fatalf("Commit failed: %v", err)
 	}
 
 	// updater must only carry the winner's cert for shared.example.com
@@ -1124,5 +1112,45 @@ func TestDataplaneConfig_Revision(t *testing.T) {
 				t.Errorf("got revision %q, base %q, wantEqual=%v", rev, baseRev, tc.wantEqual)
 			}
 		})
+	}
+}
+
+func TestInProcessDataplanePublisher_PublishDataplaneConfig_ApplyError(t *testing.T) {
+	updater := &mockProxyUpdater{}
+	pub := NewInProcessDataplanePublisher(updater)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-1"},
+	}
+	badConfig := &DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
+		Certificates: map[string]CertificateData{
+			"invalid-cert": {
+				Certificate: [][]byte{[]byte("invalid-cert-bytes")},
+				PrivateKey:  []byte("invalid-key-bytes"),
+			},
+		},
+	}
+
+	ctx := t.Context()
+	err := pub.PublishDataplaneConfig(ctx, gw, badConfig)
+	if err == nil {
+		t.Fatalf("expected PublishDataplaneConfig to return apply error, got nil")
+	}
+
+	// Valid config succeeds and updates proxy updater
+	validConfig := &DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
+		Routes: []InternalRoute{
+			{
+				Hostnames: routeHostnamesFromStrings("valid.example.com"),
+			},
+		},
+	}
+	if err := pub.PublishDataplaneConfig(ctx, gw, validConfig); err != nil {
+		t.Fatalf("expected PublishDataplaneConfig to succeed, got: %v", err)
+	}
+	if len(updater.routes) != 1 || updater.routes[0].Hostnames[0].Hostname != "valid.example.com" {
+		t.Errorf("expected updater to receive valid config")
 	}
 }
