@@ -108,10 +108,9 @@ type DataPlaneRejection struct {
 	Reason string
 }
 
-// Rejection is an alias for DataPlaneRejection.
-type Rejection = DataPlaneRejection
-
 // PublishResult reports what data planes did with a configuration revision for a Gateway.
+// An all-zero result with no applied, rejected, or unanswered data planes means no data plane
+// reports through this publisher (such as when publishing via Secrets).
 type PublishResult struct {
 	// Applied is the number of data planes that applied the revision.
 	Applied int
@@ -471,8 +470,10 @@ func ApplyDataplaneConfig(updater ProxyConfigUpdater, data []byte) error {
 }
 
 type inProcessStatus struct {
+	// revision is the configuration revision applied to the proxy updater.
 	revision string
-	err      error
+	// err is the apply error from ApplyDataplaneConfig, or nil if applied successfully.
+	err error
 }
 
 // InProcessDataplanePublisher is a DataplanePublisher that serializes DataplaneConfig
@@ -534,7 +535,9 @@ func (p *InProcessDataplanePublisher) PublishDataplaneConfig(ctx context.Context
 // WaitApplied waits until every data plane known for the Gateway has answered
 // for this revision, or until ctx ends. For the in-process publisher, applying
 // happens synchronously in PublishDataplaneConfig, so WaitApplied answers immediately:
-// one data plane, applied or rejected with the apply error.
+// one data plane, applied or rejected with the apply error. If the recorded
+// revision differs from the one requested (or no revision was recorded for this Gateway),
+// the data plane has not answered for that revision.
 func (p *InProcessDataplanePublisher) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error) {
 	if p == nil {
 		return PublishResult{}, nil
@@ -543,8 +546,10 @@ func (p *InProcessDataplanePublisher) WaitApplied(ctx context.Context, gateway t
 	defer p.mu.Unlock()
 
 	status, ok := p.statuses[gateway]
-	if !ok {
-		return PublishResult{}, nil
+	if !ok || status.revision != revision {
+		return PublishResult{
+			NotAnswered: 1,
+		}, nil
 	}
 
 	if status.err != nil {

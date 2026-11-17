@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -998,7 +999,6 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	st.mu.RLock()
 	recordedErr := st.dataplaneState[gwKey].lastPublishError
 	provErr := st.provisioningErrors[gwKey]
-	result := st.dataplaneState[gwKey].lastPublishResult
 	st.mu.RUnlock()
 
 	if recordedErr == nil {
@@ -1007,14 +1007,11 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	if recordedErr.Error() != err.Error() {
 		t.Errorf("expected recorded error %q, got %q", err.Error(), recordedErr.Error())
 	}
+	if !strings.HasPrefix(recordedErr.Error(), "in-process: ") {
+		t.Errorf("expected recorded error to start with %q, got %q", "in-process: ", recordedErr.Error())
+	}
 	if provErr != err.Error() {
 		t.Errorf("expected provisioning error %q, got %q", err.Error(), provErr)
-	}
-	if len(result.Rejections) != 1 {
-		t.Fatalf("expected 1 rejection in result, got %d", len(result.Rejections))
-	}
-	if result.Rejections[0].Reason != recordedErr.Error() {
-		t.Errorf("expected rejection reason %q to match recorded error %q", result.Rejections[0].Reason, recordedErr.Error())
 	}
 
 	// When a valid config is subsequently reconciled, the recorded error is cleared.
@@ -1032,7 +1029,6 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	st.mu.RLock()
 	clearedRecordedErr := st.dataplaneState[gwKey].lastPublishError
 	clearedProvErr := st.provisioningErrors[gwKey]
-	validPublishResult := st.dataplaneState[gwKey].lastPublishResult
 	st.mu.RUnlock()
 
 	if clearedRecordedErr != nil {
@@ -1040,12 +1036,6 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	}
 	if clearedProvErr != "" {
 		t.Errorf("expected provisioning error to be cleared, got %q", clearedProvErr)
-	}
-	if validPublishResult.Applied != 1 {
-		t.Errorf("expected Applied=1 after valid config, got %d", validPublishResult.Applied)
-	}
-	if len(validPublishResult.Rejections) != 0 {
-		t.Errorf("expected 0 rejections after valid config, got %d", len(validPublishResult.Rejections))
 	}
 }
 
@@ -1121,19 +1111,13 @@ func TestState_PublishDataplaneConfig_NeverAnsweringPublisher(t *testing.T) {
 	}
 
 	st.mu.RLock()
-	dpState := st.dataplaneState[gwKey]
+	dataplaneState := st.dataplaneState[gwKey]
 	st.mu.RUnlock()
 
-	if dpState.lastPublishError != nil {
-		t.Errorf("expected no publish error, got: %v", dpState.lastPublishError)
+	if dataplaneState.lastPublishError != nil {
+		t.Errorf("expected no publish error, got: %v", dataplaneState.lastPublishError)
 	}
-	if dpState.lastPublishResult.NotAnswered != 1 {
-		t.Errorf("expected NotAnswered=1 in result, got %d", dpState.lastPublishResult.NotAnswered)
-	}
-	if dpState.lastPublishResult.Applied != 0 {
-		t.Errorf("expected Applied=0 in result, got %d", dpState.lastPublishResult.Applied)
-	}
-	if dpState.acceptedConfig == nil {
+	if dataplaneState.acceptedConfig == nil {
 		t.Errorf("expected acceptedConfig to be saved in dataplane state")
 	}
 }

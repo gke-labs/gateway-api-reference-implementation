@@ -122,8 +122,6 @@ type gatewayDataplaneState struct {
 	acceptedConfig []byte
 	// lastPublishError is the error from the most recent publish attempt, or nil after a success.
 	lastPublishError error
-	// lastPublishResult is the most recent PublishResult returned by WaitApplied.
-	lastPublishResult PublishResult
 }
 
 type State struct {
@@ -630,30 +628,19 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	}
 
 	if len(result.Rejections) > 0 {
-		var rejectionErr error
-		if len(result.Rejections) == 1 {
-			rejectionErr = errors.New(result.Rejections[0].Reason)
-		} else {
-			var reasons []string
-			for _, r := range result.Rejections {
-				reasons = append(reasons, fmt.Sprintf("%s: %s", r.DataPlane, r.Reason))
-			}
-			rejectionErr = errors.New(strings.Join(reasons, "; "))
+		var reasons []string
+		for _, rejection := range result.Rejections {
+			reasons = append(reasons, fmt.Sprintf("%s: %s", rejection.DataPlane, rejection.Reason))
 		}
+		rejectionErr := errors.New(strings.Join(reasons, "; "))
 		s.recordPublishError(gwKey, rejectionErr)
-		s.mu.Lock()
-		dp := s.dataplaneState[gwKey]
-		dp.lastPublishResult = result
-		s.dataplaneState[gwKey] = dp
-		s.mu.Unlock()
 		return rejectionErr
 	}
 
 	s.mu.Lock()
 	prev := s.dataplaneState[gwKey]
 	s.dataplaneState[gwKey] = gatewayDataplaneState{
-		acceptedConfig:    data,
-		lastPublishResult: result,
+		acceptedConfig: data,
 	}
 	s.mu.Unlock()
 
@@ -667,9 +654,9 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 // data-plane state and reports it as a Gateway provisioning error.
 func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
 	s.mu.Lock()
-	dp := s.dataplaneState[gwKey]
-	dp.lastPublishError = err
-	s.dataplaneState[gwKey] = dp
+	dataplaneState := s.dataplaneState[gwKey]
+	dataplaneState.lastPublishError = err
+	s.dataplaneState[gwKey] = dataplaneState
 	s.mu.Unlock()
 	s.SetGatewayProvisioningError(gwKey, err.Error())
 }

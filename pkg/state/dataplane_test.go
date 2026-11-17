@@ -1181,3 +1181,50 @@ func TestInProcessDataplanePublisher_PublishDataplaneConfig_ApplyError(t *testin
 		t.Errorf("expected updater to receive valid config")
 	}
 }
+
+func TestInProcessDataplanePublisher_WaitApplied_NeverPublishedRevision(t *testing.T) {
+	updater := &mockProxyUpdater{}
+	pub := NewInProcessDataplanePublisher(updater)
+	ctx := t.Context()
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "gw-test"}
+
+	// 1. Gateway never published at all: reports NotAnswered=1.
+	resUnseenGateway, err := pub.WaitApplied(ctx, gwKey, "rev-1")
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if resUnseenGateway.NotAnswered != 1 || resUnseenGateway.Applied != 0 || len(resUnseenGateway.Rejections) != 0 {
+		t.Errorf("expected NotAnswered=1 on unseen gateway, got: %+v", resUnseenGateway)
+	}
+
+	// 2. Publish config with revision "rev-1".
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
+	}
+	config := &DataplaneConfig{
+		GatewayName: gwKey,
+		Revision:    "rev-1",
+	}
+	if err := pub.PublishDataplaneConfig(ctx, gw, config); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed: %v", err)
+	}
+
+	// 3. Ask for a revision that was never published: reports NotAnswered=1.
+	resNeverPublishedRevision, err := pub.WaitApplied(ctx, gwKey, "never-published-rev")
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if resNeverPublishedRevision.NotAnswered != 1 || resNeverPublishedRevision.Applied != 0 || len(resNeverPublishedRevision.Rejections) != 0 {
+		t.Errorf("expected NotAnswered=1 on never published revision, got: %+v", resNeverPublishedRevision)
+	}
+
+	// 4. Ask for the published revision: reports Applied=1.
+	resPublished, err := pub.WaitApplied(ctx, gwKey, "rev-1")
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if resPublished.Applied != 1 || resPublished.NotAnswered != 0 || len(resPublished.Rejections) != 0 {
+		t.Errorf("expected Applied=1 on published revision, got: %+v", resPublished)
+	}
+}

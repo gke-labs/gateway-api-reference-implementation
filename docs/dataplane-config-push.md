@@ -114,8 +114,7 @@ type DataplanePublisher interface {
   result indicating no data plane reports through `singlepod.AddressProvider`.
   The planned removal of the Secret path removes this case.
 - **State tracking.** The state machine calls `WaitApplied` after each publish with a
-  limit held in a named constant (`dataplaneWaitAppliedLimit`) and stores the latest
-  result for each Gateway next to the accepted configuration. A rejection becomes the
+  limit held in a named constant (`dataplaneWaitAppliedLimit`). A rejection becomes the
   Gateway's recorded publish error.
 - **Planned (not built).** The controller reports `Programmed=False` while any data
   plane has not applied the current revision, and a late reply re-queues the Gateway.
