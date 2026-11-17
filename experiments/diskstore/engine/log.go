@@ -38,7 +38,7 @@ type Log interface {
 	// When Sync returns, all appended records have been written and made durable
 	// on storage (for the WAL, via a local fsync). Records survive process crashes,
 	// operating system crashes, and node power loss. The engine calls Sync on
-	// Engine.Sync and Engine.Flush when persistence is requested, and during checkpoints
+	// Engine.Sync when persistence is requested, and during checkpoints
 	// to ensure the checkpoint record and earlier operations are durable before
 	// truncating finished log segments.
 	Sync() error

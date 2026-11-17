@@ -2164,18 +2164,6 @@ func (s *Engine) Sync() error {
 	return nil
 }
 
-// Flush flushes all buffered WAL records to disk and fsynced.
-func (s *Engine) Flush() error {
-	if s.isFailed() {
-		return s.failErr()
-	}
-	if err := s.wal.Sync(); err != nil {
-		s.setFailed(err)
-		return s.failErr()
-	}
-	return nil
-}
-
 // Checkpoint performs a non-blocking checkpoint.
 func (s *Engine) Checkpoint() (uint64, error) {
 	if s.isFailed() {
