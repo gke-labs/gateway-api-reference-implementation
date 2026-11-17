@@ -57,7 +57,7 @@ type RecoveryResult struct {
 	KeyIndex          map[string]KeyIndexEntry
 	EmptyLogicalPages []uint64
 	// SupersededPages maps a qualified key to older page copies discovered on disk
-	// where that key appeared on more than one page. replayWAL consumes it to clear
+	// where that key appeared on more than one page. replay consumes it to clear
 	// each older page at the first record whose LSN is above the older page's LSN.
 	SupersededPages map[string][]KeyIndexEntry
 	MaxLSN          uint64
@@ -492,4 +492,112 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		NextLogicalPage:   maxRecoveredLogicalPage + 1,
 		RedoStartLSN:      redoStartLSN,
 	}, nil
+}
+
+// replay replays records from a LogIterator through the write path apply functions.
+// Replay holds writerMu throughout, and appends nothing to the log.
+//
+// Replay skips a record when the page that holds the key carries that LSN or a newer one,
+// because a page image at LSN L holds every record up to L that touched it, and a record
+// that replay applies again leaves the key with the same value.
+// When recovery finds a key on more than one page, replay clears the older copy at the
+// first record for that key whose LSN is above the older page's LSN, even when the key's
+// current page is up to date.
+//
+// Iterator Errors and End-of-Log:
+// The provided LogIterator may return the following errors from Next:
+//   - io.EOF: indicates the end of the log or an unacknowledged torn write at the active log tail.
+//     Replay treats io.EOF as normal completion, stops iteration, and closes the iterator.
+//   - An error wrapping ErrCorruptWAL: indicates corruption, checksum mismatch, or an unexpected
+//     gap in earlier completed segments or log positions. Replay aborts immediately, closes
+//     the iterator, and returns the error.
+//   - Any other I/O or decode error: replay aborts immediately, closes the iterator, and returns
+//     the error.
+func (s *Engine) replay(iterator LogIterator, superseded map[string][]KeyIndexEntry) error {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+
+	for {
+		rec, err := iterator.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return errors.Join(fmt.Errorf("error during redo replay: %w", err), iterator.Close())
+		}
+
+		s.keyMu.RLock()
+		existing, inIndex := s.keyIndex[rec.Key]
+		s.keyMu.RUnlock()
+
+		// Replay applies each page's part of a record by that page's own LSN:
+		// an older superseded page is cleared when its LSN is below the record's,
+		// even when the key's current page is already up to date.
+		if oldEntries := superseded[rec.Key]; len(oldEntries) > 0 {
+			var remaining []KeyIndexEntry
+			for _, oldEntry := range oldEntries {
+				oldLSN, ok := s.bp.PageLSN(oldEntry.LogicalPage)
+				if ok && oldLSN < rec.LSN {
+					if oldEntry.NumBlocks > 1 {
+						if err := s.clearLogicalPageLocked(oldEntry.LogicalPage, rec.LSN); err != nil {
+							return errors.Join(err, iterator.Close())
+						}
+					} else {
+						// When the older copy is an oversize pointer, replay removes the slot
+						// and leaves the old oversize file for the quarantine pass.
+						if err := s.deleteSlotFromPageLocked(oldEntry.LogicalPage, oldEntry.Slot, rec.LSN); err != nil {
+							return errors.Join(err, iterator.Close())
+						}
+					}
+				} else {
+					remaining = append(remaining, oldEntry)
+				}
+			}
+			if len(remaining) > 0 {
+				superseded[rec.Key] = remaining
+			} else {
+				delete(superseded, rec.Key)
+			}
+		}
+
+		// Replay skips a record when the page that holds the key carries that LSN
+		// or a newer one, because a page image at LSN L holds every record up to L
+		// that touched it, and a record that replay applies again leaves the key
+		// with the same value.
+		if inIndex {
+			if pageLSN, ok := s.bp.PageLSN(existing.LogicalPage); ok && pageLSN >= rec.LSN {
+				continue
+			}
+		}
+
+		switch rec.Type {
+		case RecordTypePut, RecordTypePutPointer:
+			isOversize := rec.Type == RecordTypePutPointer
+			if err := s.applyPutLocked(rec.Key, rec.Payload, rec.LSN, isOversize); err != nil {
+				return errors.Join(err, iterator.Close())
+			}
+
+		case RecordTypeDelete:
+			if !inIndex {
+				continue
+			}
+			if err := s.applyDeleteLocked(rec.Key, rec.LSN); err != nil {
+				return errors.Join(err, iterator.Close())
+			}
+		}
+	}
+
+	if err := iterator.Close(); err != nil {
+		return fmt.Errorf("failed to close redo iterator: %w", err)
+	}
+	return nil
+}
+
+// replayWAL builds a LogIterator from s.wal starting at redoStartLSN and passes it to replay.
+func (s *Engine) replayWAL(redoStartLSN uint64, superseded map[string][]KeyIndexEntry) error {
+	walRedoIt, err := s.wal.NewIterator(redoStartLSN)
+	if err != nil {
+		return fmt.Errorf("failed to create WAL redo iterator: %w", err)
+	}
+	return s.replay(walRedoIt, superseded)
 }
