@@ -156,30 +156,3 @@ func Setup(args []string) (gari.Options, error) {
 
 	return opts, nil
 }
-
-// SetupController parses args and builds the gari.Options for controller mode.
-func SetupController(args []string) (gari.Options, error) {
-	opts, err := Setup(args)
-	if err != nil {
-		return opts, err
-	}
-	if opts.DataplaneMode {
-		return opts, fmt.Errorf("unexpected --dataplane-mode in controller setup")
-	}
-	return opts, nil
-}
-
-// SetupDataplane parses args and builds the gari.Options for data-plane mode.
-func SetupDataplane(args []string) (gari.Options, error) {
-	hasDataplaneMode := false
-	for _, a := range args {
-		if a == "--dataplane-mode" || a == "-dataplane-mode" || a == "--dataplane-mode=true" || a == "-dataplane-mode=true" {
-			hasDataplaneMode = true
-			break
-		}
-	}
-	if !hasDataplaneMode {
-		args = append([]string{"--dataplane-mode"}, args...)
-	}
-	return Setup(args)
-}
