@@ -806,6 +806,11 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
+	var pushPub state.DataplanePublisher
+	if s.pushServer != nil {
+		pushPub = s.pushServer
+	}
+
 	return controller.RegisterReconcilers(mgr, s.state, s.proxy, controller.ReconcilerOptions{
 		ControllerName:       s.opts.ControllerName,
 		OnGatewaysUpdate:     wrappedHook,
@@ -814,6 +819,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		DisableStatusUpdates: s.opts.DisableStatusUpdates,
 		GatewayStatusHook:    s.opts.GatewayStatusHook,
 		ListenerValidator:    s.opts.ListenerValidator,
+		DataplanePublisher:   pushPub,
 
 		CertificateSources: s.opts.CertificateSources,
 	})

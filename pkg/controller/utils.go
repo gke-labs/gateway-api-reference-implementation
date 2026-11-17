@@ -62,6 +62,7 @@ type ReconcilerOptions struct {
 	CRDView              *CRDView
 	GatewayStatusHook    GatewayStatusHook
 	ListenerValidator    state.ListenerValidator
+	DataplanePublisher   state.DataplanePublisher
 
 	CertificateSources map[string]CertificateSource
 }
@@ -145,7 +146,19 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 			st.SetSupportedAddressTypes(atp.SupportedAddressTypes())
 		}
 
-		if publisher, ok := opts.AddressProvider.(state.DataplanePublisher); ok {
+		var publisher state.DataplanePublisher
+		if p, ok := opts.AddressProvider.(state.DataplanePublisher); ok {
+			publisher = p
+		}
+		if opts.DataplanePublisher != nil {
+			if publisher != nil {
+				publisher = state.NewMultiDataplanePublisher(publisher, opts.DataplanePublisher)
+			} else {
+				publisher = opts.DataplanePublisher
+			}
+		}
+
+		if publisher != nil {
 			st.SetDataplanePublisher(publisher)
 		} else if p != nil {
 			st.SetProxy(p)

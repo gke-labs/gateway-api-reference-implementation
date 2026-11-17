@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -129,6 +130,61 @@ type DataplanePublisher interface {
 	// answered for this revision, or until ctx ends, and reports what each did.
 	WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error)
 }
+
+// MultiDataplanePublisher broadcasts config updates to multiple DataplanePublishers.
+type MultiDataplanePublisher []DataplanePublisher
+
+// NewMultiDataplanePublisher creates a DataplanePublisher that broadcasts to all non-nil publishers.
+func NewMultiDataplanePublisher(publishers ...DataplanePublisher) DataplanePublisher {
+	var nonNil []DataplanePublisher
+	for _, p := range publishers {
+		if p != nil {
+			nonNil = append(nonNil, p)
+		}
+	}
+	if len(nonNil) == 0 {
+		return nil
+	}
+	if len(nonNil) == 1 {
+		return nonNil[0]
+	}
+	return MultiDataplanePublisher(nonNil)
+}
+
+// Begin implements DataplanePublisher.
+func (m MultiDataplanePublisher) Begin(ctx context.Context) error {
+	var errs []error
+	for _, p := range m {
+		if err := p.Begin(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// PublishDataplaneConfig implements DataplanePublisher.
+func (m MultiDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
+	var errs []error
+	for _, p := range m {
+		if err := p.PublishDataplaneConfig(ctx, gw, config); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Commit implements DataplanePublisher.
+func (m MultiDataplanePublisher) Commit(ctx context.Context) error {
+	var errs []error
+	for _, p := range m {
+		if err := p.Commit(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+var _ DataplanePublisher = (MultiDataplanePublisher)(nil)
 
 func tlsCertToData(cert *tls.Certificate) (CertificateData, error) {
 	if cert == nil {
