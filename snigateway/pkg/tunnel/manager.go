@@ -26,8 +26,8 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"

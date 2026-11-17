@@ -37,9 +37,9 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/httphost"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 	"golang.org/x/time/rate"
 	"k8s.io/klog/v2"
