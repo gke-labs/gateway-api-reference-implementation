@@ -816,14 +816,6 @@ func (w *WAL) SyncThrough(lsn uint64) error {
 	}
 }
 
-// Flush flushes all buffered records and fsyncs the WAL.
-func (w *WAL) Flush() error {
-	w.mu.Lock()
-	targetLSN := w.lastAppendedLSN
-	w.mu.Unlock()
-	return w.SyncThrough(targetLSN)
-}
-
 // TruncateBefore removes whole completed segment files whose records are all strictly prior to oldestNeededLSN.
 // Finished segments are deleted only when fully covered by a completed checkpoint.
 func (w *WAL) TruncateBefore(oldestNeededLSN uint64) error {

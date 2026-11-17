@@ -129,8 +129,8 @@ func TestDiskStore_FailedStateOnErrors(t *testing.T) {
 	injectedErr := errors.New("simulated unrecoverable disk error")
 	faultFS.SetWriteError(injectedErr)
 
-	// Flush will attempt to write to disk, fail, and transition store into failed state
-	err = store.Flush()
+	// Sync will attempt to write to disk, fail, and transition store into failed state
+	err = store.Sync()
 	if err == nil {
 		err = store.Put("ConfigMap", "default/cm-2", []byte("data-2"))
 	}
