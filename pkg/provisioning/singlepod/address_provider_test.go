@@ -43,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
@@ -4995,5 +4996,274 @@ func TestSinglePodAddressProvider_HostPorts_ReservedPortsSkipped(t *testing.T) {
 	}
 	if ports[0].HostPort != 80 || ports[0].ContainerPort != 8080 {
 		t.Errorf("expected port 80 mapping, got %+v", ports[0])
+	}
+}
+
+func TestSinglePodAddressProvider_WithNoService(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c, WithNoService())
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-no-svc",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-no-svc-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+
+	// 1. Initial reconcile creates Deployment and no Service.
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false when deployment has no ready replicas")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected reason=AddressNotAssigned, got %s", readiness.Reason)
+	}
+	if len(addrs) > 0 {
+		t.Errorf("expected no addresses, got %+v", addrs)
+	}
+
+	resName := ResourceNameForGateway("gw-no-svc")
+
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
+		t.Errorf("expected Service to not exist with WithNoService(), got err: %v", err)
+	}
+
+	// 2. When deployment has ready replicas, still reports AddressNotAssigned with no Service addresses
+	deploy.Status.ReadyReplicas = 1
+	if err := c.Status().Update(ctx, &deploy); err != nil {
+		t.Fatalf("failed to update deployment status: %v", err)
+	}
+	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error when deployment ready: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false because no Service exists to supply addresses")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected reason=AddressNotAssigned, got %s", readiness.Reason)
+	}
+	if readiness.Message != "Waiting for address to be assigned to the Gateway" {
+		t.Errorf("expected message 'Waiting for address to be assigned to the Gateway', got %q", readiness.Message)
+	}
+	if len(addrs) > 0 {
+		t.Errorf("expected no addresses, got %+v", addrs)
+	}
+
+	// 3. Pre-existing Service is not deleted when reconciling with WithNoService()
+	existingSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      resName,
+			Namespace: "test-ns",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: gatewayv1.GroupVersion.String(),
+					Kind:       "Gateway",
+					Name:       gw.Name,
+					UID:        gw.UID,
+					Controller: state.Ptr(true),
+				},
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{Name: "http", Port: 80},
+			},
+		},
+	}
+	if err := c.Create(ctx, existingSvc); err != nil {
+		t.Fatalf("failed to create existing Service: %v", err)
+	}
+
+	// Reconcile with WithNoService() provider again
+	_, _, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify existing Service is STILL present (not deleted)
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Errorf("expected existing Service to remain untouched (not deleted) with WithNoService(), got err: %v", err)
+	}
+}
+
+func TestSinglePodAddressProvider_WithDeploymentMutator(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+
+	var passedGw *gatewayv1.Gateway
+	var passedListeners []*state.EffectiveListener
+	mutatorCalled := false
+
+	mutator := func(deploy *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error {
+		mutatorCalled = true
+		passedGw = gw
+		passedListeners = effectiveListeners
+
+		// Change rollout strategy to RollingUpdate with maxSurge: 0, maxUnavailable: 1
+		deploy.Spec.WithStrategy(appsv1ac.DeploymentStrategy().
+			WithType(appsv1.RollingUpdateDeploymentStrategyType).
+			WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
+				WithMaxSurge(intstr.FromInt32(0)).
+				WithMaxUnavailable(intstr.FromInt32(1)),
+			),
+		)
+
+		// Add custom container port
+		deploy.Spec.Template.Spec.Containers[0].WithPorts(
+			corev1ac.ContainerPort().
+				WithName("custom-port").
+				WithContainerPort(9090).
+				WithProtocol(corev1.ProtocolTCP),
+		)
+		return nil
+	}
+
+	p := NewAddressProvider(c, WithDeploymentMutator(mutator))
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-mutated",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-mutated-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	listeners := []*state.EffectiveListener{
+		{
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+		},
+	}
+
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !mutatorCalled {
+		t.Fatalf("expected mutator to be called")
+	}
+	if passedGw != gw {
+		t.Errorf("expected mutator to receive Gateway, got %+v", passedGw)
+	}
+	if len(passedListeners) != 1 || passedListeners[0].Port != 80 {
+		t.Errorf("expected mutator to receive effective listeners, got %+v", passedListeners)
+	}
+
+	resName := ResourceNameForGateway("gw-mutated")
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+
+	// Verify rollout strategy was updated by the mutator
+	if deploy.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Errorf("expected RollingUpdate strategy, got %s", deploy.Spec.Strategy.Type)
+	}
+	if deploy.Spec.Strategy.RollingUpdate == nil {
+		t.Fatalf("expected RollingUpdate configuration")
+	}
+	if deploy.Spec.Strategy.RollingUpdate.MaxSurge == nil || deploy.Spec.Strategy.RollingUpdate.MaxSurge.IntValue() != 0 {
+		t.Errorf("expected maxSurge=0, got %v", deploy.Spec.Strategy.RollingUpdate.MaxSurge)
+	}
+	if deploy.Spec.Strategy.RollingUpdate.MaxUnavailable == nil || deploy.Spec.Strategy.RollingUpdate.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("expected maxUnavailable=1, got %v", deploy.Spec.Strategy.RollingUpdate.MaxUnavailable)
+	}
+
+	// Verify container port was added by the mutator
+	ports := deploy.Spec.Template.Spec.Containers[0].Ports
+	foundCustom := false
+	for _, port := range ports {
+		if port.Name == "custom-port" {
+			foundCustom = true
+			if port.ContainerPort != 9090 {
+				t.Errorf("expected containerPort=9090, got %d", port.ContainerPort)
+			}
+			if port.Protocol != corev1.ProtocolTCP {
+				t.Errorf("expected protocol TCP, got %s", port.Protocol)
+			}
+		}
+	}
+	if !foundCustom {
+		t.Errorf("expected custom-port container port to be present in applied Deployment, got ports: %+v", ports)
+	}
+}
+
+func TestSinglePodAddressProvider_WithDeploymentMutator_Error(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+
+	expectedErr := errors.New("boom: mutator failed")
+	mutator := func(deploy *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error {
+		return expectedErr
+	}
+
+	p := NewAddressProvider(c, WithDeploymentMutator(mutator))
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-mut-err",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-mut-err-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	// Reconcile via GatewayAddressesWithReadiness
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err == nil {
+		t.Fatalf("expected error from mutator, got nil")
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("expected error %v, got %v", expectedErr, err)
+	}
+
+	// Deployment must not have been applied
+	resName := ResourceNameForGateway("gw-mut-err")
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); !apierrors.IsNotFound(err) {
+		t.Errorf("expected Deployment to not exist after mutator error, got err: %v", err)
+	}
+
+	// Service must not have been applied
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
+		t.Errorf("expected Service to not exist after mutator error, got err: %v", err)
+	}
+
+	// Reconcile via GatewayAddresses
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
+	if err == nil {
+		t.Fatalf("expected error from mutator via GatewayAddresses, got nil")
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("expected error %v, got %v", expectedErr, err)
 	}
 }

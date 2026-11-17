@@ -154,6 +154,33 @@ func WithHostPorts() Option {
 	}
 }
 
+// WithNoService configures the AddressProvider to create and reconcile no
+// Service for the Gateway, leaving any existing Service in place without
+// deleting it. It is intended for callers that expose data-plane pods through
+// alternative network mechanisms and manage Gateway addresses independently.
+func WithNoService() Option {
+	return func(p *AddressProvider) {
+		p.noService = true
+	}
+}
+
+// DeploymentMutator is a function called immediately before a data-plane
+// Deployment apply configuration is applied to the API server.
+type DeploymentMutator func(deploy *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error
+
+// WithDeploymentMutator configures a function called immediately before the
+// data-plane Deployment apply configuration is applied to the API server.
+// The mutator receives the Deployment apply configuration, the Gateway, and
+// its effective listeners. If the mutator returns an error, reconciliation stops
+// and the error is returned to the caller. It is intended for callers that need
+// to customize data-plane pod specs, container configurations, or deployment
+// strategies beyond singlepod defaults.
+func WithDeploymentMutator(fn DeploymentMutator) Option {
+	return func(p *AddressProvider) {
+		p.deploymentMutator = fn
+	}
+}
+
 // WithEnableH2C configures whether H2C is enabled on data-plane instances.
 func WithEnableH2C(enable bool) Option {
 	return func(p *AddressProvider) {
@@ -199,6 +226,8 @@ type AddressProvider struct {
 	// useHostPorts indicates whether the data-plane Deployment maps listener ports
 	// to host ports directly instead of provisioning a LoadBalancer Service.
 	useHostPorts                  bool
+	noService                     bool
+	deploymentMutator             DeploymentMutator
 	forwardedForMode              string
 	debugErrorResponses           bool
 	state                         *state.State
@@ -871,118 +900,125 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	if len(annotations) > 0 {
 		deployApply.WithAnnotations(annotations)
 	}
+	if p.deploymentMutator != nil {
+		if err := p.deploymentMutator(deployApply, gw, effectiveListeners); err != nil {
+			return nil, state.GatewayReadiness{}, err
+		}
+	}
 	if err := p.client.Apply(ctx, deployApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
 		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Deployment for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
-	}
-
-	// 4. Reconcile per-Gateway LoadBalancer Service in Gateway namespace
-	var existingSvc corev1.Service
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc)
-	if err == nil {
-		if !isOwnedByGateway(&existingSvc, gw) {
-			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
-				Message: fmt.Sprintf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-			}
-		}
-		if p.useHostPorts {
-			if deleteErr := p.client.Delete(ctx, &existingSvc); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
-				return nil, state.GatewayReadiness{}, fmt.Errorf("failed to delete Service for Gateway %s/%s: %w", gwNamespace, gw.Name, deleteErr)
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return nil, state.GatewayReadiness{}, err
-	}
-
-	var svcPorts []*corev1ac.ServicePortApplyConfiguration
-	for _, portInt := range sortedPorts {
-		port := gatewayv1.PortNumber(portInt)
-		proto := uniquePorts[port]
-		if proto == gatewayv1.HTTPSProtocolType {
-			svcPorts = append(svcPorts,
-				corev1ac.ServicePort().
-					WithName(fmt.Sprintf("https-%d", port)).
-					WithPort(int32(port)).
-					WithTargetPort(intstr.FromString("https")).
-					WithProtocol(corev1.ProtocolTCP),
-				corev1ac.ServicePort().
-					WithName(fmt.Sprintf("http3-%d", port)).
-					WithPort(int32(port)).
-					WithTargetPort(intstr.FromString("http3")).
-					WithProtocol(corev1.ProtocolUDP),
-			)
-		} else if proto == gatewayv1.TLSProtocolType {
-			svcPorts = append(svcPorts,
-				corev1ac.ServicePort().
-					WithName(fmt.Sprintf("tls-%d", port)).
-					WithPort(int32(port)).
-					WithTargetPort(intstr.FromString("https")).
-					WithProtocol(corev1.ProtocolTCP),
-			)
-		} else if proto == gatewayv1.TCPProtocolType {
-			svcPorts = append(svcPorts,
-				corev1ac.ServicePort().
-					WithName(fmt.Sprintf("tcp-%d", port)).
-					WithPort(int32(port)).
-					WithTargetPort(intstr.FromInt32(int32(port))).
-					WithProtocol(corev1.ProtocolTCP),
-			)
-		} else {
-			svcPorts = append(svcPorts,
-				corev1ac.ServicePort().
-					WithName(fmt.Sprintf("http-%d", port)).
-					WithPort(int32(port)).
-					WithTargetPort(intstr.FromString("http")).
-					WithProtocol(corev1.ProtocolTCP),
-			)
-		}
-	}
-	for _, portInt := range udpPorts {
-		port := gatewayv1.PortNumber(portInt)
-		svcPorts = append(svcPorts,
-			corev1ac.ServicePort().
-				WithName(fmt.Sprintf("udp-%d", port)).
-				WithPort(int32(port)).
-				WithTargetPort(intstr.FromInt32(int32(port))).
-				WithProtocol(corev1.ProtocolUDP),
-		)
 	}
 
 	requestedIPs := requestedIPAddresses(gw)
 	requestedHostnames := requestedHostnameAddresses(gw)
 
-	if !p.useHostPorts && len(svcPorts) > 0 {
-		svcSpec := corev1ac.ServiceSpec().
-			WithType(params.ServiceType).
-			WithSelector(map[string]string{
-				LabelGatewayName: labelGwName,
-				LabelAppName:     AppNameValue,
-			}).
-			WithPorts(svcPorts...)
-		if params.ServiceType == corev1.ServiceTypeLoadBalancer {
-			if params.ExternalTrafficPolicy != "" {
-				svcSpec.WithExternalTrafficPolicy(params.ExternalTrafficPolicy)
+	var existingSvc corev1.Service
+	// 4. Reconcile per-Gateway LoadBalancer Service in Gateway namespace
+	if !p.noService {
+		err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc)
+		if err == nil {
+			if !isOwnedByGateway(&existingSvc, gw) {
+				return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
+					Message: fmt.Sprintf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+				}
 			}
-			if len(requestedIPs) > 0 {
-				svcSpec.WithLoadBalancerIP(requestedIPs[0])
+			if p.useHostPorts {
+				if deleteErr := p.client.Delete(ctx, &existingSvc); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+					return nil, state.GatewayReadiness{}, fmt.Errorf("failed to delete Service for Gateway %s/%s: %w", gwNamespace, gw.Name, deleteErr)
+				}
 			}
+		} else if !apierrors.IsNotFound(err) {
+			return nil, state.GatewayReadiness{}, err
 		}
-		svcApply := corev1ac.Service(name, gwNamespace).
-			WithOwnerReferences(ownerRef).
-			WithLabels(labels).
-			WithSpec(svcSpec)
 
-		svcAnnos := make(map[string]string)
-		for k, v := range annotations {
-			svcAnnos[k] = v
+		var svcPorts []*corev1ac.ServicePortApplyConfiguration
+		for _, portInt := range sortedPorts {
+			port := gatewayv1.PortNumber(portInt)
+			proto := uniquePorts[port]
+			if proto == gatewayv1.HTTPSProtocolType {
+				svcPorts = append(svcPorts,
+					corev1ac.ServicePort().
+						WithName(fmt.Sprintf("https-%d", port)).
+						WithPort(int32(port)).
+						WithTargetPort(intstr.FromString("https")).
+						WithProtocol(corev1.ProtocolTCP),
+					corev1ac.ServicePort().
+						WithName(fmt.Sprintf("http3-%d", port)).
+						WithPort(int32(port)).
+						WithTargetPort(intstr.FromString("http3")).
+						WithProtocol(corev1.ProtocolUDP),
+				)
+			} else if proto == gatewayv1.TLSProtocolType {
+				svcPorts = append(svcPorts,
+					corev1ac.ServicePort().
+						WithName(fmt.Sprintf("tls-%d", port)).
+						WithPort(int32(port)).
+						WithTargetPort(intstr.FromString("https")).
+						WithProtocol(corev1.ProtocolTCP),
+				)
+			} else if proto == gatewayv1.TCPProtocolType {
+				svcPorts = append(svcPorts,
+					corev1ac.ServicePort().
+						WithName(fmt.Sprintf("tcp-%d", port)).
+						WithPort(int32(port)).
+						WithTargetPort(intstr.FromInt32(int32(port))).
+						WithProtocol(corev1.ProtocolTCP),
+				)
+			} else {
+				svcPorts = append(svcPorts,
+					corev1ac.ServicePort().
+						WithName(fmt.Sprintf("http-%d", port)).
+						WithPort(int32(port)).
+						WithTargetPort(intstr.FromString("http")).
+						WithProtocol(corev1.ProtocolTCP),
+				)
+			}
 		}
-		for k, v := range params.ServiceAnnotations {
-			svcAnnos[k] = v
+		for _, portInt := range udpPorts {
+			port := gatewayv1.PortNumber(portInt)
+			svcPorts = append(svcPorts,
+				corev1ac.ServicePort().
+					WithName(fmt.Sprintf("udp-%d", port)).
+					WithPort(int32(port)).
+					WithTargetPort(intstr.FromInt32(int32(port))).
+					WithProtocol(corev1.ProtocolUDP),
+			)
 		}
-		if len(svcAnnos) > 0 {
-			svcApply.WithAnnotations(svcAnnos)
-		}
-		if err := p.client.Apply(ctx, svcApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-			return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+
+		if !p.useHostPorts && len(svcPorts) > 0 {
+			svcSpec := corev1ac.ServiceSpec().
+				WithType(params.ServiceType).
+				WithSelector(map[string]string{
+					LabelGatewayName: labelGwName,
+					LabelAppName:     AppNameValue,
+				}).
+				WithPorts(svcPorts...)
+			if params.ServiceType == corev1.ServiceTypeLoadBalancer {
+				if params.ExternalTrafficPolicy != "" {
+					svcSpec.WithExternalTrafficPolicy(params.ExternalTrafficPolicy)
+				}
+				if len(requestedIPs) > 0 {
+					svcSpec.WithLoadBalancerIP(requestedIPs[0])
+				}
+			}
+			svcApply := corev1ac.Service(name, gwNamespace).
+				WithOwnerReferences(ownerRef).
+				WithLabels(labels).
+				WithSpec(svcSpec)
+
+			svcAnnos := make(map[string]string)
+			for k, v := range annotations {
+				svcAnnos[k] = v
+			}
+			for k, v := range params.ServiceAnnotations {
+				svcAnnos[k] = v
+			}
+			if len(svcAnnos) > 0 {
+				svcApply.WithAnnotations(svcAnnos)
+			}
+			if err := p.client.Apply(ctx, svcApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+				return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+			}
 		}
 	}
 
@@ -1002,6 +1038,18 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		message := "Waiting for data-plane deployment to become available"
 		if deployReady {
 			message = "Waiting for node address to be assigned to host-port Gateway"
+		}
+		return nil, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+			Message: message,
+		}, nil
+	}
+
+	if p.noService {
+		message := "Waiting for data-plane deployment to become available"
+		if deployReady {
+			message = "Waiting for address to be assigned to the Gateway"
 		}
 		return nil, state.GatewayReadiness{
 			Ready:   false,
@@ -1184,7 +1232,9 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 	pred := managedByPredicate()
 	ownerHandler := handler.EnqueueRequestForOwner(scheme, mapper, &gatewayv1.Gateway{}, handler.OnlyControllerOwner())
 
-	bldr.Watches(&corev1.Service{}, ownerHandler, builder.WithPredicates(pred))
+	if !p.noService {
+		bldr.Watches(&corev1.Service{}, ownerHandler, builder.WithPredicates(pred))
+	}
 	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
 
 	return nil
