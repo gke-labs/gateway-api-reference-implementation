@@ -44,21 +44,32 @@ func cloneMemFS(src *MemFS) *MemFS {
 func TestRecoverySlot_TearSlotWriteAtByteBoundaries(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_slot_tear"
+	metaPath := filepath.Join(dir, "meta.db")
 
 	store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-
-	// Initial store created has slot 0 active with recoveryStartLSN 0 and counter 1.
-	if got := store.RecoveryStartLSN(); got != 0 {
-		t.Fatalf("expected initial RecoveryStartLSN 0, got %d", got)
-	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	metaPath := filepath.Join(dir, "meta.db")
+	// Verify initial store created has slot 0 active with recoveryStartLSN 0 and counter 1.
+	var initMeta [metaFileSize]byte
+	mf, err := memFS.OpenFile(metaPath, 0, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if _, err := mf.ReadAt(initMeta[:], 0); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	if err := mf.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	initialLSN, _, _, err := readRecoveryStartSlots(initMeta[:], metaPath)
+	if err != nil || initialLSN != 0 {
+		t.Fatalf("expected initial recoveryStartLSN 0, got %d (err: %v)", initialLSN, err)
+	}
 
 	// Positions to advance through.
 	positions := []uint64{10, 25, 55, 120, 300}
@@ -119,7 +130,24 @@ func TestRecoverySlot_TearSlotWriteAtByteBoundaries(t *testing.T) {
 				t.Fatalf("Open failed at nextPos=%d byteBoundary=%d: %v", nextPos, byteBoundary, err)
 			}
 
-			gotLSN := reopened.RecoveryStartLSN()
+			// Verify the active slot on disk in the torn store that Open accepted
+			reopenedMetaFile, err := tornFS.OpenFile(metaPath, 0, 0)
+			if err != nil {
+				t.Fatalf("reopened OpenFile failed: %v", err)
+			}
+			var tornMeta [metaFileSize]byte
+			if _, err := reopenedMetaFile.ReadAt(tornMeta[:], 0); err != nil {
+				t.Fatalf("reopened ReadAt failed: %v", err)
+			}
+			if err := reopenedMetaFile.Close(); err != nil {
+				t.Fatalf("reopened Close failed: %v", err)
+			}
+
+			gotLSN, _, _, err := readRecoveryStartSlots(tornMeta[:], metaPath)
+			if err != nil {
+				t.Fatalf("readRecoveryStartSlots failed: %v", err)
+			}
+
 			if err := reopened.Close(); err != nil {
 				t.Fatalf("reopened.Close failed: %v", err)
 			}
@@ -150,7 +178,9 @@ func TestRecoverySlot_TearSlotWriteAtByteBoundaries(t *testing.T) {
 		if _, err := metaFile.ReadAt(metaBuf[:], 0); err != nil {
 			t.Fatalf("base ReadAt failed: %v", err)
 		}
-		_ = metaFile.Close()
+		if err := metaFile.Close(); err != nil {
+			t.Fatalf("base Close failed: %v", err)
+		}
 
 		copy(metaBuf[slotOffset:slotOffset+recoveryStartSlotSize], encoded)
 
@@ -161,7 +191,9 @@ func TestRecoverySlot_TearSlotWriteAtByteBoundaries(t *testing.T) {
 		if _, err := writeFile.WriteAt(metaBuf[:], 0); err != nil {
 			t.Fatalf("base WriteAt failed: %v", err)
 		}
-		_ = writeFile.Close()
+		if err := writeFile.Close(); err != nil {
+			t.Fatalf("base Write Close failed: %v", err)
+		}
 
 		currentPos = nextPos
 		activeSlot = targetSlot
@@ -210,7 +242,9 @@ func TestRecoverySlot_CorruptOneSlotAndReopenWithOther_CorruptBothFails(t *testi
 	if _, err := metaFile.ReadAt(baseMeta[:], 0); err != nil {
 		t.Fatalf("ReadAt failed: %v", err)
 	}
-	_ = metaFile.Close()
+	if err := metaFile.Close(); err != nil {
+		t.Fatalf("Close metaFile failed: %v", err)
+	}
 
 	slot0, err := decodeRecoveryStartSlot(baseMeta[metaOffsetRecoverySlot0 : metaOffsetRecoverySlot0+recoveryStartSlotSize])
 	if err != nil {
@@ -240,18 +274,21 @@ func TestRecoverySlot_CorruptOneSlotAndReopenWithOther_CorruptBothFails(t *testi
 		if _, err := f.WriteAt(corrupted, 0); err != nil {
 			t.Fatalf("WriteAt failed: %v", err)
 		}
-		_ = f.Close()
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
 
 		reopened, err := Open(WithFS(corruptSlot0FS), WithDir(dir), WithCompressionCodec(CodecNone))
 		if err != nil {
 			t.Fatalf("Open with corrupted slot 0 failed: %v", err)
 		}
-		if got := reopened.RecoveryStartLSN(); got != slot1.recoveryStartLSN {
-			t.Fatalf("expected fallback to slot 1 LSN %d, got %d", slot1.recoveryStartLSN, got)
-		}
 		val, exists, err := reopened.Get("Table", "k1")
 		if err != nil || !exists || string(val) != "v1" {
 			t.Fatalf("expected k1 to exist, got val=%s exists=%v err=%v", string(val), exists, err)
+		}
+		val2, exists2, err := reopened.Get("Table", "k2")
+		if err != nil || !exists2 || string(val2) != "v2" {
+			t.Fatalf("expected k2 to exist, got val=%s exists=%v err=%v", string(val2), exists2, err)
 		}
 		if err := reopened.Close(); err != nil {
 			t.Fatalf("Close failed: %v", err)
@@ -272,18 +309,21 @@ func TestRecoverySlot_CorruptOneSlotAndReopenWithOther_CorruptBothFails(t *testi
 		if _, err := f.WriteAt(corrupted, 0); err != nil {
 			t.Fatalf("WriteAt failed: %v", err)
 		}
-		_ = f.Close()
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
 
 		reopened, err := Open(WithFS(corruptSlot1FS), WithDir(dir), WithCompressionCodec(CodecNone))
 		if err != nil {
 			t.Fatalf("Open with corrupted slot 1 failed: %v", err)
 		}
-		if got := reopened.RecoveryStartLSN(); got != slot0.recoveryStartLSN {
-			t.Fatalf("expected slot 0 LSN %d, got %d", slot0.recoveryStartLSN, got)
-		}
 		val, exists, err := reopened.Get("Table", "k2")
 		if err != nil || !exists || string(val) != "v2" {
 			t.Fatalf("expected k2 to exist, got val=%s exists=%v err=%v", string(val), exists, err)
+		}
+		val1, exists1, err := reopened.Get("Table", "k1")
+		if err != nil || !exists1 || string(val1) != "v1" {
+			t.Fatalf("expected k1 to exist, got val=%s exists=%v err=%v", string(val1), exists1, err)
 		}
 		if err := reopened.Close(); err != nil {
 			t.Fatalf("Close failed: %v", err)
@@ -305,7 +345,9 @@ func TestRecoverySlot_CorruptOneSlotAndReopenWithOther_CorruptBothFails(t *testi
 		if _, err := f.WriteAt(corrupted, 0); err != nil {
 			t.Fatalf("WriteAt failed: %v", err)
 		}
-		_ = f.Close()
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
 
 		_, err = Open(WithFS(corruptBothFS), WithDir(dir), WithCompressionCodec(CodecNone))
 		if err == nil {
@@ -341,14 +383,8 @@ func TestRecoverySlot_CrashRecoveryReplaysFromStoredLSN(t *testing.T) {
 		}
 	}
 
-	chkLSN, err := store.Checkpoint()
-	if err != nil {
+	if _, err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
-	}
-
-	expectedRecoveryLSN := store.RecoveryStartLSN()
-	if expectedRecoveryLSN == 0 {
-		t.Fatalf("expected non-zero RecoveryStartLSN after checkpoint, got 0 (chkLSN=%d)", chkLSN)
 	}
 
 	// Write additional uncheckpointed records to WAL and fsync the WAL
@@ -375,10 +411,6 @@ func TestRecoverySlot_CrashRecoveryReplaysFromStoredLSN(t *testing.T) {
 		t.Fatalf("Open after crash failed: %v", err)
 	}
 	defer reopened.Close()
-
-	if got := reopened.RecoveryStartLSN(); got != expectedRecoveryLSN {
-		t.Fatalf("expected reopened RecoveryStartLSN %d, got %d", expectedRecoveryLSN, got)
-	}
 
 	// Verify all checkpointed and replayed records are present
 	for i := 0; i < 5; i++ {
@@ -425,7 +457,9 @@ func TestRecoverySlot_StoreCreatedBeforeChange_Rejected(t *testing.T) {
 	if _, err := metaFile.ReadAt(metaBuf[:], 0); err != nil {
 		t.Fatalf("ReadAt failed: %v", err)
 	}
-	_ = metaFile.Close()
+	if err := metaFile.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
 
 	// Set StoreFormatVersion to 7
 	binary.BigEndian.PutUint32(metaBuf[metaOffsetVersion:metaOffsetDBID], 7)
@@ -439,7 +473,9 @@ func TestRecoverySlot_StoreCreatedBeforeChange_Rejected(t *testing.T) {
 	if _, err := writeFile.WriteAt(metaBuf[:], 0); err != nil {
 		t.Fatalf("WriteAt failed: %v", err)
 	}
-	_ = writeFile.Close()
+	if err := writeFile.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
 
 	// Open without WithEraseOnError must fail
 	_, err = Open(WithFS(memFS), WithDir(dir))

@@ -303,9 +303,6 @@ type Engine struct {
 	bp       *BlockPool
 	cp       *Checkpointer
 
-	// recoveryStartLSN is the start LSN for recovery read from meta.db at Open.
-	recoveryStartLSN uint64
-
 	writerMu sync.RWMutex // Single writer: serializes Put, Delete; RLock for point-in-time Scan/List
 
 	keyMu    sync.RWMutex
@@ -454,12 +451,18 @@ const (
 
 // recoveryStartSlot represents one of the two alternating slots in meta.db
 // storing the LSN from which recovery must start replay.
-// Each slot holds the LSN, an incrementing counter, and a CRC32C over the slot.
+// Each slot holds the LSN, an incrementing write counter that identifies the newer slot,
+// and a CRC32C over the slot.
+//
+// Both recovery start slots and the header sit within the first 4 KiB block of meta.db.
+// The invariant that a crash damages only the slot being written relies on the assumption
+// that the underlying storage device writes a disk sector (512 bytes or 4 KiB) as an atomic unit,
+// ensuring a torn write to one 20-byte slot cannot corrupt the other slot.
 type recoveryStartSlot struct {
 	// recoveryStartLSN is the LSN from which recovery must start replay.
 	recoveryStartLSN uint64
 
-	// counter is the incrementing generation counter for the slot.
+	// counter is the monotonically incrementing write counter used to identify the newer slot.
 	counter uint64
 
 	// crc is the Castagnoli CRC32C checksum over the 16 bytes of recoveryStartLSN and counter.
@@ -981,7 +984,6 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		quarantine:       options.Quarantine,
 		metaFile:         sMetaFile,
 		heapFile:         heapFile,
-		recoveryStartLSN: recoveryStartLSN,
 		keyIndex:         make(map[string]KeyIndexEntry),
 		inFlightOversize: make(map[string]int),
 		emptyPages:       newEmptyPageTracker(nil),
@@ -1028,7 +1030,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 			HeapCipher:    heapCipher,
 		})
 		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile)
-		s.cp.initRecoverySlot(0, 1, 0)
+		s.cp.initRecoverySlot(0, 1)
 	} else {
 		// Existing store: perform crash recovery scan and WAL redo replay
 		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID, RecoveryOptions{
@@ -1087,7 +1089,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile)
-		s.cp.initRecoverySlot(activeSlot, slotCounter, recoveryStartLSN)
+		s.cp.initRecoverySlot(activeSlot, slotCounter)
 
 		// Replay WAL records from redo start LSN through write path apply functions.
 		if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.SupersededPages); err != nil {
@@ -1322,14 +1324,6 @@ func (s *Engine) Wiped() bool {
 // DBID returns the store's unique database ID.
 func (s *Engine) DBID() [16]byte {
 	return s.dbID
-}
-
-// RecoveryStartLSN returns the recovery start LSN stored in meta.db.
-func (s *Engine) RecoveryStartLSN() uint64 {
-	if s.cp != nil {
-		return s.cp.RecoveryStartLSN()
-	}
-	return s.recoveryStartLSN
 }
 
 // Cipher returns the configured cipher.
