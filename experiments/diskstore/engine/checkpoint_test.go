@@ -265,12 +265,41 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 
 		checkpointer := NewCheckpointer(bp, heapFile, wal)
 
-		r1, err := buddy.Allocate(0)
+		// Allocate and flush page 1 to disk
+		if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")}); err != nil {
+			t.Fatalf("Append failed: %v", err)
+		}
+		if err := wal.SyncThrough(10); err != nil {
+			t.Fatalf("SyncThrough failed: %v", err)
+		}
+		h1, err := bp.AllocateNewPage(1, 1, 10)
 		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
+			t.Fatalf("AllocateNewPage failed: %v", err)
+		}
+		copy(h1.Block(0)[BlockHeaderSize:], []byte("v1"))
+		h1.Unpin()
+		if err := bp.FlushPage(1); err != nil {
+			t.Fatalf("first FlushPage failed: %v", err)
+		}
+		bp.mu.Lock()
+		r1 := bp.pageTable[1].PhysicalBlock
+		bp.mu.Unlock()
+
+		if _, err := checkpointer.Checkpoint(); err != nil {
+			t.Fatalf("initial Checkpoint failed: %v", err)
 		}
 
-		bp.deferFree(blockRun{block: r1})
+		// Dirty and flush page 1 again: supersedes and defers r1
+		if err := wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k", Payload: []byte("v2")}); err != nil {
+			t.Fatalf("Append failed: %v", err)
+		}
+		if err := wal.SyncThrough(20); err != nil {
+			t.Fatalf("SyncThrough failed: %v", err)
+		}
+		bp.MarkDirty(1, 20)
+		if err := bp.FlushPage(1); err != nil {
+			t.Fatalf("second FlushPage failed: %v", err)
+		}
 
 		// Checkpoint calls startHeapSync, Sync, and heapSyncSucceeded
 		if _, err := checkpointer.Checkpoint(); err != nil {
@@ -307,12 +336,41 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 
 		checkpointer := NewCheckpointer(bp, heapFile, wal)
 
-		r1, err := buddy.Allocate(0)
+		// Allocate and flush page 1 to disk
+		if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")}); err != nil {
+			t.Fatalf("Append failed: %v", err)
+		}
+		if err := wal.SyncThrough(10); err != nil {
+			t.Fatalf("SyncThrough failed: %v", err)
+		}
+		h1, err := bp.AllocateNewPage(1, 1, 10)
 		if err != nil {
-			t.Fatalf("Allocate failed: %v", err)
+			t.Fatalf("AllocateNewPage failed: %v", err)
+		}
+		copy(h1.Block(0)[BlockHeaderSize:], []byte("v1"))
+		h1.Unpin()
+		if err := bp.FlushPage(1); err != nil {
+			t.Fatalf("first FlushPage failed: %v", err)
+		}
+		bp.mu.Lock()
+		r1 := bp.pageTable[1].PhysicalBlock
+		bp.mu.Unlock()
+
+		if _, err := checkpointer.Checkpoint(); err != nil {
+			t.Fatalf("initial Checkpoint failed: %v", err)
 		}
 
-		bp.deferFree(blockRun{block: r1})
+		// Dirty and flush page 1 again: supersedes and defers r1
+		if err := wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k", Payload: []byte("v2")}); err != nil {
+			t.Fatalf("Append failed: %v", err)
+		}
+		if err := wal.SyncThrough(20); err != nil {
+			t.Fatalf("SyncThrough failed: %v", err)
+		}
+		bp.MarkDirty(1, 20)
+		if err := bp.FlushPage(1); err != nil {
+			t.Fatalf("second FlushPage failed: %v", err)
+		}
 
 		// Fail only the heap file's sync
 		heapSyncFailedOnce := false
@@ -663,5 +721,232 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 	}
 	if exists {
 		t.Fatalf("expected deleted mb1 to not exist after recovery")
+	}
+}
+
+// TestCheckpointer_DeterministicDeferredFreesSequence verifies the deterministic sequence:
+// 1. Flush a page and checkpoint.
+// 2. Dirty it.
+// 3. Start a heap fsync.
+// 4. Flush the page while the fsync runs.
+// 5. Complete the fsync.
+// 6. Dirty and flush the page again.
+// 7. Allocate and flush another page.
+// Assert: No write lands on a block that holds a newest durable copy.
+func TestCheckpointer_DeterministicDeferredFreesSequence(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	faultFS.SetAssertReuseRule(true)
+	storeDir := "test_deterministic_deferred_frees"
+
+	store, err := Open(WithFS(faultFS), WithDir(storeDir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Flush a page and checkpoint
+	if err := store.Put("table", "k1", []byte("val_v1")); err != nil {
+		t.Fatalf("initial Put failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("initial Checkpoint failed: %v", err)
+	}
+
+	store.keyMu.RLock()
+	entry, exists := store.keyIndex[qualifyKey("table", "k1")]
+	store.keyMu.RUnlock()
+	if !exists {
+		t.Fatalf("expected k1 in index")
+	}
+	pageID := entry.LogicalPage
+
+	store.bp.mu.Lock()
+	durableLoc0 := store.bp.pageTable[pageID].DurableLoc
+	store.bp.mu.Unlock()
+	if durableLoc0 == NoBlock {
+		t.Fatalf("expected page %d to have a durable location after checkpoint", pageID)
+	}
+
+	// 2. Dirty it
+	if err := store.Put("table", "k1", []byte("val_v2")); err != nil {
+		t.Fatalf("second Put failed: %v", err)
+	}
+
+	// 3. Start a heap fsync
+	store.bp.SnapshotFlushedForSync()
+	store.bp.startHeapSync()
+
+	// 4. Flush the page while the fsync runs
+	if err := store.bp.FlushPage(pageID); err != nil {
+		t.Fatalf("FlushPage during fsync failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	loc1 := store.bp.pageTable[pageID].PhysicalBlock
+	store.bp.mu.Unlock()
+	if loc1 == durableLoc0 {
+		t.Fatalf("flush of page %d should write to new location, got same %d", pageID, loc1)
+	}
+
+	// 5. Complete the fsync
+	if err := store.heapFile.Sync(); err != nil {
+		store.bp.heapSyncFailed()
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := store.bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("heapSyncSucceeded failed: %v", err)
+	}
+	if err := store.bp.PromoteFlushedToDurable(); err != nil {
+		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	}
+
+	// Verify durableLoc0 is NOT freed because it was superseded after startHeapSync was called
+	store.bp.mu.Lock()
+	_, dur0Allocated := store.bp.buddy.allocated[durableLoc0]
+	store.bp.mu.Unlock()
+	if !dur0Allocated {
+		t.Fatalf("durableLoc0 %d was prematurely freed in allocator", durableLoc0)
+	}
+
+	// 6. Dirty and flush the page again
+	if err := store.Put("table", "k1", []byte("val_v3")); err != nil {
+		t.Fatalf("third Put failed: %v", err)
+	}
+	if err := store.bp.FlushPage(pageID); err != nil {
+		t.Fatalf("FlushPage after fsync failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	loc2 := store.bp.pageTable[pageID].PhysicalBlock
+	store.bp.mu.Unlock()
+	if loc2 == durableLoc0 || loc2 == loc1 {
+		t.Fatalf("third flush should write to new location, got %d", loc2)
+	}
+
+	// 7. Allocate and flush another page
+	const page2ID = 999
+	lsn2 := store.wal.NextLSN()
+	if err := store.wal.Append(Record{Type: RecordTypePut, LSN: lsn2, Key: "k999", Payload: []byte("page-999-content")}); err != nil {
+		t.Fatalf("Append WAL record for page 999 failed: %v", err)
+	}
+	if err := store.wal.SyncThrough(lsn2); err != nil {
+		t.Fatalf("SyncThrough WAL failed: %v", err)
+	}
+	h2, err := store.bp.AllocateNewPage(page2ID, 1, lsn2)
+	if err != nil {
+		t.Fatalf("AllocateNewPage 999 failed: %v", err)
+	}
+	copy(h2.Block(0)[BlockHeaderSize:], []byte("page-999-content"))
+	h2.Unpin()
+
+	// Under Reuse Rule, the write of page 999 must NOT land on durableLoc0
+	if err := store.bp.FlushPage(page2ID); err != nil {
+		t.Fatalf("FlushPage 999 failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	page2Loc := store.bp.pageTable[page2ID].PhysicalBlock
+	store.bp.mu.Unlock()
+
+	// 8. Assert: No write lands on a block that holds a newest durable copy
+	if page2Loc == durableLoc0 {
+		t.Fatalf("reuse rule violation: page 999 write landed on block %d holding newest durable copy of page %d",
+			page2Loc, pageID)
+	}
+	if page2Loc == loc1 {
+		t.Fatalf("reuse rule violation: page 999 write landed on block %d which was not yet durable", page2Loc)
+	}
+
+	// Verify durableLoc0 remains allocated in buddy allocator
+	store.bp.mu.Lock()
+	_, dur0StillAllocated := store.bp.buddy.allocated[durableLoc0]
+	store.bp.mu.Unlock()
+	if !dur0StillAllocated {
+		t.Fatalf("durableLoc0 %d was freed before replacement became durable", durableLoc0)
+	}
+
+	// 9. Now run a full checkpoint; fsync will make loc2 durable and release durableLoc0 and loc1
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("final Checkpoint failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	_, dur0After := store.bp.buddy.allocated[durableLoc0]
+	_, loc1After := store.bp.buddy.allocated[loc1]
+	store.bp.mu.Unlock()
+	if dur0After {
+		t.Fatalf("durableLoc0 %d should be freed after final checkpoint", durableLoc0)
+	}
+	if loc1After {
+		t.Fatalf("loc1 %d should be freed after final checkpoint", loc1)
+	}
+}
+
+// TestCheckpointer_PageDeletionDefersOldLocation tests that deleting all records from a page
+// writes an empty slotted page whose flush defers the prior on-disk location.
+func TestCheckpointer_PageDeletionDefersOldLocation(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	storeDir := "test_deletion_defers"
+
+	store, err := Open(WithFS(faultFS), WithDir(storeDir), WithCompressionCodec(CodecNone), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.Put("table", "k1", []byte("val_v1")); err != nil {
+		t.Fatalf("Put k1 failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+
+	store.keyMu.RLock()
+	pageID := store.keyIndex[qualifyKey("table", "k1")].LogicalPage
+	store.keyMu.RUnlock()
+
+	store.bp.mu.Lock()
+	loc1 := store.bp.pageTable[pageID].PhysicalBlock
+	store.bp.mu.Unlock()
+
+	// Delete k1: slotted page becomes empty and dirty
+	if err := store.Delete("table", "k1"); err != nil {
+		t.Fatalf("Delete k1 failed: %v", err)
+	}
+
+	// Flush dirty pages: writes empty slotted page to a new block and defers loc1
+	if err := store.bp.FlushAllDirty(); err != nil {
+		t.Fatalf("FlushAllDirty failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	loc2 := store.bp.pageTable[pageID].PhysicalBlock
+	deferredCount := 0
+	for _, run := range store.bp.deferredFreesUnsynced {
+		if run.block == loc1 {
+			deferredCount++
+		}
+	}
+	store.bp.mu.Unlock()
+
+	if loc2 == loc1 {
+		t.Fatalf("empty page should be written out-of-place to new block, got %d", loc2)
+	}
+	if deferredCount != 1 {
+		t.Fatalf("expected old location %d to be deferred exactly once, got %d", loc1, deferredCount)
+	}
+
+	// Checkpoint fsyncs the empty page and frees loc1
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("final Checkpoint failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	_, loc1Allocated := store.bp.buddy.allocated[loc1]
+	store.bp.mu.Unlock()
+	if loc1Allocated {
+		t.Fatalf("old location %d should be freed after checkpoint", loc1)
 	}
 }

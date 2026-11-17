@@ -17,6 +17,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -86,7 +87,15 @@ type PageDesc struct {
 	PhysicalBlock     uint64 // currently known disk location
 	FlushedLoc        uint64 // location written since last heap fsync
 	FlushedBeforeSync uint64 // location written before current heap fsync started
-	DurableLoc        uint64 // location confirmed durable by heap fsync
+
+	// DurableLoc can name a freed block while FlushedLoc is set. The engine uses
+	// DurableLoc only when FlushedLoc and PhysicalBlock are NoBlock, and in that state
+	// DurableLoc names the page's newest copy. The next step removes the field.
+	DurableLoc uint64
+
+	// Blocks that held earlier contents of this page and have not been deferred yet.
+	// The flush of the new contents defers them.
+	replacedBlocks []uint64
 
 	InFlight bool // true when a direct I/O flush is active for this page
 
@@ -477,11 +486,25 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 	var oldFlushedLoc uint64 = NoBlock
 	var oldRedoLSN uint64
 	var oldDirtyLSN uint64
+	var replacedBlocks []uint64
 
 	if oldDescriptor := bp.pageTable[logicalPage]; oldDescriptor != nil {
 		if len(oldDescriptor.PoolBlocks) > 0 {
 			bp.freePoolBlocks = append(bp.freePoolBlocks, oldDescriptor.PoolBlocks...)
 			oldDescriptor.PoolBlocks = nil
+		}
+
+		replacedBlocks = append(replacedBlocks, oldDescriptor.replacedBlocks...)
+		var carriedBlock uint64 = NoBlock
+		if oldDescriptor.FlushedLoc != NoBlock {
+			carriedBlock = oldDescriptor.FlushedLoc
+		} else if oldDescriptor.DurableLoc != NoBlock {
+			carriedBlock = oldDescriptor.DurableLoc
+		} else if oldDescriptor.PhysicalBlock != NoBlock {
+			carriedBlock = oldDescriptor.PhysicalBlock
+		}
+		if carriedBlock != NoBlock && !slices.Contains(replacedBlocks, carriedBlock) {
+			replacedBlocks = append(replacedBlocks, carriedBlock)
 		}
 
 		// Defer freeing the old durable location until the new copy is promoted to durable,
@@ -498,6 +521,7 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 		oldDescriptor.FlushedBeforeSync = NoBlock
 		oldDescriptor.FlushedLoc = NoBlock
 		oldDescriptor.PhysicalBlock = NoBlock
+		oldDescriptor.replacedBlocks = nil
 	}
 
 	redoLSN := lsn
@@ -524,6 +548,7 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 		FlushedLoc:        oldFlushedLoc,
 		FlushedBeforeSync: oldFlushedBeforeSync,
 		DurableLoc:        oldDurableLoc,
+		replacedBlocks:    replacedBlocks,
 	}
 	desc.PageLSN.Store(lsn)
 	desc.PinCount.Store(1)
@@ -546,7 +571,10 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 	return &PageHandle{pool: bp, Desc: desc}, nil
 }
 
-// FreePage releases the pool blocks and disk locations for a discarded or cleared logical page.
+// FreePage releases pool blocks and unregisters the logical page from the page table.
+// It does not defer on-disk blocks because no replacement write has occurred; under
+// Invariant 5 (Retention of Logical Page Numbers), discarded or emptied pages are retired
+// by writing an empty page or tombstone whose flush defers the prior on-disk location.
 func (bp *BlockPool) FreePage(logicalPage uint64) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
@@ -561,24 +589,10 @@ func (bp *BlockPool) FreePage(logicalPage uint64) {
 				bp.freePoolBlocks = append(bp.freePoolBlocks, desc.PoolBlocks...)
 				desc.PoolBlocks = nil
 			}
-			if desc.DurableLoc != NoBlock {
-				if err := bp.buddy.Free(desc.DurableLoc); err != nil && bp.onFailure != nil {
-					bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free durable block %d: %w", desc.DurableLoc, err))
-				}
-				desc.DurableLoc = NoBlock
-			}
-			if desc.FlushedLoc != NoBlock && desc.FlushedLoc != desc.DurableLoc {
-				if err := bp.buddy.Free(desc.FlushedLoc); err != nil && bp.onFailure != nil {
-					bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free flushed block %d: %w", desc.FlushedLoc, err))
-				}
-				desc.FlushedLoc = NoBlock
-			}
-			if desc.PhysicalBlock != NoBlock && desc.PhysicalBlock != desc.DurableLoc && desc.PhysicalBlock != desc.FlushedLoc {
-				if err := bp.buddy.Free(desc.PhysicalBlock); err != nil && bp.onFailure != nil {
-					bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free physical block %d: %w", desc.PhysicalBlock, err))
-				}
-				desc.PhysicalBlock = NoBlock
-			}
+			desc.replacedBlocks = nil
+			desc.FlushedLoc = NoBlock
+			desc.DurableLoc = NoBlock
+			desc.PhysicalBlock = NoBlock
 			delete(bp.pageTable, logicalPage)
 			return
 		}
@@ -889,18 +903,28 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 		return flushErr
 	}
 
-	// Update page locations and free superseded flushed locations
+	// Update page locations and defer superseded locations
 	for i, desc := range chunk {
 		newLoc := locs[i]
 		oldFlushed := desc.FlushedLoc
 		desc.FlushedLoc = newLoc
 		desc.PhysicalBlock = newLoc
 
-		if oldFlushed != NoBlock && oldFlushed != desc.DurableLoc && oldFlushed != desc.FlushedBeforeSync {
-			if err := bp.buddy.Free(oldFlushed); err != nil && bp.onFailure != nil {
-				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free superseded flushed block %d: %w", oldFlushed, err))
+		if len(desc.replacedBlocks) > 0 {
+			for _, replacedBlock := range desc.replacedBlocks {
+				if replacedBlock != NoBlock {
+					bp.deferFreeLocked(blockRun{block: replacedBlock})
+				}
+			}
+			desc.replacedBlocks = nil
+		} else {
+			if oldFlushed != NoBlock {
+				bp.deferFreeLocked(blockRun{block: oldFlushed})
+			} else if desc.DurableLoc != NoBlock {
+				bp.deferFreeLocked(blockRun{block: desc.DurableLoc})
 			}
 		}
+
 		if desc.PageLSN.Load() == pageLSNs[i] {
 			desc.Dirty = false
 			desc.DirtyLSN = 0
@@ -950,20 +974,12 @@ func (bp *BlockPool) SnapshotFlushedForSync() {
 }
 
 // PromoteFlushedToDurable promotes only locations that were flushed before the heap fsync began.
-// Frees any superseded durable locations to the buddy allocator according to the Reuse Rule.
 func (bp *BlockPool) PromoteFlushedToDurable() error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
-	var errs []error
 	for _, desc := range bp.pageTable {
 		if desc.FlushedBeforeSync != NoBlock {
-			if desc.DurableLoc != NoBlock && desc.DurableLoc != desc.FlushedBeforeSync {
-				// Old durable copy is now superseded and can be safely reused
-				if err := bp.buddy.Free(desc.DurableLoc); err != nil {
-					errs = append(errs, fmt.Errorf("page %d DurableLoc=%d (FlushedBeforeSync=%d): %w", desc.LogicalPage, desc.DurableLoc, desc.FlushedBeforeSync, err))
-				}
-			}
 			desc.DurableLoc = desc.FlushedBeforeSync
 			if desc.FlushedLoc == desc.FlushedBeforeSync {
 				desc.FlushedLoc = NoBlock
@@ -971,18 +987,16 @@ func (bp *BlockPool) PromoteFlushedToDurable() error {
 			desc.FlushedBeforeSync = NoBlock
 		}
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
-// deferFree queues run to be freed after a future heap fsync confirms its newer copy is durable.
-func (bp *BlockPool) deferFree(run blockRun) {
-	bp.mu.Lock()
-	defer bp.mu.Unlock()
+// deferFreeLocked appends run to deferredFreesUnsynced.
+func (bp *BlockPool) deferFreeLocked(run blockRun) {
+	if run.block == NoBlock {
+		return
+	}
 	bp.deferredFreesUnsynced = append(bp.deferredFreesUnsynced, run)
 }
-
-// The next step calls deferFree from the free sites and removes this line.
-var _ = (*BlockPool).deferFree
 
 // startHeapSync rotates deferredFreesUnsynced into deferredFreesSyncing,
 // and flushedPagesUnsynced into flushedPagesSyncing at the start of a heap fsync.

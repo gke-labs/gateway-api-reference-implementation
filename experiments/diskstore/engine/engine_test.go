@@ -2543,7 +2543,9 @@ func TestEngine_DeferredFreeFailureTransitionsToFailedState(t *testing.T) {
 	defer store.Close()
 
 	// Queue an unallocated block, which causes buddy.Free to fail during heapSyncSucceeded
-	store.bp.deferFree(blockRun{block: 99999})
+	store.bp.mu.Lock()
+	store.bp.deferredFreesUnsynced = append(store.bp.deferredFreesUnsynced, blockRun{block: 99999})
+	store.bp.mu.Unlock()
 
 	// Checkpoint triggers startHeapSync, heap fsync, and heapSyncSucceeded
 	_, cpErr := store.Checkpoint()
