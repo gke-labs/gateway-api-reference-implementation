@@ -225,10 +225,10 @@ type AddressProvider struct {
 	enableH2C      bool
 	// useHostPorts indicates whether the data-plane Deployment maps listener ports
 	// to host ports directly instead of provisioning a LoadBalancer Service.
-	useHostPorts                  bool
+	useHostPorts bool
 	// noService indicates whether the provider skips creating and reconciling a
 	// Service for the Gateway.
-	noService                     bool
+	noService bool
 	// deploymentMutator is an optional function called immediately before the
 	// Deployment apply configuration is applied to the API server.
 	deploymentMutator             DeploymentMutator
