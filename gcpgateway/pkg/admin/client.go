@@ -83,11 +83,6 @@ func NewGCEAdminClient(ctx context.Context) (*GCEAdminClient, error) {
 	return &GCEAdminClient{svc: svc}, nil
 }
 
-// NewGCEAdminClientWithService creates a GCEAdminClient with an existing compute.Service.
-func NewGCEAdminClientWithService(svc *compute.Service) *GCEAdminClient {
-	return &GCEAdminClient{svc: svc}
-}
-
 func isNotFound(err error) bool {
 	var gErr *googleapi.Error
 	return errors.As(err, &gErr) && gErr.Code == 404
