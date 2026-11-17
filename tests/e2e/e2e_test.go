@@ -44,8 +44,13 @@ func TestGatewayAPI(t *testing.T) {
 	// 1. Install Gateway API CRDs
 	h.InstallGatewayAPI(gatewayconsts.BundleVersion)
 
-	// 2. Deploy Controller
+	// 2. Deploy Controller (runs the push credentials Job)
 	h.DeployController()
+
+	// Verify push credentials Job created the expected Secret and ConfigMap objects
+	h.RunCmd("kubectl", "get", "secret", "gari-controller-push-ca-key", "--namespace=default")
+	h.RunCmd("kubectl", "get", "configmap", "gari-controller-push-ca", "--namespace=default")
+	h.RunCmd("kubectl", "get", "secret", "gari-controller-push-cert", "--namespace=default")
 
 	// 3. Deploy Backend (Toolbox Server)
 	h.DeployBackend()
