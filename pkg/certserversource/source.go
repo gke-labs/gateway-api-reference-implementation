@@ -143,20 +143,6 @@ func WithEvictionPeriod(d time.Duration) SourceOption {
 	}
 }
 
-// WithRenewalWindow overrides the window before expiry when background refresh begins.
-func WithRenewalWindow(d time.Duration) SourceOption {
-	return func(s *Source) {
-		s.renewalWindow = d
-	}
-}
-
-// WithClusterID sets the cluster ID sent to certserver.
-func WithClusterID(id string) SourceOption {
-	return func(s *Source) {
-		s.clusterID = id
-	}
-}
-
 // WithTimeNow overrides time.Now for deterministic testing.
 func WithTimeNow(nowFn func() time.Time) SourceOption {
 	return func(s *Source) {

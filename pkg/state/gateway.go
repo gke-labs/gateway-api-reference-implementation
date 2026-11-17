@@ -172,11 +172,6 @@ func (l *InternalListener) SelectTLSBackendWithRand(sni string, r *rand.Rand) (I
 	return PickTLSBackendWithRand(backends, r)
 }
 
-// PickTLSBackend selects an InternalTLSBackend from a slice of InternalTLSBackend based on weight.
-func PickTLSBackend(backends []InternalTLSBackend) (InternalTLSBackend, bool) {
-	return PickTLSBackendWithRand(backends, nil)
-}
-
 // PickTLSBackendWithRand selects an InternalTLSBackend from a slice of InternalTLSBackend based on weight using the provided RNG.
 func PickTLSBackendWithRand(backends []InternalTLSBackend, r *rand.Rand) (InternalTLSBackend, bool) {
 	if len(backends) == 0 {

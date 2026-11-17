@@ -194,21 +194,6 @@ func MergeConditions(conditions *[]metav1.Condition, desired []metav1.Condition,
 	return changed
 }
 
-// RemoveCondition removes a condition of the specified type from conditions.
-// It returns true if a condition was removed.
-func RemoveCondition(conditions *[]metav1.Condition, condType string) bool {
-	if conditions == nil {
-		return false
-	}
-	for i, c := range *conditions {
-		if c.Type == condType {
-			*conditions = append((*conditions)[:i], (*conditions)[i+1:]...)
-			return true
-		}
-	}
-	return false
-}
-
 // FindCondition searches a slice of conditions for a condition with the specified type.
 func FindCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
 	for i := range conditions {
