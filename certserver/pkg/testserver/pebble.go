@@ -81,8 +81,9 @@ type Server struct {
 func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 	t.Helper()
 
-	// Disable VA validation sleeps for instant testing
+	// Disable VA validation sleeps and bad nonce rejections for instant testing
 	t.Setenv("PEBBLE_VA_NOSLEEP", "1")
+	t.Setenv("PEBBLE_WFE_NONCEREJECT", "0")
 
 	// 1. Start Challenge HTTP server
 	challengeStore := cfg.ChallengeStore
@@ -205,10 +206,15 @@ func (s *Server) Close() {
 	s.closed = true
 
 	if s.pebbleServer != nil {
+		s.pebbleServer.CloseClientConnections()
 		s.pebbleServer.Close()
 	}
 	if s.ChallengeServer != nil {
+		s.ChallengeServer.CloseClientConnections()
 		s.ChallengeServer.Close()
+	}
+	if s.HTTPClient != nil {
+		s.HTTPClient.CloseIdleConnections()
 	}
 	if s.dnsServer != nil {
 		if err := s.dnsServer.Shutdown(); err != nil {
