@@ -166,7 +166,7 @@ func WithNoService() Option {
 
 // DeploymentMutator is a function called immediately before a data-plane
 // Deployment apply configuration is applied to the API server.
-type DeploymentMutator func(deploy *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error
+type DeploymentMutator func(deployment *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error
 
 // WithDeploymentMutator configures a function called immediately before the
 // data-plane Deployment apply configuration is applied to the API server.
@@ -175,9 +175,9 @@ type DeploymentMutator func(deploy *appsv1ac.DeploymentApplyConfiguration, gw *g
 // and the error is returned to the caller. It is intended for callers that need
 // to customize data-plane pod specs, container configurations, or deployment
 // strategies beyond singlepod defaults.
-func WithDeploymentMutator(fn DeploymentMutator) Option {
+func WithDeploymentMutator(mutator DeploymentMutator) Option {
 	return func(p *AddressProvider) {
-		p.deploymentMutator = fn
+		p.deploymentMutator = mutator
 	}
 }
 
@@ -226,7 +226,11 @@ type AddressProvider struct {
 	// useHostPorts indicates whether the data-plane Deployment maps listener ports
 	// to host ports directly instead of provisioning a LoadBalancer Service.
 	useHostPorts                  bool
+	// noService indicates whether the provider skips creating and reconciling a
+	// Service for the Gateway.
 	noService                     bool
+	// deploymentMutator is an optional function called immediately before the
+	// Deployment apply configuration is applied to the API server.
 	deploymentMutator             DeploymentMutator
 	forwardedForMode              string
 	debugErrorResponses           bool

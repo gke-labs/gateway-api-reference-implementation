@@ -5112,13 +5112,13 @@ func TestSinglePodAddressProvider_WithDeploymentMutator(t *testing.T) {
 	var passedListeners []*state.EffectiveListener
 	mutatorCalled := false
 
-	mutator := func(deploy *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error {
+	mutator := func(deployment *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error {
 		mutatorCalled = true
 		passedGw = gw
 		passedListeners = effectiveListeners
 
 		// Change rollout strategy to RollingUpdate with maxSurge: 0, maxUnavailable: 1
-		deploy.Spec.WithStrategy(appsv1ac.DeploymentStrategy().
+		deployment.Spec.WithStrategy(appsv1ac.DeploymentStrategy().
 			WithType(appsv1.RollingUpdateDeploymentStrategyType).
 			WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
 				WithMaxSurge(intstr.FromInt32(0)).
@@ -5127,7 +5127,7 @@ func TestSinglePodAddressProvider_WithDeploymentMutator(t *testing.T) {
 		)
 
 		// Add custom container port
-		deploy.Spec.Template.Spec.Containers[0].WithPorts(
+		deployment.Spec.Template.Spec.Containers[0].WithPorts(
 			corev1ac.ContainerPort().
 				WithName("custom-port").
 				WithContainerPort(9090).
@@ -5217,7 +5217,7 @@ func TestSinglePodAddressProvider_WithDeploymentMutator_Error(t *testing.T) {
 	ctx := t.Context()
 
 	expectedErr := errors.New("boom: mutator failed")
-	mutator := func(deploy *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error {
+	mutator := func(deployment *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error {
 		return expectedErr
 	}
 
