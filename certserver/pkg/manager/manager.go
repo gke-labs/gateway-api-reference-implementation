@@ -576,6 +576,12 @@ func (m *Manager) issueCertificate(ctx context.Context, normalized []string, hos
 	return cert, nil
 }
 
+// RevokeAuthorizationTimeout is the time limit for deactivating authorizations of an ACME order.
+// 5 seconds provides sufficient time for the ACME server to process the deactivation request over
+// typical network round trips, while bounding delay for callers waiting on failed orders and preventing
+// goroutines from hanging indefinitely if the ACME server is unresponsive.
+const RevokeAuthorizationTimeout = 5 * time.Second
+
 func (m *Manager) executeACMEOrder(ctx context.Context, normalized []string, hostnamesKey string, req challenge.Requester, candidates []challenge.Requester) (*cache.Certificate, error) {
 	// Ensure ACME account is registered
 	if _, err := m.client.EnsureAccount(ctx); err != nil {
@@ -591,8 +597,10 @@ func (m *Manager) executeACMEOrder(ctx context.Context, normalized []string, hos
 	authzURLs := append([]string(nil), order.AuthzURLs...)
 	// Ensure authorizations are relinquished so subsequent orders must prove fresh domain control
 	defer func() {
+		revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), RevokeAuthorizationTimeout)
+		defer cancel()
 		for _, authzURL := range authzURLs {
-			if revokeErr := m.client.RevokeAuthorization(context.WithoutCancel(ctx), authzURL); revokeErr != nil {
+			if revokeErr := m.client.RevokeAuthorization(revokeCtx, authzURL); revokeErr != nil {
 				log.Printf("certserver: failed to revoke authorization %s: %v", authzURL, revokeErr)
 			}
 		}
