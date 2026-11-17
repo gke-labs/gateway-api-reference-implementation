@@ -25,6 +25,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -221,6 +222,14 @@ type Options struct {
 	// In this mode, the instance watches only its per-Gateway configuration Secret
 	// and applies updates directly to the proxy, without running state computation.
 	DataplaneMode bool
+
+	// InitPushCredentials runs in push credentials initialization mode, ensuring TLS credentials
+	// for the configuration push listener exist in PushCredentialsNamespace, then exits.
+	InitPushCredentials bool
+
+	// PushCredentialsNamespace is the namespace in which push credentials are created or renewed.
+	// If empty, defaults to POD_NAMESPACE or in-cluster namespace or "default".
+	PushCredentialsNamespace string
 
 	// DataplaneGatewayNamespace is the namespace of the Gateway in DataplaneMode.
 	DataplaneGatewayNamespace string
@@ -1215,6 +1224,44 @@ func (s *Server) Start(ctx context.Context) error {
 
 // Run creates a new Server with opts and runs it until ctx is canceled.
 func Run(ctx context.Context, opts Options) error {
+	if opts.InitPushCredentials {
+		restConfig := opts.RestConfig
+		if restConfig == nil {
+			var err error
+			restConfig, err = ctrl.GetConfig()
+			if err != nil {
+				return fmt.Errorf("getting kubeconfig for push credentials: %w", err)
+			}
+		}
+		namespace := opts.PushCredentialsNamespace
+		if namespace == "" {
+			namespace = os.Getenv("POD_NAMESPACE")
+		}
+		if namespace == "" {
+			data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+			if err == nil {
+				namespace = strings.TrimSpace(string(data))
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("reading serviceaccount namespace: %w", err)
+			}
+		}
+		if namespace == "" {
+			return errors.New("push credentials namespace is required: specify --push-credentials-namespace, set POD_NAMESPACE, or run in-cluster with a ServiceAccount")
+		}
+		scheme := opts.Scheme
+		if scheme == nil {
+			scheme = runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				return fmt.Errorf("adding corev1 to scheme: %w", err)
+			}
+		}
+		kubeClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+		if err != nil {
+			return fmt.Errorf("creating client for push credentials: %w", err)
+		}
+		return push.EnsurePushCredentials(ctx, kubeClient, namespace)
+	}
+
 	s, err := New(opts)
 	if err != nil {
 		return err

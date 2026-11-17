@@ -72,6 +72,105 @@ metadata:
 spec:
   controllerName: github.com/gke-labs/gateway-api-reference-implementation
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gari-controller-push-credentials
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gari-controller-push-credentials
+  namespace: default
+rules:
+# Read, update, and patch verbs are restricted by resourceNames to the two push TLS Secrets.
+# Kubernetes RBAC cannot limit 'create' operations by resource name because the resource name
+# is assigned upon creation. Therefore, the create rule permits creating any Secret in this
+# namespace beyond these two names, while read and update access remains restricted to
+# gari-controller-push-ca-key and gari-controller-push-cert.
+# Note on authority key access: only the Job is intended to read the CA private key Secret
+# (gari-controller-push-ca-key). However, the controller's ClusterRole above currently grants
+# get/list/watch on all Secrets cluster-wide, meaning the controller technically has read access
+# as well; narrowing controller Secret RBAC is an open maintainer follow-up.
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames:
+  - "gari-controller-push-ca-key"
+  - "gari-controller-push-cert"
+  verbs: ["get", "update", "patch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create"]
+# Read, update, and patch verbs are restricted by resourceNames to the push CA ConfigMap.
+# As noted above, 'create' cannot be restricted by name in Kubernetes RBAC, allowing creation
+# of any ConfigMap in this namespace beyond this single name, while read and update access
+# remains restricted to gari-controller-push-ca.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames:
+  - "gari-controller-push-ca"
+  verbs: ["get", "update", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gari-controller-push-credentials
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gari-controller-push-credentials
+subjects:
+- kind: ServiceAccount
+  name: gari-controller-push-credentials
+  namespace: default
+---
+# The Job creates and renews the TLS credentials for the controller's push listener.
+# Note on immutability: A Job's spec.template is immutable once created. If 'kubectl apply' is
+# run a second time with a new container image or changed spec while a previous Job object exists,
+# the apply will fail with an immutability validation error. The previous completed Job must be
+# deleted before re-applying (or cleaned up automatically via ttlSecondsAfterFinished).
+# Note on lifecycle: Nothing runs this Job again automatically after initial installation, so the
+# serving certificate will expire after its lifetime (1 year) unless renewed by a scheduled
+# CronJob, operator, or manual re-run; automated periodic renewal is planned work.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gari-controller-push-credentials
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: gari-controller-push-credentials
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+      - name: init-push-credentials
+        image: gari-controller:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        args:
+        - --init-push-credentials
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

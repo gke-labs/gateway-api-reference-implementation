@@ -53,6 +53,8 @@ func BindFlags(fs *flag.FlagSet, opts *gari.Options, cfg *Config) {
 	}
 
 	fs.BoolVar(&opts.DataplaneMode, "dataplane-mode", opts.DataplaneMode, "Run in data-plane mode serving a single Gateway.")
+	fs.BoolVar(&opts.InitPushCredentials, "init-push-credentials", opts.InitPushCredentials, "Create or renew TLS credentials for the configuration push listener, then exit.")
+	fs.StringVar(&opts.PushCredentialsNamespace, "push-credentials-namespace", opts.PushCredentialsNamespace, "Namespace in which to create/renew push credentials (defaults to POD_NAMESPACE or in-cluster namespace or 'default').")
 	fs.StringVar(&opts.DataplaneGatewayNamespace, "gateway-namespace", opts.DataplaneGatewayNamespace, "The namespace of the Gateway to serve in data-plane mode.")
 	fs.StringVar(&opts.DataplaneGatewayName, "gateway-name", opts.DataplaneGatewayName, "The name of the Gateway to serve in data-plane mode.")
 	fs.StringVar(&cfg.DataplaneImage, "dataplane-image", cfg.DataplaneImage, "The container image to use for provisioned per-Gateway data-plane Deployments.")
@@ -120,6 +122,10 @@ func Setup(args []string) (gari.Options, error) {
 		return opts, err
 	}
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
+
+	if opts.InitPushCredentials {
+		return opts, nil
+	}
 
 	if opts.DataplaneMode {
 		if opts.DataplaneGatewayNamespace == "" || opts.DataplaneGatewayName == "" {
