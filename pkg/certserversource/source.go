@@ -98,7 +98,6 @@ type Source struct {
 	renewalWindow  time.Duration
 	evictionPeriod time.Duration
 	logInterval    time.Duration
-	clusterID      string
 	timeNow        func() time.Time
 
 	// mu guards cache and recomputeTrigger.
@@ -140,20 +139,6 @@ func WithCheckInterval(d time.Duration) SourceOption {
 func WithEvictionPeriod(d time.Duration) SourceOption {
 	return func(s *Source) {
 		s.evictionPeriod = d
-	}
-}
-
-// WithRenewalWindow overrides the window before expiry when background refresh begins.
-func WithRenewalWindow(d time.Duration) SourceOption {
-	return func(s *Source) {
-		s.renewalWindow = d
-	}
-}
-
-// WithClusterID sets the cluster ID sent to certserver.
-func WithClusterID(id string) SourceOption {
-	return func(s *Source) {
-		s.clusterID = id
 	}
 }
 
@@ -509,7 +494,6 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		Hostnames:               hostnames,
 		Gateway:                 gateway,
 		DataPlaneServiceAccount: dataPlaneSA,
-		ClusterId:               s.clusterID,
 		Addresses:               addresses,
 	}
 
