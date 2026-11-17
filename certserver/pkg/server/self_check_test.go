@@ -188,7 +188,10 @@ func setupSelfCheckTest(t *testing.T, cfg selfCheckHarnessConfig) *selfCheckHarn
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(buildTestJWKS(map[string]*rsa.PublicKey{kid: &clusterKey.PublicKey}))
 	}))
-	t.Cleanup(jwksServer.Close)
+	t.Cleanup(func() {
+		jwksServer.CloseClientConnections()
+		jwksServer.Close()
+	})
 
 	issuerURL := jwksServer.URL + "/" + clusterID
 	clusters := []registry.ClusterConfig{
@@ -254,7 +257,10 @@ func setupSelfCheckTest(t *testing.T, cfg selfCheckHarnessConfig) *selfCheckHarn
 			challengeHandler = cfg.challengeServerWrap(challengeHandler)
 		}
 		harness.challengeSrv = httptest.NewServer(audit.WrapHTTP(auditLogger, challengeHandler))
-		t.Cleanup(harness.challengeSrv.Close)
+		t.Cleanup(func() {
+			harness.challengeSrv.CloseClientConnections()
+			harness.challengeSrv.Close()
+		})
 	}
 
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -275,7 +281,10 @@ func setupSelfCheckTest(t *testing.T, cfg selfCheckHarnessConfig) *selfCheckHarn
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(keyAuth))
 	}))
-	t.Cleanup(testServer.Close)
+	t.Cleanup(func() {
+		testServer.CloseClientConnections()
+		testServer.Close()
+	})
 	testIP := testServer.Listener.Addr().(*net.TCPAddr).IP
 	harness.testServer = testServer
 	harness.testServerIP = testIP.String()
