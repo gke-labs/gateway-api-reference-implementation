@@ -1122,8 +1122,9 @@ func TestInProcessDataplanePublisher_PublishDataplaneConfig_ApplyError(t *testin
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-1"},
 	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "gw-1"}
 	badConfig := &DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
+		GatewayName: gwKey,
 		Certificates: map[string]CertificateData{
 			"invalid-cert": {
 				Certificate: [][]byte{[]byte("invalid-cert-bytes")},
@@ -1133,14 +1134,30 @@ func TestInProcessDataplanePublisher_PublishDataplaneConfig_ApplyError(t *testin
 	}
 
 	ctx := t.Context()
-	err := pub.PublishDataplaneConfig(ctx, gw, badConfig)
-	if err == nil {
-		t.Fatalf("expected PublishDataplaneConfig to return apply error, got nil")
+	if err := pub.PublishDataplaneConfig(ctx, gw, badConfig); err != nil {
+		t.Fatalf("expected PublishDataplaneConfig to succeed without error, got: %v", err)
+	}
+
+	result, err := pub.WaitApplied(ctx, gwKey, badConfig.Revision)
+	if err != nil {
+		t.Fatalf("expected WaitApplied to succeed without error, got: %v", err)
+	}
+	if len(result.Rejections) != 1 {
+		t.Fatalf("expected 1 rejection, got %d", len(result.Rejections))
+	}
+	if result.Rejections[0].DataPlane != "in-process" {
+		t.Errorf("expected DataPlane %q, got %q", "in-process", result.Rejections[0].DataPlane)
+	}
+	if result.Rejections[0].Reason == "" {
+		t.Errorf("expected non-empty rejection reason")
+	}
+	if result.Applied != 0 {
+		t.Errorf("expected 0 applied, got %d", result.Applied)
 	}
 
 	// Valid config succeeds and updates proxy updater
 	validConfig := &DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
+		GatewayName: gwKey,
 		Routes: []InternalRoute{
 			{
 				Hostnames: routeHostnamesFromStrings("valid.example.com"),
@@ -1149,6 +1166,16 @@ func TestInProcessDataplanePublisher_PublishDataplaneConfig_ApplyError(t *testin
 	}
 	if err := pub.PublishDataplaneConfig(ctx, gw, validConfig); err != nil {
 		t.Fatalf("expected PublishDataplaneConfig to succeed, got: %v", err)
+	}
+	validResult, err := pub.WaitApplied(ctx, gwKey, validConfig.Revision)
+	if err != nil {
+		t.Fatalf("expected WaitApplied to succeed, got: %v", err)
+	}
+	if validResult.Applied != 1 {
+		t.Errorf("expected 1 applied, got %d", validResult.Applied)
+	}
+	if len(validResult.Rejections) != 0 {
+		t.Errorf("expected 0 rejections, got %d", len(validResult.Rejections))
 	}
 	if len(updater.routes) != 1 || updater.routes[0].Hostnames[0].Hostname != "valid.example.com" {
 		t.Errorf("expected updater to receive valid config")

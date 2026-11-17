@@ -100,9 +100,35 @@ func (cfg *DataplaneConfig) ComputeRevision() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// DataPlaneRejection describes a data plane that rejected a configuration revision and the reason why.
+type DataPlaneRejection struct {
+	// DataPlane is the identifier of the data plane that rejected the configuration.
+	DataPlane string
+	// Reason describes why the data plane rejected the configuration.
+	Reason string
+}
+
+// Rejection is an alias for DataPlaneRejection.
+type Rejection = DataPlaneRejection
+
+// PublishResult reports what data planes did with a configuration revision for a Gateway.
+type PublishResult struct {
+	// Applied is the number of data planes that applied the revision.
+	Applied int
+	// Rejections records which data planes rejected the revision and why.
+	Rejections []DataPlaneRejection
+	// NotAnswered is the number of known data planes that have not answered.
+	NotAnswered int
+}
+
 // DataplanePublisher defines the interface for publishing a Gateway's compiled data-plane configuration.
 type DataplanePublisher interface {
-	PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error
+	// PublishDataplaneConfig sends the config and does not wait for data planes.
+	PublishDataplaneConfig(ctx context.Context, gateway *gatewayv1.Gateway, config *DataplaneConfig) error
+
+	// WaitApplied waits until every data plane known for the Gateway has
+	// answered for this revision, or until ctx ends, and reports what each did.
+	WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error)
 }
 
 func tlsCertToData(cert *tls.Certificate) (CertificateData, error) {
@@ -444,19 +470,26 @@ func ApplyDataplaneConfig(updater ProxyConfigUpdater, data []byte) error {
 	return nil
 }
 
+type inProcessStatus struct {
+	revision string
+	err      error
+}
+
 // InProcessDataplanePublisher is a DataplanePublisher that serializes DataplaneConfig
 // to JSON and applies it to an in-process proxy using ApplyDataplaneConfig.
 type InProcessDataplanePublisher struct {
-	mu      sync.Mutex
-	updater ProxyConfigUpdater
-	configs map[types.NamespacedName]*DataplaneConfig
+	mu       sync.Mutex
+	updater  ProxyConfigUpdater
+	configs  map[types.NamespacedName]*DataplaneConfig
+	statuses map[types.NamespacedName]inProcessStatus
 }
 
 // NewInProcessDataplanePublisher creates a new in-process DataplanePublisher for the given proxy updater.
 func NewInProcessDataplanePublisher(updater ProxyConfigUpdater) *InProcessDataplanePublisher {
 	return &InProcessDataplanePublisher{
-		updater: updater,
-		configs: make(map[types.NamespacedName]*DataplaneConfig),
+		updater:  updater,
+		configs:  make(map[types.NamespacedName]*DataplaneConfig),
+		statuses: make(map[types.NamespacedName]inProcessStatus),
 	}
 }
 
@@ -472,18 +505,62 @@ func (p *InProcessDataplanePublisher) PublishDataplaneConfig(ctx context.Context
 	if gw == nil || config == nil {
 		if gw != nil {
 			delete(p.configs, types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
+			delete(p.statuses, types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
 		} else {
 			p.configs = make(map[types.NamespacedName]*DataplaneConfig)
+			p.statuses = make(map[types.NamespacedName]inProcessStatus)
 		}
-	} else {
-		gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
-		if p.configs == nil {
-			p.configs = make(map[types.NamespacedName]*DataplaneConfig)
-		}
-		p.configs[gwKey] = config
+		return p.applyLocked()
 	}
 
-	return p.applyLocked()
+	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	if p.configs == nil {
+		p.configs = make(map[types.NamespacedName]*DataplaneConfig)
+	}
+	if p.statuses == nil {
+		p.statuses = make(map[types.NamespacedName]inProcessStatus)
+	}
+	p.configs[gwKey] = config
+
+	applyErr := p.applyLocked()
+	p.statuses[gwKey] = inProcessStatus{
+		revision: config.Revision,
+		err:      applyErr,
+	}
+
+	return nil
+}
+
+// WaitApplied waits until every data plane known for the Gateway has answered
+// for this revision, or until ctx ends. For the in-process publisher, applying
+// happens synchronously in PublishDataplaneConfig, so WaitApplied answers immediately:
+// one data plane, applied or rejected with the apply error.
+func (p *InProcessDataplanePublisher) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error) {
+	if p == nil {
+		return PublishResult{}, nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	status, ok := p.statuses[gateway]
+	if !ok {
+		return PublishResult{}, nil
+	}
+
+	if status.err != nil {
+		return PublishResult{
+			Rejections: []DataPlaneRejection{
+				{
+					DataPlane: "in-process",
+					Reason:    status.err.Error(),
+				},
+			},
+		}, nil
+	}
+
+	return PublishResult{
+		Applied: 1,
+	}, nil
 }
 
 func (p *InProcessDataplanePublisher) applyLocked() error {

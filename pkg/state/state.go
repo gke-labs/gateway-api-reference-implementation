@@ -18,8 +18,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -99,6 +102,9 @@ const (
 	// dataplaneRetryMaxDelay caps the exponential backoff to bound the worst-case delay
 	// before a recovered data plane receives its updated configuration (e.g. after a temporary outage).
 	dataplaneRetryMaxDelay = 30 * time.Second
+	// dataplaneWaitAppliedLimit is the maximum time the controller waits for data planes
+	// to report what they did with a published configuration before continuing the reconcile pass.
+	dataplaneWaitAppliedLimit = 1 * time.Second
 )
 
 func newDataplaneQueue() workqueue.TypedRateLimitingInterface[types.NamespacedName] {
@@ -116,6 +122,8 @@ type gatewayDataplaneState struct {
 	acceptedConfig []byte
 	// lastPublishError is the error from the most recent publish attempt, or nil after a success.
 	lastPublishError error
+	// lastPublishResult is the most recent PublishResult returned by WaitApplied.
+	lastPublishResult PublishResult
 }
 
 type State struct {
@@ -611,10 +619,41 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		return err
 	}
 
+	waitCtx, cancel := context.WithTimeout(ctx, dataplaneWaitAppliedLimit)
+	defer cancel()
+
+	result, err := publisher.WaitApplied(waitCtx, gwKey, dpConfig.Revision)
+	if err != nil {
+		klog.Errorf("failed waiting for dataplane config to be applied for %s (revision %s): %v", gwKey, dpConfig.Revision, err)
+		s.recordPublishError(gwKey, err)
+		return err
+	}
+
+	if len(result.Rejections) > 0 {
+		var rejectionErr error
+		if len(result.Rejections) == 1 {
+			rejectionErr = errors.New(result.Rejections[0].Reason)
+		} else {
+			var reasons []string
+			for _, r := range result.Rejections {
+				reasons = append(reasons, fmt.Sprintf("%s: %s", r.DataPlane, r.Reason))
+			}
+			rejectionErr = errors.New(strings.Join(reasons, "; "))
+		}
+		s.recordPublishError(gwKey, rejectionErr)
+		s.mu.Lock()
+		dp := s.dataplaneState[gwKey]
+		dp.lastPublishResult = result
+		s.dataplaneState[gwKey] = dp
+		s.mu.Unlock()
+		return rejectionErr
+	}
+
 	s.mu.Lock()
 	prev := s.dataplaneState[gwKey]
 	s.dataplaneState[gwKey] = gatewayDataplaneState{
-		acceptedConfig: data,
+		acceptedConfig:    data,
+		lastPublishResult: result,
 	}
 	s.mu.Unlock()
 
