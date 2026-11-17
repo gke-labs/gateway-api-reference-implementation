@@ -24,16 +24,82 @@ type Checkpointer struct {
 	bp       *BlockPool
 	heapFile File
 	wal      Log
+	metaFile File
 	mu       sync.Mutex
+
+	activeSlot       int    // 0 or 1: index of slot holding latest valid recovery position
+	slotCounter      uint64 // counter in the latest valid slot
+	hasActiveSlot    bool   // true if at least one valid slot exists
+	recoveryStartLSN uint64 // current recovery start LSN
 }
 
 // NewCheckpointer creates a new Checkpointer.
-func NewCheckpointer(bp *BlockPool, heapFile File, wal Log) *Checkpointer {
-	return &Checkpointer{
-		bp:       bp,
-		heapFile: heapFile,
-		wal:      wal,
+func NewCheckpointer(bp *BlockPool, heapFile File, wal Log, metaFile ...File) *Checkpointer {
+	var mf File
+	if len(metaFile) > 0 {
+		mf = metaFile[0]
 	}
+	return &Checkpointer{
+		bp:         bp,
+		heapFile:   heapFile,
+		wal:        wal,
+		metaFile:   mf,
+		activeSlot: 1, // default so first write targets slot 0
+	}
+}
+
+func (c *Checkpointer) initRecoverySlot(activeSlot int, slotCounter uint64, hasActive bool, recoveryStartLSN uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.activeSlot = activeSlot
+	c.slotCounter = slotCounter
+	c.hasActiveSlot = hasActive
+	c.recoveryStartLSN = recoveryStartLSN
+}
+
+// RecoveryStartLSN returns the latest recovery start LSN written to meta.db.
+func (c *Checkpointer) RecoveryStartLSN() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.recoveryStartLSN
+}
+
+func (c *Checkpointer) writeRecoverySlotLocked(redoStartLSN uint64) error {
+	if c.metaFile == nil {
+		return nil
+	}
+
+	targetSlot := 0
+	nextCounter := uint64(1)
+	if c.hasActiveSlot {
+		targetSlot = 1 - c.activeSlot
+		nextCounter = c.slotCounter + 1
+	}
+
+	slot := recoveryStartSlot{
+		recoveryStartLSN: redoStartLSN,
+		counter:          nextCounter,
+	}
+	encoded := encodeRecoveryStartSlot(slot)
+
+	offset := int64(metaOffsetRecoverySlot0)
+	if targetSlot == 1 {
+		offset = int64(metaOffsetRecoverySlot1)
+	}
+
+	if _, err := c.metaFile.WriteAt(encoded, offset); err != nil {
+		return fmt.Errorf("failed to write recovery slot to meta.db: %w", err)
+	}
+
+	if err := c.metaFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync meta.db after writing recovery slot: %w", err)
+	}
+
+	c.activeSlot = targetSlot
+	c.slotCounter = nextCounter
+	c.hasActiveSlot = true
+	c.recoveryStartLSN = redoStartLSN
+	return nil
 }
 
 // FlushPages flushes all dirty pages to the heap file, fsyncs the heap, and promotes
@@ -110,6 +176,19 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 	// 2-5. Flush dirty pages, sync heap file, and promote flushed locations
 	if err := c.flushPagesLocked(); err != nil {
 		return 0, fmt.Errorf("checkpoint failed to flush dirty pages: %w", err)
+	}
+
+	// Write the recovery start LSN slot to meta.db only after the heap fsync completes,
+	// and then fsync meta.db.
+	// The heap fsync must precede the meta.db fsync: if the order were reversed and
+	// meta.db were fsynced first, a crash before the heap fsync completes would leave
+	// meta.db pointing to a recovery start LSN whose corresponding heap pages are not
+	// durable on disk. Recovery would then start replay at the advanced LSN, skipping
+	// replay of unpersisted changes and causing silent data loss.
+	if c.metaFile != nil {
+		if err := c.writeRecoverySlotLocked(redoStartLSN); err != nil {
+			return 0, fmt.Errorf("checkpoint failed to write recovery start slot to meta.db: %w", err)
+		}
 	}
 
 	// 6. Append checkpoint record to WAL, assigning LSN under WAL lock

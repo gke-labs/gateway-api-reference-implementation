@@ -20,7 +20,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	mathrand "math/rand"
 	"os"
 	"path/filepath"
@@ -2256,6 +2255,11 @@ func TestEngine_MetaDBChecksumAndValidation(t *testing.T) {
 		metaPath := filepath.Join(directory, "meta.db")
 
 		for i := 0; i < metaFileSize; i++ {
+			if i >= metaOffsetRecoverySlot0 && i < metaOffsetReserved {
+				// The two recovery start LSN slots are tested separately for redundancy and recovery;
+				// when slot 0 is valid, a single flipped bit in slot 1 falls back to slot 0.
+				continue
+			}
 			corrupt := make([]byte, metaFileSize)
 			copy(corrupt, metaBytes)
 			corrupt[i] ^= 0x01
@@ -2364,11 +2368,7 @@ func TestEngine_MetaDBChecksumAndValidation(t *testing.T) {
 				name: "NonZeroReservedBytesWithValidCRC",
 				mutate: func(metaBytes []byte) {
 					metaBytes[metaOffsetReserved+50] = 0xff
-					metaBytes[metaOffsetCRC] = 0
-					metaBytes[metaOffsetCRC+1] = 0
-					metaBytes[metaOffsetCRC+2] = 0
-					metaBytes[metaOffsetCRC+3] = 0
-					crc := crc32.Checksum(metaBytes, castagnoliTable)
+					crc := computeMetaBlockCRC(metaBytes)
 					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
 				},
 			},
@@ -2376,23 +2376,15 @@ func TestEngine_MetaDBChecksumAndValidation(t *testing.T) {
 				name: "InvalidMagicWithValidCRC",
 				mutate: func(metaBytes []byte) {
 					binary.BigEndian.PutUint32(metaBytes[metaOffsetMagic:metaOffsetVersion], 0x12345678)
-					metaBytes[metaOffsetCRC] = 0
-					metaBytes[metaOffsetCRC+1] = 0
-					metaBytes[metaOffsetCRC+2] = 0
-					metaBytes[metaOffsetCRC+3] = 0
-					crc := crc32.Checksum(metaBytes, castagnoliTable)
+					crc := computeMetaBlockCRC(metaBytes)
 					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
 				},
 			},
 			{
 				name: "UnknownFlagsWithValidCRC",
 				mutate: func(metaBytes []byte) {
-					binary.BigEndian.PutUint64(metaBytes[metaOffsetFlags:metaOffsetReserved], 1<<2)
-					metaBytes[metaOffsetCRC] = 0
-					metaBytes[metaOffsetCRC+1] = 0
-					metaBytes[metaOffsetCRC+2] = 0
-					metaBytes[metaOffsetCRC+3] = 0
-					crc := crc32.Checksum(metaBytes, castagnoliTable)
+					binary.BigEndian.PutUint64(metaBytes[metaOffsetFlags:metaOffsetKeyCheck], 1<<2)
+					crc := computeMetaBlockCRC(metaBytes)
 					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
 				},
 			},

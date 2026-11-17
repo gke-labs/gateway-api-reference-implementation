@@ -47,7 +47,19 @@ The database metadata file (`meta.db`) is a fixed-size 4 KiB (4096-byte) record 
 |                                                               |
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Reserved (4028B)                        |
+|                 Recovery Start Slot 0 (20B)                   |
+|       (LSN 8B, Counter 8B, CRC32C 4B)                         |
+|                                                               |
+|                                                               |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                 Recovery Start Slot 1 (20B)                   |
+|       (LSN 8B, Counter 8B, CRC32C 4B)                         |
+|                                                               |
+|                                                               |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Reserved (3988B)                        |
 |                              ...                              |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                          CRC32C (4B)                          |
@@ -56,12 +68,13 @@ The database metadata file (`meta.db`) is a fixed-size 4 KiB (4096-byte) record 
 
 The fields contain the following values:
 - **Magic (4 bytes):** The constant `0x4D455441` (ASCII `"META"`).
-- **StoreFormatVersion (4 bytes):** The store format version recorded by the engine (`StoreFormatVersion`).
+- **StoreFormatVersion (4 bytes):** The store format version recorded by the engine (`StoreFormatVersion`, currently `8`).
 - **Database ID (16 bytes):** Unique 16-byte identifier for the database instance.
 - **Flags (8 bytes):** Store flags. Bit 0 indicates whether the store was created with an encryption cipher (`metaFlagEncrypted`). Bits 1 through 63 are reserved and must be zero.
-- **KeyCheckToken (32 bytes):** An HMAC-SHA256 of the database ID computed using a key derived from the master key with context `"diskstore/keycheck"`. In an unencrypted store, this field is zero. Adding this field takes 32 reserved bytes and bumps `StoreFormatVersion`.
-- **Reserved (4028 bytes):** Reserved space written as zeroes. New fields take reserved bytes and bump `StoreFormatVersion`. Reserved bytes that aren't zero under the current version are rejected as an error.
-- **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the full 4096-byte block with the CRC field zeroed.
+- **KeyCheckToken (32 bytes):** An HMAC-SHA256 of the database ID computed using a key derived from the master key with context `"diskstore/keycheck"`. In an unencrypted store, this field is zero.
+- **Recovery Start Slot 0 and Slot 1 (20 bytes each):** Two alternating slots holding the LSN from which recovery starts replay, an incrementing generation counter, and a Castagnoli CRC32C checksum over the 16 bytes of LSN and counter. Adding these slots takes 40 reserved bytes and bumps `StoreFormatVersion`.
+- **Reserved (3988 bytes):** Reserved space written as zeroes. New fields take reserved bytes and bump `StoreFormatVersion`. Reserved bytes that aren't zero under the current version are rejected as an error.
+- **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the full 4096-byte block with the dynamic recovery start slots and CRC field zeroed.
 
 ### Block Header
 

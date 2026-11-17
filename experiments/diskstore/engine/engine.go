@@ -296,11 +296,15 @@ type Engine struct {
 
 	quarantine QuarantineOptions
 
+	metaFile File
 	heapFile File
 	wal      Log
 	buddy    *BuddyAllocator
 	bp       *BlockPool
 	cp       *Checkpointer
+
+	// recoveryStartLSN is the start LSN for recovery read from meta.db at Open.
+	recoveryStartLSN uint64
 
 	writerMu sync.RWMutex // Single writer: serializes Put, Delete; RLock for point-in-time Scan/List
 
@@ -428,25 +432,102 @@ const (
 	// Version 5 makes meta.db a 4 KiB checksummed record with room for new fields.
 	// Version 6 stores oversize values in separate files and logs only pointers in the WAL.
 	// Version 7 adds the HMAC-SHA256 key check token for block-level encryption.
-	StoreFormatVersion uint32 = 7
+	// Version 8 adds recovery start LSN slots in meta.db's reserved space.
+	StoreFormatVersion uint32 = 8
 
 	// metaFileSize is the fixed size of meta.db (one 4 KiB block).
 	metaFileSize = BlockSize
 
-	metaOffsetMagic    = 0
-	metaOffsetVersion  = 4
-	metaOffsetDBID     = 8
-	metaOffsetFlags    = 24
-	metaOffsetKeyCheck = 32
-	metaOffsetReserved = 64
-	metaOffsetCRC      = 4092
+	metaOffsetMagic         = 0
+	metaOffsetVersion       = 4
+	metaOffsetDBID          = 8
+	metaOffsetFlags         = 24
+	metaOffsetKeyCheck      = 32
+	metaOffsetRecoverySlot0 = 64
+	metaOffsetRecoverySlot1 = 84
+	metaOffsetReserved      = 104
+	metaOffsetCRC           = 4092
+
+	// recoveryStartSlotSize is the fixed size of each recovery start slot (20 bytes).
+	recoveryStartSlotSize = 20
 )
+
+// recoveryStartSlot represents one of the two alternating slots in meta.db
+// storing the LSN from which recovery must start replay.
+// Each slot holds the LSN, an incrementing counter, and a CRC32C over the slot.
+type recoveryStartSlot struct {
+	// recoveryStartLSN is the LSN from which recovery must start replay.
+	recoveryStartLSN uint64
+
+	// counter is the incrementing generation counter for the slot.
+	counter uint64
+
+	// crc is the Castagnoli CRC32C checksum over the 16 bytes of recoveryStartLSN and counter.
+	crc uint32
+}
+
+func encodeRecoveryStartSlot(slot recoveryStartSlot) []byte {
+	buf := make([]byte, recoveryStartSlotSize)
+	binary.BigEndian.PutUint64(buf[0:8], slot.recoveryStartLSN)
+	binary.BigEndian.PutUint64(buf[8:16], slot.counter)
+	crc := crc32.Checksum(buf[:16], castagnoliTable)
+	binary.BigEndian.PutUint32(buf[16:20], crc)
+	return buf
+}
+
+func decodeRecoveryStartSlot(buf []byte) (recoveryStartSlot, error) {
+	if len(buf) < recoveryStartSlotSize {
+		return recoveryStartSlot{}, errors.New("recovery start slot too short")
+	}
+	storedCRC := binary.BigEndian.Uint32(buf[16:20])
+	actualCRC := crc32.Checksum(buf[:16], castagnoliTable)
+	if storedCRC != actualCRC {
+		return recoveryStartSlot{}, errors.New("recovery start slot CRC mismatch")
+	}
+	return recoveryStartSlot{
+		recoveryStartLSN: binary.BigEndian.Uint64(buf[0:8]),
+		counter:          binary.BigEndian.Uint64(buf[8:16]),
+		crc:              storedCRC,
+	}, nil
+}
+
+// readRecoveryStartSlots reads both recovery start slots from metaBuffer and selects
+// the valid slot with the larger counter. If one slot fails its checksum, it uses the other.
+// If both fail, it returns an error naming metaPath without guessing.
+func readRecoveryStartSlots(metaBuffer []byte, metaPath string) (recoveryStartLSN uint64, activeSlot int, slotCounter uint64, hasActive bool, err error) {
+	if len(metaBuffer) < metaOffsetReserved {
+		return 0, 0, 0, false, fmt.Errorf("%s: meta buffer too small for recovery start slots", metaPath)
+	}
+
+	slot0Bytes := metaBuffer[metaOffsetRecoverySlot0 : metaOffsetRecoverySlot0+recoveryStartSlotSize]
+	slot1Bytes := metaBuffer[metaOffsetRecoverySlot1 : metaOffsetRecoverySlot1+recoveryStartSlotSize]
+
+	slot0, err0 := decodeRecoveryStartSlot(slot0Bytes)
+	slot1, err1 := decodeRecoveryStartSlot(slot1Bytes)
+
+	if err0 == nil && err1 == nil {
+		if slot1.counter > slot0.counter {
+			return slot1.recoveryStartLSN, 1, slot1.counter, true, nil
+		}
+		return slot0.recoveryStartLSN, 0, slot0.counter, true, nil
+	}
+
+	if err0 == nil && err1 != nil {
+		return slot0.recoveryStartLSN, 0, slot0.counter, true, nil
+	}
+
+	if err0 != nil && err1 == nil {
+		return slot1.recoveryStartLSN, 1, slot1.counter, true, nil
+	}
+
+	// Both slots failed checksum.
+	return 0, 0, 0, false, fmt.Errorf("%s: both recovery start slots corrupt: slot 0 (%v), slot 1 (%v)", metaPath, err0, err1)
+}
 
 // metaRecord represents the decoded contents of meta.db.
 //
-// The engine writes meta.db once, when it creates the store, fsyncs it, and never
-// rewrites it. Because the engine never rewrites meta.db after creation, a torn
-// write can only happen before the store holds data.
+// The engine writes meta.db header fields once when it creates the store, fsyncs it,
+// and subsequently updates only the alternating recovery start LSN slots in reserved space.
 //
 // Binary layout of meta.db (4096 bytes / one 4 KiB block):
 //   - Bytes 0..4:     Magic (0x4D455441, "META")
@@ -454,8 +535,10 @@ const (
 //   - Bytes 8..24:    Database ID (16 bytes)
 //   - Bytes 24..32:   Flags (uint64, bit 0: encrypted flag)
 //   - Bytes 32..64:   KeyCheckToken (32 bytes HMAC-SHA256 of dbID; all zeroes in an unencrypted store)
-//   - Bytes 64..4092: Reserved bytes (must be zero under current StoreFormatVersion)
-//   - Bytes 4092..4096: CRC32C (uint32 over full 4096-byte block with CRC field zeroed)
+//   - Bytes 64..84:   Recovery start slot 0 (20 bytes: LSN uint64, counter uint64, CRC32C uint32)
+//   - Bytes 84..104:  Recovery start slot 1 (20 bytes: LSN uint64, counter uint64, CRC32C uint32)
+//   - Bytes 104..4092: Reserved bytes (must be zero under current StoreFormatVersion)
+//   - Bytes 4092..4096: CRC32C (uint32 over full 4096-byte block with slots and CRC field zeroed)
 //
 // New fields take reserved bytes and bump StoreFormatVersion.
 type metaRecord struct {
@@ -473,6 +556,15 @@ type metaRecord struct {
 	keyCheckToken [32]byte
 }
 
+func computeMetaBlockCRC(buffer []byte) uint32 {
+	var zeroSlots [metaOffsetReserved - metaOffsetRecoverySlot0]byte
+	var zeroCRC [4]byte
+	crc := crc32.Checksum(buffer[:metaOffsetRecoverySlot0], castagnoliTable)
+	crc = crc32.Update(crc, castagnoliTable, zeroSlots[:])
+	crc = crc32.Update(crc, castagnoliTable, buffer[metaOffsetReserved:metaOffsetCRC])
+	return crc32.Update(crc, castagnoliTable, zeroCRC[:])
+}
+
 func encodeMetaRecord(record metaRecord) []byte {
 	buffer := make([]byte, metaFileSize)
 	binary.BigEndian.PutUint32(buffer[metaOffsetMagic:metaOffsetVersion], metaMagic)
@@ -483,9 +575,17 @@ func encodeMetaRecord(record metaRecord) []byte {
 		flags |= metaFlagEncrypted
 	}
 	binary.BigEndian.PutUint64(buffer[metaOffsetFlags:metaOffsetKeyCheck], flags)
-	copy(buffer[metaOffsetKeyCheck:metaOffsetReserved], record.keyCheckToken[:])
+	copy(buffer[metaOffsetKeyCheck:metaOffsetRecoverySlot0], record.keyCheckToken[:])
 
-	crc := crc32.Checksum(buffer, castagnoliTable)
+	// Initialize recovery slot 0 with recoveryStartLSN 0 and counter 1 so a crash
+	// before the first checkpoint recovers cleanly from the beginning of the log.
+	slot0 := recoveryStartSlot{
+		recoveryStartLSN: 0,
+		counter:          1,
+	}
+	copy(buffer[metaOffsetRecoverySlot0:metaOffsetRecoverySlot1], encodeRecoveryStartSlot(slot0))
+
+	crc := computeMetaBlockCRC(buffer)
 	binary.BigEndian.PutUint32(buffer[metaOffsetCRC:metaFileSize], crc)
 	return buffer
 }
@@ -496,9 +596,7 @@ func decodeMetaRecord(buffer []byte) (metaRecord, error) {
 	}
 
 	storedCRC := binary.BigEndian.Uint32(buffer[metaOffsetCRC:metaFileSize])
-	var zeroCRC [4]byte
-	crc := crc32.Update(0, castagnoliTable, buffer[:metaOffsetCRC])
-	actualCRC := crc32.Update(crc, castagnoliTable, zeroCRC[:])
+	actualCRC := computeMetaBlockCRC(buffer)
 	if storedCRC != actualCRC {
 		return metaRecord{}, errors.New("meta file CRC mismatch")
 	}
@@ -528,7 +626,7 @@ func decodeMetaRecord(buffer []byte) (metaRecord, error) {
 	copy(record.dbID[:], buffer[metaOffsetDBID:metaOffsetFlags])
 	record.version = version
 	record.encrypted = (flags & metaFlagEncrypted) != 0
-	copy(record.keyCheckToken[:], buffer[metaOffsetKeyCheck:metaOffsetReserved])
+	copy(record.keyCheckToken[:], buffer[metaOffsetKeyCheck:metaOffsetRecoverySlot0])
 	if !record.encrypted && record.keyCheckToken != [32]byte{} {
 		return metaRecord{}, errors.New("non-zero key check token in unencrypted store")
 	}
@@ -637,6 +735,10 @@ func Open(opts ...Option) (*Engine, error) {
 
 	var dbID [16]byte
 	isNewStore := false
+	var recoveryStartLSN uint64
+	activeSlot := 1
+	var slotCounter uint64
+	var hasActiveSlot bool
 
 	if needsErase {
 		isNewStore = true
@@ -739,6 +841,22 @@ func Open(opts ...Option) (*Engine, error) {
 							return nil, fmt.Errorf("%w: store is encrypted with a key: encryption key option required", ErrStoreEncrypted)
 						}
 					}
+
+					if !needsErase {
+						var slotErr error
+						recoveryStartLSN, activeSlot, slotCounter, hasActiveSlot, slotErr = readRecoveryStartSlots(
+							metaBuffer,
+							metaPath,
+						)
+						if slotErr != nil {
+							if !options.EraseOnError {
+								return nil, slotErr
+							}
+							needsErase = true
+							eraseReason = slotErr.Error()
+							isNewStore = true
+						}
+					}
 				}
 			}
 		}
@@ -772,6 +890,14 @@ func Open(opts ...Option) (*Engine, error) {
 		return nil, fmt.Errorf("failed to create oversize directory: %w", err)
 	}
 
+	var s *Engine
+	var sMetaFile File
+	defer func() {
+		if s == nil && sMetaFile != nil {
+			_ = sMetaFile.Close()
+		}
+	}()
+
 	if isNewStore {
 		if _, randErr := io.ReadFull(rand.Reader, dbID[:]); randErr != nil {
 			return nil, fmt.Errorf("failed to generate DB ID: %w", randErr)
@@ -803,9 +929,13 @@ func Open(opts ...Option) (*Engine, error) {
 			closeErr := metaFile.Close()
 			return nil, errors.Join(fmt.Errorf("failed to sync meta file: %w", err), closeErr)
 		}
-		if err := metaFile.Close(); err != nil {
-			return nil, fmt.Errorf("failed to close meta file: %w", err)
+		sMetaFile = metaFile
+	} else {
+		metaFile, err := options.FS.OpenFile(metaPath, os.O_RDWR, StoreFileMode)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open meta file: %w", err)
 		}
+		sMetaFile = metaFile
 	}
 
 	// Open heap file with direct I/O flag
@@ -841,7 +971,7 @@ func Open(opts ...Option) (*Engine, error) {
 		}
 	}
 
-	s := &Engine{
+	s = &Engine{
 		fs:               options.FS,
 		dir:              dir,
 		dbID:             dbID,
@@ -852,7 +982,9 @@ func Open(opts ...Option) (*Engine, error) {
 		compressionCodec: options.CompressionCodec,
 		maxObjectSize:    options.MaxObjectSize,
 		quarantine:       options.Quarantine,
+		metaFile:         sMetaFile,
 		heapFile:         heapFile,
+		recoveryStartLSN: recoveryStartLSN,
 		keyIndex:         make(map[string]KeyIndexEntry),
 		inFlightOversize: make(map[string]int),
 		emptyPages:       newEmptyPageTracker(nil),
@@ -898,14 +1030,17 @@ func Open(opts ...Option) (*Engine, error) {
 			Cipher:        options.Cipher,
 			HeapCipher:    heapCipher,
 		})
-		s.cp = NewCheckpointer(s.bp, heapFile, wal)
+		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile)
+		s.cp.initRecoverySlot(0, 1, true, 0)
 	} else {
 		// Existing store: perform crash recovery scan and WAL redo replay
 		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID, RecoveryOptions{
-			Quarantine:    options.Quarantine,
-			HeapCipher:    heapCipher,
-			ClosedCleanly: closedCleanly,
-			EncryptionKey: options.EncryptionKey,
+			Quarantine:          options.Quarantine,
+			HeapCipher:          heapCipher,
+			ClosedCleanly:       closedCleanly,
+			EncryptionKey:       options.EncryptionKey,
+			RecoveryStartLSN:    recoveryStartLSN,
+			HasRecoveryStartLSN: true,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -955,7 +1090,8 @@ func Open(opts ...Option) (*Engine, error) {
 			HeapCipher:    heapCipher,
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
-		s.cp = NewCheckpointer(s.bp, heapFile, wal)
+		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile)
+		s.cp.initRecoverySlot(activeSlot, slotCounter, hasActiveSlot, recoveryStartLSN)
 
 		// Replay WAL records from redo start LSN through write path apply functions.
 		if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.SupersededPages); err != nil {
@@ -1190,6 +1326,14 @@ func (s *Engine) Wiped() bool {
 // DBID returns the store's unique database ID.
 func (s *Engine) DBID() [16]byte {
 	return s.dbID
+}
+
+// RecoveryStartLSN returns the recovery start LSN stored in meta.db.
+func (s *Engine) RecoveryStartLSN() uint64 {
+	if s.cp != nil {
+		return s.cp.RecoveryStartLSN()
+	}
+	return s.recoveryStartLSN
 }
 
 // Cipher returns the configured cipher.
@@ -2115,6 +2259,11 @@ func (s *Engine) Close() error {
 	}
 	if s.wal != nil {
 		if err := s.wal.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.metaFile != nil {
+		if err := s.metaFile.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
