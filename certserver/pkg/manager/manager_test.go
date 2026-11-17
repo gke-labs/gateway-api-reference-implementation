@@ -15,9 +15,13 @@
 package manager
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -928,4 +932,254 @@ func TestManager_GetCertificate_And_EnsureIssuance(t *testing.T) {
 	if startedAfterCached {
 		t.Fatalf("expected EnsureIssuance on cached cert to return false")
 	}
+}
+
+type testCustomRoundTripper struct {
+	base      http.RoundTripper
+	roundTrip func(req *http.Request, base http.RoundTripper) (*http.Response, error)
+}
+
+func (rt *testCustomRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if rt.roundTrip != nil {
+		return rt.roundTrip(req, rt.base)
+	}
+	return rt.base.RoundTrip(req)
+}
+
+func isACMEDeactivateRequest(req *http.Request) bool {
+	if req.Method != http.MethodPost || req.Body == nil {
+		return false
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return false
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+
+	var jws struct {
+		Payload string `json:"payload"`
+	}
+	if err := json.Unmarshal(body, &jws); err != nil {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(jws.Payload)
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(jws.Payload)
+		if err != nil {
+			return false
+		}
+	}
+	return strings.Contains(string(decoded), `"deactivated"`)
+}
+
+func isACMEPostAsGetRequest(req *http.Request) bool {
+	if req.Method != http.MethodPost || req.Body == nil {
+		return false
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return false
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+
+	var jws struct {
+		Payload string `json:"payload"`
+	}
+	if err := json.Unmarshal(body, &jws); err != nil {
+		return false
+	}
+	return jws.Payload == ""
+}
+
+func TestManager_Deactivation_UnresponsiveServerReturnsWithinLimit(t *testing.T) {
+	pebble := testserver.StartPebble(t, testserver.ServerConfig{})
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+
+	var deactivateCalled atomic.Bool
+	hangTripper := &testCustomRoundTripper{
+		base: pebble.HTTPClient.Transport,
+		roundTrip: func(req *http.Request, base http.RoundTripper) (*http.Response, error) {
+			if isACMEDeactivateRequest(req) {
+				deactivateCalled.Store(true)
+				// ACME server that never answers the deactivation
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}
+			if isACMEPostAsGetRequest(req) {
+				return nil, errors.New("simulated order failure during authorization")
+			}
+			return base.RoundTrip(req)
+		},
+	}
+
+	customHTTPClient := &http.Client{Transport: hangTripper}
+
+	diskCache, err := cache.NewDiskCache(cacheDir)
+	if err != nil {
+		t.Fatalf("failed to create disk cache: %v", err)
+	}
+	accountKey, err := diskCache.LoadOrGenerateAccountKey()
+	if err != nil {
+		t.Fatalf("failed to load/generate account key: %v", err)
+	}
+
+	acmeCli, err := acmeclient.NewClient(t.Context(), acmeclient.Config{
+		DirectoryURL: pebble.DirectoryURL,
+		HTTPClient:   customHTTPClient,
+		AccountKey:   accountKey,
+	})
+	if err != nil {
+		t.Fatalf("failed to create ACME client: %v", err)
+	}
+
+	mgr := NewManager(acmeCli, diskCache, pebble.ChallengeStore, metrics.New(prometheus.NewRegistry()), pebbleSelfCheckOption(pebble))
+	ctx := t.Context()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("mgr.Start failed: %v", err)
+	}
+	defer mgr.Stop()
+
+	start := time.Now()
+	_, err = mgr.Obtain(ctx, []string{"hang-deact.example.com"}, challenge.Requester{})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected Obtain to fail, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "simulated order failure during authorization") {
+		t.Fatalf("expected order to return its original error, got: %v", err)
+	}
+	if !deactivateCalled.Load() {
+		t.Fatal("expected deactivation request to be sent, but none was observed")
+	}
+	if elapsed < RevokeAuthorizationTimeout {
+		t.Fatalf("expected call to wait for at least %v, but finished in %v", RevokeAuthorizationTimeout, elapsed)
+	}
+	if elapsed > RevokeAuthorizationTimeout+3*time.Second {
+		t.Fatalf("expected order to return within the limit, but took %v", elapsed)
+	}
+}
+
+func TestManager_FailedOrder_SendsDeactivation(t *testing.T) {
+	t.Run("FailsDuringFulfillment", func(t *testing.T) {
+		pebble := testserver.StartPebble(t, testserver.ServerConfig{})
+		tempDir := t.TempDir()
+		cacheDir := filepath.Join(tempDir, "cache")
+
+		var deactivateCalled atomic.Bool
+		tripper := &testCustomRoundTripper{
+			base: pebble.HTTPClient.Transport,
+			roundTrip: func(req *http.Request, base http.RoundTripper) (*http.Response, error) {
+				if isACMEDeactivateRequest(req) {
+					deactivateCalled.Store(true)
+					return base.RoundTrip(req)
+				}
+				if isACMEPostAsGetRequest(req) {
+					return nil, errors.New("simulated order failure during authorization")
+				}
+				return base.RoundTrip(req)
+			},
+		}
+
+		customHTTPClient := &http.Client{Transport: tripper}
+		diskCache, err := cache.NewDiskCache(cacheDir)
+		if err != nil {
+			t.Fatalf("failed to create disk cache: %v", err)
+		}
+		accountKey, err := diskCache.LoadOrGenerateAccountKey()
+		if err != nil {
+			t.Fatalf("failed to load/generate account key: %v", err)
+		}
+
+		acmeCli, err := acmeclient.NewClient(t.Context(), acmeclient.Config{
+			DirectoryURL: pebble.DirectoryURL,
+			HTTPClient:   customHTTPClient,
+			AccountKey:   accountKey,
+		})
+		if err != nil {
+			t.Fatalf("failed to create ACME client: %v", err)
+		}
+
+		mgr := NewManager(acmeCli, diskCache, pebble.ChallengeStore, metrics.New(prometheus.NewRegistry()), pebbleSelfCheckOption(pebble))
+		ctx := t.Context()
+		if err := mgr.Start(ctx); err != nil {
+			t.Fatalf("mgr.Start failed: %v", err)
+		}
+		defer mgr.Stop()
+
+		_, err = mgr.Obtain(ctx, []string{"fail-order-deact.example.com"}, challenge.Requester{})
+		if err == nil {
+			t.Fatal("expected Obtain to fail, but it succeeded")
+		}
+		if !strings.Contains(err.Error(), "simulated order failure during authorization") {
+			t.Fatalf("expected original error, got: %v", err)
+		}
+		if !deactivateCalled.Load() {
+			t.Fatal("expected failed order to send deactivation, but none was sent")
+		}
+	})
+
+	t.Run("ContextEnded", func(t *testing.T) {
+		pebble := testserver.StartPebble(t, testserver.ServerConfig{})
+		tempDir := t.TempDir()
+		cacheDir := filepath.Join(tempDir, "cache")
+
+		var cancelOrder context.CancelFunc
+		var deactivateCalled atomic.Bool
+		tripper := &testCustomRoundTripper{
+			base: pebble.HTTPClient.Transport,
+			roundTrip: func(req *http.Request, base http.RoundTripper) (*http.Response, error) {
+				if isACMEDeactivateRequest(req) {
+					deactivateCalled.Store(true)
+					return base.RoundTrip(req)
+				}
+				if isACMEPostAsGetRequest(req) {
+					if cancelOrder != nil {
+						cancelOrder()
+					}
+				}
+				return base.RoundTrip(req)
+			},
+		}
+
+		customHTTPClient := &http.Client{Transport: tripper}
+		diskCache, err := cache.NewDiskCache(cacheDir)
+		if err != nil {
+			t.Fatalf("failed to create disk cache: %v", err)
+		}
+		accountKey, err := diskCache.LoadOrGenerateAccountKey()
+		if err != nil {
+			t.Fatalf("failed to load/generate account key: %v", err)
+		}
+
+		acmeCli, err := acmeclient.NewClient(t.Context(), acmeclient.Config{
+			DirectoryURL: pebble.DirectoryURL,
+			HTTPClient:   customHTTPClient,
+			AccountKey:   accountKey,
+		})
+		if err != nil {
+			t.Fatalf("failed to create ACME client: %v", err)
+		}
+
+		mgr := NewManager(acmeCli, diskCache, pebble.ChallengeStore, metrics.New(prometheus.NewRegistry()), pebbleSelfCheckOption(pebble))
+
+		orderCtx, cancel := context.WithCancel(t.Context())
+		cancelOrder = cancel
+		defer cancel()
+
+		_, err = mgr.executeACMEOrder(orderCtx, []string{"ctx-ended.example.com"}, "ctx-ended.example.com", challenge.Requester{}, nil)
+		if err == nil {
+			t.Fatal("expected executeACMEOrder to fail due to canceled context, but it succeeded")
+		}
+		if !deactivateCalled.Load() {
+			t.Fatal("expected order with ended context to still send authorization deactivation, but none was sent")
+		}
+	})
 }
