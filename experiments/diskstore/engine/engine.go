@@ -2169,7 +2169,7 @@ func (s *Engine) Flush() error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if err := s.wal.Flush(); err != nil {
+	if err := s.wal.Sync(); err != nil {
 		s.setFailed(err)
 		return s.failErr()
 	}

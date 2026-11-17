@@ -38,19 +38,10 @@ type Log interface {
 	// When Sync returns, all appended records have been written and made durable
 	// on storage (for the WAL, via a local fsync). Records survive process crashes,
 	// operating system crashes, and node power loss. The engine calls Sync on
-	// Engine.Sync when durable persistence is requested, and during checkpoints
+	// Engine.Sync and Engine.Flush when persistence is requested, and during checkpoints
 	// to ensure the checkpoint record and earlier operations are durable before
 	// truncating finished log segments.
 	Sync() error
-
-	// Flush writes buffered records out to the operating system without an fsync.
-	// When Flush returns, buffered records have been handed to the operating system
-	// (for example, written to the OS page cache), but not made durable on physical
-	// storage. Records survive a process crash, but do not survive an operating
-	// system crash or node power loss. The engine calls Flush on Engine.Flush when
-	// the caller wants buffered writes pushed to the operating system without
-	// paying the latency cost of an fsync.
-	Flush() error
 
 	// MaxLSN reports the highest LSN appended to the log.
 	// The engine uses this during checkpoints to determine the redo start LSN
