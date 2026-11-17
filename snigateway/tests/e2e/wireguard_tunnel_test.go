@@ -46,6 +46,14 @@ import (
 
 const requirePrivilegesEnv = "WIREGUARD_REQUIRE_PRIVILEGES"
 
+func newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCertPEM) {
+		return nil, fmt.Errorf("failed to parse CA cert PEM")
+	}
+	return certs.NewServerTLSConfigWithCertPool(caPool, serverCertPEM, serverKeyPEM)
+}
+
 type testNamespaceWorker struct {
 	namespace     netns.NsHandle
 	ownsNamespace bool
@@ -329,9 +337,9 @@ func TestSNIGateway_WireGuardTunnel(t *testing.T) {
 		t.Fatalf("reading client.key: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	serverTLS, err := newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")

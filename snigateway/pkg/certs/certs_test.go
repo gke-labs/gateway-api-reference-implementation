@@ -16,6 +16,7 @@ package certs
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"os"
 	"path/filepath"
@@ -71,9 +72,13 @@ func TestGenerateAndWriteCertificates(t *testing.T) {
 		t.Fatalf("reading %s: %v", ClientKeyFileName, err)
 	}
 
-	serverTLS, err := NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCertPEM) {
+		t.Fatalf("failed to parse CA cert PEM")
+	}
+	serverTLS, err := NewServerTLSConfigWithCertPool(caPool, serverCertPEM, serverKeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("NewServerTLSConfigWithCertPool failed: %v", err)
 	}
 
 	clientTLS, err := NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")

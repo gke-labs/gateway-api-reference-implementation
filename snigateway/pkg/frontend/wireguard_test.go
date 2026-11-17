@@ -118,9 +118,9 @@ func setupTestWireGuardServer(t *testing.T, prefixStr string, clientCerts ...*ce
 		if err != nil {
 			t.Fatalf("GenerateAll certs failed: %v", err)
 		}
-		serverTLS, err = certs.NewServerTLSConfig(defaultGenerated.CA.CertPEM, defaultGenerated.Server.CertPEM, defaultGenerated.Server.KeyPEM)
+		serverTLS, err = newServerTLSConfig(defaultGenerated.CA.CertPEM, defaultGenerated.Server.CertPEM, defaultGenerated.Server.KeyPEM)
 		if err != nil {
-			t.Fatalf("NewServerTLSConfig failed: %v", err)
+			t.Fatalf("newServerTLSConfig failed: %v", err)
 		}
 	} else {
 		defaultGenerated = clientCerts[0]
@@ -209,9 +209,9 @@ func setupTestWireGuardServerWithDial(t *testing.T, prefixStr string, dialContex
 	if err != nil {
 		t.Fatalf("GenerateAll certs failed: %v", err)
 	}
-	serverTLS, err := certs.NewServerTLSConfig(defaultGenerated.CA.CertPEM, defaultGenerated.Server.CertPEM, defaultGenerated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(defaultGenerated.CA.CertPEM, defaultGenerated.Server.CertPEM, defaultGenerated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

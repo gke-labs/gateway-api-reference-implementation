@@ -308,9 +308,9 @@ func newWireGuardFixture(t *testing.T, options fixtureOptions) *wireguardFixture
 		t.Fatalf("GenerateAll failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
@@ -362,7 +362,7 @@ func newWireGuardFixture(t *testing.T, options fixtureOptions) *wireguardFixture
 	}
 
 	go func() {
-		fixture.srvErrCh <- server.Serve(serverListener)
+		fixture.srvErrCh <- server.ServeWithHTTP([]net.Listener{serverListener}, nil)
 	}()
 
 	opener := options.deviceOpener

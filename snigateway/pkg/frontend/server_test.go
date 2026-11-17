@@ -105,6 +105,14 @@ func testDialContext(ctx context.Context, network, address string) (net.Conn, er
 	return (&net.Dialer{}).DialContext(ctx, "tcp", ln.Addr().String())
 }
 
+func newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCertPEM) {
+		return nil, fmt.Errorf("failed to parse CA cert PEM")
+	}
+	return certs.NewServerTLSConfigWithCertPool(caPool, serverCertPEM, serverKeyPEM)
+}
+
 func setupTestServerAndClient(t *testing.T) (*Server, string, *certs.GeneratedCerts, func()) {
 	t.Helper()
 
@@ -113,9 +121,9 @@ func setupTestServerAndClient(t *testing.T) (*Server, string, *certs.GeneratedCe
 		t.Fatalf("GenerateAll certs failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -150,7 +158,7 @@ func setupTestServerAndClient(t *testing.T) (*Server, string, *certs.GeneratedCe
 	}
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	cleanup := func() {
@@ -461,9 +469,9 @@ func TestHTTPHostRouting(t *testing.T) {
 		t.Fatalf("GenerateAll certs failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	tlsListener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -810,7 +818,7 @@ func TestCAAllowlistAuthorization(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	clientTLSA, err := certs.NewClientTLSConfig(certsA.CA.CertPEM, certsA.Client.CertPEM, certsA.Client.KeyPEM, "snigateway.internal")
@@ -1003,9 +1011,9 @@ func TestFailover_UnresponsiveBackend(t *testing.T) {
 		t.Fatalf("GenerateAll certs failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1044,7 +1052,7 @@ func TestFailover_UnresponsiveBackend(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	backendCert, err := generateTestBackendCert("unresponsive.example.com")
@@ -1261,9 +1269,9 @@ func TestFrontendServer_MaxConnections(t *testing.T) {
 		t.Fatalf("GenerateAll certs failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1285,7 +1293,7 @@ func TestFrontendServer_MaxConnections(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	serverAddr := ln.Addr().String()
@@ -1465,9 +1473,9 @@ func setupTestServerWithConfig(t *testing.T, modifyCfg func(*ServerConfig)) (*Se
 		t.Fatalf("GenerateAll certs failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1494,7 +1502,7 @@ func setupTestServerWithConfig(t *testing.T, modifyCfg func(*ServerConfig)) (*Se
 	}
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	cleanup := func() {
@@ -1755,9 +1763,9 @@ func setupTestHTTPServerAndClient(t *testing.T) (*Server, string, string, *certs
 		t.Fatalf("GenerateAll certs failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	tlsLn, err := net.Listen("tcp", "127.0.0.1:0")

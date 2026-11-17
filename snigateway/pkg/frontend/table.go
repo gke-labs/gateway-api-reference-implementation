@@ -78,11 +78,6 @@ func (t *RegistrationTable) GetSessionIdentity(sessionID string) (ClientIdentity
 	return id, ok
 }
 
-// Register sets the full list of hostnames served by sessionID, replacing any previous list for that session.
-func (t *RegistrationTable) Register(sessionID string, hostnames []string) {
-	t.RegisterWithLease(sessionID, hostnames, time.Time{})
-}
-
 // RegisterWithLease sets the hostnames served by sessionID with an optional lease expiration time.
 func (t *RegistrationTable) RegisterWithLease(sessionID string, hostnames []string, leaseExpiry time.Time) {
 	t.mu.Lock()
@@ -110,14 +105,6 @@ func (t *RegistrationTable) RegisterWithLease(sessionID string, hostnames []stri
 	} else {
 		delete(t.sessionLease, sessionID)
 	}
-}
-
-// GetSessionLease returns the lease expiration time for a session, if set.
-func (t *RegistrationTable) GetSessionLease(sessionID string) (time.Time, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	exp, ok := t.sessionLease[sessionID]
-	return exp, ok
 }
 
 // DropExpiredLeases unregisters hostnames for any sessions whose lease has expired before or at now.
@@ -179,17 +166,6 @@ func (t *RegistrationTable) unregisterLocked(sessionID string) {
 		}
 		delete(t.sessionHosts, sessionID)
 	}
-}
-
-// Match looks up the best matching sessionID for a given incoming SNI hostname.
-// Exact match wins. If no exact match, longest matching wildcard pattern wins.
-// If multiple sessions are registered for the matched pattern, selection is round-robined.
-func (t *RegistrationTable) Match(hostname string) (string, bool) {
-	sessions := t.MatchSessions(hostname)
-	if len(sessions) == 0 {
-		return "", false
-	}
-	return sessions[0], true
 }
 
 // MatchSessions returns all sessions registered for the matching hostname pattern,

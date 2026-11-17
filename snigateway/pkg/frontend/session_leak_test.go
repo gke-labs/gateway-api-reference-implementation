@@ -54,9 +54,9 @@ func setupTestServerForLeakTests(t *testing.T, clk *leakTestClock) (*Server, str
 		t.Fatalf("GenerateAll certs failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -84,7 +84,7 @@ func setupTestServerForLeakTests(t *testing.T, clk *leakTestClock) (*Server, str
 	}
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	cleanup := func() {
@@ -175,7 +175,7 @@ func TestSessionTeardown_LeaseReaperAndHandler(t *testing.T) {
 		srv.RegistrationTable().RegisterWithLease(sessID, []string{"reaper-http.example.com"}, leaseExp)
 
 		// Verify registration exists initially
-		if _, ok := srv.RegistrationTable().Match("reaper-http.example.com"); !ok {
+		if sessions := srv.RegistrationTable().MatchSessions("reaper-http.example.com"); len(sessions) == 0 {
 			t.Fatal("expected hostname to be registered initially")
 		}
 
@@ -195,7 +195,7 @@ func TestSessionTeardown_LeaseReaperAndHandler(t *testing.T) {
 		waitForEmptySessionMaps(t, srv)
 
 		// Registration must be removed
-		if _, ok := srv.RegistrationTable().Match("reaper-http.example.com"); ok {
+		if sessions := srv.RegistrationTable().MatchSessions("reaper-http.example.com"); len(sessions) > 0 {
 			t.Fatal("expected hostname to be dropped from registration table")
 		}
 	})

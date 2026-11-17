@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,14 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 )
+
+func newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCertPEM) {
+		return nil, fmt.Errorf("failed to parse CA cert PEM")
+	}
+	return certs.NewServerTLSConfigWithCertPool(caPool, serverCertPEM, serverKeyPEM)
+}
 
 func setupTestWireGuardPair(t *testing.T) (func(*frontend.ServerConfig), []ManagerOption) {
 	t.Helper()
@@ -131,9 +140,9 @@ func TestManager_EndToEnd(t *testing.T) {
 		t.Fatalf("reading client.key: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	serverTLS, err := newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -157,7 +166,7 @@ func TestManager_EndToEnd(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
@@ -330,9 +339,9 @@ func TestManager_SessionReconnect(t *testing.T) {
 		t.Fatalf("reading client.key: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	serverTLS, err := newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -356,7 +365,7 @@ func TestManager_SessionReconnect(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
@@ -583,9 +592,9 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 		t.Fatalf("reading client.key: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	serverTLS, err := newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -612,7 +621,7 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")

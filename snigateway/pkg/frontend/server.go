@@ -246,11 +246,6 @@ func (s *Server) ListenAndServe() error {
 	return s.ServeWithHTTP(tlsListeners, httpListeners)
 }
 
-// Serve serves TCP traffic on the given pre-created TLS listeners.
-func (s *Server) Serve(listeners ...net.Listener) error {
-	return s.ServeWithHTTP(listeners, nil)
-}
-
 // ServeWithHTTP serves TLS and HTTP TCP traffic on the given pre-created listeners.
 func (s *Server) ServeWithHTTP(tlsListeners []net.Listener, httpListeners []net.Listener) error {
 	allListeners := slices.Concat(tlsListeners, httpListeners)
