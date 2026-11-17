@@ -513,17 +513,17 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 //     the iterator, and returns the error.
 //   - Any other I/O or decode error: replay aborts immediately, closes the iterator, and returns
 //     the error.
-func (s *Engine) replay(it LogIterator, superseded map[string][]KeyIndexEntry) error {
+func (s *Engine) replay(iterator LogIterator, superseded map[string][]KeyIndexEntry) error {
 	s.writerMu.Lock()
 	defer s.writerMu.Unlock()
 
 	for {
-		rec, err := it.Next()
+		rec, err := iterator.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return errors.Join(fmt.Errorf("error during redo replay: %w", err), it.Close())
+			return errors.Join(fmt.Errorf("error during redo replay: %w", err), iterator.Close())
 		}
 
 		s.keyMu.RLock()
@@ -540,13 +540,13 @@ func (s *Engine) replay(it LogIterator, superseded map[string][]KeyIndexEntry) e
 				if ok && oldLSN < rec.LSN {
 					if oldEntry.NumBlocks > 1 {
 						if err := s.clearLogicalPageLocked(oldEntry.LogicalPage, rec.LSN); err != nil {
-							return errors.Join(err, it.Close())
+							return errors.Join(err, iterator.Close())
 						}
 					} else {
 						// When the older copy is an oversize pointer, replay removes the slot
 						// and leaves the old oversize file for the quarantine pass.
 						if err := s.deleteSlotFromPageLocked(oldEntry.LogicalPage, oldEntry.Slot, rec.LSN); err != nil {
-							return errors.Join(err, it.Close())
+							return errors.Join(err, iterator.Close())
 						}
 					}
 				} else {
@@ -574,7 +574,7 @@ func (s *Engine) replay(it LogIterator, superseded map[string][]KeyIndexEntry) e
 		case RecordTypePut, RecordTypePutPointer:
 			isOversize := rec.Type == RecordTypePutPointer
 			if err := s.applyPutLocked(rec.Key, rec.Payload, rec.LSN, isOversize); err != nil {
-				return errors.Join(err, it.Close())
+				return errors.Join(err, iterator.Close())
 			}
 
 		case RecordTypeDelete:
@@ -582,12 +582,12 @@ func (s *Engine) replay(it LogIterator, superseded map[string][]KeyIndexEntry) e
 				continue
 			}
 			if err := s.applyDeleteLocked(rec.Key, rec.LSN); err != nil {
-				return errors.Join(err, it.Close())
+				return errors.Join(err, iterator.Close())
 			}
 		}
 	}
 
-	if err := it.Close(); err != nil {
+	if err := iterator.Close(); err != nil {
 		return fmt.Errorf("failed to close redo iterator: %w", err)
 	}
 	return nil
@@ -601,4 +601,3 @@ func (s *Engine) replayWAL(redoStartLSN uint64, superseded map[string][]KeyIndex
 	}
 	return s.replay(walRedoIt, superseded)
 }
-
