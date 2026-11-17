@@ -537,9 +537,9 @@ func (e *OwnershipConflictError) Error() string {
 
 // reconcileDataplaneKey reconciles the desired data-plane configuration for a single Gateway.
 // The worker updates the cache only after the publisher accepts the config.
-// Each key is processed as its own Begin/Commit batch. For the in-process publisher,
-// this means one proxy update for each changed Gateway (rather than a single batch update
-// across all Gateways), so the proxy can briefly serve a mix of old and new Gateway configs.
+// For the in-process publisher, this means one proxy update for each changed Gateway
+// (rather than a single batch update across all Gateways), so the proxy can briefly serve
+// a mix of old and new Gateway configs.
 func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.NamespacedName) error {
 	s.mu.RLock()
 	var (
@@ -574,9 +574,6 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 			return nil
 		}
 
-		if err := publisher.Begin(ctx); err != nil {
-			klog.Errorf("failed to begin dataplane publish batch: %v", err)
-		}
 		deleteGW := &gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: gwKey.Namespace,
@@ -585,13 +582,6 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		}
 		if err := publisher.PublishDataplaneConfig(ctx, deleteGW, nil); err != nil {
 			klog.Errorf("failed to publish deletion of dataplane config for %s: %v", gwKey, err)
-			if commitErr := publisher.Commit(ctx); commitErr != nil {
-				klog.Errorf("failed to commit dataplane publish batch after deletion error for %s: %v", gwKey, commitErr)
-			}
-			return err
-		}
-		if err := publisher.Commit(ctx); err != nil {
-			klog.Errorf("failed to commit dataplane publish batch: %v", err)
 			return err
 		}
 
@@ -615,19 +605,8 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		return nil
 	}
 
-	if err := publisher.Begin(ctx); err != nil {
-		klog.Errorf("failed to begin dataplane publish batch: %v", err)
-	}
 	if err := publisher.PublishDataplaneConfig(ctx, gw, dpConfig); err != nil {
 		klog.Errorf("failed to publish dataplane config for %s (revision %s): %v", gwKey, dpConfig.Revision, err)
-		if commitErr := publisher.Commit(ctx); commitErr != nil {
-			klog.Errorf("failed to commit dataplane publish batch after publish error for %s: %v", gwKey, commitErr)
-		}
-		s.recordPublishError(gwKey, err)
-		return err
-	}
-	if err := publisher.Commit(ctx); err != nil {
-		klog.Errorf("failed to commit dataplane publish batch: %v", err)
 		s.recordPublishError(gwKey, err)
 		return err
 	}

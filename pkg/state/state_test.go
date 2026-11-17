@@ -792,8 +792,6 @@ type mockDataplanePublisher struct {
 	published  map[types.NamespacedName]*DataplaneConfig
 }
 
-func (m *mockDataplanePublisher) Begin(ctx context.Context) error  { return nil }
-func (m *mockDataplanePublisher) Commit(ctx context.Context) error { return nil }
 func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -951,6 +949,84 @@ func TestState_PublishDataplaneConfig_PlainError(t *testing.T) {
 	}
 }
 
+func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
+	st := NewState()
+	updater := &mockProxyUpdater{}
+	pub := NewInProcessDataplanePublisher(updater)
+	st.SetDataplanePublisher(pub)
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
+	}
+	// Config with an unparseable certificate triggers an apply error in ApplyDataplaneConfig.
+	badConfig := &DataplaneConfig{
+		GatewayName: gwKey,
+		Certificates: map[string]CertificateData{
+			"invalid-cert": {
+				Certificate: [][]byte{[]byte("invalid-cert-bytes")},
+				PrivateKey:  []byte("invalid-key-bytes"),
+			},
+		},
+	}
+
+	st.mu.Lock()
+	st.previousOutputs = &Outputs{
+		DataplaneConfigs: map[types.NamespacedName]*DataplaneConfig{
+			gwKey: badConfig,
+		},
+		CompiledGateways: map[types.NamespacedName]*CompiledGateway{
+			gwKey: {Gateway: gw},
+		},
+	}
+	st.mu.Unlock()
+
+	ctx := t.Context()
+	err := st.reconcileDataplaneKey(ctx, gwKey)
+	if err == nil {
+		t.Fatalf("expected reconcileDataplaneKey to fail due to apply error")
+	}
+
+	st.mu.RLock()
+	recordedErr := st.dataplaneState[gwKey].lastPublishError
+	provErr := st.provisioningErrors[gwKey]
+	st.mu.RUnlock()
+
+	if recordedErr == nil {
+		t.Fatalf("expected lastPublishError to be recorded on gateway dataplane state")
+	}
+	if recordedErr.Error() != err.Error() {
+		t.Errorf("expected recorded error %q, got %q", err.Error(), recordedErr.Error())
+	}
+	if provErr != err.Error() {
+		t.Errorf("expected provisioning error %q, got %q", err.Error(), provErr)
+	}
+
+	// When a valid config is subsequently reconciled, the recorded error is cleared.
+	validConfig := &DataplaneConfig{
+		GatewayName: gwKey,
+	}
+	st.mu.Lock()
+	st.previousOutputs.DataplaneConfigs[gwKey] = validConfig
+	st.mu.Unlock()
+
+	if err := st.reconcileDataplaneKey(ctx, gwKey); err != nil {
+		t.Fatalf("unexpected error after valid config: %v", err)
+	}
+
+	st.mu.RLock()
+	clearedRecordedErr := st.dataplaneState[gwKey].lastPublishError
+	clearedProvErr := st.provisioningErrors[gwKey]
+	st.mu.RUnlock()
+
+	if clearedRecordedErr != nil {
+		t.Errorf("expected lastPublishError to be cleared, got %v", clearedRecordedErr)
+	}
+	if clearedProvErr != "" {
+		t.Errorf("expected provisioning error to be cleared, got %q", clearedProvErr)
+	}
+}
+
 type retryTestPublisher struct {
 	mu                sync.Mutex
 	failCount         int
@@ -962,8 +1038,6 @@ type retryTestPublisher struct {
 	published         map[types.NamespacedName]*DataplaneConfig
 }
 
-func (m *retryTestPublisher) Begin(ctx context.Context) error  { return nil }
-func (m *retryTestPublisher) Commit(ctx context.Context) error { return nil }
 func (m *retryTestPublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

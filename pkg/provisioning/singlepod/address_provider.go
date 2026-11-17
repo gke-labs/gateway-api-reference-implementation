@@ -1564,16 +1564,6 @@ func readyEndpointAddresses(endpointSlices []discoveryv1.EndpointSlice) []string
 	return readyEndpoints
 }
 
-// Begin implements state.DataplanePublisher.
-func (p *AddressProvider) Begin(ctx context.Context) error {
-	return nil
-}
-
-// Commit implements state.DataplanePublisher.
-func (p *AddressProvider) Commit(ctx context.Context) error {
-	return nil
-}
-
 var (
 	_ controller.AddressProvider          = (*AddressProvider)(nil)
 	_ controller.AddressWatcher           = (*AddressProvider)(nil)

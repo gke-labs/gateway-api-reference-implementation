@@ -2421,17 +2421,11 @@ func TestInProcessDataplanePublisher_MultipleGatewaysDistinctCertificates(t *tes
 	}
 
 	ctx := t.Context()
-	if err := publisher.Begin(ctx); err != nil {
-		t.Fatalf("Begin failed: %v", err)
-	}
 	if err := publisher.PublishDataplaneConfig(ctx, gwA, dpConfigA); err != nil {
 		t.Fatalf("PublishDataplaneConfig gwA failed: %v", err)
 	}
 	if err := publisher.PublishDataplaneConfig(ctx, gwB, dpConfigB); err != nil {
 		t.Fatalf("PublishDataplaneConfig gwB failed: %v", err)
-	}
-	if err := publisher.Commit(ctx); err != nil {
-		t.Fatalf("Commit failed: %v", err)
 	}
 
 	// Assert each hostname resolves to its own distinct certificate

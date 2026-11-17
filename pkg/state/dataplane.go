@@ -102,9 +102,7 @@ func (cfg *DataplaneConfig) ComputeRevision() (string, error) {
 
 // DataplanePublisher defines the interface for publishing a Gateway's compiled data-plane configuration.
 type DataplanePublisher interface {
-	Begin(ctx context.Context) error
 	PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error
-	Commit(ctx context.Context) error
 }
 
 func tlsCertToData(cert *tls.Certificate) (CertificateData, error) {
@@ -452,8 +450,6 @@ type InProcessDataplanePublisher struct {
 	mu      sync.Mutex
 	updater ProxyConfigUpdater
 	configs map[types.NamespacedName]*DataplaneConfig
-	inBatch bool
-	dirty   bool
 }
 
 // NewInProcessDataplanePublisher creates a new in-process DataplanePublisher for the given proxy updater.
@@ -464,29 +460,14 @@ func NewInProcessDataplanePublisher(updater ProxyConfigUpdater) *InProcessDatapl
 	}
 }
 
-// Begin starts a batch of config updates. When in a batch, updates to the proxy
-// are deferred until Commit is called.
-func (p *InProcessDataplanePublisher) Begin(ctx context.Context) error {
-	if p == nil {
-		return nil
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.inBatch = true
-	p.dirty = false
-	return nil
-}
-
-// PublishDataplaneConfig records the config for a Gateway. If inside a Begin/Commit batch,
-// the proxy update is deferred until Commit. Otherwise, it is applied immediately.
+// PublishDataplaneConfig records the config for a Gateway and applies the merged
+// configuration to the proxy.
 func (p *InProcessDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
 	if p == nil || p.updater == nil {
 		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	p.dirty = true
 
 	if gw == nil || config == nil {
 		if gw != nil {
@@ -502,24 +483,6 @@ func (p *InProcessDataplanePublisher) PublishDataplaneConfig(ctx context.Context
 		p.configs[gwKey] = config
 	}
 
-	if !p.inBatch {
-		return p.applyLocked()
-	}
-	return nil
-}
-
-// Commit finalizes the batch and applies the merged configuration to the proxy if modified.
-func (p *InProcessDataplanePublisher) Commit(ctx context.Context) error {
-	if p == nil || p.updater == nil {
-		return nil
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.inBatch = false
-	if !p.dirty {
-		return nil
-	}
-	p.dirty = false
 	return p.applyLocked()
 }
 
