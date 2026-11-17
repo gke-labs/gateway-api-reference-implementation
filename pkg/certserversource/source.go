@@ -98,7 +98,6 @@ type Source struct {
 	renewalWindow  time.Duration
 	evictionPeriod time.Duration
 	logInterval    time.Duration
-	clusterID      string
 	timeNow        func() time.Time
 
 	// mu guards cache and recomputeTrigger.
@@ -495,7 +494,6 @@ func (s *Source) fetchLoop(key cacheKey, hostnames []string, gateway string, dat
 		Hostnames:               hostnames,
 		Gateway:                 gateway,
 		DataPlaneServiceAccount: dataPlaneSA,
-		ClusterId:               s.clusterID,
 		Addresses:               addresses,
 	}
 
