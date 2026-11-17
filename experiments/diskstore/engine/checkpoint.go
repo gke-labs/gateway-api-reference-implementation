@@ -29,7 +29,6 @@ type Checkpointer struct {
 
 	activeSlot       int    // 0 or 1: index of slot holding latest valid recovery position
 	slotCounter      uint64 // counter in the latest valid slot
-	hasActiveSlot    bool   // true if at least one valid slot exists
 	recoveryStartLSN uint64 // current recovery start LSN
 }
 
@@ -40,20 +39,19 @@ func NewCheckpointer(bp *BlockPool, heapFile File, wal Log, metaFile ...File) *C
 		mf = metaFile[0]
 	}
 	return &Checkpointer{
-		bp:         bp,
-		heapFile:   heapFile,
-		wal:        wal,
-		metaFile:   mf,
-		activeSlot: 1, // default so first write targets slot 0
+		bp:          bp,
+		heapFile:    heapFile,
+		wal:         wal,
+		metaFile:    mf,
+		slotCounter: 1,
 	}
 }
 
-func (c *Checkpointer) initRecoverySlot(activeSlot int, slotCounter uint64, hasActive bool, recoveryStartLSN uint64) {
+func (c *Checkpointer) initRecoverySlot(activeSlot int, slotCounter uint64, recoveryStartLSN uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.activeSlot = activeSlot
 	c.slotCounter = slotCounter
-	c.hasActiveSlot = hasActive
 	c.recoveryStartLSN = recoveryStartLSN
 }
 
@@ -69,12 +67,8 @@ func (c *Checkpointer) writeRecoverySlotLocked(redoStartLSN uint64) error {
 		return nil
 	}
 
-	targetSlot := 0
-	nextCounter := uint64(1)
-	if c.hasActiveSlot {
-		targetSlot = 1 - c.activeSlot
-		nextCounter = c.slotCounter + 1
-	}
+	targetSlot := 1 - c.activeSlot
+	nextCounter := c.slotCounter + 1
 
 	slot := recoveryStartSlot{
 		recoveryStartLSN: redoStartLSN,
@@ -97,7 +91,6 @@ func (c *Checkpointer) writeRecoverySlotLocked(redoStartLSN uint64) error {
 
 	c.activeSlot = targetSlot
 	c.slotCounter = nextCounter
-	c.hasActiveSlot = true
 	c.recoveryStartLSN = redoStartLSN
 	return nil
 }

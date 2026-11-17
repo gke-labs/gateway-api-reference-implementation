@@ -494,9 +494,9 @@ func decodeRecoveryStartSlot(buf []byte) (recoveryStartSlot, error) {
 // readRecoveryStartSlots reads both recovery start slots from metaBuffer and selects
 // the valid slot with the larger counter. If one slot fails its checksum, it uses the other.
 // If both fail, it returns an error naming metaPath without guessing.
-func readRecoveryStartSlots(metaBuffer []byte, metaPath string) (recoveryStartLSN uint64, activeSlot int, slotCounter uint64, hasActive bool, err error) {
+func readRecoveryStartSlots(metaBuffer []byte, metaPath string) (recoveryStartLSN uint64, activeSlot int, slotCounter uint64, err error) {
 	if len(metaBuffer) < metaOffsetReserved {
-		return 0, 0, 0, false, fmt.Errorf("%s: meta buffer too small for recovery start slots", metaPath)
+		return 0, 0, 0, fmt.Errorf("%s: meta buffer too small for recovery start slots", metaPath)
 	}
 
 	slot0Bytes := metaBuffer[metaOffsetRecoverySlot0 : metaOffsetRecoverySlot0+recoveryStartSlotSize]
@@ -507,21 +507,17 @@ func readRecoveryStartSlots(metaBuffer []byte, metaPath string) (recoveryStartLS
 
 	if err0 == nil && err1 == nil {
 		if slot1.counter > slot0.counter {
-			return slot1.recoveryStartLSN, 1, slot1.counter, true, nil
+			return slot1.recoveryStartLSN, 1, slot1.counter, nil
 		}
-		return slot0.recoveryStartLSN, 0, slot0.counter, true, nil
+		return slot0.recoveryStartLSN, 0, slot0.counter, nil
 	}
-
-	if err0 == nil && err1 != nil {
-		return slot0.recoveryStartLSN, 0, slot0.counter, true, nil
+	if err0 == nil {
+		return slot0.recoveryStartLSN, 0, slot0.counter, nil
 	}
-
-	if err0 != nil && err1 == nil {
-		return slot1.recoveryStartLSN, 1, slot1.counter, true, nil
+	if err1 == nil {
+		return slot1.recoveryStartLSN, 1, slot1.counter, nil
 	}
-
-	// Both slots failed checksum.
-	return 0, 0, 0, false, fmt.Errorf("%s: both recovery start slots corrupt: slot 0 (%v), slot 1 (%v)", metaPath, err0, err1)
+	return 0, 0, 0, fmt.Errorf("%s: both recovery start slots corrupt: slot 0 (%v), slot 1 (%v)", metaPath, err0, err1)
 }
 
 // metaRecord represents the decoded contents of meta.db.
@@ -647,7 +643,7 @@ func isEncrypted(c Cipher) bool {
 }
 
 // Open opens or initializes an Engine in dir.
-func Open(opts ...Option) (*Engine, error) {
+func Open(opts ...Option) (_ *Engine, err error) {
 	options := Options{
 		FS:               NewOSFS(),
 		Cipher:           NoopCipher{},
@@ -736,9 +732,8 @@ func Open(opts ...Option) (*Engine, error) {
 	var dbID [16]byte
 	isNewStore := false
 	var recoveryStartLSN uint64
-	activeSlot := 1
-	var slotCounter uint64
-	var hasActiveSlot bool
+	var activeSlot int
+	var slotCounter uint64 = 1
 
 	if needsErase {
 		isNewStore = true
@@ -844,7 +839,7 @@ func Open(opts ...Option) (*Engine, error) {
 
 					if !needsErase {
 						var slotErr error
-						recoveryStartLSN, activeSlot, slotCounter, hasActiveSlot, slotErr = readRecoveryStartSlots(
+						recoveryStartLSN, activeSlot, slotCounter, slotErr = readRecoveryStartSlots(
 							metaBuffer,
 							metaPath,
 						)
@@ -894,7 +889,9 @@ func Open(opts ...Option) (*Engine, error) {
 	var sMetaFile File
 	defer func() {
 		if s == nil && sMetaFile != nil {
-			_ = sMetaFile.Close()
+			if closeErr := sMetaFile.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 		}
 	}()
 
@@ -1031,16 +1028,15 @@ func Open(opts ...Option) (*Engine, error) {
 			HeapCipher:    heapCipher,
 		})
 		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile)
-		s.cp.initRecoverySlot(0, 1, true, 0)
+		s.cp.initRecoverySlot(0, 1, 0)
 	} else {
 		// Existing store: perform crash recovery scan and WAL redo replay
 		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID, RecoveryOptions{
-			Quarantine:          options.Quarantine,
-			HeapCipher:          heapCipher,
-			ClosedCleanly:       closedCleanly,
-			EncryptionKey:       options.EncryptionKey,
-			RecoveryStartLSN:    recoveryStartLSN,
-			HasRecoveryStartLSN: true,
+			Quarantine:       options.Quarantine,
+			HeapCipher:       heapCipher,
+			ClosedCleanly:    closedCleanly,
+			EncryptionKey:    options.EncryptionKey,
+			RecoveryStartLSN: recoveryStartLSN,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
@@ -1091,7 +1087,7 @@ func Open(opts ...Option) (*Engine, error) {
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile)
-		s.cp.initRecoverySlot(activeSlot, slotCounter, hasActiveSlot, recoveryStartLSN)
+		s.cp.initRecoverySlot(activeSlot, slotCounter, recoveryStartLSN)
 
 		// Replay WAL records from redo start LSN through write path apply functions.
 		if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.SupersededPages); err != nil {

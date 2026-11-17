@@ -157,8 +157,6 @@ type RecoveryOptions struct {
 	// RecoveryStartLSN is the start LSN for recovery read from meta.db.
 	// When non-zero, recovery replays the log starting from this LSN.
 	RecoveryStartLSN uint64
-	// HasRecoveryStartLSN indicates that RecoveryStartLSN was explicitly provided by the caller.
-	HasRecoveryStartLSN bool
 }
 
 // Recover scans the heap file, filters out foreign and torn copies, finds the WAL redo start LSN,
@@ -452,18 +450,6 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	// Step 4: Scan WAL to find maxWAL_LSN and verify the write-ahead rule.
 	// Recovery takes its start LSN from meta.db only; it does not read checkpoint records.
 	redoStartLSN := options.RecoveryStartLSN
-	if !options.HasRecoveryStartLSN && redoStartLSN == 0 && storeDir != "" {
-		metaPath := filepath.Join(storeDir, "meta.db")
-		if metaFile, err := fs.Open(metaPath); err == nil {
-			var metaBuf [metaFileSize]byte
-			if _, err := metaFile.ReadAt(metaBuf[:], 0); err == nil {
-				if lsn, _, _, hasActive, _ := readRecoveryStartSlots(metaBuf[:], metaPath); hasActive {
-					redoStartLSN = lsn
-				}
-			}
-			_ = metaFile.Close()
-		}
-	}
 	if redoStartLSN == 0 {
 		redoStartLSN = 1
 	}
