@@ -135,53 +135,54 @@ type DataplanePublisher interface {
 type MultiDataplanePublisher []DataplanePublisher
 
 // NewMultiDataplanePublisher creates a DataplanePublisher that broadcasts to all non-nil publishers.
+// If one publisher fails, the others still receive the configuration and the state records the joined error.
 func NewMultiDataplanePublisher(publishers ...DataplanePublisher) DataplanePublisher {
-	var nonNil []DataplanePublisher
-	for _, p := range publishers {
-		if p != nil {
-			nonNil = append(nonNil, p)
+	var nonNilPublishers []DataplanePublisher
+	for _, publisher := range publishers {
+		if publisher != nil {
+			nonNilPublishers = append(nonNilPublishers, publisher)
 		}
 	}
-	if len(nonNil) == 0 {
+	if len(nonNilPublishers) == 0 {
 		return nil
 	}
-	if len(nonNil) == 1 {
-		return nonNil[0]
+	if len(nonNilPublishers) == 1 {
+		return nonNilPublishers[0]
 	}
-	return MultiDataplanePublisher(nonNil)
+	return MultiDataplanePublisher(nonNilPublishers)
 }
 
 // Begin implements DataplanePublisher.
-func (m MultiDataplanePublisher) Begin(ctx context.Context) error {
-	var errs []error
-	for _, p := range m {
-		if err := p.Begin(ctx); err != nil {
-			errs = append(errs, err)
+func (multi MultiDataplanePublisher) Begin(ctx context.Context) error {
+	var errorsList []error
+	for _, publisher := range multi {
+		if err := publisher.Begin(ctx); err != nil {
+			errorsList = append(errorsList, err)
 		}
 	}
-	return errors.Join(errs...)
+	return errors.Join(errorsList...)
 }
 
 // PublishDataplaneConfig implements DataplanePublisher.
-func (m MultiDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
-	var errs []error
-	for _, p := range m {
-		if err := p.PublishDataplaneConfig(ctx, gw, config); err != nil {
-			errs = append(errs, err)
+func (multi MultiDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gateway *gatewayv1.Gateway, config *DataplaneConfig) error {
+	var errorsList []error
+	for _, publisher := range multi {
+		if err := publisher.PublishDataplaneConfig(ctx, gateway, config); err != nil {
+			errorsList = append(errorsList, err)
 		}
 	}
-	return errors.Join(errs...)
+	return errors.Join(errorsList...)
 }
 
 // Commit implements DataplanePublisher.
-func (m MultiDataplanePublisher) Commit(ctx context.Context) error {
-	var errs []error
-	for _, p := range m {
-		if err := p.Commit(ctx); err != nil {
-			errs = append(errs, err)
+func (multi MultiDataplanePublisher) Commit(ctx context.Context) error {
+	var errorsList []error
+	for _, publisher := range multi {
+		if err := publisher.Commit(ctx); err != nil {
+			errorsList = append(errorsList, err)
 		}
 	}
-	return errors.Join(errs...)
+	return errors.Join(errorsList...)
 }
 
 var _ DataplanePublisher = (MultiDataplanePublisher)(nil)

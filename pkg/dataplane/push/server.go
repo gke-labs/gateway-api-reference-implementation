@@ -22,11 +22,9 @@ import (
 	"io"
 	"net"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -160,22 +158,20 @@ type ServerOptions struct {
 	SendTimeout time.Duration
 }
 
-// StreamReply records the latest acknowledgment or negative acknowledgment received from a data plane stream.
-// This record is read by the controller step that derives the Programmed condition.
-type StreamReply struct {
-	Revision string
-	Accepted bool
-	Reason   string
-}
-
 type gatewayConfig struct {
+	// revision is the content-derived version identifier of the configuration.
 	revision string
-	data     []byte
+
+	// data is the JSON-encoded DataplaneConfig payload pushed to data planes.
+	data []byte
 }
 
 type streamSubscriber struct {
-	id       uint64
-	notifyCh chan struct{}
+	// id uniquely identifies this stream subscriber.
+	id uint64
+
+	// notifyChannel signals when a new configuration revision is available.
+	notifyChannel chan struct{}
 }
 
 // Server implements PushServiceServer for configuration push.
@@ -191,20 +187,17 @@ type Server struct {
 	// sendTimeout is the maximum duration allowed to push a configuration to a stream.
 	sendTimeout time.Duration
 
-	// mu guards streams, subscribers, configs, and replies.
+	// mu guards streams, subscribers, and configs.
 	mu sync.Mutex
 
 	// streams tracks the number of active streams grouped by Gateway namespace and name.
 	streams map[types.NamespacedName]int
 
-	// subscribers tracks active stream subscribers grouped by Gateway.
+	// subscribers tracks active stream subscribers grouped by Gateway namespace and name.
 	subscribers map[types.NamespacedName]map[uint64]*streamSubscriber
 
-	// configs holds the latest configuration for each Gateway.
+	// configs holds the latest configuration for each Gateway namespace and name.
 	configs map[types.NamespacedName]*gatewayConfig
-
-	// replies holds the last reply for each stream grouped by Gateway.
-	replies map[types.NamespacedName]map[uint64]StreamReply
 
 	// nextStreamID generates unique IDs for streams.
 	nextStreamID uint64
@@ -236,7 +229,6 @@ func NewServer(options ServerOptions) (*Server, error) {
 		streams:              make(map[types.NamespacedName]int),
 		subscribers:          make(map[types.NamespacedName]map[uint64]*streamSubscriber),
 		configs:              make(map[types.NamespacedName]*gatewayConfig),
-		replies:              make(map[types.NamespacedName]map[uint64]StreamReply),
 	}, nil
 }
 
@@ -251,76 +243,52 @@ func (server *Server) Commit(ctx context.Context) error {
 }
 
 // PublishDataplaneConfig implements state.DataplanePublisher.
-func (server *Server) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
-	if gw == nil {
+func (server *Server) PublishDataplaneConfig(ctx context.Context, gateway *gatewayv1.Gateway, config *state.DataplaneConfig) error {
+	if gateway == nil {
 		return nil
 	}
-	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	gatewayKey := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
 
 	if config == nil {
 		server.mu.Lock()
-		delete(server.configs, gwKey)
-		delete(server.replies, gwKey)
+		delete(server.configs, gatewayKey)
 		server.mu.Unlock()
 		return nil
 	}
 
-	rev := config.Revision
-	if rev == "" {
-		var err error
-		rev, err = config.ComputeRevision()
-		if err != nil {
-			return fmt.Errorf("computing revision for gateway %s: %w", gwKey, err)
-		}
-		config.Revision = rev
+	if config.Revision == "" {
+		return fmt.Errorf("dataplane config for gateway %s has empty revision", gatewayKey)
 	}
 
 	data, err := json.Marshal(config)
 	if err != nil {
-		return fmt.Errorf("marshaling dataplane config for gateway %s: %w", gwKey, err)
+		return fmt.Errorf("marshaling dataplane config for gateway %s: %w", gatewayKey, err)
 	}
 
 	server.mu.Lock()
 	if server.configs == nil {
 		server.configs = make(map[types.NamespacedName]*gatewayConfig)
 	}
-	server.configs[gwKey] = &gatewayConfig{
-		revision: rev,
+	server.configs[gatewayKey] = &gatewayConfig{
+		revision: config.Revision,
 		data:     data,
 	}
 
-	for _, sub := range server.subscribers[gwKey] {
+	// Notify all active stream subscribers for this Gateway. notifyChannel has a buffer
+	// capacity of 1. A non-blocking send drops the token only when a notification is
+	// already pending in the channel. Because runSender always reads the latest configuration
+	// directly from server.configs under mutex when processing a notification, intermediate
+	// revisions that arrive while a send is in flight are coalesced into the latest revision,
+	// and no updates are lost.
+	for _, subscriber := range server.subscribers[gatewayKey] {
 		select {
-		case sub.notifyCh <- struct{}{}:
+		case subscriber.notifyChannel <- struct{}{}:
 		default:
 		}
 	}
 	server.mu.Unlock()
 
 	return nil
-}
-
-// StreamReplies returns the latest reply recorded for each stream serving the given Gateway.
-// This is read by the controller step that derives the Programmed condition.
-func (server *Server) StreamReplies(gw types.NamespacedName) []StreamReply {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-
-	gwReplies, ok := server.replies[gw]
-	if !ok || len(gwReplies) == 0 {
-		return nil
-	}
-	result := make([]StreamReply, 0, len(gwReplies))
-	for _, r := range gwReplies {
-		result = append(result, r)
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Revision != result[j].Revision {
-			return result[i].Revision < result[j].Revision
-		}
-		return result[i].Reason < result[j].Reason
-	})
-	return result
 }
 
 // defaultServerOptions returns gRPC server options with keepalive settings and raised message limits.
@@ -375,17 +343,6 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener, options 
 		return nil
 	}
 	return err
-}
-
-func truncateReason(reason string) string {
-	if len(reason) <= MaxNACKReasonBytes {
-		return reason
-	}
-	reason = reason[:MaxNACKReasonBytes]
-	for !utf8.ValidString(reason) && len(reason) > 0 {
-		reason = reason[:len(reason)-1]
-	}
-	return reason
 }
 
 // StreamConfig establishes a bidirectional stream with a data plane.
@@ -445,66 +402,66 @@ func (server *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMess
 	streamID := server.nextStreamID
 	server.nextStreamID++
 
-	sub := &streamSubscriber{
-		id:       streamID,
-		notifyCh: make(chan struct{}, 1),
+	subscriber := &streamSubscriber{
+		id:            streamID,
+		notifyChannel: make(chan struct{}, 1),
 	}
 	if server.subscribers[gatewayKey] == nil {
 		server.subscribers[gatewayKey] = make(map[uint64]*streamSubscriber)
 	}
-	server.subscribers[gatewayKey][streamID] = sub
+	server.subscribers[gatewayKey][streamID] = subscriber
 	server.mu.Unlock()
-
-	defer func() {
-		server.mu.Lock()
-		server.streams[gatewayKey]--
-		if server.streams[gatewayKey] <= 0 {
-			delete(server.streams, gatewayKey)
-		}
-		if subs, ok := server.subscribers[gatewayKey]; ok {
-			delete(subs, streamID)
-			if len(subs) == 0 {
-				delete(server.subscribers, gatewayKey)
-			}
-		}
-		if reps, ok := server.replies[gatewayKey]; ok {
-			delete(reps, streamID)
-			if len(reps) == 0 {
-				delete(server.replies, gatewayKey)
-			}
-		}
-		server.mu.Unlock()
-	}()
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	senderErrCh := make(chan error, 1)
-	receiverErrCh := make(chan error, 1)
+	var senderWaitGroup sync.WaitGroup
+	senderWaitGroup.Add(1)
+	senderErrChannel := make(chan error, 1)
 
 	go func() {
-		senderErrCh <- server.runSender(streamCtx, stream, gatewayKey, sub, hello.AppliedRevision, logger)
+		defer senderWaitGroup.Done()
+		senderErrChannel <- server.runSender(streamCtx, stream, gatewayKey, subscriber, hello.AppliedRevision, logger)
 	}()
 
+	receiverErrChannel := make(chan error, 1)
 	go func() {
-		receiverErrCh <- server.runReceiver(streamCtx, stream, gatewayKey, streamID)
+		receiverErrChannel <- server.runReceiver(stream)
 	}()
 
+	var returnErr error
 	select {
-	case err := <-senderErrCh:
+	case returnErr = <-senderErrChannel:
 		cancel()
-		return err
-	case err := <-receiverErrCh:
+	case returnErr = <-receiverErrChannel:
 		cancel()
-		return err
 	}
+
+	// Wait for the sender goroutine to exit so it cannot call stream.Send
+	// or access server maps after StreamConfig returns.
+	senderWaitGroup.Wait()
+
+	server.mu.Lock()
+	server.streams[gatewayKey]--
+	if server.streams[gatewayKey] <= 0 {
+		delete(server.streams, gatewayKey)
+	}
+	if subscribers, ok := server.subscribers[gatewayKey]; ok {
+		delete(subscribers, streamID)
+		if len(subscribers) == 0 {
+			delete(server.subscribers, gatewayKey)
+		}
+	}
+	server.mu.Unlock()
+
+	return returnErr
 }
 
 func (server *Server) runSender(
 	ctx context.Context,
 	stream grpc.BidiStreamingServer[DataplaneMessage, ControllerMessage],
 	gatewayKey types.NamespacedName,
-	sub *streamSubscriber,
+	subscriber *streamSubscriber,
 	appliedRevision string,
 	logger klog.Logger,
 ) error {
@@ -520,7 +477,7 @@ func (server *Server) runSender(
 		}
 
 		if len(latest.data) > MaxConfigMessageBytes {
-			logger.Error(nil, fmt.Sprintf("dataplane config for gateway %s (%d bytes) exceeds MaxConfigMessageBytes (%d bytes)", gatewayKey, len(latest.data), MaxConfigMessageBytes),
+			logger.Error(nil, "dataplane config exceeds MaxConfigMessageBytes; not sending to stream",
 				"gateway", gatewayKey.String(),
 				"size", len(latest.data),
 				"maxSize", MaxConfigMessageBytes,
@@ -529,7 +486,7 @@ func (server *Server) runSender(
 			return nil
 		}
 
-		msg := &ControllerMessage{
+		message := &ControllerMessage{
 			Body: &ControllerMessage_Config{
 				Config: &Config{
 					Revision:        latest.revision,
@@ -540,7 +497,7 @@ func (server *Server) runSender(
 
 		sendDone := make(chan error, 1)
 		go func() {
-			sendDone <- stream.Send(msg)
+			sendDone <- stream.Send(message)
 		}()
 
 		timer := time.NewTimer(server.sendTimeout)
@@ -575,7 +532,7 @@ func (server *Server) runSender(
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-sub.notifyCh:
+		case <-subscriber.notifyChannel:
 			if err := sendLatest(); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return nil
@@ -587,15 +544,12 @@ func (server *Server) runSender(
 }
 
 func (server *Server) runReceiver(
-	ctx context.Context,
 	stream grpc.BidiStreamingServer[DataplaneMessage, ControllerMessage],
-	gatewayKey types.NamespacedName,
-	streamID uint64,
 ) error {
 	for {
 		message, err := stream.Recv()
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+			if errors.Is(err, io.EOF) || status.Code(err) == codes.Canceled {
 				return nil
 			}
 			return err
@@ -603,31 +557,6 @@ func (server *Server) runReceiver(
 
 		if message.GetHello() != nil {
 			return status.Errorf(codes.InvalidArgument, "unexpected second Hello message")
-		}
-
-		if ack := message.GetAck(); ack != nil {
-			server.mu.Lock()
-			if server.replies[gatewayKey] == nil {
-				server.replies[gatewayKey] = make(map[uint64]StreamReply)
-			}
-			server.replies[gatewayKey][streamID] = StreamReply{
-				Revision: ack.AppliedRevision,
-				Accepted: true,
-				Reason:   "",
-			}
-			server.mu.Unlock()
-		} else if nack := message.GetNack(); nack != nil {
-			reason := truncateReason(nack.Reason)
-			server.mu.Lock()
-			if server.replies[gatewayKey] == nil {
-				server.replies[gatewayKey] = make(map[uint64]StreamReply)
-			}
-			server.replies[gatewayKey][streamID] = StreamReply{
-				Revision: nack.Revision,
-				Accepted: false,
-				Reason:   reason,
-			}
-			server.mu.Unlock()
 		}
 	}
 }
