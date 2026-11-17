@@ -22,6 +22,10 @@ rules:
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# ReplicaSet read access (get) is required for the singlepod host-ports address provider to verify owner references from data-plane pods to their owning Deployment.
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get"]
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["roles", "rolebindings"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -34,6 +38,14 @@ rules:
 - apiGroups: ["discovery.k8s.io"]
   resources: ["endpointslices"]
   verbs: ["get", "list", "watch"]
+# Pod read access (get, list) is required for the singlepod host-ports address provider to find the Gateway's data-plane pod via the uncached direct API reader.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+# Node read access (get) is required for the singlepod host-ports address provider to look up the data-plane pod's node address directly by name via the uncached direct API reader.
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status", "tlsroutes/status", "grpcroutes/status", "tcproutes/status", "udproutes/status"]
   verbs: ["update", "patch"]

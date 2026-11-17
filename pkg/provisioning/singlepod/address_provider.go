@@ -23,8 +23,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -377,6 +379,43 @@ func isOwnedByGateway(obj metav1.Object, gw *gatewayv1.Gateway) bool {
 		return false
 	}
 	return ref.Kind == "Gateway" && ref.Name == gw.Name && gw.UID != "" && ref.UID == gw.UID
+}
+
+// podBelongsToDeployment checks whether pod belongs to the given Deployment through owner references
+// (specifically through its owning ReplicaSet).
+func podBelongsToDeployment(ctx context.Context, reader client.Reader, pod *corev1.Pod, deployment *appsv1.Deployment) (bool, error) {
+	if pod == nil || deployment == nil || deployment.UID == "" {
+		return false, nil
+	}
+	controllerRef := metav1.GetControllerOf(pod)
+	if controllerRef == nil {
+		return false, nil
+	}
+	if controllerRef.Kind == "ReplicaSet" {
+		var replicaSet appsv1.ReplicaSet
+		err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: controllerRef.Name}, &replicaSet)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("getting ReplicaSet %s/%s for pod %s: %w", pod.Namespace, controllerRef.Name, pod.Name, err)
+		}
+		if replicaSet.UID == "" || controllerRef.UID != replicaSet.UID {
+			return false, nil
+		}
+		rsControllerRef := metav1.GetControllerOf(&replicaSet)
+		if rsControllerRef == nil {
+			return false, nil
+		}
+		if rsControllerRef.Kind == "Deployment" && rsControllerRef.Name == deployment.Name && rsControllerRef.UID == deployment.UID {
+			return true, nil
+		}
+		return false, nil
+	}
+	if controllerRef.Kind == "Deployment" && controllerRef.Name == deployment.Name && controllerRef.UID == deployment.UID {
+		return true, nil
+	}
+	return false, nil
 }
 
 func buildLabelsAndAnnotations(gw *gatewayv1.Gateway) (map[string]string, map[string]string) {
@@ -1051,14 +1090,128 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	if p.useHostPorts {
-		message := "Waiting for data-plane deployment to become available"
-		if deployReady {
-			message = "Waiting for node address to be assigned to host-port Gateway"
+		// Use the direct, uncached reader (p.apiReader) for Pod and Node lookups to avoid
+		// starting unbounded cluster-wide cache informers for all Pods and Nodes.
+		reader := p.apiReader
+		if reader == nil {
+			return nil, state.GatewayReadiness{}, fmt.Errorf("apiReader is required for host-ports address provider")
 		}
-		return nil, state.GatewayReadiness{
-			Ready:   false,
-			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
-			Message: message,
+
+		var podList corev1.PodList
+		if err := reader.List(ctx, &podList, client.InNamespace(gwNamespace), client.MatchingLabels{
+			LabelGatewayName: labelGwName,
+			LabelAppName:     AppNameValue,
+		}); err != nil {
+			return nil, state.GatewayReadiness{}, fmt.Errorf("listing data-plane pods for Gateway %s/%s: %w", gwNamespace, gw.Name, err)
+		}
+
+		var selectedPod *corev1.Pod
+		for index := range podList.Items {
+			pod := &podList.Items[index]
+			if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+				continue
+			}
+			belongs, err := podBelongsToDeployment(ctx, reader, pod, &existingDeploy)
+			if err != nil {
+				return nil, state.GatewayReadiness{}, err
+			}
+			if !belongs {
+				continue
+			}
+			if selectedPod == nil {
+				selectedPod = pod
+				continue
+			}
+			if selectedPod.DeletionTimestamp != nil && pod.DeletionTimestamp == nil {
+				selectedPod = pod
+				continue
+			}
+			if selectedPod.DeletionTimestamp == nil && pod.DeletionTimestamp != nil {
+				continue
+			}
+			if selectedPod.Spec.NodeName == "" && pod.Spec.NodeName != "" {
+				selectedPod = pod
+				continue
+			}
+			if selectedPod.Spec.NodeName != "" && pod.Spec.NodeName == "" {
+				continue
+			}
+			if pod.CreationTimestamp.After(selectedPod.CreationTimestamp.Time) {
+				selectedPod = pod
+			}
+		}
+
+		if selectedPod == nil || selectedPod.Spec.NodeName == "" {
+			message := "Waiting for data-plane deployment to become available"
+			if deployReady {
+				message = "Waiting for node address to be assigned to host-port Gateway"
+			}
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+				Message: message,
+			}, nil
+		}
+
+		var node corev1.Node
+		if err := reader.Get(ctx, types.NamespacedName{Name: selectedPod.Spec.NodeName}, &node); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, state.GatewayReadiness{
+					Ready:   false,
+					Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+					Message: fmt.Sprintf("Node %s not found", selectedPod.Spec.NodeName),
+				}, nil
+			}
+			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Node %s for Gateway %s/%s: %w", selectedPod.Spec.NodeName, gwNamespace, gw.Name, err)
+		}
+
+		var internalIPs []string
+		for index := range node.Status.Addresses {
+			nodeAddress := node.Status.Addresses[index]
+			if nodeAddress.Type == corev1.NodeInternalIP && nodeAddress.Address != "" {
+				internalIPs = append(internalIPs, strings.TrimSpace(nodeAddress.Address))
+			}
+		}
+
+		if len(internalIPs) == 0 {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+				Message: fmt.Sprintf("Node %s has no NodeInternalIP addresses", selectedPod.Spec.NodeName),
+			}, nil
+		}
+
+		slices.SortFunc(internalIPs, func(firstAddress, secondAddress string) int {
+			firstIP, firstParseErr := netip.ParseAddr(firstAddress)
+			secondIP, secondParseErr := netip.ParseAddr(secondAddress)
+			if firstParseErr == nil && secondParseErr == nil {
+				return firstIP.Compare(secondIP)
+			}
+			return strings.Compare(firstAddress, secondAddress)
+		})
+		internalIPs = slices.Compact(internalIPs)
+
+		var addresses []gatewayv1.GatewayStatusAddress
+		for index := range internalIPs {
+			ipAddress := internalIPs[index]
+			addresses = append(addresses, gatewayv1.GatewayStatusAddress{
+				Type:  state.Ptr(gatewayv1.IPAddressType),
+				Value: ipAddress,
+			})
+		}
+
+		if !deployReady {
+			return addresses, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonPending),
+				Message: "Waiting for data-plane deployment to become available",
+			}, nil
+		}
+
+		return addresses, state.GatewayReadiness{
+			Ready:   true,
+			Reason:  string(gatewayv1.GatewayReasonProgrammed),
+			Message: "Gateway programmed by reference implementation",
 		}, nil
 	}
 
@@ -1198,7 +1351,13 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	return addrs, readiness.Ready, err
 }
 
-// SupportedAddressTypes returns the address types supported by singlepod.
+// SupportedAddressTypes returns the address types supported by singlepod in Gateway.spec.addresses.
+//
+// When host ports are enabled (WithHostPorts), this returns nil because host-port Gateways assign node LAN
+// IP addresses dynamically from the node running the data-plane pod and do not support user-requested
+// spec.addresses. Returning nil causes GARI to reject requested spec.addresses with Accepted=False and
+// reason UnsupportedAddress. Even though Gateway.status.addresses publishes IPAddress values discovered
+// from the node, requested addresses in spec.addresses remain unsupported.
 func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
 	if p.useHostPorts {
 		return nil
@@ -1242,6 +1401,12 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 	ownerHandler := handler.EnqueueRequestForOwner(scheme, mapper, &gatewayv1.Gateway{}, handler.OnlyControllerOwner())
 
 	bldr.Watches(&corev1.Service{}, ownerHandler, builder.WithPredicates(pred))
+	// In host-ports mode, the provider watches Deployments (and Services) only rather than
+	// watching all Pods in the cluster. When the data-plane pod is scheduled or moves to another node,
+	// the Kubernetes Deployment controller observes the ReplicaSet/Pod status changes and updates
+	// the Deployment's status (such as ReadyReplicas or AvailableReplicas). That status change fires
+	// the Deployment watch below and enqueues the owning Gateway for reconciliation, allowing a
+	// sub-second delay while the Deployment controller converges.
 	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
 
 	return nil
