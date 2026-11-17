@@ -192,6 +192,7 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "gateway-namespace", DefValue: "", Usage: "The namespace of the Gateway to serve in data-plane mode."},
 		{Name: "health-probe-bind-address", DefValue: ":8999", Usage: "The address the probe endpoint binds to."},
 		{Name: "idle-timeout", DefValue: "1m0s", Usage: "The maximum amount of time to wait for the next request when keep-alives are enabled."},
+		{Name: "init-push-credentials", DefValue: "false", Usage: "Create or renew TLS credentials for the configuration push listener, then exit."},
 		{Name: "leader-elect", DefValue: "false", Usage: "Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager."},
 		{Name: "metrics-bind-address", DefValue: ":8999", Usage: "The address the metric endpoint binds to."},
 		{Name: "proxy-bind-address", DefValue: ":8080", Usage: "The address the proxy binds to for HTTP."},
@@ -201,6 +202,7 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "proxy-protocol", DefValue: "", Usage: "Enable PROXY protocol ('enabled')."},
 		{Name: "proxy-protocol-trusted-cidrs", DefValue: "", Usage: "Comma-separated list of trusted CIDRs for PROXY protocol."},
 		{Name: "push-bind-address", DefValue: "", Usage: "The address the configuration push stream gRPC server binds to (disabled by default)."},
+		{Name: "push-credentials-namespace", DefValue: "", Usage: "Namespace in which to create/renew push credentials (defaults to POD_NAMESPACE or in-cluster namespace or 'default')."},
 		{Name: "push-tls-cert-file", DefValue: "", Usage: "Path to TLS server certificate file for configuration push gRPC endpoint. The listener stays off until a certificate that data planes can verify is provided, and how it is provided is not settled."},
 		{Name: "push-tls-key-file", DefValue: "", Usage: "Path to TLS server private key file for configuration push gRPC endpoint."},
 		{Name: "read-header-timeout", DefValue: "10s", Usage: "The amount of time allowed to read request headers on HTTP and HTTPS servers."},
@@ -330,5 +332,17 @@ func TestSetup_ModeSelection(t *testing.T) {
 	}
 	if optsDP.DataplaneGatewayNamespace != "ns" || optsDP.DataplaneGatewayName != "gw" {
 		t.Errorf("expected gateway ns/gw, got %s/%s", optsDP.DataplaneGatewayNamespace, optsDP.DataplaneGatewayName)
+	}
+
+	// 4. Push credentials initialization mode
+	optsCreds, err := Setup([]string{"--init-push-credentials", "--push-credentials-namespace=custom-ns"})
+	if err != nil {
+		t.Fatalf("Setup failed for --init-push-credentials: %v", err)
+	}
+	if !optsCreds.InitPushCredentials {
+		t.Errorf("expected InitPushCredentials=true")
+	}
+	if optsCreds.PushCredentialsNamespace != "custom-ns" {
+		t.Errorf("expected PushCredentialsNamespace='custom-ns', got %q", optsCreds.PushCredentialsNamespace)
 	}
 }
