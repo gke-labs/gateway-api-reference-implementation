@@ -23,9 +23,9 @@ func TestRegistrationTable(t *testing.T) {
 	tbl := NewRegistrationTable()
 
 	// Register client A
-	tbl.Register("client-a", []string{"foo.example.com", "*.wildcard.org"})
+	tbl.RegisterWithLease("client-a", []string{"foo.example.com", "*.wildcard.org"}, time.Time{})
 	// Register client B
-	tbl.Register("client-b", []string{"bar.example.com", "*.example.com", "*.sub.wildcard.org"})
+	tbl.RegisterWithLease("client-b", []string{"bar.example.com", "*.example.com", "*.sub.wildcard.org"}, time.Time{})
 
 	tests := []struct {
 		name       string
@@ -91,38 +91,43 @@ func TestRegistrationTable(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotClient, gotFound := tbl.Match(tt.hostname)
+			sessions := tbl.MatchSessions(tt.hostname)
+			gotFound := len(sessions) > 0
+			var gotClient string
+			if gotFound {
+				gotClient = sessions[0]
+			}
 			if gotFound != tt.wantFound {
-				t.Fatalf("Match(%q) gotFound = %v, want %v", tt.hostname, gotFound, tt.wantFound)
+				t.Fatalf("MatchSessions(%q) gotFound = %v, want %v", tt.hostname, gotFound, tt.wantFound)
 			}
 			if gotClient != tt.wantClient {
-				t.Fatalf("Match(%q) gotClient = %q, want %q", tt.hostname, gotClient, tt.wantClient)
+				t.Fatalf("MatchSessions(%q) gotClient = %q, want %q", tt.hostname, gotClient, tt.wantClient)
 			}
 		})
 	}
 
 	// Test exact match wins over wildcard when both are registered
-	tbl.Register("client-c", []string{"exact.example.com"})
-	gotClient, gotFound := tbl.Match("exact.example.com")
-	if !gotFound || gotClient != "client-c" {
-		t.Fatalf("expected client-c for exact.example.com, got %s (found=%v)", gotClient, gotFound)
+	tbl.RegisterWithLease("client-c", []string{"exact.example.com"}, time.Time{})
+	sessions := tbl.MatchSessions("exact.example.com")
+	if len(sessions) == 0 || sessions[0] != "client-c" {
+		t.Fatalf("expected client-c for exact.example.com, got %v", sessions)
 	}
 
 	// Test unregister client-c, now wildcard (*.example.com -> client-b) takes over
 	tbl.Unregister("client-c")
-	gotClient, gotFound = tbl.Match("exact.example.com")
-	if !gotFound || gotClient != "client-b" {
-		t.Fatalf("expected fallback to client-b for exact.example.com, got %s (found=%v)", gotClient, gotFound)
+	sessions = tbl.MatchSessions("exact.example.com")
+	if len(sessions) == 0 || sessions[0] != "client-b" {
+		t.Fatalf("expected fallback to client-b for exact.example.com, got %v", sessions)
 	}
 
 	// Test re-registration replaces previous hostnames
-	tbl.Register("client-a", []string{"new.domain.com"})
-	gotClient, gotFound = tbl.Match("foo.example.com")
-	if gotFound && gotClient == "client-a" {
+	tbl.RegisterWithLease("client-a", []string{"new.domain.com"}, time.Time{})
+	sessions = tbl.MatchSessions("foo.example.com")
+	if len(sessions) > 0 && sessions[0] == "client-a" {
 		t.Fatalf("foo.example.com should have been unregistered for client-a")
 	}
-	gotClient, gotFound = tbl.Match("new.domain.com")
-	if !gotFound || gotClient != "client-a" {
+	sessions = tbl.MatchSessions("new.domain.com")
+	if len(sessions) == 0 || sessions[0] != "client-a" {
 		t.Fatalf("expected client-a for new.domain.com")
 	}
 }
@@ -131,46 +136,47 @@ func TestRegistrationTable_MultipleClientsPerHostname(t *testing.T) {
 	tbl := NewRegistrationTable()
 
 	// Register 2 clients for the same exact hostname
-	tbl.Register("client-1", []string{"shared.example.com", "*.shared.wildcard"})
-	tbl.Register("client-2", []string{"shared.example.com", "*.shared.wildcard"})
+	tbl.RegisterWithLease("client-1", []string{"shared.example.com", "*.shared.wildcard"}, time.Time{})
+	tbl.RegisterWithLease("client-2", []string{"shared.example.com", "*.shared.wildcard"}, time.Time{})
 
 	// Matching exact hostname should round-robin between client-1 and client-2
-	m1, ok1 := tbl.Match("shared.example.com")
-	m2, ok2 := tbl.Match("shared.example.com")
-	m3, ok3 := tbl.Match("shared.example.com")
+	s1 := tbl.MatchSessions("shared.example.com")
+	s2 := tbl.MatchSessions("shared.example.com")
+	s3 := tbl.MatchSessions("shared.example.com")
 
-	if !ok1 || !ok2 || !ok3 {
+	if len(s1) == 0 || len(s2) == 0 || len(s3) == 0 {
 		t.Fatalf("expected matches for shared.example.com")
 	}
+	m1, m2, m3 := s1[0], s2[0], s3[0]
 	if m1 != "client-1" || m2 != "client-2" || m3 != "client-1" {
 		t.Fatalf("expected round robin [client-1, client-2, client-1], got [%s, %s, %s]", m1, m2, m3)
 	}
 
 	// Matching wildcard should also round-robin
-	w1, wok1 := tbl.Match("foo.shared.wildcard")
-	w2, wok2 := tbl.Match("bar.shared.wildcard")
-	w3, wok3 := tbl.Match("baz.shared.wildcard")
+	ws1 := tbl.MatchSessions("foo.shared.wildcard")
+	ws2 := tbl.MatchSessions("bar.shared.wildcard")
+	ws3 := tbl.MatchSessions("baz.shared.wildcard")
 
-	if !wok1 || !wok2 || !wok3 {
+	if len(ws1) == 0 || len(ws2) == 0 || len(ws3) == 0 {
 		t.Fatalf("expected matches for wildcard")
 	}
+	w1, w2, w3 := ws1[0], ws2[0], ws3[0]
 	if w1 != "client-1" || w2 != "client-2" || w3 != "client-1" {
 		t.Fatalf("expected round robin wildcard [client-1, client-2, client-1], got [%s, %s, %s]", w1, w2, w3)
 	}
 
 	// Unregister client-1; client-2 should now get all requests
 	tbl.Unregister("client-1")
-	u1, uok1 := tbl.Match("shared.example.com")
-	u2, uok2 := tbl.Match("shared.example.com")
-	if !uok1 || !uok2 || u1 != "client-2" || u2 != "client-2" {
-		t.Fatalf("expected client-2 after client-1 unregistered, got [%s, %s]", u1, u2)
+	u1 := tbl.MatchSessions("shared.example.com")
+	u2 := tbl.MatchSessions("shared.example.com")
+	if len(u1) == 0 || len(u2) == 0 || u1[0] != "client-2" || u2[0] != "client-2" {
+		t.Fatalf("expected client-2 after client-1 unregistered, got [%v, %v]", u1, u2)
 	}
 
 	// Unregister client-2; hostname should be not found
 	tbl.Unregister("client-2")
-	_, uok3 := tbl.Match("shared.example.com")
-	if uok3 {
-		t.Fatalf("expected not found after all clients unregistered")
+	if u3 := tbl.MatchSessions("shared.example.com"); len(u3) > 0 {
+		t.Fatalf("expected not found after all clients unregistered, got %v", u3)
 	}
 }
 
@@ -183,10 +189,10 @@ func TestRegistrationTable_Lease(t *testing.T) {
 	tbl.RegisterWithLease("sess-2", []string{"bar.example.com"}, now.Add(2*time.Second))
 
 	// Match succeeds
-	if _, ok := tbl.Match("foo.example.com"); !ok {
+	if sessions := tbl.MatchSessions("foo.example.com"); len(sessions) == 0 {
 		t.Fatal("expected match for foo.example.com")
 	}
-	if _, ok := tbl.Match("bar.example.com"); !ok {
+	if sessions := tbl.MatchSessions("bar.example.com"); len(sessions) == 0 {
 		t.Fatal("expected match for bar.example.com")
 	}
 
@@ -196,10 +202,10 @@ func TestRegistrationTable_Lease(t *testing.T) {
 		t.Fatalf("expected expired [sess-2], got %v", expired)
 	}
 
-	if _, ok := tbl.Match("bar.example.com"); ok {
+	if sessions := tbl.MatchSessions("bar.example.com"); len(sessions) > 0 {
 		t.Fatal("expected bar.example.com to no longer match after lease expired")
 	}
-	if _, ok := tbl.Match("foo.example.com"); !ok {
+	if sessions := tbl.MatchSessions("foo.example.com"); len(sessions) == 0 {
 		t.Fatal("expected foo.example.com to still match")
 	}
 
@@ -217,7 +223,7 @@ func TestRegistrationTable_Lease(t *testing.T) {
 	if len(expired) != 1 || expired[0] != "sess-1" {
 		t.Fatalf("expected expired [sess-1], got %v", expired)
 	}
-	if _, ok := tbl.Match("foo.example.com"); ok {
+	if sessions := tbl.MatchSessions("foo.example.com"); len(sessions) > 0 {
 		t.Fatal("expected foo.example.com to no longer match after lease expired")
 	}
 }

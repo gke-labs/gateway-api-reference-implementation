@@ -101,9 +101,9 @@ func TestE2ESmoke(t *testing.T) {
 	}
 
 	// 2. Start frontend server
-	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	serverTLS, err := newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -127,7 +127,7 @@ func TestE2ESmoke(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	// 3. Initialize client and tunnel Manager

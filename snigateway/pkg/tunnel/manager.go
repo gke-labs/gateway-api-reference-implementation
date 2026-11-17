@@ -41,20 +41,6 @@ const (
 // ManagerOption configures a Manager.
 type ManagerOption func(*Manager)
 
-// WithHTTPSListener sets a custom HTTPS Listener for the Manager.
-func WithHTTPSListener(lis *Listener) ManagerOption {
-	return func(m *Manager) {
-		m.httpsListener = lis
-	}
-}
-
-// WithRegisterTimeout sets the timeout for registration API calls.
-func WithRegisterTimeout(d time.Duration) ManagerOption {
-	return func(m *Manager) {
-		m.registerTimeout = d
-	}
-}
-
 // WithBackoff sets the minimum and maximum backoff durations for reconnecting.
 func WithBackoff(min, max time.Duration) ManagerOption {
 	return func(m *Manager) {

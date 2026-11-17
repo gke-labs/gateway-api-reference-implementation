@@ -21,6 +21,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -39,6 +40,14 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/tunnel"
 )
+
+func newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCertPEM) {
+		return nil, fmt.Errorf("failed to parse CA cert PEM")
+	}
+	return certs.NewServerTLSConfigWithCertPool(caPool, serverCertPEM, serverKeyPEM)
+}
 
 func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "snigateway-integration-*")
@@ -74,9 +83,9 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	}
 
 	// 2. Start snigateway-frontend in-process
-	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	serverTLS, err := newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	frontendListener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -100,7 +109,7 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	defer frontendServer.Close()
 
 	go func() {
-		_ = frontendServer.Serve(frontendListener)
+		_ = frontendServer.ServeWithHTTP([]net.Listener{frontendListener}, nil)
 	}()
 
 	// 3. Start tunnel Manager with client connecting to frontend
@@ -347,7 +356,7 @@ func TestTokenAuthentication_ProjectedVolumeAndRotationIntegration(t *testing.T)
 	}
 	authorizer := frontend.NewSubjectAuthorizer([]frontend.SubjectRule{subjRule})
 
-	serverTLS, err := certs.NewServerTLSConfig(certsBundle.CA.CertPEM, certsBundle.Server.CertPEM, certsBundle.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(certsBundle.CA.CertPEM, certsBundle.Server.CertPEM, certsBundle.Server.KeyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +384,7 @@ func TestTokenAuthentication_ProjectedVolumeAndRotationIntegration(t *testing.T)
 	defer frontendServer.Close()
 
 	go func() {
-		_ = frontendServer.Serve(ln)
+		_ = frontendServer.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	// 3. Write initial token to projected token file

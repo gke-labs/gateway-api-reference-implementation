@@ -263,15 +263,6 @@ func ParseCertificatesFromPEM(pemBytes []byte) ([]*x509.Certificate, error) {
 	return certificates, nil
 }
 
-// NewServerTLSConfig creates a *tls.Config for the frontend server requiring mTLS.
-func NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
-	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caCertPEM) {
-		return nil, fmt.Errorf("failed to parse CA cert PEM")
-	}
-	return NewServerTLSConfigWithCertPool(caPool, serverCertPEM, serverKeyPEM)
-}
-
 // NewServerTLSConfigWithCertPool creates a *tls.Config for the frontend server requiring mTLS with the given client CA pool.
 func NewServerTLSConfigWithCertPool(clientCAPool *x509.CertPool, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
 	serverCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)

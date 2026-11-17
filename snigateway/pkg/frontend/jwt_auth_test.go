@@ -198,7 +198,7 @@ func setupJWTTestEnv(t *testing.T, timeNow ...func() time.Time) (*Server, string
 		t.Fatal(err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func setupJWTTestEnv(t *testing.T, timeNow ...func() time.Time) (*Server, string
 	}
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	cleanup := func() {
@@ -480,7 +480,7 @@ func TestJWT_LeaseExpirationAndRenewal(t *testing.T) {
 		}
 
 		// Verify immediately registered
-		if _, ok := srv.table.Match("app.example.com"); !ok {
+		if sessions := srv.table.MatchSessions("app.example.com"); len(sessions) == 0 {
 			t.Fatal("expected app.example.com to be registered initially")
 		}
 
@@ -497,7 +497,7 @@ func TestJWT_LeaseExpirationAndRenewal(t *testing.T) {
 		}
 
 		// Verify registration expired and dropped from table
-		if _, ok := srv.table.Match("app.example.com"); ok {
+		if sessions := srv.table.MatchSessions("app.example.com"); len(sessions) > 0 {
 			t.Fatal("expected app.example.com to expire and be dropped from registration table")
 		}
 	})
@@ -525,7 +525,7 @@ func TestJWT_LeaseExpirationAndRenewal(t *testing.T) {
 			t.Fatalf("Register failed: %v", err)
 		}
 
-		if _, ok := srv.table.Match("app.example.com"); !ok {
+		if sessions := srv.table.MatchSessions("app.example.com"); len(sessions) == 0 {
 			t.Fatal("expected app.example.com to be registered initially")
 		}
 
@@ -565,12 +565,12 @@ func TestJWT_LeaseExpirationAndRenewal(t *testing.T) {
 		}
 
 		// Canary must be dropped from table
-		if _, ok := srv.table.Match("canary.example.com"); ok {
+		if sessions := srv.table.MatchSessions("canary.example.com"); len(sessions) > 0 {
 			t.Fatal("expected canary.example.com to expire and be dropped from table")
 		}
 
 		// app.example.com must STILL be registered because lease was extended!
-		if _, ok := srv.table.Match("app.example.com"); !ok {
+		if sessions := srv.table.MatchSessions("app.example.com"); len(sessions) == 0 {
 			t.Fatal("expected app.example.com to still be active after lease extension")
 		}
 
@@ -592,7 +592,7 @@ func TestJWT_LeaseExpirationAndRenewal(t *testing.T) {
 		}
 
 		// Verify registration expired and dropped from table
-		if _, ok := srv.table.Match("app.example.com"); ok {
+		if sessions := srv.table.MatchSessions("app.example.com"); len(sessions) > 0 {
 			t.Fatal("expected app.example.com to expire and be dropped from registration table")
 		}
 	})
@@ -605,7 +605,7 @@ func TestJWT_MTLSOnlyDeploymentsUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +627,7 @@ func TestJWT_MTLSOnlyDeploymentsUnchanged(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	// 1. Client without certificate connects

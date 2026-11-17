@@ -16,7 +16,10 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"testing"
@@ -27,15 +30,23 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
 )
 
+func newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCertPEM) {
+		return nil, fmt.Errorf("failed to parse CA cert PEM")
+	}
+	return certs.NewServerTLSConfigWithCertPool(caPool, serverCertPEM, serverKeyPEM)
+}
+
 func TestClient_Registration(t *testing.T) {
 	generated, err := certs.GenerateAll("snigateway.internal", "client-test")
 	if err != nil {
 		t.Fatalf("GenerateAll failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -53,7 +64,7 @@ func TestClient_Registration(t *testing.T) {
 	defer srv.Close()
 
 	go func() {
-		_ = srv.Serve(ln)
+		_ = srv.ServeWithHTTP([]net.Listener{ln}, nil)
 	}()
 
 	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
@@ -105,9 +116,9 @@ func TestClient_ExchangeWireGuard(t *testing.T) {
 		t.Fatalf("GenerateAll failed: %v", err)
 	}
 
-	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	serverTLS, err := newServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
 	if err != nil {
-		t.Fatalf("NewServerTLSConfig failed: %v", err)
+		t.Fatalf("newServerTLSConfig failed: %v", err)
 	}
 
 	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
@@ -144,14 +155,14 @@ func TestClient_ExchangeWireGuard(t *testing.T) {
 		}
 		serverErrCh := make(chan error, 1)
 		go func() {
-			serverErrCh <- server.Serve(listener)
+			serverErrCh <- server.ServeWithHTTP([]net.Listener{listener}, nil)
 		}()
 		defer func() {
 			if err := server.Close(); err != nil {
 				t.Errorf("server.Close failed: %v", err)
 			}
 			if err := <-serverErrCh; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
-				t.Errorf("server.Serve failed: %v", err)
+				t.Errorf("server.ServeWithHTTP failed: %v", err)
 			}
 		}()
 
@@ -203,14 +214,14 @@ func TestClient_ExchangeWireGuard(t *testing.T) {
 		}
 		serverErrCh := make(chan error, 1)
 		go func() {
-			serverErrCh <- server.Serve(listener)
+			serverErrCh <- server.ServeWithHTTP([]net.Listener{listener}, nil)
 		}()
 		defer func() {
 			if err := server.Close(); err != nil {
 				t.Errorf("server.Close failed: %v", err)
 			}
 			if err := <-serverErrCh; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
-				t.Errorf("server.Serve failed: %v", err)
+				t.Errorf("server.ServeWithHTTP failed: %v", err)
 			}
 		}()
 
