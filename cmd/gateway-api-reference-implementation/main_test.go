@@ -124,9 +124,9 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	}
 	args := deploy.Spec.Template.Spec.Containers[0].Args
 
-	opts, err := SetupDataplane(args)
+	opts, err := Setup(args)
 	if err != nil {
-		t.Fatalf("SetupDataplane failed on provisioner-generated args %v: %v", args, err)
+		t.Fatalf("Setup failed on provisioner-generated args %v: %v", args, err)
 	}
 
 	if !opts.DataplaneMode {
@@ -242,12 +242,12 @@ func TestSetupController_CertserverRegistered(t *testing.T) {
 		t.Fatalf("failed to write token file: %v", err)
 	}
 
-	opts, err := SetupController([]string{
+	opts, err := Setup([]string{
 		"--certserver-address=127.0.0.1:8443",
 		"--certserver-token-path=" + tokenFile,
 	})
 	if err != nil {
-		t.Fatalf("SetupController failed: %v", err)
+		t.Fatalf("Setup failed: %v", err)
 	}
 
 	if opts.CertificateSources == nil {
@@ -263,9 +263,9 @@ func TestSetupController_CertserverUnregistered(t *testing.T) {
 	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
 	t.Setenv("CERTSERVER_TOKEN_PATH", "")
 
-	opts, err := SetupController([]string{})
+	opts, err := Setup([]string{})
 	if err != nil {
-		t.Fatalf("SetupController failed: %v", err)
+		t.Fatalf("Setup failed: %v", err)
 	}
 
 	if opts.CertificateSources != nil && opts.CertificateSources["certserver"] != nil {
@@ -279,7 +279,7 @@ func TestSetupController_CertserverValidationErrors(t *testing.T) {
 	t.Setenv("CERTSERVER_TOKEN_PATH", "")
 
 	// 1. Missing token
-	_, err := SetupController([]string{
+	_, err := Setup([]string{
 		"--certserver-address=127.0.0.1:8443",
 	})
 	if err == nil {
@@ -290,7 +290,7 @@ func TestSetupController_CertserverValidationErrors(t *testing.T) {
 	}
 
 	// 2. Missing address
-	_, err = SetupController([]string{
+	_, err = Setup([]string{
 		"--certserver-token-path=/path/to/token",
 	})
 	if err == nil {
