@@ -826,8 +826,8 @@ func TestCheckpointer_DeterministicDeferredFreesSequence(t *testing.T) {
 
 	// 7. Allocate and flush another page
 	const page2ID = 999
-	lsn2 := store.wal.NextLSN()
-	if err := store.wal.Append(Record{Type: RecordTypePut, LSN: lsn2, Key: "k999", Payload: []byte("page-999-content")}); err != nil {
+	lsn2, err := store.wal.AppendRecord(&Record{Type: RecordTypePut, Key: "k999", Payload: []byte("page-999-content")})
+	if err != nil {
 		t.Fatalf("Append WAL record for page 999 failed: %v", err)
 	}
 	if err := store.wal.SyncThrough(lsn2); err != nil {
