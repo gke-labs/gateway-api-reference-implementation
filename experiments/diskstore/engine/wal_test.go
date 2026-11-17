@@ -27,6 +27,14 @@ import (
 	"time"
 )
 
+// asWAL unwraps a Log interface into the concrete *WAL for test-only assertions.
+func asWAL(l Log) *WAL {
+	if w, ok := l.(*WAL); ok {
+		return w
+	}
+	return nil
+}
+
 func TestWAL_AppendAndIterate(t *testing.T) {
 	fs := NewMemFS()
 	var dbID [16]byte

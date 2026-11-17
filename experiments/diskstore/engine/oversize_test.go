@@ -313,7 +313,7 @@ func TestOversize_Overwrite_NeverDeletesOldFileBeforePointerRecordDurable(t *tes
 	var oldFileRemovedBeforeDurable bool
 	hookedFS.onRemove = func(name string) {
 		if filepath.Clean(name) == filepath.Clean(oldFilePath) {
-			if store.wal.FsyncedLSN() < store.wal.MaxLSN() {
+			if asWAL(store.wal).FsyncedLSN() < asWAL(store.wal).MaxLSN() {
 				oldFileRemovedBeforeDurable = true
 			}
 		}
@@ -454,7 +454,7 @@ func TestOversize_KeyMovingBackToPage_DeletesOldFileOnlyAfterWALSync(t *testing.
 	var oldFileRemovedBeforeDurable bool
 	hookedFS.onRemove = func(name string) {
 		if filepath.Clean(name) == filepath.Clean(oldFilePath) {
-			if store.wal.FsyncedLSN() < store.wal.MaxLSN() {
+			if asWAL(store.wal).FsyncedLSN() < asWAL(store.wal).MaxLSN() {
 				oldFileRemovedBeforeDurable = true
 			}
 		}

@@ -2042,7 +2042,7 @@ func TestRegression_OversizeValueFileFirst(t *testing.T) {
 	if err := store.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
-	if store.wal.FsyncedLSN() < store.wal.MaxLSN() {
+	if asWAL(store.wal).FsyncedLSN() < asWAL(store.wal).MaxLSN() {
 		t.Fatalf("expected WAL to be durable after Sync")
 	}
 }

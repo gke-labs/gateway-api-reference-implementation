@@ -891,6 +891,15 @@ func (w *WAL) Close() error {
 	return errors.Join(errs...)
 }
 
+// NewIterator creates an iterator to read records forward in sequence starting from startLSN.
+func (w *WAL) NewIterator(startLSN uint64) (LogIterator, error) {
+	return NewWALIterator(w.fs, w.dir, w.dbID, startLSN, WALIteratorOptions{
+		EncryptionKey: w.encryptionKey,
+	})
+}
+
+var _ Log = (*WAL)(nil)
+
 // WALIteratorOptions configures WAL iteration.
 type WALIteratorOptions struct {
 	// EncryptionKey is the 32-byte master key for decrypting WAL segment blocks.
@@ -951,6 +960,8 @@ type WALIterator struct {
 	cachedBlockIndex int64  // Block index within current segment currently held in cachedBlock; -1 when empty
 	cachedBlockLen   int    // Valid bytes in cachedBlock (less than WALBlockSize only on torn tail)
 }
+
+var _ LogIterator = (*WALIterator)(nil)
 
 // NewWALIterator creates an iterator to replay records from startLSN.
 func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, options WALIteratorOptions) (*WALIterator, error) {

@@ -23,12 +23,12 @@ import (
 type Checkpointer struct {
 	bp       *BlockPool
 	heapFile File
-	wal      *WAL
+	wal      Log
 	mu       sync.Mutex
 }
 
 // NewCheckpointer creates a new Checkpointer.
-func NewCheckpointer(bp *BlockPool, heapFile File, wal *WAL) *Checkpointer {
+func NewCheckpointer(bp *BlockPool, heapFile File, wal Log) *Checkpointer {
 	return &Checkpointer{
 		bp:       bp,
 		heapFile: heapFile,

@@ -379,8 +379,8 @@ func TestEngine_WithQuarantineDefaults(t *testing.T) {
 		t.Errorf("expected default MinQuarantinedRetention %v, got %v", DefaultMinQuarantinedRetention, store1.quarantine.MinQuarantinedRetention)
 	}
 	expectedWALDir1 := filepath.Join("d1", "wal", "lost+found")
-	if store1.wal.quarantine.Dir != expectedWALDir1 {
-		t.Errorf("expected WAL quarantine Dir %s, got %s", expectedWALDir1, store1.wal.quarantine.Dir)
+	if asWAL(store1.wal).quarantine.Dir != expectedWALDir1 {
+		t.Errorf("expected WAL quarantine Dir %s, got %s", expectedWALDir1, asWAL(store1.wal).quarantine.Dir)
 	}
 
 	// 2. Unset retention gets defaulted
@@ -433,8 +433,8 @@ func TestEngine_WithQuarantineDefaults(t *testing.T) {
 		t.Errorf("expected MinQuarantinedRetention -1, got %v", store4.quarantine.MinQuarantinedRetention)
 	}
 	expectedWALDir4 := filepath.Join("d4", "wal", "lost+found")
-	if store4.wal.quarantine.Dir != expectedWALDir4 {
-		t.Errorf("expected WAL quarantine Dir %s, got %s", expectedWALDir4, store4.wal.quarantine.Dir)
+	if asWAL(store4.wal).quarantine.Dir != expectedWALDir4 {
+		t.Errorf("expected WAL quarantine Dir %s, got %s", expectedWALDir4, asWAL(store4.wal).quarantine.Dir)
 	}
 }
 
