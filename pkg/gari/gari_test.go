@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
@@ -43,6 +44,8 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -522,6 +525,140 @@ func TestServerCustomHTTPSListener(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Errorf("timed out waiting for proxy shutdown")
+	}
+}
+
+type staticTestTokenReviewer struct {
+	fn func(ctx context.Context, token string) (string, string, error)
+}
+
+func (s *staticTestTokenReviewer) ReviewToken(ctx context.Context, token string) (string, string, error) {
+	return s.fn(ctx, token)
+}
+
+func TestServerPushServer_RequiresTLSWhenBindAddressSet(t *testing.T) {
+	opts := Options{
+		PushBindAddress:   "127.0.0.1:0",
+		PushTokenReviewer: &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
+	}
+	pushServer, err := push.NewServer(push.ServerOptions{
+		TokenReviewer: opts.PushTokenReviewer,
+	})
+	if err != nil {
+		t.Fatalf("push.NewServer failed: %v", err)
+	}
+	server := &Server{
+		opts:       opts,
+		pushServer: pushServer,
+	}
+
+	err = server.StartPushServer(t.Context())
+	if err == nil {
+		t.Fatal("expected error when PushBindAddress is set without TLS config or cert files, got nil")
+	}
+	if !strings.Contains(err.Error(), "TLS configuration required for push server") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestServerPushServer_RequiresTLSWhenListenerSet(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	opts := Options{
+		PushListener:      listener,
+		PushTokenReviewer: &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
+	}
+	pushServer, err := push.NewServer(push.ServerOptions{
+		TokenReviewer: opts.PushTokenReviewer,
+	})
+	if err != nil {
+		t.Fatalf("push.NewServer failed: %v", err)
+	}
+	server := &Server{
+		opts:       opts,
+		pushServer: pushServer,
+	}
+
+	err = server.StartPushServer(t.Context())
+	if err == nil {
+		t.Fatal("expected error when PushListener is set without TLS config, got nil")
+	}
+	if !strings.Contains(err.Error(), "TLS configuration required for push server") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestServerPushServer_CustomListener(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	cert, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+
+	opts := Options{
+		PushListener:      listener,
+		PushTLSConfig:     tlsConfig,
+		PushTokenReviewer: &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
+	}
+	pushServer, err := push.NewServer(push.ServerOptions{
+		TokenReviewer: opts.PushTokenReviewer,
+	})
+	if err != nil {
+		t.Fatalf("push.NewServer failed: %v", err)
+	}
+	server := &Server{
+		opts:       opts,
+		pushServer: pushServer,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartPushServer(ctx)
+	}()
+
+	clientCreds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
+	clientConn, err := grpc.NewClient(listener.Addr().String(),
+		grpc.WithTransportCredentials(clientCreds),
+	)
+	if err != nil {
+		t.Fatalf("failed to connect to push server: %v", err)
+	}
+	defer clientConn.Close()
+
+	pushClient := push.NewPushServiceClient(clientConn)
+	stream, err := pushClient.StreamConfig(t.Context())
+	if err != nil {
+		t.Fatalf("StreamConfig failed: %v", err)
+	}
+	// Missing token returns error
+	_, err = stream.Recv()
+	if err == nil {
+		t.Fatal("expected error without token, got nil")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("StartPushServer returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("StartPushServer timed out on cancel")
 	}
 }
 

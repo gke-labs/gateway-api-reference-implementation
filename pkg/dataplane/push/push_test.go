@@ -79,21 +79,21 @@ func TestStreamConfig_Exchange(t *testing.T) {
 	defer cancel()
 
 	// 1. Start in-process gRPC server.
-	const bufSize = 1024 * 1024
-	lis := bufconn.Listen(bufSize)
+	const bufferSize = 1024 * 1024
+	listener := bufconn.Listen(bufferSize)
 	server := newTrivialPushServer()
 	grpcServer := grpc.NewServer()
 	push.RegisterPushServiceServer(grpcServer, server)
 
 	go func() {
-		if err := grpcServer.Serve(lis); err != nil && err != grpc.ErrServerStopped {
+		if err := grpcServer.Serve(listener); err != nil && err != grpc.ErrServerStopped {
 			t.Errorf("grpcServer.Serve error: %v", err)
 		}
 	}()
 	t.Cleanup(func() {
 		grpcServer.Stop()
-		if err := lis.Close(); err != nil {
-			t.Errorf("lis.Close error: %v", err)
+		if err := listener.Close(); err != nil {
+			t.Errorf("listener.Close error: %v", err)
 		}
 	})
 
@@ -101,7 +101,7 @@ func TestStreamConfig_Exchange(t *testing.T) {
 	conn, err := grpc.NewClient("passthrough://bufnet",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return lis.Dial()
+			return listener.Dial()
 		}),
 	)
 	if err != nil {
@@ -170,15 +170,15 @@ func TestStreamConfig_Exchange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client failed to receive Config: %v", err)
 	}
-	cfg := resp.GetConfig()
-	if cfg == nil {
+	config := resp.GetConfig()
+	if config == nil {
 		t.Fatalf("expected Config message, got: %v", resp)
 	}
-	if cfg.GetRevision() != "rev-1" {
-		t.Errorf("got revision %q, want %q", cfg.GetRevision(), "rev-1")
+	if config.GetRevision() != "rev-1" {
+		t.Errorf("got revision %q, want %q", config.GetRevision(), "rev-1")
 	}
-	if !bytes.Equal(cfg.GetDataplaneConfig(), configPayload) {
-		t.Errorf("got dataplane_config %q, want %q", cfg.GetDataplaneConfig(), configPayload)
+	if !bytes.Equal(config.GetDataplaneConfig(), configPayload) {
+		t.Errorf("got dataplane_config %q, want %q", config.GetDataplaneConfig(), configPayload)
 	}
 
 	// 5. Data plane replies with ACK.
