@@ -74,6 +74,18 @@ const (
 	// MaxLabelValueLength is the maximum length of a Kubernetes label value (63 characters).
 	MaxLabelValueLength = 63
 
+	// DataplaneContainerName is the name of the data-plane container in the per-Gateway Deployment.
+	DataplaneContainerName = "dataplane"
+
+	// HTTPPortName is the container port name for HTTP traffic.
+	HTTPPortName = "http"
+
+	// HTTPSPortName is the container port name for HTTPS/TLS traffic.
+	HTTPSPortName = "https"
+
+	// HTTP3PortName is the container port name for HTTP/3 UDP traffic.
+	HTTP3PortName = "http3"
+
 	// DataplaneSecretDataKey is the key in the per-Gateway Secret holding the serialized DataplaneConfig.
 	DataplaneSecretDataKey = "config.json"
 
@@ -717,12 +729,12 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			if protocol == gatewayv1.HTTPProtocolType {
 				containerPort = DataPlaneHTTPPort
 				if port == 80 {
-					name = "http"
+					name = HTTPPortName
 				}
 			} else if protocol == gatewayv1.HTTPSProtocolType || protocol == gatewayv1.TLSProtocolType {
 				containerPort = DataPlaneHTTPSPort
 				if port == 443 && protocol == gatewayv1.HTTPSProtocolType {
-					name = "https"
+					name = HTTPSPortName
 				}
 			}
 			containerPorts = append(containerPorts,
@@ -731,7 +743,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			if protocol == gatewayv1.HTTPSProtocolType {
 				http3Name := fmt.Sprintf("http3-%d", port)
 				if port == 443 {
-					http3Name = "http3"
+					http3Name = HTTP3PortName
 				}
 				containerPorts = append(containerPorts,
 					corev1ac.ContainerPort().WithName(http3Name).WithContainerPort(DataPlaneHTTPSPort).WithHostPort(int32(port)).WithProtocol(corev1.ProtocolUDP),
@@ -750,15 +762,15 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	} else {
 		containerPorts = []*corev1ac.ContainerPortApplyConfiguration{
 			corev1ac.ContainerPort().
-				WithName("http").
+				WithName(HTTPPortName).
 				WithContainerPort(DataPlaneHTTPPort).
 				WithProtocol(corev1.ProtocolTCP),
 			corev1ac.ContainerPort().
-				WithName("https").
+				WithName(HTTPSPortName).
 				WithContainerPort(DataPlaneHTTPSPort).
 				WithProtocol(corev1.ProtocolTCP),
 			corev1ac.ContainerPort().
-				WithName("http3").
+				WithName(HTTP3PortName).
 				WithContainerPort(DataPlaneHTTPSPort).
 				WithProtocol(corev1.ProtocolUDP),
 		}
@@ -787,7 +799,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	containerApply := corev1ac.Container().
-		WithName("dataplane").
+		WithName(DataplaneContainerName).
 		WithImage(image).
 		WithImagePullPolicy(corev1.PullIfNotPresent).
 		WithArgs(args...).
@@ -944,12 +956,12 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 					corev1ac.ServicePort().
 						WithName(fmt.Sprintf("https-%d", port)).
 						WithPort(int32(port)).
-						WithTargetPort(intstr.FromString("https")).
+						WithTargetPort(intstr.FromString(HTTPSPortName)).
 						WithProtocol(corev1.ProtocolTCP),
 					corev1ac.ServicePort().
 						WithName(fmt.Sprintf("http3-%d", port)).
 						WithPort(int32(port)).
-						WithTargetPort(intstr.FromString("http3")).
+						WithTargetPort(intstr.FromString(HTTP3PortName)).
 						WithProtocol(corev1.ProtocolUDP),
 				)
 			} else if proto == gatewayv1.TLSProtocolType {
@@ -957,7 +969,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 					corev1ac.ServicePort().
 						WithName(fmt.Sprintf("tls-%d", port)).
 						WithPort(int32(port)).
-						WithTargetPort(intstr.FromString("https")).
+						WithTargetPort(intstr.FromString(HTTPSPortName)).
 						WithProtocol(corev1.ProtocolTCP),
 				)
 			} else if proto == gatewayv1.TCPProtocolType {
@@ -973,7 +985,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 					corev1ac.ServicePort().
 						WithName(fmt.Sprintf("http-%d", port)).
 						WithPort(int32(port)).
-						WithTargetPort(intstr.FromString("http")).
+						WithTargetPort(intstr.FromString(HTTPPortName)).
 						WithProtocol(corev1.ProtocolTCP),
 				)
 			}
