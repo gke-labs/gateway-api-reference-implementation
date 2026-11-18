@@ -1131,7 +1131,7 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 	}
 }
 
-func TestHostPortAddressProvider_PodReplacementAndRollout(t *testing.T) {
+func TestHostPortAddressProvider_MultiplePodsOnMultipleNodesAndShrink(t *testing.T) {
 	fixture, ctx := setupHostPortsFixture(t)
 	fixture.setDeploymentReady(t, ctx, true)
 
@@ -1189,6 +1189,7 @@ func TestHostPortAddressProvider_PodReplacementAndRollout(t *testing.T) {
 	if err := fixture.client.Create(ctx, oldPod); err != nil {
 		t.Fatalf("failed to create oldPod: %v", err)
 	}
+	// A terminating pod holds its host port until it exits, so its node stays in the list
 	if err := fixture.client.Delete(ctx, oldPod); err != nil {
 		t.Fatalf("failed to delete oldPod: %v", err)
 	}
@@ -1196,30 +1197,55 @@ func TestHostPortAddressProvider_PodReplacementAndRollout(t *testing.T) {
 		t.Fatalf("failed to create newPod: %v", err)
 	}
 
-	// While old pod is terminating and new one has a node, the new node's addresses are reported
+	// Two owned pods on two nodes give both nodes' addresses:
+	// node-1 (10.0.0.5, 2001:db8::5) and node-2 (192.168.1.20)
 	addresses, readiness, err := fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error during rollout: %v", err)
 	}
-	if len(addresses) != 1 || addresses[0].Value != "192.168.1.20" {
-		t.Fatalf("expected provider to select non-terminating pod on node-2 (192.168.1.20), got %+v", addresses)
-	}
 	if !readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
 		t.Errorf("expected ready=true and Reason=Programmed, got %+v", readiness)
 	}
-
-	// While old pod is terminating and new one does NOT have a node,
-	// the provider prefers the new pod (non-terminating) which has no node -> 0 addresses and AddressNotAssigned
-	newPod.Spec.NodeName = ""
-	if err := fixture.client.Update(ctx, newPod); err != nil {
-		t.Fatalf("failed to update newPod: %v", err)
+	if len(addresses) != 3 || addresses[0].Value != "10.0.0.5" || addresses[1].Value != "192.168.1.20" || addresses[2].Value != "2001:db8::5" {
+		t.Fatalf("expected both nodes' addresses [10.0.0.5, 192.168.1.20, 2001:db8::5], got %+v", addresses)
 	}
+
+	// The list shrinks when a pod is gone: remove finalizer so oldPod exits completely
+	if err := fixture.client.Get(ctx, types.NamespacedName{Namespace: fixture.gateway.Namespace, Name: "pod-old"}, oldPod); err != nil {
+		t.Fatalf("failed to get oldPod: %v", err)
+	}
+	oldPod.Finalizers = nil
+	if err := fixture.client.Update(ctx, oldPod); err != nil {
+		t.Fatalf("failed to remove finalizer: %v", err)
+	}
+
 	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected 0 addresses and AddressNotAssigned when new pod has no node, got addresses=%+v readiness=%+v", addresses, readiness)
+	if len(addresses) != 1 || addresses[0].Value != "192.168.1.20" {
+		t.Fatalf("expected address list to shrink to [192.168.1.20] after old pod is gone, got %+v", addresses)
+	}
+}
+
+func TestHostPortAddressProvider_MultiplePodsOnSameNode(t *testing.T) {
+	fixture, ctx := setupHostPortsFixture(t)
+	fixture.setDeploymentReady(t, ctx, true)
+
+	// Two owned pods on one node (node-1)
+	_ = fixture.createPod(t, ctx, "pod-a", "node-1", true)
+	_ = fixture.createPod(t, ctx, "pod-b", "node-1", true)
+
+	// Two pods on one node give that node once (node-1 read once, deduplicated addresses)
+	addresses, readiness, err := fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Errorf("expected ready=true and Reason=Programmed, got %+v", readiness)
+	}
+	if len(addresses) != 2 || addresses[0].Value != "10.0.0.5" || addresses[1].Value != "2001:db8::5" {
+		t.Fatalf("expected node-1 addresses once [10.0.0.5, 2001:db8::5], got %+v", addresses)
 	}
 }
 
@@ -1328,31 +1354,19 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Errorf("expected Succeeded pod to be skipped, got addresses=%+v readiness=%+v", addresses, readiness)
 	}
 
-	// Clean up pod
-	if err := fixture.client.Delete(ctx, pod); err != nil {
-		t.Fatalf("failed to delete pod: %v", err)
-	}
-
-	// 7. Two active candidate pods on different nodes: newer pod is preferred
-	now := metav1.Now()
-	podOlder := fixture.createPod(t, ctx, "pod-older", "node-1", true)
-	podOlder.CreationTimestamp = metav1.Time{Time: now.Add(-5 * time.Minute)}
-	if err := fixture.client.Update(ctx, podOlder); err != nil {
-		t.Fatalf("failed to update podOlder: %v", err)
-	}
-
-	podNewer := fixture.createPod(t, ctx, "pod-newer", "node-2", true)
-	podNewer.CreationTimestamp = now
-	if err := fixture.client.Update(ctx, podNewer); err != nil {
-		t.Fatalf("failed to update podNewer: %v", err)
+	// 7. Pod with empty NodeName -> ignored
+	pod.Status.Phase = corev1.PodRunning
+	pod.Spec.NodeName = ""
+	if err := fixture.client.Update(ctx, pod); err != nil {
+		t.Fatalf("failed to update pod: %v", err)
 	}
 
 	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(addresses) != 1 || addresses[0].Value != "192.168.1.20" {
-		t.Fatalf("expected newer pod on node-2 (192.168.1.20) to be selected, got %+v", addresses)
+	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected pod with empty NodeName to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
 	}
 }
 

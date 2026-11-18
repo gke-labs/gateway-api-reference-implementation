@@ -50,8 +50,8 @@ var (
 // It wraps singlepod.AddressProvider to configure host-port container mappings,
 // zero-surge rolling updates, and no Service creation.
 //
-// Addresses: The Gateway's addresses are the internal addresses of the node that runs
-// its data-plane pod, sorted and deduplicated.
+// Addresses: The Gateway's addresses are the internal addresses of every node that runs
+// a data-plane pod owned by the Gateway's Deployment, sorted and deduplicated.
 type HostPortAddressProvider struct {
 	reader  client.Reader
 	wrapped *singlepod.AddressProvider
@@ -83,7 +83,7 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 }
 
 // GatewayAddressesWithReadiness reconciles the Gateway's data-plane infrastructure and returns
-// addresses and readiness status based on the node running the Gateway's data-plane pod.
+// addresses and readiness status based on the nodes running the Gateway's data-plane pods.
 func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	// 1. Reconcile the Deployment via the wrapped singlepod provisioner.
 	// With WithNoService(), singlepod can return not-ready results such as
@@ -113,16 +113,16 @@ func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx conte
 		return nil, state.GatewayReadiness{}, fmt.Errorf("getting Deployment %s/%s for Gateway %s: %w", gateway.Namespace, deploymentName, gateway.Name, err)
 	}
 
-	// 2. Find the active data-plane pod.
-	selectedPod, err := provider.selectDataplanePod(ctx, gateway, &deployment)
+	deploymentAvailable := deployment.Status.AvailableReplicas > 0 || deployment.Status.ReadyReplicas > 0
+
+	// 2. Find all data-plane pods owned by the Deployment.
+	pods, err := provider.dataplanePods(ctx, gateway, &deployment)
 	if err != nil {
 		return nil, state.GatewayReadiness{}, err
 	}
 
-	deploymentAvailable := deployment.Status.AvailableReplicas > 0 || deployment.Status.ReadyReplicas > 0
-
-	// While no pod has a node, the Gateway has no address and is not ready with reason AddressNotAssigned.
-	if selectedPod == nil || selectedPod.Spec.NodeName == "" {
+	// With no such pod, the Gateway has no address and reason AddressNotAssigned.
+	if len(pods) == 0 {
 		message := "Waiting for data-plane deployment to become available"
 		if deploymentAvailable {
 			message = "Waiting for node address to be assigned to host-port Gateway"
@@ -134,37 +134,49 @@ func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx conte
 		}, nil
 	}
 
-	// 3. Read the assigned Node and collect NodeInternalIP addresses.
-	var node corev1.Node
-	if err := provider.reader.Get(ctx, types.NamespacedName{Name: selectedPod.Spec.NodeName}, &node); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, state.GatewayReadiness{
-				Ready:   false,
-				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
-				Message: fmt.Sprintf("Node %s not found", selectedPod.Spec.NodeName),
-			}, nil
+	// 3. Collect unique node names to read each node once.
+	seenNodes := make(map[string]bool)
+	var nodeNames []string
+	for index := range pods {
+		nodeName := pods[index].Spec.NodeName
+		if !seenNodes[nodeName] {
+			seenNodes[nodeName] = true
+			nodeNames = append(nodeNames, nodeName)
 		}
-		return nil, state.GatewayReadiness{}, fmt.Errorf("getting Node %s for Gateway %s/%s: %w", selectedPod.Spec.NodeName, gateway.Namespace, gateway.Name, err)
 	}
 
 	var parsedIPs []netip.Addr
-	for index := range node.Status.Addresses {
-		nodeAddress := node.Status.Addresses[index]
-		if nodeAddress.Type == corev1.NodeInternalIP && nodeAddress.Address != "" {
-			trimmed := strings.TrimSpace(nodeAddress.Address)
-			ip, err := netip.ParseAddr(trimmed)
-			if err != nil {
-				return nil, state.GatewayReadiness{}, fmt.Errorf("parsing NodeInternalIP %q on node %s: %w", trimmed, selectedPod.Spec.NodeName, err)
+	for _, nodeName := range nodeNames {
+		var node corev1.Node
+		if err := provider.reader.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
 			}
-			parsedIPs = append(parsedIPs, ip)
+			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Node %s for Gateway %s/%s: %w", nodeName, gateway.Namespace, gateway.Name, err)
+		}
+
+		for index := range node.Status.Addresses {
+			nodeAddress := node.Status.Addresses[index]
+			if nodeAddress.Type == corev1.NodeInternalIP && nodeAddress.Address != "" {
+				trimmed := strings.TrimSpace(nodeAddress.Address)
+				ip, err := netip.ParseAddr(trimmed)
+				if err != nil {
+					return nil, state.GatewayReadiness{}, fmt.Errorf("parsing NodeInternalIP %q on node %s: %w", trimmed, nodeName, err)
+				}
+				parsedIPs = append(parsedIPs, ip)
+			}
 		}
 	}
 
 	if len(parsedIPs) == 0 {
+		message := "Waiting for data-plane deployment to become available"
+		if deploymentAvailable {
+			message = "Waiting for node address to be assigned to host-port Gateway"
+		}
 		return nil, state.GatewayReadiness{
 			Ready:   false,
 			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
-			Message: fmt.Sprintf("Node %s has no NodeInternalIP addresses", selectedPod.Spec.NodeName),
+			Message: message,
 		}, nil
 	}
 
@@ -182,7 +194,7 @@ func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx conte
 		})
 	}
 
-	// With a node but a Deployment that is not available, report addresses and reason Pending.
+	// Readiness: ready when the Deployment is available.
 	if !deploymentAvailable {
 		return addresses, state.GatewayReadiness{
 			Ready:   false,
@@ -198,22 +210,10 @@ func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx conte
 	}, nil
 }
 
-// selectDataplanePod finds the active data-plane pod for the Gateway.
-//
-// Order of preference and why:
-//  1. Phase filtering: Pods in PodFailed or PodSucceeded phase (e.g., evicted or completed pods)
-//     are ignored because they are no longer running traffic.
-//  2. Owner verification: The pod must belong to the Gateway's Deployment through owner references
-//     (specifically via its managing ReplicaSet). Unowned pods or pods belonging to other controllers
-//     are ignored to prevent label spoofing.
-//  3. Non-terminating over terminating: A pod without a DeletionTimestamp takes precedence over a
-//     terminating pod (DeletionTimestamp != nil). The terminating pod is draining connections and
-//     shutting down, while the non-terminating pod is the target of the rollout.
-//  4. Scheduled over unscheduled: A pod assigned to a node (Spec.NodeName != "") takes precedence
-//     over an unscheduled pod (Spec.NodeName == "") because an unscheduled pod cannot bind host ports.
-//  5. Newer over older: If two candidate pods share the same deletion and scheduling status,
-//     the pod with the later CreationTimestamp is preferred to reflect the newest rollout generation.
-func (provider *HostPortAddressProvider) selectDataplanePod(ctx context.Context, gateway *gatewayv1.Gateway, deployment *appsv1.Deployment) (*corev1.Pod, error) {
+// dataplanePods finds all data-plane pods owned by the Gateway's Deployment that have an assigned node,
+// leaving out pods that have failed or completed. Terminating pods are kept because a terminating pod
+// continues to hold its host port until it exits.
+func (provider *HostPortAddressProvider) dataplanePods(ctx context.Context, gateway *gatewayv1.Gateway, deployment *appsv1.Deployment) ([]corev1.Pod, error) {
 	var podList corev1.PodList
 	if err := provider.reader.List(ctx, &podList, client.InNamespace(gateway.Namespace), client.MatchingLabels{
 		singlepod.LabelGatewayName: singlepod.LabelValueForGateway(gateway.Name),
@@ -222,10 +222,13 @@ func (provider *HostPortAddressProvider) selectDataplanePod(ctx context.Context,
 		return nil, fmt.Errorf("listing data-plane pods for Gateway %s/%s: %w", gateway.Namespace, gateway.Name, err)
 	}
 
-	var selectedPod *corev1.Pod
+	var validPods []corev1.Pod
 	for index := range podList.Items {
 		pod := &podList.Items[index]
 		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+			continue
+		}
+		if pod.Spec.NodeName == "" {
 			continue
 		}
 		belongs, err := podBelongsToDeployment(ctx, provider.reader, pod, deployment)
@@ -235,33 +238,10 @@ func (provider *HostPortAddressProvider) selectDataplanePod(ctx context.Context,
 		if !belongs {
 			continue
 		}
-		if selectedPod == nil {
-			selectedPod = pod
-			continue
-		}
-		// Non-terminating preferred over terminating
-		if selectedPod.DeletionTimestamp != nil && pod.DeletionTimestamp == nil {
-			selectedPod = pod
-			continue
-		}
-		if selectedPod.DeletionTimestamp == nil && pod.DeletionTimestamp != nil {
-			continue
-		}
-		// Scheduled (has a node) preferred over unscheduled
-		if selectedPod.Spec.NodeName == "" && pod.Spec.NodeName != "" {
-			selectedPod = pod
-			continue
-		}
-		if selectedPod.Spec.NodeName != "" && pod.Spec.NodeName == "" {
-			continue
-		}
-		// Newer preferred over older
-		if pod.CreationTimestamp.After(selectedPod.CreationTimestamp.Time) {
-			selectedPod = pod
-		}
+		validPods = append(validPods, *pod)
 	}
 
-	return selectedPod, nil
+	return validPods, nil
 }
 
 // podBelongsToDeployment checks whether pod belongs to the given Deployment through owner references

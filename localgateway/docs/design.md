@@ -99,32 +99,30 @@ All eight `useHostPorts` branches on `main` move out of `pkg/provisioning/single
 
 ### 5.3 The Address Rule
 
-Each Gateway has one data-plane Deployment with one replica (`replicas: 1`). During a rollout or a node reschedule, two pods can temporarily coexist: the terminating old pod and the newly scheduled pod.
+The Gateway's addresses are the internal addresses of every node that runs a data-plane pod the Deployment owns, leaving out pods that have failed, completed, or have no node. A terminating pod holds its host port until it exits, so its node stays in the list until the pod is gone.
 
-#### Pod Selection Invariants
+#### Data-Plane Pod Invariants
 
-`HostPortAddressProvider` selects the active pod from `corev1.PodList` in this order of precedence:
+`HostPortAddressProvider` finds all valid data-plane pods matching the following criteria:
 
-1. **Phase filtering**: Ignore pods in `PodFailed` or `PodSucceeded` phase (e.g., evicted pods).
+1. **Phase filtering**: Ignore pods in `PodFailed` or `PodSucceeded` phase (e.g., evicted or completed pods).
 2. **Owner verification**: Verify that the pod belongs to the Gateway's Deployment through owner references. The pod's controller must be a `ReplicaSet` whose controller is the Gateway's Deployment UID. Unowned pods or pods owned by unrelated ReplicaSets are rejected to prevent label spoofing.
-3. **Non-terminating over terminating**: A pod without a `DeletionTimestamp` (`DeletionTimestamp == nil`) takes precedence over a terminating pod (`DeletionTimestamp != nil`). The terminating pod is draining connections and shutting down; the non-terminating pod is the target of the rollout.
-4. **Scheduled over unscheduled**: A pod assigned to a node (`Spec.NodeName != ""`) takes precedence over a pod waiting to be scheduled (`Spec.NodeName == ""`).
-5. **Newer over older**: If two candidate pods share the same deletion and scheduling status, the pod with the later `CreationTimestamp` is selected.
+3. **Scheduled only**: Ignore pods that have no assigned node (`Spec.NodeName == ""`).
+4. **Terminating pods kept**: A terminating pod (`DeletionTimestamp != nil`) continues to bind its host port on its node until the process exits and the pod is removed from the cluster. Therefore, terminating pods remain in the active pod list until deleted.
 
 #### Address and Status Reporting
 
-The Gateway reports addresses and readiness based on the selected pod:
+The Gateway reports addresses and readiness based on the nodes running those pods:
 
-- **When the pod has an assigned node**:
-  - The provider reads the assigned Node (`selectedPod.Spec.NodeName`) and collects all addresses with type `corev1.NodeInternalIP`.
+- **When one or more data-plane pods have assigned nodes**:
+  - The provider reads each unique assigned Node once by name (`Spec.NodeName`) and collects all addresses with type `corev1.NodeInternalIP`.
   - The addresses are sorted (IPv4 before IPv6, then numerically) and deduplicated.
-  - If the Deployment is not yet ready (`ReadyReplicas == 0` and `AvailableReplicas == 0`), the Gateway reports the node's internal addresses, but sets condition `Programmed=False` with reason `Pending` and message `"Waiting for data-plane deployment to become available"`.
-  - When the Deployment has at least one ready replica (`ReadyReplicas > 0` or `AvailableReplicas > 0`), the Gateway reports the node's internal addresses with condition `Programmed=True` and reason `Programmed`.
-- **While the pod has no node**:
-  - When no pod exists, or when the selected pod is unscheduled (`Spec.NodeName == ""`):
+  - If the Deployment is not yet available (`ReadyReplicas == 0` and `AvailableReplicas == 0`), the Gateway reports the nodes' internal addresses, but sets condition `Programmed=False` with reason `Pending` and message `"Waiting for data-plane deployment to become available"`.
+  - When the Deployment is available (at least one ready or available replica), the Gateway reports the nodes' internal addresses with condition `Programmed=True` and reason `Programmed`.
+- **While no such pod exists**:
+  - When no pod exists, or when all candidate pods are unscheduled, failed, or completed:
   - The Gateway reports **zero addresses** (`addresses: []`).
   - The Gateway sets condition `Programmed=False` with reason `AddressNotAssigned` and message `"Waiting for data-plane deployment to become available"` (or `"Waiting for node address to be assigned to host-port Gateway"` if the Deployment is ready).
-  - **Reason**: Without an assigned node, no host port is bound on any node. Reporting a stale node's address would direct LAN traffic to a node where the data plane is absent or terminating.
 
 ### 5.4 Update Triggers, Node Lookups, and RBAC Isolation
 
@@ -145,7 +143,7 @@ During reconciliation, `HostPortAddressProvider` reads from the API server using
 
 1. **`PodList`**: Lists pods in the Gateway's namespace matching labels `LabelGatewayName` and `LabelAppName`.
 2. **`ReplicaSet`**: Reads the candidate pod's controller ReplicaSet by name to verify owner references back to the Deployment.
-3. **`Node`**: Reads the assigned Node object directly by name (`selectedPod.Spec.NodeName`) to inspect `status.addresses`.
+3. **`Node`**: Reads each assigned Node object directly by name (`Spec.NodeName`) to inspect `status.addresses`.
 
 Using `client.Reader` (uncached GET/LIST) avoids initializing cluster-wide informers or caches for Pods, ReplicaSets, and Nodes, which avoids caching every Pod and Node in the cluster.
 
@@ -184,7 +182,7 @@ Two Gateways request the same host port (e.g., both request port 80 or port 443)
 - **Single-node cluster (or all nodes occupied)**:
   - The first Gateway schedules successfully, binds the host port, and reports `Programmed=True` with the node's LAN IP.
   - The second Gateway's pod cannot schedule because the requested host port is held by the first Gateway's pod.
-  - While the second Gateway's pod has no node (`selectedPod.Spec.NodeName == ""`), `HostPortAddressProvider` reports `Programmed=False` with reason `AddressNotAssigned` and zero addresses.
+  - While the second Gateway's pod has no node (`Spec.NodeName == ""`), `HostPortAddressProvider` reports `Programmed=False` with reason `AddressNotAssigned` and zero addresses.
   - **Planned**: To specifically indicate port exhaustion, the provider can inspect the pod's `PodScheduled` condition. When `PodScheduled` is False with reason `Unschedulable` and the condition message mentions a host-port conflict, the provider will report `Programmed=False` with reason `AddressNotUsable` on the Gateway and listener condition `Conflicted=True` with reason `PortUnavailable`. Until that condition check is implemented, the second Gateway reports `Programmed=False` with reason `AddressNotAssigned` because `Spec.NodeName` is empty.
 
 ### 5.6 Order of Work and Fate of PR #1415
