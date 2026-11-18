@@ -78,6 +78,28 @@ func New(client client.Client, reader client.Reader, options ...singlepod.Option
 // GatewayAddresses reconciles the Gateway's data-plane infrastructure and returns
 // addresses and readiness status based on the nodes running the Gateway's data-plane pods.
 func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+	// 0. Validate that listeners do not exceed one HTTP port and one HTTPS/TLS port.
+	httpPorts := make(map[gatewayv1.PortNumber]struct{})
+	httpsPorts := make(map[gatewayv1.PortNumber]struct{})
+	for _, effectiveListener := range effectiveListeners {
+		if effectiveListener.IsConflicted() {
+			continue
+		}
+		switch effectiveListener.Protocol {
+		case gatewayv1.HTTPProtocolType:
+			httpPorts[effectiveListener.Port] = struct{}{}
+		case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
+			httpsPorts[effectiveListener.Port] = struct{}{}
+		}
+	}
+	if len(httpPorts) > 1 || len(httpsPorts) > 1 {
+		return nil, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
+			Message: "host ports allow one HTTP and one HTTPS port",
+		}, nil
+	}
+
 	// 1. Reconcile the Deployment via the wrapped singlepod provisioner.
 	// With WithNoService(), singlepod can return not-ready results such as
 	// GatewayReasonPending (waiting for state to compute gateway parameters) or
@@ -322,13 +344,9 @@ func MutateDeployment(deployment *appsv1ac.DeploymentApplyConfiguration, gateway
 		port := int32(effectiveListener.Port)
 		switch effectiveListener.Protocol {
 		case gatewayv1.HTTPProtocolType:
-			if httpPort == 0 {
-				httpPort = port
-			}
+			httpPort = port
 		case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
-			if httpsPort == 0 {
-				httpsPort = port
-			}
+			httpsPort = port
 		case gatewayv1.TCPProtocolType:
 			tcpPorts[port] = true
 		case gatewayv1.UDPProtocolType:
