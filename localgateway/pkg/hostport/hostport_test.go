@@ -17,6 +17,7 @@ package hostport
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,7 +116,10 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 
 	// 2. Actual: run HostPortAddressProvider
 	actualClient := setupTestClient(t)
-	hostPortProvider := New(actualClient, actualClient)
+	hostPortProvider, err := New(actualClient, actualClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 	actualAddresses, actualReadiness, err := hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
@@ -217,7 +221,10 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 	}
 
 	actualClient := setupTestClient(t)
-	hostPortProvider := New(actualClient, actualClient)
+	hostPortProvider, err := New(actualClient, actualClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
@@ -284,7 +291,10 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 	}
 
 	actualClient := setupTestClient(t)
-	hostPortProvider := New(actualClient, actualClient)
+	hostPortProvider, err := New(actualClient, actualClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
@@ -431,7 +441,10 @@ func TestHostPortAddressProvider_ListenerSetListener(t *testing.T) {
 	}
 
 	actualClient := setupTestClient(t)
-	hostPortProvider := New(actualClient, actualClient)
+	hostPortProvider, err := New(actualClient, actualClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
@@ -503,8 +516,11 @@ func TestHostPortAddressProvider_ConflictedListenerSkipped(t *testing.T) {
 	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
 
 	actualClient := setupTestClient(t)
-	hostPortProvider := New(actualClient, actualClient)
-	_, _, err := hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	hostPortProvider, err := New(actualClient, actualClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
@@ -566,7 +582,10 @@ func TestHostPortAddressProvider_AddressRequestRejected(t *testing.T) {
 		WithObjects(gateway, gatewayClass).
 		Build()
 
-	provider := New(testClient, testClient)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 
 	// 1. SupportedAddressTypes returns nil
 	supported := provider.SupportedAddressTypes()
@@ -631,7 +650,10 @@ func TestHostPortAddressProvider_AddressRequestRejected(t *testing.T) {
 
 func TestHostPortAddressProvider_GatewayAddresses(t *testing.T) {
 	testClient := setupTestClient(t)
-	provider := New(testClient, testClient)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -659,7 +681,11 @@ func TestHostPortAddressProvider_GatewayAddresses(t *testing.T) {
 }
 
 func TestHostPortAddressProvider_SetupWatches(t *testing.T) {
-	provider := New(nil, nil)
+	testClient := setupTestClient(t)
+	provider, err := New(nil, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 
 	// SetupWatches without scheme/mapper delegates to singlepod and returns an error
 	if err := provider.SetupWatches(nil, nil); err == nil {
@@ -667,12 +693,62 @@ func TestHostPortAddressProvider_SetupWatches(t *testing.T) {
 	}
 }
 
+func TestHostPortAddressProvider_NewRequiresReader(t *testing.T) {
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, nil)
+	if err == nil {
+		t.Fatalf("expected error when reader is nil, got nil")
+	}
+	if provider != nil {
+		t.Fatalf("expected nil provider when reader is nil, got %+v", provider)
+	}
+}
+
 func TestHostPortAddressProvider_SetState(t *testing.T) {
 	testClient := setupTestClient(t)
-	provider := New(testClient, testClient)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 
 	gatewayState := state.NewState()
 	provider.SetState(gatewayState)
+}
+
+func TestHostPortAddressProvider_WrappedReadinessPropagated(t *testing.T) {
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+
+	gatewayState := state.NewState()
+	provider.SetState(gatewayState)
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-pending-params",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-params-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "localgateway",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	// With state set on provider but no parameters computed in state,
+	// singlepod returns GatewayReasonPending ("Waiting for state to compute gateway parameters").
+	// HostPortAddressProvider must return that readiness without discovering pods.
+	addresses, readiness, err := provider.GatewayAddressesWithReadiness(t.Context(), gateway, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Errorf("expected Pending readiness from wrapped provider, got addresses=%+v readiness=%+v", addresses, readiness)
+	}
 }
 
 type hostPortsFixture struct {
@@ -731,7 +807,10 @@ func setupHostPortsFixture(t *testing.T) (*hostPortsFixture, context.Context) {
 		},
 	}
 
-	provider := New(testClient, testClient)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 
 	// Run provider to build the Deployment
 	if _, _, err := provider.GatewayAddressesWithReadiness(ctx, gateway, nil); err != nil {
@@ -789,6 +868,7 @@ func (fixture *hostPortsFixture) createPod(t *testing.T, ctx context.Context, po
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
 			Namespace: fixture.gateway.Namespace,
+			UID:       types.UID("pod-uid-" + podName),
 			Labels: map[string]string{
 				singlepod.LabelGatewayName: singlepod.LabelValueForGateway(fixture.gateway.Name),
 				singlepod.LabelAppName:     singlepod.AppNameValue,
@@ -968,41 +1048,86 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 		t.Fatalf("failed to delete foreign pod: %v", err)
 	}
 
-	// 3. Pod owned by the Deployment's ReplicaSet -> accepted
-	ownedPod := fixture.createPod(t, ctx, "valid-rs-pod", "node-1", true)
+	// 3. Pod with ownerRef missing UID -> ignored
+	noUIDPod := fixture.createPod(t, ctx, "no-uid-pod", "node-1", false)
+	noUIDPod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion:         "apps/v1",
+			Kind:               "ReplicaSet",
+			Name:               fixture.replicaSet.Name,
+			UID:                "", // empty UID
+			Controller:         state.Ptr(true),
+			BlockOwnerDeletion: state.Ptr(true),
+		},
+	}
+	if err := fixture.client.Update(ctx, noUIDPod); err != nil {
+		t.Fatalf("failed to update no-uid pod: %v", err)
+	}
+	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected pod with empty ownerRef UID to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
+	}
+	if err := fixture.client.Delete(ctx, noUIDPod); err != nil {
+		t.Fatalf("failed to delete no-uid pod: %v", err)
+	}
+
+	// 4. Pod referencing ReplicaSet whose ownerRef to Deployment has mismatched UID -> ignored
+	mismatchedRS := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mismatched-rs",
+			Namespace: fixture.gateway.Namespace,
+			UID:       types.UID("mismatched-rs-uid"),
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         "apps/v1",
+					Kind:               "Deployment",
+					Name:               fixture.deployment.Name,
+					UID:                types.UID("wrong-deploy-uid"),
+					Controller:         state.Ptr(true),
+					BlockOwnerDeletion: state.Ptr(true),
+				},
+			},
+		},
+	}
+	if err := fixture.client.Create(ctx, mismatchedRS); err != nil {
+		t.Fatalf("failed to create mismatched RS: %v", err)
+	}
+	mismatchedPod := fixture.createPod(t, ctx, "mismatched-pod", "node-1", false)
+	mismatchedPod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion:         "apps/v1",
+			Kind:               "ReplicaSet",
+			Name:               mismatchedRS.Name,
+			UID:                mismatchedRS.UID,
+			Controller:         state.Ptr(true),
+			BlockOwnerDeletion: state.Ptr(true),
+		},
+	}
+	if err := fixture.client.Update(ctx, mismatchedPod); err != nil {
+		t.Fatalf("failed to update mismatched pod: %v", err)
+	}
+	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected pod with mismatched Deployment UID to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
+	}
+	if err := fixture.client.Delete(ctx, mismatchedPod); err != nil {
+		t.Fatalf("failed to delete mismatched pod: %v", err)
+	}
+
+	// 5. Pod owned by the Deployment's ReplicaSet with strictly matching UIDs -> accepted
+	_ = fixture.createPod(t, ctx, "valid-rs-pod", "node-1", true)
 	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !readiness.Ready || len(addresses) != 2 {
 		t.Errorf("expected owned pod to be accepted, got ready=%v addresses=%+v", readiness.Ready, addresses)
-	}
-	if err := fixture.client.Delete(ctx, ownedPod); err != nil {
-		t.Fatalf("failed to delete owned pod: %v", err)
-	}
-
-	// 4. Pod directly owned by the Deployment -> accepted
-	directPod := fixture.createPod(t, ctx, "direct-deploy-pod", "node-1", false)
-	directPod.OwnerReferences = []metav1.OwnerReference{
-		{
-			APIVersion:         "apps/v1",
-			Kind:               "Deployment",
-			Name:               fixture.deployment.Name,
-			UID:                fixture.deployment.UID,
-			Controller:         state.Ptr(true),
-			BlockOwnerDeletion: state.Ptr(true),
-		},
-	}
-	if err := fixture.client.Update(ctx, directPod); err != nil {
-		t.Fatalf("failed to update direct pod owner reference: %v", err)
-	}
-
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !readiness.Ready || len(addresses) != 2 {
-		t.Errorf("expected directly owned pod to be accepted, got ready=%v addresses=%+v", readiness.Ready, addresses)
 	}
 }
 
@@ -1016,6 +1141,7 @@ func TestHostPortAddressProvider_PodReplacementAndRollout(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "pod-old",
 			Namespace:         fixture.gateway.Namespace,
+			UID:               types.UID("pod-old-uid"),
 			CreationTimestamp: metav1.Time{Time: now.Add(-10 * time.Minute)},
 			Finalizers:        []string{"test.finalizer"},
 			Labels: map[string]string{
@@ -1040,6 +1166,7 @@ func TestHostPortAddressProvider_PodReplacementAndRollout(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "pod-new",
 			Namespace:         fixture.gateway.Namespace,
+			UID:               types.UID("pod-new-uid"),
 			CreationTimestamp: now,
 			Labels: map[string]string{
 				singlepod.LabelGatewayName: singlepod.LabelValueForGateway(fixture.gateway.Name),
@@ -1133,7 +1260,31 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Errorf("expected 0 addresses for node without internal IP, got addresses=%+v readiness=%+v", addresses, readiness)
 	}
 
-	// 3. Pod on valid node, but deployment is NOT available -> returns addresses, but Ready=false / Pending
+	// 3. Pod on node with unparseable NodeInternalIP -> returns error naming the node
+	nodeBadIP := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-bad-ip"},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: "not-an-ip-address"},
+			},
+		},
+	}
+	if err := fixture.client.Create(ctx, nodeBadIP); err != nil {
+		t.Fatalf("failed to create nodeBadIP: %v", err)
+	}
+	pod.Spec.NodeName = "node-bad-ip"
+	if err := fixture.client.Update(ctx, pod); err != nil {
+		t.Fatalf("failed to update pod: %v", err)
+	}
+	_, _, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	if err == nil {
+		t.Fatalf("expected error for unparseable NodeInternalIP, got nil")
+	}
+	if !strings.Contains(err.Error(), "node-bad-ip") {
+		t.Errorf("expected error to name the node node-bad-ip, got %v", err)
+	}
+
+	// 4. Pod on valid node, but deployment is NOT available -> returns addresses, but Ready=false / Pending
 	pod.Spec.NodeName = "node-1"
 	if err := fixture.client.Update(ctx, pod); err != nil {
 		t.Fatalf("failed to update pod: %v", err)
@@ -1148,7 +1299,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Errorf("expected 2 addresses and Pending when deployment not ready, got addresses=%+v readiness=%+v", addresses, readiness)
 	}
 
-	// 4. Pod in Failed phase (e.g. evicted) with a node assigned -> ignored
+	// 5. Pod in Failed phase (e.g. evicted) with a node assigned -> ignored
 	fixture.setDeploymentReady(t, ctx, true)
 	pod.Status.Phase = corev1.PodFailed
 	if err := fixture.client.Status().Update(ctx, pod); err != nil {
@@ -1163,7 +1314,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Errorf("expected Failed pod to be skipped, got addresses=%+v readiness=%+v", addresses, readiness)
 	}
 
-	// 5. Pod in Succeeded phase -> ignored
+	// 6. Pod in Succeeded phase -> ignored
 	pod.Status.Phase = corev1.PodSucceeded
 	if err := fixture.client.Status().Update(ctx, pod); err != nil {
 		t.Fatalf("failed to update pod status: %v", err)
@@ -1182,7 +1333,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Fatalf("failed to delete pod: %v", err)
 	}
 
-	// 6. Two active candidate pods on different nodes: newer pod is preferred
+	// 7. Two active candidate pods on different nodes: newer pod is preferred
 	now := metav1.Now()
 	podOlder := fixture.createPod(t, ctx, "pod-older", "node-1", true)
 	podOlder.CreationTimestamp = metav1.Time{Time: now.Add(-5 * time.Minute)}
@@ -1266,7 +1417,10 @@ func TestHostPortAddressProvider_GatewayReconciler_EndToEnd(t *testing.T) {
 		Build()
 
 	ctx := t.Context()
-	provider := New(testClient, testClient)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
 	stateStore.SetSupportedAddressTypes(provider.SupportedAddressTypes())
 
 	reconciler := &controller.GatewayReconciler{
@@ -1345,6 +1499,7 @@ func TestHostPortAddressProvider_GatewayReconciler_EndToEnd(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-gw-dataplane-pod",
 			Namespace: "test-ns",
+			UID:       types.UID("pod-uid-e2e"),
 			Labels: map[string]string{
 				singlepod.LabelGatewayName: singlepod.LabelValueForGateway("test-gw"),
 				singlepod.LabelAppName:     singlepod.AppNameValue,

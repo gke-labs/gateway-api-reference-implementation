@@ -59,19 +59,21 @@ type HostPortAddressProvider struct {
 
 // New creates a new HostPortAddressProvider wrapping a singlepod.AddressProvider
 // configured with WithNoService() and the host-port Deployment mutator.
-// The reader is used for uncached reads of Pods, ReplicaSets, and Nodes.
-func New(client client.Client, reader client.Reader, options ...singlepod.Option) *HostPortAddressProvider {
-	wrappedOptions := make([]singlepod.Option, 0, len(options)+3)
+// The reader is required for uncached reads of Pods, ReplicaSets, and Nodes.
+func New(client client.Client, reader client.Reader, options ...singlepod.Option) (*HostPortAddressProvider, error) {
+	if reader == nil {
+		return nil, fmt.Errorf("reader is required for HostPortAddressProvider")
+	}
+	wrappedOptions := make([]singlepod.Option, 0, len(options)+2)
 	wrappedOptions = append(wrappedOptions, options...)
 	wrappedOptions = append(wrappedOptions,
-		singlepod.WithAPIReader(reader),
 		singlepod.WithNoService(),
 		singlepod.WithDeploymentMutator(MutateDeployment),
 	)
 	return &HostPortAddressProvider{
 		reader:  reader,
 		wrapped: singlepod.NewAddressProvider(client, wrappedOptions...),
-	}
+	}, nil
 }
 
 // GatewayAddresses returns the Gateway's addresses and whether the Deployment is ready.
@@ -83,24 +85,24 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 // GatewayAddressesWithReadiness reconciles the Gateway's data-plane infrastructure and returns
 // addresses and readiness status based on the node running the Gateway's data-plane pod.
 func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
-	if provider.reader == nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("reader is required for HostPortAddressProvider")
-	}
-
 	// 1. Reconcile the Deployment via the wrapped singlepod provisioner.
-	_, _, err := provider.wrapped.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	// With WithNoService(), singlepod can return not-ready results such as
+	// GatewayReasonPending (waiting for state to compute gateway parameters) or
+	// GatewayReasonInvalidParameters (problem with the Gateway's parameters).
+	// If singlepod reports any not-ready condition other than AddressNotAssigned
+	// ("no address yet"), return it immediately without discovering pods.
+	_, readiness, err := provider.wrapped.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
-		return nil, state.GatewayReadiness{}, err
+		return nil, readiness, err
+	}
+	if !readiness.Ready && readiness.Reason != "" && readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		return nil, readiness, nil
 	}
 
-	gatewayNamespace := gateway.Namespace
-	if gatewayNamespace == "" {
-		gatewayNamespace = "default"
-	}
 	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
 
 	var deployment appsv1.Deployment
-	if err := provider.reader.Get(ctx, types.NamespacedName{Namespace: gatewayNamespace, Name: deploymentName}, &deployment); err != nil {
+	if err := provider.reader.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, state.GatewayReadiness{
 				Ready:   false,
@@ -108,7 +110,7 @@ func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx conte
 				Message: "Waiting for data-plane deployment to become available",
 			}, nil
 		}
-		return nil, state.GatewayReadiness{}, fmt.Errorf("getting Deployment %s/%s for Gateway %s: %w", gatewayNamespace, deploymentName, gateway.Name, err)
+		return nil, state.GatewayReadiness{}, fmt.Errorf("getting Deployment %s/%s for Gateway %s: %w", gateway.Namespace, deploymentName, gateway.Name, err)
 	}
 
 	// 2. Find the active data-plane pod.
@@ -142,18 +144,23 @@ func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx conte
 				Message: fmt.Sprintf("Node %s not found", selectedPod.Spec.NodeName),
 			}, nil
 		}
-		return nil, state.GatewayReadiness{}, fmt.Errorf("getting Node %s for Gateway %s/%s: %w", selectedPod.Spec.NodeName, gatewayNamespace, gateway.Name, err)
+		return nil, state.GatewayReadiness{}, fmt.Errorf("getting Node %s for Gateway %s/%s: %w", selectedPod.Spec.NodeName, gateway.Namespace, gateway.Name, err)
 	}
 
-	var internalIPs []string
+	var parsedIPs []netip.Addr
 	for index := range node.Status.Addresses {
 		nodeAddress := node.Status.Addresses[index]
 		if nodeAddress.Type == corev1.NodeInternalIP && nodeAddress.Address != "" {
-			internalIPs = append(internalIPs, strings.TrimSpace(nodeAddress.Address))
+			trimmed := strings.TrimSpace(nodeAddress.Address)
+			ip, err := netip.ParseAddr(trimmed)
+			if err != nil {
+				return nil, state.GatewayReadiness{}, fmt.Errorf("parsing NodeInternalIP %q on node %s: %w", trimmed, selectedPod.Spec.NodeName, err)
+			}
+			parsedIPs = append(parsedIPs, ip)
 		}
 	}
 
-	if len(internalIPs) == 0 {
+	if len(parsedIPs) == 0 {
 		return nil, state.GatewayReadiness{
 			Ready:   false,
 			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
@@ -161,22 +168,17 @@ func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx conte
 		}, nil
 	}
 
-	// Sort addresses (IPv4 before IPv6, then numerically) and deduplicate.
-	slices.SortFunc(internalIPs, func(firstAddress, secondAddress string) int {
-		firstIP, firstErr := netip.ParseAddr(firstAddress)
-		secondIP, secondErr := netip.ParseAddr(secondAddress)
-		if firstErr == nil && secondErr == nil {
-			return firstIP.Compare(secondIP)
-		}
-		return strings.Compare(firstAddress, secondAddress)
+	// Sort parsed IP addresses (IPv4 before IPv6, then numerically) and deduplicate.
+	slices.SortFunc(parsedIPs, func(a, b netip.Addr) int {
+		return a.Compare(b)
 	})
-	internalIPs = slices.Compact(internalIPs)
+	parsedIPs = slices.Compact(parsedIPs)
 
-	addresses := make([]gatewayv1.GatewayStatusAddress, 0, len(internalIPs))
-	for index := range internalIPs {
+	addresses := make([]gatewayv1.GatewayStatusAddress, 0, len(parsedIPs))
+	for _, ip := range parsedIPs {
 		addresses = append(addresses, gatewayv1.GatewayStatusAddress{
 			Type:  state.Ptr(gatewayv1.IPAddressType),
-			Value: internalIPs[index],
+			Value: ip.String(),
 		})
 	}
 
@@ -212,17 +214,12 @@ func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx conte
 //  5. Newer over older: If two candidate pods share the same deletion and scheduling status,
 //     the pod with the later CreationTimestamp is preferred to reflect the newest rollout generation.
 func (provider *HostPortAddressProvider) selectDataplanePod(ctx context.Context, gateway *gatewayv1.Gateway, deployment *appsv1.Deployment) (*corev1.Pod, error) {
-	gatewayNamespace := gateway.Namespace
-	if gatewayNamespace == "" {
-		gatewayNamespace = "default"
-	}
-
 	var podList corev1.PodList
-	if err := provider.reader.List(ctx, &podList, client.InNamespace(gatewayNamespace), client.MatchingLabels{
+	if err := provider.reader.List(ctx, &podList, client.InNamespace(gateway.Namespace), client.MatchingLabels{
 		singlepod.LabelGatewayName: singlepod.LabelValueForGateway(gateway.Name),
 		singlepod.LabelAppName:     singlepod.AppNameValue,
 	}); err != nil {
-		return nil, fmt.Errorf("listing data-plane pods for Gateway %s/%s: %w", gatewayNamespace, gateway.Name, err)
+		return nil, fmt.Errorf("listing data-plane pods for Gateway %s/%s: %w", gateway.Namespace, gateway.Name, err)
 	}
 
 	var selectedPod *corev1.Pod
@@ -268,46 +265,30 @@ func (provider *HostPortAddressProvider) selectDataplanePod(ctx context.Context,
 }
 
 // podBelongsToDeployment checks whether pod belongs to the given Deployment through owner references
-// (specifically through its owning ReplicaSet, or directly).
+// (specifically through its owning ReplicaSet).
 func podBelongsToDeployment(ctx context.Context, reader client.Reader, pod *corev1.Pod, deployment *appsv1.Deployment) (bool, error) {
-	if pod == nil || deployment == nil {
+	if pod == nil || deployment == nil || deployment.UID == "" {
 		return false, nil
 	}
 	controllerRef := metav1.GetControllerOf(pod)
-	if controllerRef == nil {
+	if controllerRef == nil || controllerRef.Kind != "ReplicaSet" || controllerRef.UID == "" {
 		return false, nil
 	}
-	if controllerRef.Kind == "ReplicaSet" {
-		var replicaSet appsv1.ReplicaSet
-		err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: controllerRef.Name}, &replicaSet)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, fmt.Errorf("getting ReplicaSet %s/%s for pod %s: %w", pod.Namespace, controllerRef.Name, pod.Name, err)
-		}
-		if replicaSet.UID != "" && controllerRef.UID != "" && controllerRef.UID != replicaSet.UID {
+	var replicaSet appsv1.ReplicaSet
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: controllerRef.Name}, &replicaSet); err != nil {
+		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
-		rsControllerRef := metav1.GetControllerOf(&replicaSet)
-		if rsControllerRef == nil {
-			return false, nil
-		}
-		if rsControllerRef.Kind == "Deployment" && rsControllerRef.Name == deployment.Name {
-			if deployment.UID != "" && rsControllerRef.UID != "" && rsControllerRef.UID != deployment.UID {
-				return false, nil
-			}
-			return true, nil
-		}
+		return false, fmt.Errorf("getting ReplicaSet %s/%s for pod %s: %w", pod.Namespace, controllerRef.Name, pod.Name, err)
+	}
+	if replicaSet.UID != controllerRef.UID {
 		return false, nil
 	}
-	if controllerRef.Kind == "Deployment" && controllerRef.Name == deployment.Name {
-		if deployment.UID != "" && controllerRef.UID != "" && controllerRef.UID != deployment.UID {
-			return false, nil
-		}
-		return true, nil
+	rsControllerRef := metav1.GetControllerOf(&replicaSet)
+	if rsControllerRef == nil || rsControllerRef.Kind != "Deployment" {
+		return false, nil
 	}
-	return false, nil
+	return rsControllerRef.UID == deployment.UID, nil
 }
 
 // SupportedAddressTypes returns nil because host-port data planes bind directly to node host
@@ -319,9 +300,6 @@ func (provider *HostPortAddressProvider) SupportedAddressTypes() []gatewayv1.Add
 
 // SetupWatches registers watches on managed resources with the Gateway controller.
 func (provider *HostPortAddressProvider) SetupWatches(manager ctrl.Manager, builder *builder.Builder) error {
-	if provider.reader == nil && manager != nil {
-		provider.reader = manager.GetAPIReader()
-	}
 	return provider.wrapped.SetupWatches(manager, builder)
 }
 
