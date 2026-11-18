@@ -81,26 +81,15 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 	// 0. Validate that listeners do not exceed one HTTP port and one HTTPS/TLS port.
 	httpPorts := make(map[gatewayv1.PortNumber]struct{})
 	httpsPorts := make(map[gatewayv1.PortNumber]struct{})
-	if len(effectiveListeners) > 0 {
-		for _, el := range effectiveListeners {
-			if el.IsConflicted() {
-				continue
-			}
-			switch el.Protocol {
-			case gatewayv1.HTTPProtocolType:
-				httpPorts[el.Port] = struct{}{}
-			case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
-				httpsPorts[el.Port] = struct{}{}
-			}
+	for _, effectiveListener := range effectiveListeners {
+		if effectiveListener.IsConflicted() {
+			continue
 		}
-	} else if gateway != nil {
-		for _, l := range gateway.Spec.Listeners {
-			switch l.Protocol {
-			case gatewayv1.HTTPProtocolType:
-				httpPorts[l.Port] = struct{}{}
-			case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
-				httpsPorts[l.Port] = struct{}{}
-			}
+		switch effectiveListener.Protocol {
+		case gatewayv1.HTTPProtocolType:
+			httpPorts[effectiveListener.Port] = struct{}{}
+		case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
+			httpsPorts[effectiveListener.Port] = struct{}{}
 		}
 	}
 	if len(httpPorts) > 1 || len(httpsPorts) > 1 {

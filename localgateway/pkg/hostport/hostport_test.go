@@ -1606,7 +1606,6 @@ func TestHostPortAddressProvider_MultipleHTTPListeners_AddressNotUsable(t *testi
 		{Name: "http-8080", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
 	}
 
-	// 1. Test via effectiveListeners
 	addresses, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1630,18 +1629,6 @@ func TestHostPortAddressProvider_MultipleHTTPListeners_AddressNotUsable(t *testi
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); !apierrors.IsNotFound(err) {
 		t.Errorf("expected no Deployment to exist, got err: %v", err)
-	}
-
-	// 2. Test via gateway.Spec.Listeners fallback (effectiveListeners nil)
-	addresses, readiness, err = provider.GatewayAddresses(ctx, gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) || readiness.Message != expectedMsg {
-		t.Errorf("expected AddressNotUsable readiness when effectiveListeners is nil, got %+v", readiness)
-	}
-	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); !apierrors.IsNotFound(err) {
-		t.Errorf("expected no Deployment to exist after nil effectiveListeners, got err: %v", err)
 	}
 }
 
