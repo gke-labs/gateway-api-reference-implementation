@@ -117,9 +117,9 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 	ctx := t.Context()
 
 	// 1. Initially disconnected: returns addresses, ready=false, tunnel-specific unready message
-	addrs, readiness, err := provider.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected GatewayAddressesWithReadiness error: %v", err)
+		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
 	if len(addrs) != 2 {
 		t.Fatalf("expected 2 addresses, got %d", len(addrs))
@@ -133,9 +133,9 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 2. Tunnel connects, but hostnames not registered yet: ready=false
 	fakeState.setConnected(true)
-	addrs, readiness, err = provider.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected GatewayAddressesWithReadiness error: %v", err)
+		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
 	if len(addrs) != 2 {
 		t.Fatalf("expected 2 addresses, got %d", len(addrs))
@@ -149,9 +149,9 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 3. Register a different hostname: still ready=false for this Gateway
 	fakeState.setRegistered("other.example.com")
-	_, readiness, err = provider.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected GatewayAddressesWithReadiness error: %v", err)
+		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
 	if readiness.Ready {
 		t.Fatalf("expected ready=false when this Gateway's hostname is not registered")
@@ -159,9 +159,9 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 4. Register this Gateway's hostname: ready=true
 	fakeState.setRegistered("echo.example.com")
-	_, readiness, err = provider.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected GatewayAddressesWithReadiness error: %v", err)
+		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
 	if !readiness.Ready {
 		t.Fatalf("expected ready=true when tunnel is connected and hostnames are registered")
@@ -172,9 +172,9 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 5. Kill session (disconnect): flips back to ready=false
 	fakeState.setConnected(false)
-	_, readiness, err = provider.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected GatewayAddressesWithReadiness error: %v", err)
+		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
 	if readiness.Ready {
 		t.Fatalf("expected ready=false after killing tunnel session")
@@ -185,9 +185,9 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 6. Restore session: flips back to ready=true
 	fakeState.setConnected(true)
-	_, readiness, err = provider.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected GatewayAddressesWithReadiness error: %v", err)
+		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
 	if !readiness.Ready {
 		t.Fatalf("expected ready=true after restoring tunnel session")
@@ -218,15 +218,15 @@ func TestAddressProvider_MultipleListeners(t *testing.T) {
 
 	// Only h1 registered
 	fakeState.setRegistered("echo1.example.com")
-	_, ready, _ := provider.GatewayAddresses(ctx, gw, nil)
-	if ready {
+	_, readiness, _ := provider.GatewayAddresses(ctx, gw, nil)
+	if readiness.Ready {
 		t.Fatalf("expected ready=false when only 1 of 2 listener hostnames is registered")
 	}
 
 	// Register h2 as well
 	fakeState.setRegistered("echo2.example.com")
-	_, ready, _ = provider.GatewayAddresses(ctx, gw, nil)
-	if !ready {
+	_, readiness, _ = provider.GatewayAddresses(ctx, gw, nil)
+	if !readiness.Ready {
 		t.Fatalf("expected ready=true when all listener hostnames are registered")
 	}
 }
@@ -250,8 +250,8 @@ func TestAddressProvider_NoHostnamesGateway(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	_, ready, _ := provider.GatewayAddresses(ctx, gw, nil)
-	if !ready {
+	_, readiness, _ := provider.GatewayAddresses(ctx, gw, nil)
+	if !readiness.Ready {
 		t.Fatalf("expected ready=true for Gateway with no SNI hostnames when tunnel is connected")
 	}
 }

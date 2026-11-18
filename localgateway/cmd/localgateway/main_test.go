@@ -328,11 +328,11 @@ func TestLocalGateway_E2E_AppLocalCompiledRoute(t *testing.T) {
 
 	// 4. Assert address provider reports node LAN IP
 	t.Run("address provider reports node LAN IP", func(t *testing.T) {
-		addrs, ready, err := addrProvider.GatewayAddresses(ctx, gw, nil)
+		addrs, readiness, err := addrProvider.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("GatewayAddresses failed: %v", err)
 		}
-		if !ready {
+		if !readiness.Ready {
 			t.Fatalf("expected address provider ready=true")
 		}
 		if len(addrs) == 0 || addrs[0].Value != nodeIP {

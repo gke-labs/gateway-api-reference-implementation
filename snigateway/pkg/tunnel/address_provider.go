@@ -43,9 +43,8 @@ type TunnelState interface {
 }
 
 var (
-	_ controller.AddressProvider          = (*AddressProvider)(nil)
-	_ controller.AddressWatcher           = (*AddressProvider)(nil)
-	_ controller.AddressReadinessProvider = (*AddressProvider)(nil)
+	_ controller.AddressProvider = (*AddressProvider)(nil)
+	_ controller.AddressWatcher  = (*AddressProvider)(nil)
 )
 
 // AddressProvider reports frontend public addresses in Gateway status
@@ -133,13 +132,7 @@ func ParseGatewayAddresses(addrs []string) []gatewayv1.GatewayStatusAddress {
 }
 
 // GatewayAddresses returns the configured addresses and whether the Gateway is ready.
-func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
-	return addrs, readiness.Ready, err
-}
-
-// GatewayAddressesWithReadiness returns addresses and detailed readiness atomically in a single call.
-func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	if gw != nil {
 		p.mu.Lock()
 		p.knownGateways[types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}] = struct{}{}

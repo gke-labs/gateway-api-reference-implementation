@@ -40,10 +40,9 @@ import (
 )
 
 var (
-	_ controller.AddressProvider          = (*HostPortAddressProvider)(nil)
-	_ controller.AddressReadinessProvider = (*HostPortAddressProvider)(nil)
-	_ controller.AddressTypeProvider      = (*HostPortAddressProvider)(nil)
-	_ controller.AddressWatcher           = (*HostPortAddressProvider)(nil)
+	_ controller.AddressProvider     = (*HostPortAddressProvider)(nil)
+	_ controller.AddressTypeProvider = (*HostPortAddressProvider)(nil)
+	_ controller.AddressWatcher      = (*HostPortAddressProvider)(nil)
 )
 
 // HostPortAddressProvider manages host-port data planes for localgateway.
@@ -76,22 +75,16 @@ func New(client client.Client, reader client.Reader, options ...singlepod.Option
 	}, nil
 }
 
-// GatewayAddresses returns the Gateway's addresses and whether the Deployment is ready.
-func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
-	addresses, readiness, err := provider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
-	return addresses, readiness.Ready, err
-}
-
-// GatewayAddressesWithReadiness reconciles the Gateway's data-plane infrastructure and returns
+// GatewayAddresses reconciles the Gateway's data-plane infrastructure and returns
 // addresses and readiness status based on the nodes running the Gateway's data-plane pods.
-func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	// 1. Reconcile the Deployment via the wrapped singlepod provisioner.
 	// With WithNoService(), singlepod can return not-ready results such as
 	// GatewayReasonPending (waiting for state to compute gateway parameters) or
 	// GatewayReasonInvalidParameters (problem with the Gateway's parameters).
 	// If singlepod reports any not-ready condition other than AddressNotAssigned
 	// ("no address yet"), return it immediately without discovering pods.
-	_, readiness, err := provider.wrapped.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	_, readiness, err := provider.wrapped.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		return nil, readiness, err
 	}

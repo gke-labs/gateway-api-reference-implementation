@@ -36,10 +36,9 @@ import (
 )
 
 var (
-	_ controller.AddressProvider          = (*AddressProvider)(nil)
-	_ controller.AddressReadinessProvider = (*AddressProvider)(nil)
-	_ controller.AddressTypeProvider      = (*AddressProvider)(nil)
-	_ controller.AddressWatcher           = (*AddressProvider)(nil)
+	_ controller.AddressProvider     = (*AddressProvider)(nil)
+	_ controller.AddressTypeProvider = (*AddressProvider)(nil)
+	_ controller.AddressWatcher      = (*AddressProvider)(nil)
 )
 
 // Options configures an AddressProvider.
@@ -115,14 +114,8 @@ func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
 	return nil
 }
 
-// GatewayAddresses returns the node's LAN IP addresses and ready status for the Gateway.
-func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
-	return addrs, readiness.Ready, err
-}
-
-// GatewayAddressesWithReadiness returns the node's LAN IP addresses and detailed readiness for the Gateway.
-func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+// GatewayAddresses returns the node's LAN IP addresses and detailed readiness for the Gateway.
+func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	p.mu.RLock()
 	ifaceName := p.interfaceName
 	nodeName := p.nodeName

@@ -109,9 +109,9 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 		singlepod.WithACMEChallengeTokenPath("/var/run/secrets/tokens/certserver/token"),
 	)
 
-	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 	if err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 
 	var deploy appsv1.Deployment

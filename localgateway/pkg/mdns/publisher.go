@@ -55,7 +55,7 @@ const (
 
 // AddressProvider queries LAN addresses for a Gateway.
 type AddressProvider interface {
-	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error)
+	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error)
 }
 
 // PublisherOptions configures the mDNS Publisher.
@@ -305,8 +305,8 @@ func (p *Publisher) OnGatewaysUpdate(gateways []*gatewayv1.Gateway) {
 		// 1. Resolve LAN IP addresses from AddressProvider or Gateway status
 		var addresses []net.IP
 		if p.opts.AddressProvider != nil {
-			addrs, ready, err := p.opts.AddressProvider.GatewayAddresses(p.ctx, gw, nil)
-			if err == nil && ready {
+			addrs, readiness, err := p.opts.AddressProvider.GatewayAddresses(p.ctx, gw, nil)
+			if err == nil && readiness.Ready {
 				for _, a := range addrs {
 					if ip := net.ParseIP(a.Value); ip != nil {
 						addresses = append(addresses, ip)

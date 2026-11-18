@@ -114,29 +114,18 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // AddressProvider returns the addresses to report in Gateway.status.addresses and whether the Gateway infrastructure is ready.
 // An empty result means the address is not assigned yet.
 //
-// The ready flag indicates whether the data path from the reported addresses to this Gateway's
+// GatewayReadiness.Ready indicates whether the data path from the reported addresses to this Gateway's
 // listeners is serving the Gateway's current configuration, as far as the provider can tell.
 // Concrete providers approximate this readiness contract using available infrastructure signals,
 // but fall short of confirming that the latest configuration revision is actively being served.
 type AddressProvider interface {
-	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) (addresses []gatewayv1.GatewayStatusAddress, ready bool, err error)
+	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error)
 }
 
 // AddressWatcher is an optional interface that an AddressProvider can implement
 // to register custom watches with the Gateway controller.
 type AddressWatcher interface {
 	SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error
-}
-
-// AddressReadinessProvider is an optional interface that an AddressProvider can implement
-// to report addresses and detailed readiness state (including reason and message) in a single call.
-// GatewayReadiness.Ready shares the same semantics as AddressProvider's ready return value:
-// the data path from the reported addresses to this Gateway's listeners is serving the Gateway's
-// current configuration, as far as the provider can tell. Like AddressProvider, providers
-// implementing AddressReadinessProvider approximate this signal and fall short of an end-to-end
-// confirmation that the current configuration is applied by all data-plane replicas.
-type AddressReadinessProvider interface {
-	GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error)
 }
 
 // AddressTypeProvider is an optional interface that an AddressProvider can implement
@@ -233,18 +222,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{Ready: false})
 			} else {
 				effectiveListeners := r.State.GetEffectiveListeners(req.NamespacedName)
-				var (
-					providedAddresses []gatewayv1.GatewayStatusAddress
-					readiness         state.GatewayReadiness
-					err               error
-				)
-				if arp, ok := r.AddressProvider.(AddressReadinessProvider); ok {
-					providedAddresses, readiness, err = arp.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
-				} else {
-					var ready bool
-					providedAddresses, ready, err = r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
-					readiness = state.GatewayReadiness{Ready: ready}
-				}
+				providedAddresses, readiness, err := r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
 				if err != nil {
 					var conflictErr *OwnershipConflictError
 					if errors.As(err, &conflictErr) {

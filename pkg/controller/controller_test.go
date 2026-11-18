@@ -178,9 +178,9 @@ type trackingAddressProvider struct {
 	called bool
 }
 
-func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
+func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	p.called = true
-	return nil, false, nil
+	return nil, state.GatewayReadiness{}, nil
 }
 
 func TestGatewayReconciler_SkipsOtherControllersGateways(t *testing.T) {
@@ -1566,16 +1566,20 @@ func findCondition(conditions []metav1.Condition, condType string) *metav1.Condi
 
 type fakeAddressProvider struct {
 	addresses []gatewayv1.GatewayStatusAddress
+	readiness state.GatewayReadiness
 	ready     bool
 	err       error
 }
 
-func (f *fakeAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
-	ready := f.ready
-	if !ready && f.err == nil && len(f.addresses) > 0 {
-		ready = true
+func (f *fakeAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+	readiness := f.readiness
+	if f.ready {
+		readiness.Ready = true
 	}
-	return f.addresses, ready, f.err
+	if !readiness.Ready && readiness.Reason == "" && readiness.Message == "" && f.err == nil && len(f.addresses) > 0 {
+		readiness.Ready = true
+	}
+	return f.addresses, readiness, f.err
 }
 
 type fakeAddressWatcherProvider struct {
@@ -1870,16 +1874,7 @@ func TestGatewayReconciler_AddressWatcher(t *testing.T) {
 	}
 }
 
-type fakeAddressReadinessProvider struct {
-	fakeAddressProvider
-	readiness state.GatewayReadiness
-}
-
-func (f *fakeAddressReadinessProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
-	return f.addresses, f.readiness, f.err
-}
-
-func TestGatewayReconciler_AddressReadinessProvider(t *testing.T) {
+func TestGatewayReconciler_AddressReadiness(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)
@@ -1917,10 +1912,8 @@ func TestGatewayReconciler_AddressReadinessProvider(t *testing.T) {
 		WithStatusSubresource(&gatewayv1.Gateway{}).
 		Build()
 
-	readinessProvider := &fakeAddressReadinessProvider{
-		fakeAddressProvider: fakeAddressProvider{
-			addresses: []gatewayv1.GatewayStatusAddress{{Value: "1.2.3.4"}},
-		},
+	readinessProvider := &fakeAddressProvider{
+		addresses: []gatewayv1.GatewayStatusAddress{{Value: "1.2.3.4"}},
 		readiness: state.GatewayReadiness{
 			Ready:   false,
 			Reason:  "Pending",
@@ -2139,7 +2132,7 @@ func (f *fakeAddressTypeProvider) SupportedAddressTypes() []gatewayv1.AddressTyp
 	return f.supportedTypes
 }
 
-func (f *fakeAddressTypeProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
+func (f *fakeAddressTypeProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	f.called = true
 	return f.fakeAddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
 }

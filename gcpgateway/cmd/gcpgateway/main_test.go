@@ -205,9 +205,9 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 	if err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 
 	var deploy appsv1.Deployment
@@ -315,9 +315,9 @@ func TestSetupDataplane_ProvisionerArgs_ACMEChallenge(t *testing.T) {
 	)
 
 	// 1. Turned on via acmeChallenge: enabled in ConfigMap
-	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 	if err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 
 	var deploy appsv1.Deployment
@@ -350,9 +350,9 @@ func TestSetupDataplane_ProvisionerArgs_ACMEChallenge(t *testing.T) {
 	st.UpsertConfigMap(cm)
 	st.Recompute()
 
-	_, _, err = p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	_, _, err = p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 	if err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
 		t.Fatalf("failed to get updated Deployment: %v", err)
