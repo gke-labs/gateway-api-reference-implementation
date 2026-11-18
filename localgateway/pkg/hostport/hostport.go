@@ -17,11 +17,8 @@ package hostport
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
@@ -55,71 +52,58 @@ type HostPortAddressProvider struct {
 
 // New creates a new HostPortAddressProvider wrapping a singlepod.AddressProvider
 // configured with WithNoService() and the host-port Deployment mutator.
-func New(c client.Client, opts ...singlepod.Option) *HostPortAddressProvider {
-	wrappedOpts := make([]singlepod.Option, 0, len(opts)+2)
-	wrappedOpts = append(wrappedOpts, opts...)
-	wrappedOpts = append(wrappedOpts,
+func New(client client.Client, options ...singlepod.Option) *HostPortAddressProvider {
+	wrappedOptions := make([]singlepod.Option, 0, len(options)+2)
+	wrappedOptions = append(wrappedOptions, options...)
+	wrappedOptions = append(wrappedOptions,
 		singlepod.WithNoService(),
 		singlepod.WithDeploymentMutator(MutateDeployment),
 	)
 	return &HostPortAddressProvider{
-		provider: singlepod.NewAddressProvider(c, wrappedOpts...),
+		provider: singlepod.NewAddressProvider(client, wrappedOptions...),
 	}
 }
 
-// NewHostPortAddressProvider creates a new HostPortAddressProvider.
-func NewHostPortAddressProvider(c client.Client, opts ...singlepod.Option) *HostPortAddressProvider {
-	return New(c, opts...)
-}
-
-// NewAddressProvider creates a new HostPortAddressProvider.
-func NewAddressProvider(c client.Client, opts ...singlepod.Option) *HostPortAddressProvider {
-	return New(c, opts...)
-}
-
 // GatewayAddresses returns the Gateway's addresses and whether the Deployment is ready.
-func (p *HostPortAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
-	return addrs, readiness.Ready, err
+func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
+	addresses, readiness, err := provider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	return addresses, readiness.Ready, err
 }
 
 // GatewayAddressesWithReadiness reconciles the Gateway's data-plane infrastructure and returns
 // addresses and readiness status. In this step, address resolution is not yet implemented, so
 // the provider reports what the wrapped singlepod.AddressProvider reports with no Service:
 // no address and not ready. Node address resolution will be added in a subsequent step.
-func (p *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
-	return p.provider.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+	return provider.provider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 }
 
 // SupportedAddressTypes returns nil because host-port data planes bind directly to node host
 // ports and do not support requested spec.addresses. Returning nil causes Gateway API
 // to reject requested spec.addresses with Accepted=False and reason UnsupportedAddress.
-func (p *HostPortAddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
+func (provider *HostPortAddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
 	return nil
 }
 
 // SetupWatches registers watches on managed resources with the Gateway controller.
-func (p *HostPortAddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error {
-	if bldr == nil {
-		return nil
-	}
-	return p.provider.SetupWatches(mgr, bldr)
+func (provider *HostPortAddressProvider) SetupWatches(manager ctrl.Manager, builder *builder.Builder) error {
+	return provider.provider.SetupWatches(manager, builder)
 }
 
 // SetState sets the State reference on the wrapped singlepod.AddressProvider.
-func (p *HostPortAddressProvider) SetState(s *state.State) {
-	p.provider.SetState(s)
+func (provider *HostPortAddressProvider) SetState(s *state.State) {
+	provider.provider.SetState(s)
 }
 
 // MutateDeployment configures the Deployment with host-port container port mappings
 // and a rolling update strategy with maxSurge: 0 and maxUnavailable: 1.
-func MutateDeployment(deploy *appsv1ac.DeploymentApplyConfiguration, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error {
-	if deploy.Spec == nil {
-		deploy.WithSpec(appsv1ac.DeploymentSpec())
+func MutateDeployment(deployment *appsv1ac.DeploymentApplyConfiguration, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) error {
+	if deployment.Spec == nil {
+		deployment.WithSpec(appsv1ac.DeploymentSpec())
 	}
 	// The rollout strategy is a rolling update with no surge and one unavailable,
 	// because two pods cannot hold the same host port on one node.
-	deploy.Spec.WithStrategy(appsv1ac.DeploymentStrategy().
+	deployment.Spec.WithStrategy(appsv1ac.DeploymentStrategy().
 		WithType(appsv1.RollingUpdateDeploymentStrategyType).
 		WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
 			WithMaxSurge(intstr.FromInt32(0)).
@@ -127,141 +111,57 @@ func MutateDeployment(deploy *appsv1ac.DeploymentApplyConfiguration, gw *gateway
 		),
 	)
 
-	containerPorts := buildContainerPorts(gw, effectiveListeners)
-	if deploy.Spec.Template != nil && deploy.Spec.Template.Spec != nil {
-		for i := range deploy.Spec.Template.Spec.Containers {
-			c := &deploy.Spec.Template.Spec.Containers[i]
-			if c.Name != nil && *c.Name == "dataplane" {
-				c.Ports = nil
-				c.WithPorts(containerPorts...)
-				return nil
+	var dataplaneContainer *corev1ac.ContainerApplyConfiguration
+	if deployment.Spec.Template != nil && deployment.Spec.Template.Spec != nil {
+		for index := range deployment.Spec.Template.Spec.Containers {
+			container := &deployment.Spec.Template.Spec.Containers[index]
+			if container.Name != nil && *container.Name == singlepod.DataplaneContainerName {
+				dataplaneContainer = container
+				break
 			}
 		}
-		if len(deploy.Spec.Template.Spec.Containers) > 0 {
-			c := &deploy.Spec.Template.Spec.Containers[0]
-			c.Ports = nil
-			c.WithPorts(containerPorts...)
+	}
+	if dataplaneContainer == nil {
+		return fmt.Errorf("container %q not found in deployment", singlepod.DataplaneContainerName)
+	}
+
+	var httpPort, httpsPort int32
+	if gateway != nil {
+		for _, listener := range gateway.Spec.Listeners {
+			switch listener.Protocol {
+			case gatewayv1.HTTPProtocolType:
+				if httpPort == 0 {
+					httpPort = int32(listener.Port)
+				}
+			case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
+				if httpsPort == 0 {
+					httpsPort = int32(listener.Port)
+				}
+			}
 		}
 	}
+
+	for index := range dataplaneContainer.Ports {
+		port := &dataplaneContainer.Ports[index]
+		portName := ""
+		if port.Name != nil {
+			portName = *port.Name
+		}
+		switch portName {
+		case "http":
+			if httpPort > 0 {
+				port.WithHostPort(httpPort)
+			}
+		case "https", "http3":
+			if httpsPort > 0 {
+				port.WithHostPort(httpsPort)
+			}
+		default:
+			if port.ContainerPort != nil {
+				port.WithHostPort(*port.ContainerPort)
+			}
+		}
+	}
+
 	return nil
-}
-
-type listenerItem struct {
-	port       gatewayv1.PortNumber
-	protocol   gatewayv1.ProtocolType
-	conflicted bool
-}
-
-func buildContainerPorts(gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) []*corev1ac.ContainerPortApplyConfiguration {
-	var items []listenerItem
-	if len(effectiveListeners) > 0 {
-		items = make([]listenerItem, 0, len(effectiveListeners))
-		for _, el := range effectiveListeners {
-			items = append(items, listenerItem{
-				port:       el.Port,
-				protocol:   el.Protocol,
-				conflicted: el.IsConflicted(),
-			})
-		}
-	} else if gw != nil {
-		items = make([]listenerItem, 0, len(gw.Spec.Listeners))
-		for _, l := range gw.Spec.Listeners {
-			items = append(items, listenerItem{
-				port:     l.Port,
-				protocol: l.Protocol,
-			})
-		}
-	}
-
-	uniquePorts := make(map[gatewayv1.PortNumber]gatewayv1.ProtocolType)
-	var udpPorts []int
-	seenUDPPort := make(map[gatewayv1.PortNumber]bool)
-
-	for _, item := range items {
-		if item.conflicted {
-			continue
-		}
-		if item.protocol == gatewayv1.UDPProtocolType {
-			if !state.IsReservedDataPlanePort(item.port) && !seenUDPPort[item.port] {
-				seenUDPPort[item.port] = true
-				udpPorts = append(udpPorts, int(item.port))
-			}
-			continue
-		}
-		if item.protocol == gatewayv1.TCPProtocolType && state.IsReservedDataPlanePort(item.port) {
-			continue
-		}
-		if prev, ok := uniquePorts[item.port]; !ok {
-			uniquePorts[item.port] = item.protocol
-		} else if item.protocol == gatewayv1.HTTPSProtocolType {
-			uniquePorts[item.port] = gatewayv1.HTTPSProtocolType
-		} else if item.protocol == gatewayv1.TLSProtocolType && prev != gatewayv1.HTTPSProtocolType {
-			uniquePorts[item.port] = gatewayv1.TLSProtocolType
-		}
-	}
-
-	sort.Ints(udpPorts)
-
-	sortedPorts := make([]int, 0, len(uniquePorts))
-	for port := range uniquePorts {
-		sortedPorts = append(sortedPorts, int(port))
-	}
-	sort.Ints(sortedPorts)
-
-	var containerPorts []*corev1ac.ContainerPortApplyConfiguration
-	for _, portInt := range sortedPorts {
-		port := gatewayv1.PortNumber(portInt)
-		protocol := uniquePorts[port]
-		if protocol == gatewayv1.TCPProtocolType && state.IsReservedDataPlanePort(port) {
-			continue
-		}
-		name := fmt.Sprintf("%s-%d", strings.ToLower(string(protocol)), port)
-		containerPort := int32(port)
-		if protocol == gatewayv1.HTTPProtocolType {
-			containerPort = singlepod.DataPlaneHTTPPort
-			if port == 80 {
-				name = "http"
-			}
-		} else if protocol == gatewayv1.HTTPSProtocolType || protocol == gatewayv1.TLSProtocolType {
-			containerPort = singlepod.DataPlaneHTTPSPort
-			if port == 443 && protocol == gatewayv1.HTTPSProtocolType {
-				name = "https"
-			}
-		}
-		containerPorts = append(containerPorts,
-			corev1ac.ContainerPort().
-				WithName(name).
-				WithContainerPort(containerPort).
-				WithHostPort(int32(port)).
-				WithProtocol(corev1.ProtocolTCP),
-		)
-		if protocol == gatewayv1.HTTPSProtocolType {
-			http3Name := fmt.Sprintf("http3-%d", port)
-			if port == 443 {
-				http3Name = "http3"
-			}
-			containerPorts = append(containerPorts,
-				corev1ac.ContainerPort().
-					WithName(http3Name).
-					WithContainerPort(singlepod.DataPlaneHTTPSPort).
-					WithHostPort(int32(port)).
-					WithProtocol(corev1.ProtocolUDP),
-			)
-		}
-	}
-	for _, portInt := range udpPorts {
-		port := gatewayv1.PortNumber(portInt)
-		if state.IsReservedDataPlanePort(port) {
-			continue
-		}
-		containerPorts = append(containerPorts,
-			corev1ac.ContainerPort().
-				WithName(fmt.Sprintf("udp-%d", portInt)).
-				WithContainerPort(int32(portInt)).
-				WithHostPort(int32(portInt)).
-				WithProtocol(corev1.ProtocolUDP),
-		)
-	}
-
-	return containerPorts
 }

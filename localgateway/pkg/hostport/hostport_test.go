@@ -15,7 +15,6 @@
 package hostport
 
 import (
-	"fmt"
 	"reflect"
 	"testing"
 
@@ -25,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,10 +48,30 @@ func setupTestClient(t *testing.T) client.Client {
 		Build()
 }
 
+type hostPortSignature struct {
+	containerPort int32
+	hostPort      int32
+	protocol      corev1.Protocol
+}
+
+func extractHostPortSignatures(ports []corev1.ContainerPort) []hostPortSignature {
+	var signatures []hostPortSignature
+	for _, port := range ports {
+		if port.HostPort > 0 {
+			signatures = append(signatures, hostPortSignature{
+				containerPort: port.ContainerPort,
+				hostPort:      port.HostPort,
+				protocol:      port.Protocol,
+			})
+		}
+	}
+	return signatures
+}
+
 func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 	ctx := t.Context()
 
-	gw := &gatewayv1.Gateway{
+	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "gw-hp",
 			Namespace: "test-ns",
@@ -67,103 +87,67 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 		},
 	}
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
 
 	// 1. Expected: run existing singlepod provider with WithHostPorts()
-	cExpected := setupTestClient(t)
-	singlePodHP := singlepod.NewAddressProvider(cExpected, singlepod.WithHostPorts())
-	expectedAddrs, expectedReadiness, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gw, nil)
+	expectedClient := setupTestClient(t)
+	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
+	expectedAddresses, expectedReadiness, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, nil)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
 
-	var deployExpected appsv1.Deployment
-	if err := cExpected.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deployExpected); err != nil {
+	var expectedDeployment appsv1.Deployment
+	if err := expectedClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &expectedDeployment); err != nil {
 		t.Fatalf("failed to get expected Deployment: %v", err)
 	}
 
 	// 2. Actual: run HostPortAddressProvider
-	cActual := setupTestClient(t)
-	hpProvider := New(cActual)
-	actualAddrs, actualReadiness, err := hpProvider.GatewayAddressesWithReadiness(ctx, gw, nil)
+	actualClient := setupTestClient(t)
+	hostPortProvider := New(actualClient)
+	actualAddresses, actualReadiness, err := hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, nil)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
 
-	var deployActual appsv1.Deployment
-	if err := cActual.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deployActual); err != nil {
+	var actualDeployment appsv1.Deployment
+	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
 		t.Fatalf("failed to get actual Deployment: %v", err)
 	}
 
-	// 3. Deployment rollout strategy verification
-	if deployActual.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
-		t.Errorf("expected Deployment strategy RollingUpdate, got %s", deployActual.Spec.Strategy.Type)
+	// 3. Deployment rollout strategy verification: RollingUpdate with maxSurge: 0 and maxUnavailable: 1
+	if actualDeployment.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+		t.Errorf("expected Deployment strategy RollingUpdate, got %s", actualDeployment.Spec.Strategy.Type)
 	}
-	if deployActual.Spec.Strategy.RollingUpdate == nil {
+	if actualDeployment.Spec.Strategy.RollingUpdate == nil {
 		t.Fatalf("expected RollingUpdate strategy configuration")
 	}
-	if deployActual.Spec.Strategy.RollingUpdate.MaxSurge == nil || deployActual.Spec.Strategy.RollingUpdate.MaxSurge.IntValue() != 0 {
-		t.Errorf("expected maxSurge=0, got %v", deployActual.Spec.Strategy.RollingUpdate.MaxSurge)
+	if actualDeployment.Spec.Strategy.RollingUpdate.MaxSurge == nil || actualDeployment.Spec.Strategy.RollingUpdate.MaxSurge.IntValue() != 0 {
+		t.Errorf("expected maxSurge=0, got %v", actualDeployment.Spec.Strategy.RollingUpdate.MaxSurge)
 	}
-	if deployActual.Spec.Strategy.RollingUpdate.MaxUnavailable == nil || deployActual.Spec.Strategy.RollingUpdate.MaxUnavailable.IntValue() != 1 {
-		t.Errorf("expected maxUnavailable=1, got %v", deployActual.Spec.Strategy.RollingUpdate.MaxUnavailable)
+	if actualDeployment.Spec.Strategy.RollingUpdate.MaxUnavailable == nil || actualDeployment.Spec.Strategy.RollingUpdate.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("expected maxUnavailable=1, got %v", actualDeployment.Spec.Strategy.RollingUpdate.MaxUnavailable)
 	}
 
 	// Verify strategy matches singlepod.WithHostPorts() exactly
-	if !reflect.DeepEqual(deployActual.Spec.Strategy, deployExpected.Spec.Strategy) {
-		t.Errorf("strategy mismatch:\ngot  %+v\nwant %+v", deployActual.Spec.Strategy, deployExpected.Spec.Strategy)
+	if !reflect.DeepEqual(actualDeployment.Spec.Strategy, expectedDeployment.Spec.Strategy) {
+		t.Errorf("strategy mismatch:\ngot  %+v\nwant %+v", actualDeployment.Spec.Strategy, expectedDeployment.Spec.Strategy)
 	}
 
-	// 4. Container ports verification
-	actualPorts := deployActual.Spec.Template.Spec.Containers[0].Ports
-	expectedPorts := deployExpected.Spec.Template.Spec.Containers[0].Ports
-	if !reflect.DeepEqual(actualPorts, expectedPorts) {
-		t.Errorf("container ports mismatch:\ngot  %+v\nwant %+v", actualPorts, expectedPorts)
-	}
+	// 4. Container ports verification: compare hostPort, containerPort, and protocol with singlepod.WithHostPorts()
+	actualPorts := actualDeployment.Spec.Template.Spec.Containers[0].Ports
+	expectedPorts := expectedDeployment.Spec.Template.Spec.Containers[0].Ports
 
-	portMap := make(map[string]corev1.ContainerPort)
-	for _, cp := range actualPorts {
-		portMap[fmt.Sprintf("%s/%s", cp.Name, cp.Protocol)] = cp
-	}
+	actualSignatures := extractHostPortSignatures(actualPorts)
+	expectedSignatures := extractHostPortSignatures(expectedPorts)
 
-	// Verify HTTP mapping: containerPort 8080, hostPort 80
-	if cp, ok := portMap["http/TCP"]; !ok {
-		t.Errorf("missing http/TCP port in container")
-	} else if cp.ContainerPort != singlepod.DataPlaneHTTPPort || cp.HostPort != 80 {
-		t.Errorf("http/TCP: expected containerPort=%d hostPort=80, got containerPort=%d hostPort=%d", singlepod.DataPlaneHTTPPort, cp.ContainerPort, cp.HostPort)
-	}
-
-	// Verify HTTPS TCP mapping: containerPort 8443, hostPort 443
-	if cp, ok := portMap["https/TCP"]; !ok {
-		t.Errorf("missing https/TCP port in container")
-	} else if cp.ContainerPort != singlepod.DataPlaneHTTPSPort || cp.HostPort != 443 {
-		t.Errorf("https/TCP: expected containerPort=%d hostPort=443, got containerPort=%d hostPort=%d", singlepod.DataPlaneHTTPSPort, cp.ContainerPort, cp.HostPort)
-	}
-
-	// Verify HTTP/3 UDP mapping: containerPort 8443, hostPort 443
-	if cp, ok := portMap["http3/UDP"]; !ok {
-		t.Errorf("missing http3/UDP port in container")
-	} else if cp.ContainerPort != singlepod.DataPlaneHTTPSPort || cp.HostPort != 443 {
-		t.Errorf("http3/UDP: expected containerPort=%d hostPort=443, got containerPort=%d hostPort=%d", singlepod.DataPlaneHTTPSPort, cp.ContainerPort, cp.HostPort)
-	}
-
-	// Verify TCP mapping: containerPort 9000, hostPort 9000
-	if cp, ok := portMap["tcp-9000/TCP"]; !ok {
-		t.Errorf("missing tcp-9000/TCP port in container")
-	} else if cp.ContainerPort != 9000 || cp.HostPort != 9000 {
-		t.Errorf("tcp-9000/TCP: expected containerPort=9000 hostPort=9000, got containerPort=%d hostPort=%d", cp.ContainerPort, cp.HostPort)
-	}
-
-	// Verify UDP mapping: containerPort 5353, hostPort 5353
-	if cp, ok := portMap["udp-5353/UDP"]; !ok {
-		t.Errorf("missing udp-5353/UDP port in container")
-	} else if cp.ContainerPort != 5353 || cp.HostPort != 5353 {
-		t.Errorf("udp-5353/UDP: expected containerPort=5353 hostPort=5353, got containerPort=%d hostPort=%d", cp.ContainerPort, cp.HostPort)
+	if !reflect.DeepEqual(actualSignatures, expectedSignatures) {
+		t.Errorf("host port signatures mismatch:\ngot  %+v\nwant %+v", actualSignatures, expectedSignatures)
 	}
 
 	// 5. Verify no Service created
-	var svc corev1.Service
-	if err := cActual.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &svc); !apierrors.IsNotFound(err) {
+	var service corev1.Service
+	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &service); !apierrors.IsNotFound(err) {
 		t.Errorf("expected no Service to be created, got err: %v", err)
 	}
 
@@ -171,11 +155,11 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 	if actualReadiness.Ready {
 		t.Errorf("expected ready=false in this step")
 	}
-	if len(actualAddrs) > 0 {
-		t.Errorf("expected 0 addresses in this step, got %+v", actualAddrs)
+	if len(actualAddresses) > 0 {
+		t.Errorf("expected 0 addresses in this step, got %+v", actualAddresses)
 	}
-	if !reflect.DeepEqual(actualAddrs, expectedAddrs) {
-		t.Errorf("addresses mismatch: got %+v, want %+v", actualAddrs, expectedAddrs)
+	if !reflect.DeepEqual(actualAddresses, expectedAddresses) {
+		t.Errorf("addresses mismatch: got %+v, want %+v", actualAddresses, expectedAddresses)
 	}
 	if actualReadiness.Ready != expectedReadiness.Ready {
 		t.Errorf("readiness.Ready mismatch: got %v, want %v", actualReadiness.Ready, expectedReadiness.Ready)
@@ -185,7 +169,7 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 	ctx := t.Context()
 
-	gw := &gatewayv1.Gateway{
+	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "gw-reserved",
 			Namespace: "test-ns",
@@ -201,49 +185,55 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 		},
 	}
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
 
-	cExpected := setupTestClient(t)
-	singlePodHP := singlepod.NewAddressProvider(cExpected, singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gw, nil)
+	expectedClient := setupTestClient(t)
+	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
+	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, nil)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
-	var deployExpected appsv1.Deployment
-	if err := cExpected.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deployExpected); err != nil {
+	var expectedDeployment appsv1.Deployment
+	if err := expectedClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &expectedDeployment); err != nil {
 		t.Fatalf("failed to get expected Deployment: %v", err)
 	}
 
-	cActual := setupTestClient(t)
-	hpProvider := NewHostPortAddressProvider(cActual)
-	_, _, err = hpProvider.GatewayAddressesWithReadiness(ctx, gw, nil)
+	actualClient := setupTestClient(t)
+	hostPortProvider := New(actualClient)
+	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, nil)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
-	var deployActual appsv1.Deployment
-	if err := cActual.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deployActual); err != nil {
+	var actualDeployment appsv1.Deployment
+	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
 		t.Fatalf("failed to get actual Deployment: %v", err)
 	}
 
-	actualPorts := deployActual.Spec.Template.Spec.Containers[0].Ports
-	expectedPorts := deployExpected.Spec.Template.Spec.Containers[0].Ports
-	if !reflect.DeepEqual(actualPorts, expectedPorts) {
-		t.Errorf("container ports mismatch:\ngot  %+v\nwant %+v", actualPorts, expectedPorts)
+	actualSignatures := extractHostPortSignatures(actualDeployment.Spec.Template.Spec.Containers[0].Ports)
+	expectedSignatures := extractHostPortSignatures(expectedDeployment.Spec.Template.Spec.Containers[0].Ports)
+
+	if !reflect.DeepEqual(actualSignatures, expectedSignatures) {
+		t.Errorf("host port signatures mismatch:\ngot  %+v\nwant %+v", actualSignatures, expectedSignatures)
 	}
 
-	// Only port 80 should be in container ports; 8080 TCP, 8443 UDP, and 8999 TCP should be skipped
-	if len(actualPorts) != 1 {
-		t.Fatalf("expected exactly 1 container port (port 80), got %d: %+v", len(actualPorts), actualPorts)
+	// Only port 80 should have a hostPort; reserved ports 8080 TCP, 8443 UDP, and 8999 TCP should be skipped
+	if len(actualSignatures) != 1 {
+		t.Fatalf("expected exactly 1 host port signature, got %d: %+v", len(actualSignatures), actualSignatures)
 	}
-	if actualPorts[0].HostPort != 80 || actualPorts[0].ContainerPort != singlepod.DataPlaneHTTPPort {
-		t.Errorf("expected port 80 mapping, got %+v", actualPorts[0])
+	expectedSingle := hostPortSignature{
+		containerPort: singlepod.DataPlaneHTTPPort,
+		hostPort:      80,
+		protocol:      corev1.ProtocolTCP,
+	}
+	if actualSignatures[0] != expectedSingle {
+		t.Errorf("expected port 80 host port mapping %+v, got %+v", expectedSingle, actualSignatures[0])
 	}
 }
 
 func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 	ctx := t.Context()
 
-	gw := &gatewayv1.Gateway{
+	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "gw-custom-ports",
 			Namespace: "test-ns",
@@ -257,133 +247,47 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 		},
 	}
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
 
-	cExpected := setupTestClient(t)
-	singlePodHP := singlepod.NewAddressProvider(cExpected, singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gw, nil)
+	expectedClient := setupTestClient(t)
+	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
+	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, nil)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
-	var deployExpected appsv1.Deployment
-	if err := cExpected.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deployExpected); err != nil {
+	var expectedDeployment appsv1.Deployment
+	if err := expectedClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &expectedDeployment); err != nil {
 		t.Fatalf("failed to get expected Deployment: %v", err)
 	}
 
-	cActual := setupTestClient(t)
-	hpProvider := NewAddressProvider(cActual)
-	_, _, err = hpProvider.GatewayAddressesWithReadiness(ctx, gw, nil)
+	actualClient := setupTestClient(t)
+	hostPortProvider := New(actualClient)
+	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, nil)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
-	var deployActual appsv1.Deployment
-	if err := cActual.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deployActual); err != nil {
+	var actualDeployment appsv1.Deployment
+	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
 		t.Fatalf("failed to get actual Deployment: %v", err)
 	}
 
-	actualPorts := deployActual.Spec.Template.Spec.Containers[0].Ports
-	expectedPorts := deployExpected.Spec.Template.Spec.Containers[0].Ports
-	if !reflect.DeepEqual(actualPorts, expectedPorts) {
-		t.Errorf("container ports mismatch:\ngot  %+v\nwant %+v", actualPorts, expectedPorts)
-	}
+	actualSignatures := extractHostPortSignatures(actualDeployment.Spec.Template.Spec.Containers[0].Ports)
+	expectedSignatures := extractHostPortSignatures(expectedDeployment.Spec.Template.Spec.Containers[0].Ports)
 
-	portMap := make(map[string]corev1.ContainerPort)
-	for _, cp := range actualPorts {
-		portMap[fmt.Sprintf("%s/%s", cp.Name, cp.Protocol)] = cp
-	}
-
-	// http-8081 -> containerPort 8080, hostPort 8081
-	if cp, ok := portMap["http-8081/TCP"]; !ok {
-		t.Errorf("missing http-8081/TCP port")
-	} else if cp.ContainerPort != singlepod.DataPlaneHTTPPort || cp.HostPort != 8081 {
-		t.Errorf("http-8081/TCP: expected containerPort=%d hostPort=8081, got containerPort=%d hostPort=%d", singlepod.DataPlaneHTTPPort, cp.ContainerPort, cp.HostPort)
-	}
-
-	// https-8444 -> containerPort 8443, hostPort 8444
-	if cp, ok := portMap["https-8444/TCP"]; !ok {
-		t.Errorf("missing https-8444/TCP port")
-	} else if cp.ContainerPort != singlepod.DataPlaneHTTPSPort || cp.HostPort != 8444 {
-		t.Errorf("https-8444/TCP: expected containerPort=%d hostPort=8444, got containerPort=%d hostPort=%d", singlepod.DataPlaneHTTPSPort, cp.ContainerPort, cp.HostPort)
-	}
-
-	// http3-8444 -> containerPort 8443, hostPort 8444
-	if cp, ok := portMap["http3-8444/UDP"]; !ok {
-		t.Errorf("missing http3-8444/UDP port")
-	} else if cp.ContainerPort != singlepod.DataPlaneHTTPSPort || cp.HostPort != 8444 {
-		t.Errorf("http3-8444/UDP: expected containerPort=%d hostPort=8444, got containerPort=%d hostPort=%d", singlepod.DataPlaneHTTPSPort, cp.ContainerPort, cp.HostPort)
+	if !reflect.DeepEqual(actualSignatures, expectedSignatures) {
+		t.Errorf("host port signatures mismatch:\ngot  %+v\nwant %+v", actualSignatures, expectedSignatures)
 	}
 }
 
-func TestHostPortAddressProvider_EffectiveListeners(t *testing.T) {
-	ctx := t.Context()
-
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "gw-effective",
-			Namespace: "test-ns",
-			UID:       types.UID("gw-effective-uid"),
-		},
-		Spec: gatewayv1.GatewaySpec{
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-				{Name: "conflicted", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
-			},
-		},
+func TestHostPortAddressProvider_ContainerMissing(t *testing.T) {
+	emptyDeployment := appsv1ac.Deployment("test", "default")
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-empty", Namespace: "default"},
 	}
 
-	effectiveListeners := []*state.EffectiveListener{
-		{
-			Port:     80,
-			Protocol: gatewayv1.HTTPProtocolType,
-		},
-		{
-			Port:     8080,
-			Protocol: gatewayv1.HTTPProtocolType,
-			ListenerInfo: state.ListenerInfo{
-				Conditions: []metav1.Condition{
-					{
-						Type:   string(gatewayv1.ListenerConditionConflicted),
-						Status: metav1.ConditionTrue,
-						Reason: string(gatewayv1.ListenerReasonHostnameConflict),
-					},
-				},
-			},
-		},
-	}
-
-	resName := singlepod.ResourceNameForGateway(gw.Name)
-
-	cExpected := setupTestClient(t)
-	singlePodHP := singlepod.NewAddressProvider(cExpected, singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
-	if err != nil {
-		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
-	}
-	var deployExpected appsv1.Deployment
-	if err := cExpected.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deployExpected); err != nil {
-		t.Fatalf("failed to get expected Deployment: %v", err)
-	}
-
-	cActual := setupTestClient(t)
-	hpProvider := New(cActual)
-	_, _, err = hpProvider.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
-	if err != nil {
-		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
-	}
-	var deployActual appsv1.Deployment
-	if err := cActual.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deployActual); err != nil {
-		t.Fatalf("failed to get actual Deployment: %v", err)
-	}
-
-	actualPorts := deployActual.Spec.Template.Spec.Containers[0].Ports
-	expectedPorts := deployExpected.Spec.Template.Spec.Containers[0].Ports
-	if !reflect.DeepEqual(actualPorts, expectedPorts) {
-		t.Errorf("container ports mismatch:\ngot  %+v\nwant %+v", actualPorts, expectedPorts)
-	}
-
-	// Conflicted listener on port 8080 should have been skipped
-	if len(actualPorts) != 1 || actualPorts[0].HostPort != 80 {
-		t.Fatalf("expected only port 80, got %+v", actualPorts)
+	err := MutateDeployment(emptyDeployment, gateway, nil)
+	if err == nil {
+		t.Fatalf("expected error when dataplane container is missing, got nil")
 	}
 }
 
@@ -392,8 +296,8 @@ func TestHostPortAddressProvider_AddressRequestRejected(t *testing.T) {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)
 
-	ipAddrType := gatewayv1.IPAddressType
-	gw := &gatewayv1.Gateway{
+	ipAddressType := gatewayv1.IPAddressType
+	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "gw-request-addr",
 			Namespace: "default",
@@ -401,7 +305,7 @@ func TestHostPortAddressProvider_AddressRequestRejected(t *testing.T) {
 		Spec: gatewayv1.GatewaySpec{
 			GatewayClassName: "localgateway",
 			Addresses: []gatewayv1.GatewaySpecAddress{
-				{Type: &ipAddrType, Value: "192.168.1.100"},
+				{Type: &ipAddressType, Value: "192.168.1.100"},
 			},
 			Listeners: []gatewayv1.Listener{
 				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
@@ -409,20 +313,20 @@ func TestHostPortAddressProvider_AddressRequestRejected(t *testing.T) {
 		},
 	}
 
-	gc := &gatewayv1.GatewayClass{
+	gatewayClass := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "localgateway"},
 		Spec: gatewayv1.GatewayClassSpec{
 			ControllerName: "localgateway",
 		},
 	}
 
-	c := fake.NewClientBuilder().
+	testClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&gatewayv1.Gateway{}).
-		WithObjects(gw, gc).
+		WithObjects(gateway, gatewayClass).
 		Build()
 
-	provider := New(c)
+	provider := New(testClient)
 
 	// 1. SupportedAddressTypes returns nil
 	supported := provider.SupportedAddressTypes()
@@ -431,65 +335,65 @@ func TestHostPortAddressProvider_AddressRequestRejected(t *testing.T) {
 	}
 
 	// 2. Gateway requesting an address is rejected via state.State
-	st := state.NewState()
-	st.SetSupportedAddressTypes(provider.SupportedAddressTypes())
-	st.UpsertGatewayClass(gc)
-	st.UpsertGateway(gw)
-	st.Recompute()
+	gatewayState := state.NewState()
+	gatewayState.SetSupportedAddressTypes(provider.SupportedAddressTypes())
+	gatewayState.UpsertGatewayClass(gatewayClass)
+	gatewayState.UpsertGateway(gateway)
+	gatewayState.Recompute()
 
-	status, ok := st.GetDesiredGatewayStatus(types.NamespacedName{Namespace: "default", Name: "gw-request-addr"})
+	status, ok := gatewayState.GetDesiredGatewayStatus(types.NamespacedName{Namespace: "default", Name: "gw-request-addr"})
 	if !ok {
 		t.Fatalf("expected desired status for gateway")
 	}
 
-	var acceptedCond *metav1.Condition
-	for i := range status.Conditions {
-		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionAccepted) {
-			acceptedCond = &status.Conditions[i]
+	var acceptedCondition *metav1.Condition
+	for index := range status.Conditions {
+		if status.Conditions[index].Type == string(gatewayv1.GatewayConditionAccepted) {
+			acceptedCondition = &status.Conditions[index]
 			break
 		}
 	}
-	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.GatewayReasonUnsupportedAddress) {
-		t.Errorf("expected Accepted=False Reason=UnsupportedAddress from State, got %+v", acceptedCond)
+	if acceptedCondition == nil || acceptedCondition.Status != metav1.ConditionFalse || acceptedCondition.Reason != string(gatewayv1.GatewayReasonUnsupportedAddress) {
+		t.Errorf("expected Accepted=False Reason=UnsupportedAddress from State, got %+v", acceptedCondition)
 	}
 
 	// 3. Gateway requesting an address is rejected via controller.GatewayReconciler
-	r := &controller.GatewayReconciler{
-		Client:          c,
+	reconciler := &controller.GatewayReconciler{
+		Client:          testClient,
 		Scheme:          scheme,
-		State:           st,
+		State:           gatewayState,
 		ControllerName:  "localgateway",
 		AddressProvider: provider,
 	}
 
 	ctx := t.Context()
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-request-addr"}}
-	if _, err := r.Reconcile(ctx, req); err != nil {
+	if _, err := reconciler.Reconcile(ctx, req); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 
-	var reconciledGW gatewayv1.Gateway
-	if err := c.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+	var reconciledGateway gatewayv1.Gateway
+	if err := testClient.Get(ctx, req.NamespacedName, &reconciledGateway); err != nil {
 		t.Fatalf("failed to get reconciled gateway: %v", err)
 	}
 
-	var rAcceptedCond *metav1.Condition
-	for i := range reconciledGW.Status.Conditions {
-		if reconciledGW.Status.Conditions[i].Type == string(gatewayv1.GatewayConditionAccepted) {
-			rAcceptedCond = &reconciledGW.Status.Conditions[i]
+	var reconciledAcceptedCondition *metav1.Condition
+	for index := range reconciledGateway.Status.Conditions {
+		if reconciledGateway.Status.Conditions[index].Type == string(gatewayv1.GatewayConditionAccepted) {
+			reconciledAcceptedCondition = &reconciledGateway.Status.Conditions[index]
 			break
 		}
 	}
-	if rAcceptedCond == nil || rAcceptedCond.Status != metav1.ConditionFalse || rAcceptedCond.Reason != string(gatewayv1.GatewayReasonUnsupportedAddress) {
-		t.Errorf("expected Accepted=False Reason=UnsupportedAddress from Reconciler, got %+v", rAcceptedCond)
+	if reconciledAcceptedCondition == nil || reconciledAcceptedCondition.Status != metav1.ConditionFalse || reconciledAcceptedCondition.Reason != string(gatewayv1.GatewayReasonUnsupportedAddress) {
+		t.Errorf("expected Accepted=False Reason=UnsupportedAddress from Reconciler, got %+v", reconciledAcceptedCondition)
 	}
 }
 
 func TestHostPortAddressProvider_GatewayAddresses(t *testing.T) {
-	c := setupTestClient(t)
-	provider := New(c)
+	testClient := setupTestClient(t)
+	provider := New(testClient)
 
-	gw := &gatewayv1.Gateway{
+	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "gw-simple",
 			Namespace: "test-ns",
@@ -502,32 +406,31 @@ func TestHostPortAddressProvider_GatewayAddresses(t *testing.T) {
 		},
 	}
 
-	addrs, ready, err := provider.GatewayAddresses(t.Context(), gw, nil)
+	addresses, ready, err := provider.GatewayAddresses(t.Context(), gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if ready {
 		t.Errorf("expected ready=false")
 	}
-	if len(addrs) != 0 {
-		t.Errorf("expected 0 addresses, got %+v", addrs)
+	if len(addresses) != 0 {
+		t.Errorf("expected 0 addresses, got %+v", addresses)
 	}
 }
 
 func TestHostPortAddressProvider_SetupWatches(t *testing.T) {
-	c := setupTestClient(t)
-	provider := New(c)
+	provider := New(nil)
 
-	// SetupWatches with nil mgr/bldr should delegate safely without error
-	if err := provider.SetupWatches(nil, nil); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// SetupWatches without scheme/mapper delegates to singlepod and returns an error
+	if err := provider.SetupWatches(nil, nil); err == nil {
+		t.Fatalf("expected error from SetupWatches without scheme and mapper, got nil")
 	}
 }
 
 func TestHostPortAddressProvider_SetState(t *testing.T) {
-	c := setupTestClient(t)
-	provider := New(c)
+	testClient := setupTestClient(t)
+	provider := New(testClient)
 
-	st := state.NewState()
-	provider.SetState(st)
+	gatewayState := state.NewState()
+	provider.SetState(gatewayState)
 }
