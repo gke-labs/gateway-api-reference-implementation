@@ -159,6 +159,19 @@ spec:
             fieldRef:
               fieldPath: metadata.namespace
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gari-controller
+  namespace: default
+spec:
+  selector:
+    app: gari-controller
+  ports:
+  - name: push
+    port: 8443
+    targetPort: 8443
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -183,12 +196,25 @@ spec:
           value: ${IMAGE_PREFIX}/gari-controller
         args:
         - --dataplane-image=$(DATAPLANE_IMAGE)
+        - --push-bind-address=:8443
+        - --push-tls-cert-file=/etc/gari/svid/svid.pem
+        - --push-tls-key-file=/etc/gari/svid/svid_key.pem
         ports:
         - name: metrics
           containerPort: 8999
+        - name: push
+          containerPort: 8443
         readinessProbe:
           httpGet:
             path: /readyz
             port: 8999
           initialDelaySeconds: 1
           periodSeconds: 2
+        volumeMounts:
+        - name: svid
+          mountPath: /etc/gari/svid
+          readOnly: true
+      volumes:
+      - name: svid
+        secret:
+          secretName: gari-controller-svid

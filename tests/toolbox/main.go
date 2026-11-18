@@ -118,6 +118,7 @@ func runClientCLI(args []string) {
 	insecure := fs.Bool("insecure", false, "Skip TLS verification")
 	expectFail := fs.Bool("expect-fail", false, "Expect request / TLS connection to fail/be closed")
 	http3Flag := fs.Bool("http3", false, "Use HTTP/3 (QUIC) protocol")
+	tlsHandshakeOnly := fs.Bool("tls-handshake-only", false, "Only perform TLS handshake and verify peer certificates")
 	timeout := fs.Duration("timeout", 10*time.Second, "Request timeout")
 	retries := fs.Int("retries", 30, "Number of retries for request on failure")
 	retryInterval := fs.Duration("retry-interval", 1*time.Second, "Interval between retries")
@@ -146,6 +147,82 @@ func runClientCLI(args []string) {
 		if !rootCAs.AppendCertsFromPEM(caData) {
 			log.Fatalf("Failed to append CA cert from %s", *caCertPath)
 		}
+	}
+
+	if *tlsHandshakeOnly {
+		serverName := *sni
+		if serverName == "" {
+			serverName = parseHostname(targetURL)
+		}
+		tlsConfig := &tls.Config{
+			ServerName:         serverName,
+			RootCAs:            rootCAs,
+			InsecureSkipVerify: *insecure,
+		}
+		u, err := url.Parse(targetURL)
+		if err != nil {
+			log.Fatalf("Failed to parse target URL %q: %v", targetURL, err)
+		}
+		dialAddr := u.Host
+		if !strings.Contains(dialAddr, ":") {
+			if u.Scheme == "https" {
+				dialAddr += ":443"
+			} else {
+				dialAddr += ":80"
+			}
+		}
+		if *connectTo != "" {
+			dialAddr = *connectTo
+		}
+
+		maxAttempts := 1
+		if !*expectFail && *retries > 0 {
+			maxAttempts = *retries + 1
+		}
+
+		var lastErr error
+		var capturedCerts []*x509.Certificate
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			if attempt > 1 {
+				time.Sleep(*retryInterval)
+				log.Printf("Retrying TLS handshake (attempt %d/%d)...", attempt, maxAttempts)
+			}
+			dialer := &net.Dialer{Timeout: *timeout}
+			conn, err := tls.DialWithDialer(dialer, "tcp", dialAddr, tlsConfig)
+			if err != nil {
+				lastErr = err
+				if *expectFail {
+					fmt.Printf("TLS connection failed as expected: %v\n", err)
+					return
+				}
+				continue
+			}
+			capturedCerts = conn.ConnectionState().PeerCertificates
+			if closeErr := conn.Close(); closeErr != nil {
+				log.Printf("Failed to close TLS connection: %v", closeErr)
+			}
+			lastErr = nil
+			break
+		}
+		if *expectFail {
+			log.Fatalf("Expected TLS connection to fail, but succeeded")
+		}
+		if lastErr != nil {
+			log.Fatalf("TLS handshake failed: %v", lastErr)
+		}
+		fmt.Println("TLS handshake succeeded")
+		if len(capturedCerts) > 0 {
+			leaf := capturedCerts[0]
+			fmt.Printf("PeerCertSubjectCN: %s\n", leaf.Subject.CommonName)
+			fmt.Printf("PeerCertDNSNames: %s\n", strings.Join(leaf.DNSNames, ","))
+			var uris []string
+			for _, u := range leaf.URIs {
+				uris = append(uris, u.String())
+			}
+			fmt.Printf("PeerCertURIs: %s\n", strings.Join(uris, ","))
+			fmt.Printf("PeerCertIssuerCN: %s\n", leaf.Issuer.CommonName)
+		}
+		return
 	}
 
 	var capturedPeerCerts []*x509.Certificate
