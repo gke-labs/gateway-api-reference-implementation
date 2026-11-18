@@ -26,6 +26,7 @@ import (
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 )
 
 func TestGatewayAPI(t *testing.T) {
@@ -54,6 +55,101 @@ func TestGatewayAPI(t *testing.T) {
 
 	// 3. Deploy Backend (Toolbox Server)
 	h.DeployBackend()
+
+	// Verify push listener TLS with controller X.509-SVID
+	// 1. A client in the cluster that trusts only the trust bundle in the ConfigMap
+	// completes a TLS handshake with the push Service by its DNS name.
+	dnsNames, err := spiffe.ServiceDNSNames(spiffe.ControllerServiceName, "default")
+	if err != nil {
+		t.Fatalf("Failed to get push Service DNS names: %v", err)
+	}
+	serviceDNS := dnsNames[len(dnsNames)-1]
+	targetPushURL := fmt.Sprintf("https://%s:8443", serviceDNS)
+
+	pushClientPod := "test-push-client"
+	h.DeletePod(pushClientPod)
+	clientPushManifest := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: default
+spec:
+  containers:
+  - name: toolbox
+    image: toolbox:e2e
+    imagePullPolicy: Never
+    command: ["/app/toolbox", "client"]
+    args: ["--ca-cert=/etc/spiffe/%s", "--tls-handshake-only", "%s"]
+    volumeMounts:
+    - name: bundle
+      mountPath: /etc/spiffe
+      readOnly: true
+  volumes:
+  - name: bundle
+    configMap:
+      name: %s
+  restartPolicy: Never
+`, pushClientPod, spiffe.BundleDataKey, targetPushURL, spiffe.BundleConfigMapName)
+
+	h.KubectlApplyContent(clientPushManifest)
+	h.WaitForPodSuccess(pushClientPod, 1*time.Minute)
+	pushLogs := h.GetPodLogs(pushClientPod)
+	t.Logf("Push client logs (trusted): %s", pushLogs)
+	if !strings.Contains(pushLogs, "TLS handshake succeeded") {
+		t.Errorf("Expected TLS handshake to succeed, got: %s", pushLogs)
+	}
+	for _, expectedDNS := range dnsNames {
+		if !strings.Contains(pushLogs, expectedDNS) {
+			t.Errorf("Expected peer certificate to contain DNS name %q, got logs: %s", expectedDNS, pushLogs)
+		}
+	}
+	h.DeletePod(pushClientPod)
+
+	// 2. A client that trusts another authority fails.
+	untrustedPod := "test-push-client-untrusted"
+	h.DeletePod(untrustedPod)
+
+	untrustedCertPEM, untrustedKeyPEM, err := GenerateTestCertificate("other-ca.example.com", "other-ca.example.com")
+	if err != nil {
+		t.Fatalf("Failed to generate untrusted CA certificate: %v", err)
+	}
+	untrustedSecretName := "untrusted-ca-secret"
+	h.CreateTLSSecret(untrustedSecretName, "default", untrustedCertPEM, untrustedKeyPEM)
+	defer h.RunCmd("kubectl", "delete", "secret", untrustedSecretName, "--namespace=default", "--ignore-not-found")
+
+	clientUntrustedManifest := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: default
+spec:
+  containers:
+  - name: toolbox
+    image: toolbox:e2e
+    imagePullPolicy: Never
+    command: ["/app/toolbox", "client"]
+    args: ["--ca-cert=/etc/untrusted/tls.crt", "--expect-fail", "--tls-handshake-only", "%s"]
+    volumeMounts:
+    - name: untrusted-ca
+      mountPath: /etc/untrusted
+      readOnly: true
+  volumes:
+  - name: untrusted-ca
+    secret:
+      secretName: %s
+  restartPolicy: Never
+`, untrustedPod, targetPushURL, untrustedSecretName)
+
+	h.KubectlApplyContent(clientUntrustedManifest)
+	h.WaitForPodSuccess(untrustedPod, 1*time.Minute)
+	untrustedLogs := h.GetPodLogs(untrustedPod)
+	t.Logf("Push client logs (untrusted): %s", untrustedLogs)
+	if !strings.Contains(untrustedLogs, "TLS connection failed as expected") {
+		t.Errorf("Expected TLS handshake with untrusted authority to fail, got: %s", untrustedLogs)
+	}
+	h.DeletePod(untrustedPod)
 
 	// 4. Create Gateway API Resources
 	certPEM, keyPEM, err := GenerateTestCertificate("example.com", "example.com")
