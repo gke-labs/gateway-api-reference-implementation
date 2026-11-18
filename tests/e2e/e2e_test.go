@@ -47,6 +47,11 @@ func TestGatewayAPI(t *testing.T) {
 	// 2. Deploy Controller
 	h.DeployController()
 
+	// Verify the credentials Job created the three SPIFFE objects
+	h.RunCmd("kubectl", "get", "secret", "gari-spiffe-authority", "--namespace=default")
+	h.RunCmd("kubectl", "get", "configmap", "gari-spiffe-bundle", "--namespace=default")
+	h.RunCmd("kubectl", "get", "secret", "gari-controller-svid", "--namespace=default")
+
 	// 3. Deploy Backend (Toolbox Server)
 	h.DeployBackend()
 

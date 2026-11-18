@@ -146,7 +146,7 @@ spec:
         fsGroup: 65532
       containers:
       - name: init-credentials
-        image: gari-controller:latest
+        image: gari-credentials:latest
         imagePullPolicy: IfNotPresent
         securityContext:
           allowPrivilegeEscalation: false
@@ -158,8 +158,6 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        args:
-        - --init-credentials
 ---
 apiVersion: apps/v1
 kind: Deployment
