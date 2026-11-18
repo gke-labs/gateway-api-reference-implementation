@@ -192,7 +192,6 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "gateway-namespace", DefValue: "", Usage: "The namespace of the Gateway to serve in data-plane mode."},
 		{Name: "health-probe-bind-address", DefValue: ":8999", Usage: "The address the probe endpoint binds to."},
 		{Name: "idle-timeout", DefValue: "1m0s", Usage: "The maximum amount of time to wait for the next request when keep-alives are enabled."},
-		{Name: "init-credentials", DefValue: "false", Usage: "Create SPIFFE credentials for the cluster, then exit."},
 		{Name: "leader-elect", DefValue: "false", Usage: "Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager."},
 		{Name: "metrics-bind-address", DefValue: ":8999", Usage: "The address the metric endpoint binds to."},
 		{Name: "proxy-bind-address", DefValue: ":8080", Usage: "The address the proxy binds to for HTTP."},
@@ -331,14 +330,5 @@ func TestSetup_ModeSelection(t *testing.T) {
 	}
 	if optsDP.DataplaneGatewayNamespace != "ns" || optsDP.DataplaneGatewayName != "gw" {
 		t.Errorf("expected gateway ns/gw, got %s/%s", optsDP.DataplaneGatewayNamespace, optsDP.DataplaneGatewayName)
-	}
-
-	// 4. Init credentials mode
-	optsInit, err := Setup([]string{"--init-credentials"})
-	if err != nil {
-		t.Fatalf("Setup failed for --init-credentials: %v", err)
-	}
-	if !optsInit.InitCredentials {
-		t.Errorf("expected InitCredentials=true")
 	}
 }

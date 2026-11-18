@@ -22,14 +22,20 @@ cd "${REPO_ROOT}"
 
 IMAGE_TAG=${IMAGE_TAG:-latest}
 IMAGE_NAME=${IMAGE_NAME:-gari-controller}
+CREDENTIALS_IMAGE_NAME=${CREDENTIALS_IMAGE_NAME:-gari-credentials}
 
 echo "Building docker image ${IMAGE_NAME}:${IMAGE_TAG}..."
 docker build -f images/gari-controller/Dockerfile -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+
+echo "Building docker image ${CREDENTIALS_IMAGE_NAME}:${IMAGE_TAG}..."
+docker build -f images/gari-credentials/Dockerfile -t "${CREDENTIALS_IMAGE_NAME}:${IMAGE_TAG}" .
 
 if [[ "${KUBERNETES_CLUSTER:-}" == "kind" ]]; then
     KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME:-kind}
     echo "Loading image into kind cluster ${KIND_CLUSTER_NAME}..."
     kind load docker-image "${IMAGE_NAME}:${IMAGE_TAG}" --name "${KIND_CLUSTER_NAME}"
+    echo "Loading credentials image into kind cluster ${KIND_CLUSTER_NAME}..."
+    kind load docker-image "${CREDENTIALS_IMAGE_NAME}:${IMAGE_TAG}" --name "${KIND_CLUSTER_NAME}"
 fi
 
 echo "Installing Gateway API CRDs..."

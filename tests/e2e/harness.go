@@ -489,8 +489,11 @@ func (h *Harness) DeployController() {
 	gitRoot := h.GetGitRoot()
 	h.DockerBuild("gari-controller:e2e", filepath.Join(gitRoot, "images/gari-controller/Dockerfile"), gitRoot)
 	h.KindLoad("gari-controller:e2e")
+	h.DockerBuild("gari-credentials:latest", filepath.Join(gitRoot, "images/gari-credentials/Dockerfile"), gitRoot)
+	h.KindLoad("gari-credentials:latest")
 
 	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/controller.yaml"))
+	h.RunCmd("kubectl", "wait", "--for=condition=complete", "--timeout=1m", "job/gari-credentials", "--namespace=default")
 	h.RunCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
 	h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--dataplane-image","gari-controller:e2e","--enable-h2c"]}]}}}}`)
 	h.RunCmd("kubectl", "rollout", "restart", "deployment/gari-controller", "--namespace=default")

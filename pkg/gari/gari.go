@@ -34,7 +34,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -222,10 +221,6 @@ type Options struct {
 	// In this mode, the instance watches only its per-Gateway configuration Secret
 	// and applies updates directly to the proxy, without running state computation.
 	DataplaneMode bool
-
-	// InitCredentials runs in credentials initialization mode, ensuring SPIFFE credentials
-	// for the cluster exist in the namespace specified by POD_NAMESPACE, then exits.
-	InitCredentials bool
 
 	// DataplaneGatewayNamespace is the namespace of the Gateway in DataplaneMode.
 	DataplaneGatewayNamespace string
@@ -1220,33 +1215,6 @@ func (s *Server) Start(ctx context.Context) error {
 
 // Run creates a new Server with opts and runs it until ctx is canceled.
 func Run(ctx context.Context, opts Options) error {
-	if opts.InitCredentials {
-		restConfig := opts.RestConfig
-		if restConfig == nil {
-			var err error
-			restConfig, err = ctrl.GetConfig()
-			if err != nil {
-				return fmt.Errorf("getting kubeconfig for credentials: %w", err)
-			}
-		}
-		namespace := os.Getenv("POD_NAMESPACE")
-		if namespace == "" {
-			return errors.New("POD_NAMESPACE environment variable is required")
-		}
-		scheme := opts.Scheme
-		if scheme == nil {
-			scheme = runtime.NewScheme()
-			if err := corev1.AddToScheme(scheme); err != nil {
-				return fmt.Errorf("adding corev1 to scheme: %w", err)
-			}
-		}
-		kubeClient, err := client.New(restConfig, client.Options{Scheme: scheme})
-		if err != nil {
-			return fmt.Errorf("creating client for credentials: %w", err)
-		}
-		return spiffe.EnsureCredentials(ctx, kubeClient, namespace)
-	}
-
 	s, err := New(opts)
 	if err != nil {
 		return err
