@@ -74,10 +74,6 @@ type AddressProvider = controller.AddressProvider
 // to register custom watches with the Gateway controller.
 type AddressWatcher = controller.AddressWatcher
 
-// AddressReadinessProvider is an optional interface an AddressProvider can implement
-// to report addresses and detailed readiness state in a single call.
-type AddressReadinessProvider = controller.AddressReadinessProvider
-
 // AddressTypeProvider is an optional interface an AddressProvider can implement
 // to declare which address types it supports for requested addresses (spec.addresses).
 type AddressTypeProvider = controller.AddressTypeProvider

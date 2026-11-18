@@ -435,9 +435,9 @@ func requestedHostnameAddresses(gw *gatewayv1.Gateway) []string {
 	return hosts
 }
 
-// GatewayAddressesWithReadiness reconciles the per-Gateway ServiceAccount, Deployment, and Service,
+// GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and Service,
 // and returns the Service's ingress addresses and detailed readiness state.
-func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	if p.client == nil {
 		return nil, state.GatewayReadiness{}, nil
 	}
@@ -1203,13 +1203,6 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}, nil
 }
 
-// GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
-// and returns the Service's LoadBalancer ingress addresses and whether the Deployment is ready.
-func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
-	return addrs, readiness.Ready, err
-}
-
 // SupportedAddressTypes returns the address types supported by singlepod.
 func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
 	if p.useHostPorts {
@@ -1378,9 +1371,8 @@ func PublishDataplaneConfig(ctx context.Context, cl client.Client, namespace, na
 }
 
 var (
-	_ controller.AddressProvider          = (*AddressProvider)(nil)
-	_ controller.AddressWatcher           = (*AddressProvider)(nil)
-	_ controller.AddressReadinessProvider = (*AddressProvider)(nil)
-	_ controller.AddressTypeProvider      = (*AddressProvider)(nil)
-	_ state.DataplanePublisher            = (*AddressProvider)(nil)
+	_ controller.AddressProvider     = (*AddressProvider)(nil)
+	_ controller.AddressWatcher      = (*AddressProvider)(nil)
+	_ controller.AddressTypeProvider = (*AddressProvider)(nil)
+	_ state.DataplanePublisher       = (*AddressProvider)(nil)
 )

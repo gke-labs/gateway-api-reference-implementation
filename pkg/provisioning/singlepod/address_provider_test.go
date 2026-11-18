@@ -195,14 +195,14 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	p := NewAddressProvider(client, WithEnableH2C(true))
 
 	// 1. Initial reconcile creates SA, adds to CRB, creates Deployment and Service in my-ns, but no Ingress and replicas not ready yet
-	addrs, ready, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
+	addrs, readiness, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(addrs) != 0 {
 		t.Fatalf("expected 0 addresses before LB ingress is assigned, got %d", len(addrs))
 	}
-	if ready {
+	if readiness.Ready {
 		t.Fatalf("expected ready=false before deployment replicas become available")
 	}
 
@@ -312,11 +312,11 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	}
 
 	// Reconcile again -> should return the assigned LB address and ready=true
-	addrs, ready, err = p.GatewayAddresses(ctx, gw, effectiveListeners)
+	addrs, readiness, err = p.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !ready {
+	if !readiness.Ready {
 		t.Fatalf("expected ready=true after replicas available")
 	}
 	if len(addrs) != 1 || addrs[0].Value != "172.18.255.201" || state.ValueOf(addrs[0].Type) != gatewayv1.IPAddressType {
@@ -1725,7 +1725,7 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 	}
 
 	// 1. Initial reconcile with requested IP: Service pins loadBalancerIP, readiness is AddressNotUsable
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1765,7 +1765,7 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 		t.Fatalf("failed to update Service status: %v", err)
 	}
 
-	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error on second reconcile: %v", err)
 	}
@@ -1779,7 +1779,7 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 	// 3. Removing requested address from spec.addresses releases it:
 	// Service no longer pins it and status updates on next reconcile without restart.
 	gw.Spec.Addresses = nil
-	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error on remove reconcile: %v", err)
 	}
@@ -1835,7 +1835,7 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 	}
 
 	// Reconcile gw1 and mark bound
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw1, nil)
+	_, _, err := p.GatewayAddresses(ctx, gw1, nil)
 	if err != nil {
 		t.Fatalf("unexpected error on gw1: %v", err)
 	}
@@ -1851,13 +1851,13 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 	deploy1.Status.ReadyReplicas = 1
 	_ = c.Status().Update(ctx, &deploy1)
 
-	_, readiness1, _ := p.GatewayAddressesWithReadiness(ctx, gw1, nil)
+	_, readiness1, _ := p.GatewayAddresses(ctx, gw1, nil)
 	if !readiness1.Ready {
 		t.Fatalf("expected gw1 to be ready")
 	}
 
 	// Reconcile gw2 requesting the same IP: its service does NOT have the ingress IP bound
-	_, readiness2, err := p.GatewayAddressesWithReadiness(ctx, gw2, nil)
+	_, readiness2, err := p.GatewayAddresses(ctx, gw2, nil)
 	if err != nil {
 		t.Fatalf("unexpected error on gw2: %v", err)
 	}
@@ -1894,7 +1894,7 @@ func TestSinglePodAddressProvider_MultipleRequestedIPs(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1906,7 +1906,7 @@ func TestSinglePodAddressProvider_MultipleRequestedIPs(t *testing.T) {
 	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "192.0.2.10"}}
 	_ = c.Status().Update(ctx, &svc)
 
-	_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2001,7 +2001,7 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 		},
 	}
 
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+	_, _, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2176,7 +2176,7 @@ func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testin
 		},
 	}
 
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+	_, _, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2387,9 +2387,9 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 	}
 
 	// Verify at the provider level: Service has an LB IP but Deployment has 0 ready replicas
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected error from GatewayAddressesWithReadiness: %v", err)
+		t.Fatalf("unexpected error from GatewayAddresses: %v", err)
 	}
 	if len(addrs) != 0 {
 		t.Fatalf("expected no addresses when data plane is not ready, got %d", len(addrs))
@@ -2448,9 +2448,9 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 	}
 
 	// Provider level check
-	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected error from GatewayAddressesWithReadiness: %v", err)
+		t.Fatalf("unexpected error from GatewayAddresses: %v", err)
 	}
 	if len(addrs) != 0 {
 		t.Fatalf("expected 0 addresses before LB ingress is assigned, got %d", len(addrs))
@@ -2497,9 +2497,9 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 	}
 
 	// Provider level check
-	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected error from GatewayAddressesWithReadiness: %v", err)
+		t.Fatalf("unexpected error from GatewayAddresses: %v", err)
 	}
 	if len(addrs) != 1 || addrs[0].Value != "192.0.2.100" {
 		t.Fatalf("expected 1 address 192.0.2.100, got %+v", addrs)
@@ -2546,9 +2546,9 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 	st.UpsertGateway(&reconciledGW)
 	st.Recompute()
 
-	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, &reconciledGW, nil)
+	addrs, readiness, err = p.GatewayAddresses(ctx, &reconciledGW, nil)
 	if err != nil {
-		t.Fatalf("unexpected error from GatewayAddressesWithReadiness: %v", err)
+		t.Fatalf("unexpected error from GatewayAddresses: %v", err)
 	}
 	if readiness.Ready {
 		t.Fatalf("expected readiness.Ready=false when requested IP is not bound")
@@ -2650,7 +2650,7 @@ func TestSinglePodAddressProvider_ParametersRef_MergeOrder(t *testing.T) {
 	st.Recompute()
 
 	p := NewAddressProvider(c, WithState(st))
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2746,7 +2746,7 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, WithState(st))
-		_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		_, _, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -2815,7 +2815,7 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, WithState(st))
-		_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		_, _, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -2908,7 +2908,7 @@ func TestSinglePodAddressProvider_ParametersRef_InvalidValues(t *testing.T) {
 			st.Recompute()
 
 			p := NewAddressProvider(c, WithState(st))
-			addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+			addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 			if err != nil {
 				t.Fatalf("expected nil error (reported via readiness), got: %v", err)
 			}
@@ -2978,7 +2978,7 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, WithState(st))
-		_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("expected nil error, got: %v", err)
 		}
@@ -3033,7 +3033,7 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, WithState(st))
-		_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("expected nil error, got: %v", err)
 		}
@@ -3105,7 +3105,7 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, WithState(st))
-		_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("expected nil error, got: %v", err)
 		}
@@ -3168,7 +3168,7 @@ func TestSinglePodAddressProvider_ParametersRef_NotComputedYet(t *testing.T) {
 	// State has not computed outputs for gw yet
 
 	p := NewAddressProvider(c, WithState(st))
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -3244,7 +3244,7 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, WithState(st))
-		addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -3315,7 +3315,7 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		p := NewAddressProvider(c, WithState(st))
 
 		// 1. Initial reconcile: Deployment has 0 available replicas -> addresses withheld
-		addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -3342,7 +3342,7 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		}
 
 		// 3. Reconcile again: data plane is ready -> addresses are reported
-		addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -3613,7 +3613,7 @@ func TestSinglePodAddressProvider_UpgradeUpdatesServiceAndDeploymentInPlace(t *t
 	}
 
 	// 3. Reconcile with updated provider
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+	_, _, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected error during reconcile: %v", err)
 	}
@@ -3704,7 +3704,7 @@ func TestAddressProvider_GcpGatewayHooks(t *testing.T) {
 		WithTerminationGracePeriodSeconds(60),
 	)
 
-	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	_, _, err := p.GatewayAddresses(t.Context(), gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -3898,7 +3898,7 @@ func TestSinglePodAddressProvider_ACMEChallengeForwarding(t *testing.T) {
 	)
 
 	// Phase 1: Controller has upstream URL, but ConfigMap does not have acmeChallenge: enabled -> no volume, no args
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error in phase 1: %v", err)
 	}
@@ -3923,7 +3923,7 @@ func TestSinglePodAddressProvider_ACMEChallengeForwarding(t *testing.T) {
 	st.UpsertConfigMap(cm)
 	st.Recompute()
 
-	_, _, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error in phase 2: %v", err)
 	}
@@ -4006,7 +4006,7 @@ func TestSinglePodAddressProvider_ACMEChallengeForwarding(t *testing.T) {
 	st.UpsertConfigMap(cm)
 	st.Recompute()
 
-	_, _, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error in phase 3: %v", err)
 	}
@@ -4037,7 +4037,7 @@ func TestSinglePodAddressProvider_ACMEChallengeForwarding(t *testing.T) {
 	st.Recompute()
 
 	pNoURL := NewAddressProvider(c, WithState(st))
-	_, _, err = pNoURL.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err = pNoURL.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error in phase 4: %v", err)
 	}
@@ -4128,7 +4128,7 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 		WithACMEChallengeTokenPath(tokenPath),
 	)
 
-	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4281,9 +4281,9 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 	}
 
 	// 1. Reconcile Gateway resources
-	_, readiness, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	_, readiness, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 	if err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed for max length gateway: %v", err)
+		t.Fatalf("GatewayAddresses failed for max length gateway: %v", err)
 	}
 
 	expectedName := ResourceNameForGateway(gwName)
@@ -4377,9 +4377,9 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 		t.Fatalf("failed to update Deployment status: %v", err)
 	}
 
-	finalAddrs, readiness, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	finalAddrs, readiness, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 	if err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 	if !readiness.Ready {
 		t.Errorf("expected readiness.Ready = true, got false (reason=%s message=%s)", readiness.Reason, readiness.Message)
@@ -4506,8 +4506,8 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).Build()
 	p := NewAddressProvider(c)
 	listeners := []*state.EffectiveListener{{Port: 80, Protocol: gatewayv1.HTTPProtocolType}}
-	if _, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, listeners); err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+	if _, _, err := p.GatewayAddresses(t.Context(), gw, listeners); err != nil {
+		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 
 	expectedName := ResourceNameForGateway("my.gateway")
@@ -4742,7 +4742,7 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 	}
 
 	// 1. Initial reconciliation creates Deployment with host ports, but no Service
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4826,7 +4826,7 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 	if err := c.Status().Update(ctx, &deploy); err != nil {
 		t.Fatalf("failed to update deployment status: %v", err)
 	}
-	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error when deployment is ready: %v", err)
 	}
@@ -4842,7 +4842,7 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 
 	// 2. Switching from Service mode to host-port mode deletes existing owned Service
 	pDefault := NewAddressProvider(c)
-	_, _, err = pDefault.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err = pDefault.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error creating Service with default provider: %v", err)
 	}
@@ -4851,7 +4851,7 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 	}
 
 	// Reconcile with host-port provider again
-	_, _, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error with host-port provider: %v", err)
 	}
@@ -4893,7 +4893,7 @@ func TestSinglePodAddressProvider_HostPorts_MultipleHTTPListenersConflict(t *tes
 		},
 	}
 
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4938,7 +4938,7 @@ func TestSinglePodAddressProvider_HostPorts_MultipleHTTPSListenersConflict(t *te
 		},
 	}
 
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4978,7 +4978,7 @@ func TestSinglePodAddressProvider_HostPorts_ReservedPortsSkipped(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -5019,7 +5019,7 @@ func TestSinglePodAddressProvider_WithNoService(t *testing.T) {
 	}
 
 	// 1. Initial reconcile creates Deployment and no Service.
-	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -5050,7 +5050,7 @@ func TestSinglePodAddressProvider_WithNoService(t *testing.T) {
 	if err := c.Status().Update(ctx, &deploy); err != nil {
 		t.Fatalf("failed to update deployment status: %v", err)
 	}
-	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error when deployment ready: %v", err)
 	}
@@ -5093,7 +5093,7 @@ func TestSinglePodAddressProvider_WithNoService(t *testing.T) {
 	}
 
 	// Reconcile with WithNoService() provider again
-	_, _, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -5158,7 +5158,7 @@ func TestSinglePodAddressProvider_WithDeploymentMutator(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, listeners)
+	_, _, err := p.GatewayAddresses(ctx, gw, listeners)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -5236,8 +5236,8 @@ func TestSinglePodAddressProvider_WithDeploymentMutator_Error(t *testing.T) {
 		},
 	}
 
-	// Reconcile via GatewayAddressesWithReadiness
-	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	// Reconcile via GatewayAddresses
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
 	if err == nil {
 		t.Fatalf("expected error from mutator, got nil")
 	}
@@ -5256,14 +5256,5 @@ func TestSinglePodAddressProvider_WithDeploymentMutator_Error(t *testing.T) {
 	var svc corev1.Service
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
 		t.Errorf("expected Service to not exist after mutator error, got err: %v", err)
-	}
-
-	// Reconcile via GatewayAddresses
-	_, _, err = p.GatewayAddresses(ctx, gw, nil)
-	if err == nil {
-		t.Fatalf("expected error from mutator via GatewayAddresses, got nil")
-	}
-	if !errors.Is(err, expectedErr) {
-		t.Errorf("expected error %v, got %v", expectedErr, err)
 	}
 }
