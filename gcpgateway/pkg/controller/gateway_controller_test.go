@@ -85,7 +85,7 @@ func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nod
 		singlepod.WithTerminationGracePeriodSeconds(60),
 	)
 
-	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	_, _, err := p.GatewayAddresses(t.Context(), gw, nil)
 	if err != nil {
 		t.Fatalf("failed to reconcile deployment for pod template: %v", err)
 	}
@@ -1393,9 +1393,9 @@ func TestGateway_PeriodicResyncPrunesOrphanedEndpoints(t *testing.T) {
 		singlepod.WithExtraReadinessGates(registrar.LoadBalancerReadyGate),
 		singlepod.WithTerminationGracePeriodSeconds(60),
 	)
-	_, _, err := ap.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	_, _, err := ap.GatewayAddresses(t.Context(), gw, nil)
 	if err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 
 	resName := singlepod.ResourceNameForGateway(gw.Name)
@@ -1904,9 +1904,9 @@ func TestGateway_DeleteDetachesEndpoints_EnvTest(t *testing.T) {
 		singlepod.WithExtraReadinessGates(registrar.LoadBalancerReadyGate),
 		singlepod.WithTerminationGracePeriodSeconds(60),
 	)
-	_, _, err := ap.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	_, _, err := ap.GatewayAddresses(t.Context(), gw, nil)
 	if err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 
 	resName := singlepod.ResourceNameForGateway(gw.Name)

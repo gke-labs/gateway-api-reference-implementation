@@ -99,7 +99,7 @@ func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nod
 		singlepod.WithTerminationGracePeriodSeconds(60),
 	)
 
-	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	_, _, err := p.GatewayAddresses(t.Context(), gw, nil)
 	if err != nil {
 		t.Fatalf("failed to reconcile deployment for pod template: %v", err)
 	}
