@@ -78,6 +78,39 @@ func New(client client.Client, reader client.Reader, options ...singlepod.Option
 // GatewayAddresses reconciles the Gateway's data-plane infrastructure and returns
 // addresses and readiness status based on the nodes running the Gateway's data-plane pods.
 func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+	// 0. Validate that listeners do not exceed one HTTP port and one HTTPS/TLS port.
+	httpPorts := make(map[gatewayv1.PortNumber]struct{})
+	httpsPorts := make(map[gatewayv1.PortNumber]struct{})
+	if len(effectiveListeners) > 0 {
+		for _, el := range effectiveListeners {
+			if el.IsConflicted() {
+				continue
+			}
+			switch el.Protocol {
+			case gatewayv1.HTTPProtocolType:
+				httpPorts[el.Port] = struct{}{}
+			case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
+				httpsPorts[el.Port] = struct{}{}
+			}
+		}
+	} else if gateway != nil {
+		for _, l := range gateway.Spec.Listeners {
+			switch l.Protocol {
+			case gatewayv1.HTTPProtocolType:
+				httpPorts[l.Port] = struct{}{}
+			case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
+				httpsPorts[l.Port] = struct{}{}
+			}
+		}
+	}
+	if len(httpPorts) > 1 || len(httpsPorts) > 1 {
+		return nil, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
+			Message: "host ports allow one HTTP and one HTTPS port",
+		}, nil
+	}
+
 	// 1. Reconcile the Deployment via the wrapped singlepod provisioner.
 	// With WithNoService(), singlepod can return not-ready results such as
 	// GatewayReasonPending (waiting for state to compute gateway parameters) or
@@ -322,13 +355,9 @@ func MutateDeployment(deployment *appsv1ac.DeploymentApplyConfiguration, gateway
 		port := int32(effectiveListener.Port)
 		switch effectiveListener.Protocol {
 		case gatewayv1.HTTPProtocolType:
-			if httpPort == 0 {
-				httpPort = port
-			}
+			httpPort = port
 		case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
-			if httpsPort == 0 {
-				httpsPort = port
-			}
+			httpsPort = port
 		case gatewayv1.TCPProtocolType:
 			tcpPorts[port] = true
 		case gatewayv1.UDPProtocolType:

@@ -1578,3 +1578,465 @@ func TestHostPortAddressProvider_GatewayReconciler_EndToEnd(t *testing.T) {
 		t.Fatalf("expected Gateway.status.addresses = [10.200.0.2] after reschedule, got %+v", reconciledGW.Status.Addresses)
 	}
 }
+
+func TestHostPortAddressProvider_MultipleHTTPListeners_AddressNotUsable(t *testing.T) {
+	ctx := t.Context()
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-two-http",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-two-http-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http-80", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "http-8080", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "http-80", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "http-8080", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
+	}
+
+	// 1. Test via effectiveListeners
+	addresses, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false for two HTTP listeners on different ports")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	}
+	expectedMsg := "host ports allow one HTTP and one HTTPS port"
+	if readiness.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	}
+	if len(addresses) > 0 {
+		t.Errorf("expected no addresses, got %+v", addresses)
+	}
+
+	// Verify no Deployment exists
+	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	var deployment appsv1.Deployment
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Deployment to exist, got err: %v", err)
+	}
+
+	// 2. Test via gateway.Spec.Listeners fallback (effectiveListeners nil)
+	addresses, readiness, err = provider.GatewayAddresses(ctx, gateway, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) || readiness.Message != expectedMsg {
+		t.Errorf("expected AddressNotUsable readiness when effectiveListeners is nil, got %+v", readiness)
+	}
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Deployment to exist after nil effectiveListeners, got err: %v", err)
+	}
+}
+
+func TestHostPortAddressProvider_MultipleHTTPSListeners_AddressNotUsable(t *testing.T) {
+	ctx := t.Context()
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-two-https",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-two-https-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "https-443", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				{Name: "https-8443", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "https-443", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+		{Name: "https-8443", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+	}
+
+	addresses, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false for two HTTPS listeners on different ports")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	}
+	expectedMsg := "host ports allow one HTTP and one HTTPS port"
+	if readiness.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	}
+	if len(addresses) > 0 {
+		t.Errorf("expected no addresses, got %+v", addresses)
+	}
+
+	// Verify no Deployment exists
+	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	var deployment appsv1.Deployment
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Deployment to exist, got err: %v", err)
+	}
+}
+
+func TestHostPortAddressProvider_HTTPSAndTLSListenersDifferentPorts_AddressNotUsable(t *testing.T) {
+	ctx := t.Context()
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-https-tls-diff",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-https-tls-diff-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "https-443", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				{Name: "tls-8443", Port: 8443, Protocol: gatewayv1.TLSProtocolType},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "https-443", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+		{Name: "tls-8443", Port: 8443, Protocol: gatewayv1.TLSProtocolType},
+	}
+
+	addresses, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false for one HTTPS port and one differing TLS port")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	}
+	expectedMsg := "host ports allow one HTTP and one HTTPS port"
+	if readiness.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	}
+	if len(addresses) > 0 {
+		t.Errorf("expected no addresses, got %+v", addresses)
+	}
+
+	// Verify no Deployment exists
+	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	var deployment appsv1.Deployment
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Deployment to exist, got err: %v", err)
+	}
+}
+
+func TestHostPortAddressProvider_HTTPSAndTLSListenersSamePort_Provisioned(t *testing.T) {
+	ctx := t.Context()
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-https-tls-same",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-https-tls-same-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "https-443", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				{Name: "tls-443", Port: 443, Protocol: gatewayv1.TLSProtocolType},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "https-443", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+		{Name: "tls-443", Port: 443, Protocol: gatewayv1.TLSProtocolType},
+	}
+
+	_, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected not rejected with AddressNotUsable for HTTPS and TLS on same port")
+	}
+
+	// Deployment should be provisioned
+	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	var deployment appsv1.Deployment
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+}
+
+func TestHostPortAddressProvider_OneHTTPOneHTTPSSeveralTCPUDP_Provisioned(t *testing.T) {
+	ctx := t.Context()
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-mixed",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-mixed-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				{Name: "tcp-9000", Port: 9000, Protocol: gatewayv1.TCPProtocolType},
+				{Name: "tcp-9001", Port: 9001, Protocol: gatewayv1.TCPProtocolType},
+				{Name: "udp-5353", Port: 5353, Protocol: gatewayv1.UDPProtocolType},
+				{Name: "udp-5354", Port: 5354, Protocol: gatewayv1.UDPProtocolType},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+		{Name: "tcp-9000", Port: 9000, Protocol: gatewayv1.TCPProtocolType},
+		{Name: "tcp-9001", Port: 9001, Protocol: gatewayv1.TCPProtocolType},
+		{Name: "udp-5353", Port: 5353, Protocol: gatewayv1.UDPProtocolType},
+		{Name: "udp-5354", Port: 5354, Protocol: gatewayv1.UDPProtocolType},
+	}
+
+	_, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("mixed listener configuration with 1 HTTP and 1 HTTPS should be provisioned, got AddressNotUsable")
+	}
+
+	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	var deployment appsv1.Deployment
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+
+	actualSignatures := extractHostPortSignatures(deployment.Spec.Template.Spec.Containers[0].Ports)
+	expectedSignatures := []hostPortSignature{
+		{containerPort: singlepod.DataPlaneHTTPPort, hostPort: 80, protocol: corev1.ProtocolTCP},
+		{containerPort: singlepod.DataPlaneHTTPSPort, hostPort: 443, protocol: corev1.ProtocolTCP},
+		{containerPort: singlepod.DataPlaneHTTPSPort, hostPort: 443, protocol: corev1.ProtocolUDP},
+		{containerPort: 9000, hostPort: 9000, protocol: corev1.ProtocolTCP},
+		{containerPort: 9001, hostPort: 9001, protocol: corev1.ProtocolTCP},
+		{containerPort: 5353, hostPort: 5353, protocol: corev1.ProtocolUDP},
+		{containerPort: 5354, hostPort: 5354, protocol: corev1.ProtocolUDP},
+	}
+
+	if !reflect.DeepEqual(actualSignatures, expectedSignatures) {
+		t.Errorf("signatures mismatch:\ngot  %+v\nwant %+v", actualSignatures, expectedSignatures)
+	}
+}
+
+func TestHostPortAddressProvider_TwoHTTPListenersSamePortDifferentHostnames(t *testing.T) {
+	ctx := t.Context()
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+
+	h1 := gatewayv1.Hostname("foo.example.com")
+	h2 := gatewayv1.Hostname("bar.example.com")
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-hostnames",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-hostnames-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http-foo", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: &h1},
+				{Name: "http-bar", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: &h2},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "http-foo", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: &h1},
+		{Name: "http-bar", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: &h2},
+	}
+
+	_, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("two HTTP listeners on same port with different hostnames must count as one port, got AddressNotUsable")
+	}
+
+	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	var deployment appsv1.Deployment
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+
+	actualSignatures := extractHostPortSignatures(deployment.Spec.Template.Spec.Containers[0].Ports)
+	expectedSignatures := []hostPortSignature{
+		{containerPort: singlepod.DataPlaneHTTPPort, hostPort: 80, protocol: corev1.ProtocolTCP},
+	}
+	if !reflect.DeepEqual(actualSignatures, expectedSignatures) {
+		t.Errorf("signatures mismatch:\ngot  %+v\nwant %+v", actualSignatures, expectedSignatures)
+	}
+}
+
+func TestHostPortAddressProvider_ConflictedListenerSkippedInPortCount(t *testing.T) {
+	ctx := t.Context()
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-conflicted-http",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-conflicted-http-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http-80", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "http-8080", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "http-80", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{
+			Name:     "http-8080",
+			Port:     8080,
+			Protocol: gatewayv1.HTTPProtocolType,
+			ListenerInfo: state.ListenerInfo{
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(gatewayv1.ListenerConditionConflicted),
+						Status: metav1.ConditionTrue,
+						Reason: string(gatewayv1.ListenerReasonHostnameConflict),
+					},
+				},
+			},
+		},
+	}
+
+	_, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("conflicted listener should be excluded from port count, got AddressNotUsable")
+	}
+
+	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	var deployment appsv1.Deployment
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+
+	actualSignatures := extractHostPortSignatures(deployment.Spec.Template.Spec.Containers[0].Ports)
+	expectedSignatures := []hostPortSignature{
+		{containerPort: singlepod.DataPlaneHTTPPort, hostPort: 80, protocol: corev1.ProtocolTCP},
+	}
+	if !reflect.DeepEqual(actualSignatures, expectedSignatures) {
+		t.Errorf("signatures mismatch:\ngot  %+v\nwant %+v", actualSignatures, expectedSignatures)
+	}
+}
+
+func TestHostPortAddressProvider_ExistingDeploymentUnchangedWhenPortLimitExceeded(t *testing.T) {
+	ctx := t.Context()
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient)
+	if err != nil {
+		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-unchanged",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-unchanged-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http-80", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	validListeners := []*state.EffectiveListener{
+		{Name: "http-80", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+	}
+
+	// 1. Initial valid reconcile provisions Deployment
+	_, _, err = provider.GatewayAddresses(ctx, gateway, validListeners)
+	if err != nil {
+		t.Fatalf("initial reconcile failed: %v", err)
+	}
+
+	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	var initialDeployment appsv1.Deployment
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &initialDeployment); err != nil {
+		t.Fatalf("failed to get initial Deployment: %v", err)
+	}
+
+	// 2. Gateway updated with conflicting HTTP ports
+	invalidListeners := []*state.EffectiveListener{
+		{Name: "http-80", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "http-8080", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
+	}
+	gateway.Spec.Listeners = append(gateway.Spec.Listeners, gatewayv1.Listener{
+		Name: "http-8080", Port: 8080, Protocol: gatewayv1.HTTPProtocolType,
+	})
+
+	addresses, readiness, err := provider.GatewayAddresses(ctx, gateway, invalidListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected AddressNotUsable, got readiness: %+v", readiness)
+	}
+	if len(addresses) > 0 {
+		t.Errorf("expected no addresses, got %+v", addresses)
+	}
+
+	// Verify existing Deployment is unchanged
+	var currentDeployment appsv1.Deployment
+	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &currentDeployment); err != nil {
+		t.Fatalf("failed to get current Deployment: %v", err)
+	}
+	if currentDeployment.ResourceVersion != initialDeployment.ResourceVersion {
+		t.Errorf("expected Deployment to be unchanged (resourceVersion %s != %s)", currentDeployment.ResourceVersion, initialDeployment.ResourceVersion)
+	}
+}
