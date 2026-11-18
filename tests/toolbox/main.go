@@ -159,15 +159,16 @@ func runClientCLI(args []string) {
 			RootCAs:            rootCAs,
 			InsecureSkipVerify: *insecure,
 		}
-		dialAddr := targetURL
-		if u, err := url.Parse(targetURL); err == nil {
-			dialAddr = u.Host
-			if !strings.Contains(dialAddr, ":") {
-				if u.Scheme == "https" {
-					dialAddr += ":443"
-				} else {
-					dialAddr += ":80"
-				}
+		u, err := url.Parse(targetURL)
+		if err != nil {
+			log.Fatalf("Failed to parse target URL %q: %v", targetURL, err)
+		}
+		dialAddr := u.Host
+		if !strings.Contains(dialAddr, ":") {
+			if u.Scheme == "https" {
+				dialAddr += ":443"
+			} else {
+				dialAddr += ":80"
 			}
 		}
 		if *connectTo != "" {
@@ -197,7 +198,9 @@ func runClientCLI(args []string) {
 				continue
 			}
 			capturedCerts = conn.ConnectionState().PeerCertificates
-			_ = conn.Close()
+			if closeErr := conn.Close(); closeErr != nil {
+				log.Printf("Failed to close TLS connection: %v", closeErr)
+			}
 			lastErr = nil
 			break
 		}
