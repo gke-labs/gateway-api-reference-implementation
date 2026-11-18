@@ -538,8 +538,8 @@ func (s *staticTestTokenReviewer) ReviewToken(ctx context.Context, token string)
 
 func TestServerPushServer_RequiresTLSWhenBindAddressSet(t *testing.T) {
 	opts := Options{
-		PushBindAddress:   "127.0.0.1:0",
-		PushTokenReviewer: &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
+		InternalAPIBindAddress: "127.0.0.1:0",
+		PushTokenReviewer:      &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
 	}
 	pushServer, err := push.NewServer(push.ServerOptions{
 		TokenReviewer: opts.PushTokenReviewer,
@@ -554,7 +554,7 @@ func TestServerPushServer_RequiresTLSWhenBindAddressSet(t *testing.T) {
 
 	err = server.StartPushServer(t.Context())
 	if err == nil {
-		t.Fatal("expected error when PushBindAddress is set without TLS config or cert files, got nil")
+		t.Fatal("expected error when InternalAPIBindAddress is set without TLS config or cert files, got nil")
 	}
 	if !strings.Contains(err.Error(), "TLS configuration required for push server") {
 		t.Fatalf("unexpected error message: %v", err)
@@ -569,8 +569,8 @@ func TestServerPushServer_RequiresTLSWhenListenerSet(t *testing.T) {
 	defer listener.Close()
 
 	opts := Options{
-		PushListener:      listener,
-		PushTokenReviewer: &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
+		InternalAPIListener: listener,
+		PushTokenReviewer:   &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
 	}
 	pushServer, err := push.NewServer(push.ServerOptions{
 		TokenReviewer: opts.PushTokenReviewer,
@@ -585,7 +585,7 @@ func TestServerPushServer_RequiresTLSWhenListenerSet(t *testing.T) {
 
 	err = server.StartPushServer(t.Context())
 	if err == nil {
-		t.Fatal("expected error when PushListener is set without TLS config, got nil")
+		t.Fatal("expected error when InternalAPIListener is set without TLS config, got nil")
 	}
 	if !strings.Contains(err.Error(), "TLS configuration required for push server") {
 		t.Fatalf("unexpected error message: %v", err)
@@ -608,9 +608,9 @@ func TestServerPushServer_CustomListener(t *testing.T) {
 	}
 
 	opts := Options{
-		PushListener:      listener,
-		PushTLSConfig:     tlsConfig,
-		PushTokenReviewer: &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
+		InternalAPIListener:  listener,
+		InternalAPITLSConfig: tlsConfig,
+		PushTokenReviewer:    &staticTestTokenReviewer{fn: func(ctx context.Context, token string) (string, string, error) { return "default", "sa", nil }},
 	}
 	pushServer, err := push.NewServer(push.ServerOptions{
 		TokenReviewer: opts.PushTokenReviewer,

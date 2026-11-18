@@ -56,19 +56,19 @@ func TestGatewayAPI(t *testing.T) {
 	// 3. Deploy Backend (Toolbox Server)
 	h.DeployBackend()
 
-	// Verify push listener TLS with controller X.509-SVID
+	// Verify internal API listener TLS with controller X.509-SVID
 	// 1. A client in the cluster that trusts only the trust bundle in the ConfigMap
-	// completes a TLS handshake with the push Service by its DNS name.
+	// completes a TLS handshake with the internal API Service by its DNS name.
 	dnsNames, err := spiffe.ServiceDNSNames(spiffe.ControllerServiceName, "default")
 	if err != nil {
-		t.Fatalf("Failed to get push Service DNS names: %v", err)
+		t.Fatalf("Failed to get internal API Service DNS names: %v", err)
 	}
 	serviceDNS := dnsNames[len(dnsNames)-1]
-	targetPushURL := fmt.Sprintf("https://%s:8443", serviceDNS)
+	targetInternalAPIURL := fmt.Sprintf("https://%s:8443", serviceDNS)
 
-	pushClientPod := "test-push-client"
-	h.DeletePod(pushClientPod)
-	clientPushManifest := fmt.Sprintf(`
+	internalAPIClientPod := "test-internal-api-client"
+	h.DeletePod(internalAPIClientPod)
+	clientManifest := fmt.Sprintf(`
 apiVersion: v1
 kind: Pod
 metadata:
@@ -90,24 +90,24 @@ spec:
     configMap:
       name: %s
   restartPolicy: Never
-`, pushClientPod, spiffe.BundleDataKey, targetPushURL, spiffe.BundleConfigMapName)
+`, internalAPIClientPod, spiffe.BundleDataKey, targetInternalAPIURL, spiffe.BundleConfigMapName)
 
-	h.KubectlApplyContent(clientPushManifest)
-	h.WaitForPodSuccess(pushClientPod, 1*time.Minute)
-	pushLogs := h.GetPodLogs(pushClientPod)
-	t.Logf("Push client logs (trusted): %s", pushLogs)
-	if !strings.Contains(pushLogs, "TLS handshake succeeded") {
-		t.Errorf("Expected TLS handshake to succeed, got: %s", pushLogs)
+	h.KubectlApplyContent(clientManifest)
+	h.WaitForPodSuccess(internalAPIClientPod, 1*time.Minute)
+	clientLogs := h.GetPodLogs(internalAPIClientPod)
+	t.Logf("Internal API client logs (trusted): %s", clientLogs)
+	if !strings.Contains(clientLogs, "TLS handshake succeeded") {
+		t.Errorf("Expected TLS handshake to succeed, got: %s", clientLogs)
 	}
 	for _, expectedDNS := range dnsNames {
-		if !strings.Contains(pushLogs, expectedDNS) {
-			t.Errorf("Expected peer certificate to contain DNS name %q, got logs: %s", expectedDNS, pushLogs)
+		if !strings.Contains(clientLogs, expectedDNS) {
+			t.Errorf("Expected peer certificate to contain DNS name %q, got logs: %s", expectedDNS, clientLogs)
 		}
 	}
-	h.DeletePod(pushClientPod)
+	h.DeletePod(internalAPIClientPod)
 
 	// 2. A client that trusts another authority fails.
-	untrustedPod := "test-push-client-untrusted"
+	untrustedPod := "test-internal-api-client-untrusted"
 	h.DeletePod(untrustedPod)
 
 	untrustedCertPEM, untrustedKeyPEM, err := GenerateTestCertificate("other-ca.example.com", "other-ca.example.com")
@@ -140,12 +140,12 @@ spec:
     secret:
       secretName: %s
   restartPolicy: Never
-`, untrustedPod, targetPushURL, untrustedSecretName)
+`, untrustedPod, targetInternalAPIURL, untrustedSecretName)
 
 	h.KubectlApplyContent(clientUntrustedManifest)
 	h.WaitForPodSuccess(untrustedPod, 1*time.Minute)
 	untrustedLogs := h.GetPodLogs(untrustedPod)
-	t.Logf("Push client logs (untrusted): %s", untrustedLogs)
+	t.Logf("Internal API client logs (untrusted): %s", untrustedLogs)
 	if !strings.Contains(untrustedLogs, "TLS connection failed as expected") {
 		t.Errorf("Expected TLS handshake with untrusted authority to fail, got: %s", untrustedLogs)
 	}
