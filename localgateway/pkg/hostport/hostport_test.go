@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -87,12 +88,19 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 		},
 	}
 
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+		{Name: "tcp", Port: 9000, Protocol: gatewayv1.TCPProtocolType},
+		{Name: "udp", Port: 5353, Protocol: gatewayv1.UDPProtocolType},
+	}
+
 	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
 
 	// 1. Expected: run existing singlepod provider with WithHostPorts()
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
-	expectedAddresses, expectedReadiness, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, nil)
+	expectedAddresses, expectedReadiness, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
@@ -105,7 +113,7 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 	// 2. Actual: run HostPortAddressProvider
 	actualClient := setupTestClient(t)
 	hostPortProvider := New(actualClient)
-	actualAddresses, actualReadiness, err := hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, nil)
+	actualAddresses, actualReadiness, err := hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
@@ -185,11 +193,18 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 		},
 	}
 
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "tcp-reserved", Port: 8080, Protocol: gatewayv1.TCPProtocolType},
+		{Name: "udp-reserved", Port: 8443, Protocol: gatewayv1.UDPProtocolType},
+		{Name: "health-reserved", Port: 8999, Protocol: gatewayv1.TCPProtocolType},
+	}
+
 	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, nil)
+	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
@@ -200,7 +215,7 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 
 	actualClient := setupTestClient(t)
 	hostPortProvider := New(actualClient)
-	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, nil)
+	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
@@ -247,11 +262,16 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 		},
 	}
 
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "http", Port: 8081, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "https", Port: 8444, Protocol: gatewayv1.HTTPSProtocolType},
+	}
+
 	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, nil)
+	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
@@ -262,7 +282,7 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 
 	actualClient := setupTestClient(t)
 	hostPortProvider := New(actualClient)
-	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, nil)
+	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
@@ -276,6 +296,223 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 
 	if !reflect.DeepEqual(actualSignatures, expectedSignatures) {
 		t.Errorf("host port signatures mismatch:\ngot  %+v\nwant %+v", actualSignatures, expectedSignatures)
+	}
+}
+
+func TestHostPortAddressProvider_UnmatchedContainerPortGetsNoHostPort(t *testing.T) {
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-extra", Namespace: "default"},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "tcp", Port: 9000, Protocol: gatewayv1.TCPProtocolType},
+	}
+
+	deployment := appsv1ac.Deployment("dataplane", "default").
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithSpec(corev1ac.PodSpec().
+					WithContainers(corev1ac.Container().
+						WithName(singlepod.DataplaneContainerName).
+						WithPorts(
+							corev1ac.ContainerPort().
+								WithName(singlepod.HTTPPortName).
+								WithContainerPort(singlepod.DataPlaneHTTPPort).
+								WithProtocol(corev1.ProtocolTCP),
+							corev1ac.ContainerPort().
+								WithName("tcp-9000").
+								WithContainerPort(9000).
+								WithProtocol(corev1.ProtocolTCP),
+							// Unmatched metrics port that no listener names
+							corev1ac.ContainerPort().
+								WithName("metrics").
+								WithContainerPort(9090).
+								WithProtocol(corev1.ProtocolTCP),
+							// Unmatched UDP health port that no listener names
+							corev1ac.ContainerPort().
+								WithName("health-udp").
+								WithContainerPort(8999).
+								WithProtocol(corev1.ProtocolUDP),
+						),
+					),
+				),
+			),
+		)
+
+	if err := MutateDeployment(deployment, gateway, effectiveListeners); err != nil {
+		t.Fatalf("MutateDeployment failed: %v", err)
+	}
+
+	containers := deployment.Spec.Template.Spec.Containers
+	if len(containers) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(containers))
+	}
+
+	for _, port := range containers[0].Ports {
+		portName := ""
+		if port.Name != nil {
+			portName = *port.Name
+		}
+		switch portName {
+		case singlepod.HTTPPortName:
+			if port.HostPort == nil || *port.HostPort != 80 {
+				t.Errorf("expected http hostPort=80, got %v", port.HostPort)
+			}
+		case "tcp-9000":
+			if port.HostPort == nil || *port.HostPort != 9000 {
+				t.Errorf("expected tcp-9000 hostPort=9000, got %v", port.HostPort)
+			}
+		case "metrics":
+			if port.HostPort != nil && *port.HostPort != 0 {
+				t.Errorf("expected metrics to get no hostPort, got %v", *port.HostPort)
+			}
+		case "health-udp":
+			if port.HostPort != nil && *port.HostPort != 0 {
+				t.Errorf("expected health-udp to get no hostPort, got %v", *port.HostPort)
+			}
+		}
+	}
+}
+
+func TestHostPortAddressProvider_ListenerSetListener(t *testing.T) {
+	ctx := t.Context()
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-listenerset",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-ls-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Owner: state.ListenerOwner{
+				Kind:      "Gateway",
+				Namespace: "test-ns",
+				Name:      "gw-listenerset",
+			},
+			Name:     "http",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+		},
+		{
+			Owner: state.ListenerOwner{
+				Kind:      "ListenerSet",
+				Namespace: "test-ns",
+				Name:      "my-listenerset",
+			},
+			Name:     "tcp-ls",
+			Port:     9090,
+			Protocol: gatewayv1.TCPProtocolType,
+		},
+	}
+
+	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
+
+	expectedClient := setupTestClient(t)
+	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
+	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
+	}
+	var expectedDeployment appsv1.Deployment
+	if err := expectedClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &expectedDeployment); err != nil {
+		t.Fatalf("failed to get expected Deployment: %v", err)
+	}
+
+	actualClient := setupTestClient(t)
+	hostPortProvider := New(actualClient)
+	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
+	}
+	var actualDeployment appsv1.Deployment
+	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
+		t.Fatalf("failed to get actual Deployment: %v", err)
+	}
+
+	actualSignatures := extractHostPortSignatures(actualDeployment.Spec.Template.Spec.Containers[0].Ports)
+	expectedSignatures := extractHostPortSignatures(expectedDeployment.Spec.Template.Spec.Containers[0].Ports)
+
+	if !reflect.DeepEqual(actualSignatures, expectedSignatures) {
+		t.Errorf("host port signatures mismatch:\ngot  %+v\nwant %+v", actualSignatures, expectedSignatures)
+	}
+
+	// Verify the ListenerSet's TCP port 9090 got a hostPort
+	foundListenerSetPort := false
+	for _, signature := range actualSignatures {
+		if signature.hostPort == 9090 && signature.containerPort == 9090 && signature.protocol == corev1.ProtocolTCP {
+			foundListenerSetPort = true
+			break
+		}
+	}
+	if !foundListenerSetPort {
+		t.Errorf("expected hostPort 9090 from ListenerSet in actual signatures: %+v", actualSignatures)
+	}
+}
+
+func TestHostPortAddressProvider_ConflictedListenerSkipped(t *testing.T) {
+	ctx := t.Context()
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-conflicted",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-conflicted-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				{Name: "tcp-conflict", Port: 9000, Protocol: gatewayv1.TCPProtocolType},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Name:     "http",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+		},
+		{
+			Name:     "tcp-conflict",
+			Port:     9000,
+			Protocol: gatewayv1.TCPProtocolType,
+			ListenerInfo: state.ListenerInfo{
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(gatewayv1.ListenerConditionConflicted),
+						Status: metav1.ConditionTrue,
+						Reason: string(gatewayv1.ListenerReasonHostnameConflict),
+					},
+				},
+			},
+		},
+	}
+
+	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
+
+	actualClient := setupTestClient(t)
+	hostPortProvider := New(actualClient)
+	_, _, err := hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
+	}
+	var actualDeployment appsv1.Deployment
+	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
+		t.Fatalf("failed to get actual Deployment: %v", err)
+	}
+
+	actualSignatures := extractHostPortSignatures(actualDeployment.Spec.Template.Spec.Containers[0].Ports)
+	if len(actualSignatures) != 1 || actualSignatures[0].hostPort != 80 {
+		t.Errorf("expected only port 80 host port, got %+v", actualSignatures)
 	}
 }
 

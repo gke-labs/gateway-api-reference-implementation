@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
@@ -47,7 +48,7 @@ var (
 // reports with no Service: no address and not ready. Node address resolution
 // (the address rule) is the next step.
 type HostPortAddressProvider struct {
-	provider *singlepod.AddressProvider
+	wrapped *singlepod.AddressProvider
 }
 
 // New creates a new HostPortAddressProvider wrapping a singlepod.AddressProvider
@@ -60,7 +61,7 @@ func New(client client.Client, options ...singlepod.Option) *HostPortAddressProv
 		singlepod.WithDeploymentMutator(MutateDeployment),
 	)
 	return &HostPortAddressProvider{
-		provider: singlepod.NewAddressProvider(client, wrappedOptions...),
+		wrapped: singlepod.NewAddressProvider(client, wrappedOptions...),
 	}
 }
 
@@ -75,7 +76,7 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 // the provider reports what the wrapped singlepod.AddressProvider reports with no Service:
 // no address and not ready. Node address resolution will be added in a subsequent step.
 func (provider *HostPortAddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
-	return provider.provider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	return provider.wrapped.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
 }
 
 // SupportedAddressTypes returns nil because host-port data planes bind directly to node host
@@ -87,12 +88,12 @@ func (provider *HostPortAddressProvider) SupportedAddressTypes() []gatewayv1.Add
 
 // SetupWatches registers watches on managed resources with the Gateway controller.
 func (provider *HostPortAddressProvider) SetupWatches(manager ctrl.Manager, builder *builder.Builder) error {
-	return provider.provider.SetupWatches(manager, builder)
+	return provider.wrapped.SetupWatches(manager, builder)
 }
 
 // SetState sets the State reference on the wrapped singlepod.AddressProvider.
 func (provider *HostPortAddressProvider) SetState(s *state.State) {
-	provider.provider.SetState(s)
+	provider.wrapped.SetState(s)
 }
 
 // MutateDeployment configures the Deployment with host-port container port mappings
@@ -126,18 +127,27 @@ func MutateDeployment(deployment *appsv1ac.DeploymentApplyConfiguration, gateway
 	}
 
 	var httpPort, httpsPort int32
-	if gateway != nil {
-		for _, listener := range gateway.Spec.Listeners {
-			switch listener.Protocol {
-			case gatewayv1.HTTPProtocolType:
-				if httpPort == 0 {
-					httpPort = int32(listener.Port)
-				}
-			case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
-				if httpsPort == 0 {
-					httpsPort = int32(listener.Port)
-				}
+	tcpPorts := make(map[int32]bool)
+	udpPorts := make(map[int32]bool)
+
+	for _, effectiveListener := range effectiveListeners {
+		if effectiveListener.IsConflicted() {
+			continue
+		}
+		port := int32(effectiveListener.Port)
+		switch effectiveListener.Protocol {
+		case gatewayv1.HTTPProtocolType:
+			if httpPort == 0 {
+				httpPort = port
 			}
+		case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType:
+			if httpsPort == 0 {
+				httpsPort = port
+			}
+		case gatewayv1.TCPProtocolType:
+			tcpPorts[port] = true
+		case gatewayv1.UDPProtocolType:
+			udpPorts[port] = true
 		}
 	}
 
@@ -148,17 +158,27 @@ func MutateDeployment(deployment *appsv1ac.DeploymentApplyConfiguration, gateway
 			portName = *port.Name
 		}
 		switch portName {
-		case "http":
+		case singlepod.HTTPPortName:
 			if httpPort > 0 {
 				port.WithHostPort(httpPort)
 			}
-		case "https", "http3":
+		case singlepod.HTTPSPortName, singlepod.HTTP3PortName:
 			if httpsPort > 0 {
 				port.WithHostPort(httpsPort)
 			}
 		default:
+			portNumber := int32(0)
 			if port.ContainerPort != nil {
-				port.WithHostPort(*port.ContainerPort)
+				portNumber = *port.ContainerPort
+			}
+			protocol := corev1.ProtocolTCP
+			if port.Protocol != nil {
+				protocol = *port.Protocol
+			}
+			if protocol == corev1.ProtocolTCP && tcpPorts[portNumber] {
+				port.WithHostPort(portNumber)
+			} else if protocol == corev1.ProtocolUDP && udpPorts[portNumber] {
+				port.WithHostPort(portNumber)
 			}
 		}
 	}
