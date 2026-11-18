@@ -49,11 +49,11 @@ func TestAddressProvider_ConfiguredInterface(t *testing.T) {
 		})
 
 		gw := &gatewayv1.Gateway{}
-		addrs, ready, err := provider.GatewayAddresses(ctx, gw, nil)
+		addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if !ready {
+		if !readiness.Ready {
 			t.Errorf("expected ready=true")
 		}
 
@@ -81,11 +81,11 @@ func TestAddressProvider_ConfiguredInterface(t *testing.T) {
 		})
 
 		gw := &gatewayv1.Gateway{}
-		addrs, ready, err := provider.GatewayAddresses(ctx, gw, nil)
+		addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if ready {
+		if readiness.Ready {
 			t.Errorf("expected ready=false on error")
 		}
 		if len(addrs) != 0 {
@@ -121,11 +121,11 @@ func TestAddressProvider_NodeFallback(t *testing.T) {
 	})
 
 	gw := &gatewayv1.Gateway{}
-	addrs, ready, err := provider.GatewayAddresses(ctx, gw, nil)
+	addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !ready {
+	if !readiness.Ready {
 		t.Errorf("expected ready=true")
 	}
 
@@ -145,11 +145,11 @@ func TestAddressProvider_Unconfigured(t *testing.T) {
 	ctx := t.Context()
 	provider := NewAddressProvider(Options{})
 	gw := &gatewayv1.Gateway{}
-	addrs, ready, err := provider.GatewayAddresses(ctx, gw, nil)
+	addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if ready {
+	if readiness.Ready {
 		t.Errorf("expected ready=false when unconfigured")
 	}
 	if len(addrs) != 0 {

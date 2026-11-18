@@ -104,7 +104,7 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 	// 1. Expected: run existing singlepod provider with WithHostPorts()
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
-	expectedAddresses, expectedReadiness, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	expectedAddresses, expectedReadiness, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	actualAddresses, actualReadiness, err := hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	actualAddresses, actualReadiness, err := hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	_, _, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	_, _, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	_, _, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	_, _, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
@@ -431,7 +431,7 @@ func TestHostPortAddressProvider_ListenerSetListener(t *testing.T) {
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	_, _, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestHostPortAddressProvider_ListenerSetListener(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	_, _, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
@@ -520,7 +520,7 @@ func TestHostPortAddressProvider_ConflictedListenerSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	_, _, err = hostPortProvider.GatewayAddressesWithReadiness(ctx, gateway, effectiveListeners)
+	_, _, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
 	}
@@ -668,11 +668,11 @@ func TestHostPortAddressProvider_GatewayAddresses(t *testing.T) {
 		},
 	}
 
-	addresses, ready, err := provider.GatewayAddresses(t.Context(), gateway, nil)
+	addresses, readiness, err := provider.GatewayAddresses(t.Context(), gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if ready {
+	if readiness.Ready {
 		t.Errorf("expected ready=false")
 	}
 	if len(addresses) != 0 {
@@ -742,7 +742,7 @@ func TestHostPortAddressProvider_WrappedReadinessPropagated(t *testing.T) {
 	// With state set on provider but no parameters computed in state,
 	// singlepod returns GatewayReasonPending ("Waiting for state to compute gateway parameters").
 	// HostPortAddressProvider must return that readiness without discovering pods.
-	addresses, readiness, err := provider.GatewayAddressesWithReadiness(t.Context(), gateway, nil)
+	addresses, readiness, err := provider.GatewayAddresses(t.Context(), gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -813,7 +813,7 @@ func setupHostPortsFixture(t *testing.T) (*hostPortsFixture, context.Context) {
 	}
 
 	// Run provider to build the Deployment
-	if _, _, err := provider.GatewayAddressesWithReadiness(ctx, gateway, nil); err != nil {
+	if _, _, err := provider.GatewayAddresses(ctx, gateway, nil); err != nil {
 		t.Fatalf("initial reconciliation failed: %v", err)
 	}
 
@@ -916,7 +916,7 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 	fixture, ctx := setupHostPortsFixture(t)
 
 	// 1. Initial reconcile: no pod exists yet -> no address and not programmed
-	addresses, readiness, err := fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -926,7 +926,7 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 
 	// 2. Pod exists but has no node assigned (Spec.NodeName = "") -> no address and not programmed
 	pod := fixture.createPod(t, ctx, "gw-hp-pod", "", true)
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -942,7 +942,7 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 	}
 	fixture.setDeploymentReady(t, ctx, true)
 
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -958,9 +958,9 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 	}
 
 	// Also verify through GatewayAddresses public API
-	gwAddresses, ready, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil || !ready || len(gwAddresses) != 2 || gwAddresses[0].Value != "10.0.0.5" || gwAddresses[1].Value != "2001:db8::5" {
-		t.Errorf("unexpected addresses from GatewayAddresses: ready=%v addrs=%+v err=%v", ready, gwAddresses, err)
+	gwAddresses, gwReadiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	if err != nil || !gwReadiness.Ready || len(gwAddresses) != 2 || gwAddresses[0].Value != "10.0.0.5" || gwAddresses[1].Value != "2001:db8::5" {
+		t.Errorf("unexpected addresses from GatewayAddresses: ready=%v addrs=%+v err=%v", gwReadiness.Ready, gwAddresses, err)
 	}
 
 	// 4. Pod is rescheduled to node-2: addresses follow to node-2's internal address
@@ -969,7 +969,7 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 		t.Fatalf("failed to reschedule pod to node-2: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error after reschedule: %v", err)
 	}
@@ -983,7 +983,7 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 		t.Fatalf("failed to update pod: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error when unscheduled: %v", err)
 	}
@@ -999,7 +999,7 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 	// 1. Unowned pod that matches labels but lacks owner references -> ignored
 	unownedPod := fixture.createPod(t, ctx, "spoofed-pod", "node-1", false)
 
-	addresses, readiness, err := fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1037,7 +1037,7 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 		t.Fatalf("failed to update foreign pod owner reference: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1063,7 +1063,7 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 	if err := fixture.client.Update(ctx, noUIDPod); err != nil {
 		t.Fatalf("failed to update no-uid pod: %v", err)
 	}
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1109,7 +1109,7 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 	if err := fixture.client.Update(ctx, mismatchedPod); err != nil {
 		t.Fatalf("failed to update mismatched pod: %v", err)
 	}
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1122,7 +1122,7 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 
 	// 5. Pod owned by the Deployment's ReplicaSet with strictly matching UIDs -> accepted
 	_ = fixture.createPod(t, ctx, "valid-rs-pod", "node-1", true)
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1199,7 +1199,7 @@ func TestHostPortAddressProvider_MultiplePodsOnMultipleNodesAndShrink(t *testing
 
 	// Two owned pods on two nodes give both nodes' addresses:
 	// node-1 (10.0.0.5, 2001:db8::5) and node-2 (192.168.1.20)
-	addresses, readiness, err := fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error during rollout: %v", err)
 	}
@@ -1219,7 +1219,7 @@ func TestHostPortAddressProvider_MultiplePodsOnMultipleNodesAndShrink(t *testing
 		t.Fatalf("failed to remove finalizer: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1237,7 +1237,7 @@ func TestHostPortAddressProvider_MultiplePodsOnSameNode(t *testing.T) {
 	_ = fixture.createPod(t, ctx, "pod-b", "node-1", true)
 
 	// Two pods on one node give that node once (node-1 read once, deduplicated addresses)
-	addresses, readiness, err := fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1254,7 +1254,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 
 	// 1. Pod on node that does not exist -> AddressNotAssigned
 	pod := fixture.createPod(t, ctx, "edge-pod", "non-existent-node", true)
-	addresses, readiness, err := fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1278,7 +1278,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 	if err := fixture.client.Update(ctx, pod); err != nil {
 		t.Fatalf("failed to update pod: %v", err)
 	}
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1302,7 +1302,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 	if err := fixture.client.Update(ctx, pod); err != nil {
 		t.Fatalf("failed to update pod: %v", err)
 	}
-	_, _, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	_, _, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err == nil {
 		t.Fatalf("expected error for unparseable NodeInternalIP, got nil")
 	}
@@ -1317,7 +1317,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 	}
 	fixture.setDeploymentReady(t, ctx, false)
 
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1332,7 +1332,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Fatalf("failed to update pod status: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1346,7 +1346,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Fatalf("failed to update pod status: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1361,7 +1361,7 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Fatalf("failed to update pod: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddressesWithReadiness(ctx, fixture.gateway, nil)
+	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
