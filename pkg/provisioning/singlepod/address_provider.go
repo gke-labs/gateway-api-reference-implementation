@@ -74,6 +74,9 @@ const (
 	// MaxLabelValueLength is the maximum length of a Kubernetes label value (63 characters).
 	MaxLabelValueLength = 63
 
+	// DataplaneContainerName is the name of the data-plane container in the per-Gateway Deployment.
+	DataplaneContainerName = "dataplane"
+
 	// DataplaneSecretDataKey is the key in the per-Gateway Secret holding the serialized DataplaneConfig.
 	DataplaneSecretDataKey = "config.json"
 
@@ -787,7 +790,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	containerApply := corev1ac.Container().
-		WithName("dataplane").
+		WithName(DataplaneContainerName).
 		WithImage(image).
 		WithImagePullPolicy(corev1.PullIfNotPresent).
 		WithArgs(args...).
