@@ -39,14 +39,13 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -166,12 +165,12 @@ func startTestPushServer(t *testing.T, server *push.Server, addr string, serverT
 }
 
 // TestDataplanePushClient_EndToEnd tests criteria 1, 2, 3, and 4:
-// - The data plane connects, receives its Gateway's config, serves a request through the proxy,
-//   and the controller's WaitApplied reports one data plane applied.
-// - A config the proxy rejects produces a Nack, and WaitApplied reports the rejection with the reason.
-// - A second config after a change is applied and acknowledged.
-// - The server is stopped and started again: the data plane keeps serving while disconnected,
-//   reconnects, and reports its applied revision in Hello, so the server does not send the same config again.
+//   - The data plane connects, receives its Gateway's config, serves a request through the proxy,
+//     and the controller's WaitApplied reports one data plane applied.
+//   - A config the proxy rejects produces a Nack, and WaitApplied reports the rejection with the reason.
+//   - A second config after a change is applied and acknowledged.
+//   - The server is stopped and started again: the data plane keeps serving while disconnected,
+//     reconnects, and reports its applied revision in Hello, so the server does not send the same config again.
 func TestDataplanePushClient_EndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -685,17 +684,14 @@ func TestDataplanePushClient_RejectedToken(t *testing.T) {
 // TestDataplanePushClient_FlagsUnset_BehavesAsToday tests Criterion 6:
 // With the flags unset, the data plane behaves as it does today (watches Secret).
 func TestDataplanePushClient_FlagsUnset_BehavesAsToday(t *testing.T) {
+	env := testenv.Start(t)
+
 	const (
 		gwNamespace = "test-ns"
 		gwName      = "test-gw"
 	)
 	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
 	secretName := singlepod.ResourceNameForGateway(gwName)
-
-	scheme := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		t.Fatalf("failed to add clientgo scheme: %v", err)
-	}
 
 	route := state.InternalRoute{
 		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
@@ -732,9 +728,11 @@ func TestDataplanePushClient_FlagsUnset_BehavesAsToday(t *testing.T) {
 		},
 	}
 
-	cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	cl := fakeclient.NewClientBuilder().WithScheme(env.Scheme).WithObjects(secret).Build()
 
 	opts := DefaultOptions()
+	opts.RestConfig = env.Config
+	opts.Scheme = env.Scheme
 	opts.DataplaneMode = true
 	opts.DataplaneGatewayNamespace = gwNamespace
 	opts.DataplaneGatewayName = gwName
