@@ -56,6 +56,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -319,6 +320,25 @@ type Options struct {
 	// Kubernetes TokenReview API with the gari-controller audience (push.DefaultAudience).
 	PushTokenReviewer push.TokenReviewer
 
+	// InternalAPIAddress is the host and port of the controller's internal API Service.
+	// When configured in data-plane mode, the data plane receives configuration pushed from
+	// the controller over a gRPC stream rather than watching a Secret.
+	InternalAPIAddress string
+
+	// InternalAPICAFile is the path to the trust bundle that verifies the controller's certificate.
+	InternalAPICAFile string
+
+	// InternalAPITokenFile is the path to the projected ServiceAccount token for data-plane identity.
+	InternalAPITokenFile string
+
+	// PushClientMinBackoff is an optional minimum backoff delay between push client reconnect attempts.
+	// If 0, DefaultPushClientMinBackoff is used.
+	PushClientMinBackoff time.Duration
+
+	// PushClientMaxBackoff is an optional maximum backoff delay between push client reconnect attempts.
+	// If 0, DefaultPushClientMaxBackoff is used.
+	PushClientMaxBackoff time.Duration
+
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
 	// is created, allowing callers to register additional reconcilers or runnables before
 	// the manager starts. If non-nil, it is passed the manager and the GARI Server.
@@ -384,6 +404,20 @@ func (o *Options) complete() error {
 		o.DisableStatusUpdates = true
 		o.AddressProvider = nil
 	}
+	hasAddr := o.InternalAPIAddress != ""
+	hasCA := o.InternalAPICAFile != ""
+	hasToken := o.InternalAPITokenFile != ""
+	if hasAddr || hasCA || hasToken {
+		if !hasAddr || !hasCA || !hasToken {
+			return errors.New("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file are all required together")
+		}
+		if !o.DataplaneMode {
+			return errors.New("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file require --dataplane-mode")
+		}
+		if o.DataplaneGatewayNamespace == "" || o.DataplaneGatewayName == "" {
+			return errors.New("--gateway-namespace and --gateway-name are required in --dataplane-mode")
+		}
+	}
 	return nil
 }
 
@@ -396,6 +430,7 @@ type Server struct {
 	proxy   *proxy.Proxy
 
 	pushServer *push.Server
+	pushClient *pushClient
 
 	proxySynced atomic.Bool
 
@@ -554,7 +589,11 @@ func New(opts Options) (*Server, error) {
 			var err error
 			cfg, err = ctrl.GetConfig()
 			if err != nil {
-				return nil, fmt.Errorf("unable to get kubeconfig: %w", err)
+				if opts.DataplaneMode && opts.InternalAPIAddress != "" {
+					cfg = &rest.Config{Host: "http://127.0.0.1:0"}
+				} else {
+					return nil, fmt.Errorf("unable to get kubeconfig: %w", err)
+				}
 			}
 		}
 
@@ -585,13 +624,10 @@ func New(opts Options) (*Server, error) {
 
 		var err error
 		if opts.DataplaneMode {
-			secretName := singlepod.ResourceNameForGateway(opts.DataplaneGatewayName)
-			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
-				Scheme:                 opts.Scheme,
-				Metrics:                metricsOpts,
-				HealthProbeBindAddress: healthProbeBindAddress,
-				LeaderElection:         false,
-				Cache: cache.Options{
+			var cacheOpts cache.Options
+			if opts.InternalAPIAddress == "" {
+				secretName := singlepod.ResourceNameForGateway(opts.DataplaneGatewayName)
+				cacheOpts = cache.Options{
 					ByObject: map[client.Object]cache.ByObject{
 						&corev1.Secret{}: {
 							Namespaces: map[string]cache.Config{
@@ -601,7 +637,14 @@ func New(opts Options) (*Server, error) {
 							},
 						},
 					},
-				},
+				}
+			}
+			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
+				Scheme:                 opts.Scheme,
+				Metrics:                metricsOpts,
+				HealthProbeBindAddress: healthProbeBindAddress,
+				LeaderElection:         false,
+				Cache:                  cacheOpts,
 			})
 		} else {
 			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
@@ -659,6 +702,10 @@ func New(opts Options) (*Server, error) {
 			return nil, fmt.Errorf("creating push server: %w", err)
 		}
 		s.pushServer = pushServer
+	}
+
+	if opts.DataplaneMode && opts.InternalAPIAddress != "" {
+		s.pushClient = newPushClient(s, opts)
 	}
 
 	return s, nil
@@ -765,6 +812,10 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	if s.opts.DataplaneMode {
+		if s.opts.InternalAPIAddress != "" {
+			// In internal API mode, config comes from the push stream only; do not watch the Secret.
+			return nil
+		}
 		secretName := singlepod.ResourceNameForGateway(s.opts.DataplaneGatewayName)
 		reconciler := &dataplaneSecretReconciler{
 			Client:           mgr.GetClient(),
@@ -775,7 +826,9 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 			onConfigUpdate:   s.updateListenerFilters,
 			onConfigApplied:  s.recordAppliedRevision,
 		}
+		skipNameValidation := true
 		if err := ctrl.NewControllerManagedBy(mgr).
+			WithOptions(crcontroller.Options{SkipNameValidation: &skipNameValidation}).
 			For(&corev1.Secret{}).
 			Complete(reconciler); err != nil {
 			return fmt.Errorf("failed to create dataplane secret controller: %w", err)
@@ -887,6 +940,33 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (s *Server) applyDataplaneConfig(data []byte) error {
+	if err := state.ApplyDataplaneConfig(s.proxy, data); err != nil {
+		return fmt.Errorf("failed to apply dataplane config: %w", err)
+	}
+	s.proxySynced.Store(true)
+
+	dpCfg, err := state.UnmarshalDataplaneConfig(data)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal dataplane config: %w", err)
+	}
+
+	opts := proxyproto.ListenerOptions{
+		AllowedSourceCIDRs:        dpCfg.AllowedSourceCIDRs,
+		ProxyProtocol:             dpCfg.ProxyProtocol,
+		ProxyProtocolTrustedCIDRs: dpCfg.ProxyProtocolTrustedCIDRs,
+	}
+	if err := s.updateListenerFilters(opts); err != nil {
+		return fmt.Errorf("failed to update listener filters: %w", err)
+	}
+
+	if dpCfg.Revision != "" {
+		s.recordAppliedRevision(dpCfg.GatewayName.String(), dpCfg.Revision)
+	}
+
+	return nil
 }
 
 func (s *Server) initDefaultCertificate() error {
@@ -1207,6 +1287,12 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.pushServer != nil && (s.opts.InternalAPIListener != nil || s.opts.InternalAPIBindAddress != "") {
 		g.Go(func() error {
 			return s.StartPushServer(ctx)
+		})
+	}
+
+	if s.pushClient != nil {
+		g.Go(func() error {
+			return s.pushClient.run(ctx)
 		})
 	}
 
