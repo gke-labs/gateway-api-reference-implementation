@@ -1373,7 +1373,7 @@ func PublishDataplaneConfig(ctx context.Context, cl client.Client, namespace, na
 // WaitApplied implements state.DataplanePublisher. A Secret carries no reply,
 // so WaitApplied returns a result that says no data plane reports through this
 // publisher. The planned removal of the Secret path removes this case.
-func (p *AddressProvider) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (state.PublishResult, error) {
+func (p *AddressProvider) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (state.PublishResult, error) {
 	return state.PublishResult{}, nil
 }
 

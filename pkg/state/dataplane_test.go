@@ -1138,7 +1138,7 @@ func TestInProcessDataplanePublisher_PublishDataplaneConfig_ApplyError(t *testin
 		t.Fatalf("expected PublishDataplaneConfig to succeed without error, got: %v", err)
 	}
 
-	result, err := pub.WaitApplied(ctx, gwKey, badConfig.Revision)
+	result, err := pub.WaitApplied(ctx, gw, badConfig.Revision)
 	if err != nil {
 		t.Fatalf("expected WaitApplied to succeed without error, got: %v", err)
 	}
@@ -1167,7 +1167,7 @@ func TestInProcessDataplanePublisher_PublishDataplaneConfig_ApplyError(t *testin
 	if err := pub.PublishDataplaneConfig(ctx, gw, validConfig); err != nil {
 		t.Fatalf("expected PublishDataplaneConfig to succeed, got: %v", err)
 	}
-	validResult, err := pub.WaitApplied(ctx, gwKey, validConfig.Revision)
+	validResult, err := pub.WaitApplied(ctx, gw, validConfig.Revision)
 	if err != nil {
 		t.Fatalf("expected WaitApplied to succeed, got: %v", err)
 	}
@@ -1188,9 +1188,12 @@ func TestInProcessDataplanePublisher_WaitApplied_NeverPublishedRevision(t *testi
 	ctx := t.Context()
 
 	gwKey := types.NamespacedName{Namespace: "default", Name: "gw-test"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
+	}
 
 	// 1. Gateway never published at all: reports NotAnswered=1.
-	resUnseenGateway, err := pub.WaitApplied(ctx, gwKey, "rev-1")
+	resUnseenGateway, err := pub.WaitApplied(ctx, gw, "rev-1")
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -1199,9 +1202,6 @@ func TestInProcessDataplanePublisher_WaitApplied_NeverPublishedRevision(t *testi
 	}
 
 	// 2. Publish config with revision "rev-1".
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
-	}
 	config := &DataplaneConfig{
 		GatewayName: gwKey,
 		Revision:    "rev-1",
@@ -1211,7 +1211,7 @@ func TestInProcessDataplanePublisher_WaitApplied_NeverPublishedRevision(t *testi
 	}
 
 	// 3. Ask for a revision that was never published: reports NotAnswered=1.
-	resNeverPublishedRevision, err := pub.WaitApplied(ctx, gwKey, "never-published-rev")
+	resNeverPublishedRevision, err := pub.WaitApplied(ctx, gw, "never-published-rev")
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -1220,7 +1220,7 @@ func TestInProcessDataplanePublisher_WaitApplied_NeverPublishedRevision(t *testi
 	}
 
 	// 4. Ask for the published revision: reports Applied=1.
-	resPublished, err := pub.WaitApplied(ctx, gwKey, "rev-1")
+	resPublished, err := pub.WaitApplied(ctx, gw, "rev-1")
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}

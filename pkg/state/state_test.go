@@ -808,7 +808,7 @@ func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw 
 	return nil
 }
 
-func (m *mockDataplanePublisher) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error) {
+func (m *mockDataplanePublisher) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return PublishResult{
@@ -1056,7 +1056,7 @@ func (p *neverAnsweringPublisher) PublishDataplaneConfig(ctx context.Context, gw
 	return nil
 }
 
-func (p *neverAnsweringPublisher) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error) {
+func (p *neverAnsweringPublisher) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error) {
 	<-ctx.Done()
 	return PublishResult{
 		NotAnswered: 1,
@@ -1078,7 +1078,7 @@ func TestState_PublishDataplaneConfig_NeverAnsweringPublisher(t *testing.T) {
 	// 1. Direct WaitApplied test: when ctx limit ends, WaitApplied returns NotAnswered=1 and nil error.
 	shortCtx, shortCancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
 	defer shortCancel()
-	directResult, err := pub.WaitApplied(shortCtx, gwKey, dpConfig.Revision)
+	directResult, err := pub.WaitApplied(shortCtx, gw, dpConfig.Revision)
 	if err != nil {
 		t.Fatalf("expected WaitApplied to return nil error when ctx limit ends, got: %v", err)
 	}
@@ -1172,7 +1172,7 @@ func (m *retryTestPublisher) PublishDataplaneConfig(ctx context.Context, gw *gat
 	return nil
 }
 
-func (m *retryTestPublisher) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error) {
+func (m *retryTestPublisher) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error) {
 	return PublishResult{
 		Applied: 1,
 	}, nil

@@ -92,7 +92,7 @@ type DataplanePublisher interface {
 
 	// WaitApplied waits until every data plane known for the Gateway has
 	// answered for this revision, or until ctx ends, and reports what each did.
-	WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error)
+	WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error)
 }
 ```
 
