@@ -192,9 +192,12 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "gateway-namespace", DefValue: "", Usage: "The namespace of the Gateway to serve in data-plane mode."},
 		{Name: "health-probe-bind-address", DefValue: ":8999", Usage: "The address the probe endpoint binds to."},
 		{Name: "idle-timeout", DefValue: "1m0s", Usage: "The maximum amount of time to wait for the next request when keep-alives are enabled."},
+		{Name: "internal-api-address", DefValue: "", Usage: "Host and port of the controller's Service."},
 		{Name: "internal-api-bind-address", DefValue: "", Usage: "The address the internal API server binds to (disabled by default)."},
+		{Name: "internal-api-ca-file", DefValue: "", Usage: "The trust bundle that verifies the controller's certificate."},
 		{Name: "internal-api-tls-cert-file", DefValue: "", Usage: "Path to TLS server certificate file for internal API endpoint. The listener stays off until a certificate that data planes can verify is provided, and how it is provided is not settled."},
 		{Name: "internal-api-tls-key-file", DefValue: "", Usage: "Path to TLS server private key file for internal API endpoint."},
+		{Name: "internal-api-token-file", DefValue: "", Usage: "A projected ServiceAccount token with the audience the server expects."},
 		{Name: "leader-elect", DefValue: "false", Usage: "Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager."},
 		{Name: "metrics-bind-address", DefValue: ":8999", Usage: "The address the metric endpoint binds to."},
 		{Name: "proxy-bind-address", DefValue: ":8080", Usage: "The address the proxy binds to for HTTP."},
@@ -332,3 +335,74 @@ func TestSetup_ModeSelection(t *testing.T) {
 		t.Errorf("expected gateway ns/gw, got %s/%s", optsDP.DataplaneGatewayNamespace, optsDP.DataplaneGatewayName)
 	}
 }
+
+func TestSetup_InternalAPIFlags(t *testing.T) {
+	// Flags without --dataplane-mode
+	_, err := Setup([]string{
+		"--internal-api-address=127.0.0.1:8443",
+		"--internal-api-ca-file=/path/to/ca.crt",
+		"--internal-api-token-file=/path/to/token",
+	})
+	if err == nil || !strings.Contains(err.Error(), "require --dataplane-mode") {
+		t.Errorf("expected error requiring --dataplane-mode, got %v", err)
+	}
+
+	// Missing token file
+	_, err = Setup([]string{
+		"--dataplane-mode",
+		"--gateway-namespace=ns",
+		"--gateway-name=gw",
+		"--internal-api-address=127.0.0.1:8443",
+		"--internal-api-ca-file=/path/to/ca.crt",
+	})
+	if err == nil || !strings.Contains(err.Error(), "required together") {
+		t.Errorf("expected error about flags required together, got %v", err)
+	}
+
+	// Missing CA file
+	_, err = Setup([]string{
+		"--dataplane-mode",
+		"--gateway-namespace=ns",
+		"--gateway-name=gw",
+		"--internal-api-address=127.0.0.1:8443",
+		"--internal-api-token-file=/path/to/token",
+	})
+	if err == nil || !strings.Contains(err.Error(), "required together") {
+		t.Errorf("expected error about flags required together, got %v", err)
+	}
+
+	// Missing address
+	_, err = Setup([]string{
+		"--dataplane-mode",
+		"--gateway-namespace=ns",
+		"--gateway-name=gw",
+		"--internal-api-ca-file=/path/to/ca.crt",
+		"--internal-api-token-file=/path/to/token",
+	})
+	if err == nil || !strings.Contains(err.Error(), "required together") {
+		t.Errorf("expected error about flags required together, got %v", err)
+	}
+
+	// All three flags valid
+	opts, err := Setup([]string{
+		"--dataplane-mode",
+		"--gateway-namespace=ns",
+		"--gateway-name=gw",
+		"--internal-api-address=127.0.0.1:8443",
+		"--internal-api-ca-file=/path/to/ca.crt",
+		"--internal-api-token-file=/path/to/token",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error for valid flags: %v", err)
+	}
+	if opts.InternalAPIAddress != "127.0.0.1:8443" {
+		t.Errorf("expected address 127.0.0.1:8443, got %q", opts.InternalAPIAddress)
+	}
+	if opts.InternalAPICAFile != "/path/to/ca.crt" {
+		t.Errorf("expected ca file /path/to/ca.crt, got %q", opts.InternalAPICAFile)
+	}
+	if opts.InternalAPITokenFile != "/path/to/token" {
+		t.Errorf("expected token file /path/to/token, got %q", opts.InternalAPITokenFile)
+	}
+}
+
