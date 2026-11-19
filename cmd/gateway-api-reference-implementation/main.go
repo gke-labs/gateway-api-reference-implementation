@@ -124,21 +124,9 @@ func Setup(args []string) (gari.Options, error) {
 	}
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
 
-	hasAddr := opts.InternalAPIAddress != ""
-	hasCA := opts.InternalAPICAFile != ""
-	hasToken := opts.InternalAPITokenFile != ""
-	if (hasAddr || hasCA || hasToken) && !opts.DataplaneMode {
-		return opts, fmt.Errorf("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file require --dataplane-mode")
-	}
-
 	if opts.DataplaneMode {
 		if opts.DataplaneGatewayNamespace == "" || opts.DataplaneGatewayName == "" {
 			return opts, fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode")
-		}
-		if hasAddr || hasCA || hasToken {
-			if !hasAddr || !hasCA || !hasToken {
-				return opts, fmt.Errorf("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file are all required together")
-			}
 		}
 		// Data-plane pods serve traffic for a single Gateway and do not perform
 		// status updates or run leader election.
