@@ -32,6 +32,15 @@ import (
 
 type GatewayState struct {
 	*gatewayv1.Gateway
+
+	// addresses holds infrastructure-assigned status addresses; guarded by State.mu
+	addresses []gatewayv1.GatewayStatusAddress
+
+	// readiness holds data-plane readiness state; guarded by State.mu
+	readiness *GatewayReadiness
+
+	// provisioningErrors holds per-Gateway provisioning errors from different sources; guarded by State.mu
+	provisioningErrors gatewayProvisioningErrors
 }
 
 func (s *GatewayState) GetHTTPRoutes(allRoutes []*HTTPRouteState, controllerName string) []*HTTPRouteState {

@@ -160,9 +160,6 @@ type State struct {
 
 	gatewayClasses        map[types.NamespacedName]*gatewayv1.GatewayClass
 	gateways              map[types.NamespacedName]*GatewayState
-	gatewayAddresses      map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
-	gatewayReadiness      map[types.NamespacedName]GatewayReadiness
-	provisioningErrors    map[types.NamespacedName]gatewayProvisioningErrors
 	supportedAddressTypes []gatewayv1.AddressType
 	listenerSets          map[types.NamespacedName]*ListenerSetState
 	httpRoutes            map[types.NamespacedName]*HTTPRouteState
@@ -213,9 +210,6 @@ func NewState() *State {
 	return &State{
 		gatewayClasses:         make(map[types.NamespacedName]*gatewayv1.GatewayClass),
 		gateways:               make(map[types.NamespacedName]*GatewayState),
-		gatewayAddresses:       make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress),
-		gatewayReadiness:       make(map[types.NamespacedName]GatewayReadiness),
-		provisioningErrors:     make(map[types.NamespacedName]gatewayProvisioningErrors),
 		listenerSets:           make(map[types.NamespacedName]*ListenerSetState),
 		httpRoutes:             make(map[types.NamespacedName]*HTTPRouteState),
 		tlsRoutes:              make(map[types.NamespacedName]*TLSRouteState),
@@ -707,13 +701,8 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 // clearPublishErrorLocked clears the data-plane publish error for a Gateway.
 // It must be called with s.mu held.
 func (s *State) clearPublishErrorLocked(gwKey types.NamespacedName) {
-	if errs, ok := s.provisioningErrors[gwKey]; ok && errs.publish != nil {
-		errs.publish = nil
-		if errs.empty() {
-			delete(s.provisioningErrors, gwKey)
-		} else {
-			s.provisioningErrors[gwKey] = errs
-		}
+	if gw, ok := s.gateways[gwKey]; ok && gw.provisioningErrors.publish != nil {
+		gw.provisioningErrors.publish = nil
 		s.revision++
 		s.markDirtyLocked()
 	}
@@ -745,16 +734,11 @@ func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.gateways[gwKey]; !ok {
+	gw, ok := s.gateways[gwKey]
+	if !ok || publishErrorsEqual(gw.provisioningErrors.publish, err) {
 		return
 	}
-
-	errs := s.provisioningErrors[gwKey]
-	if publishErrorsEqual(errs.publish, err) {
-		return
-	}
-	errs.publish = err
-	s.provisioningErrors[gwKey] = errs
+	gw.provisioningErrors.publish = err
 	s.revision++
 	s.markDirtyLocked()
 }
@@ -817,21 +801,19 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 	})
 
 	gwAddrs := make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress)
-	for k, v := range s.gatewayAddresses {
-		copied := make([]gatewayv1.GatewayStatusAddress, len(v))
-		copy(copied, v)
-		gwAddrs[k] = copied
-	}
-
 	gwReady := make(map[types.NamespacedName]GatewayReadiness)
-	for k, v := range s.gatewayReadiness {
-		gwReady[k] = v
-	}
-
 	gwProvErrs := make(map[types.NamespacedName]string)
-	for k, v := range s.provisioningErrors {
-		if msg := v.message(); msg != "" {
-			gwProvErrs[k] = msg
+	for k, gwState := range s.gateways {
+		if gwState != nil {
+			if len(gwState.addresses) > 0 {
+				gwAddrs[k] = slices.Clone(gwState.addresses)
+			}
+			if gwState.readiness != nil {
+				gwReady[k] = *gwState.readiness
+			}
+			if msg := gwState.provisioningErrors.message(); msg != "" {
+				gwProvErrs[k] = msg
+			}
 		}
 	}
 
@@ -1448,9 +1430,6 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 	if s.gatewayFilter != nil && !s.gatewayFilter(gw) {
 		if _, ok := s.gateways[key]; ok {
 			delete(s.gateways, key)
-			delete(s.gatewayAddresses, key)
-			delete(s.gatewayReadiness, key)
-			delete(s.provisioningErrors, key)
 			s.revision++
 			s.markDirtyLocked()
 		}
@@ -1462,8 +1441,10 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 		return
 	}
 
-	s.gateways[key] = &GatewayState{
-		Gateway: gw.DeepCopy(),
+	if old != nil {
+		old.Gateway = gw.DeepCopy()
+	} else {
+		s.gateways[key] = &GatewayState{Gateway: gw.DeepCopy()}
 	}
 	s.revision++
 	s.markDirtyLocked()
@@ -1475,9 +1456,6 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 
 	if _, ok := s.gateways[name]; ok {
 		delete(s.gateways, name)
-		delete(s.gatewayAddresses, name)
-		delete(s.gatewayReadiness, name)
-		delete(s.provisioningErrors, name)
 		s.revision++
 		s.markDirtyLocked()
 	}
@@ -1524,16 +1502,15 @@ func (s *State) SetGatewayAddresses(key types.NamespacedName, addrs []gatewayv1.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if reflectAddressesEqual(s.gatewayAddresses[key], addrs) {
+	gw, ok := s.gateways[key]
+	if !ok || reflectAddressesEqual(gw.addresses, addrs) {
 		return
 	}
 
 	if len(addrs) == 0 {
-		delete(s.gatewayAddresses, key)
+		gw.addresses = nil
 	} else {
-		copied := make([]gatewayv1.GatewayStatusAddress, len(addrs))
-		copy(copied, addrs)
-		s.gatewayAddresses[key] = copied
+		gw.addresses = slices.Clone(addrs)
 	}
 	s.revision++
 	s.markDirtyLocked()
@@ -1543,8 +1520,8 @@ func (s *State) DeleteGatewayAddresses(key types.NamespacedName) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.gatewayAddresses[key]; ok {
-		delete(s.gatewayAddresses, key)
+	if gw, ok := s.gateways[key]; ok && gw.addresses != nil {
+		gw.addresses = nil
 		s.revision++
 		s.markDirtyLocked()
 	}
@@ -1555,10 +1532,10 @@ func (s *State) GetGatewayAddresses() map[types.NamespacedName][]gatewayv1.Gatew
 	defer s.mu.RUnlock()
 
 	gwAddrs := make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress)
-	for k, v := range s.gatewayAddresses {
-		copied := make([]gatewayv1.GatewayStatusAddress, len(v))
-		copy(copied, v)
-		gwAddrs[k] = copied
+	for k, gw := range s.gateways {
+		if gw != nil && len(gw.addresses) > 0 {
+			gwAddrs[k] = slices.Clone(gw.addresses)
+		}
 	}
 	return gwAddrs
 }
@@ -1567,11 +1544,12 @@ func (s *State) SetGatewayReadiness(key types.NamespacedName, readiness GatewayR
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if cur, ok := s.gatewayReadiness[key]; ok && cur == readiness {
+	gw, ok := s.gateways[key]
+	if !ok || (gw.readiness != nil && *gw.readiness == readiness) {
 		return
 	}
 
-	s.gatewayReadiness[key] = readiness
+	gw.readiness = &readiness
 	s.revision++
 	s.markDirtyLocked()
 }
@@ -1581,23 +1559,24 @@ func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	errs := s.provisioningErrors[key]
+	gw, ok := s.gateways[key]
+	if !ok {
+		return
+	}
+
 	var newErr error
 	if provErr != "" {
 		newErr = errors.New(provErr)
 	}
 
+	errs := gw.provisioningErrors
 	if (errs.addressProvider == nil && newErr == nil) ||
 		(errs.addressProvider != nil && newErr != nil && errs.addressProvider.Error() == newErr.Error()) {
 		return
 	}
 
 	errs.addressProvider = newErr
-	if errs.empty() {
-		delete(s.provisioningErrors, key)
-	} else {
-		s.provisioningErrors[key] = errs
-	}
+	gw.provisioningErrors = errs
 	s.revision++
 	s.markDirtyLocked()
 }

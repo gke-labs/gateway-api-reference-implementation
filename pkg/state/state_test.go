@@ -1010,7 +1010,7 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	}
 
 	st.mu.RLock()
-	errs := st.provisioningErrors[gwKey]
+	errs := st.gateways[gwKey].provisioningErrors
 	st.mu.RUnlock()
 
 	if errs.publish == nil {
@@ -1046,7 +1046,7 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	}
 
 	st.mu.RLock()
-	clearedErrs := st.provisioningErrors[gwKey]
+	clearedErrs := st.gateways[gwKey].provisioningErrors
 	dataplaneState := st.dataplaneState[gwKey]
 	st.mu.RUnlock()
 
@@ -1108,7 +1108,7 @@ func TestState_PublishDataplaneConfig_MultipleRejections_ErrorsAs(t *testing.T) 
 	}
 
 	st.mu.RLock()
-	errs := st.provisioningErrors[gwKey]
+	errs := st.gateways[gwKey].provisioningErrors
 	st.mu.RUnlock()
 
 	if errs.publish == nil {
@@ -1234,7 +1234,7 @@ func TestState_PublishDataplaneConfig_Rejections_ChangeDetection(t *testing.T) {
 	st.mu.RLock()
 	revAfterFourthPublish := st.revision
 	dirtyAfterFourthPublish := st.dirty
-	errs := st.provisioningErrors[gwKey]
+	errs := st.gateways[gwKey].provisioningErrors
 	st.mu.RUnlock()
 
 	if revAfterFourthPublish == revAfterReorderedPublish {
@@ -1686,7 +1686,10 @@ func TestState_PublishDataplaneConfig_NeverAnsweringPublisher(t *testing.T) {
 
 	st.mu.RLock()
 	dataplaneState := st.dataplaneState[gwKey]
-	errs := st.provisioningErrors[gwKey]
+	var errs gatewayProvisioningErrors
+	if gwState := st.gateways[gwKey]; gwState != nil {
+		errs = gwState.provisioningErrors
+	}
 	st.mu.RUnlock()
 
 	if errs.publish != nil {
@@ -2702,5 +2705,94 @@ func TestState_GatewayCRDBundleVersionEnqueuesGatewayClass(t *testing.T) {
 	cond = findCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != string(gatewayv1.GatewayClassReasonUnsupportedVersion) {
 		t.Errorf("expected SupportedVersion=False/UnsupportedVersion, got %+v", cond)
+	}
+}
+
+func TestState_GatewayState_AddressesReadinessErrorsLifecycle(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+
+	// 1. Setting addresses, readiness, and errors for a non-existent Gateway is safely ignored.
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+	st.SetGatewayProvisioningError(gwKey, "some-err")
+
+	st.mu.RLock()
+	_, exists := st.gateways[gwKey]
+	st.mu.RUnlock()
+	if exists {
+		t.Fatalf("expected non-existent Gateway not to be created in gateways")
+	}
+	if addrs := st.GetGatewayAddresses(); len(addrs) != 0 {
+		t.Fatalf("expected no addresses for non-existent Gateway, got: %v", addrs)
+	}
+
+	// 2. Upsert Gateway and populate addresses, readiness, and provisioning error.
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+	st.SetGatewayProvisioningError(gwKey, "test provisioning error")
+
+	st.mu.RLock()
+	gwState := st.gateways[gwKey]
+	if gwState == nil {
+		st.mu.RUnlock()
+		t.Fatalf("expected Gateway to exist in gateways")
+	}
+	if len(gwState.addresses) != 1 || gwState.addresses[0].Value != "192.0.2.1" {
+		t.Errorf("expected addresses to be stored on GatewayState, got: %+v", gwState.addresses)
+	}
+	if gwState.readiness == nil || !gwState.readiness.Ready {
+		t.Errorf("expected readiness to be stored on GatewayState, got: %+v", gwState.readiness)
+	}
+	if gwState.provisioningErrors.addressProvider == nil || gwState.provisioningErrors.addressProvider.Error() != "test provisioning error" {
+		t.Errorf("expected provisioning error to be stored on GatewayState, got: %+v", gwState.provisioningErrors)
+	}
+	st.mu.RUnlock()
+
+	// 3. Updating Gateway spec preserves addresses, readiness, and provisioning errors.
+	gwUpdated := gw.DeepCopy()
+	gwUpdated.Spec.Listeners[0].Port = 8080
+	st.UpsertGateway(gwUpdated)
+
+	st.mu.RLock()
+	gwStateUpdated := st.gateways[gwKey]
+	if gwStateUpdated == nil {
+		st.mu.RUnlock()
+		t.Fatalf("expected Gateway to exist in gateways after spec update")
+	}
+	if len(gwStateUpdated.addresses) != 1 || gwStateUpdated.addresses[0].Value != "192.0.2.1" {
+		t.Errorf("expected addresses to be preserved after spec update, got: %+v", gwStateUpdated.addresses)
+	}
+	if gwStateUpdated.readiness == nil || !gwStateUpdated.readiness.Ready {
+		t.Errorf("expected readiness to be preserved after spec update, got: %+v", gwStateUpdated.readiness)
+	}
+	if gwStateUpdated.provisioningErrors.addressProvider == nil || gwStateUpdated.provisioningErrors.addressProvider.Error() != "test provisioning error" {
+		t.Errorf("expected provisioning error to be preserved after spec update, got: %+v", gwStateUpdated.provisioningErrors)
+	}
+	st.mu.RUnlock()
+
+	// 4. Deleting Gateway removes GatewayState and all its stored fields.
+	st.DeleteGateway(gwKey)
+
+	st.mu.RLock()
+	_, existsAfterDelete := st.gateways[gwKey]
+	st.mu.RUnlock()
+	if existsAfterDelete {
+		t.Errorf("expected Gateway to be removed from gateways after delete")
+	}
+	if addrs := st.GetGatewayAddresses(); len(addrs) != 0 {
+		t.Errorf("expected GetGatewayAddresses to be empty after delete, got: %v", addrs)
 	}
 }
