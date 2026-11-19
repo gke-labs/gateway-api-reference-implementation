@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -807,6 +808,14 @@ func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw 
 	return nil
 }
 
+func (m *mockDataplanePublisher) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return PublishResult{
+		Applied: 1,
+	}, nil
+}
+
 func (m *mockDataplanePublisher) setPublishErr(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -998,6 +1007,9 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	if recordedErr.Error() != err.Error() {
 		t.Errorf("expected recorded error %q, got %q", err.Error(), recordedErr.Error())
 	}
+	if !strings.HasPrefix(recordedErr.Error(), "in-process: ") {
+		t.Errorf("expected recorded error to start with %q, got %q", "in-process: ", recordedErr.Error())
+	}
 	if provErr != err.Error() {
 		t.Errorf("expected provisioning error %q, got %q", err.Error(), provErr)
 	}
@@ -1024,6 +1036,89 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	}
 	if clearedProvErr != "" {
 		t.Errorf("expected provisioning error to be cleared, got %q", clearedProvErr)
+	}
+}
+
+type neverAnsweringPublisher struct {
+	mu        sync.Mutex
+	published map[types.NamespacedName]*DataplaneConfig
+}
+
+func (p *neverAnsweringPublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.published == nil {
+		p.published = make(map[types.NamespacedName]*DataplaneConfig)
+	}
+	if gw != nil {
+		p.published[types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}] = config
+	}
+	return nil
+}
+
+func (p *neverAnsweringPublisher) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error) {
+	<-ctx.Done()
+	return PublishResult{
+		NotAnswered: 1,
+	}, nil
+}
+
+func TestState_PublishDataplaneConfig_NeverAnsweringPublisher(t *testing.T) {
+	pub := &neverAnsweringPublisher{}
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
+	}
+	dpConfig := &DataplaneConfig{
+		GatewayName: gwKey,
+		Revision:    "rev-1",
+	}
+
+	// 1. Direct WaitApplied test: when ctx limit ends, WaitApplied returns NotAnswered=1 and nil error.
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer shortCancel()
+	directResult, err := pub.WaitApplied(shortCtx, gwKey, dpConfig.Revision)
+	if err != nil {
+		t.Fatalf("expected WaitApplied to return nil error when ctx limit ends, got: %v", err)
+	}
+	if directResult.NotAnswered != 1 {
+		t.Errorf("expected NotAnswered=1, got %d", directResult.NotAnswered)
+	}
+	if directResult.Applied != 0 {
+		t.Errorf("expected Applied=0, got %d", directResult.Applied)
+	}
+
+	// 2. State reconcile pass test: with publisher that never answers, WaitApplied returns when the limit ends,
+	// the result counts the data plane as not answered, and the reconcile pass continues.
+	st := NewState()
+	st.SetDataplanePublisher(pub)
+
+	st.mu.Lock()
+	st.previousOutputs = &Outputs{
+		DataplaneConfigs: map[types.NamespacedName]*DataplaneConfig{
+			gwKey: dpConfig,
+		},
+		CompiledGateways: map[types.NamespacedName]*CompiledGateway{
+			gwKey: {Gateway: gw},
+		},
+	}
+	st.mu.Unlock()
+
+	ctx := t.Context()
+	if err := st.reconcileDataplaneKey(ctx, gwKey); err != nil {
+		t.Fatalf("expected reconcile pass to continue without error, got: %v", err)
+	}
+
+	st.mu.RLock()
+	dataplaneState := st.dataplaneState[gwKey]
+	st.mu.RUnlock()
+
+	if dataplaneState.lastPublishError != nil {
+		t.Errorf("expected no publish error, got: %v", dataplaneState.lastPublishError)
+	}
+	if dataplaneState.acceptedConfig == nil {
+		t.Errorf("expected acceptedConfig to be saved in dataplane state")
 	}
 }
 
@@ -1075,6 +1170,12 @@ func (m *retryTestPublisher) PublishDataplaneConfig(ctx context.Context, gw *gat
 	}
 	m.published[key] = config
 	return nil
+}
+
+func (m *retryTestPublisher) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error) {
+	return PublishResult{
+		Applied: 1,
+	}, nil
 }
 
 func (m *retryTestPublisher) getPublished(key types.NamespacedName) *DataplaneConfig {

@@ -18,8 +18,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -99,6 +102,9 @@ const (
 	// dataplaneRetryMaxDelay caps the exponential backoff to bound the worst-case delay
 	// before a recovered data plane receives its updated configuration (e.g. after a temporary outage).
 	dataplaneRetryMaxDelay = 30 * time.Second
+	// dataplaneWaitAppliedLimit is the maximum time the controller waits for data planes
+	// to report what they did with a published configuration before continuing the reconcile pass.
+	dataplaneWaitAppliedLimit = 1 * time.Second
 )
 
 func newDataplaneQueue() workqueue.TypedRateLimitingInterface[types.NamespacedName] {
@@ -611,6 +617,26 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		return err
 	}
 
+	waitCtx, cancel := context.WithTimeout(ctx, dataplaneWaitAppliedLimit)
+	defer cancel()
+
+	result, err := publisher.WaitApplied(waitCtx, gwKey, dpConfig.Revision)
+	if err != nil {
+		klog.Errorf("failed waiting for dataplane config to be applied for %s (revision %s): %v", gwKey, dpConfig.Revision, err)
+		s.recordPublishError(gwKey, err)
+		return err
+	}
+
+	if len(result.Rejections) > 0 {
+		var reasons []string
+		for _, rejection := range result.Rejections {
+			reasons = append(reasons, fmt.Sprintf("%s: %s", rejection.DataPlane, rejection.Reason))
+		}
+		rejectionErr := errors.New(strings.Join(reasons, "; "))
+		s.recordPublishError(gwKey, rejectionErr)
+		return rejectionErr
+	}
+
 	s.mu.Lock()
 	prev := s.dataplaneState[gwKey]
 	s.dataplaneState[gwKey] = gatewayDataplaneState{
@@ -628,9 +654,9 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 // data-plane state and reports it as a Gateway provisioning error.
 func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
 	s.mu.Lock()
-	dp := s.dataplaneState[gwKey]
-	dp.lastPublishError = err
-	s.dataplaneState[gwKey] = dp
+	dataplaneState := s.dataplaneState[gwKey]
+	dataplaneState.lastPublishError = err
+	s.dataplaneState[gwKey] = dataplaneState
 	s.mu.Unlock()
 	s.SetGatewayProvisioningError(gwKey, err.Error())
 }

@@ -4716,6 +4716,26 @@ func TestPublishDataplaneConfig(t *testing.T) {
 	})
 }
 
+func TestAddressProvider_WaitApplied(t *testing.T) {
+	p := &AddressProvider{}
+	ctx := t.Context()
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+
+	res, err := p.WaitApplied(ctx, gwKey, "rev-1")
+	if err != nil {
+		t.Fatalf("expected nil error from WaitApplied, got: %v", err)
+	}
+	if res.Applied != 0 {
+		t.Errorf("expected Applied=0, got %d", res.Applied)
+	}
+	if len(res.Rejections) != 0 {
+		t.Errorf("expected 0 rejections, got %d", len(res.Rejections))
+	}
+	if res.NotAnswered != 0 {
+		t.Errorf("expected NotAnswered=0, got %d", res.NotAnswered)
+	}
+}
+
 func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()

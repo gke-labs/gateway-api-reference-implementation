@@ -81,16 +81,43 @@ after a restart while the controller is down.
 
 ## 4. Acknowledgement
 
-The push reply carries the applied revision or the reason the apply failed:
+The push reply carries the applied revision or the reason the apply failed.
+The controller sends configuration to data planes without waiting and then gathers
+what each data plane did with it, waiting up to a limit:
+
+```go
+type DataplanePublisher interface {
+	// PublishDataplaneConfig sends the config and does not wait for data planes.
+	PublishDataplaneConfig(ctx context.Context, gateway *gatewayv1.Gateway, config *DataplaneConfig) error
+
+	// WaitApplied waits until every data plane known for the Gateway has
+	// answered for this revision, or until ctx ends, and reports what each did.
+	WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error)
+}
+```
 
 - **ACK and NACK framing.** The data plane replies with an ACK containing the
   applied revision, or a NACK containing the revision and the error reason.
 - **Replaces polling.** Push replies replace the controller's HTTP polling of
   data-plane `/applied` endpoints with immediate, push-driven telemetry.
-- **Programmed condition.** The controller sets `Programmed=True` when all active
-  data-plane replicas acknowledge the desired revision and their listeners accept
-  connections. A NACK or push timeout sets `Programmed=False` with reason
-  `SyncError` and surfaces the data plane's error message.
+- **PublishResult.** A `PublishResult` reports what data planes did with a configuration
+  revision for a Gateway: the count of data planes that applied it, each data plane
+  that rejected it and why, and the count of known data planes that have not answered.
+- **Caller timeout.** The caller bounds the wait through `ctx`. When `ctx` ends,
+  `WaitApplied` returns what it has gathered, counting remaining data planes as not
+  answered. That is a result, not an error. The error return indicates a failure of
+  the publisher itself.
+- **In-process publisher.** The in-process publisher applies configuration synchronously
+  during `PublishDataplaneConfig`. `WaitApplied` answers immediately with one data
+  plane, applied or rejected with the apply error.
+- **Secret publisher.** A Secret carries no reply. `WaitApplied` returns an empty
+  result indicating no data plane reports through `singlepod.AddressProvider`.
+  The planned removal of the Secret path removes this case.
+- **State tracking.** The state machine calls `WaitApplied` after each publish with a
+  limit held in a named constant (`dataplaneWaitAppliedLimit`). A rejection becomes the
+  Gateway's recorded publish error.
+- **Planned (not built).** The controller reports `Programmed=False` while any data
+  plane has not applied the current revision, and a late reply re-queues the Gateway.
 
 ## 5. Readiness
 
