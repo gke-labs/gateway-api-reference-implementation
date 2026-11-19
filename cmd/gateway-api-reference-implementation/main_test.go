@@ -405,4 +405,3 @@ func TestSetup_InternalAPIFlags(t *testing.T) {
 		t.Errorf("expected token file /path/to/token, got %q", opts.InternalAPITokenFile)
 	}
 }
-
