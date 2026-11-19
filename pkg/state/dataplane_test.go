@@ -16,6 +16,7 @@ package state
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -27,9 +28,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -1226,5 +1229,97 @@ func TestInProcessDataplanePublisher_WaitApplied_NeverPublishedRevision(t *testi
 	}
 	if resPublished.Applied != 1 || resPublished.NotAnswered != 0 || len(resPublished.Rejections) != 0 {
 		t.Errorf("expected Applied=1 on published revision, got: %+v", resPublished)
+	}
+}
+
+type fakePublisherForMulti struct {
+	publishErr  error
+	waitResult  PublishResult
+	waitErr     error
+	published   []*DataplaneConfig
+	waitGateway *gatewayv1.Gateway
+	waitRev     string
+}
+
+func (f *fakePublisherForMulti) PublishDataplaneConfig(ctx context.Context, gateway *gatewayv1.Gateway, config *DataplaneConfig) error {
+	f.published = append(f.published, config)
+	return f.publishErr
+}
+
+func (f *fakePublisherForMulti) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error) {
+	f.waitGateway = gateway
+	f.waitRev = revision
+	return f.waitResult, f.waitErr
+}
+
+func TestMultiDataplanePublisher(t *testing.T) {
+	ctx := t.Context()
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-1"},
+	}
+	cfg := &DataplaneConfig{Revision: "rev-1"}
+
+	// 1. Constructor edge cases
+	if res := NewMultiDataplanePublisher(); res != nil {
+		t.Errorf("expected nil for empty publishers, got %v", res)
+	}
+	if res := NewMultiDataplanePublisher(nil, nil); res != nil {
+		t.Errorf("expected nil for all nil publishers, got %v", res)
+	}
+
+	singlePub := &fakePublisherForMulti{}
+	if res := NewMultiDataplanePublisher(nil, singlePub, nil); res != DataplanePublisher(singlePub) {
+		t.Errorf("expected single publisher returned directly, got %v", res)
+	}
+
+	// 2. PublishDataplaneConfig broadcasts and joins errors
+	pub1 := &fakePublisherForMulti{publishErr: errors.New("err1")}
+	pub2 := &fakePublisherForMulti{publishErr: errors.New("err2")}
+	multi := NewMultiDataplanePublisher(pub1, pub2)
+
+	err := multi.PublishDataplaneConfig(ctx, gw, cfg)
+	if err == nil {
+		t.Fatal("expected joined error, got nil")
+	}
+	if !strings.Contains(err.Error(), "err1") || !strings.Contains(err.Error(), "err2") {
+		t.Errorf("expected joined error to contain both err1 and err2, got %q", err.Error())
+	}
+	if len(pub1.published) != 1 || len(pub2.published) != 1 {
+		t.Errorf("expected both publishers to receive config, got %d and %d", len(pub1.published), len(pub2.published))
+	}
+
+	// 3. WaitApplied aggregates results and joins errors
+	pub1.waitResult = PublishResult{
+		Applied:     2,
+		Rejections:  []DataPlaneRejection{{DataPlane: "dp1", Reason: "bad config"}},
+		NotAnswered: 1,
+	}
+	pub1.waitErr = errors.New("wait-err1")
+
+	pub2.waitResult = PublishResult{
+		Applied:     3,
+		Rejections:  []DataPlaneRejection{{DataPlane: "dp2", Reason: "crash"}},
+		NotAnswered: 2,
+	}
+	pub2.waitErr = errors.New("wait-err2")
+
+	res, err := multi.WaitApplied(ctx, gw, "rev-1")
+	if err == nil {
+		t.Fatal("expected joined wait error, got nil")
+	}
+	if !strings.Contains(err.Error(), "wait-err1") || !strings.Contains(err.Error(), "wait-err2") {
+		t.Errorf("expected joined error to contain wait-err1 and wait-err2, got %q", err.Error())
+	}
+	if res.Applied != 5 {
+		t.Errorf("expected Applied=5, got %d", res.Applied)
+	}
+	if res.NotAnswered != 3 {
+		t.Errorf("expected NotAnswered=3, got %d", res.NotAnswered)
+	}
+	if len(res.Rejections) != 2 {
+		t.Fatalf("expected 2 rejections, got %d", len(res.Rejections))
+	}
+	if res.Rejections[0].DataPlane != "dp1" || res.Rejections[1].DataPlane != "dp2" {
+		t.Errorf("unexpected rejections order: %+v", res.Rejections)
 	}
 }

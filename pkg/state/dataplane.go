@@ -135,7 +135,10 @@ type DataplanePublisher interface {
 type MultiDataplanePublisher []DataplanePublisher
 
 // NewMultiDataplanePublisher creates a DataplanePublisher that broadcasts to all non-nil publishers.
-// If one publisher fails, the others still receive the configuration and the state records the joined error.
+// If one publisher fails during PublishDataplaneConfig, the others still receive the configuration
+// and the state records the joined error. WaitApplied invokes WaitApplied on each publisher and
+// merges the results: Applied and NotAnswered counts are summed, Rejections are concatenated, and
+// errors are joined with errors.Join.
 func NewMultiDataplanePublisher(publishers ...DataplanePublisher) DataplanePublisher {
 	var nonNilPublishers []DataplanePublisher
 	for _, publisher := range publishers {
@@ -152,17 +155,6 @@ func NewMultiDataplanePublisher(publishers ...DataplanePublisher) DataplanePubli
 	return MultiDataplanePublisher(nonNilPublishers)
 }
 
-// Begin implements DataplanePublisher.
-func (multi MultiDataplanePublisher) Begin(ctx context.Context) error {
-	var errorsList []error
-	for _, publisher := range multi {
-		if err := publisher.Begin(ctx); err != nil {
-			errorsList = append(errorsList, err)
-		}
-	}
-	return errors.Join(errorsList...)
-}
-
 // PublishDataplaneConfig implements DataplanePublisher.
 func (multi MultiDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gateway *gatewayv1.Gateway, config *DataplaneConfig) error {
 	var errorsList []error
@@ -174,15 +166,22 @@ func (multi MultiDataplanePublisher) PublishDataplaneConfig(ctx context.Context,
 	return errors.Join(errorsList...)
 }
 
-// Commit implements DataplanePublisher.
-func (multi MultiDataplanePublisher) Commit(ctx context.Context) error {
+// WaitApplied implements DataplanePublisher. It invokes WaitApplied on each publisher and
+// merges the results: Applied and NotAnswered counts are summed, Rejections are concatenated,
+// and errors are joined with errors.Join.
+func (multi MultiDataplanePublisher) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error) {
+	var mergedResult PublishResult
 	var errorsList []error
 	for _, publisher := range multi {
-		if err := publisher.Commit(ctx); err != nil {
+		result, err := publisher.WaitApplied(ctx, gateway, revision)
+		if err != nil {
 			errorsList = append(errorsList, err)
 		}
+		mergedResult.Applied += result.Applied
+		mergedResult.Rejections = append(mergedResult.Rejections, result.Rejections...)
+		mergedResult.NotAnswered += result.NotAnswered
 	}
-	return errors.Join(errorsList...)
+	return mergedResult, errors.Join(errorsList...)
 }
 
 var _ DataplanePublisher = (MultiDataplanePublisher)(nil)

@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
@@ -795,6 +796,27 @@ func TestStreamConfig_ReceivesConfigAfterHelloAndOnStateChange(t *testing.T) {
 		t.Fatalf("expected GatewayName %v, got %v", gatewayKey, dataplaneConfig1.GatewayName)
 	}
 
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gatewayKey.Namespace, Name: gatewayKey.Name},
+	}
+
+	// Send Ack for initial config and verify WaitApplied returns applied
+	if err := stream.Send(&push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Ack{
+			Ack: &push.Ack{AppliedRevision: config1.Revision},
+		},
+	}); err != nil {
+		t.Fatalf("failed to send Ack: %v", err)
+	}
+
+	res1, err := server.WaitApplied(t.Context(), gateway, config1.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied failed: %v", err)
+	}
+	if res1.Applied != 1 || res1.NotAnswered != 0 || len(res1.Rejections) != 0 {
+		t.Fatalf("expected Applied=1, got %+v", res1)
+	}
+
 	// 2. Change state by updating gateway listener port
 	addTestGateway(stateEngine, gatewayKey, 8080)
 
@@ -812,6 +834,23 @@ func TestStreamConfig_ReceivesConfigAfterHelloAndOnStateChange(t *testing.T) {
 	}
 	if dataplaneConfig2.GatewayName != gatewayKey {
 		t.Fatalf("expected GatewayName %v, got %v", gatewayKey, dataplaneConfig2.GatewayName)
+	}
+
+	// Send Ack for second config and verify WaitApplied returns applied
+	if err := stream.Send(&push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Ack{
+			Ack: &push.Ack{AppliedRevision: config2.Revision},
+		},
+	}); err != nil {
+		t.Fatalf("failed to send Ack for second config: %v", err)
+	}
+
+	res2, err := server.WaitApplied(t.Context(), gateway, config2.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied failed for second config: %v", err)
+	}
+	if res2.Applied != 1 || res2.NotAnswered != 0 || len(res2.Rejections) != 0 {
+		t.Fatalf("expected Applied=1 for second config, got %+v", res2)
 	}
 
 	if err := stream.CloseSend(); err != nil {
@@ -954,11 +993,195 @@ func TestStreamConfig_TwoGatewaysTwoStreamsIsolation(t *testing.T) {
 		t.Fatalf("stream2 expected nothing when gw-1 updated, got %v, err=%v", config2Unexpected, err)
 	}
 
+	gateway1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gatewayKey1.Namespace, Name: gatewayKey1.Name},
+	}
+	gateway2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gatewayKey2.Namespace, Name: gatewayKey2.Name},
+	}
+
+	// Stream 1 acknowledges updated config for gw-1
+	if err := stream1.Send(&push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Ack{
+			Ack: &push.Ack{AppliedRevision: config1Updated.Revision},
+		},
+	}); err != nil {
+		t.Fatalf("stream1 failed to send Ack: %v", err)
+	}
+
+	// WaitApplied for gw-1 reports Applied=1
+	res1, err := server.WaitApplied(t.Context(), gateway1, config1Updated.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied gw-1 failed: %v", err)
+	}
+	if res1.Applied != 1 || res1.NotAnswered != 0 || len(res1.Rejections) != 0 {
+		t.Fatalf("expected gw-1 Applied=1, got: %+v", res1)
+	}
+
+	// WaitApplied for gw-2 querying gw-1's revision reports NotAnswered=1 (only gw-2's stream is checked, and it has not answered for that revision)
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer shortCancel()
+	res2ForGw1Rev, err := server.WaitApplied(shortCtx, gateway2, config1Updated.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied gw-2 unexpected error: %v", err)
+	}
+	if res2ForGw1Rev.NotAnswered != 1 || res2ForGw1Rev.Applied != 0 {
+		t.Fatalf("expected gw-2 NotAnswered=1 for gw-1 revision, got: %+v", res2ForGw1Rev)
+	}
+
 	if err := stream1.CloseSend(); err != nil {
 		t.Fatalf("stream1.CloseSend error: %v", err)
 	}
 	if err := stream2.CloseSend(); err != nil {
 		t.Fatalf("stream2.CloseSend error: %v", err)
+	}
+}
+
+func TestStreamConfig_NackRejectionWithReasonTruncatedUTF8(t *testing.T) {
+	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
+	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+
+	reviewer := &staticTokenReviewer{
+		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
+			if token == "valid-token" {
+				return gatewayKey.Namespace, expectedServiceAccount, nil
+			}
+			return "", "", errors.New("unauthorized")
+		},
+	}
+
+	server, err := push.NewServer(push.ServerOptions{
+		TokenReviewer: reviewer,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gatewayKey.Namespace, Name: gatewayKey.Name},
+	}
+	config := &state.DataplaneConfig{
+		GatewayName: gatewayKey,
+		Revision:    "rev-nack-test",
+		Listeners: []state.InternalListener{
+			{Name: "http", Port: 80, Protocol: "HTTP"},
+		},
+	}
+	if err := server.PublishDataplaneConfig(t.Context(), gateway, config); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed: %v", err)
+	}
+
+	client := startInProcessServer(t, server)
+	stream, reader := openTestStream(t, client, gatewayKey, "valid-token", "")
+
+	if _, err := reader.recv(2 * time.Second); err != nil {
+		t.Fatalf("failed to receive config: %v", err)
+	}
+
+	// Reason longer than MaxNACKReasonBytes (1024) where byte 1024 cuts across
+	// a multi-byte UTF-8 character (1023 'A's + "世界" which is multi-byte UTF-8).
+	// Truncation must drop the partial rune and yield valid UTF-8 of length <= 1024.
+	longReason := strings.Repeat("A", 1023) + "世界" + strings.Repeat("B", 1000)
+	if err := stream.Send(&push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Nack{
+			Nack: &push.Nack{
+				Revision: config.Revision,
+				Reason:   longReason,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("failed to send Nack: %v", err)
+	}
+
+	result, err := server.WaitApplied(t.Context(), gateway, config.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied failed: %v", err)
+	}
+	if result.Applied != 0 {
+		t.Errorf("expected Applied=0, got %d", result.Applied)
+	}
+	if len(result.Rejections) != 1 {
+		t.Fatalf("expected 1 rejection, got %d", len(result.Rejections))
+	}
+	if result.Rejections[0].DataPlane != expectedServiceAccount {
+		t.Errorf("expected DataPlane %q, got %q", expectedServiceAccount, result.Rejections[0].DataPlane)
+	}
+	if len(result.Rejections[0].Reason) > push.MaxNACKReasonBytes {
+		t.Errorf("expected reason length <= %d, got %d", push.MaxNACKReasonBytes, len(result.Rejections[0].Reason))
+	}
+	if !utf8.ValidString(result.Rejections[0].Reason) {
+		t.Errorf("expected valid UTF-8 string in rejection reason")
+	}
+	if result.Rejections[0].Reason != strings.Repeat("A", 1023) {
+		t.Errorf("expected reason to be truncated to 1023 'A's at UTF-8 boundary, got length %d", len(result.Rejections[0].Reason))
+	}
+
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("stream.CloseSend error: %v", err)
+	}
+}
+
+func TestStreamConfig_NeverReplies_WaitAppliedReturnsNotAnswered(t *testing.T) {
+	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
+	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+
+	reviewer := &staticTokenReviewer{
+		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
+			if token == "valid-token" {
+				return gatewayKey.Namespace, expectedServiceAccount, nil
+			}
+			return "", "", errors.New("unauthorized")
+		},
+	}
+
+	server, err := push.NewServer(push.ServerOptions{
+		TokenReviewer: reviewer,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gatewayKey.Namespace, Name: gatewayKey.Name},
+	}
+	config := &state.DataplaneConfig{
+		GatewayName: gatewayKey,
+		Revision:    "rev-never-reply",
+		Listeners: []state.InternalListener{
+			{Name: "http", Port: 80, Protocol: "HTTP"},
+		},
+	}
+	if err := server.PublishDataplaneConfig(t.Context(), gateway, config); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed: %v", err)
+	}
+
+	client := startInProcessServer(t, server)
+	stream, reader := openTestStream(t, client, gatewayKey, "valid-token", "")
+
+	if _, err := reader.recv(2 * time.Second); err != nil {
+		t.Fatalf("failed to receive config: %v", err)
+	}
+
+	// Data plane never sends Ack or Nack; verify WaitApplied returns when context ends
+	waitCtx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	result, err := server.WaitApplied(waitCtx, gateway, config.Revision)
+	if err != nil {
+		t.Fatalf("expected nil error when context deadline ends, got: %v", err)
+	}
+	if result.NotAnswered != 1 {
+		t.Errorf("expected NotAnswered=1, got %d", result.NotAnswered)
+	}
+	if result.Applied != 0 {
+		t.Errorf("expected Applied=0, got %d", result.Applied)
+	}
+	if len(result.Rejections) != 0 {
+		t.Errorf("expected 0 rejections, got %d", len(result.Rejections))
+	}
+
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("stream.CloseSend error: %v", err)
 	}
 }
 
@@ -1041,7 +1264,7 @@ func TestStreamConfig_ClosedStreamWhileMessagesArriveCleansUp(t *testing.T) {
 					GatewayName: gatewayKey,
 					Revision:    fmt.Sprintf("rev-%d", revisionCounter),
 				}
-				if err := server.PublishDataplaneConfig(context.Background(), gateway, config); err != nil {
+				if err := server.PublishDataplaneConfig(t.Context(), gateway, config); err != nil {
 					t.Errorf("PublishDataplaneConfig error: %v", err)
 				}
 				time.Sleep(2 * time.Millisecond)
@@ -1206,6 +1429,24 @@ func TestStreamConfig_OversizedConfigNotSentStreamStaysOpen(t *testing.T) {
 	cfg, err := reader.recv(100 * time.Millisecond)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected no config when oversized, got cfg=%v, err=%v", cfg, err)
+	}
+
+	// WaitApplied reports rejection for oversized config
+	res, err := server.WaitApplied(t.Context(), gateway, oversizedConfig.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied failed for oversized config: %v", err)
+	}
+	if res.Applied != 0 {
+		t.Errorf("expected Applied=0 for oversized config, got %d", res.Applied)
+	}
+	if len(res.Rejections) != 1 {
+		t.Fatalf("expected 1 rejection for oversized config, got %d", len(res.Rejections))
+	}
+	if !strings.Contains(res.Rejections[0].Reason, "MaxConfigMessageBytes") {
+		t.Errorf("expected rejection reason to mention MaxConfigMessageBytes, got %q", res.Rejections[0].Reason)
+	}
+	if res.Rejections[0].DataPlane != expectedServiceAccount {
+		t.Errorf("expected DataPlane %q, got %q", expectedServiceAccount, res.Rejections[0].DataPlane)
 	}
 
 	// Stream is still open; publish normal config and verify it is received
