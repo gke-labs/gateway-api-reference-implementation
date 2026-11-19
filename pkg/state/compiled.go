@@ -3582,6 +3582,15 @@ func ComputeDesiredBackendTLSPolicyStatus(
 
 	conflictingPolicy, isConflicted := resolution.Conflict(policyKey)
 
+	var missingPortMessages []string
+	if resolution != nil {
+		for _, targetResult := range resolution.TargetResultsForPolicy(policyKey) {
+			if targetResult.MissingPort() {
+				missingPortMessages = append(missingPortMessages, fmt.Sprintf("Service %s has no port %s", targetResult.TargetRef.Name, *targetResult.TargetRef.SectionName))
+			}
+		}
+	}
+
 	var unresolvedRefs []string
 	hasInvalidKind := false
 	hasInvalidCACertRef := false
@@ -3616,29 +3625,43 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	acceptedReason := string(gatewayv1.PolicyReasonAccepted)
 	acceptedMessage := "Policy accepted"
 
-	resolvedRefsStatus := metav1.ConditionTrue
-	resolvedRefsReason := string(gatewayv1.BackendTLSPolicyReasonResolvedRefs)
-	resolvedRefsMessage := "All references resolved"
-
 	if hasInvalidKind || hasInvalidCACertRef {
 		acceptedStatus = metav1.ConditionFalse
 		acceptedReason = string(gatewayv1.BackendTLSPolicyReasonNoValidCACertificate)
 		acceptedMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
-
-		resolvedRefsStatus = metav1.ConditionFalse
-		if hasInvalidKind {
-			resolvedRefsReason = string(gatewayv1.BackendTLSPolicyReasonInvalidKind)
-			resolvedRefsMessage = fmt.Sprintf("Unsupported or unknown CA certificate reference kind: %v", unresolvedRefs)
-		} else {
-			resolvedRefsReason = string(gatewayv1.BackendTLSPolicyReasonInvalidCACertificateRef)
-			resolvedRefsMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
-		}
 	}
 
 	if isConflicted {
 		acceptedStatus = metav1.ConditionFalse
 		acceptedReason = string(gatewayv1.PolicyReasonConflicted)
 		acceptedMessage = fmt.Sprintf("Conflicted with older policy: %s", conflictingPolicy)
+	}
+
+	var resolvedRefsProblems []string
+	var resolvedRefsFailureReason string
+	if hasInvalidKind {
+		resolvedRefsFailureReason = string(gatewayv1.BackendTLSPolicyReasonInvalidKind)
+		resolvedRefsProblems = append(resolvedRefsProblems, fmt.Sprintf("Unsupported or unknown CA certificate reference kind: %v", unresolvedRefs))
+	} else if hasInvalidCACertRef {
+		resolvedRefsFailureReason = string(gatewayv1.BackendTLSPolicyReasonInvalidCACertificateRef)
+		resolvedRefsProblems = append(resolvedRefsProblems, fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs))
+	}
+
+	if len(missingPortMessages) > 0 {
+		if resolvedRefsFailureReason == "" {
+			resolvedRefsFailureReason = string(gatewayv1.PolicyReasonTargetNotFound)
+		}
+		resolvedRefsProblems = append(resolvedRefsProblems, missingPortMessages...)
+	}
+
+	resolvedRefsStatus := metav1.ConditionTrue
+	resolvedRefsReason := string(gatewayv1.BackendTLSPolicyReasonResolvedRefs)
+	resolvedRefsMessage := "All references resolved"
+
+	if len(resolvedRefsProblems) > 0 {
+		resolvedRefsStatus = metav1.ConditionFalse
+		resolvedRefsReason = resolvedRefsFailureReason
+		resolvedRefsMessage = strings.Join(resolvedRefsProblems, ", ")
 	}
 
 	var ancestors []gatewayv1.PolicyAncestorStatus
