@@ -576,6 +576,11 @@ func resolveBackendTarget(
 		Name:      string(backendRef.Name),
 	}
 
+	// BackendTLSPolicy resolution variables
+	var tlsConfig *InternalTLSConfig
+	var backendErr *ErrorState
+	var selectedPolicy *gatewayv1.BackendTLSPolicy
+
 	var svc *corev1.Service
 	var appProtocol *string
 	if services != nil {
@@ -597,30 +602,18 @@ func resolveBackendTarget(
 			}
 		}
 
+		var portName string
 		for _, p := range svc.Spec.Ports {
 			if p.Port == port {
 				appProtocol = p.AppProtocol
+				portName = p.Name
 				if svc.Spec.ClusterIP == corev1.ClusterIPNone && p.TargetPort.IntValue() > 0 {
 					port = int32(p.TargetPort.IntValue())
 				}
 				break
 			}
 		}
-	}
 
-	// BackendTLSPolicy resolution
-	var tlsConfig *InternalTLSConfig
-	var backendErr *ErrorState
-
-	var selectedPolicy *gatewayv1.BackendTLSPolicy
-	if svc != nil {
-		var portName string
-		for _, p := range svc.Spec.Ports {
-			if p.Port == port {
-				portName = p.Name
-				break
-			}
-		}
 		if portName != "" {
 			for _, policy := range sortedTLSPolicies {
 				if policy.Namespace != svcNamespace {
