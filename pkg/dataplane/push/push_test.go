@@ -19,8 +19,10 @@ import (
 	"context"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"google.golang.org/grpc"
@@ -272,3 +274,30 @@ func TestStreamConfig_Exchange(t *testing.T) {
 		t.Fatalf("CloseSend failed: %v", err)
 	}
 }
+
+func TestTruncateNACKReason(t *testing.T) {
+	shortReason := "short error message"
+	if got := push.TruncateNACKReason(shortReason); got != shortReason {
+		t.Errorf("TruncateNACKReason(%q) = %q, want %q", shortReason, got, shortReason)
+	}
+
+	exactReason := strings.Repeat("a", push.MaxNACKReasonBytes)
+	if got := push.TruncateNACKReason(exactReason); got != exactReason {
+		t.Errorf("TruncateNACKReason(exact) length = %d, want %d", len(got), len(exactReason))
+	}
+
+	// 1023 'A's + "世界" (3 bytes each) + 1000 'B's
+	// Byte 1024 lands inside the first character '世', so it must be truncated to 1023 'A's.
+	boundaryReason := strings.Repeat("A", 1023) + "世界" + strings.Repeat("B", 1000)
+	got := push.TruncateNACKReason(boundaryReason)
+	if len(got) != 1023 {
+		t.Errorf("got length %d, want 1023", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("expected valid UTF-8 string, got invalid")
+	}
+	if got != strings.Repeat("A", 1023) {
+		t.Errorf("got unexpected truncated string: %q", got)
+	}
+}
+

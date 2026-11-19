@@ -16,6 +16,8 @@
 // push from the controller to data planes.
 package push
 
+import "unicode/utf8"
+
 const (
 	// MaxConfigMessageBytes is the maximum allowed size in bytes of a serialized
 	// DataplaneConfig payload (4 MiB). This comfortably exceeds the 1 MiB Kubernetes
@@ -29,3 +31,15 @@ const (
 	// condition messages.
 	MaxNACKReasonBytes = 1024
 )
+
+// TruncateNACKReason truncates reason to at most MaxNACKReasonBytes at a valid UTF-8 boundary.
+func TruncateNACKReason(reason string) string {
+	if len(reason) <= MaxNACKReasonBytes {
+		return reason
+	}
+	reason = reason[:MaxNACKReasonBytes]
+	for len(reason) > 0 && !utf8.ValidString(reason) {
+		reason = reason[:len(reason)-1]
+	}
+	return reason
+}
