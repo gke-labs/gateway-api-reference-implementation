@@ -37,59 +37,63 @@ import (
 )
 
 const (
-	// DefaultPushClientMinBackoff is the minimum backoff delay between push client reconnect attempts.
-	DefaultPushClientMinBackoff = 100 * time.Millisecond
+	// defaultInternalAPIClientMinBackoff is the minimum backoff delay between reconnect attempts.
+	defaultInternalAPIClientMinBackoff = 100 * time.Millisecond
 
-	// DefaultPushClientMaxBackoff is the maximum backoff delay between push client reconnect attempts.
-	DefaultPushClientMaxBackoff = 30 * time.Second
+	// defaultInternalAPIClientMaxBackoff is the maximum backoff delay between reconnect attempts.
+	defaultInternalAPIClientMaxBackoff = 30 * time.Second
+
+	// stableConnectionThreshold is the duration a connection must remain healthy
+	// before reconnect backoff is reset to the minimum backoff. This prevents
+	// flapping connections from repeatedly connecting without backoff.
+	stableConnectionThreshold = 2 * time.Second
 )
 
-// pushClient maintains a configuration push stream connection to the controller.
-type pushClient struct {
+// internalAPIClient connects to the controller's internal API Service over TLS
+// to receive configuration streams and acknowledge them.
+type internalAPIClient struct {
+	// server is the parent GARI server whose proxy configuration is updated.
 	server *Server
 
-	address   string
-	caFile    string
+	// address is the host and port of the controller's internal API Service.
+	address string
+
+	// caFile is the path to the trust bundle that verifies the controller's certificate.
+	caFile string
+
+	// tokenFile is the path to the projected ServiceAccount token for data-plane identity.
 	tokenFile string
 
+	// gatewayNamespace is the namespace of the Gateway this data plane serves.
 	gatewayNamespace string
-	gatewayName      string
 
+	// gatewayName is the name of the Gateway this data plane serves.
+	gatewayName string
+
+	// minBackoff is the initial backoff delay before reconnect attempts.
 	minBackoff time.Duration
+
+	// maxBackoff is the maximum backoff delay before reconnect attempts.
 	maxBackoff time.Duration
 
 	// mu guards appliedRevision.
 	mu sync.Mutex
-	// appliedRevision is the currently applied configuration revision, reported in Hello.
+
+	// appliedRevision is the configuration revision currently applied by the proxy.
 	appliedRevision string
 }
 
-func newPushClient(server *Server, opts Options) *pushClient {
-	minBackoff := opts.PushClientMinBackoff
-	if minBackoff <= 0 {
-		minBackoff = DefaultPushClientMinBackoff
-	}
-	maxBackoff := opts.PushClientMaxBackoff
-	if maxBackoff <= 0 {
-		maxBackoff = DefaultPushClientMaxBackoff
-	}
-	return &pushClient{
+func newInternalAPIClient(server *Server, options Options) *internalAPIClient {
+	return &internalAPIClient{
 		server:           server,
-		address:          opts.InternalAPIAddress,
-		caFile:           opts.InternalAPICAFile,
-		tokenFile:        opts.InternalAPITokenFile,
-		gatewayNamespace: opts.DataplaneGatewayNamespace,
-		gatewayName:      opts.DataplaneGatewayName,
-		minBackoff:       minBackoff,
-		maxBackoff:       maxBackoff,
+		address:          options.InternalAPIAddress,
+		caFile:           options.InternalAPICAFile,
+		tokenFile:        options.InternalAPITokenFile,
+		gatewayNamespace: options.DataplaneGatewayNamespace,
+		gatewayName:      options.DataplaneGatewayName,
+		minBackoff:       defaultInternalAPIClientMinBackoff,
+		maxBackoff:       defaultInternalAPIClientMaxBackoff,
 	}
-}
-
-// AppliedRevision returns the configuration revision currently applied by the data plane.
-func (c *pushClient) AppliedRevision() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.appliedRevision
 }
 
 func loadTLSConfig(caFile string, address string) (*tls.Config, error) {
@@ -102,21 +106,21 @@ func loadTLSConfig(caFile string, address string) (*tls.Config, error) {
 		return nil, fmt.Errorf("no valid certificates in CA bundle file %q", caFile)
 	}
 
-	host, _, err := net.SplitHostPort(address)
+	serverName, _, err := net.SplitHostPort(address)
 	if err != nil {
-		host = address
+		return nil, fmt.Errorf("parsing internal API address %q: %w", address, err)
 	}
 
 	return &tls.Config{
 		RootCAs:    certPool,
-		ServerName: host,
+		ServerName: serverName,
 		MinVersion: tls.VersionTLS12,
 	}, nil
 }
 
-func (c *pushClient) run(ctx context.Context) error {
+func (client *internalAPIClient) run(ctx context.Context) error {
 	logger := klog.FromContext(ctx)
-	backoff := c.minBackoff
+	backoff := client.minBackoff
 
 	for {
 		select {
@@ -127,7 +131,7 @@ func (c *pushClient) run(ctx context.Context) error {
 
 		connected := false
 		startTime := time.Now()
-		err := c.runStream(ctx, func() {
+		err := client.runStream(ctx, func() {
 			connected = true
 		})
 
@@ -135,9 +139,9 @@ func (c *pushClient) run(ctx context.Context) error {
 			return nil
 		}
 
-		logger.Error(err, "dataplane push stream disconnected, retrying",
-			"gatewayNamespace", c.gatewayNamespace,
-			"gatewayName", c.gatewayName,
+		logger.Error(err, "dataplane internal API stream disconnected, retrying",
+			"gatewayNamespace", client.gatewayNamespace,
+			"gatewayName", client.gatewayName,
 			"backoff", backoff,
 		)
 
@@ -147,33 +151,33 @@ func (c *pushClient) run(ctx context.Context) error {
 		case <-time.After(backoff):
 		}
 
-		if connected || time.Since(startTime) > 2*time.Second {
-			backoff = c.minBackoff
+		if connected || time.Since(startTime) > stableConnectionThreshold {
+			backoff = client.minBackoff
 		} else {
-			backoff = min(backoff*2, c.maxBackoff)
+			backoff = min(backoff*2, client.maxBackoff)
 		}
 	}
 }
 
-func (c *pushClient) runStream(ctx context.Context, onConnected func()) error {
+func (client *internalAPIClient) runStream(ctx context.Context, onConnected func()) error {
 	logger := klog.FromContext(ctx)
 
-	tokenBytes, err := os.ReadFile(c.tokenFile)
+	tokenBytes, err := os.ReadFile(client.tokenFile)
 	if err != nil {
-		return fmt.Errorf("reading token file %q: %w", c.tokenFile, err)
+		return fmt.Errorf("reading token file %q: %w", client.tokenFile, err)
 	}
 	token := strings.TrimSpace(string(tokenBytes))
 	if token == "" {
-		return fmt.Errorf("token file %q is empty", c.tokenFile)
+		return fmt.Errorf("token file %q is empty", client.tokenFile)
 	}
 
-	tlsConfig, err := loadTLSConfig(c.caFile, c.address)
+	tlsConfig, err := loadTLSConfig(client.caFile, client.address)
 	if err != nil {
 		return err
 	}
 
 	conn, err := grpc.NewClient(
-		c.address,
+		client.address,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(push.MaxMessageBytes),
@@ -181,31 +185,31 @@ func (c *pushClient) runStream(ctx context.Context, onConnected func()) error {
 		),
 	)
 	if err != nil {
-		return fmt.Errorf("creating gRPC client for %s: %w", c.address, err)
+		return fmt.Errorf("creating gRPC client for %s: %w", client.address, err)
 	}
 	defer func() {
 		if closeErr := conn.Close(); closeErr != nil {
-			logger.V(4).Info("failed to close gRPC client connection", "err", closeErr)
+			logger.Error(closeErr, "failed to close gRPC client connection")
 		}
 	}()
 
-	client := push.NewPushServiceClient(conn)
+	pushClient := push.NewPushServiceClient(conn)
 	streamCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
-	stream, err := client.StreamConfig(streamCtx)
+	stream, err := pushClient.StreamConfig(streamCtx)
 	if err != nil {
 		return fmt.Errorf("opening push stream: %w", err)
 	}
 
-	c.mu.Lock()
-	appliedRev := c.appliedRevision
-	c.mu.Unlock()
+	client.mu.Lock()
+	appliedRevision := client.appliedRevision
+	client.mu.Unlock()
 
 	hello := &push.DataplaneMessage{
 		Body: &push.DataplaneMessage_Hello{
 			Hello: &push.Hello{
-				GatewayNamespace: c.gatewayNamespace,
-				GatewayName:      c.gatewayName,
-				AppliedRevision:  appliedRev,
+				GatewayNamespace: client.gatewayNamespace,
+				GatewayName:      client.gatewayName,
+				AppliedRevision:  appliedRevision,
 			},
 		},
 	}
@@ -214,7 +218,7 @@ func (c *pushClient) runStream(ctx context.Context, onConnected func()) error {
 	}
 
 	for {
-		msg, err := stream.Recv()
+		message, err := stream.Recv()
 		if err != nil {
 			if errors.Is(err, io.EOF) || status.Code(err) == codes.Canceled || errors.Is(err, context.Canceled) {
 				return err
@@ -227,17 +231,17 @@ func (c *pushClient) runStream(ctx context.Context, onConnected func()) error {
 			onConnected = nil
 		}
 
-		cfg := msg.GetConfig()
-		if cfg == nil {
+		config := message.GetConfig()
+		if config == nil {
 			continue
 		}
 
-		revision := cfg.Revision
-		applyErr := c.server.applyDataplaneConfig(cfg.DataplaneConfig)
+		revision := config.Revision
+		applyErr := client.server.applyDataplaneConfig(config.DataplaneConfig)
 		if applyErr != nil {
 			logger.Error(applyErr, "failed to apply dataplane config",
-				"gatewayNamespace", c.gatewayNamespace,
-				"gatewayName", c.gatewayName,
+				"gatewayNamespace", client.gatewayNamespace,
+				"gatewayName", client.gatewayName,
 				"revision", revision,
 			)
 			nack := &push.DataplaneMessage{
@@ -252,9 +256,9 @@ func (c *pushClient) runStream(ctx context.Context, onConnected func()) error {
 				return fmt.Errorf("sending Nack: %w", sendErr)
 			}
 		} else {
-			c.mu.Lock()
-			c.appliedRevision = revision
-			c.mu.Unlock()
+			client.mu.Lock()
+			client.appliedRevision = revision
+			client.mu.Unlock()
 
 			ack := &push.DataplaneMessage{
 				Body: &push.DataplaneMessage_Ack{

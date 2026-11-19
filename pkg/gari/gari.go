@@ -56,7 +56,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -331,14 +330,6 @@ type Options struct {
 	// InternalAPITokenFile is the path to the projected ServiceAccount token for data-plane identity.
 	InternalAPITokenFile string
 
-	// PushClientMinBackoff is an optional minimum backoff delay between push client reconnect attempts.
-	// If 0, DefaultPushClientMinBackoff is used.
-	PushClientMinBackoff time.Duration
-
-	// PushClientMaxBackoff is an optional maximum backoff delay between push client reconnect attempts.
-	// If 0, DefaultPushClientMaxBackoff is used.
-	PushClientMaxBackoff time.Duration
-
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
 	// is created, allowing callers to register additional reconcilers or runnables before
 	// the manager starts. If non-nil, it is passed the manager and the GARI Server.
@@ -404,11 +395,11 @@ func (o *Options) complete() error {
 		o.DisableStatusUpdates = true
 		o.AddressProvider = nil
 	}
-	hasAddr := o.InternalAPIAddress != ""
-	hasCA := o.InternalAPICAFile != ""
-	hasToken := o.InternalAPITokenFile != ""
-	if hasAddr || hasCA || hasToken {
-		if !hasAddr || !hasCA || !hasToken {
+	hasAddress := o.InternalAPIAddress != ""
+	hasCAFile := o.InternalAPICAFile != ""
+	hasTokenFile := o.InternalAPITokenFile != ""
+	if hasAddress || hasCAFile || hasTokenFile {
+		if !hasAddress || !hasCAFile || !hasTokenFile {
 			return errors.New("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file are all required together")
 		}
 		if !o.DataplaneMode {
@@ -429,8 +420,10 @@ type Server struct {
 	state   *state.State
 	proxy   *proxy.Proxy
 
-	pushServer *push.Server
-	pushClient *pushClient
+	pushServer        *push.Server
+	internalAPIClient *internalAPIClient
+
+	healthProbeServer *http.Server
 
 	proxySynced atomic.Bool
 
@@ -582,6 +575,33 @@ func New(opts Options) (*Server, error) {
 		proxy: p,
 	}
 
+	if opts.DataplaneMode && opts.InternalAPIAddress != "" {
+		healthAddr := opts.HealthProbeBindAddress
+		if (healthAddr == "" || healthAddr == "0") && opts.MetricsAddr != "" && opts.MetricsAddr != "0" {
+			healthAddr = opts.MetricsAddr
+		}
+		if healthAddr != "" && healthAddr != "0" {
+			readyzHandler, healthzHandler := s.healthzHandlers()
+			appliedHandler := s.appliedHandler()
+			mux := http.NewServeMux()
+			mux.Handle("/healthz", http.StripPrefix("/healthz", healthzHandler))
+			mux.Handle("/healthz/", http.StripPrefix("/healthz", healthzHandler))
+			mux.Handle("/readyz", http.StripPrefix("/readyz", readyzHandler))
+			mux.Handle("/readyz/", http.StripPrefix("/readyz", readyzHandler))
+			mux.Handle("/_gari/readyz", http.StripPrefix("/_gari/readyz", readyzHandler))
+			mux.Handle("/_gari/readyz/", http.StripPrefix("/_gari/readyz", readyzHandler))
+			mux.Handle("/_gari/applied", appliedHandler)
+			mux.Handle("/_gari/applied/", appliedHandler)
+			s.healthProbeServer = &http.Server{
+				Addr:    healthAddr,
+				Handler: mux,
+			}
+		}
+
+		s.internalAPIClient = newInternalAPIClient(s, opts)
+		return s, nil
+	}
+
 	mgr := opts.Manager
 	if mgr == nil {
 		cfg := opts.RestConfig
@@ -589,11 +609,7 @@ func New(opts Options) (*Server, error) {
 			var err error
 			cfg, err = ctrl.GetConfig()
 			if err != nil {
-				if opts.DataplaneMode && opts.InternalAPIAddress != "" {
-					cfg = &rest.Config{Host: "http://127.0.0.1:0"}
-				} else {
-					return nil, fmt.Errorf("unable to get kubeconfig: %w", err)
-				}
+				return nil, fmt.Errorf("unable to get kubeconfig: %w", err)
 			}
 		}
 
@@ -624,10 +640,13 @@ func New(opts Options) (*Server, error) {
 
 		var err error
 		if opts.DataplaneMode {
-			var cacheOpts cache.Options
-			if opts.InternalAPIAddress == "" {
-				secretName := singlepod.ResourceNameForGateway(opts.DataplaneGatewayName)
-				cacheOpts = cache.Options{
+			secretName := singlepod.ResourceNameForGateway(opts.DataplaneGatewayName)
+			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
+				Scheme:                 opts.Scheme,
+				Metrics:                metricsOpts,
+				HealthProbeBindAddress: healthProbeBindAddress,
+				LeaderElection:         false,
+				Cache: cache.Options{
 					ByObject: map[client.Object]cache.ByObject{
 						&corev1.Secret{}: {
 							Namespaces: map[string]cache.Config{
@@ -637,14 +656,7 @@ func New(opts Options) (*Server, error) {
 							},
 						},
 					},
-				}
-			}
-			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
-				Scheme:                 opts.Scheme,
-				Metrics:                metricsOpts,
-				HealthProbeBindAddress: healthProbeBindAddress,
-				LeaderElection:         false,
-				Cache:                  cacheOpts,
+				},
 			})
 		} else {
 			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
@@ -702,10 +714,6 @@ func New(opts Options) (*Server, error) {
 			return nil, fmt.Errorf("creating push server: %w", err)
 		}
 		s.pushServer = pushServer
-	}
-
-	if opts.DataplaneMode && opts.InternalAPIAddress != "" {
-		s.pushClient = newPushClient(s, opts)
 	}
 
 	return s, nil
@@ -818,17 +826,12 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		}
 		secretName := singlepod.ResourceNameForGateway(s.opts.DataplaneGatewayName)
 		reconciler := &dataplaneSecretReconciler{
-			Client:           mgr.GetClient(),
-			proxy:            s.proxy,
-			proxySynced:      &s.proxySynced,
-			gatewayNamespace: s.opts.DataplaneGatewayNamespace,
-			secretName:       secretName,
-			onConfigUpdate:   s.updateListenerFilters,
-			onConfigApplied:  s.recordAppliedRevision,
+			Client:               mgr.GetClient(),
+			gatewayNamespace:     s.opts.DataplaneGatewayNamespace,
+			secretName:           secretName,
+			applyDataplaneConfig: s.applyDataplaneConfig,
 		}
-		skipNameValidation := true
 		if err := ctrl.NewControllerManagedBy(mgr).
-			WithOptions(crcontroller.Options{SkipNameValidation: &skipNameValidation}).
 			For(&corev1.Secret{}).
 			Complete(reconciler); err != nil {
 			return fmt.Errorf("failed to create dataplane secret controller: %w", err)
@@ -888,12 +891,9 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 
 type dataplaneSecretReconciler struct {
 	client.Client
-	proxy            *proxy.Proxy
-	proxySynced      *atomic.Bool
-	gatewayNamespace string
-	secretName       string
-	onConfigUpdate   func(opts proxyproto.ListenerOptions) error
-	onConfigApplied  func(gwKey string, revision string)
+	gatewayNamespace     string
+	secretName           string
+	applyDataplaneConfig func(data []byte) error
 }
 
 func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -914,29 +914,8 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	if err := state.ApplyDataplaneConfig(r.proxy, data); err != nil {
+	if err := r.applyDataplaneConfig(data); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to apply dataplane config: %w", err)
-	}
-	r.proxySynced.Store(true)
-
-	dpCfg, err := state.UnmarshalDataplaneConfig(data)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
-	}
-
-	if r.onConfigUpdate != nil {
-		opts := proxyproto.ListenerOptions{
-			AllowedSourceCIDRs:        dpCfg.AllowedSourceCIDRs,
-			ProxyProtocol:             dpCfg.ProxyProtocol,
-			ProxyProtocolTrustedCIDRs: dpCfg.ProxyProtocolTrustedCIDRs,
-		}
-		if err := r.onConfigUpdate(opts); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to update listener filters: %w", err)
-		}
-	}
-
-	if r.onConfigApplied != nil && dpCfg.Revision != "" {
-		r.onConfigApplied(dpCfg.GatewayName.String(), dpCfg.Revision)
 	}
 
 	return ctrl.Result{}, nil
@@ -1290,9 +1269,26 @@ func (s *Server) Start(ctx context.Context) error {
 		})
 	}
 
-	if s.pushClient != nil {
+	if s.internalAPIClient != nil {
 		g.Go(func() error {
-			return s.pushClient.run(ctx)
+			return s.internalAPIClient.run(ctx)
+		})
+	}
+
+	if s.healthProbeServer != nil {
+		g.Go(func() error {
+			go func() {
+				<-ctx.Done()
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer shutdownCancel()
+				if shutdownErr := s.healthProbeServer.Shutdown(shutdownCtx); shutdownErr != nil {
+					klog.Warningf("failed to shut down health probe server: %v", shutdownErr)
+				}
+			}()
+			if err := s.healthProbeServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("health probe server failed: %w", err)
+			}
+			return nil
 		})
 	}
 
