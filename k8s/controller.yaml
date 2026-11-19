@@ -168,7 +168,7 @@ spec:
   selector:
     app: gari-controller
   ports:
-  - name: push
+  - name: internal-api
     port: 8443
     targetPort: 8443
 ---
@@ -196,13 +196,13 @@ spec:
           value: ${IMAGE_PREFIX}/gari-controller
         args:
         - --dataplane-image=$(DATAPLANE_IMAGE)
-        - --push-bind-address=:8443
-        - --push-tls-cert-file=/etc/gari/svid/svid.pem
-        - --push-tls-key-file=/etc/gari/svid/svid_key.pem
+        - --internal-api-bind-address=:8443
+        - --internal-api-tls-cert-file=/etc/gari/svid/svid.pem
+        - --internal-api-tls-key-file=/etc/gari/svid/svid_key.pem
         ports:
         - name: metrics
           containerPort: 8999
-        - name: push
+        - name: internal-api
           containerPort: 8443
         readinessProbe:
           httpGet:

@@ -297,22 +297,22 @@ type Options struct {
 	// ACMEChallengeTokenPath is the path to the projected service-account token file for data-plane identity.
 	ACMEChallengeTokenPath string
 
-	// PushBindAddress is the address the configuration push stream gRPC server binds to.
-	// Defaults to "" (disabled). Ignored if PushListener is provided.
-	PushBindAddress string
+	// InternalAPIBindAddress is the address the internal API server binds to.
+	// Defaults to "" (disabled). Ignored if InternalAPIListener is provided.
+	InternalAPIBindAddress string
 
-	// PushTLSCertFile is the path to the TLS server certificate file for the push server.
-	PushTLSCertFile string
+	// InternalAPITLSCertFile is the path to the TLS server certificate file for the internal API server.
+	InternalAPITLSCertFile string
 
-	// PushTLSKeyFile is the path to the TLS server private key file for the push server.
-	PushTLSKeyFile string
+	// InternalAPITLSKeyFile is the path to the TLS server private key file for the internal API server.
+	InternalAPITLSKeyFile string
 
-	// PushTLSConfig is an optional custom TLS configuration for the push server.
-	PushTLSConfig *tls.Config
+	// InternalAPITLSConfig is an optional custom TLS configuration for the internal API server.
+	InternalAPITLSConfig *tls.Config
 
-	// PushListener is an optional custom net.Listener for the push server.
-	// If set, PushBindAddress is ignored.
-	PushListener net.Listener
+	// InternalAPIListener is an optional custom net.Listener for the internal API server.
+	// If set, InternalAPIBindAddress is ignored.
+	InternalAPIListener net.Listener
 
 	// PushTokenReviewer is an optional custom token reviewer for the push server.
 	// If nil and push is enabled, a KubeTokenReviewer is created targeting the
@@ -632,7 +632,7 @@ func New(opts Options) (*Server, error) {
 		}
 	}
 
-	if !opts.DataplaneMode && (opts.PushListener != nil || opts.PushBindAddress != "") {
+	if !opts.DataplaneMode && (opts.InternalAPIListener != nil || opts.InternalAPIBindAddress != "") {
 		tokenReviewer := opts.PushTokenReviewer
 		if tokenReviewer == nil {
 			cfg := opts.RestConfig
@@ -1150,12 +1150,12 @@ func (s *Server) StartPushServer(ctx context.Context) error {
 
 	var listener net.Listener
 
-	tlsConfig := s.opts.PushTLSConfig
+	tlsConfig := s.opts.InternalAPITLSConfig
 	if tlsConfig == nil {
-		if s.opts.PushTLSCertFile == "" || s.opts.PushTLSKeyFile == "" {
+		if s.opts.InternalAPITLSCertFile == "" || s.opts.InternalAPITLSKeyFile == "" {
 			return errors.New("TLS configuration required for push server; plaintext and self-signed certificates are not permitted")
 		}
-		cert, err := tls.LoadX509KeyPair(s.opts.PushTLSCertFile, s.opts.PushTLSKeyFile)
+		cert, err := tls.LoadX509KeyPair(s.opts.InternalAPITLSCertFile, s.opts.InternalAPITLSKeyFile)
 		if err != nil {
 			return fmt.Errorf("loading TLS key pair for push server: %w", err)
 		}
@@ -1166,19 +1166,19 @@ func (s *Server) StartPushServer(ctx context.Context) error {
 	}
 	grpcOptions := []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsConfig))}
 
-	if s.opts.PushListener != nil {
-		listener = s.opts.PushListener
-	} else if s.opts.PushBindAddress != "" {
+	if s.opts.InternalAPIListener != nil {
+		listener = s.opts.InternalAPIListener
+	} else if s.opts.InternalAPIBindAddress != "" {
 		var err error
-		listener, err = net.Listen("tcp", s.opts.PushBindAddress)
+		listener, err = net.Listen("tcp", s.opts.InternalAPIBindAddress)
 		if err != nil {
-			return fmt.Errorf("listening on push bind address %q: %w", s.opts.PushBindAddress, err)
+			return fmt.Errorf("listening on internal API bind address %q: %w", s.opts.InternalAPIBindAddress, err)
 		}
 	} else {
 		return nil
 	}
 
-	setupLog.Info("starting configuration push server", "addr", listener.Addr().String())
+	setupLog.Info("starting internal API listener", "addr", listener.Addr().String())
 	return s.pushServer.Serve(ctx, listener, grpcOptions...)
 }
 
@@ -1190,7 +1190,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return s.StartProxyServers(ctx)
 	})
 
-	if s.pushServer != nil && (s.opts.PushListener != nil || s.opts.PushBindAddress != "") {
+	if s.pushServer != nil && (s.opts.InternalAPIListener != nil || s.opts.InternalAPIBindAddress != "") {
 		g.Go(func() error {
 			return s.StartPushServer(ctx)
 		})
