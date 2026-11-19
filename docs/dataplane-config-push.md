@@ -150,8 +150,9 @@ serves and data planes connect and receive:
    accept data-plane connections, validate tokens, and stream configurations
    alongside Secret publishing.
 3. **Data-plane push client.** Add the push client to `pkg/gari` so data planes
-   dial the controller Service, receive configuration streams, and send ACKs,
-   while keeping Secret watching active as a fallback.
+   dial the controller Service, receive configuration streams, and send ACKs.
+   When the internal API flags are set, the data plane takes configuration from
+   the stream only and does not watch the Secret; when unset, it watches the Secret.
 4. **Switch status derivation.** Derive `Programmed` from direct push ACKs.
 5. **Remove Secret path.** Remove `PublishDataplaneConfig` Secret generation,
    delete `dataplaneSecretReconciler`, and drop data-plane Secret RBAC.
