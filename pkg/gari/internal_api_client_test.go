@@ -428,6 +428,11 @@ func TestInternalAPIClient_ConnectAndApply(t *testing.T) {
 	if respStill1.StatusCode != http.StatusOK || string(bodyStill1) != "backend response" {
 		t.Errorf("expected 200 OK 'backend response' after rejection, got %d %q", respStill1.StatusCode, string(bodyStill1))
 	}
+
+	cancel()
+	if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
+		t.Errorf("server.Start error: %v", startErr)
+	}
 }
 
 // TestInternalAPIClient_SecondConfigAfterChange tests:
@@ -539,8 +544,9 @@ func TestInternalAPIClient_SecondConfigAfterChange(t *testing.T) {
 	}
 	server.SetInternalAPIClientBackoffForTest(20*time.Millisecond, 100*time.Millisecond)
 
+	serverErr := make(chan error, 1)
 	go func() {
-		_ = server.Start(ctx)
+		serverErr <- server.Start(ctx)
 	}()
 
 	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
@@ -646,6 +652,11 @@ func TestInternalAPIClient_SecondConfigAfterChange(t *testing.T) {
 	}
 	if resp2.StatusCode != http.StatusOK || string(body2) != "backend2 response" {
 		t.Errorf("expected 200 OK 'backend2 response', got %d %q", resp2.StatusCode, string(body2))
+	}
+
+	cancel()
+	if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
+		t.Errorf("server.Start error: %v", startErr)
 	}
 }
 
@@ -784,8 +795,9 @@ func TestInternalAPIClient_ServerStoppedAndStartedAgain(t *testing.T) {
 	}
 	server.SetInternalAPIClientBackoffForTest(20*time.Millisecond, 100*time.Millisecond)
 
+	serverErr := make(chan error, 1)
 	go func() {
-		_ = server.Start(ctx)
+		serverErr <- server.Start(ctx)
 	}()
 
 	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
@@ -914,6 +926,11 @@ func TestInternalAPIClient_ServerStoppedAndStartedAgain(t *testing.T) {
 	if respAfter.StatusCode != http.StatusOK || string(bodyAfter) != "backend response" {
 		t.Errorf("expected 200 OK after reconnect, got %d %q", respAfter.StatusCode, string(bodyAfter))
 	}
+
+	cancel()
+	if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
+		t.Errorf("server.Start error: %v", startErr)
+	}
 }
 
 // TestInternalAPIClient_WrongTrustBundle tests:
@@ -983,8 +1000,9 @@ func TestInternalAPIClient_WrongTrustBundle(t *testing.T) {
 	}
 	server.SetInternalAPIClientBackoffForTest(20*time.Millisecond, 50*time.Millisecond)
 
+	serverErr := make(chan error, 1)
 	go func() {
-		_ = server.Start(ctx)
+		serverErr <- server.Start(ctx)
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -996,6 +1014,11 @@ func TestInternalAPIClient_WrongTrustBundle(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	if err := readyzCheck(req); err == nil {
 		t.Errorf("expected readyzChecker to return error, got nil")
+	}
+
+	cancel()
+	if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
+		t.Errorf("server.Start error: %v", startErr)
 	}
 }
 
@@ -1063,8 +1086,9 @@ func TestInternalAPIClient_RejectedToken(t *testing.T) {
 	}
 	server.SetInternalAPIClientBackoffForTest(20*time.Millisecond, 50*time.Millisecond)
 
+	serverErr := make(chan error, 1)
 	go func() {
-		_ = server.Start(ctx)
+		serverErr <- server.Start(ctx)
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -1076,6 +1100,11 @@ func TestInternalAPIClient_RejectedToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	if err := readyzCheck(req); err == nil {
 		t.Errorf("expected readyzChecker to return error, got nil")
+	}
+
+	cancel()
+	if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
+		t.Errorf("server.Start error: %v", startErr)
 	}
 }
 

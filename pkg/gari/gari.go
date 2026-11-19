@@ -576,24 +576,13 @@ func New(opts Options) (*Server, error) {
 	}
 
 	if opts.DataplaneMode && opts.InternalAPIAddress != "" {
-		healthAddr := opts.HealthProbeBindAddress
-		if (healthAddr == "" || healthAddr == "0") && opts.MetricsAddr != "" && opts.MetricsAddr != "0" {
-			healthAddr = opts.MetricsAddr
-		}
-		if healthAddr != "" && healthAddr != "0" {
-			readyzHandler, healthzHandler := s.healthzHandlers()
-			appliedHandler := s.appliedHandler()
+		if opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
 			mux := http.NewServeMux()
-			mux.Handle("/healthz", http.StripPrefix("/healthz", healthzHandler))
-			mux.Handle("/healthz/", http.StripPrefix("/healthz", healthzHandler))
-			mux.Handle("/readyz", http.StripPrefix("/readyz", readyzHandler))
-			mux.Handle("/readyz/", http.StripPrefix("/readyz", readyzHandler))
-			mux.Handle("/_gari/readyz", http.StripPrefix("/_gari/readyz", readyzHandler))
-			mux.Handle("/_gari/readyz/", http.StripPrefix("/_gari/readyz", readyzHandler))
-			mux.Handle("/_gari/applied", appliedHandler)
-			mux.Handle("/_gari/applied/", appliedHandler)
+			for path, handler := range s.healthEndpoints() {
+				mux.Handle(path, handler)
+			}
 			s.healthProbeServer = &http.Server{
-				Addr:    healthAddr,
+				Addr:    opts.HealthProbeBindAddress,
 				Handler: mux,
 			}
 		}
@@ -613,22 +602,11 @@ func New(opts Options) (*Server, error) {
 			}
 		}
 
-		readyzHandler, healthzHandler := s.healthzHandlers()
-		appliedHandler := s.appliedHandler()
 		metricsOpts := metricsserver.Options{
 			BindAddress: opts.MetricsAddr,
 		}
 		healthProbeBindAddress := opts.HealthProbeBindAddress
-		extraHandlers := map[string]http.Handler{
-			"/healthz":        http.StripPrefix("/healthz", healthzHandler),
-			"/healthz/":       http.StripPrefix("/healthz", healthzHandler),
-			"/readyz":         http.StripPrefix("/readyz", readyzHandler),
-			"/readyz/":        http.StripPrefix("/readyz", readyzHandler),
-			"/_gari/readyz":   http.StripPrefix("/_gari/readyz", readyzHandler),
-			"/_gari/readyz/":  http.StripPrefix("/_gari/readyz", readyzHandler),
-			"/_gari/applied":  appliedHandler,
-			"/_gari/applied/": appliedHandler,
-		}
+		extraHandlers := s.healthEndpoints()
 		if samePortOrAddr(opts.MetricsAddr, opts.HealthProbeBindAddress) && opts.MetricsAddr != "" && opts.MetricsAddr != "0" && opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
 			metricsOpts.ExtraHandlers = extraHandlers
 			healthProbeBindAddress = ""
@@ -808,6 +786,22 @@ func (s *Server) appliedHandler() http.Handler {
 			klog.Warningf("failed to write applied revisions response: %v", err)
 		}
 	})
+}
+
+// healthEndpoints returns the map of health, readiness, and revision handlers.
+func (s *Server) healthEndpoints() map[string]http.Handler {
+	readyzHandler, healthzHandler := s.healthzHandlers()
+	appliedHandler := s.appliedHandler()
+	return map[string]http.Handler{
+		"/healthz":        http.StripPrefix("/healthz", healthzHandler),
+		"/healthz/":       http.StripPrefix("/healthz", healthzHandler),
+		"/readyz":         http.StripPrefix("/readyz", readyzHandler),
+		"/readyz/":        http.StripPrefix("/readyz", readyzHandler),
+		"/_gari/readyz":   http.StripPrefix("/_gari/readyz", readyzHandler),
+		"/_gari/readyz/":  http.StripPrefix("/_gari/readyz", readyzHandler),
+		"/_gari/applied":  appliedHandler,
+		"/_gari/applied/": appliedHandler,
+	}
 }
 
 // SetupWithManager registers all GARI reconcilers with the given Manager.
@@ -1282,7 +1276,7 @@ func (s *Server) Start(ctx context.Context) error {
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer shutdownCancel()
 				if shutdownErr := s.healthProbeServer.Shutdown(shutdownCtx); shutdownErr != nil {
-					klog.Warningf("failed to shut down health probe server: %v", shutdownErr)
+					klog.FromContext(ctx).Error(shutdownErr, "failed to shut down health probe server")
 				}
 			}()
 			if err := s.healthProbeServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
