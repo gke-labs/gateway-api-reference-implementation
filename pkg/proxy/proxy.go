@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -2950,7 +2951,7 @@ func writeHTTPResponse(w http.ResponseWriter, r *http.Request, resp *http.Respon
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	if err := copyResponseBody(w, resp); err != nil {
 		if !isNormalClose(err) {
 			log.Log.Error(err, "Failed to copy response body")
 		}
@@ -2964,6 +2965,61 @@ func writeHTTPResponse(w http.ResponseWriter, r *http.Request, resp *http.Respon
 			w.Header().Add(http.TrailerPrefix+k, v)
 		}
 	}
+}
+
+// copyResponseBody copies the backend's response body to the client.
+//
+// A streamed response is flushed to the client as each piece arrives.
+// Without that, the HTTP server holds a response in its write buffer until
+// the buffer fills or the response ends, so Server-Sent Events and other
+// incremental responses reach the client late or, on a stream that stays
+// open, not at all.
+func copyResponseBody(w http.ResponseWriter, resp *http.Response) error {
+	if !isStreamingResponse(resp) {
+		_, err := io.Copy(w, resp.Body)
+		return err
+	}
+
+	responseController := http.NewResponseController(w)
+	flush := func() error {
+		if err := responseController.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		return nil
+	}
+	// Send the headers now: a client such as EventSource waits for them
+	// before it considers the stream open.
+	if err := flush(); err != nil {
+		return err
+	}
+	buffer := make([]byte, 32*1024)
+	for {
+		bytesRead, readErr := resp.Body.Read(buffer)
+		if bytesRead > 0 {
+			if _, err := w.Write(buffer[:bytesRead]); err != nil {
+				return err
+			}
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+}
+
+// isStreamingResponse reports whether the response should be flushed as it
+// arrives: Server-Sent Events, and any response whose length the backend
+// did not announce. This is the rule net/http/httputil.ReverseProxy uses.
+func isStreamingResponse(resp *http.Response) bool {
+	if mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type")); err == nil && mediaType == "text/event-stream" {
+		return true
+	}
+	return resp.ContentLength == -1
 }
 
 // abortFailedResponse aborts a response after headers have already been written.
