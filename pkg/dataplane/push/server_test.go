@@ -84,10 +84,12 @@ func startInProcessServer(t *testing.T, server *push.Server, options ...grpc.Ser
 	)
 	if err != nil {
 		cancel()
+		if serveErr := <-serverDone; serveErr != nil {
+			t.Errorf("server.Serve error: %v", serveErr)
+		}
 		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
 			t.Errorf("listener.Close error: %v", closeErr)
 		}
-		<-serverDone
 		t.Fatalf("failed to dial in-process server: %v", err)
 	}
 	t.Cleanup(func() {
@@ -95,11 +97,11 @@ func startInProcessServer(t *testing.T, server *push.Server, options ...grpc.Ser
 			t.Errorf("clientConn.Close error: %v", closeErr)
 		}
 		cancel()
+		if serveErr := <-serverDone; serveErr != nil {
+			t.Errorf("server.Serve error: %v", serveErr)
+		}
 		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
 			t.Errorf("listener.Close error: %v", closeErr)
-		}
-		if serveErr := <-serverDone; serveErr != nil && !errors.Is(serveErr, net.ErrClosed) {
-			t.Errorf("server.Serve error: %v", serveErr)
 		}
 	})
 
