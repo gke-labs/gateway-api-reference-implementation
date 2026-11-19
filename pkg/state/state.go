@@ -620,7 +620,7 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	waitCtx, cancel := context.WithTimeout(ctx, dataplaneWaitAppliedLimit)
 	defer cancel()
 
-	result, err := publisher.WaitApplied(waitCtx, gwKey, dpConfig.Revision)
+	result, err := publisher.WaitApplied(waitCtx, gw, dpConfig.Revision)
 	if err != nil {
 		klog.Errorf("failed waiting for dataplane config to be applied for %s (revision %s): %v", gwKey, dpConfig.Revision, err)
 		s.recordPublishError(gwKey, err)

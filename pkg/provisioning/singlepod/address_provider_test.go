@@ -4719,9 +4719,14 @@ func TestPublishDataplaneConfig(t *testing.T) {
 func TestAddressProvider_WaitApplied(t *testing.T) {
 	p := &AddressProvider{}
 	ctx := t.Context()
-	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "my-gw",
+		},
+	}
 
-	res, err := p.WaitApplied(ctx, gwKey, "rev-1")
+	res, err := p.WaitApplied(ctx, gw, "rev-1")
 	if err != nil {
 		t.Fatalf("expected nil error from WaitApplied, got: %v", err)
 	}

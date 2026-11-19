@@ -127,7 +127,7 @@ type DataplanePublisher interface {
 
 	// WaitApplied waits until every data plane known for the Gateway has
 	// answered for this revision, or until ctx ends, and reports what each did.
-	WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error)
+	WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error)
 }
 
 func tlsCertToData(cert *tls.Certificate) (CertificateData, error) {
@@ -538,14 +538,19 @@ func (p *InProcessDataplanePublisher) PublishDataplaneConfig(ctx context.Context
 // one data plane, applied or rejected with the apply error. If the recorded
 // revision differs from the one requested (or no revision was recorded for this Gateway),
 // the data plane has not answered for that revision.
-func (p *InProcessDataplanePublisher) WaitApplied(ctx context.Context, gateway types.NamespacedName, revision string) (PublishResult, error) {
+func (p *InProcessDataplanePublisher) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error) {
 	if p == nil {
 		return PublishResult{}, nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	status, ok := p.statuses[gateway]
+	var gwKey types.NamespacedName
+	if gateway != nil {
+		gwKey = types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
+	}
+
+	status, ok := p.statuses[gwKey]
 	if !ok || status.revision != revision {
 		return PublishResult{
 			NotAnswered: 1,
