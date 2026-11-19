@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -120,8 +121,6 @@ func newDataplaneQueue() workqueue.TypedRateLimitingInterface[types.NamespacedNa
 type gatewayDataplaneState struct {
 	// acceptedConfig is the last config that the Gateway's data plane accepted.
 	acceptedConfig []byte
-	// lastPublishResult is the most recent PublishResult returned by WaitApplied.
-	lastPublishResult PublishResult
 }
 
 // gatewayProvisioningErrors holds per-Gateway provisioning errors from different sources.
@@ -568,6 +567,22 @@ func (e *OwnershipConflictError) Error() string {
 	return e.Message
 }
 
+// RejectedError indicates that one or more data planes rejected the configuration.
+type RejectedError struct {
+	Rejections []DataPlaneRejection
+}
+
+func (e *RejectedError) Error() string {
+	if e == nil {
+		return ""
+	}
+	var reasons []string
+	for _, rejection := range e.Rejections {
+		reasons = append(reasons, fmt.Sprintf("%s: %s", rejection.DataPlane, rejection.Reason))
+	}
+	return strings.Join(reasons, "; ")
+}
+
 // reconcileDataplaneKey reconciles the desired data-plane configuration for a single Gateway.
 // The worker updates the cache only after the publisher accepts the config.
 // For the in-process publisher, this means one proxy update for each changed Gateway
@@ -658,29 +673,16 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	}
 
 	if len(result.Rejections) > 0 {
-		var rejectionErr error
-		if len(result.Rejections) == 1 {
-			rejectionErr = errors.New(result.Rejections[0].Reason)
-		} else {
-			var reasons []string
-			for _, r := range result.Rejections {
-				reasons = append(reasons, fmt.Sprintf("%s: %s", r.DataPlane, r.Reason))
-			}
-			rejectionErr = errors.New(strings.Join(reasons, "; "))
+		rejectionErr := &RejectedError{
+			Rejections: result.Rejections,
 		}
 		s.recordPublishError(gwKey, rejectionErr)
-		s.mu.Lock()
-		dp := s.dataplaneState[gwKey]
-		dp.lastPublishResult = result
-		s.dataplaneState[gwKey] = dp
-		s.mu.Unlock()
 		return rejectionErr
 	}
 
 	s.mu.Lock()
 	s.dataplaneState[gwKey] = gatewayDataplaneState{
-		acceptedConfig:    data,
-		lastPublishResult: result,
+		acceptedConfig: data,
 	}
 	s.clearPublishErrorLocked(gwKey)
 	s.mu.Unlock()
@@ -703,6 +705,26 @@ func (s *State) clearPublishErrorLocked(gwKey types.NamespacedName) {
 	}
 }
 
+// publishErrorsEqual reports whether two publish errors are equivalent.
+// If both errors wrap RejectedError, their rejections are compared rather than their error messages.
+// For other error types, the error messages are compared.
+func publishErrorsEqual(a, b error) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	var rejA, rejB *RejectedError
+	if errors.As(a, &rejA) && errors.As(b, &rejB) {
+		if rejA == nil || rejB == nil {
+			return rejA == rejB
+		}
+		return slices.Equal(rejA.Rejections, rejB.Rejections)
+	}
+	if errors.As(a, &rejA) || errors.As(b, &rejB) {
+		return false
+	}
+	return a.Error() == b.Error()
+}
+
 // recordPublishError records the error from a failed data-plane publish attempt on the Gateway's
 // provisioning errors.
 func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
@@ -714,7 +736,7 @@ func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
 	}
 
 	errs := s.provisioningErrors[gwKey]
-	if errs.publish != nil && errs.publish.Error() == err.Error() {
+	if publishErrorsEqual(errs.publish, err) {
 		return
 	}
 	errs.publish = err

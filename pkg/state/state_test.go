@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -787,9 +788,11 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 }
 
 type mockDataplanePublisher struct {
-	mu         sync.Mutex
-	publishErr error
-	published  map[types.NamespacedName]*DataplaneConfig
+	mu                sync.Mutex
+	publishErr        error
+	waitAppliedResult *PublishResult
+	waitAppliedErr    error
+	published         map[types.NamespacedName]*DataplaneConfig
 }
 
 func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
@@ -810,9 +813,19 @@ func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw 
 func (m *mockDataplanePublisher) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.waitAppliedResult != nil {
+		return *m.waitAppliedResult, m.waitAppliedErr
+	}
 	return PublishResult{
 		Applied: 1,
 	}, nil
+}
+
+func (m *mockDataplanePublisher) setWaitAppliedResult(result PublishResult, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.waitAppliedResult = &result
+	m.waitAppliedErr = err
 }
 
 func (m *mockDataplanePublisher) setPublishErr(err error) {
@@ -998,7 +1011,6 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 
 	st.mu.RLock()
 	errs := st.provisioningErrors[gwKey]
-	result := st.dataplaneState[gwKey].lastPublishResult
 	st.mu.RUnlock()
 
 	if errs.publish == nil {
@@ -1010,11 +1022,15 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	if msg := errs.message(); msg != err.Error() {
 		t.Errorf("expected provisioning error message %q, got %q", err.Error(), msg)
 	}
-	if len(result.Rejections) != 1 {
-		t.Fatalf("expected 1 rejection in result, got %d", len(result.Rejections))
+	var rejectedErr *RejectedError
+	if !errors.As(errs.publish, &rejectedErr) {
+		t.Fatalf("expected publish error to be *RejectedError, got %T: %v", errs.publish, errs.publish)
 	}
-	if result.Rejections[0].Reason != errs.publish.Error() {
-		t.Errorf("expected rejection reason %q to match recorded error %q", result.Rejections[0].Reason, errs.publish.Error())
+	if len(rejectedErr.Rejections) != 1 {
+		t.Fatalf("expected 1 rejection in recorded error, got %d", len(rejectedErr.Rejections))
+	}
+	if rejectedErr.Rejections[0].DataPlane != "in-process" {
+		t.Errorf("expected DataPlane %q, got %q", "in-process", rejectedErr.Rejections[0].DataPlane)
 	}
 
 	// When a valid config is subsequently reconciled, the recorded error is cleared.
@@ -1031,7 +1047,7 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 
 	st.mu.RLock()
 	clearedErrs := st.provisioningErrors[gwKey]
-	validPublishResult := st.dataplaneState[gwKey].lastPublishResult
+	dataplaneState := st.dataplaneState[gwKey]
 	st.mu.RUnlock()
 
 	if clearedErrs.publish != nil {
@@ -1040,11 +1056,274 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	if msg := clearedErrs.message(); msg != "" {
 		t.Errorf("expected provisioning error to be cleared, got %q", msg)
 	}
-	if validPublishResult.Applied != 1 {
-		t.Errorf("expected Applied=1 after valid config, got %d", validPublishResult.Applied)
+	if dataplaneState.acceptedConfig == nil {
+		t.Errorf("expected acceptedConfig to be saved in dataplane state")
 	}
-	if len(validPublishResult.Rejections) != 0 {
-		t.Errorf("expected 0 rejections after valid config, got %d", len(validPublishResult.Rejections))
+}
+
+func TestState_PublishDataplaneConfig_MultipleRejections_ErrorsAs(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	twoRejections := []DataPlaneRejection{
+		{DataPlane: "dp-east", Reason: "unsupported protocol"},
+		{DataPlane: "dp-west", Reason: "certificate expired"},
+	}
+	mockPub := &mockDataplanePublisher{}
+	mockPub.setWaitAppliedResult(PublishResult{
+		Rejections: twoRejections,
+	}, nil)
+	st.SetDataplanePublisher(mockPub)
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
+	}
+	st.UpsertGateway(gw)
+
+	cfg := &DataplaneConfig{
+		GatewayName: gwKey,
+		Revision:    "rev-1",
+	}
+	st.mu.Lock()
+	st.previousOutputs = &Outputs{
+		DataplaneConfigs: map[types.NamespacedName]*DataplaneConfig{
+			gwKey: cfg,
+		},
+		CompiledGateways: map[types.NamespacedName]*CompiledGateway{
+			gwKey: {Gateway: gw},
+		},
+	}
+	st.mu.Unlock()
+
+	ctx := t.Context()
+	err := st.reconcileDataplaneKey(ctx, gwKey)
+	if err == nil {
+		t.Fatalf("expected reconcileDataplaneKey to fail due to rejections")
+	}
+
+	expectedErrMsg := "dp-east: unsupported protocol; dp-west: certificate expired"
+	if err.Error() != expectedErrMsg {
+		t.Errorf("expected error message %q, got %q", expectedErrMsg, err.Error())
+	}
+
+	st.mu.RLock()
+	errs := st.provisioningErrors[gwKey]
+	st.mu.RUnlock()
+
+	if errs.publish == nil {
+		t.Fatalf("expected publish error to be recorded on gateway provisioning errors")
+	}
+
+	var rejectedErr *RejectedError
+	if !errors.As(errs.publish, &rejectedErr) {
+		t.Fatalf("expected errors.As to return *RejectedError, got %T: %v", errs.publish, errs.publish)
+	}
+	if len(rejectedErr.Rejections) != 2 {
+		t.Fatalf("expected 2 rejections, got %d", len(rejectedErr.Rejections))
+	}
+	if !slices.Equal(rejectedErr.Rejections, twoRejections) {
+		t.Errorf("expected rejections %+v, got %+v", twoRejections, rejectedErr.Rejections)
+	}
+	if msg := errs.message(); msg != expectedErrMsg {
+		t.Errorf("expected provisioning error message %q, got %q", expectedErrMsg, msg)
+	}
+}
+
+func TestState_PublishDataplaneConfig_Rejections_ChangeDetection(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	initialRejections := []DataPlaneRejection{
+		{DataPlane: "dp-1", Reason: "bad certificate"},
+		{DataPlane: "dp-2", Reason: "port conflict"},
+	}
+	mockPub := &mockDataplanePublisher{}
+	mockPub.setWaitAppliedResult(PublishResult{
+		Rejections: initialRejections,
+	}, nil)
+	st.SetDataplanePublisher(mockPub)
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
+	}
+	st.UpsertGateway(gw)
+
+	cfg := &DataplaneConfig{
+		GatewayName: gwKey,
+		Revision:    "rev-1",
+	}
+	st.mu.Lock()
+	st.previousOutputs = &Outputs{
+		DataplaneConfigs: map[types.NamespacedName]*DataplaneConfig{
+			gwKey: cfg,
+		},
+		CompiledGateways: map[types.NamespacedName]*CompiledGateway{
+			gwKey: {Gateway: gw},
+		},
+	}
+	st.mu.Unlock()
+
+	ctx := t.Context()
+	// 1. First publish encounters rejections.
+	if err := st.reconcileDataplaneKey(ctx, gwKey); err == nil {
+		t.Fatalf("expected reconcileDataplaneKey to fail")
+	}
+
+	st.mu.RLock()
+	revAfterFirstPublish := st.revision
+	st.dirty = false // Reset dirty flag to test if second publish sets dirty
+	st.mu.RUnlock()
+
+	// 2. Second publish with the exact same rejections shouldn't count as a change.
+	if err := st.reconcileDataplaneKey(ctx, gwKey); err == nil {
+		t.Fatalf("expected reconcileDataplaneKey to fail")
+	}
+
+	st.mu.RLock()
+	revAfterSecondPublish := st.revision
+	dirtyAfterSecondPublish := st.dirty
+	st.mu.RUnlock()
+
+	if revAfterSecondPublish != revAfterFirstPublish {
+		t.Errorf("expected revision not to change for same rejections, got %d -> %d", revAfterFirstPublish, revAfterSecondPublish)
+	}
+	if dirtyAfterSecondPublish {
+		t.Errorf("expected dirty flag not to be set when rejections have not changed")
+	}
+
+	// 3. Third publish with a different reason DOES count as a change.
+	changedRejections := []DataPlaneRejection{
+		{DataPlane: "dp-1", Reason: "bad certificate"},
+		{DataPlane: "dp-2", Reason: "different reason: connection refused"},
+	}
+	mockPub.setWaitAppliedResult(PublishResult{
+		Rejections: changedRejections,
+	}, nil)
+
+	if err := st.reconcileDataplaneKey(ctx, gwKey); err == nil {
+		t.Fatalf("expected reconcileDataplaneKey to fail")
+	}
+
+	st.mu.RLock()
+	revAfterThirdPublish := st.revision
+	dirtyAfterThirdPublish := st.dirty
+	errs := st.provisioningErrors[gwKey]
+	st.mu.RUnlock()
+
+	if revAfterThirdPublish == revAfterSecondPublish {
+		t.Errorf("expected revision to increment for different rejection reason, but stayed %d", revAfterThirdPublish)
+	}
+	if !dirtyAfterThirdPublish {
+		t.Errorf("expected dirty flag to be set when rejection reason changed")
+	}
+
+	var rejectedErr *RejectedError
+	if !errors.As(errs.publish, &rejectedErr) {
+		t.Fatalf("expected errors.As to return *RejectedError")
+	}
+	if !slices.Equal(rejectedErr.Rejections, changedRejections) {
+		t.Errorf("expected recorded rejections %+v, got %+v", changedRejections, rejectedErr.Rejections)
+	}
+}
+
+func TestPublishErrorsEqual(t *testing.T) {
+	rejsA := []DataPlaneRejection{
+		{DataPlane: "dp1", Reason: "reason1"},
+		{DataPlane: "dp2", Reason: "reason2"},
+	}
+	rejsB := []DataPlaneRejection{
+		{DataPlane: "dp1", Reason: "reason1"},
+		{DataPlane: "dp2", Reason: "reason2"},
+	}
+	rejsDiffReason := []DataPlaneRejection{
+		{DataPlane: "dp1", Reason: "reason1"},
+		{DataPlane: "dp2", Reason: "different reason"},
+	}
+	rejsDiffDP := []DataPlaneRejection{
+		{DataPlane: "dp1", Reason: "reason1"},
+		{DataPlane: "dp-other", Reason: "reason2"},
+	}
+	rejsFewer := []DataPlaneRejection{
+		{DataPlane: "dp1", Reason: "reason1"},
+	}
+
+	tests := []struct {
+		name string
+		a    error
+		b    error
+		want bool
+	}{
+		{
+			name: "both nil",
+			a:    nil,
+			b:    nil,
+			want: true,
+		},
+		{
+			name: "one nil",
+			a:    nil,
+			b:    errors.New("err"),
+			want: false,
+		},
+		{
+			name: "same RejectedError instances",
+			a:    &RejectedError{Rejections: rejsA},
+			b:    &RejectedError{Rejections: rejsA},
+			want: true,
+		},
+		{
+			name: "different RejectedError instances with same rejections",
+			a:    &RejectedError{Rejections: rejsA},
+			b:    &RejectedError{Rejections: rejsB},
+			want: true,
+		},
+		{
+			name: "RejectedError with different reason",
+			a:    &RejectedError{Rejections: rejsA},
+			b:    &RejectedError{Rejections: rejsDiffReason},
+			want: false,
+		},
+		{
+			name: "RejectedError with different dataplane",
+			a:    &RejectedError{Rejections: rejsA},
+			b:    &RejectedError{Rejections: rejsDiffDP},
+			want: false,
+		},
+		{
+			name: "RejectedError with different count",
+			a:    &RejectedError{Rejections: rejsA},
+			b:    &RejectedError{Rejections: rejsFewer},
+			want: false,
+		},
+		{
+			name: "RejectedError vs standard error",
+			a:    &RejectedError{Rejections: rejsA},
+			b:    errors.New("dp1: reason1; dp2: reason2"),
+			want: false,
+		},
+		{
+			name: "standard errors with same message",
+			a:    errors.New("timeout"),
+			b:    errors.New("timeout"),
+			want: true,
+		},
+		{
+			name: "standard errors with different message",
+			a:    errors.New("timeout"),
+			b:    errors.New("connection reset"),
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := publishErrorsEqual(tc.a, tc.b)
+			if got != tc.want {
+				t.Errorf("publishErrorsEqual(%v, %v) = %v; want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
 	}
 }
 
