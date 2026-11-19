@@ -300,4 +300,3 @@ func TestTruncateNACKReason(t *testing.T) {
 		t.Errorf("got unexpected truncated string: %q", got)
 	}
 }
-
