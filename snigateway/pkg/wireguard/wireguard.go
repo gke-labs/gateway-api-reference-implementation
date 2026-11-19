@@ -32,6 +32,15 @@ import (
 // Key is a 32-byte WireGuard key.
 type Key = wgtypes.Key
 
+const (
+	// ifaFNodad is the IFA_F_NODAD flag (0x02) from Linux <linux/if_addr.h>.
+	// It tells the kernel to skip duplicate address detection (DAD) on the address.
+	// WireGuard tunnels are point-to-point links where no other host can hold the address;
+	// disabling DAD prevents the address from entering the tentative state where immediate
+	// bind calls fail with EADDRNOTAVAIL ("bind: cannot assign requested address").
+	ifaFNodad = 0x02
+)
+
 var (
 	// ErrPermission indicates that the process lacks CAP_NET_ADMIN.
 	ErrPermission = errors.New("process lacks CAP_NET_ADMIN")
@@ -190,7 +199,10 @@ func OpenDevice(ctx context.Context, configuration Config) (device *Device, retu
 		return nil, fmt.Errorf("configuring wireguard device %q: %w", interfaceName, err)
 	}
 
-	address := &netlink.Addr{IPNet: &net.IPNet{IP: deviceAddress, Mask: configuration.TunnelPrefix.Mask}}
+	address := &netlink.Addr{
+		IPNet: &net.IPNet{IP: deviceAddress, Mask: configuration.TunnelPrefix.Mask},
+		Flags: ifaFNodad,
+	}
 	if err := netlink.AddrAdd(link, address); err != nil {
 		return nil, fmt.Errorf("assigning address %s to %q: %w", address.IPNet, interfaceName, err)
 	}

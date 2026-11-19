@@ -380,6 +380,65 @@ func openTestDevice(t *testing.T, worker *testNamespaceWorker, interfaceName str
 	return device, port
 }
 
+func TestOpenDevice_ListenImmediately(t *testing.T) {
+	worker, err := newTestNamespaceWorker(t)
+	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create network namespace")
+	t.Cleanup(func() {
+		if closeErr := worker.Close(); closeErr != nil {
+			t.Errorf("closing worker namespace: %v", closeErr)
+		}
+	})
+
+	privateKey, _, err := GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	_, prefix, err := net.ParseCIDR("fd00::/64")
+	if err != nil {
+		t.Fatalf("ParseCIDR failed: %v", err)
+	}
+	deviceAddress := net.ParseIP("fd00::1")
+
+	device, _ := openTestDevice(t, worker, "wg-nodad", privateKey, deviceAddress, prefix)
+	_ = device
+
+	if err := worker.Do(func() error {
+		link, err := netlink.LinkByName("wg-nodad")
+		if err != nil {
+			return fmt.Errorf("getting link: %w", err)
+		}
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+		if err != nil {
+			return fmt.Errorf("listing addresses: %w", err)
+		}
+		var targetAddr *netlink.Addr
+		for i := range addrs {
+			if addrs[i].IP.Equal(deviceAddress) {
+				targetAddr = &addrs[i]
+				break
+			}
+		}
+		if targetAddr == nil {
+			return fmt.Errorf("address %s not found on interface", deviceAddress)
+		}
+		if targetAddr.Flags&ifaFNodad == 0 {
+			return fmt.Errorf("address %s missing IFA_F_NODAD flag (flags: 0x%x)", deviceAddress, targetAddr.Flags)
+		}
+		const ifaFTentative = 0x40
+		if targetAddr.Flags&ifaFTentative != 0 {
+			return fmt.Errorf("address %s has IFA_F_TENTATIVE flag set (flags: 0x%x)", deviceAddress, targetAddr.Flags)
+		}
+
+		listener, err := net.Listen("tcp", net.JoinHostPort(deviceAddress.String(), "0"))
+		if err != nil {
+			return fmt.Errorf("listening immediately on tunnel address: %w", err)
+		}
+		return listener.Close()
+	}); err != nil {
+		t.Fatalf("immediate listen verification failed: %v", err)
+	}
+}
+
 func TestWireGuard_NamespaceCommunication(t *testing.T) {
 	worker1, err := newTestNamespaceWorker(t)
 	skipWithoutPrivilegeOrKernelSupport(t, err, "cannot create network namespace")
