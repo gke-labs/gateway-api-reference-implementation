@@ -22,7 +22,6 @@ import (
 	"io"
 	"net"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +33,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -154,10 +154,6 @@ type ServerOptions struct {
 	// MaxStreamsPerGateway is the maximum number of concurrent streams allowed for a single Gateway.
 	// If <= 0, DefaultMaxStreamsPerGateway is used.
 	MaxStreamsPerGateway int
-
-	// SendTimeout is the maximum duration allowed to push a configuration to a stream before the
-	// stream is closed. If <= 0, DefaultSendTimeout is used.
-	SendTimeout time.Duration
 }
 
 type gatewayConfig struct {
@@ -166,6 +162,17 @@ type gatewayConfig struct {
 
 	// data is the JSON-encoded DataplaneConfig payload pushed to data planes.
 	data []byte
+}
+
+type streamReply struct {
+	// revision is the configuration revision this reply applies to.
+	revision string
+
+	// accepted indicates whether the configuration was applied successfully.
+	accepted bool
+
+	// reason explains why the configuration was rejected or could not be applied.
+	reason string
 }
 
 type streamSubscriber struct {
@@ -177,19 +184,9 @@ type streamSubscriber struct {
 
 	// notifyChannel signals when a new configuration revision is available.
 	notifyChannel chan struct{}
-}
 
-// streamReply records the latest acknowledgment, negative acknowledgment, or server-detected error
-// for a data plane stream.
-type streamReply struct {
-	// revision is the configuration revision this reply applies to.
-	revision string
-
-	// accepted indicates whether the configuration was applied successfully.
-	accepted bool
-
-	// reason explains why the configuration was rejected or could not be applied.
-	reason string
+	// reply is the latest reply recorded for this stream.
+	reply streamReply
 }
 
 // Server implements PushServiceServer for configuration push.
@@ -205,11 +202,8 @@ type Server struct {
 	// sendTimeout is the maximum duration allowed to push a configuration to a stream.
 	sendTimeout time.Duration
 
-	// mu guards streams, subscribers, configs, replies, and replyChannel.
+	// mu guards subscribers, configs, rejections, and replyChannel.
 	mu sync.Mutex
-
-	// streams tracks the number of active streams grouped by Gateway namespace and name.
-	streams map[types.NamespacedName]int
 
 	// subscribers tracks active stream subscribers grouped by Gateway namespace and name.
 	subscribers map[types.NamespacedName]map[uint64]*streamSubscriber
@@ -217,8 +211,9 @@ type Server struct {
 	// configs holds the latest configuration for each Gateway namespace and name.
 	configs map[types.NamespacedName]*gatewayConfig
 
-	// replies holds the latest reply for each active stream grouped by Gateway namespace and name.
-	replies map[types.NamespacedName]map[uint64]streamReply
+	// rejections holds unhandled failures (such as a failed send or timeout) for each Gateway
+	// that outlive the stream until the next publish.
+	rejections map[types.NamespacedName][]state.DataPlaneRejection
 
 	// replyChannel signals when a stream reply arrives, a stream closes, or an error is recorded.
 	replyChannel chan struct{}
@@ -242,27 +237,40 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if maxStreams <= 0 {
 		maxStreams = DefaultMaxStreamsPerGateway
 	}
-	sendTimeout := options.SendTimeout
-	if sendTimeout <= 0 {
-		sendTimeout = DefaultSendTimeout
-	}
 	return &Server{
 		tokenReviewer:        options.TokenReviewer,
 		maxStreamsPerGateway: maxStreams,
-		sendTimeout:          sendTimeout,
-		streams:              make(map[types.NamespacedName]int),
+		sendTimeout:          DefaultSendTimeout,
 		subscribers:          make(map[types.NamespacedName]map[uint64]*streamSubscriber),
 		configs:              make(map[types.NamespacedName]*gatewayConfig),
-		replies:              make(map[types.NamespacedName]map[uint64]streamReply),
+		rejections:           make(map[types.NamespacedName][]state.DataPlaneRejection),
 		replyChannel:         make(chan struct{}),
 	}, nil
 }
 
 func (server *Server) notifyReplyLocked() {
-	if server.replyChannel != nil {
-		close(server.replyChannel)
-		server.replyChannel = make(chan struct{})
+	close(server.replyChannel)
+	server.replyChannel = make(chan struct{})
+}
+
+func (server *Server) recordReplyLocked(gatewayKey types.NamespacedName, subscriber *streamSubscriber, revision string, accepted bool, reason string) {
+	if server.subscribers[gatewayKey][subscriber.id] != subscriber {
+		return
 	}
+	subscriber.reply = streamReply{
+		revision: revision,
+		accepted: accepted,
+		reason:   reason,
+	}
+	server.notifyReplyLocked()
+}
+
+func (server *Server) recordFailureLocked(gatewayKey types.NamespacedName, dataPlane, reason string) {
+	server.rejections[gatewayKey] = append(server.rejections[gatewayKey], state.DataPlaneRejection{
+		DataPlane: dataPlane,
+		Reason:    reason,
+	})
+	server.notifyReplyLocked()
 }
 
 // PublishDataplaneConfig implements state.DataplanePublisher.
@@ -272,13 +280,15 @@ func (server *Server) PublishDataplaneConfig(ctx context.Context, gateway *gatew
 	}
 	gatewayKey := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
 
+	server.mu.Lock()
+	delete(server.rejections, gatewayKey)
 	if config == nil {
-		server.mu.Lock()
 		delete(server.configs, gatewayKey)
 		server.notifyReplyLocked()
 		server.mu.Unlock()
 		return nil
 	}
+	server.mu.Unlock()
 
 	if config.Revision == "" {
 		return fmt.Errorf("dataplane config for gateway %s has empty revision", gatewayKey)
@@ -290,9 +300,6 @@ func (server *Server) PublishDataplaneConfig(ctx context.Context, gateway *gatew
 	}
 
 	server.mu.Lock()
-	if server.configs == nil {
-		server.configs = make(map[types.NamespacedName]*gatewayConfig)
-	}
 	server.configs[gatewayKey] = &gatewayConfig{
 		revision: config.Revision,
 		data:     data,
@@ -315,8 +322,55 @@ func (server *Server) PublishDataplaneConfig(ctx context.Context, gateway *gatew
 	return nil
 }
 
-// WaitApplied implements state.DataplanePublisher. It returns when every open stream for
-// the Gateway has answered for the revision, or when ctx ends.
+func (server *Server) buildResultLocked(gatewayKey types.NamespacedName, revision string) (state.PublishResult, bool) {
+	subscribers := server.subscribers[gatewayKey]
+	rejections := slices.Clone(server.rejections[gatewayKey])
+
+	if len(subscribers) == 0 {
+		if len(rejections) == 0 {
+			return state.PublishResult{}, true
+		}
+		return state.PublishResult{Rejections: rejections}, true
+	}
+
+	var applied int
+	var notAnswered int
+	allAnswered := true
+
+	for _, subscriber := range subscribers {
+		if subscriber.reply.revision != revision {
+			allAnswered = false
+			notAnswered++
+			continue
+		}
+		if subscriber.reply.accepted {
+			applied++
+		} else {
+			rejections = append(rejections, state.DataPlaneRejection{
+				DataPlane: subscriber.dataPlane,
+				Reason:    subscriber.reply.reason,
+			})
+		}
+	}
+
+	if allAnswered {
+		return state.PublishResult{
+			Applied:    applied,
+			Rejections: rejections,
+		}, true
+	}
+
+	return state.PublishResult{
+		Applied:     applied,
+		Rejections:  rejections,
+		NotAnswered: notAnswered,
+	}, false
+}
+
+// WaitApplied implements state.DataplanePublisher. It returns when every open stream
+// for the Gateway has answered for the revision, or when ctx ends.
+// If a newer revision is published while a wait for an older revision is in progress,
+// the wait for the older revision cannot be answered and will return only when its context ends.
 func (server *Server) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (state.PublishResult, error) {
 	if gateway == nil {
 		return state.PublishResult{}, nil
@@ -325,85 +379,20 @@ func (server *Server) WaitApplied(ctx context.Context, gateway *gatewayv1.Gatewa
 
 	for {
 		server.mu.Lock()
-		subscribers := server.subscribers[gatewayKey]
-		if len(subscribers) == 0 {
-			server.mu.Unlock()
-			return state.PublishResult{}, nil
-		}
-
-		var applied int
-		var rejections []state.DataPlaneRejection
-		var notAnswered int
-		allAnswered := true
-
-		for streamID, subscriber := range subscribers {
-			reply, ok := server.replies[gatewayKey][streamID]
-			if !ok || reply.revision != revision {
-				allAnswered = false
-				notAnswered++
-				continue
-			}
-			if reply.accepted {
-				applied++
-			} else {
-				rejections = append(rejections, state.DataPlaneRejection{
-					DataPlane: subscriber.dataPlane,
-					Reason:    reply.reason,
-				})
-			}
-		}
-
+		result, allAnswered := server.buildResultLocked(gatewayKey, revision)
 		if allAnswered {
 			server.mu.Unlock()
-			sort.Slice(rejections, func(i, j int) bool {
-				if rejections[i].DataPlane != rejections[j].DataPlane {
-					return rejections[i].DataPlane < rejections[j].DataPlane
-				}
-				return rejections[i].Reason < rejections[j].Reason
-			})
-			return state.PublishResult{
-				Applied:    applied,
-				Rejections: rejections,
-			}, nil
+			return result, nil
 		}
-
 		replyChannel := server.replyChannel
 		server.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
 			server.mu.Lock()
-			subscribers = server.subscribers[gatewayKey]
-			applied = 0
-			rejections = nil
-			notAnswered = 0
-			for streamID, subscriber := range subscribers {
-				reply, ok := server.replies[gatewayKey][streamID]
-				if !ok || reply.revision != revision {
-					notAnswered++
-					continue
-				}
-				if reply.accepted {
-					applied++
-				} else {
-					rejections = append(rejections, state.DataPlaneRejection{
-						DataPlane: subscriber.dataPlane,
-						Reason:    reply.reason,
-					})
-				}
-			}
+			result, _ := server.buildResultLocked(gatewayKey, revision)
 			server.mu.Unlock()
-			sort.Slice(rejections, func(i, j int) bool {
-				if rejections[i].DataPlane != rejections[j].DataPlane {
-					return rejections[i].DataPlane < rejections[j].DataPlane
-				}
-				return rejections[i].Reason < rejections[j].Reason
-			})
-			return state.PublishResult{
-				Applied:     applied,
-				Rejections:  rejections,
-				NotAnswered: notAnswered,
-			}, nil
+			return result, nil
 		case <-replyChannel:
 		}
 	}
@@ -523,17 +512,28 @@ func (server *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMess
 	// 4. Stream limits and registration
 	gatewayKey := types.NamespacedName{Namespace: hello.GatewayNamespace, Name: hello.GatewayName}
 	server.mu.Lock()
-	if server.streams[gatewayKey] >= server.maxStreamsPerGateway {
+	if len(server.subscribers[gatewayKey]) >= server.maxStreamsPerGateway {
 		server.mu.Unlock()
 		return status.Errorf(codes.ResourceExhausted, "stream limit exceeded for gateway %s", gatewayKey)
 	}
-	server.streams[gatewayKey]++
+
 	streamID := server.nextStreamID
 	server.nextStreamID++
 
+	dataPlane := ""
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		dataPlane = p.Addr.String()
+		if dataPlane == "bufconn" || dataPlane == "bufnet" {
+			dataPlane = fmt.Sprintf("%s:%d", dataPlane, streamID)
+		}
+	}
+	if dataPlane == "" {
+		dataPlane = fmt.Sprintf("%s/%s#%d", callerNamespace, callerServiceAccount, streamID)
+	}
+
 	subscriber := &streamSubscriber{
 		id:            streamID,
-		dataPlane:     callerServiceAccount,
+		dataPlane:     dataPlane,
 		notifyChannel: make(chan struct{}, 1),
 	}
 	if server.subscribers[gatewayKey] == nil {
@@ -542,14 +542,7 @@ func (server *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMess
 	server.subscribers[gatewayKey][streamID] = subscriber
 
 	if hello.AppliedRevision != "" {
-		if server.replies[gatewayKey] == nil {
-			server.replies[gatewayKey] = make(map[uint64]streamReply)
-		}
-		server.replies[gatewayKey][streamID] = streamReply{
-			revision: hello.AppliedRevision,
-			accepted: true,
-			reason:   "",
-		}
+		server.recordReplyLocked(gatewayKey, subscriber, hello.AppliedRevision, true, "")
 	}
 	server.notifyReplyLocked()
 	server.mu.Unlock()
@@ -568,7 +561,7 @@ func (server *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMess
 
 	receiverErrChannel := make(chan error, 1)
 	go func() {
-		receiverErrChannel <- server.runReceiver(stream, gatewayKey, streamID)
+		receiverErrChannel <- server.runReceiver(stream, gatewayKey, subscriber)
 	}()
 
 	var returnErr error
@@ -584,20 +577,10 @@ func (server *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMess
 	senderWaitGroup.Wait()
 
 	server.mu.Lock()
-	server.streams[gatewayKey]--
-	if server.streams[gatewayKey] <= 0 {
-		delete(server.streams, gatewayKey)
-	}
 	if subscribers, ok := server.subscribers[gatewayKey]; ok {
-		delete(subscribers, streamID)
+		delete(subscribers, subscriber.id)
 		if len(subscribers) == 0 {
 			delete(server.subscribers, gatewayKey)
-		}
-	}
-	if replies, ok := server.replies[gatewayKey]; ok {
-		delete(replies, streamID)
-		if len(replies) == 0 {
-			delete(server.replies, gatewayKey)
 		}
 	}
 	server.notifyReplyLocked()
@@ -633,19 +616,8 @@ func (server *Server) runSender(
 				"maxSize", MaxConfigMessageBytes,
 			)
 			server.mu.Lock()
-			if subscribers, ok := server.subscribers[gatewayKey]; ok {
-				if _, exists := subscribers[subscriber.id]; exists {
-					if server.replies[gatewayKey] == nil {
-						server.replies[gatewayKey] = make(map[uint64]streamReply)
-					}
-					server.replies[gatewayKey][subscriber.id] = streamReply{
-						revision: latest.revision,
-						accepted: false,
-						reason:   fmt.Sprintf("config size %d exceeds MaxConfigMessageBytes %d", len(latest.data), MaxConfigMessageBytes),
-					}
-					server.notifyReplyLocked()
-				}
-			}
+			server.recordReplyLocked(gatewayKey, subscriber, latest.revision, false,
+				fmt.Sprintf("config size %d exceeds MaxConfigMessageBytes %d", len(latest.data), MaxConfigMessageBytes))
 			server.mu.Unlock()
 			lastSentRevision = latest.revision
 			return nil
@@ -675,6 +647,9 @@ func (server *Server) runSender(
 					"gateway", gatewayKey.String(),
 					"revision", latest.revision,
 				)
+				server.mu.Lock()
+				server.recordFailureLocked(gatewayKey, subscriber.dataPlane, "failed to send dataplane config: "+err.Error())
+				server.mu.Unlock()
 				return err
 			}
 			lastSentRevision = latest.revision
@@ -685,6 +660,9 @@ func (server *Server) runSender(
 				"revision", latest.revision,
 				"timeout", server.sendTimeout,
 			)
+			server.mu.Lock()
+			server.recordFailureLocked(gatewayKey, subscriber.dataPlane, fmt.Sprintf("stream send timed out after %v", server.sendTimeout))
+			server.mu.Unlock()
 			return status.Errorf(codes.DeadlineExceeded, "stream send timed out after %v", server.sendTimeout)
 		case <-ctx.Done():
 			return ctx.Err()
@@ -716,7 +694,7 @@ func (server *Server) runSender(
 func (server *Server) runReceiver(
 	stream grpc.BidiStreamingServer[DataplaneMessage, ControllerMessage],
 	gatewayKey types.NamespacedName,
-	streamID uint64,
+	subscriber *streamSubscriber,
 ) error {
 	for {
 		message, err := stream.Recv()
@@ -733,36 +711,12 @@ func (server *Server) runReceiver(
 
 		if ack := message.GetAck(); ack != nil {
 			server.mu.Lock()
-			if subscribers, ok := server.subscribers[gatewayKey]; ok {
-				if _, exists := subscribers[streamID]; exists {
-					if server.replies[gatewayKey] == nil {
-						server.replies[gatewayKey] = make(map[uint64]streamReply)
-					}
-					server.replies[gatewayKey][streamID] = streamReply{
-						revision: ack.AppliedRevision,
-						accepted: true,
-						reason:   "",
-					}
-					server.notifyReplyLocked()
-				}
-			}
+			server.recordReplyLocked(gatewayKey, subscriber, ack.AppliedRevision, true, "")
 			server.mu.Unlock()
 		} else if nack := message.GetNack(); nack != nil {
 			reason := truncateReason(nack.Reason)
 			server.mu.Lock()
-			if subscribers, ok := server.subscribers[gatewayKey]; ok {
-				if _, exists := subscribers[streamID]; exists {
-					if server.replies[gatewayKey] == nil {
-						server.replies[gatewayKey] = make(map[uint64]streamReply)
-					}
-					server.replies[gatewayKey][streamID] = streamReply{
-						revision: nack.Revision,
-						accepted: false,
-						reason:   reason,
-					}
-					server.notifyReplyLocked()
-				}
-			}
+			server.recordReplyLocked(gatewayKey, subscriber, nack.Revision, false, reason)
 			server.mu.Unlock()
 		}
 	}

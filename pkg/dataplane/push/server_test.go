@@ -1103,8 +1103,8 @@ func TestStreamConfig_NackRejectionWithReasonTruncatedUTF8(t *testing.T) {
 	if len(result.Rejections) != 1 {
 		t.Fatalf("expected 1 rejection, got %d", len(result.Rejections))
 	}
-	if result.Rejections[0].DataPlane != expectedServiceAccount {
-		t.Errorf("expected DataPlane %q, got %q", expectedServiceAccount, result.Rejections[0].DataPlane)
+	if result.Rejections[0].DataPlane == "" {
+		t.Errorf("expected non-empty DataPlane")
 	}
 	if len(result.Rejections[0].Reason) > push.MaxNACKReasonBytes {
 		t.Errorf("expected reason length <= %d, got %d", push.MaxNACKReasonBytes, len(result.Rejections[0].Reason))
@@ -1445,8 +1445,8 @@ func TestStreamConfig_OversizedConfigNotSentStreamStaysOpen(t *testing.T) {
 	if !strings.Contains(res.Rejections[0].Reason, "MaxConfigMessageBytes") {
 		t.Errorf("expected rejection reason to mention MaxConfigMessageBytes, got %q", res.Rejections[0].Reason)
 	}
-	if res.Rejections[0].DataPlane != expectedServiceAccount {
-		t.Errorf("expected DataPlane %q, got %q", expectedServiceAccount, res.Rejections[0].DataPlane)
+	if res.Rejections[0].DataPlane == "" {
+		t.Errorf("expected non-empty DataPlane")
 	}
 
 	// Stream is still open; publish normal config and verify it is received
@@ -1630,11 +1630,11 @@ func TestStreamConfig_SlowReaderClosedAfterTimeout(t *testing.T) {
 
 	server, err := push.NewServer(push.ServerOptions{
 		TokenReviewer: reviewer,
-		SendTimeout:   50 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
 	}
+	server.SetSendTimeoutForTest(50 * time.Millisecond)
 
 	gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: gatewayKey.Namespace, Name: gatewayKey.Name}}
 	config := &state.DataplaneConfig{GatewayName: gatewayKey, Revision: "rev-1"}
@@ -1663,7 +1663,7 @@ func TestStreamConfig_SlowReaderClosedAfterTimeout(t *testing.T) {
 	}
 
 	// Server attempts to push config, but slowSendInterceptor delays SendMsg by 200ms,
-	// exceeding SendTimeout of 50ms, causing the stream to close with DeadlineExceeded.
+	// exceeding sendTimeout of 50ms, causing the stream to close with DeadlineExceeded.
 	_, recvErr := stream.Recv()
 	if recvErr == nil {
 		t.Fatal("expected error due to slow reader closure, got nil")
@@ -1671,5 +1671,200 @@ func TestStreamConfig_SlowReaderClosedAfterTimeout(t *testing.T) {
 	rpcStatus, ok := status.FromError(recvErr)
 	if !ok || rpcStatus.Code() != codes.DeadlineExceeded {
 		t.Fatalf("expected codes.DeadlineExceeded, got: %v", recvErr)
+	}
+
+	// WaitApplied reports the timeout failure as a rejection that outlives the closed stream
+	result, err := server.WaitApplied(t.Context(), gateway, config.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied failed: %v", err)
+	}
+	if len(result.Rejections) != 1 {
+		t.Fatalf("expected 1 rejection for timed out stream, got: %+v", result)
+	}
+	if !strings.Contains(result.Rejections[0].Reason, "timed out") {
+		t.Errorf("expected rejection reason to mention timeout, got %q", result.Rejections[0].Reason)
+	}
+	if result.Rejections[0].DataPlane == "" {
+		t.Errorf("expected non-empty DataPlane")
+	}
+}
+
+type failSendStreamWrapper struct {
+	grpc.ServerStream
+}
+
+func (wrapper *failSendStreamWrapper) SendMsg(message any) error {
+	if _, ok := message.(*push.ControllerMessage); ok {
+		return errors.New("simulated network send error")
+	}
+	return wrapper.ServerStream.SendMsg(message)
+}
+
+func failSendInterceptor() grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		return handler(srv, &failSendStreamWrapper{ServerStream: ss})
+	}
+}
+
+func TestStreamConfig_FailedSendPersistsAsRejectionUntilNextPublish(t *testing.T) {
+	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
+	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+
+	reviewer := &staticTokenReviewer{
+		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
+			return gatewayKey.Namespace, expectedServiceAccount, nil
+		},
+	}
+
+	server, err := push.NewServer(push.ServerOptions{
+		TokenReviewer: reviewer,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: gatewayKey.Namespace, Name: gatewayKey.Name}}
+	config1 := &state.DataplaneConfig{GatewayName: gatewayKey, Revision: "rev-1"}
+	if err := server.PublishDataplaneConfig(t.Context(), gateway, config1); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed: %v", err)
+	}
+
+	client := startInProcessServer(t, server, grpc.StreamInterceptor(failSendInterceptor()))
+
+	outgoingContext := metadata.NewOutgoingContext(t.Context(), metadata.Pairs("authorization", "Bearer valid-token"))
+	stream, err := client.StreamConfig(outgoingContext)
+	if err != nil {
+		t.Fatalf("StreamConfig failed: %v", err)
+	}
+
+	if err := stream.Send(&push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Hello{
+			Hello: &push.Hello{
+				GatewayNamespace: gatewayKey.Namespace,
+				GatewayName:      gatewayKey.Name,
+				AppliedRevision:  "",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Send Hello failed: %v", err)
+	}
+
+	// Server tries to send config1, but failSendInterceptor fails it.
+	// The stream receives an error and terminates.
+	_, recvErr := stream.Recv()
+	if recvErr == nil {
+		t.Fatal("expected receive error from failed send, got nil")
+	}
+
+	// WaitApplied reports the failed send as a rejection for rev-1 that outlives the stream
+	res1, err := server.WaitApplied(t.Context(), gateway, config1.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied failed: %v", err)
+	}
+	if len(res1.Rejections) != 1 {
+		t.Fatalf("expected 1 rejection for failed send, got: %+v", res1)
+	}
+	if !strings.Contains(res1.Rejections[0].Reason, "failed to send dataplane config") {
+		t.Errorf("expected reason to mention failed to send, got %q", res1.Rejections[0].Reason)
+	}
+	if res1.Rejections[0].DataPlane == "" {
+		t.Errorf("expected non-empty DataPlane")
+	}
+
+	// Next publish for this Gateway clears the persistent failure
+	config2 := &state.DataplaneConfig{GatewayName: gatewayKey, Revision: "rev-2"}
+	if err := server.PublishDataplaneConfig(t.Context(), gateway, config2); err != nil {
+		t.Fatalf("PublishDataplaneConfig config2 failed: %v", err)
+	}
+
+	// Since the stream closed and the failure was cleared, WaitApplied for rev-2 reports no data plane
+	res2, err := server.WaitApplied(t.Context(), gateway, config2.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied config2 failed: %v", err)
+	}
+	if res2.Applied != 0 || len(res2.Rejections) != 0 || res2.NotAnswered != 0 {
+		t.Fatalf("expected all zeros after failure cleared, got: %+v", res2)
+	}
+}
+
+func TestStreamConfig_TwoStreamsRejectionsHaveDistinctDataPlanes(t *testing.T) {
+	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
+	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+
+	reviewer := &staticTokenReviewer{
+		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
+			return gatewayKey.Namespace, expectedServiceAccount, nil
+		},
+	}
+
+	server, err := push.NewServer(push.ServerOptions{
+		TokenReviewer:        reviewer,
+		MaxStreamsPerGateway: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: gatewayKey.Namespace, Name: gatewayKey.Name}}
+	config := &state.DataplaneConfig{
+		GatewayName: gatewayKey,
+		Revision:    "rev-two-streams",
+		Listeners: []state.InternalListener{
+			{Name: "http", Port: 80, Protocol: "HTTP"},
+		},
+	}
+	if err := server.PublishDataplaneConfig(t.Context(), gateway, config); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed: %v", err)
+	}
+
+	client := startInProcessServer(t, server)
+	stream1, reader1 := openTestStream(t, client, gatewayKey, "valid-token", "")
+	stream2, reader2 := openTestStream(t, client, gatewayKey, "valid-token", "")
+
+	if _, err := reader1.recv(2 * time.Second); err != nil {
+		t.Fatalf("stream1 failed to receive config: %v", err)
+	}
+	if _, err := reader2.recv(2 * time.Second); err != nil {
+		t.Fatalf("stream2 failed to receive config: %v", err)
+	}
+
+	if err := stream1.Send(&push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Nack{
+			Nack: &push.Nack{
+				Revision: config.Revision,
+				Reason:   "failure from stream 1",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("stream1 failed to send Nack: %v", err)
+	}
+
+	if err := stream2.Send(&push.DataplaneMessage{
+		Body: &push.DataplaneMessage_Nack{
+			Nack: &push.Nack{
+				Revision: config.Revision,
+				Reason:   "failure from stream 2",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("stream2 failed to send Nack: %v", err)
+	}
+
+	result, err := server.WaitApplied(t.Context(), gateway, config.Revision)
+	if err != nil {
+		t.Fatalf("WaitApplied failed: %v", err)
+	}
+	if len(result.Rejections) != 2 {
+		t.Fatalf("expected 2 rejections, got: %+v", result.Rejections)
+	}
+	if result.Rejections[0].DataPlane == result.Rejections[1].DataPlane {
+		t.Errorf("expected distinct DataPlane identifiers for different streams, got both %q", result.Rejections[0].DataPlane)
+	}
+
+	if err := stream1.CloseSend(); err != nil {
+		t.Fatalf("stream1.CloseSend error: %v", err)
+	}
+	if err := stream2.CloseSend(); err != nil {
+		t.Fatalf("stream2.CloseSend error: %v", err)
 	}
 }
