@@ -2416,7 +2416,7 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		if _, err := io.Copy(w, resp.Body); err != nil {
+		if err := copyResponseBody(w, r, resp); err != nil {
 			if !isNormalClose(err) {
 				log.Log.Error(err, "Failed to copy websocket response body")
 			}

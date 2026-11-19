@@ -264,3 +264,81 @@ func TestProxyStreamWhenFlushingNotSupported(t *testing.T) {
 		t.Errorf("second response logged contentType = %v, want %q", got, "text/event-stream")
 	}
 }
+
+// TestProxyStreamsServerSentEvents_UpgradeRequest checks that an upgrade
+// request whose backend answers with a streamed response flushes events to
+// the client while the response is still open.
+func TestProxyStreamsServerSentEvents_UpgradeRequest(t *testing.T) {
+	release := make(chan struct{})
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("data: first\n\n")); err != nil {
+			t.Errorf("failed to write backend event: %v", err)
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-release:
+		case <-req.Context().Done():
+		}
+	}))
+	t.Cleanup(backendServer.Close)
+
+	backendURL, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend server url: %v", err)
+	}
+	port, err := strconv.Atoi(backendURL.Port())
+	if err != nil {
+		t.Fatalf("failed to parse backend server port: %v", err)
+	}
+
+	proxyHandler := NewProxy()
+	proxyHandler.UpdateRoutes([]state.InternalRoute{{
+		Rules: []state.InternalRule{{
+			Backends: []state.InternalBackend{{Host: backendURL.Hostname(), Port: int32(port), Weight: 1}},
+		}},
+	}})
+	proxyServer := httptest.NewServer(proxyHandler)
+	t.Cleanup(proxyServer.Close)
+	t.Cleanup(func() { close(release) })
+
+	type readResult struct {
+		line string
+		err  error
+	}
+	got := make(chan readResult, 1)
+	go func() {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, proxyServer.URL+"/events", nil)
+		if err != nil {
+			got <- readResult{err: err}
+			return
+		}
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "websocket")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			got <- readResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		line, err := bufio.NewReader(resp.Body).ReadString('\n')
+		got <- readResult{line: line, err: err}
+	}()
+
+	select {
+	case result := <-got:
+		if result.err != nil {
+			t.Fatalf("reading the first event: %v", result.err)
+		}
+		if result.line != "data: first\n" {
+			t.Errorf("first line = %q, want %q", result.line, "data: first\n")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the event did not reach the client while the response was open")
+	}
+}
