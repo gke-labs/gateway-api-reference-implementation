@@ -133,11 +133,6 @@ type gatewayProvisioningErrors struct {
 	publish error
 }
 
-// empty reports whether all provisioning error sources are clear.
-func (e gatewayProvisioningErrors) empty() bool {
-	return e.addressProvider == nil && e.publish == nil
-}
-
 // message returns the error message for the Gateway's Programmed condition.
 // The address provider's error is shown first, then the publish error.
 func (e gatewayProvisioningErrors) message() string {
@@ -185,7 +180,13 @@ type State struct {
 
 	dataplanePublisher DataplanePublisher
 	dataplaneQueue     workqueue.TypedRateLimitingInterface[types.NamespacedName]
-	dataplaneState     map[types.NamespacedName]gatewayDataplaneState // holds the data-plane state for each Gateway; guarded by mu
+	// dataplaneState holds the data-plane state for each Gateway; guarded by mu.
+	// It remains a map on State rather than a field on GatewayState because it must
+	// outlive Gateway deletion: when a Gateway is deleted from State, the background
+	// worker needs the acceptedConfig to publish deletion to data planes and handle retries.
+	// In contrast, addresses, readiness, and provisioningErrors live on GatewayState,
+	// and UpsertGateway carries those three fields over on a spec update.
+	dataplaneState map[types.NamespacedName]gatewayDataplaneState
 
 	previousOutputs *Outputs
 
