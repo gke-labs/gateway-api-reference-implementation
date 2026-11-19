@@ -806,6 +806,19 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
+	// Build the combined DataplanePublisher for the controller. In singlepod mode,
+	// AddressProvider writes configurations to per-Gateway Secrets. When the push
+	// server is enabled, configurations are also pushed directly to data planes over
+	// gRPC streams. NewMultiDataplanePublisher multiplexes to both publishers so that
+	// both paths carry the exact same configuration and revision.
+	var dataplanePublisher state.DataplanePublisher
+	if provider, ok := s.opts.AddressProvider.(state.DataplanePublisher); ok {
+		dataplanePublisher = provider
+	}
+	if s.pushServer != nil {
+		dataplanePublisher = state.NewMultiDataplanePublisher(dataplanePublisher, s.pushServer)
+	}
+
 	return controller.RegisterReconcilers(mgr, s.state, s.proxy, controller.ReconcilerOptions{
 		ControllerName:       s.opts.ControllerName,
 		OnGatewaysUpdate:     wrappedHook,
@@ -814,6 +827,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		DisableStatusUpdates: s.opts.DisableStatusUpdates,
 		GatewayStatusHook:    s.opts.GatewayStatusHook,
 		ListenerValidator:    s.opts.ListenerValidator,
+		DataplanePublisher:   dataplanePublisher,
 
 		CertificateSources: s.opts.CertificateSources,
 	})

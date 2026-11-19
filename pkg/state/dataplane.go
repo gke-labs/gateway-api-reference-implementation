@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -129,6 +130,61 @@ type DataplanePublisher interface {
 	// answered for this revision, or until ctx ends, and reports what each did.
 	WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error)
 }
+
+// MultiDataplanePublisher broadcasts config updates to multiple DataplanePublishers.
+type MultiDataplanePublisher []DataplanePublisher
+
+// NewMultiDataplanePublisher creates a DataplanePublisher that broadcasts to all non-nil publishers.
+// If one publisher fails during PublishDataplaneConfig, the others still receive the configuration
+// and the state records the joined error. WaitApplied invokes WaitApplied on each publisher and
+// merges the results: Applied and NotAnswered counts are summed, Rejections are concatenated, and
+// errors are joined with errors.Join.
+func NewMultiDataplanePublisher(publishers ...DataplanePublisher) DataplanePublisher {
+	var nonNilPublishers []DataplanePublisher
+	for _, publisher := range publishers {
+		if publisher != nil {
+			nonNilPublishers = append(nonNilPublishers, publisher)
+		}
+	}
+	if len(nonNilPublishers) == 0 {
+		return nil
+	}
+	if len(nonNilPublishers) == 1 {
+		return nonNilPublishers[0]
+	}
+	return MultiDataplanePublisher(nonNilPublishers)
+}
+
+// PublishDataplaneConfig implements DataplanePublisher.
+func (multi MultiDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gateway *gatewayv1.Gateway, config *DataplaneConfig) error {
+	var errorsList []error
+	for _, publisher := range multi {
+		if err := publisher.PublishDataplaneConfig(ctx, gateway, config); err != nil {
+			errorsList = append(errorsList, err)
+		}
+	}
+	return errors.Join(errorsList...)
+}
+
+// WaitApplied implements DataplanePublisher. It invokes WaitApplied on each publisher and
+// merges the results: Applied and NotAnswered counts are summed, Rejections are concatenated,
+// and errors are joined with errors.Join.
+func (multi MultiDataplanePublisher) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (PublishResult, error) {
+	var mergedResult PublishResult
+	var errorsList []error
+	for _, publisher := range multi {
+		result, err := publisher.WaitApplied(ctx, gateway, revision)
+		if err != nil {
+			errorsList = append(errorsList, err)
+		}
+		mergedResult.Applied += result.Applied
+		mergedResult.Rejections = append(mergedResult.Rejections, result.Rejections...)
+		mergedResult.NotAnswered += result.NotAnswered
+	}
+	return mergedResult, errors.Join(errorsList...)
+}
+
+var _ DataplanePublisher = (MultiDataplanePublisher)(nil)
 
 func tlsCertToData(cert *tls.Certificate) (CertificateData, error) {
 	if cert == nil {

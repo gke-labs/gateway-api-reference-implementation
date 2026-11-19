@@ -63,11 +63,15 @@ type ReconcilerOptions struct {
 	GatewayStatusHook    GatewayStatusHook
 	ListenerValidator    state.ListenerValidator
 
+	// DataplanePublisher receives compiled Gateway configurations alongside any publisher
+	// implemented by AddressProvider. If set, configurations are pushed to both publishers.
+	DataplanePublisher state.DataplanePublisher
+
 	CertificateSources map[string]CertificateSource
 }
 
 // RegisterReconcilers registers all GARI reconcilers and informer event handlers with the given Manager.
-func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts ReconcilerOptions) error {
+func RegisterReconcilers(mgr ctrl.Manager, st *state.State, proxyServer *proxy.Proxy, opts ReconcilerOptions) error {
 	controllerName := opts.ControllerName
 	if controllerName == "" {
 		controllerName = DefaultControllerName
@@ -145,10 +149,15 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 			st.SetSupportedAddressTypes(atp.SupportedAddressTypes())
 		}
 
-		if publisher, ok := opts.AddressProvider.(state.DataplanePublisher); ok {
-			st.SetDataplanePublisher(publisher)
-		} else if p != nil {
-			st.SetProxy(p)
+		dataplanePublisher := opts.DataplanePublisher
+		if dataplanePublisher != nil {
+			st.SetDataplanePublisher(dataplanePublisher)
+		} else if proxyServer != nil {
+			// When a dataplanePublisher is configured, data planes run as external pods
+			// and receive configuration updates through that publisher (via Secrets or
+			// gRPC push streams). The in-process proxy server is only used in all-in-one
+			// mode when no external data-plane publisher is configured.
+			st.SetProxy(proxyServer)
 		}
 
 		if err := registerInformerHandlers(context.Background(), mgr, st, servedKinds); err != nil {
