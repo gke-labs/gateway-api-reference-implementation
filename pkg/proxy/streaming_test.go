@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/go-logr/logr"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -264,4 +264,3 @@ func TestProxyStreamWhenFlushingNotSupported(t *testing.T) {
 		t.Errorf("second response logged contentType = %v, want %q", got, "text/event-stream")
 	}
 }
-
