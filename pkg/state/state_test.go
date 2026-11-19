@@ -1193,7 +1193,32 @@ func TestState_PublishDataplaneConfig_Rejections_ChangeDetection(t *testing.T) {
 		t.Errorf("expected dirty flag not to be set when rejections have not changed")
 	}
 
-	// 3. Third publish with a different reason DOES count as a change.
+	// 3. Third publish with the same rejections in a different order also shouldn't count as a change.
+	reorderedRejections := []DataPlaneRejection{
+		{DataPlane: "dp-2", Reason: "port conflict"},
+		{DataPlane: "dp-1", Reason: "bad certificate"},
+	}
+	mockPub.setWaitAppliedResult(PublishResult{
+		Rejections: reorderedRejections,
+	}, nil)
+
+	if err := st.reconcileDataplaneKey(ctx, gwKey); err == nil {
+		t.Fatalf("expected reconcileDataplaneKey to fail")
+	}
+
+	st.mu.RLock()
+	revAfterReorderedPublish := st.revision
+	dirtyAfterReorderedPublish := st.dirty
+	st.mu.RUnlock()
+
+	if revAfterReorderedPublish != revAfterFirstPublish {
+		t.Errorf("expected revision not to change for reordered rejections, got %d -> %d", revAfterFirstPublish, revAfterReorderedPublish)
+	}
+	if dirtyAfterReorderedPublish {
+		t.Errorf("expected dirty flag not to be set when rejections are only reordered")
+	}
+
+	// 4. Fourth publish with a different reason DOES count as a change.
 	changedRejections := []DataPlaneRejection{
 		{DataPlane: "dp-1", Reason: "bad certificate"},
 		{DataPlane: "dp-2", Reason: "different reason: connection refused"},
@@ -1207,15 +1232,15 @@ func TestState_PublishDataplaneConfig_Rejections_ChangeDetection(t *testing.T) {
 	}
 
 	st.mu.RLock()
-	revAfterThirdPublish := st.revision
-	dirtyAfterThirdPublish := st.dirty
+	revAfterFourthPublish := st.revision
+	dirtyAfterFourthPublish := st.dirty
 	errs := st.provisioningErrors[gwKey]
 	st.mu.RUnlock()
 
-	if revAfterThirdPublish == revAfterSecondPublish {
-		t.Errorf("expected revision to increment for different rejection reason, but stayed %d", revAfterThirdPublish)
+	if revAfterFourthPublish == revAfterReorderedPublish {
+		t.Errorf("expected revision to increment for different rejection reason, but stayed %d", revAfterFourthPublish)
 	}
-	if !dirtyAfterThirdPublish {
+	if !dirtyAfterFourthPublish {
 		t.Errorf("expected dirty flag to be set when rejection reason changed")
 	}
 
@@ -1223,105 +1248,138 @@ func TestState_PublishDataplaneConfig_Rejections_ChangeDetection(t *testing.T) {
 	if !errors.As(errs.publish, &rejectedErr) {
 		t.Fatalf("expected errors.As to return *RejectedError")
 	}
-	if !slices.Equal(rejectedErr.Rejections, changedRejections) {
-		t.Errorf("expected recorded rejections %+v, got %+v", changedRejections, rejectedErr.Rejections)
+	expectedSortedRejections := []DataPlaneRejection{
+		{DataPlane: "dp-1", Reason: "bad certificate"},
+		{DataPlane: "dp-2", Reason: "different reason: connection refused"},
+	}
+	if !slices.Equal(rejectedErr.Rejections, expectedSortedRejections) {
+		t.Errorf("expected recorded rejections %+v, got %+v", expectedSortedRejections, rejectedErr.Rejections)
+	}
+}
+
+func TestNewRejectedError_SortsRejections(t *testing.T) {
+	unsorted := []DataPlaneRejection{
+		{DataPlane: "dp-b", Reason: "reason 2"},
+		{DataPlane: "dp-a", Reason: "reason 2"},
+		{DataPlane: "dp-b", Reason: "reason 1"},
+		{DataPlane: "dp-a", Reason: "reason 1"},
+	}
+	expected := []DataPlaneRejection{
+		{DataPlane: "dp-a", Reason: "reason 1"},
+		{DataPlane: "dp-a", Reason: "reason 2"},
+		{DataPlane: "dp-b", Reason: "reason 1"},
+		{DataPlane: "dp-b", Reason: "reason 2"},
+	}
+	rejectedError := NewRejectedError(unsorted)
+	if !slices.Equal(rejectedError.Rejections, expected) {
+		t.Errorf("expected sorted rejections %+v, got %+v", expected, rejectedError.Rejections)
 	}
 }
 
 func TestPublishErrorsEqual(t *testing.T) {
-	rejsA := []DataPlaneRejection{
+	rejectionsFirst := []DataPlaneRejection{
 		{DataPlane: "dp1", Reason: "reason1"},
 		{DataPlane: "dp2", Reason: "reason2"},
 	}
-	rejsB := []DataPlaneRejection{
+	rejectionsSecond := []DataPlaneRejection{
 		{DataPlane: "dp1", Reason: "reason1"},
 		{DataPlane: "dp2", Reason: "reason2"},
 	}
-	rejsDiffReason := []DataPlaneRejection{
+	rejectionsDifferentReason := []DataPlaneRejection{
 		{DataPlane: "dp1", Reason: "reason1"},
 		{DataPlane: "dp2", Reason: "different reason"},
 	}
-	rejsDiffDP := []DataPlaneRejection{
+	rejectionsDifferentDataPlane := []DataPlaneRejection{
 		{DataPlane: "dp1", Reason: "reason1"},
 		{DataPlane: "dp-other", Reason: "reason2"},
 	}
-	rejsFewer := []DataPlaneRejection{
+	rejectionsFewer := []DataPlaneRejection{
+		{DataPlane: "dp1", Reason: "reason1"},
+	}
+	rejectionsReversed := []DataPlaneRejection{
+		{DataPlane: "dp2", Reason: "reason2"},
 		{DataPlane: "dp1", Reason: "reason1"},
 	}
 
 	tests := []struct {
-		name string
-		a    error
-		b    error
-		want bool
+		name        string
+		firstError  error
+		secondError error
+		want        bool
 	}{
 		{
-			name: "both nil",
-			a:    nil,
-			b:    nil,
-			want: true,
+			name:        "both nil",
+			firstError:  nil,
+			secondError: nil,
+			want:        true,
 		},
 		{
-			name: "one nil",
-			a:    nil,
-			b:    errors.New("err"),
-			want: false,
+			name:        "one nil",
+			firstError:  nil,
+			secondError: errors.New("err"),
+			want:        false,
 		},
 		{
-			name: "same RejectedError instances",
-			a:    &RejectedError{Rejections: rejsA},
-			b:    &RejectedError{Rejections: rejsA},
-			want: true,
+			name:        "same RejectedError instances",
+			firstError:  NewRejectedError(rejectionsFirst),
+			secondError: NewRejectedError(rejectionsFirst),
+			want:        true,
 		},
 		{
-			name: "different RejectedError instances with same rejections",
-			a:    &RejectedError{Rejections: rejsA},
-			b:    &RejectedError{Rejections: rejsB},
-			want: true,
+			name:        "different RejectedError instances with same rejections",
+			firstError:  NewRejectedError(rejectionsFirst),
+			secondError: NewRejectedError(rejectionsSecond),
+			want:        true,
 		},
 		{
-			name: "RejectedError with different reason",
-			a:    &RejectedError{Rejections: rejsA},
-			b:    &RejectedError{Rejections: rejsDiffReason},
-			want: false,
+			name:        "RejectedError instances created from different ordering",
+			firstError:  NewRejectedError(rejectionsFirst),
+			secondError: NewRejectedError(rejectionsReversed),
+			want:        true,
 		},
 		{
-			name: "RejectedError with different dataplane",
-			a:    &RejectedError{Rejections: rejsA},
-			b:    &RejectedError{Rejections: rejsDiffDP},
-			want: false,
+			name:        "RejectedError with different reason",
+			firstError:  NewRejectedError(rejectionsFirst),
+			secondError: NewRejectedError(rejectionsDifferentReason),
+			want:        false,
 		},
 		{
-			name: "RejectedError with different count",
-			a:    &RejectedError{Rejections: rejsA},
-			b:    &RejectedError{Rejections: rejsFewer},
-			want: false,
+			name:        "RejectedError with different dataplane",
+			firstError:  NewRejectedError(rejectionsFirst),
+			secondError: NewRejectedError(rejectionsDifferentDataPlane),
+			want:        false,
 		},
 		{
-			name: "RejectedError vs standard error",
-			a:    &RejectedError{Rejections: rejsA},
-			b:    errors.New("dp1: reason1; dp2: reason2"),
-			want: false,
+			name:        "RejectedError with different count",
+			firstError:  NewRejectedError(rejectionsFirst),
+			secondError: NewRejectedError(rejectionsFewer),
+			want:        false,
 		},
 		{
-			name: "standard errors with same message",
-			a:    errors.New("timeout"),
-			b:    errors.New("timeout"),
-			want: true,
+			name:        "RejectedError vs standard error",
+			firstError:  NewRejectedError(rejectionsFirst),
+			secondError: errors.New("dp1: reason1; dp2: reason2"),
+			want:        false,
 		},
 		{
-			name: "standard errors with different message",
-			a:    errors.New("timeout"),
-			b:    errors.New("connection reset"),
-			want: false,
+			name:        "standard errors with same message",
+			firstError:  errors.New("timeout"),
+			secondError: errors.New("timeout"),
+			want:        true,
+		},
+		{
+			name:        "standard errors with different message",
+			firstError:  errors.New("timeout"),
+			secondError: errors.New("connection reset"),
+			want:        false,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := publishErrorsEqual(tc.a, tc.b)
+			got := publishErrorsEqual(tc.firstError, tc.secondError)
 			if got != tc.want {
-				t.Errorf("publishErrorsEqual(%v, %v) = %v; want %v", tc.a, tc.b, got, tc.want)
+				t.Errorf("publishErrorsEqual(%v, %v) = %v; want %v", tc.firstError, tc.secondError, got, tc.want)
 			}
 		})
 	}

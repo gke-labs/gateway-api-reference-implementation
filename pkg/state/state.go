@@ -568,16 +568,32 @@ func (e *OwnershipConflictError) Error() string {
 }
 
 // RejectedError indicates that one or more data planes rejected the configuration.
+// Its list of rejections is sorted by data plane and then reason.
 type RejectedError struct {
+	// Rejections holds the data-plane rejections, sorted by data plane and then reason.
 	Rejections []DataPlaneRejection
 }
 
-func (e *RejectedError) Error() string {
-	if e == nil {
+// NewRejectedError creates a RejectedError with rejections sorted by data plane and then reason.
+func NewRejectedError(rejections []DataPlaneRejection) *RejectedError {
+	sorted := slices.Clone(rejections)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].DataPlane != sorted[j].DataPlane {
+			return sorted[i].DataPlane < sorted[j].DataPlane
+		}
+		return sorted[i].Reason < sorted[j].Reason
+	})
+	return &RejectedError{
+		Rejections: sorted,
+	}
+}
+
+func (rejected *RejectedError) Error() string {
+	if rejected == nil {
 		return ""
 	}
 	var reasons []string
-	for _, rejection := range e.Rejections {
+	for _, rejection := range rejected.Rejections {
 		reasons = append(reasons, fmt.Sprintf("%s: %s", rejection.DataPlane, rejection.Reason))
 	}
 	return strings.Join(reasons, "; ")
@@ -673,9 +689,7 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	}
 
 	if len(result.Rejections) > 0 {
-		rejectionErr := &RejectedError{
-			Rejections: result.Rejections,
-		}
+		rejectionErr := NewRejectedError(result.Rejections)
 		s.recordPublishError(gwKey, rejectionErr)
 		return rejectionErr
 	}
@@ -708,21 +722,21 @@ func (s *State) clearPublishErrorLocked(gwKey types.NamespacedName) {
 // publishErrorsEqual reports whether two publish errors are equivalent.
 // If both errors wrap RejectedError, their rejections are compared rather than their error messages.
 // For other error types, the error messages are compared.
-func publishErrorsEqual(a, b error) bool {
-	if a == nil || b == nil {
-		return a == b
+func publishErrorsEqual(firstError, secondError error) bool {
+	if firstError == nil || secondError == nil {
+		return firstError == secondError
 	}
-	var rejA, rejB *RejectedError
-	if errors.As(a, &rejA) && errors.As(b, &rejB) {
-		if rejA == nil || rejB == nil {
-			return rejA == rejB
+	var firstRejected, secondRejected *RejectedError
+	if errors.As(firstError, &firstRejected) && errors.As(secondError, &secondRejected) {
+		if firstRejected == nil || secondRejected == nil {
+			return firstRejected == secondRejected
 		}
-		return slices.Equal(rejA.Rejections, rejB.Rejections)
+		return slices.Equal(firstRejected.Rejections, secondRejected.Rejections)
 	}
-	if errors.As(a, &rejA) || errors.As(b, &rejB) {
+	if errors.As(firstError, &firstRejected) || errors.As(secondError, &secondRejected) {
 		return false
 	}
-	return a.Error() == b.Error()
+	return firstError.Error() == secondError.Error()
 }
 
 // recordPublishError records the error from a failed data-plane publish attempt on the Gateway's
