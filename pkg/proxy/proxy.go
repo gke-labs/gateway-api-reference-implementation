@@ -2951,7 +2951,7 @@ func writeHTTPResponse(w http.ResponseWriter, r *http.Request, resp *http.Respon
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	if err := copyResponseBody(w, resp); err != nil {
+	if err := copyResponseBody(w, r, resp); err != nil {
 		if !isNormalClose(err) {
 			log.Log.Error(err, "Failed to copy response body")
 		}
@@ -2974,15 +2974,24 @@ func writeHTTPResponse(w http.ResponseWriter, r *http.Request, resp *http.Respon
 // the buffer fills or the response ends, so Server-Sent Events and other
 // incremental responses reach the client late or, on a stream that stays
 // open, not at all.
-func copyResponseBody(w http.ResponseWriter, resp *http.Response) error {
+func copyResponseBody(w http.ResponseWriter, r *http.Request, resp *http.Response) error {
 	if !isStreamingResponse(resp) {
 		_, err := io.Copy(w, resp.Body)
 		return err
 	}
 
 	responseController := http.NewResponseController(w)
+	flushingSupported := true
 	flush := func() error {
-		if err := responseController.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		if !flushingSupported {
+			return nil
+		}
+		if err := responseController.Flush(); err != nil {
+			if errors.Is(err, http.ErrNotSupported) {
+				flushingSupported = false
+				log.FromContext(r.Context()).Error(err, "Streamed response cannot be flushed", "method", r.Method, "path", r.URL.Path, "contentType", resp.Header.Get("Content-Type"))
+				return nil
+			}
 			return err
 		}
 		return nil
