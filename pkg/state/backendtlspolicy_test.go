@@ -46,7 +46,7 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 		name     string
 		policies []*gatewayv1.BackendTLSPolicy
 		services map[types.NamespacedName]*corev1.Service
-		check    func(t *testing.T, resolution *BackendTLSPolicyResolution)
+		check    func(t *testing.T, resolution *CompiledBackendTLSPolicies)
 	}{
 		{
 			name: "a named port",
@@ -68,7 +68,7 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 				},
 			},
 			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
-			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
+			check: func(t *testing.T, resolution *CompiledBackendTLSPolicies) {
 				policyKey := types.NamespacedName{Namespace: "default", Name: "p-named-port"}
 				targets := resolution.TargetResultsForPolicy(policyKey)
 				if len(targets) != 1 {
@@ -119,7 +119,7 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 				},
 			},
 			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
-			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
+			check: func(t *testing.T, resolution *CompiledBackendTLSPolicies) {
 				policyKey := types.NamespacedName{Namespace: "default", Name: "p-whole-svc"}
 				targets := resolution.TargetResultsForPolicy(policyKey)
 				if len(targets) != 1 {
@@ -185,7 +185,7 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 				},
 			},
 			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
-			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
+			check: func(t *testing.T, resolution *CompiledBackendTLSPolicies) {
 				// The named port policy wins for the named port "https"
 				if policy := resolution.PolicyForService(serviceKey, "https"); policy == nil || policy.Name != "p-named-port" {
 					t.Errorf("expected PolicyForService(https) to be p-named-port, got %v", policy)
@@ -243,7 +243,7 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 				},
 			},
 			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
-			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
+			check: func(t *testing.T, resolution *CompiledBackendTLSPolicies) {
 				// Older policy wins
 				if policy := resolution.PolicyForService(serviceKey, "https"); policy == nil || policy.Name != "p-older" {
 					t.Errorf("expected PolicyForService(https) to be p-older, got %v", policy)
@@ -300,7 +300,7 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 				},
 			},
 			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
-			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
+			check: func(t *testing.T, resolution *CompiledBackendTLSPolicies) {
 				// p-a wins alphabetically
 				if policy := resolution.PolicyForService(serviceKey, ""); policy == nil || policy.Name != "p-a" {
 					t.Errorf("expected PolicyForService to be p-a, got %v", policy)
@@ -341,7 +341,7 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 				},
 			},
 			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
-			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
+			check: func(t *testing.T, resolution *CompiledBackendTLSPolicies) {
 				policyKey := types.NamespacedName{Namespace: "default", Name: "p-missing-svc"}
 				targets := resolution.TargetResultsForPolicy(policyKey)
 				if len(targets) != 1 {
@@ -383,7 +383,7 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 				},
 			},
 			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
-			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
+			check: func(t *testing.T, resolution *CompiledBackendTLSPolicies) {
 				policyKey := types.NamespacedName{Namespace: "default", Name: "p-missing-port"}
 				targets := resolution.TargetResultsForPolicy(policyKey)
 				if len(targets) != 1 {

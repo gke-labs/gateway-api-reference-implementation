@@ -53,8 +53,8 @@ func (targetResult TargetRefResult) MissingPort() bool {
 	return targetResult.TargetRef.SectionName != nil && *targetResult.TargetRef.SectionName != "" && targetResult.ServiceExists && !targetResult.PortExists
 }
 
-// BackendTLSPolicyResolution contains the resolved targets, winning policies, and conflict state for a set of BackendTLSPolicies.
-type BackendTLSPolicyResolution struct {
+// CompiledBackendTLSPolicies contains the resolved targets, winning policies, and conflict state for a set of BackendTLSPolicies.
+type CompiledBackendTLSPolicies struct {
 	// policies maps a Service and port name (or empty port for the whole Service) to the winning policy.
 	policies map[ServicePortKey]*gatewayv1.BackendTLSPolicy
 
@@ -68,7 +68,7 @@ type BackendTLSPolicyResolution struct {
 // PolicyForService returns the winning BackendTLSPolicy for the given Service and port name.
 // If portName is non-empty and a policy targets that specific port, that policy is returned.
 // Otherwise, any policy targeting the whole Service is returned.
-func (resolution *BackendTLSPolicyResolution) PolicyForService(serviceKey types.NamespacedName, portName string) *gatewayv1.BackendTLSPolicy {
+func (resolution *CompiledBackendTLSPolicies) PolicyForService(serviceKey types.NamespacedName, portName string) *gatewayv1.BackendTLSPolicy {
 	if resolution == nil {
 		return nil
 	}
@@ -81,7 +81,7 @@ func (resolution *BackendTLSPolicyResolution) PolicyForService(serviceKey types.
 }
 
 // Conflict reports whether the policy is conflicted with an older policy, and if so, returns the conflicting policy.
-func (resolution *BackendTLSPolicyResolution) Conflict(policyKey types.NamespacedName) (string, bool) {
+func (resolution *CompiledBackendTLSPolicies) Conflict(policyKey types.NamespacedName) (string, bool) {
 	if resolution == nil {
 		return "", false
 	}
@@ -90,7 +90,7 @@ func (resolution *BackendTLSPolicyResolution) Conflict(policyKey types.Namespace
 }
 
 // TargetsService reports whether the given policy has a targetRef targeting the given Service.
-func (resolution *BackendTLSPolicyResolution) TargetsService(policyKey, serviceKey types.NamespacedName) bool {
+func (resolution *CompiledBackendTLSPolicies) TargetsService(policyKey, serviceKey types.NamespacedName) bool {
 	if resolution == nil || policyKey.Namespace != serviceKey.Namespace {
 		return false
 	}
@@ -103,7 +103,7 @@ func (resolution *BackendTLSPolicyResolution) TargetsService(policyKey, serviceK
 }
 
 // TargetResultsForPolicy returns the TargetRefResults for the given policy.
-func (resolution *BackendTLSPolicyResolution) TargetResultsForPolicy(policyKey types.NamespacedName) []TargetRefResult {
+func (resolution *CompiledBackendTLSPolicies) TargetResultsForPolicy(policyKey types.NamespacedName) []TargetRefResult {
 	if resolution == nil {
 		return nil
 	}
@@ -151,8 +151,8 @@ func sortBackendTLSPolicies(backendTLSPolicies []*gatewayv1.BackendTLSPolicy) []
 func ResolveBackendTLSPolicyTargets(
 	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
 	services map[types.NamespacedName]*corev1.Service,
-) *BackendTLSPolicyResolution {
-	resolution := &BackendTLSPolicyResolution{
+) *CompiledBackendTLSPolicies {
+	resolution := &CompiledBackendTLSPolicies{
 		policies:      make(map[ServicePortKey]*gatewayv1.BackendTLSPolicy),
 		conflicts:     make(map[types.NamespacedName]string),
 		targetResults: make(map[types.NamespacedName][]TargetRefResult),
