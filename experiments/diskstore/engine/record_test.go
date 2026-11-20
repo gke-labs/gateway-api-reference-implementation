@@ -88,8 +88,8 @@ func TestRecord_RejectsOldFormatVersion(t *testing.T) {
 	}
 
 	encoded := EncodeRecord(orig)
-	// Set version byte to 1 (old WAL record version)
-	encoded[1] = 1
+	// Set version byte to 2 (old WAL record version)
+	encoded[1] = 2
 
 	_, err := DecodeRecord(bytes.NewReader(encoded))
 	if !errors.Is(err, ErrCorruptRecord) {

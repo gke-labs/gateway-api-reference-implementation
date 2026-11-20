@@ -95,8 +95,8 @@ const (
 	// RecordMagic identifies valid log records ('R').
 	RecordMagic byte = 0x52
 
-	// RecordFormatVersion is 2.
-	RecordFormatVersion byte = 2
+	// RecordFormatVersion is 3.
+	RecordFormatVersion byte = 3
 
 	// RecordHeaderSize is 24 bytes:
 	// Magic(1) + Version(1) + Type(1) + Reserved(1) + LSN(8) + KeyLen(4) + PayloadLen(4) + CRC32C(4)

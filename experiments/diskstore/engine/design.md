@@ -227,7 +227,7 @@ Each WAL record contains a 24-byte header followed by variable-length fields:
 
 The record fields contain:
 - **Magic (1 byte):** The constant `0x52` (ASCII `'R'`).
-- **Format Version (1 byte):** The integer `2`.
+- **Format Version (1 byte):** The integer `3`.
 - **Operation Type (1 byte):** The operation code:
   - `1`: `Put`
   - `2`: `Delete`
