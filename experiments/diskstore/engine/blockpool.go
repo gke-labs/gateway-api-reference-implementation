@@ -84,7 +84,8 @@ type PageDesc struct {
 	DirtyTime  time.Time     // Timestamp when page became dirty
 	LastAccess time.Time     // Timestamp for LRU eviction tracking
 
-	PhysicalBlock uint64 // currently known disk location
+	// Known disk location.
+	PhysicalBlock uint64
 
 	// Blocks that held earlier contents of this page and have not been deferred yet.
 	// The flush of the new contents defers them.
@@ -535,33 +536,6 @@ func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint
 
 	bp.pageTable[logicalPage] = desc
 	return &PageHandle{pool: bp, Desc: desc}, nil
-}
-
-// FreePage releases pool blocks and unregisters the logical page from the page table.
-// It does not defer on-disk blocks because no replacement write has occurred; under
-// Invariant 5 (Retention of Logical Page Numbers), discarded or emptied pages are retired
-// by writing an empty page or tombstone whose flush defers the prior on-disk location.
-func (bp *BlockPool) FreePage(logicalPage uint64) {
-	bp.mu.Lock()
-	defer bp.mu.Unlock()
-
-	for {
-		desc, exists := bp.pageTable[logicalPage]
-		if !exists || desc == nil {
-			return
-		}
-		if !desc.InFlight && desc.PinCount.Load() == 0 {
-			if len(desc.PoolBlocks) > 0 {
-				bp.freePoolBlocks = append(bp.freePoolBlocks, desc.PoolBlocks...)
-				desc.PoolBlocks = nil
-			}
-			desc.replacedBlocks = nil
-			desc.PhysicalBlock = NoBlock
-			delete(bp.pageTable, logicalPage)
-			return
-		}
-		bp.cond.Wait()
-	}
 }
 
 // acquirePoolBlocksLocked acquires count pool blocks, evicting clean pages first by LRU, then flushing dirty pages.

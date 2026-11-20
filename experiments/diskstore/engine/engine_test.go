@@ -203,7 +203,9 @@ func TestRegression_Item11_ReuseRuleFlushedAfterSyncStartsNotFreed(t *testing.T)
 	defer store.Close()
 
 	// Put page 1, flush it and checkpoint to make loc1 durable
-	_ = store.Put("ConfigMap", "k1", []byte("v1"))
+	if err := store.Put("ConfigMap", "k1", []byte("v1")); err != nil {
+		t.Fatalf("Put k1 failed: %v", err)
+	}
 	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
@@ -216,9 +218,14 @@ func TestRegression_Item11_ReuseRuleFlushedAfterSyncStartsNotFreed(t *testing.T)
 	store.bp.startHeapSync()
 
 	// Put version 2 and flush it AFTER startHeapSync was called
-	_ = store.Put("ConfigMap", "k1", []byte("v2"))
+	if err := store.Put("ConfigMap", "k1", []byte("v2")); err != nil {
+		t.Fatalf("second Put k1 failed: %v", err)
+	}
 	store.bp.mu.Lock()
-	_ = store.bp.FlushPageLocked(desc)
+	if err := store.bp.FlushPageLocked(desc); err != nil {
+		store.bp.mu.Unlock()
+		t.Fatalf("FlushPageLocked failed: %v", err)
+	}
 	loc2 := desc.PhysicalBlock
 	store.bp.mu.Unlock()
 
