@@ -47,7 +47,13 @@ func TestCheckpointer_BasicCheckpoint(t *testing.T) {
 	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 	defer bp.Close()
 
-	checkpointer := NewCheckpointer(bp, heapFile, wal)
+	metaFile, err := faultFS.Create("meta.db")
+	if err != nil {
+		t.Fatalf("Create meta file failed: %v", err)
+	}
+	defer metaFile.Close()
+
+	checkpointer := NewCheckpointer(bp, heapFile, wal, metaFile, 0, 1)
 
 	// Write 5 records to WAL and dirty 2 pages
 	for i := uint64(1); i <= 5; i++ {
@@ -176,7 +182,13 @@ func runCountingCheckpointTest(t *testing.T, numPages int, expectedWrites int64)
 	bp := NewBlockPool(countingHeap, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: numPages + 10})
 	defer bp.Close()
 
-	checkpointer := NewCheckpointer(bp, countingHeap, wal)
+	metaFile, err := fs.Create(filepath.Join(dir, "meta.db"))
+	if err != nil {
+		t.Fatalf("Create meta file failed: %v", err)
+	}
+	defer metaFile.Close()
+
+	checkpointer := NewCheckpointer(bp, countingHeap, wal, metaFile, 0, 1)
 
 	// Dirty N pages and write WAL records
 	for i := 1; i <= numPages; i++ {
@@ -263,7 +275,13 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 		defer bp.Close()
 
-		checkpointer := NewCheckpointer(bp, heapFile, wal)
+		metaFile, err := faultFS.Create("meta.db")
+		if err != nil {
+			t.Fatalf("Create meta file failed: %v", err)
+		}
+		defer metaFile.Close()
+
+		checkpointer := NewCheckpointer(bp, heapFile, wal, metaFile, 0, 1)
 
 		// Allocate and flush page 1 to disk
 		if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")}); err != nil {
@@ -334,7 +352,13 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 		defer bp.Close()
 
-		checkpointer := NewCheckpointer(bp, heapFile, wal)
+		metaFile, err := faultFS.Create("meta.db")
+		if err != nil {
+			t.Fatalf("Create meta file failed: %v", err)
+		}
+		defer metaFile.Close()
+
+		checkpointer := NewCheckpointer(bp, heapFile, wal, metaFile, 0, 1)
 
 		// Allocate and flush page 1 to disk
 		if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")}); err != nil {
@@ -517,9 +541,25 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	if chkRecord.Type != RecordTypeCheckpoint {
 		t.Fatalf("expected RecordTypeCheckpoint, got %v", chkRecord.Type)
 	}
-	if chkRecord.RedoStartLSN > firstUnsyncedLSN {
-		t.Fatalf("expected checkpoint RedoStartLSN <= firstUnsyncedLSN (%d), got %d",
-			firstUnsyncedLSN, chkRecord.RedoStartLSN)
+
+	metaFile, err := faultFS.OpenFile(filepath.Join(storeDir, "meta.db"), 0, 0)
+	if err != nil {
+		t.Fatalf("OpenFile meta.db failed: %v", err)
+	}
+	var metaBuf [metaFileSize]byte
+	if _, err := metaFile.ReadAt(metaBuf[:], 0); err != nil {
+		t.Fatalf("ReadAt meta.db failed: %v", err)
+	}
+	if err := metaFile.Close(); err != nil {
+		t.Fatalf("Close meta.db failed: %v", err)
+	}
+	redoStartLSN, _, _, err := readRecoveryStartPages(metaBuf[:], "meta.db")
+	if err != nil {
+		t.Fatalf("readRecoveryStartPages failed: %v", err)
+	}
+	if redoStartLSN > firstUnsyncedLSN {
+		t.Fatalf("expected checkpoint redo start LSN <= firstUnsyncedLSN (%d), got %d",
+			firstUnsyncedLSN, redoStartLSN)
 	}
 
 	// Page descriptor should retain its RedoLSN because its flush completed during fsync (in unsynced generation)
@@ -687,9 +727,28 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading second checkpoint record failed: %v", err)
 	}
-	if chkRecord.RedoStartLSN > deleteLSN {
-		t.Fatalf("expected second checkpoint RedoStartLSN <= deleteLSN (%d), got %d (putLSN=%d)",
-			deleteLSN, chkRecord.RedoStartLSN, putLSN)
+	if chkRecord.Type != RecordTypeCheckpoint {
+		t.Fatalf("expected RecordTypeCheckpoint, got %v", chkRecord.Type)
+	}
+
+	metaFile2, err := faultFS.OpenFile(filepath.Join(storeDir, "meta.db"), 0, 0)
+	if err != nil {
+		t.Fatalf("OpenFile meta.db failed: %v", err)
+	}
+	var metaBuf2 [metaFileSize]byte
+	if _, err := metaFile2.ReadAt(metaBuf2[:], 0); err != nil {
+		t.Fatalf("ReadAt meta.db failed: %v", err)
+	}
+	if err := metaFile2.Close(); err != nil {
+		t.Fatalf("Close meta.db failed: %v", err)
+	}
+	redoStartLSN2, _, _, err := readRecoveryStartPages(metaBuf2[:], "meta.db")
+	if err != nil {
+		t.Fatalf("readRecoveryStartPages failed: %v", err)
+	}
+	if redoStartLSN2 > deleteLSN {
+		t.Fatalf("expected second checkpoint redo start LSN <= deleteLSN (%d), got %d (putLSN=%d)",
+			deleteLSN, redoStartLSN2, putLSN)
 	}
 
 	// 5. Crash and recover

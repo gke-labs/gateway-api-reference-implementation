@@ -26,7 +26,11 @@ The engine defines binary layouts for database metadata (`meta.db`), heap blocks
 
 ### Database Metadata (`meta.db`)
 
-The database metadata file (`meta.db`) is a fixed-size 4 KiB (4096-byte) record initialized when a store is created:
+The database metadata file (`meta.db`) is a 36 KiB file allocated in full when a store is created:
+- **Block 0 (4 KiB):** Static metadata header written once at store creation and never rewritten.
+- **Pages 1..8 (4 KiB each):** A ring of 8 recovery start pages recording the LSN from which recovery starts replay.
+
+#### Block 0: Static Metadata Header
 
 ```
  0                   1                   2                   3
@@ -56,12 +60,41 @@ The database metadata file (`meta.db`) is a fixed-size 4 KiB (4096-byte) record 
 
 The fields contain the following values:
 - **Magic (4 bytes):** The constant `0x4D455441` (ASCII `"META"`).
-- **StoreFormatVersion (4 bytes):** The store format version recorded by the engine (`StoreFormatVersion`).
+- **StoreFormatVersion (4 bytes):** The store format version recorded by the engine (`StoreFormatVersion`, currently `8`).
 - **Database ID (16 bytes):** Unique 16-byte identifier for the database instance.
 - **Flags (8 bytes):** Store flags. Bit 0 indicates whether the store was created with an encryption cipher (`metaFlagEncrypted`). Bits 1 through 63 are reserved and must be zero.
-- **KeyCheckToken (32 bytes):** An HMAC-SHA256 of the database ID computed using a key derived from the master key with context `"diskstore/keycheck"`. In an unencrypted store, this field is zero. Adding this field takes 32 reserved bytes and bumps `StoreFormatVersion`.
+- **KeyCheckToken (32 bytes):** An HMAC-SHA256 of the database ID computed using a key derived from the master key with context `"diskstore/keycheck"`. In an unencrypted store, this field is zero.
 - **Reserved (4028 bytes):** Reserved space written as zeroes. New fields take reserved bytes and bump `StoreFormatVersion`. Reserved bytes that aren't zero under the current version are rejected as an error.
 - **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the full 4096-byte block with the CRC field zeroed.
+
+#### Recovery Start Ring (Pages 1..8)
+
+Following block 0, `meta.db` contains a ring of 8 independent 4 KiB pages (offsets 4096..36864). Each page holds one recovery record:
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    recoveryStartLSN (8B)                      |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Counter (8B)                          |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Reserved (4076B)                        |
+|                              ...                              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          CRC32C (4B)                          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+The fields contain:
+- **recoveryStartLSN (8 bytes):** The LSN from which recovery starts replay.
+- **Counter (8 bytes):** Monotonically incrementing write counter that identifies the newer record across the ring.
+- **Reserved (4076 bytes):** Zero padding to 4 KiB.
+- **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the full 4096-byte page with the CRC field zeroed.
+
+Each checkpoint writes the page after the one that holds the latest valid record, with a counter one higher, as an aligned 4 KiB write, and then fsyncs `meta.db`. Block 0 is never rewritten after creation. `Open` reads all 8 pages and uses the valid record with the highest counter, skipping damaged pages. If the newest page is damaged by a crash, its checksum fails and recovery falls back to an older valid record with the next highest counter; because all changes prior to WAL truncation are already durable in the heap, replay begins from the first surviving log record with no error. If no page in the ring is valid, `Open` fails with an error naming `meta.db`.
 
 ### Block Header
 
@@ -202,7 +235,7 @@ The record fields contain:
   - `4`: `PutPointer`
 - **Reserved (1 byte):** Zero padding.
 - **LSN (8 bytes):** The monotonically assigned log sequence number.
-- **RedoStartLSN (8 bytes):** The starting LSN for WAL redo replay. This field is populated on Checkpoint records.
+- **RedoStartLSN (8 bytes):** Legacy field on Checkpoint records. Recovery now takes its redo starting LSN from meta.db; checkpoints no longer write this field into WAL records.
 - **KeyLen (4 bytes):** Length of the key in bytes.
 - **PayloadLen (4 bytes):** Length of the payload in bytes.
 - **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the record header and body with the CRC field zeroed.
@@ -367,7 +400,7 @@ Recovery reconstructs database state after a restart or crash by scanning the se
 - **Self-describing block scan:** Because every heap block header carries its logical page number, block index, total block count, LSN, and CRC checksum, recovery does not depend on a central catalog or page table on disk. In an encrypted store, recovery decrypts each 4 KiB block using its physical block number as the tweak before inspecting the header. If a block fails CRC32C verification, recovery treats it as torn. Recovery scans the heap file sequentially to discover all valid block runs.
 - **Newest valid copy wins:** When out-of-place writes or power failures leave multiple copies of a logical page on disk, recovery checks block integrity and checksums across the entire run. Any torn, partial, or corrupt writes are discarded. For each logical page number, the valid candidate run with the highest LSN wins. Stale and torn copies are harmless because the reuse rule ensures the previous durable copy remains intact on disk until a newer write has completed and fsynced.
 - **Allocator and index reconstruction:** Once the winning block runs are selected, the engine reconstructs the buddy allocator state by marking all winning blocks as allocated. All remaining blocks in the file become free for new allocations. The engine then populates the in-memory key index from the active records in the winning pages and restores empty logical page numbers to the empty list.
-- **Idempotent WAL redo replay:** Recovery locates the most recent checkpoint in the WAL to determine the redo starting LSN. Redo replays log records forward from that point. For each record, recovery compares the record's LSN against the recovered page's LSN. If the page already reflects an LSN equal to or greater than the log record, the engine skips the record. When recovery finds a key on more than one page, replay clears the older copy at the first record for that key whose LSN is above the older page's LSN, even when the key's current page is up to date. This per-page LSN check makes redo idempotent, safely handling crashes that occurred mid-checkpoint or mid-flush. If WAL replay stops below the highest LSN among the winning heap pages, recovery fails with `ErrCorruptWAL` because the write-ahead rule guarantees that WAL records through that LSN were durable.
+- **Idempotent WAL redo replay:** Recovery reads the redo starting LSN from the recovery ring in meta.db. Redo replays log records forward from that point. For each record, recovery compares the record's LSN against the recovered page's LSN. If the page already reflects an LSN equal to or greater than the log record, the engine skips the record. When recovery finds a key on more than one page, replay clears the older copy at the first record for that key whose LSN is above the older page's LSN, even when the key's current page is up to date. This per-page LSN check makes redo idempotent, safely handling crashes that occurred mid-checkpoint or mid-flush. If WAL replay stops below the highest LSN among the winning heap pages, recovery fails with `ErrCorruptWAL` because the write-ahead rule guarantees that WAL records through that LSN were durable.
 - **Flush before serving:** Any pages modified during WAL redo replay are marked dirty and flushed to newly allocated heap locations. The heap file is fsynced to make those pages durable, and superseded locations are freed before the engine begins serving client traffic.
 - **Clean shutdown marker and damage reporting:** The `CLEAN` marker indicates that the store closed cleanly with all in-flight writes fsynced. The engine writes this marker in `Close` after flushing dirty pages, checkpointing, and syncing all heap and WAL files; `Open` removes it and syncs the directory once the initial heap scan verifies block integrity without finding damage. With the marker present, any non-zero block that fails checksum or header validation represents disk corruption, causing recovery to return `ErrDamagedBlock` naming the physical block. Without the marker, recovery treats invalid blocks as torn writes from an interrupted flush, zeroes them on disk so they do not linger in free space, and rebuilds live page data from WAL records.
 - **Oversize value reconciliation:** Recovery decides which files are live from the pointers in the recovered heap plus the replayed WAL, and deletes only files that neither references. Recovery validates the length and checksum of every referenced file. A missing or corrupt file that a durable pointer references indicates store corruption.
@@ -459,7 +492,7 @@ The design trades disk space headroom for operational simplicity:
   - `Dirty` (bool) on `PageDesc` indicates that the in-memory copy has unwritten modifications. It is set when a page is modified in memory and clears as soon as direct I/O flush completes, allowing eviction to reclaim pool blocks by LRU immediately without waiting for an fsync. If `Dirty` remained set until an fsync, a pool full of flushed pages could not evict without an fsync, reintroducing the stall this design removes.
   - `RedoLSN` (uint64) on `PageDesc` records the earliest LSN whose effect on the page is not yet confirmed durable by a completed heap fsync. A page descriptor stays in the page table after its pool blocks are evicted, which is why the field can live there. `RedoLSN` replaces the existing `DirtyLSN` field: whereas `DirtyLSN` was tied to whether the in-memory copy was dirty, `RedoLSN` tracks durability independently of whether page blocks are resident or dirty in memory. It is set to the mutating operation's LSN when a page without un-synced modifications (`RedoLSN == 0`) is dirtied. When direct I/O completes, `Dirty` clears, but `RedoLSN` remains set. If the page is modified again in memory before an fsync occurs, `Dirty` becomes true again while `RedoLSN` continues to hold the earlier LSN across subsequent flushes.
   - `RedoLSN` clears at sync boundaries using the same two-generation rotation as the pending free list. When a flush completes, the page is recorded in `current`. At fsync start, `current` rotates to `prior`. When the fsync completes, the engine clears `RedoLSN` (to zero) for pages in `prior` that received no newer modifications, or resets `RedoLSN` to the earliest LSN of those newer modifications if they arrived while the fsync ran.
-  - When a checkpoint runs, `redoStartLSN` is computed from the minimum `RedoLSN` across all pages with `RedoLSN > 0`. Consider a page that was dirty at the checkpoint's snapshot with `RedoLSN` equal to `L1`, whose flush completes during the checkpoint's fsync. Because `L1` was captured in the snapshot, the checkpoint's `redoStartLSN` is at or below `L1`. Because the flush returned during the fsync (after generation rotation), the write is in `current`, so its superseded block remains held and this fsync does not clear its `RedoLSN`. The checkpoint appends its record to the WAL and truncates WAL segments strictly prior to `redoStartLSN`. Because `redoStartLSN` is at or below `L1`, all log records from `L1` onward remain in the WAL. If a crash occurs before the next fsync, recovery finds either the valid new copy on disk or the older durable copy (which was never freed), and replays WAL records from `redoStartLSN` forward to reconstruct the page.
+  - When a checkpoint runs, `redoStartLSN` is computed from the minimum `RedoLSN` across all pages with `RedoLSN > 0`. Consider a page that was dirty at the checkpoint's snapshot with `RedoLSN` equal to `L1`, whose flush completes during the checkpoint's fsync. Because `L1` was captured in the snapshot, the checkpoint's `redoStartLSN` is at or below `L1`. Because the flush returned during the fsync (after generation rotation), the write is in `current`, so its superseded block remains held and this fsync does not clear its `RedoLSN`. The checkpoint writes the redo start LSN to meta.db, appends its record to the WAL, and truncates WAL segments strictly prior to `redoStartLSN`. Because `redoStartLSN` is at or below `L1`, all log records from `L1` onward remain in the WAL. If a crash occurs before the next fsync, recovery finds either the valid new copy on disk or the older durable copy (which was never freed), and replays WAL records from `redoStartLSN` forward to reconstruct the page.
 - **Fault filesystem reuse check:** `FaultFS` updates its durable page set during `heapFile.Sync()`. Under deferred frees, pending blocks are released to the allocator only after `Sync()` finishes. Any subsequent write to a reallocated block occurs after `FaultFS` has updated its durable set, satisfying the reuse rule assertion without timing dependencies or special cases.
 
 ### Decisions

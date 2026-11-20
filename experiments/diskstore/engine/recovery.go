@@ -154,6 +154,9 @@ type RecoveryOptions struct {
 	ClosedCleanly bool
 	// EncryptionKey is the 32-byte master key used for decrypting WAL segments during recovery.
 	EncryptionKey EncryptionKey
+	// RecoveryStartLSN is the start LSN for recovery read from meta.db.
+	// When non-zero, recovery replays the log starting from this LSN.
+	RecoveryStartLSN uint64
 }
 
 // Recover scans the heap file, filters out foreign and torn copies, finds the WAL redo start LSN,
@@ -444,8 +447,12 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		}
 	}
 
-	// Step 4: Scan WAL to find the last checkpoint's redo start LSN
-	var redoStartLSN uint64 = 1
+	// Step 4: Scan WAL to find maxWAL_LSN and verify the write-ahead rule.
+	// Recovery takes its start LSN from meta.db only; it does not read checkpoint records.
+	redoStartLSN := options.RecoveryStartLSN
+	if redoStartLSN == 0 {
+		redoStartLSN = 1
+	}
 	var maxWAL_LSN uint64
 
 	walScanIt, err := NewWALIterator(fs, walDir, dbID, 1, WALIteratorOptions{
@@ -464,9 +471,6 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		}
 		if rec.LSN > maxWAL_LSN {
 			maxWAL_LSN = rec.LSN
-		}
-		if rec.Type == RecordTypeCheckpoint && rec.RedoStartLSN > 0 {
-			redoStartLSN = rec.RedoStartLSN
 		}
 	}
 	if closeErr := walScanIt.Close(); closeErr != nil {
