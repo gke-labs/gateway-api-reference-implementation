@@ -735,9 +735,9 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 
 	store.bp.mu.Lock()
 	entryK1 := store.keyIndex[qualifyKey("ConfigMap", "key1")]
-	v1Loc := store.bp.pageTable[entryK1.LogicalPage].DurableLoc
+	v1Loc := store.bp.pageTable[entryK1.LogicalPage].PhysicalBlock
 	store.bp.mu.Unlock()
-	t.Logf("key1 v1 on page %d has DurableLoc %d", entryK1.LogicalPage, v1Loc)
+	t.Logf("key1 v1 on page %d has PhysicalBlock %d", entryK1.LogicalPage, v1Loc)
 
 	// Step 4: Occupy block 3
 	_ = store.Put("ConfigMap", "dummy-3", bytes.Repeat([]byte("3"), 3000))
@@ -755,9 +755,9 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	}
 
 	store.bp.mu.Lock()
-	v2Loc := store.bp.pageTable[entryK1.LogicalPage].DurableLoc
+	v2Loc := store.bp.pageTable[entryK1.LogicalPage].PhysicalBlock
 	store.bp.mu.Unlock()
-	t.Logf("key1 v2 on page %d has DurableLoc %d", entryK1.LogicalPage, v2Loc)
+	t.Logf("key1 v2 on page %d has PhysicalBlock %d", entryK1.LogicalPage, v2Loc)
 
 	// Step 6: Free block 1 by updating dummy-1 so block 1 is the lowest free block
 	_ = store.Put("ConfigMap", "dummy-1", bytes.Repeat([]byte("x"), 3000))
@@ -785,9 +785,9 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	}
 
 	store.bp.mu.Lock()
-	durLoc := store.bp.pageTable[entryK1.LogicalPage].DurableLoc
+	durLoc := store.bp.pageTable[entryK1.LogicalPage].PhysicalBlock
 	store.bp.mu.Unlock()
-	t.Logf("empty page %d has DurableLoc %d (v1 was at %d, v2 was at %d)", entryK1.LogicalPage, durLoc, v1Loc, v2Loc)
+	t.Logf("empty page %d has PhysicalBlock %d (v1 was at %d, v2 was at %d)", entryK1.LogicalPage, durLoc, v1Loc, v2Loc)
 
 	// Step 8: Reuse the emptied logical page in the block pool
 	lsnNew, err := store.wal.AppendRecord(&Record{Type: RecordTypePut, Key: "new-key", Payload: []byte("new-val")})
@@ -949,7 +949,7 @@ func TestRegression_RecoveryStep6ReuseRule(t *testing.T) {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 
-	initialBlock := h1.Desc.DurableLoc
+	initialBlock := h1.Desc.PhysicalBlock
 
 	// 2. Append WAL records: page 1 modified, plus multiple new pages
 	recP1 := Record{Type: RecordTypePut, Key: "ConfigMap k1", Payload: []byte("val1-updated")}
