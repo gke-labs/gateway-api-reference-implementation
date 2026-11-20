@@ -2782,7 +2782,7 @@ func TestComputeDesiredBackendTLSPolicyStatus_ConditionsAndReasons(t *testing.T)
 				ConfigMaps:         configMaps,
 			})
 
-			status := ComputeDesiredBackendTLSPolicyStatus(policy, compiled, configMaps, []*gatewayv1.BackendTLSPolicy{policy}, "test-controller")
+			status := ComputeDesiredBackendTLSPolicyStatus(policy, compiled, configMaps, "test-controller")
 
 			if len(status.Ancestors) != 1 {
 				t.Fatalf("expected 1 ancestor in status, got %d", len(status.Ancestors))
@@ -3556,9 +3556,8 @@ func TestComputeDesiredBackendTLSPolicyStatus_SectionConflictResolution(t *testi
 		ConfigMaps:         configMaps,
 	})
 
-	allPolicies1 := []*gatewayv1.BackendTLSPolicy{pOlder, pNewer}
-	statusOlder := ComputeDesiredBackendTLSPolicyStatus(pOlder, compiled1, configMaps, allPolicies1, "test-controller")
-	statusNewer := ComputeDesiredBackendTLSPolicyStatus(pNewer, compiled1, configMaps, allPolicies1, "test-controller")
+	statusOlder := ComputeDesiredBackendTLSPolicyStatus(pOlder, compiled1, configMaps, "test-controller")
+	statusNewer := ComputeDesiredBackendTLSPolicyStatus(pNewer, compiled1, configMaps, "test-controller")
 
 	if len(statusOlder.Ancestors) != 1 || statusOlder.Ancestors[0].Conditions[0].Status != metav1.ConditionTrue {
 		t.Fatalf("expected older policy Accepted=True, got %v", statusOlder)
@@ -3627,9 +3626,8 @@ func TestComputeDesiredBackendTLSPolicyStatus_SectionConflictResolution(t *testi
 		ConfigMaps:         configMaps,
 	})
 
-	allPolicies2 := []*gatewayv1.BackendTLSPolicy{pA, pB}
-	statusA := ComputeDesiredBackendTLSPolicyStatus(pA, compiled2, configMaps, allPolicies2, "test-controller")
-	statusB := ComputeDesiredBackendTLSPolicyStatus(pB, compiled2, configMaps, allPolicies2, "test-controller")
+	statusA := ComputeDesiredBackendTLSPolicyStatus(pA, compiled2, configMaps, "test-controller")
+	statusB := ComputeDesiredBackendTLSPolicyStatus(pB, compiled2, configMaps, "test-controller")
 
 	if len(statusA.Ancestors) != 1 || statusA.Ancestors[0].Conditions[0].Status != metav1.ConditionTrue {
 		t.Fatalf("expected p-a Accepted=True, got %v", statusA)

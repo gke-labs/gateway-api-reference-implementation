@@ -1337,7 +1337,7 @@ func TestCompileGRPCRoute_BackendTLSWithoutPolicy_ResolvedRefsMessage(t *testing
 			},
 		}
 
-		compiled := CompileGRPCRoute(route, services, policies, nil, nil)
+		compiled := CompileGRPCRoute(route, services, ResolveBackendTLSPolicyTargets(policies, services), nil, nil)
 		if compiled == nil {
 			t.Fatalf("expected non-nil InternalGRPCRoute")
 		}

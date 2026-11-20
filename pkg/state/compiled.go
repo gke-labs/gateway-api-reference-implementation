@@ -682,13 +682,14 @@ type CompiledUDPRoute struct {
 
 // CompiledModel is the complete compiled model of Gateways, ListenerSets, HTTPRoutes, TLSRoutes, GRPCRoutes, TCPRoutes, and UDPRoutes.
 type CompiledModel struct {
-	Gateways     map[types.NamespacedName]*CompiledGateway
-	HTTPRoutes   map[types.NamespacedName]*CompiledRoute
-	TLSRoutes    map[types.NamespacedName]*CompiledTLSRoute
-	GRPCRoutes   map[types.NamespacedName]*CompiledGRPCRoute
-	TCPRoutes    map[types.NamespacedName]*CompiledTCPRoute
-	UDPRoutes    map[types.NamespacedName]*CompiledUDPRoute
-	ListenerSets map[types.NamespacedName]*gatewayv1.ListenerSet
+	Gateways                   map[types.NamespacedName]*CompiledGateway
+	HTTPRoutes                 map[types.NamespacedName]*CompiledRoute
+	TLSRoutes                  map[types.NamespacedName]*CompiledTLSRoute
+	GRPCRoutes                 map[types.NamespacedName]*CompiledGRPCRoute
+	TCPRoutes                  map[types.NamespacedName]*CompiledTCPRoute
+	UDPRoutes                  map[types.NamespacedName]*CompiledUDPRoute
+	ListenerSets               map[types.NamespacedName]*gatewayv1.ListenerSet
+	BackendTLSPolicyResolution *BackendTLSPolicyResolution
 }
 
 // GatewaysList returns all compiled gateways as a slice.
@@ -1905,13 +1906,14 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 	}
 
 	cm := &CompiledModel{
-		Gateways:     make(map[types.NamespacedName]*CompiledGateway),
-		HTTPRoutes:   make(map[types.NamespacedName]*CompiledRoute),
-		TLSRoutes:    make(map[types.NamespacedName]*CompiledTLSRoute),
-		GRPCRoutes:   make(map[types.NamespacedName]*CompiledGRPCRoute),
-		TCPRoutes:    make(map[types.NamespacedName]*CompiledTCPRoute),
-		UDPRoutes:    make(map[types.NamespacedName]*CompiledUDPRoute),
-		ListenerSets: make(map[types.NamespacedName]*gatewayv1.ListenerSet),
+		Gateways:                   make(map[types.NamespacedName]*CompiledGateway),
+		HTTPRoutes:                 make(map[types.NamespacedName]*CompiledRoute),
+		TLSRoutes:                  make(map[types.NamespacedName]*CompiledTLSRoute),
+		GRPCRoutes:                 make(map[types.NamespacedName]*CompiledGRPCRoute),
+		TCPRoutes:                  make(map[types.NamespacedName]*CompiledTCPRoute),
+		UDPRoutes:                  make(map[types.NamespacedName]*CompiledUDPRoute),
+		ListenerSets:               make(map[types.NamespacedName]*gatewayv1.ListenerSet),
+		BackendTLSPolicyResolution: ResolveBackendTLSPolicyTargets(inputs.BackendTLSPolicies, inputs.Services),
 	}
 
 	for _, ls := range inputs.ListenerSets {
@@ -2210,7 +2212,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 		rs := &HTTPRouteState{HTTPRoute: route}
-		rs.Compile(inputs.Services, inputs.BackendTLSPolicies, inputs.ConfigMaps, refValidator)
+		rs.Compile(inputs.Services, cm.BackendTLSPolicyResolution, inputs.ConfigMaps, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
 		boundListenersForRoute := make(map[*EffectiveListener]bool)
@@ -2242,7 +2244,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 		rs := &TLSRouteState{TLSRoute: route}
-		rs.Compile(inputs.Services, inputs.BackendTLSPolicies, inputs.ConfigMaps, refValidator)
+		rs.Compile(inputs.Services, cm.BackendTLSPolicyResolution, inputs.ConfigMaps, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
 		boundListenersForRoute := make(map[*EffectiveListener]bool)
@@ -2278,7 +2280,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 		rs := &GRPCRouteState{GRPCRoute: route}
-		rs.Compile(inputs.Services, inputs.BackendTLSPolicies, inputs.ConfigMaps, refValidator)
+		rs.Compile(inputs.Services, cm.BackendTLSPolicyResolution, inputs.ConfigMaps, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
 		boundListenersForRoute := make(map[*EffectiveListener]bool)
@@ -3152,7 +3154,6 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 			policy,
 			compiled,
 			inputs.ConfigMaps,
-			inputs.BackendTLSPolicies,
 			inputs.ControllerName,
 		)
 	}
@@ -3571,54 +3572,15 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	policy *gatewayv1.BackendTLSPolicy,
 	compiled *CompiledModel,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
-	allPolicies []*gatewayv1.BackendTLSPolicy,
 	controllerName string,
 ) gatewayv1.PolicyStatus {
-	isConflicted := false
-	var conflictingPolicy string
-	for _, targetRef := range policy.Spec.TargetRefs {
-		if string(targetRef.Group) != "" {
-			continue
-		}
-		if string(targetRef.Kind) != "Service" {
-			continue
-		}
-
-		targetSvcNamespace := policy.Namespace
-		targetSvcName := string(targetRef.Name)
-		targetSection := ValueOf(targetRef.SectionName)
-
-		for _, p := range allPolicies {
-			if p == nil || (p.Namespace == policy.Namespace && p.Name == policy.Name) {
-				continue
-			}
-
-			for _, t := range p.Spec.TargetRefs {
-				if string(t.Group) == "" && string(t.Kind) == "Service" {
-					if p.Namespace == targetSvcNamespace && string(t.Name) == targetSvcName && ValueOf(t.SectionName) == targetSection {
-						if p.CreationTimestamp.Time.Before(policy.CreationTimestamp.Time) {
-							isConflicted = true
-							conflictingPolicy = fmt.Sprintf("%s/%s", p.Namespace, p.Name)
-							break
-						}
-						if p.CreationTimestamp.Time.Equal(policy.CreationTimestamp.Time) {
-							if p.Namespace < policy.Namespace || (p.Namespace == policy.Namespace && p.Name < policy.Name) {
-								isConflicted = true
-								conflictingPolicy = fmt.Sprintf("%s/%s", p.Namespace, p.Name)
-								break
-							}
-						}
-					}
-				}
-			}
-			if isConflicted {
-				break
-			}
-		}
-		if isConflicted {
-			break
-		}
+	policyKey := types.NamespacedName{Namespace: policy.Namespace, Name: policy.Name}
+	var resolution *BackendTLSPolicyResolution
+	if compiled != nil {
+		resolution = compiled.BackendTLSPolicyResolution
 	}
+
+	conflictingPolicy, isConflicted := resolution.Conflict(policyKey)
 
 	var unresolvedRefs []string
 	hasInvalidKind := false
@@ -3707,16 +3669,14 @@ func ComputeDesiredBackendTLSPolicyStatus(
 				if routeMatchesGw {
 					for _, backendRef := range route.backendRefs {
 						if string(ValueOf(backendRef.Kind)) == "Service" || ValueOf(backendRef.Kind) == "" {
-							svcNs := route.namespace
+							serviceNamespace := route.namespace
 							if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
-								svcNs = string(*backendRef.Namespace)
+								serviceNamespace = string(*backendRef.Namespace)
 							}
-							for _, targetRef := range policy.Spec.TargetRefs {
-								if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
-									svcNs == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
-									usesPolicy = true
-									break
-								}
+							serviceKey := types.NamespacedName{Namespace: serviceNamespace, Name: string(backendRef.Name)}
+							if resolution.TargetsService(policyKey, serviceKey) {
+								usesPolicy = true
+								break
 							}
 						}
 						if usesPolicy {
