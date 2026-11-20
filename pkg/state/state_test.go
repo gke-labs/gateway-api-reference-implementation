@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2794,5 +2795,137 @@ func TestState_GatewayState_AddressesReadinessErrorsLifecycle(t *testing.T) {
 	}
 	if addrs := st.GetGatewayAddresses(); len(addrs) != 0 {
 		t.Errorf("expected GetGatewayAddresses to be empty after delete, got: %v", addrs)
+	}
+}
+
+func TestState_BackendTLSPolicy_PortAddedClearsCondition(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("test-controller")
+
+	certPEM, _ := generateTestCertPEM(t, "example.com")
+	st.UpsertConfigMap(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
+		Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
+	})
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	st.UpsertHTTPRoute(route)
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "backend"},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{Name: "http", Port: 80},
+			},
+		},
+	}
+	st.UpsertService(svc)
+
+	missingSection := gatewayv1.SectionName("https")
+	policyKey := types.NamespacedName{Namespace: "default", Name: "policy"}
+	policy := &gatewayv1.BackendTLSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "policy", Namespace: "default", Generation: 1},
+		Spec: gatewayv1.BackendTLSPolicySpec{
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+						Group: "",
+						Kind:  "Service",
+						Name:  "backend",
+					},
+					SectionName: &missingSection,
+				},
+			},
+			Validation: gatewayv1.BackendTLSPolicyValidation{
+				Hostname: "backend.example.com",
+				CACertificateRefs: []gatewayv1.LocalObjectReference{
+					{Group: "", Kind: "ConfigMap", Name: "valid-ca"},
+				},
+			},
+		},
+	}
+	st.UpsertBackendTLSPolicy(policy)
+
+	qPolicy := newTestQueue()
+	if err := st.BackendTLSPolicySource().Start(t.Context(), qPolicy); err != nil {
+		t.Fatalf("failed to start BackendTLSPolicy source: %v", err)
+	}
+
+	st.Recompute()
+
+	status, ok := st.GetDesiredBackendTLSPolicyStatus(policyKey)
+	if !ok {
+		t.Fatalf("expected desired status for policy")
+	}
+	if len(status.Ancestors) != 1 {
+		t.Fatalf("expected 1 ancestor, got %d", len(status.Ancestors))
+	}
+	refsCond := findCondition(status.Ancestors[0].Conditions, string(gatewayv1.BackendTLSPolicyConditionResolvedRefs))
+	if refsCond == nil || refsCond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected ResolvedRefs=False before port is added, got %+v", refsCond)
+	}
+	if refsCond.Reason != string(gatewayv1.PolicyReasonTargetNotFound) {
+		t.Errorf("expected ResolvedRefs reason %q, got %q", gatewayv1.PolicyReasonTargetNotFound, refsCond.Reason)
+	}
+	if !strings.Contains(refsCond.Message, "backend") || !strings.Contains(refsCond.Message, "https") {
+		t.Errorf("expected message to mention backend and https, got %q", refsCond.Message)
+	}
+
+	// Now add the port to the Service and recompute
+	svcWithPort := svc.DeepCopy()
+	svcWithPort.Spec.Ports = append(svcWithPort.Spec.Ports, corev1.ServicePort{Name: "https", Port: 443})
+	st.UpsertService(svcWithPort)
+	st.Recompute()
+
+	status, ok = st.GetDesiredBackendTLSPolicyStatus(policyKey)
+	if !ok {
+		t.Fatalf("expected desired status for policy after update")
+	}
+	refsCond = findCondition(status.Ancestors[0].Conditions, string(gatewayv1.BackendTLSPolicyConditionResolvedRefs))
+	if refsCond == nil || refsCond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected ResolvedRefs=True after port is added, got %+v", refsCond)
+	}
+	if refsCond.Reason != string(gatewayv1.BackendTLSPolicyReasonResolvedRefs) {
+		t.Errorf("expected ResolvedRefs reason %q, got %q", gatewayv1.BackendTLSPolicyReasonResolvedRefs, refsCond.Reason)
+	}
+	if refsCond.Message != "All references resolved" {
+		t.Errorf("expected message 'All references resolved', got %q", refsCond.Message)
 	}
 }

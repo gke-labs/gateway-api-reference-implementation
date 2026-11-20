@@ -3235,6 +3235,431 @@ func TestComputeOutputs_BackendTLSPolicy_SectionNameMatching(t *testing.T) {
 	}
 }
 
+func TestComputeOutputs_BackendTLSPolicy_MissingPortSectionName(t *testing.T) {
+	certPEM, _ := generateTestCertPEM(t, "example.com")
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "valid-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
+		},
+	}
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "backend"},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Name: "http", Port: 80},
+				},
+			},
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	missingSection := gatewayv1.SectionName("https")
+	policy := &gatewayv1.BackendTLSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "policy", Namespace: "default", Generation: 1},
+		Spec: gatewayv1.BackendTLSPolicySpec{
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+						Group: "",
+						Kind:  "Service",
+						Name:  "backend",
+					},
+					SectionName: &missingSection,
+				},
+			},
+			Validation: gatewayv1.BackendTLSPolicyValidation{
+				Hostname: "backend.example.com",
+				CACertificateRefs: []gatewayv1.LocalObjectReference{
+					{Group: "", Kind: "ConfigMap", Name: "valid-ca"},
+				},
+			},
+		},
+	}
+
+	outputs := ComputeOutputs(ModelInputs{
+		Gateways:           []*gatewayv1.Gateway{gw},
+		GatewayClasses:     []*gatewayv1.GatewayClass{gc},
+		HTTPRoutes:         []*gatewayv1.HTTPRoute{route},
+		BackendTLSPolicies: []*gatewayv1.BackendTLSPolicy{policy},
+		ConfigMaps:         configMaps,
+		Services:           services,
+		ControllerName:     "test-controller",
+	})
+
+	policyStatus, ok := outputs.BackendTLSPolicyStatuses[types.NamespacedName{Namespace: "default", Name: "policy"}]
+	if !ok {
+		t.Fatalf("expected policy status for policy")
+	}
+	if len(policyStatus.Ancestors) != 1 {
+		t.Fatalf("expected 1 ancestor, got %d", len(policyStatus.Ancestors))
+	}
+
+	anc := policyStatus.Ancestors[0]
+	var acceptedCond, refsCond *metav1.Condition
+	for i := range anc.Conditions {
+		c := &anc.Conditions[i]
+		if c.Type == string(gatewayv1.PolicyConditionAccepted) {
+			acceptedCond = c
+		} else if c.Type == string(gatewayv1.BackendTLSPolicyConditionResolvedRefs) {
+			refsCond = c
+		}
+	}
+
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Accepted=True, got %v", acceptedCond)
+	}
+	if refsCond == nil {
+		t.Fatalf("missing ResolvedRefs condition")
+	}
+	if refsCond.Status != metav1.ConditionFalse {
+		t.Errorf("expected ResolvedRefs=False, got %v", refsCond.Status)
+	}
+	if refsCond.Reason != string(gatewayv1.PolicyReasonTargetNotFound) {
+		t.Errorf("expected ResolvedRefs reason %q, got %q", gatewayv1.PolicyReasonTargetNotFound, refsCond.Reason)
+	}
+	if !strings.Contains(refsCond.Message, "backend") || !strings.Contains(refsCond.Message, "https") {
+		t.Errorf("expected ResolvedRefs message to contain Service 'backend' and port 'https', got %q", refsCond.Message)
+	}
+}
+
+func TestComputeOutputs_BackendTLSPolicy_PortAddedClearsCondition(t *testing.T) {
+	certPEM, _ := generateTestCertPEM(t, "example.com")
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "valid-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
+		},
+	}
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "backend"},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Name: "http", Port: 80},
+				},
+			},
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	missingSection := gatewayv1.SectionName("https")
+	policy := &gatewayv1.BackendTLSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "policy", Namespace: "default", Generation: 1},
+		Spec: gatewayv1.BackendTLSPolicySpec{
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+						Group: "",
+						Kind:  "Service",
+						Name:  "backend",
+					},
+					SectionName: &missingSection,
+				},
+			},
+			Validation: gatewayv1.BackendTLSPolicyValidation{
+				Hostname: "backend.example.com",
+				CACertificateRefs: []gatewayv1.LocalObjectReference{
+					{Group: "", Kind: "ConfigMap", Name: "valid-ca"},
+				},
+			},
+		},
+	}
+
+	// 1. Initial compute: missing port causes ResolvedRefs=False
+	outputs1 := ComputeOutputs(ModelInputs{
+		Gateways:           []*gatewayv1.Gateway{gw},
+		GatewayClasses:     []*gatewayv1.GatewayClass{gc},
+		HTTPRoutes:         []*gatewayv1.HTTPRoute{route},
+		BackendTLSPolicies: []*gatewayv1.BackendTLSPolicy{policy},
+		ConfigMaps:         configMaps,
+		Services:           services,
+		ControllerName:     "test-controller",
+	})
+
+	policyStatus1 := outputs1.BackendTLSPolicyStatuses[types.NamespacedName{Namespace: "default", Name: "policy"}]
+	var refsCond1 *metav1.Condition
+	for i := range policyStatus1.Ancestors[0].Conditions {
+		if policyStatus1.Ancestors[0].Conditions[i].Type == string(gatewayv1.BackendTLSPolicyConditionResolvedRefs) {
+			refsCond1 = &policyStatus1.Ancestors[0].Conditions[i]
+		}
+	}
+	if refsCond1 == nil || refsCond1.Status != metav1.ConditionFalse {
+		t.Fatalf("expected ResolvedRefs=False before port is added, got %v", refsCond1)
+	}
+
+	// 2. Add the port to the Service: condition clears to ResolvedRefs=True
+	servicesUpdated := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "backend"},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Name: "http", Port: 80},
+					{Name: "https", Port: 443},
+				},
+			},
+		},
+	}
+
+	outputs2 := ComputeOutputs(ModelInputs{
+		Gateways:           []*gatewayv1.Gateway{gw},
+		GatewayClasses:     []*gatewayv1.GatewayClass{gc},
+		HTTPRoutes:         []*gatewayv1.HTTPRoute{route},
+		BackendTLSPolicies: []*gatewayv1.BackendTLSPolicy{policy},
+		ConfigMaps:         configMaps,
+		Services:           servicesUpdated,
+		ControllerName:     "test-controller",
+	})
+
+	policyStatus2 := outputs2.BackendTLSPolicyStatuses[types.NamespacedName{Namespace: "default", Name: "policy"}]
+	var refsCond2 *metav1.Condition
+	for i := range policyStatus2.Ancestors[0].Conditions {
+		if policyStatus2.Ancestors[0].Conditions[i].Type == string(gatewayv1.BackendTLSPolicyConditionResolvedRefs) {
+			refsCond2 = &policyStatus2.Ancestors[0].Conditions[i]
+		}
+	}
+	if refsCond2 == nil || refsCond2.Status != metav1.ConditionTrue {
+		t.Fatalf("expected ResolvedRefs=True after port is added, got %v", refsCond2)
+	}
+	if refsCond2.Reason != string(gatewayv1.BackendTLSPolicyReasonResolvedRefs) {
+		t.Errorf("expected ResolvedRefs reason %q, got %q", gatewayv1.BackendTLSPolicyReasonResolvedRefs, refsCond2.Reason)
+	}
+	if refsCond2.Message != "All references resolved" {
+		t.Errorf("expected message 'All references resolved', got %q", refsCond2.Message)
+	}
+}
+
+func TestComputeOutputs_BackendTLSPolicy_MultipleTargetRefs_PartialMatch(t *testing.T) {
+	certPEM, _ := generateTestCertPEM(t, "example.com")
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "valid-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
+		},
+	}
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "backend"},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Name: "http", Port: 80},
+					{Name: "https", Port: 443},
+				},
+			},
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	port443 := gatewayv1.PortNumber(443)
+	port80 := gatewayv1.PortNumber(80)
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend",
+									Port: &port443,
+								},
+							},
+						},
+					},
+				},
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend",
+									Port: &port80,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	goodSection := gatewayv1.SectionName("https")
+	missingSection := gatewayv1.SectionName("nonexistent")
+	policy := &gatewayv1.BackendTLSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "policy", Namespace: "default", Generation: 1},
+		Spec: gatewayv1.BackendTLSPolicySpec{
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+						Group: "",
+						Kind:  "Service",
+						Name:  "backend",
+					},
+					SectionName: &goodSection,
+				},
+				{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+						Group: "",
+						Kind:  "Service",
+						Name:  "backend",
+					},
+					SectionName: &missingSection,
+				},
+			},
+			Validation: gatewayv1.BackendTLSPolicyValidation{
+				Hostname: "backend.example.com",
+				CACertificateRefs: []gatewayv1.LocalObjectReference{
+					{Group: "", Kind: "ConfigMap", Name: "valid-ca"},
+				},
+			},
+		},
+	}
+
+	outputs := ComputeOutputs(ModelInputs{
+		Gateways:           []*gatewayv1.Gateway{gw},
+		GatewayClasses:     []*gatewayv1.GatewayClass{gc},
+		HTTPRoutes:         []*gatewayv1.HTTPRoute{route},
+		BackendTLSPolicies: []*gatewayv1.BackendTLSPolicy{policy},
+		ConfigMaps:         configMaps,
+		Services:           services,
+		ControllerName:     "test-controller",
+	})
+
+	policyStatus := outputs.BackendTLSPolicyStatuses[types.NamespacedName{Namespace: "default", Name: "policy"}]
+	if len(policyStatus.Ancestors) != 1 {
+		t.Fatalf("expected 1 ancestor, got %d", len(policyStatus.Ancestors))
+	}
+
+	anc := policyStatus.Ancestors[0]
+	var acceptedCond, refsCond *metav1.Condition
+	for i := range anc.Conditions {
+		if anc.Conditions[i].Type == string(gatewayv1.PolicyConditionAccepted) {
+			acceptedCond = &anc.Conditions[i]
+		} else if anc.Conditions[i].Type == string(gatewayv1.BackendTLSPolicyConditionResolvedRefs) {
+			refsCond = &anc.Conditions[i]
+		}
+	}
+
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Accepted=True, got %v", acceptedCond)
+	}
+	if refsCond == nil || refsCond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected ResolvedRefs=False, got %v", refsCond)
+	}
+	if refsCond.Reason != string(gatewayv1.PolicyReasonTargetNotFound) {
+		t.Errorf("expected ResolvedRefs reason %q, got %q", gatewayv1.PolicyReasonTargetNotFound, refsCond.Reason)
+	}
+	if !strings.Contains(refsCond.Message, "backend") || !strings.Contains(refsCond.Message, "nonexistent") {
+		t.Errorf("expected ResolvedRefs message to contain Service 'backend' and port 'nonexistent', got %q", refsCond.Message)
+	}
+
+	// Policy still applies to the good port (443)
+	crMatching := outputs.ProxyListeners[0].Routes[0].Rules[0].Backends[0]
+	if crMatching.Port != 443 {
+		t.Fatalf("expected Rule 0 to target port 443, got %d", crMatching.Port)
+	}
+	if crMatching.TLSConfig == nil || crMatching.AppProtocol == nil || *crMatching.AppProtocol != "https" {
+		t.Errorf("expected policy to apply to good port 443, got TLSConfig=%v, AppProtocol=%v", crMatching.TLSConfig, crMatching.AppProtocol)
+	}
+
+	// Policy does not apply to port 80
+	crNonMatching := outputs.ProxyListeners[0].Routes[0].Rules[1].Backends[0]
+	if crNonMatching.Port != 80 {
+		t.Fatalf("expected Rule 1 to target port 80, got %d", crNonMatching.Port)
+	}
+	if crNonMatching.TLSConfig != nil {
+		t.Errorf("expected policy not to apply to port 80, got TLSConfig=%v", crNonMatching.TLSConfig)
+	}
+}
+
 func TestComputeOutputs_BackendTLSPolicy_WellKnownCACertificatesSystem(t *testing.T) {
 	services := map[types.NamespacedName]*corev1.Service{
 		{Namespace: "default", Name: "my-service"}: {
