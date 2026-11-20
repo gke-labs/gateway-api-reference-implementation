@@ -24,7 +24,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
@@ -33,6 +32,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 )
 
@@ -42,11 +42,6 @@ const (
 
 	// defaultInternalAPIClientMaxBackoff is the maximum backoff delay between reconnect attempts.
 	defaultInternalAPIClientMaxBackoff = 30 * time.Second
-
-	// stableConnectionThreshold is the duration a connection must remain healthy
-	// before reconnect backoff is reset to the minimum backoff. This prevents
-	// flapping connections from repeatedly connecting without backoff.
-	stableConnectionThreshold = 2 * time.Second
 )
 
 // internalAPIClient connects to the controller's internal API Service over TLS
@@ -55,44 +50,22 @@ type internalAPIClient struct {
 	// server is the parent GARI server whose proxy configuration is updated.
 	server *Server
 
-	// address is the host and port of the controller's internal API Service.
-	address string
-
-	// caFile is the path to the trust bundle that verifies the controller's certificate.
-	caFile string
-
-	// tokenFile is the path to the projected ServiceAccount token for data-plane identity.
-	tokenFile string
-
-	// gatewayNamespace is the namespace of the Gateway this data plane serves.
-	gatewayNamespace string
-
-	// gatewayName is the name of the Gateway this data plane serves.
-	gatewayName string
+	// options holds the data plane configuration options.
+	options Options
 
 	// minBackoff is the initial backoff delay before reconnect attempts.
 	minBackoff time.Duration
 
 	// maxBackoff is the maximum backoff delay before reconnect attempts.
 	maxBackoff time.Duration
-
-	// mu guards appliedRevision.
-	mu sync.Mutex
-
-	// appliedRevision is the configuration revision currently applied by the proxy.
-	appliedRevision string
 }
 
 func newInternalAPIClient(server *Server, options Options) *internalAPIClient {
 	return &internalAPIClient{
-		server:           server,
-		address:          options.InternalAPIAddress,
-		caFile:           options.InternalAPICAFile,
-		tokenFile:        options.InternalAPITokenFile,
-		gatewayNamespace: options.DataplaneGatewayNamespace,
-		gatewayName:      options.DataplaneGatewayName,
-		minBackoff:       defaultInternalAPIClientMinBackoff,
-		maxBackoff:       defaultInternalAPIClientMaxBackoff,
+		server:     server,
+		options:    options,
+		minBackoff: defaultInternalAPIClientMinBackoff,
+		maxBackoff: defaultInternalAPIClientMaxBackoff,
 	}
 }
 
@@ -123,25 +96,14 @@ func (client *internalAPIClient) run(ctx context.Context) error {
 	backoff := client.minBackoff
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-
-		connected := false
-		startTime := time.Now()
-		err := client.runStream(ctx, func() {
-			connected = true
-		})
-
+		receivedMessage, err := client.runStream(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
 
 		logger.Error(err, "dataplane internal API stream disconnected, retrying",
-			"gatewayNamespace", client.gatewayNamespace,
-			"gatewayName", client.gatewayName,
+			"gatewayNamespace", client.options.DataplaneGatewayNamespace,
+			"gatewayName", client.options.DataplaneGatewayName,
 			"backoff", backoff,
 		)
 
@@ -151,7 +113,7 @@ func (client *internalAPIClient) run(ctx context.Context) error {
 		case <-time.After(backoff):
 		}
 
-		if connected || time.Since(startTime) > stableConnectionThreshold {
+		if receivedMessage {
 			backoff = client.minBackoff
 		} else {
 			backoff = min(backoff*2, client.maxBackoff)
@@ -159,25 +121,26 @@ func (client *internalAPIClient) run(ctx context.Context) error {
 	}
 }
 
-func (client *internalAPIClient) runStream(ctx context.Context, onConnected func()) error {
+func (client *internalAPIClient) runStream(ctx context.Context) (bool, error) {
 	logger := klog.FromContext(ctx)
+	receivedMessage := false
 
-	tokenBytes, err := os.ReadFile(client.tokenFile)
+	tokenBytes, err := os.ReadFile(client.options.InternalAPITokenFile)
 	if err != nil {
-		return fmt.Errorf("reading token file %q: %w", client.tokenFile, err)
+		return receivedMessage, fmt.Errorf("reading token file %q: %w", client.options.InternalAPITokenFile, err)
 	}
 	token := strings.TrimSpace(string(tokenBytes))
 	if token == "" {
-		return fmt.Errorf("token file %q is empty", client.tokenFile)
+		return receivedMessage, fmt.Errorf("token file %q is empty", client.options.InternalAPITokenFile)
 	}
 
-	tlsConfig, err := loadTLSConfig(client.caFile, client.address)
+	tlsConfig, err := loadTLSConfig(client.options.InternalAPICAFile, client.options.InternalAPIAddress)
 	if err != nil {
-		return err
+		return receivedMessage, err
 	}
 
 	conn, err := grpc.NewClient(
-		client.address,
+		client.options.InternalAPIAddress,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(push.MaxMessageBytes),
@@ -185,7 +148,7 @@ func (client *internalAPIClient) runStream(ctx context.Context, onConnected func
 		),
 	)
 	if err != nil {
-		return fmt.Errorf("creating gRPC client for %s: %w", client.address, err)
+		return receivedMessage, fmt.Errorf("creating gRPC client for %s: %w", client.options.InternalAPIAddress, err)
 	}
 	defer func() {
 		if closeErr := conn.Close(); closeErr != nil {
@@ -197,39 +160,37 @@ func (client *internalAPIClient) runStream(ctx context.Context, onConnected func
 	streamCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 	stream, err := pushClient.StreamConfig(streamCtx)
 	if err != nil {
-		return fmt.Errorf("opening push stream: %w", err)
+		return receivedMessage, fmt.Errorf("opening push stream: %w", err)
 	}
 
-	client.mu.Lock()
-	appliedRevision := client.appliedRevision
-	client.mu.Unlock()
+	gatewayKey := types.NamespacedName{
+		Namespace: client.options.DataplaneGatewayNamespace,
+		Name:      client.options.DataplaneGatewayName,
+	}.String()
+	appliedRevision := client.server.AppliedRevision(gatewayKey)
 
 	hello := &push.DataplaneMessage{
 		Body: &push.DataplaneMessage_Hello{
 			Hello: &push.Hello{
-				GatewayNamespace: client.gatewayNamespace,
-				GatewayName:      client.gatewayName,
+				GatewayNamespace: client.options.DataplaneGatewayNamespace,
+				GatewayName:      client.options.DataplaneGatewayName,
 				AppliedRevision:  appliedRevision,
 			},
 		},
 	}
 	if err := stream.Send(hello); err != nil {
-		return fmt.Errorf("sending Hello: %w", err)
+		return receivedMessage, fmt.Errorf("sending Hello: %w", err)
 	}
 
 	for {
 		message, err := stream.Recv()
 		if err != nil {
 			if errors.Is(err, io.EOF) || status.Code(err) == codes.Canceled || errors.Is(err, context.Canceled) {
-				return err
+				return receivedMessage, err
 			}
-			return fmt.Errorf("push stream recv: %w", err)
+			return receivedMessage, fmt.Errorf("push stream recv: %w", err)
 		}
-
-		if onConnected != nil {
-			onConnected()
-			onConnected = nil
-		}
+		receivedMessage = true
 
 		config := message.GetConfig()
 		if config == nil {
@@ -237,14 +198,14 @@ func (client *internalAPIClient) runStream(ctx context.Context, onConnected func
 		}
 
 		revision := config.Revision
-		applyErr := client.server.applyDataplaneConfig(config.DataplaneConfig)
-		if applyErr != nil {
+		var reply *push.DataplaneMessage
+		if applyErr := client.server.applyDataplaneConfig(config.DataplaneConfig); applyErr != nil {
 			logger.Error(applyErr, "failed to apply dataplane config",
-				"gatewayNamespace", client.gatewayNamespace,
-				"gatewayName", client.gatewayName,
+				"gatewayNamespace", client.options.DataplaneGatewayNamespace,
+				"gatewayName", client.options.DataplaneGatewayName,
 				"revision", revision,
 			)
-			nack := &push.DataplaneMessage{
+			reply = &push.DataplaneMessage{
 				Body: &push.DataplaneMessage_Nack{
 					Nack: &push.Nack{
 						Revision: revision,
@@ -252,24 +213,17 @@ func (client *internalAPIClient) runStream(ctx context.Context, onConnected func
 					},
 				},
 			}
-			if sendErr := stream.Send(nack); sendErr != nil {
-				return fmt.Errorf("sending Nack: %w", sendErr)
-			}
 		} else {
-			client.mu.Lock()
-			client.appliedRevision = revision
-			client.mu.Unlock()
-
-			ack := &push.DataplaneMessage{
+			reply = &push.DataplaneMessage{
 				Body: &push.DataplaneMessage_Ack{
 					Ack: &push.Ack{
 						AppliedRevision: revision,
 					},
 				},
 			}
-			if sendErr := stream.Send(ack); sendErr != nil {
-				return fmt.Errorf("sending Ack: %w", sendErr)
-			}
+		}
+		if err := stream.Send(reply); err != nil {
+			return receivedMessage, fmt.Errorf("sending reply: %w", err)
 		}
 	}
 }

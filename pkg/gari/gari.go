@@ -576,6 +576,8 @@ func New(opts Options) (*Server, error) {
 	}
 
 	if opts.DataplaneMode && opts.InternalAPIAddress != "" {
+		// In stream mode, the data plane starts no controller manager because it needs
+		// no access to the Kubernetes API. Health and readiness endpoints are served directly.
 		if opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
 			mux := http.NewServeMux()
 			for path, handler := range s.healthEndpoints() {
@@ -774,6 +776,13 @@ func (s *Server) recordAppliedRevision(gatewayKey, revision string) {
 		s.appliedRevisions = make(map[string]string)
 	}
 	s.appliedRevisions[gatewayKey] = revision
+}
+
+// AppliedRevision returns the applied revision for the given gatewayKey, or empty string if none.
+func (s *Server) AppliedRevision(gatewayKey string) string {
+	s.appliedMu.RLock()
+	defer s.appliedMu.RUnlock()
+	return s.appliedRevisions[gatewayKey]
 }
 
 func (s *Server) appliedHandler() http.Handler {

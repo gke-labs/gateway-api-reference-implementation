@@ -79,10 +79,8 @@ func generateTestCA(t *testing.T) []byte {
 	}
 
 	caTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"Test CA"},
-		},
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"Test CA"}},
 		NotBefore:             time.Now().Add(-1 * time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		IsCA:                  true,
@@ -105,10 +103,8 @@ func generateTestCAAndServerCert(t *testing.T) ([]byte, tls.Certificate) {
 	}
 
 	caTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"Test CA"},
-		},
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"Test CA"}},
 		NotBefore:             time.Now().Add(-1 * time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		IsCA:                  true,
@@ -128,10 +124,8 @@ func generateTestCAAndServerCert(t *testing.T) ([]byte, tls.Certificate) {
 	}
 
 	serverTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			Organization: []string{"Internal API Server"},
-		},
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{Organization: []string{"Internal API Server"}},
 		NotBefore:             time.Now().Add(-1 * time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
@@ -197,13 +191,21 @@ func startTestPushServer(t *testing.T, server *push.Server, addr string, serverT
 	return actualAddr, stop
 }
 
-// TestInternalAPIClient_ConnectAndApply tests:
-//   - The data plane connects, receives its Gateway's config, serves a request through the proxy,
-//     and the controller's WaitApplied reports one data plane applied.
-//   - A config the proxy rejects produces a Nack, and WaitApplied reports the rejection with the reason.
-func TestInternalAPIClient_ConnectAndApply(t *testing.T) {
+type internalAPITestHarness struct {
+	gateway        *gatewayv1.Gateway
+	gwKey          types.NamespacedName
+	pushServer     *push.Server
+	serverAddr     string
+	serverCert     tls.Certificate
+	stopPushServer func()
+	reviewer       *fakeTokenReviewer
+	backend        *httptest.Server
+	proxyAddr      string
+}
+
+func setupInternalAPITest(t *testing.T, initialRevision string) (*internalAPITestHarness, context.Context) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
 
 	const (
 		gwNamespace = "test-ns"
@@ -220,9 +222,7 @@ func TestInternalAPIClient_ConnectAndApply(t *testing.T) {
 			tokenVal: {Namespace: gwNamespace, Name: singlepod.ResourceNameForGateway(gwName)},
 		},
 	}
-	pushServer, err := push.NewServer(push.ServerOptions{
-		TokenReviewer: reviewer,
-	})
+	pushServer, err := push.NewServer(push.ServerOptions{TokenReviewer: reviewer})
 	if err != nil {
 		t.Fatalf("push.NewServer failed: %v", err)
 	}
@@ -239,7 +239,6 @@ func TestInternalAPIClient_ConnectAndApply(t *testing.T) {
 	}
 
 	serverAddr, stopServer := startTestPushServer(t, pushServer, "", serverTLSCert)
-	defer stopServer()
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -247,16 +246,6 @@ func TestInternalAPIClient_ConnectAndApply(t *testing.T) {
 			t.Errorf("failed to write backend response: %v", writeErr)
 		}
 	}))
-	defer backend.Close()
-
-	backendHost, backendPortStr, err := net.SplitHostPort(backend.Listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to split backend host port: %v", err)
-	}
-	backendPort, err := strconv.Atoi(backendPortStr)
-	if err != nil {
-		t.Fatalf("failed to parse backend port: %v", err)
-	}
 
 	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -264,29 +253,20 @@ func TestInternalAPIClient_ConnectAndApply(t *testing.T) {
 	}
 	proxyAddr := proxyLn.Addr().String()
 
-	route1 := state.InternalRoute{
-		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
-		Rules: []state.InternalRule{
-			{
-				Matches: []state.InternalMatch{
-					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/test"}},
-				},
-				Backends: []state.InternalBackend{
-					{Host: backendHost, Port: gatewayv1.PortNumber(backendPort), Weight: 1},
-				},
-			},
-		},
+	harness := &internalAPITestHarness{
+		gateway:        gateway,
+		gwKey:          gwKey,
+		pushServer:     pushServer,
+		serverAddr:     serverAddr,
+		serverCert:     serverTLSCert,
+		stopPushServer: stopServer,
+		reviewer:       reviewer,
+		backend:        backend,
+		proxyAddr:      proxyAddr,
 	}
-	dataplaneConfig, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
-		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
-	}, []state.InternalRoute{route1}, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("BuildDataplaneConfig failed: %v", err)
-	}
-	dataplaneConfig.Revision = "rev-1"
 
-	if err := pushServer.PublishDataplaneConfig(ctx, gateway, dataplaneConfig); err != nil {
-		t.Fatalf("PublishDataplaneConfig rev-1 failed: %v", err)
+	if initialRevision != "" {
+		harness.publishConfig(ctx, t, initialRevision, backend.Listener.Addr().String(), "")
 	}
 
 	options := DefaultOptions()
@@ -313,354 +293,167 @@ func TestInternalAPIClient_ConnectAndApply(t *testing.T) {
 		serverErr <- server.Start(ctx)
 	}()
 
-	var result1 state.PublishResult
-	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		res, waitErr := pushServer.WaitApplied(ctx, gateway, "rev-1")
-		if waitErr != nil {
-			return false, waitErr
+	t.Cleanup(func() {
+		cancel()
+		if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
+			t.Errorf("server.Start error: %v", startErr)
 		}
-		if res.Applied == 1 {
-			result1 = res
-			return true, nil
-		}
-		return false, nil
+		backend.Close()
+		stopServer()
 	})
-	if err != nil {
-		t.Fatalf("timed out waiting for WaitApplied rev-1: %v (last result: %+v)", err, result1)
+
+	if initialRevision != "" {
+		harness.waitApplied(ctx, t, pushServer, initialRevision, 1)
 	}
 
-	req1, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+proxyAddr+"/test", nil)
+	return harness, ctx
+}
+
+func (h *internalAPITestHarness) requestProxy(ctx context.Context, t *testing.T, host, path string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+h.proxyAddr+path, nil)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
 	}
-	req1.Host = "example.com"
-	resp1, err := http.DefaultClient.Do(req1)
+	req.Host = host
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request through proxy failed: %v", err)
 	}
-	body1, err := io.ReadAll(resp1.Body)
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Errorf("failed to close body: %v", closeErr)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("failed to read response body: %v", err)
+		t.Fatalf("failed to read body: %v", err)
 	}
-	if err := resp1.Body.Close(); err != nil {
-		t.Errorf("failed to close response body: %v", err)
+	return resp.StatusCode, string(body)
+}
+
+func (h *internalAPITestHarness) publishConfig(ctx context.Context, t *testing.T, revision, backendAddr string, clientCertID string) {
+	t.Helper()
+	h.publishConfigOnServer(ctx, t, h.pushServer, revision, backendAddr, clientCertID)
+}
+
+func (h *internalAPITestHarness) publishConfigOnServer(ctx context.Context, t *testing.T, targetServer *push.Server, revision, backendAddr string, clientCertID ...string) {
+	t.Helper()
+	host, portStr, err := net.SplitHostPort(backendAddr)
+	if err != nil {
+		t.Fatalf("failed to split backend host port: %v", err)
 	}
-	if resp1.StatusCode != http.StatusOK || string(body1) != "backend response" {
-		t.Errorf("expected 200 OK 'backend response', got %d %q", resp1.StatusCode, string(body1))
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("failed to parse backend port: %v", err)
 	}
 
-	// Reject invalid config with missing cert ID
-	invalidConfig := &state.DataplaneConfig{
-		GatewayName: gwKey,
-		Revision:    "rev-reject",
-		Listeners: []state.InternalListener{
+	backend := state.InternalBackend{
+		Host:   host,
+		Port:   gatewayv1.PortNumber(port),
+		Weight: 1,
+	}
+	if len(clientCertID) > 0 && clientCertID[0] != "" {
+		backend.TLSConfig = &state.InternalTLSConfig{ClientCertID: clientCertID[0]}
+	}
+
+	route := state.InternalRoute{
+		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
+		Rules: []state.InternalRule{
 			{
-				Name:     "http",
-				Port:     80,
-				Protocol: gatewayv1.HTTPProtocolType,
-				Routes: []state.InternalRoute{
-					{
-						Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
-						Rules: []state.InternalRule{
-							{
-								Backends: []state.InternalBackend{
-									{
-										Host: "bad-cert-host",
-										Port: 8080,
-										TLSConfig: &state.InternalTLSConfig{
-											ClientCertID: "non-existent-cert-id",
-										},
-									},
-								},
-							},
-						},
-					},
-				},
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/test"}}},
+				Backends: []state.InternalBackend{backend},
 			},
 		},
 	}
-	if err := pushServer.PublishDataplaneConfig(ctx, gateway, invalidConfig); err != nil {
-		t.Fatalf("PublishDataplaneConfig rev-reject failed: %v", err)
+	config, err := state.BuildDataplaneConfig(h.gwKey, []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route}},
+	}, []state.InternalRoute{route}, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig failed: %v", err)
 	}
+	config.Revision = revision
 
-	var resultReject state.PublishResult
-	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		res, waitErr := pushServer.WaitApplied(ctx, gateway, "rev-reject")
+	if err := targetServer.PublishDataplaneConfig(ctx, h.gateway, config); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed: %v", err)
+	}
+}
+
+func (h *internalAPITestHarness) waitApplied(ctx context.Context, t *testing.T, targetServer *push.Server, revision string, wantApplied int) state.PublishResult {
+	t.Helper()
+	var result state.PublishResult
+	err := wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		res, waitErr := targetServer.WaitApplied(ctx, h.gateway, revision)
 		if waitErr != nil {
 			return false, waitErr
 		}
-		if len(res.Rejections) == 1 {
-			resultReject = res
+		if wantApplied > 0 && res.Applied == wantApplied {
+			result = res
+			return true, nil
+		}
+		if wantApplied == 0 && len(res.Rejections) > 0 {
+			result = res
 			return true, nil
 		}
 		return false, nil
 	})
 	if err != nil {
-		t.Fatalf("timed out waiting for WaitApplied rev-reject: %v (last result: %+v)", err, resultReject)
+		t.Fatalf("timed out waiting for revision %q: %v (last result: %+v)", revision, err, result)
 	}
-	if resultReject.Applied != 0 {
-		t.Errorf("expected Applied=0, got %d", resultReject.Applied)
+	return result
+}
+
+// TestInternalAPIClient_ConnectAndApply tests:
+//   - The data plane connects, receives its Gateway's config, serves a request through the proxy,
+//     and the controller's WaitApplied reports one data plane applied.
+//   - A config the proxy rejects produces a Nack, and WaitApplied reports the rejection with the reason.
+func TestInternalAPIClient_ConnectAndApply(t *testing.T) {
+	harness, ctx := setupInternalAPITest(t, "rev-1")
+
+	// Verify request through proxy
+	code, body := harness.requestProxy(ctx, t, "example.com", "/test")
+	if code != http.StatusOK || body != "backend response" {
+		t.Errorf("got %d %q, want 200 'backend response'", code, body)
 	}
-	if len(resultReject.Rejections) != 1 {
-		t.Fatalf("expected 1 rejection, got %d", len(resultReject.Rejections))
-	}
-	if !strings.Contains(resultReject.Rejections[0].Reason, "missing from certificates") {
-		t.Errorf("expected rejection reason to mention 'missing from certificates', got %q", resultReject.Rejections[0].Reason)
+
+	// Reject invalid config with missing cert ID
+	harness.publishConfig(ctx, t, "rev-reject", harness.backend.Listener.Addr().String(), "non-existent-cert-id")
+	result := harness.waitApplied(ctx, t, harness.pushServer, "rev-reject", 0)
+	if result.Applied != 0 || len(result.Rejections) != 1 || !strings.Contains(result.Rejections[0].Reason, "missing from certificates") {
+		t.Errorf("unexpected rejections for invalid config: %+v", result)
 	}
 
 	// Proxy continues serving the in-memory rev-1 config after rejecting rev-reject
-	reqStill1, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+proxyAddr+"/test", nil)
-	if err != nil {
-		t.Fatalf("failed to create request: %v", err)
-	}
-	reqStill1.Host = "example.com"
-	respStill1, err := http.DefaultClient.Do(reqStill1)
-	if err != nil {
-		t.Fatalf("request through proxy failed after rejection: %v", err)
-	}
-	bodyStill1, err := io.ReadAll(respStill1.Body)
-	if err != nil {
-		t.Fatalf("failed to read body: %v", err)
-	}
-	if err := respStill1.Body.Close(); err != nil {
-		t.Errorf("failed to close body: %v", err)
-	}
-	if respStill1.StatusCode != http.StatusOK || string(bodyStill1) != "backend response" {
-		t.Errorf("expected 200 OK 'backend response' after rejection, got %d %q", respStill1.StatusCode, string(bodyStill1))
-	}
-
-	cancel()
-	if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
-		t.Errorf("server.Start error: %v", startErr)
+	code, body = harness.requestProxy(ctx, t, "example.com", "/test")
+	if code != http.StatusOK || body != "backend response" {
+		t.Errorf("got %d %q after rejection, want 200 'backend response'", code, body)
 	}
 }
 
 // TestInternalAPIClient_SecondConfigAfterChange tests:
 // - A second config after a change is applied and acknowledged.
 func TestInternalAPIClient_SecondConfigAfterChange(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
+	harness, ctx := setupInternalAPITest(t, "rev-1")
 
-	const (
-		gwNamespace = "test-ns"
-		gwName      = "test-gw"
-		tokenVal    = "valid-token-1234"
-	)
-	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
-	gateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: gwNamespace, Name: gwName},
-	}
-
-	reviewer := &fakeTokenReviewer{
-		validTokens: map[string]types.NamespacedName{
-			tokenVal: {Namespace: gwNamespace, Name: singlepod.ResourceNameForGateway(gwName)},
-		},
-	}
-	pushServer, err := push.NewServer(push.ServerOptions{
-		TokenReviewer: reviewer,
-	})
-	if err != nil {
-		t.Fatalf("push.NewServer failed: %v", err)
-	}
-
-	caPEM, serverTLSCert := generateTestCAAndServerCert(t)
-	caFile := filepath.Join(t.TempDir(), "ca.crt")
-	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
-		t.Fatalf("failed to write CA file: %v", err)
-	}
-
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenFile, []byte(tokenVal), 0600); err != nil {
-		t.Fatalf("failed to write token file: %v", err)
-	}
-
-	serverAddr, stopServer := startTestPushServer(t, pushServer, "", serverTLSCert)
-	defer stopServer()
-
-	backend1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		if _, writeErr := w.Write([]byte("backend1 response")); writeErr != nil {
-			t.Errorf("failed to write backend1 response: %v", writeErr)
-		}
-	}))
-	defer backend1.Close()
-
-	backend1Host, backend1PortStr, err := net.SplitHostPort(backend1.Listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to split backend1 host port: %v", err)
-	}
-	backend1Port, err := strconv.Atoi(backend1PortStr)
-	if err != nil {
-		t.Fatalf("failed to parse backend1 port: %v", err)
-	}
-
-	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to allocate proxy listener: %v", err)
-	}
-	proxyAddr := proxyLn.Addr().String()
-
-	route1 := state.InternalRoute{
-		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
-		Rules: []state.InternalRule{
-			{
-				Matches: []state.InternalMatch{
-					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/test"}},
-				},
-				Backends: []state.InternalBackend{
-					{Host: backend1Host, Port: gatewayv1.PortNumber(backend1Port), Weight: 1},
-				},
-			},
-		},
-	}
-	config1, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
-		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route1}},
-	}, []state.InternalRoute{route1}, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("BuildDataplaneConfig 1 failed: %v", err)
-	}
-	config1.Revision = "rev-1"
-
-	if err := pushServer.PublishDataplaneConfig(ctx, gateway, config1); err != nil {
-		t.Fatalf("PublishDataplaneConfig rev-1 failed: %v", err)
-	}
-
-	options := DefaultOptions()
-	options.DataplaneMode = true
-	options.DataplaneGatewayNamespace = gwNamespace
-	options.DataplaneGatewayName = gwName
-	options.InternalAPIAddress = serverAddr
-	options.InternalAPICAFile = caFile
-	options.InternalAPITokenFile = tokenFile
-	options.HTTPListener = proxyLn
-	options.ProxyAddr = ""
-	options.ProxyHTTPSAddr = ""
-	options.MetricsAddr = "0"
-	options.HealthProbeBindAddress = "0"
-
-	server, err := New(options)
-	if err != nil {
-		t.Fatalf("New failed: %v", err)
-	}
-	server.SetInternalAPIClientBackoffForTest(20*time.Millisecond, 100*time.Millisecond)
-
-	serverErr := make(chan error, 1)
-	go func() {
-		serverErr <- server.Start(ctx)
-	}()
-
-	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		res, waitErr := pushServer.WaitApplied(ctx, gateway, "rev-1")
-		if waitErr != nil {
-			return false, waitErr
-		}
-		return res.Applied == 1, nil
-	})
-	if err != nil {
-		t.Fatalf("timed out waiting for rev-1: %v", err)
-	}
-
-	req1, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+proxyAddr+"/test", nil)
-	if err != nil {
-		t.Fatalf("failed to create request: %v", err)
-	}
-	req1.Host = "example.com"
-	resp1, err := http.DefaultClient.Do(req1)
-	if err != nil {
-		t.Fatalf("request 1 failed: %v", err)
-	}
-	body1, err := io.ReadAll(resp1.Body)
-	if err != nil {
-		t.Fatalf("failed to read body 1: %v", err)
-	}
-	if err := resp1.Body.Close(); err != nil {
-		t.Errorf("failed to close body 1: %v", err)
-	}
-	if resp1.StatusCode != http.StatusOK || string(body1) != "backend1 response" {
-		t.Errorf("expected 200 OK 'backend1 response', got %d %q", resp1.StatusCode, string(body1))
-	}
-
-	// Publish second config after a change
 	backend2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		if _, writeErr := w.Write([]byte("backend2 response")); writeErr != nil {
-			t.Errorf("failed to write backend2 response: %v", writeErr)
+		if _, err := w.Write([]byte("backend2 response")); err != nil {
+			t.Errorf("failed to write backend2 response: %v", err)
 		}
 	}))
 	defer backend2.Close()
 
-	backend2Host, backend2PortStr, err := net.SplitHostPort(backend2.Listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to split backend2 host port: %v", err)
-	}
-	backend2Port, err := strconv.Atoi(backend2PortStr)
-	if err != nil {
-		t.Fatalf("failed to parse backend2 port: %v", err)
-	}
+	// Publish second config after a change
+	harness.publishConfig(ctx, t, "rev-2", backend2.Listener.Addr().String(), "")
+	harness.waitApplied(ctx, t, harness.pushServer, "rev-2", 1)
 
-	route2 := state.InternalRoute{
-		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
-		Rules: []state.InternalRule{
-			{
-				Matches: []state.InternalMatch{
-					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/test"}},
-				},
-				Backends: []state.InternalBackend{
-					{Host: backend2Host, Port: gatewayv1.PortNumber(backend2Port), Weight: 1},
-				},
-			},
-		},
-	}
-	config2, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
-		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route2}},
-	}, []state.InternalRoute{route2}, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("BuildDataplaneConfig 2 failed: %v", err)
-	}
-	config2.Revision = "rev-2"
-
-	if err := pushServer.PublishDataplaneConfig(ctx, gateway, config2); err != nil {
-		t.Fatalf("PublishDataplaneConfig rev-2 failed: %v", err)
-	}
-
-	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		res, waitErr := pushServer.WaitApplied(ctx, gateway, "rev-2")
-		if waitErr != nil {
-			return false, waitErr
-		}
-		return res.Applied == 1, nil
-	})
-	if err != nil {
-		t.Fatalf("timed out waiting for rev-2 applied: %v", err)
-	}
-
-	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+proxyAddr+"/test", nil)
-	if err != nil {
-		t.Fatalf("failed to create request 2: %v", err)
-	}
-	req2.Host = "example.com"
-	resp2, err := http.DefaultClient.Do(req2)
-	if err != nil {
-		t.Fatalf("request 2 failed: %v", err)
-	}
-	body2, err := io.ReadAll(resp2.Body)
-	if err != nil {
-		t.Fatalf("failed to read body 2: %v", err)
-	}
-	if err := resp2.Body.Close(); err != nil {
-		t.Errorf("failed to close body 2: %v", err)
-	}
-	if resp2.StatusCode != http.StatusOK || string(body2) != "backend2 response" {
-		t.Errorf("expected 200 OK 'backend2 response', got %d %q", resp2.StatusCode, string(body2))
-	}
-
-	cancel()
-	if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
-		t.Errorf("server.Start error: %v", startErr)
+	// Verify request routing to backend2
+	code, body := harness.requestProxy(ctx, t, "example.com", "/test")
+	if code != http.StatusOK || body != "backend2 response" {
+		t.Errorf("got %d %q, want 200 'backend2 response'", code, body)
 	}
 }
 
-// wrappedServerStream records Hello messages received and Config messages sent.
 type interceptedStream struct {
 	grpc.ServerStream
 	onRecvHello func(hello *push.Hello)
@@ -690,168 +483,30 @@ func (s *interceptedStream) SendMsg(m any) error {
 //   - The server is stopped and started again: the data plane keeps serving while disconnected,
 //     reconnects, and reports its applied revision in Hello, so the server does not send the same config again.
 func TestInternalAPIClient_ServerStoppedAndStartedAgain(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	const (
-		gwNamespace = "test-ns"
-		gwName      = "test-gw"
-		tokenVal    = "valid-token-1234"
-	)
-	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
-	gateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: gwNamespace, Name: gwName},
-	}
-
-	reviewer := &fakeTokenReviewer{
-		validTokens: map[string]types.NamespacedName{
-			tokenVal: {Namespace: gwNamespace, Name: singlepod.ResourceNameForGateway(gwName)},
-		},
-	}
-	pushServer1, err := push.NewServer(push.ServerOptions{
-		TokenReviewer: reviewer,
-	})
-	if err != nil {
-		t.Fatalf("push.NewServer failed: %v", err)
-	}
-
-	caPEM, serverTLSCert := generateTestCAAndServerCert(t)
-	caFile := filepath.Join(t.TempDir(), "ca.crt")
-	if err := os.WriteFile(caFile, caPEM, 0600); err != nil {
-		t.Fatalf("failed to write CA file: %v", err)
-	}
-
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenFile, []byte(tokenVal), 0600); err != nil {
-		t.Fatalf("failed to write token file: %v", err)
-	}
-
-	serverAddr, stopServer1 := startTestPushServer(t, pushServer1, "", serverTLSCert)
-
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		if _, writeErr := w.Write([]byte("backend response")); writeErr != nil {
-			t.Errorf("failed to write backend response: %v", writeErr)
-		}
-	}))
-	defer backend.Close()
-
-	backendHost, backendPortStr, err := net.SplitHostPort(backend.Listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to split backend host port: %v", err)
-	}
-	backendPort, err := strconv.Atoi(backendPortStr)
-	if err != nil {
-		t.Fatalf("failed to parse backend port: %v", err)
-	}
-
-	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to allocate proxy listener: %v", err)
-	}
-	proxyAddr := proxyLn.Addr().String()
-
-	route := state.InternalRoute{
-		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
-		Rules: []state.InternalRule{
-			{
-				Matches: []state.InternalMatch{
-					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/test"}},
-				},
-				Backends: []state.InternalBackend{
-					{Host: backendHost, Port: gatewayv1.PortNumber(backendPort), Weight: 1},
-				},
-			},
-		},
-	}
-	config, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
-		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route}},
-	}, []state.InternalRoute{route}, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("BuildDataplaneConfig failed: %v", err)
-	}
-	config.Revision = "rev-1"
-
-	if err := pushServer1.PublishDataplaneConfig(ctx, gateway, config); err != nil {
-		t.Fatalf("PublishDataplaneConfig failed: %v", err)
-	}
-
-	options := DefaultOptions()
-	options.DataplaneMode = true
-	options.DataplaneGatewayNamespace = gwNamespace
-	options.DataplaneGatewayName = gwName
-	options.InternalAPIAddress = serverAddr
-	options.InternalAPICAFile = caFile
-	options.InternalAPITokenFile = tokenFile
-	options.HTTPListener = proxyLn
-	options.ProxyAddr = ""
-	options.ProxyHTTPSAddr = ""
-	options.MetricsAddr = "0"
-	options.HealthProbeBindAddress = "0"
-
-	server, err := New(options)
-	if err != nil {
-		t.Fatalf("New failed: %v", err)
-	}
-	server.SetInternalAPIClientBackoffForTest(20*time.Millisecond, 100*time.Millisecond)
-
-	serverErr := make(chan error, 1)
-	go func() {
-		serverErr <- server.Start(ctx)
-	}()
-
-	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		res, waitErr := pushServer1.WaitApplied(ctx, gateway, "rev-1")
-		if waitErr != nil {
-			return false, waitErr
-		}
-		return res.Applied == 1, nil
-	})
-	if err != nil {
-		t.Fatalf("timed out waiting for rev-1 applied: %v", err)
-	}
+	harness, ctx := setupInternalAPITest(t, "rev-1")
 
 	// Stop server 1: stream ends
-	stopServer1()
+	harness.stopPushServer()
 
 	// Verify data plane keeps serving while disconnected
-	reqDisconnected, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+proxyAddr+"/test", nil)
-	if err != nil {
-		t.Fatalf("failed to create request while disconnected: %v", err)
-	}
-	reqDisconnected.Host = "example.com"
-	respDisconnected, err := http.DefaultClient.Do(reqDisconnected)
-	if err != nil {
-		t.Fatalf("request failed while disconnected: %v", err)
-	}
-	bodyDisconnected, err := io.ReadAll(respDisconnected.Body)
-	if err != nil {
-		t.Fatalf("failed to read body: %v", err)
-	}
-	if err := respDisconnected.Body.Close(); err != nil {
-		t.Errorf("failed to close body: %v", err)
-	}
-	if respDisconnected.StatusCode != http.StatusOK || string(bodyDisconnected) != "backend response" {
-		t.Errorf("expected 200 OK while disconnected, got %d %q", respDisconnected.StatusCode, string(bodyDisconnected))
+	code, body := harness.requestProxy(ctx, t, "example.com", "/test")
+	if code != http.StatusOK || body != "backend response" {
+		t.Errorf("got %d %q while disconnected, want 200 'backend response'", code, body)
 	}
 
 	// Start server 2 on the same address with stream interception
-	pushServer2, err := push.NewServer(push.ServerOptions{
-		TokenReviewer: reviewer,
-	})
+	pushServer2, err := push.NewServer(push.ServerOptions{TokenReviewer: harness.reviewer})
 	if err != nil {
 		t.Fatalf("push.NewServer 2 failed: %v", err)
 	}
-	if err := pushServer2.PublishDataplaneConfig(ctx, gateway, config); err != nil {
-		t.Fatalf("pushServer2 PublishDataplaneConfig failed: %v", err)
-	}
+	harness.publishConfigOnServer(ctx, t, pushServer2, "rev-1", harness.backend.Listener.Addr().String())
 
 	var helloReceived *push.Hello
 	var helloMu sync.Mutex
-	var sentConfigs []*push.ControllerMessage
+	var sentConfigs int
 	var sendMu sync.Mutex
 
-	streamInterceptor := grpc.StreamServerInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	interceptor := grpc.StreamServerInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		wrapped := &interceptedStream{
 			ServerStream: ss,
 			onRecvHello: func(hello *push.Hello) {
@@ -860,76 +515,38 @@ func TestInternalAPIClient_ServerStoppedAndStartedAgain(t *testing.T) {
 				helloMu.Unlock()
 			},
 			onSendMsg: func(m any) {
-				if msg, ok := m.(*push.ControllerMessage); ok {
-					if msg.GetConfig() != nil {
-						sendMu.Lock()
-						sentConfigs = append(sentConfigs, msg)
-						sendMu.Unlock()
-					}
+				if msg, ok := m.(*push.ControllerMessage); ok && msg.GetConfig() != nil {
+					sendMu.Lock()
+					sentConfigs++
+					sendMu.Unlock()
 				}
 			},
 		}
 		return handler(srv, wrapped)
 	})
 
-	_, stopServer2 := startTestPushServer(t, pushServer2, serverAddr, serverTLSCert, grpc.StreamInterceptor(streamInterceptor))
+	_, stopServer2 := startTestPushServer(t, pushServer2, harness.serverAddr, harness.serverCert, grpc.StreamInterceptor(interceptor))
 	defer stopServer2()
 
-	// Wait for data plane to reconnect
-	err = wait.PollUntilContextTimeout(ctx, 20*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
-		res, waitErr := pushServer2.WaitApplied(ctx, gateway, "rev-1")
-		if waitErr != nil {
-			return false, waitErr
-		}
-		return res.Applied == 1, nil
-	})
-	if err != nil {
-		t.Fatalf("timed out waiting for WaitApplied after reconnect: %v", err)
-	}
+	harness.waitApplied(ctx, t, pushServer2, "rev-1", 1)
 
-	// Verify Hello contained AppliedRevision: "rev-1"
 	helloMu.Lock()
 	gotHello := helloReceived
 	helloMu.Unlock()
-	if gotHello == nil {
-		t.Fatalf("expected Hello message on server after reconnect, got nil")
-	}
-	if gotHello.AppliedRevision != "rev-1" {
-		t.Errorf("expected Hello.AppliedRevision = 'rev-1', got %q", gotHello.AppliedRevision)
+	if gotHello == nil || gotHello.AppliedRevision != "rev-1" {
+		t.Errorf("expected Hello.AppliedRevision = 'rev-1', got %+v", gotHello)
 	}
 
-	// Verify server did NOT send the same config again
 	sendMu.Lock()
-	configCount := len(sentConfigs)
+	configCount := sentConfigs
 	sendMu.Unlock()
 	if configCount != 0 {
 		t.Errorf("expected server not to send config again, but sent %d configs", configCount)
 	}
 
-	// Verify proxy still serves requests uninterrupted
-	reqAfter, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+proxyAddr+"/test", nil)
-	if err != nil {
-		t.Fatalf("failed to create request after reconnect: %v", err)
-	}
-	reqAfter.Host = "example.com"
-	respAfter, err := http.DefaultClient.Do(reqAfter)
-	if err != nil {
-		t.Fatalf("request after reconnect failed: %v", err)
-	}
-	bodyAfter, err := io.ReadAll(respAfter.Body)
-	if err != nil {
-		t.Fatalf("failed to read body after reconnect: %v", err)
-	}
-	if err := respAfter.Body.Close(); err != nil {
-		t.Errorf("failed to close body: %v", err)
-	}
-	if respAfter.StatusCode != http.StatusOK || string(bodyAfter) != "backend response" {
-		t.Errorf("expected 200 OK after reconnect, got %d %q", respAfter.StatusCode, string(bodyAfter))
-	}
-
-	cancel()
-	if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
-		t.Errorf("server.Start error: %v", startErr)
+	code, body = harness.requestProxy(ctx, t, "example.com", "/test")
+	if code != http.StatusOK || body != "backend response" {
+		t.Errorf("got %d %q after reconnect, want 200 'backend response'", code, body)
 	}
 }
 
@@ -937,55 +554,34 @@ func TestInternalAPIClient_ServerStoppedAndStartedAgain(t *testing.T) {
 // - A wrong trust bundle leaves the data plane with no config and not ready.
 func TestInternalAPIClient_WrongTrustBundle(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	const (
-		gwNamespace = "test-ns"
-		gwName      = "test-gw"
-		tokenVal    = "valid-token-1234"
-	)
-	gateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: gwNamespace, Name: gwName},
-	}
 	reviewer := &fakeTokenReviewer{
 		validTokens: map[string]types.NamespacedName{
-			tokenVal: {Namespace: gwNamespace, Name: singlepod.ResourceNameForGateway(gwName)},
+			"valid-token-1234": {Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")},
 		},
 	}
-	pushServer, err := push.NewServer(push.ServerOptions{
-		TokenReviewer: reviewer,
-	})
+	pushServer, err := push.NewServer(push.ServerOptions{TokenReviewer: reviewer})
 	if err != nil {
 		t.Fatalf("push.NewServer failed: %v", err)
 	}
 
 	_, serverTLSCert := generateTestCAAndServerCert(t)
-	wrongCAPEM := generateTestCA(t)
+	serverAddr, stopServer := startTestPushServer(t, pushServer, "", serverTLSCert)
+	defer stopServer()
+
 	wrongCAFile := filepath.Join(t.TempDir(), "wrong-ca.crt")
-	if err := os.WriteFile(wrongCAFile, wrongCAPEM, 0600); err != nil {
+	if err := os.WriteFile(wrongCAFile, generateTestCA(t), 0600); err != nil {
 		t.Fatalf("failed to write wrong CA file: %v", err)
 	}
 
 	tokenFile := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenFile, []byte(tokenVal), 0600); err != nil {
+	if err := os.WriteFile(tokenFile, []byte("valid-token-1234"), 0600); err != nil {
 		t.Fatalf("failed to write token file: %v", err)
-	}
-
-	serverAddr, stopServer := startTestPushServer(t, pushServer, "", serverTLSCert)
-	defer stopServer()
-
-	cfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: gwNamespace, Name: gwName},
-		Revision:    "rev-1",
-	}
-	if err := pushServer.PublishDataplaneConfig(ctx, gateway, cfg); err != nil {
-		t.Fatalf("PublishDataplaneConfig failed: %v", err)
 	}
 
 	options := DefaultOptions()
 	options.DataplaneMode = true
-	options.DataplaneGatewayNamespace = gwNamespace
-	options.DataplaneGatewayName = gwName
+	options.DataplaneGatewayNamespace = "test-ns"
+	options.DataplaneGatewayName = "test-gw"
 	options.InternalAPIAddress = serverAddr
 	options.InternalAPICAFile = wrongCAFile
 	options.InternalAPITokenFile = tokenFile
@@ -1010,9 +606,8 @@ func TestInternalAPIClient_WrongTrustBundle(t *testing.T) {
 	if server.proxySynced.Load() {
 		t.Errorf("expected proxySynced=false with wrong trust bundle")
 	}
-	readyzCheck := server.readyzChecker()
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	if err := readyzCheck(req); err == nil {
+	if err := server.readyzChecker()(req); err == nil {
 		t.Errorf("expected readyzChecker to return error, got nil")
 	}
 
@@ -1026,22 +621,8 @@ func TestInternalAPIClient_WrongTrustBundle(t *testing.T) {
 // - A rejected token leaves the data plane with no config and not ready.
 func TestInternalAPIClient_RejectedToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	const (
-		gwNamespace = "test-ns"
-		gwName      = "test-gw"
-		badTokenVal = "rejected-token-xyz"
-	)
-	gateway := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: gwNamespace, Name: gwName},
-	}
-	reviewer := &fakeTokenReviewer{
-		rejectTokens: true,
-	}
-	pushServer, err := push.NewServer(push.ServerOptions{
-		TokenReviewer: reviewer,
-	})
+	reviewer := &fakeTokenReviewer{rejectTokens: true}
+	pushServer, err := push.NewServer(push.ServerOptions{TokenReviewer: reviewer})
 	if err != nil {
 		t.Fatalf("push.NewServer failed: %v", err)
 	}
@@ -1053,25 +634,17 @@ func TestInternalAPIClient_RejectedToken(t *testing.T) {
 	}
 
 	tokenFile := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenFile, []byte(badTokenVal), 0600); err != nil {
+	if err := os.WriteFile(tokenFile, []byte("rejected-token"), 0600); err != nil {
 		t.Fatalf("failed to write token file: %v", err)
 	}
 
 	serverAddr, stopServer := startTestPushServer(t, pushServer, "", serverTLSCert)
 	defer stopServer()
 
-	cfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: gwNamespace, Name: gwName},
-		Revision:    "rev-1",
-	}
-	if err := pushServer.PublishDataplaneConfig(ctx, gateway, cfg); err != nil {
-		t.Fatalf("PublishDataplaneConfig failed: %v", err)
-	}
-
 	options := DefaultOptions()
 	options.DataplaneMode = true
-	options.DataplaneGatewayNamespace = gwNamespace
-	options.DataplaneGatewayName = gwName
+	options.DataplaneGatewayNamespace = "test-ns"
+	options.DataplaneGatewayName = "test-gw"
 	options.InternalAPIAddress = serverAddr
 	options.InternalAPICAFile = caFile
 	options.InternalAPITokenFile = tokenFile
@@ -1096,9 +669,8 @@ func TestInternalAPIClient_RejectedToken(t *testing.T) {
 	if server.proxySynced.Load() {
 		t.Errorf("expected proxySynced=false with rejected token")
 	}
-	readyzCheck := server.readyzChecker()
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
-	if err := readyzCheck(req); err == nil {
+	if err := server.readyzChecker()(req); err == nil {
 		t.Errorf("expected readyzChecker to return error, got nil")
 	}
 
@@ -1111,13 +683,6 @@ func TestInternalAPIClient_RejectedToken(t *testing.T) {
 // TestInternalAPIClient_FlagsUnset_BehavesAsToday tests:
 // - With the flags unset, the data plane behaves as it does today (watches Secret).
 func TestInternalAPIClient_FlagsUnset_BehavesAsToday(t *testing.T) {
-	const (
-		gwNamespace = "test-ns"
-		gwName      = "test-gw"
-	)
-	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
-	secretName := singlepod.ResourceNameForGateway(gwName)
-
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		t.Fatalf("failed to add clientgoscheme: %v", err)
@@ -1130,16 +695,12 @@ func TestInternalAPIClient_FlagsUnset_BehavesAsToday(t *testing.T) {
 		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
 			{
-				Matches: []state.InternalMatch{
-					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/ok"}},
-				},
-				Backends: []state.InternalBackend{
-					{Host: "backend-ok", Port: 8080, Weight: 1},
-				},
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/ok"}}},
+				Backends: []state.InternalBackend{{Host: "backend-ok", Port: 8080, Weight: 1}},
 			},
 		},
 	}
-	dataplaneConfig, err := state.BuildDataplaneConfig(gwKey, []state.InternalListener{
+	dataplaneConfig, err := state.BuildDataplaneConfig(types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}, []state.InternalListener{
 		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route}},
 	}, []state.InternalRoute{route}, nil, nil, nil)
 	if err != nil {
@@ -1152,27 +713,17 @@ func TestInternalAPIClient_FlagsUnset_BehavesAsToday(t *testing.T) {
 	}
 
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: gwNamespace,
-			Name:      secretName,
-		},
-		Data: map[string][]byte{
-			singlepod.DataplaneSecretDataKey: configBytes,
-		},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")},
+		Data:       map[string][]byte{singlepod.DataplaneSecretDataKey: configBytes},
 	}
-
 	cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 
-	options := DefaultOptions()
-	options.DataplaneMode = true
-	options.DataplaneGatewayNamespace = gwNamespace
-	options.DataplaneGatewayName = gwName
-	// internal API flags are unset!
-	options.ProxyAddr = ""
-	options.ProxyHTTPSAddr = ""
-
 	server := &Server{
-		opts:  options,
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      "test-gw",
+		},
 		proxy: proxy.NewProxy(),
 	}
 
@@ -1182,18 +733,12 @@ func TestInternalAPIClient_FlagsUnset_BehavesAsToday(t *testing.T) {
 
 	reconciler := &dataplaneSecretReconciler{
 		Client:               cl,
-		gatewayNamespace:     gwNamespace,
-		secretName:           secretName,
+		gatewayNamespace:     "test-ns",
+		secretName:           singlepod.ResourceNameForGateway("test-gw"),
 		applyDataplaneConfig: server.applyDataplaneConfig,
 	}
 
-	req := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Namespace: gwNamespace,
-			Name:      secretName,
-		},
-	}
-
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}}
 	res, err := reconciler.Reconcile(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
@@ -1203,7 +748,7 @@ func TestInternalAPIClient_FlagsUnset_BehavesAsToday(t *testing.T) {
 	}
 
 	if !server.proxySynced.Load() {
-		t.Errorf("expected proxySynced to be true after secret reconcile")
+		t.Errorf("expected proxySynced=true after secret reconcile")
 	}
 	if revs := server.appliedRevisionsList(); len(revs) != 1 || revs[0] != "rev-secret" {
 		t.Errorf("expected applied revisions ['rev-secret'], got %v", revs)
