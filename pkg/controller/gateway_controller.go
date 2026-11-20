@@ -179,6 +179,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// The reconciler does not provision for a Gateway that is being deleted,
+	// because applying the objects again would recreate what the garbage collector removes.
+	if gw.DeletionTimestamp != nil {
+		return ctrl.Result{}, nil
+	}
+
 	var requeueAfter time.Duration
 	if r.State != nil {
 		// Verify this Gateway is managed by us in State before requesting addresses
