@@ -319,6 +319,17 @@ type Options struct {
 	// Kubernetes TokenReview API with the gari-controller audience (push.DefaultAudience).
 	PushTokenReviewer push.TokenReviewer
 
+	// InternalAPIAddress is the host and port of the controller's internal API Service.
+	// When configured in data-plane mode, the data plane receives configuration pushed from
+	// the controller over a gRPC stream rather than watching a Secret.
+	InternalAPIAddress string
+
+	// InternalAPICAFile is the path to the trust bundle that verifies the controller's certificate.
+	InternalAPICAFile string
+
+	// InternalAPITokenFile is the path to the projected ServiceAccount token for data-plane identity.
+	InternalAPITokenFile string
+
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
 	// is created, allowing callers to register additional reconcilers or runnables before
 	// the manager starts. If non-nil, it is passed the manager and the GARI Server.
@@ -384,6 +395,20 @@ func (o *Options) complete() error {
 		o.DisableStatusUpdates = true
 		o.AddressProvider = nil
 	}
+	hasAddress := o.InternalAPIAddress != ""
+	hasCAFile := o.InternalAPICAFile != ""
+	hasTokenFile := o.InternalAPITokenFile != ""
+	if hasAddress || hasCAFile || hasTokenFile {
+		if !hasAddress || !hasCAFile || !hasTokenFile {
+			return errors.New("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file are all required together")
+		}
+		if !o.DataplaneMode {
+			return errors.New("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file require --dataplane-mode")
+		}
+		if o.DataplaneGatewayNamespace == "" || o.DataplaneGatewayName == "" {
+			return errors.New("--gateway-namespace and --gateway-name are required in --dataplane-mode")
+		}
+	}
 	return nil
 }
 
@@ -395,7 +420,10 @@ type Server struct {
 	state   *state.State
 	proxy   *proxy.Proxy
 
-	pushServer *push.Server
+	pushServer        *push.Server
+	internalAPIClient *internalAPIClient
+
+	healthProbeServer *http.Server
 
 	proxySynced atomic.Bool
 
@@ -547,6 +575,24 @@ func New(opts Options) (*Server, error) {
 		proxy: p,
 	}
 
+	if opts.DataplaneMode && opts.InternalAPIAddress != "" {
+		// In stream mode, the data plane starts no controller manager because it needs
+		// no access to the Kubernetes API. Health and readiness endpoints are served directly.
+		if opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
+			mux := http.NewServeMux()
+			for path, handler := range s.healthEndpoints() {
+				mux.Handle(path, handler)
+			}
+			s.healthProbeServer = &http.Server{
+				Addr:    opts.HealthProbeBindAddress,
+				Handler: mux,
+			}
+		}
+
+		s.internalAPIClient = newInternalAPIClient(s, opts)
+		return s, nil
+	}
+
 	mgr := opts.Manager
 	if mgr == nil {
 		cfg := opts.RestConfig
@@ -558,22 +604,11 @@ func New(opts Options) (*Server, error) {
 			}
 		}
 
-		readyzHandler, healthzHandler := s.healthzHandlers()
-		appliedHandler := s.appliedHandler()
 		metricsOpts := metricsserver.Options{
 			BindAddress: opts.MetricsAddr,
 		}
 		healthProbeBindAddress := opts.HealthProbeBindAddress
-		extraHandlers := map[string]http.Handler{
-			"/healthz":        http.StripPrefix("/healthz", healthzHandler),
-			"/healthz/":       http.StripPrefix("/healthz", healthzHandler),
-			"/readyz":         http.StripPrefix("/readyz", readyzHandler),
-			"/readyz/":        http.StripPrefix("/readyz", readyzHandler),
-			"/_gari/readyz":   http.StripPrefix("/_gari/readyz", readyzHandler),
-			"/_gari/readyz/":  http.StripPrefix("/_gari/readyz", readyzHandler),
-			"/_gari/applied":  appliedHandler,
-			"/_gari/applied/": appliedHandler,
-		}
+		extraHandlers := s.healthEndpoints()
 		if samePortOrAddr(opts.MetricsAddr, opts.HealthProbeBindAddress) && opts.MetricsAddr != "" && opts.MetricsAddr != "0" && opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
 			metricsOpts.ExtraHandlers = extraHandlers
 			healthProbeBindAddress = ""
@@ -743,6 +778,13 @@ func (s *Server) recordAppliedRevision(gatewayKey, revision string) {
 	s.appliedRevisions[gatewayKey] = revision
 }
 
+// AppliedRevision returns the applied revision for the given gatewayKey, or empty string if none.
+func (s *Server) AppliedRevision(gatewayKey string) string {
+	s.appliedMu.RLock()
+	defer s.appliedMu.RUnlock()
+	return s.appliedRevisions[gatewayKey]
+}
+
 func (s *Server) appliedHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -755,6 +797,22 @@ func (s *Server) appliedHandler() http.Handler {
 	})
 }
 
+// healthEndpoints returns the map of health, readiness, and revision handlers.
+func (s *Server) healthEndpoints() map[string]http.Handler {
+	readyzHandler, healthzHandler := s.healthzHandlers()
+	appliedHandler := s.appliedHandler()
+	return map[string]http.Handler{
+		"/healthz":        http.StripPrefix("/healthz", healthzHandler),
+		"/healthz/":       http.StripPrefix("/healthz", healthzHandler),
+		"/readyz":         http.StripPrefix("/readyz", readyzHandler),
+		"/readyz/":        http.StripPrefix("/readyz", readyzHandler),
+		"/_gari/readyz":   http.StripPrefix("/_gari/readyz", readyzHandler),
+		"/_gari/readyz/":  http.StripPrefix("/_gari/readyz", readyzHandler),
+		"/_gari/applied":  appliedHandler,
+		"/_gari/applied/": appliedHandler,
+	}
+}
+
 // SetupWithManager registers all GARI reconcilers with the given Manager.
 func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.AddReadyzCheck("readyz", s.readyzChecker()); err != nil {
@@ -765,15 +823,16 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	if s.opts.DataplaneMode {
+		if s.opts.InternalAPIAddress != "" {
+			// In internal API mode, config comes from the push stream only; do not watch the Secret.
+			return nil
+		}
 		secretName := singlepod.ResourceNameForGateway(s.opts.DataplaneGatewayName)
 		reconciler := &dataplaneSecretReconciler{
-			Client:           mgr.GetClient(),
-			proxy:            s.proxy,
-			proxySynced:      &s.proxySynced,
-			gatewayNamespace: s.opts.DataplaneGatewayNamespace,
-			secretName:       secretName,
-			onConfigUpdate:   s.updateListenerFilters,
-			onConfigApplied:  s.recordAppliedRevision,
+			Client:               mgr.GetClient(),
+			gatewayNamespace:     s.opts.DataplaneGatewayNamespace,
+			secretName:           secretName,
+			applyDataplaneConfig: s.applyDataplaneConfig,
 		}
 		if err := ctrl.NewControllerManagedBy(mgr).
 			For(&corev1.Secret{}).
@@ -835,12 +894,9 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 
 type dataplaneSecretReconciler struct {
 	client.Client
-	proxy            *proxy.Proxy
-	proxySynced      *atomic.Bool
-	gatewayNamespace string
-	secretName       string
-	onConfigUpdate   func(opts proxyproto.ListenerOptions) error
-	onConfigApplied  func(gwKey string, revision string)
+	gatewayNamespace     string
+	secretName           string
+	applyDataplaneConfig func(data []byte) error
 }
 
 func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -861,32 +917,38 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	if err := state.ApplyDataplaneConfig(r.proxy, data); err != nil {
+	if err := r.applyDataplaneConfig(data); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to apply dataplane config: %w", err)
-	}
-	r.proxySynced.Store(true)
-
-	dpCfg, err := state.UnmarshalDataplaneConfig(data)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
-	}
-
-	if r.onConfigUpdate != nil {
-		opts := proxyproto.ListenerOptions{
-			AllowedSourceCIDRs:        dpCfg.AllowedSourceCIDRs,
-			ProxyProtocol:             dpCfg.ProxyProtocol,
-			ProxyProtocolTrustedCIDRs: dpCfg.ProxyProtocolTrustedCIDRs,
-		}
-		if err := r.onConfigUpdate(opts); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to update listener filters: %w", err)
-		}
-	}
-
-	if r.onConfigApplied != nil && dpCfg.Revision != "" {
-		r.onConfigApplied(dpCfg.GatewayName.String(), dpCfg.Revision)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (s *Server) applyDataplaneConfig(data []byte) error {
+	if err := state.ApplyDataplaneConfig(s.proxy, data); err != nil {
+		return fmt.Errorf("failed to apply dataplane config: %w", err)
+	}
+	s.proxySynced.Store(true)
+
+	dpCfg, err := state.UnmarshalDataplaneConfig(data)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal dataplane config: %w", err)
+	}
+
+	opts := proxyproto.ListenerOptions{
+		AllowedSourceCIDRs:        dpCfg.AllowedSourceCIDRs,
+		ProxyProtocol:             dpCfg.ProxyProtocol,
+		ProxyProtocolTrustedCIDRs: dpCfg.ProxyProtocolTrustedCIDRs,
+	}
+	if err := s.updateListenerFilters(opts); err != nil {
+		return fmt.Errorf("failed to update listener filters: %w", err)
+	}
+
+	if dpCfg.Revision != "" {
+		s.recordAppliedRevision(dpCfg.GatewayName.String(), dpCfg.Revision)
+	}
+
+	return nil
 }
 
 func (s *Server) initDefaultCertificate() error {
@@ -1207,6 +1269,29 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.pushServer != nil && (s.opts.InternalAPIListener != nil || s.opts.InternalAPIBindAddress != "") {
 		g.Go(func() error {
 			return s.StartPushServer(ctx)
+		})
+	}
+
+	if s.internalAPIClient != nil {
+		g.Go(func() error {
+			return s.internalAPIClient.run(ctx)
+		})
+	}
+
+	if s.healthProbeServer != nil {
+		g.Go(func() error {
+			go func() {
+				<-ctx.Done()
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer shutdownCancel()
+				if shutdownErr := s.healthProbeServer.Shutdown(shutdownCtx); shutdownErr != nil {
+					klog.FromContext(ctx).Error(shutdownErr, "failed to shut down health probe server")
+				}
+			}()
+			if err := s.healthProbeServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("health probe server failed: %w", err)
+			}
+			return nil
 		})
 	}
 

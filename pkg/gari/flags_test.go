@@ -17,6 +17,7 @@ package gari
 import (
 	"flag"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +90,72 @@ func TestStringSlice(t *testing.T) {
 	}
 	if got := val.String(); got != "addr1,addr2" {
 		t.Errorf("val.String() = %q, want %q", got, "addr1,addr2")
+	}
+}
+
+func TestOptionsComplete_InternalAPIFlags(t *testing.T) {
+	// Missing token file
+	options := DefaultOptions()
+	options.DataplaneMode = true
+	options.DataplaneGatewayNamespace = "ns"
+	options.DataplaneGatewayName = "gw"
+	options.InternalAPIAddress = "127.0.0.1:8443"
+	options.InternalAPICAFile = "/path/to/ca.crt"
+	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "required together") {
+		t.Errorf("expected required together error, got %v", err)
+	}
+
+	// Missing CA file
+	options = DefaultOptions()
+	options.DataplaneMode = true
+	options.DataplaneGatewayNamespace = "ns"
+	options.DataplaneGatewayName = "gw"
+	options.InternalAPIAddress = "127.0.0.1:8443"
+	options.InternalAPITokenFile = "/path/to/token"
+	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "required together") {
+		t.Errorf("expected required together error, got %v", err)
+	}
+
+	// Missing address
+	options = DefaultOptions()
+	options.DataplaneMode = true
+	options.DataplaneGatewayNamespace = "ns"
+	options.DataplaneGatewayName = "gw"
+	options.InternalAPICAFile = "/path/to/ca.crt"
+	options.InternalAPITokenFile = "/path/to/token"
+	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "required together") {
+		t.Errorf("expected required together error, got %v", err)
+	}
+
+	// Not in dataplane mode
+	options = DefaultOptions()
+	options.DataplaneMode = false
+	options.InternalAPIAddress = "127.0.0.1:8443"
+	options.InternalAPICAFile = "/path/to/ca.crt"
+	options.InternalAPITokenFile = "/path/to/token"
+	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "require --dataplane-mode") {
+		t.Errorf("expected require --dataplane-mode error, got %v", err)
+	}
+
+	// Missing gateway namespace / name
+	options = DefaultOptions()
+	options.DataplaneMode = true
+	options.InternalAPIAddress = "127.0.0.1:8443"
+	options.InternalAPICAFile = "/path/to/ca.crt"
+	options.InternalAPITokenFile = "/path/to/token"
+	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "required in --dataplane-mode") {
+		t.Errorf("expected required in --dataplane-mode error, got %v", err)
+	}
+
+	// Valid combination
+	options = DefaultOptions()
+	options.DataplaneMode = true
+	options.DataplaneGatewayNamespace = "ns"
+	options.DataplaneGatewayName = "gw"
+	options.InternalAPIAddress = "127.0.0.1:8443"
+	options.InternalAPICAFile = "/path/to/ca.crt"
+	options.InternalAPITokenFile = "/path/to/token"
+	if err := options.complete(); err != nil {
+		t.Fatalf("unexpected error for valid options: %v", err)
 	}
 }

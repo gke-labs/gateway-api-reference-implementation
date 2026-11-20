@@ -25,7 +25,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -452,17 +451,6 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener, options 
 	return err
 }
 
-func truncateReason(reason string) string {
-	if len(reason) <= MaxNACKReasonBytes {
-		return reason
-	}
-	reason = reason[:MaxNACKReasonBytes]
-	for len(reason) > 0 && !utf8.ValidString(reason) {
-		reason = reason[:len(reason)-1]
-	}
-	return reason
-}
-
 // StreamConfig establishes a bidirectional stream with a data plane.
 // A data plane stream is authenticated once when the stream opens using its projected
 // ServiceAccount token. If the projected token expires while the stream is open, the
@@ -714,7 +702,7 @@ func (server *Server) runReceiver(
 			server.recordReplyLocked(gatewayKey, subscriber, ack.AppliedRevision, true, "")
 			server.mu.Unlock()
 		} else if nack := message.GetNack(); nack != nil {
-			reason := truncateReason(nack.Reason)
+			reason := TruncateNACKReason(nack.Reason)
 			server.mu.Lock()
 			server.recordReplyLocked(gatewayKey, subscriber, nack.Revision, false, reason)
 			server.mu.Unlock()

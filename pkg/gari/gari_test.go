@@ -1815,11 +1815,10 @@ func TestDataplaneSecretReconciler(t *testing.T) {
 	}
 
 	reconciler := &dataplaneSecretReconciler{
-		Client:           cl,
-		proxy:            p,
-		proxySynced:      &server.proxySynced,
-		gatewayNamespace: "test-ns",
-		secretName:       secretName,
+		Client:               cl,
+		gatewayNamespace:     "test-ns",
+		secretName:           secretName,
+		applyDataplaneConfig: server.applyDataplaneConfig,
 	}
 
 	ctx := t.Context()
@@ -2084,11 +2083,10 @@ func TestDataplaneSecretReconciler_MissingSecretLeavesProxyNotSynced(t *testing.
 	}
 
 	reconciler := &dataplaneSecretReconciler{
-		Client:           cl,
-		proxy:            p,
-		proxySynced:      &server.proxySynced,
-		gatewayNamespace: "test-ns",
-		secretName:       secretName,
+		Client:               cl,
+		gatewayNamespace:     "test-ns",
+		secretName:           secretName,
+		applyDataplaneConfig: server.applyDataplaneConfig,
 	}
 
 	ctx := t.Context()
@@ -2868,12 +2866,10 @@ func TestDataplane_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t 
 	}
 
 	reconciler := &dataplaneSecretReconciler{
-		Client:           cl,
-		proxy:            p,
-		proxySynced:      &server.proxySynced,
-		gatewayNamespace: "test-ns",
-		secretName:       secretName,
-		onConfigUpdate:   server.updateListenerFilters,
+		Client:               cl,
+		gatewayNamespace:     "test-ns",
+		secretName:           secretName,
+		applyDataplaneConfig: server.applyDataplaneConfig,
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -3033,12 +3029,10 @@ func TestDataplane_HTTPS_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerSt
 	}
 
 	reconciler := &dataplaneSecretReconciler{
-		Client:           cl,
-		proxy:            p,
-		proxySynced:      &server.proxySynced,
-		gatewayNamespace: "test-ns",
-		secretName:       secretName,
-		onConfigUpdate:   server.updateListenerFilters,
+		Client:               cl,
+		gatewayNamespace:     "test-ns",
+		secretName:           secretName,
+		applyDataplaneConfig: server.applyDataplaneConfig,
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -3220,12 +3214,10 @@ func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testin
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	reconciler := &dataplaneSecretReconciler{
-		Client:           cl,
-		proxy:            p,
-		proxySynced:      &server.proxySynced,
-		gatewayNamespace: "test-ns",
-		secretName:       secretName,
-		onConfigUpdate:   server.updateListenerFilters,
+		Client:               cl,
+		gatewayNamespace:     "test-ns",
+		secretName:           secretName,
+		applyDataplaneConfig: server.applyDataplaneConfig,
 	}
 
 	req := ctrl.Request{
@@ -3372,12 +3364,10 @@ func TestDataplane_InvalidCIDRsRejectedAndNotStored(t *testing.T) {
 
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	reconciler := &dataplaneSecretReconciler{
-		Client:           cl,
-		proxy:            p,
-		proxySynced:      &server.proxySynced,
-		gatewayNamespace: "test-ns",
-		secretName:       secretName,
-		onConfigUpdate:   server.updateListenerFilters,
+		Client:               cl,
+		gatewayNamespace:     "test-ns",
+		secretName:           secretName,
+		applyDataplaneConfig: server.applyDataplaneConfig,
 	}
 
 	req := ctrl.Request{
