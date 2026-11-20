@@ -82,11 +82,11 @@ func TestRecoveryPage_TearPageWriteAtByteBoundaries(t *testing.T) {
 		targetIndex := (activePageIndex + 1) % metaRecoveryPageCount
 		nextCounter := activeCounter + 1
 
-		newRec := recoveryStartRecord{
+		newRecord := recoveryStartRecord{
 			recoveryStartLSN: nextPos,
 			counter:          nextCounter,
 		}
-		encoded := encodeRecoveryPage(newRec)
+		encoded := encodeRecoveryPage(newRecord)
 		pageOffset := int(recoveryPageOffset(targetIndex))
 
 		// Tear the write at every single byte boundary from 0 to metaRecoveryPageSize (4096).
@@ -98,8 +98,8 @@ func TestRecoveryPage_TearPageWriteAtByteBoundaries(t *testing.T) {
 			if err != nil {
 				t.Fatalf("OpenFile failed at boundary %d: %v", byteBoundary, err)
 			}
-			var metaBuf [metaFileSize]byte
-			if _, err := metaFile.ReadAt(metaBuf[:], 0); err != nil {
+			var metaBuffer [metaFileSize]byte
+			if _, err := metaFile.ReadAt(metaBuffer[:], 0); err != nil {
 				t.Fatalf("ReadAt failed at boundary %d: %v", byteBoundary, err)
 			}
 			if err := metaFile.Close(); err != nil {
@@ -107,14 +107,14 @@ func TestRecoveryPage_TearPageWriteAtByteBoundaries(t *testing.T) {
 			}
 
 			// Apply partially written page up to byteBoundary
-			copy(metaBuf[pageOffset:pageOffset+byteBoundary], encoded[:byteBoundary])
+			copy(metaBuffer[pageOffset:pageOffset+byteBoundary], encoded[:byteBoundary])
 
 			// Rewrite meta.db in tornFS
 			writeFile, err := tornFS.Create(metaPath)
 			if err != nil {
 				t.Fatalf("Create failed at boundary %d: %v", byteBoundary, err)
 			}
-			if _, err := writeFile.WriteAt(metaBuf[:], 0); err != nil {
+			if _, err := writeFile.WriteAt(metaBuffer[:], 0); err != nil {
 				t.Fatalf("WriteAt failed at boundary %d: %v", byteBoundary, err)
 			}
 			if err := writeFile.Close(); err != nil {
@@ -171,21 +171,21 @@ func TestRecoveryPage_TearPageWriteAtByteBoundaries(t *testing.T) {
 		if err != nil {
 			t.Fatalf("base OpenFile failed: %v", err)
 		}
-		var metaBuf [metaFileSize]byte
-		if _, err := metaFile.ReadAt(metaBuf[:], 0); err != nil {
+		var metaBuffer [metaFileSize]byte
+		if _, err := metaFile.ReadAt(metaBuffer[:], 0); err != nil {
 			t.Fatalf("base ReadAt failed: %v", err)
 		}
 		if err := metaFile.Close(); err != nil {
 			t.Fatalf("base Close failed: %v", err)
 		}
 
-		copy(metaBuf[pageOffset:pageOffset+metaRecoveryPageSize], encoded)
+		copy(metaBuffer[pageOffset:pageOffset+metaRecoveryPageSize], encoded)
 
 		writeFile, err := memFS.Create(metaPath)
 		if err != nil {
 			t.Fatalf("base Create failed: %v", err)
 		}
-		if _, err := writeFile.WriteAt(metaBuf[:], 0); err != nil {
+		if _, err := writeFile.WriteAt(metaBuffer[:], 0); err != nil {
 			t.Fatalf("base WriteAt failed: %v", err)
 		}
 		if err := writeFile.Close(); err != nil {
@@ -475,15 +475,15 @@ func TestRecoveryPage_ReplayFromOlderRecordWithTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenFile failed: %v", err)
 	}
-	var metaBuf [metaFileSize]byte
-	if _, err := metaFile.ReadAt(metaBuf[:], 0); err != nil {
+	var metaBuffer [metaFileSize]byte
+	if _, err := metaFile.ReadAt(metaBuffer[:], 0); err != nil {
 		t.Fatalf("ReadAt failed: %v", err)
 	}
 	if err := metaFile.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	newestLSN, newestIdx, newestCounter, err := readRecoveryStartPages(metaBuf[:], metaPath)
+	newestLSN, newestIdx, newestCounter, err := readRecoveryStartPages(metaBuffer[:], metaPath)
 	if err != nil {
 		t.Fatalf("readRecoveryStartPages failed: %v", err)
 	}
@@ -502,18 +502,23 @@ func TestRecoveryPage_ReplayFromOlderRecordWithTruncation(t *testing.T) {
 		if strings.HasSuffix(entry.Name(), ".wal") {
 			base := strings.TrimSuffix(entry.Name(), ".wal")
 			var segLSN uint64
-			if _, err := fmt.Sscanf(base, "%d", &segLSN); err == nil && segLSN > 1 {
-				hasTruncatedSeg = true
+			if _, err := fmt.Sscanf(base, "%d", &segLSN); err == nil {
+				if segLSN == 1 {
+					t.Fatalf("expected WAL segment 1 to be truncated, but it is still present in %v", entries)
+				}
+				if segLSN > 1 {
+					hasTruncatedSeg = true
+				}
 			}
 		}
 	}
 	if !hasTruncatedSeg {
-		t.Logf("note: WAL segment rotation check found segments: %v", entries)
+		t.Fatalf("expected WAL segments to rotate and truncate earlier segments, but found: %v", entries)
 	}
 
 	// Damage the newest recovery page in meta.db
 	corrupted := make([]byte, metaFileSize)
-	copy(corrupted, metaBuf[:])
+	copy(corrupted, metaBuffer[:])
 	newestOffset := recoveryPageOffset(newestIdx)
 	corrupted[newestOffset] ^= 0x01 // bit flip in newest page
 
@@ -539,8 +544,9 @@ func TestRecoveryPage_ReplayFromOlderRecordWithTruncation(t *testing.T) {
 	if olderCounter >= newestCounter {
 		t.Fatalf("expected olderCounter (%d) < newestCounter (%d)", olderCounter, newestCounter)
 	}
-	_ = newestLSN
-	_ = olderLSN
+	if olderLSN >= newestLSN {
+		t.Fatalf("expected older record's LSN (%d) to be below newest record's LSN (%d)", olderLSN, newestLSN)
+	}
 
 	// Reopen store. Open must fall back to the older recovery record, start replay from
 	// the first surviving WAL record without error, and preserve all data.
@@ -690,8 +696,8 @@ func TestRecoveryPage_StoreCreatedBeforeChange_Rejected(t *testing.T) {
 
 	// Set StoreFormatVersion to 7 and recompute CRC over the 4 KiB block
 	binary.BigEndian.PutUint32(oldMeta[metaOffsetVersion:metaOffsetDBID], 7)
-	crc := computeMetaBlockCRC(oldMeta[:])
-	binary.BigEndian.PutUint32(oldMeta[metaOffsetCRC:metaBlockSize], crc)
+	checksum := computeMetaBlockCRC(oldMeta[:])
+	binary.BigEndian.PutUint32(oldMeta[metaOffsetCRC:metaBlockSize], checksum)
 
 	writeFile, err := memFS.Create(metaPath)
 	if err != nil {

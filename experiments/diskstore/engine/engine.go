@@ -465,43 +465,48 @@ type recoveryStartRecord struct {
 }
 
 const (
-	recoveryPageOffsetLSN     = 0
+	// recoveryPageOffsetLSN is the byte offset of the 8-byte recovery start LSN within a recovery page.
+	recoveryPageOffsetLSN = 0
+
+	// recoveryPageOffsetCounter is the byte offset of the 8-byte monotonic write counter within a recovery page.
 	recoveryPageOffsetCounter = 8
-	recoveryPageOffsetCRC     = 4092
+
+	// recoveryPageOffsetCRC is the byte offset of the 4-byte Castagnoli CRC32C checksum within a recovery page.
+	recoveryPageOffsetCRC = 4092
 )
 
 func recoveryPageOffset(pageIndex int) int64 {
 	return int64(metaBlockSize + pageIndex*metaRecoveryPageSize)
 }
 
-func encodeRecoveryPage(rec recoveryStartRecord) []byte {
-	buf := make([]byte, metaRecoveryPageSize)
-	binary.BigEndian.PutUint64(buf[recoveryPageOffsetLSN:recoveryPageOffsetCounter], rec.recoveryStartLSN)
-	binary.BigEndian.PutUint64(buf[recoveryPageOffsetCounter:recoveryPageOffsetCounter+8], rec.counter)
-	var zeroCRC [4]byte
-	crc := crc32.Update(0, castagnoliTable, buf[:recoveryPageOffsetCRC])
-	crc = crc32.Update(crc, castagnoliTable, zeroCRC[:])
-	binary.BigEndian.PutUint32(buf[recoveryPageOffsetCRC:metaRecoveryPageSize], crc)
-	return buf
+func encodeRecoveryPage(record recoveryStartRecord) []byte {
+	buffer := make([]byte, metaRecoveryPageSize)
+	binary.BigEndian.PutUint64(buffer[recoveryPageOffsetLSN:recoveryPageOffsetCounter], record.recoveryStartLSN)
+	binary.BigEndian.PutUint64(buffer[recoveryPageOffsetCounter:recoveryPageOffsetCounter+8], record.counter)
+	var zeroChecksum [4]byte
+	checksum := crc32.Update(0, castagnoliTable, buffer[:recoveryPageOffsetCRC])
+	checksum = crc32.Update(checksum, castagnoliTable, zeroChecksum[:])
+	binary.BigEndian.PutUint32(buffer[recoveryPageOffsetCRC:metaRecoveryPageSize], checksum)
+	return buffer
 }
 
-func decodeRecoveryPage(buf []byte) (recoveryStartRecord, error) {
-	if len(buf) != metaRecoveryPageSize {
+func decodeRecoveryPage(buffer []byte) (recoveryStartRecord, error) {
+	if len(buffer) != metaRecoveryPageSize {
 		return recoveryStartRecord{}, errors.New("invalid recovery page size")
 	}
-	storedCRC := binary.BigEndian.Uint32(buf[recoveryPageOffsetCRC:metaRecoveryPageSize])
-	var zeroCRC [4]byte
-	crc := crc32.Update(0, castagnoliTable, buf[:recoveryPageOffsetCRC])
-	actualCRC := crc32.Update(crc, castagnoliTable, zeroCRC[:])
-	if storedCRC != actualCRC {
+	storedChecksum := binary.BigEndian.Uint32(buffer[recoveryPageOffsetCRC:metaRecoveryPageSize])
+	var zeroChecksum [4]byte
+	checksum := crc32.Update(0, castagnoliTable, buffer[:recoveryPageOffsetCRC])
+	actualChecksum := crc32.Update(checksum, castagnoliTable, zeroChecksum[:])
+	if storedChecksum != actualChecksum {
 		return recoveryStartRecord{}, errors.New("recovery page CRC mismatch")
 	}
-	counter := binary.BigEndian.Uint64(buf[recoveryPageOffsetCounter : recoveryPageOffsetCounter+8])
+	counter := binary.BigEndian.Uint64(buffer[recoveryPageOffsetCounter : recoveryPageOffsetCounter+8])
 	if counter == 0 {
 		return recoveryStartRecord{}, errors.New("invalid recovery page counter")
 	}
 	return recoveryStartRecord{
-		recoveryStartLSN: binary.BigEndian.Uint64(buf[recoveryPageOffsetLSN:recoveryPageOffsetCounter]),
+		recoveryStartLSN: binary.BigEndian.Uint64(buffer[recoveryPageOffsetLSN:recoveryPageOffsetCounter]),
 		counter:          counter,
 	}, nil
 }
@@ -515,16 +520,16 @@ func readRecoveryStartPages(metaBuffer []byte, metaPath string) (recoveryStartLS
 	}
 
 	bestIndex := -1
-	var bestRec recoveryStartRecord
+	var bestRecord recoveryStartRecord
 
 	for i := 0; i < metaRecoveryPageCount; i++ {
 		offset := metaBlockSize + i*metaRecoveryPageSize
-		rec, decodeErr := decodeRecoveryPage(metaBuffer[offset : offset+metaRecoveryPageSize])
+		record, decodeErr := decodeRecoveryPage(metaBuffer[offset : offset+metaRecoveryPageSize])
 		if decodeErr != nil {
 			continue
 		}
-		if bestIndex == -1 || rec.counter > bestRec.counter {
-			bestRec = rec
+		if bestIndex == -1 || record.counter > bestRecord.counter {
+			bestRecord = record
 			bestIndex = i
 		}
 	}
@@ -533,7 +538,7 @@ func readRecoveryStartPages(metaBuffer []byte, metaPath string) (recoveryStartLS
 		return 0, -1, 0, fmt.Errorf("%s: no valid recovery start page found in ring", metaPath)
 	}
 
-	return bestRec.recoveryStartLSN, bestIndex, bestRec.counter, nil
+	return bestRecord.recoveryStartLSN, bestIndex, bestRecord.counter, nil
 }
 
 // metaRecord represents the decoded contents of meta.db's static header (block 0).
@@ -738,7 +743,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 	isNewStore := false
 	var recoveryStartLSN uint64
 	var activePageIndex int
-	var slotCounter uint64 = 1
+	var pageCounter uint64 = 1
 
 	if needsErase {
 		isNewStore = true
@@ -843,17 +848,17 @@ func Open(opts ...Option) (_ *Engine, err error) {
 					}
 
 					if !needsErase {
-						var slotErr error
-						recoveryStartLSN, activePageIndex, slotCounter, slotErr = readRecoveryStartPages(
+						var pageErr error
+						recoveryStartLSN, activePageIndex, pageCounter, pageErr = readRecoveryStartPages(
 							metaBuffer,
 							metaPath,
 						)
-						if slotErr != nil {
+						if pageErr != nil {
 							if !options.EraseOnError {
-								return nil, slotErr
+								return nil, pageErr
 							}
 							needsErase = true
-							eraseReason = slotErr.Error()
+							eraseReason = pageErr.Error()
 							isNewStore = true
 						}
 					}
@@ -1037,8 +1042,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 			Cipher:        options.Cipher,
 			HeapCipher:    heapCipher,
 		})
-		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile)
-		s.cp.initRecoveryPage(0, 1)
+		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile, 0, 1)
 	} else {
 		// Existing store: perform crash recovery scan and WAL redo replay
 		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID, RecoveryOptions{
@@ -1096,8 +1100,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 			HeapCipher:    heapCipher,
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
-		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile)
-		s.cp.initRecoveryPage(activePageIndex, slotCounter)
+		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile, activePageIndex, pageCounter)
 
 		// Replay WAL records from redo start LSN through write path apply functions.
 		if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.SupersededPages); err != nil {

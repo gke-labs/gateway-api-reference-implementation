@@ -53,7 +53,7 @@ func TestCheckpointer_BasicCheckpoint(t *testing.T) {
 	}
 	defer metaFile.Close()
 
-	checkpointer := NewCheckpointer(bp, heapFile, wal, metaFile)
+	checkpointer := NewCheckpointer(bp, heapFile, wal, metaFile, 0, 1)
 
 	// Write 5 records to WAL and dirty 2 pages
 	for i := uint64(1); i <= 5; i++ {
@@ -188,7 +188,7 @@ func runCountingCheckpointTest(t *testing.T, numPages int, expectedWrites int64)
 	}
 	defer metaFile.Close()
 
-	checkpointer := NewCheckpointer(bp, countingHeap, wal, metaFile)
+	checkpointer := NewCheckpointer(bp, countingHeap, wal, metaFile, 0, 1)
 
 	// Dirty N pages and write WAL records
 	for i := 1; i <= numPages; i++ {
@@ -281,7 +281,7 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		}
 		defer metaFile.Close()
 
-		checkpointer := NewCheckpointer(bp, heapFile, wal, metaFile)
+		checkpointer := NewCheckpointer(bp, heapFile, wal, metaFile, 0, 1)
 
 		// Allocate and flush page 1 to disk
 		if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")}); err != nil {
@@ -358,7 +358,7 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		}
 		defer metaFile.Close()
 
-		checkpointer := NewCheckpointer(bp, heapFile, wal, metaFile)
+		checkpointer := NewCheckpointer(bp, heapFile, wal, metaFile, 0, 1)
 
 		// Allocate and flush page 1 to disk
 		if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k", Payload: []byte("v1")}); err != nil {

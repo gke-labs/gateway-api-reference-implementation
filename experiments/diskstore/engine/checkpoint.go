@@ -26,40 +26,37 @@ type Checkpointer struct {
 	wal      Log
 	// metaFile is the open handle to meta.db used to update recovery start pages.
 	metaFile File
-	// mu serializes concurrent checkpoints and protects activePageIndex and slotCounter.
+	// mu serializes concurrent checkpoints and protects activePageIndex and pageCounter.
 	mu sync.Mutex
 
-	activePageIndex int    // 0..7: index of page in recovery ring holding latest valid record
-	slotCounter     uint64 // counter in the latest valid record
+	// activePageIndex is the 0..7 index of the page in the recovery ring holding the latest valid record.
+	activePageIndex int
+
+	// pageCounter is the monotonic write counter in the latest valid record.
+	pageCounter uint64
 }
 
 // NewCheckpointer creates a new Checkpointer.
-func NewCheckpointer(bp *BlockPool, heapFile File, wal Log, metaFile File) *Checkpointer {
+func NewCheckpointer(bp *BlockPool, heapFile File, wal Log, metaFile File, activePageIndex int, pageCounter uint64) *Checkpointer {
 	return &Checkpointer{
-		bp:          bp,
-		heapFile:    heapFile,
-		wal:         wal,
-		metaFile:    metaFile,
-		slotCounter: 1,
+		bp:              bp,
+		heapFile:        heapFile,
+		wal:             wal,
+		metaFile:        metaFile,
+		activePageIndex: activePageIndex,
+		pageCounter:     pageCounter,
 	}
-}
-
-func (c *Checkpointer) initRecoveryPage(activePageIndex int, slotCounter uint64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.activePageIndex = activePageIndex
-	c.slotCounter = slotCounter
 }
 
 func (c *Checkpointer) writeRecoveryPageLocked(redoStartLSN uint64) error {
 	targetIndex := (c.activePageIndex + 1) % metaRecoveryPageCount
-	nextCounter := c.slotCounter + 1
+	nextCounter := c.pageCounter + 1
 
-	rec := recoveryStartRecord{
+	record := recoveryStartRecord{
 		recoveryStartLSN: redoStartLSN,
 		counter:          nextCounter,
 	}
-	encoded := encodeRecoveryPage(rec)
+	encoded := encodeRecoveryPage(record)
 
 	offset := recoveryPageOffset(targetIndex)
 	if _, err := c.metaFile.WriteAt(encoded, offset); err != nil {
@@ -71,7 +68,7 @@ func (c *Checkpointer) writeRecoveryPageLocked(redoStartLSN uint64) error {
 	}
 
 	c.activePageIndex = targetIndex
-	c.slotCounter = nextCounter
+	c.pageCounter = nextCounter
 	return nil
 }
 
