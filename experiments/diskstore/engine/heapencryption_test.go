@@ -64,7 +64,7 @@ func TestHeapEncryption_PlaintextNotExposedAfterCheckpoint(t *testing.T) {
 	}
 
 	// Checkpoint flushes dirty pages to the heap file
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 
@@ -323,7 +323,7 @@ func TestHeapEncryption_NeverWrittenZeroBlocksTreatedAsTorn(t *testing.T) {
 	if err := store.Put("Table", "k1", []byte("val1")); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	if err := store.Close(); err != nil {

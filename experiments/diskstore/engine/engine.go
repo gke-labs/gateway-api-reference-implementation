@@ -2217,17 +2217,16 @@ func (s *Engine) Sync() error {
 }
 
 // Checkpoint performs a non-blocking checkpoint.
-func (s *Engine) Checkpoint() (uint64, error) {
+func (s *Engine) Checkpoint() error {
 	if s.isFailed() {
-		return 0, s.failErr()
+		return s.failErr()
 	}
 
-	chkLSN, err := s.cp.Checkpoint()
-	if err != nil {
+	if err := s.cp.Checkpoint(); err != nil {
 		s.setFailed(err)
-		return 0, s.failErr()
+		return s.failErr()
 	}
-	return chkLSN, nil
+	return nil
 }
 
 // Close flushes and shuts down engine components.
@@ -2240,7 +2239,7 @@ func (s *Engine) Close() error {
 	var errs []error
 	// If not failed, checkpoint on close to truncate WAL and speed up reopen
 	if !s.isFailed() && s.cp != nil {
-		if _, err := s.cp.Checkpoint(); err != nil {
+		if err := s.cp.Checkpoint(); err != nil {
 			errs = append(errs, err)
 		}
 	}

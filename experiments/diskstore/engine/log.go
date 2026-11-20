@@ -39,7 +39,7 @@ type Log interface {
 	// on storage (for the WAL, via a local fsync). Records survive process crashes,
 	// operating system crashes, and node power loss. The engine calls Sync on
 	// Engine.Sync when persistence is requested, and during checkpoints
-	// to ensure the checkpoint record and earlier operations are durable before
+	// to ensure earlier operations are durable before
 	// truncating finished log segments.
 	Sync() error
 

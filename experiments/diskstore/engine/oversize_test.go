@@ -112,7 +112,7 @@ func TestOversize_SurvivesCheckpointTruncation(t *testing.T) {
 			t.Fatalf("Put %s failed: %v", smallKey, err)
 		}
 		if (i+1)%500 == 0 {
-			if _, err := store.Checkpoint(); err != nil {
+			if err := store.Checkpoint(); err != nil {
 				t.Fatalf("Checkpoint at %d failed: %v", i, err)
 			}
 		}
@@ -500,7 +500,7 @@ func TestOversize_MissingFile_GetReturnsCorruptionError(t *testing.T) {
 	if err := store.Put(table, key, val); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	fileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
@@ -548,7 +548,7 @@ func TestOversize_TruncatedFile_GetReturnsCorruptionError(t *testing.T) {
 	if err := store.Put(table, key, val); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	fileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
@@ -615,7 +615,7 @@ func TestOversize_CipherOutputStartingWithMagic_ReadsBackCorrectly(t *testing.T)
 	if err := store.Put(table, key, plainVal); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -693,7 +693,7 @@ func TestOversize_ReopenHeapUseDoesNotGrowWithTotalSize(t *testing.T) {
 			t.Fatalf("Get returned invalid result: exists=%v, len=%d", exists, len(got))
 		}
 	}
-	if _, err := sOversize.Checkpoint(); err != nil {
+	if err := sOversize.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	if err := sOversize.Close(); err != nil {
@@ -769,7 +769,7 @@ func TestOversize_ReopenGetAndAlteredFileReturnsCorruption(t *testing.T) {
 	if err := store.Put(table, "healthy-key", []byte("healthy-payload")); err != nil {
 		t.Fatalf("Put healthy key failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -990,7 +990,7 @@ func TestOversize_Recovery_CrashBeforePointerRecord_QuarantinesOrphanAndPreserve
 	if err := store.Put(table, key, prevVal); err != nil {
 		t.Fatalf("Put prevVal failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 
@@ -1102,7 +1102,7 @@ func TestOversize_Recovery_ReferencedFileNeverQuarantinedByStartupPass(t *testin
 		t.Fatalf("Put k2 failed: %v", err)
 	}
 
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 

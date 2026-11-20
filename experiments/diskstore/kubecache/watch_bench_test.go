@@ -291,7 +291,7 @@ func runKubecacheWatch(t *testing.T, count int, tmpDir string) WatchBenchResult 
 		t.Fatalf("watch loop failed: %v", loopErr)
 	}
 
-	if _, err := eng.Checkpoint(); err != nil {
+	if err := eng.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	snap := readMemStats()

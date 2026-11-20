@@ -37,8 +37,7 @@ type RecordType uint8
 const (
 	RecordTypePut        RecordType = 1
 	RecordTypeDelete     RecordType = 2
-	RecordTypeCheckpoint RecordType = 3
-	RecordTypePutPointer RecordType = 4
+	RecordTypePutPointer RecordType = 3
 )
 
 const (
@@ -99,9 +98,9 @@ const (
 	// RecordFormatVersion is 2.
 	RecordFormatVersion byte = 2
 
-	// RecordHeaderSize is 32 bytes:
-	// Magic(1) + Version(1) + Type(1) + Reserved(1) + LSN(8) + RedoStartLSN(8) + KeyLen(4) + PayloadLen(4) + CRC32C(4)
-	RecordHeaderSize = 32
+	// RecordHeaderSize is 24 bytes:
+	// Magic(1) + Version(1) + Type(1) + Reserved(1) + LSN(8) + KeyLen(4) + PayloadLen(4) + CRC32C(4)
+	RecordHeaderSize = 24
 
 	// MaxRecordFieldLength stops a corrupted length field from triggering a huge allocation (64 MiB).
 	MaxRecordFieldLength = 64 * 1024 * 1024
@@ -109,12 +108,11 @@ const (
 
 // Record represents a single write-ahead log record.
 type Record struct {
-	Type         RecordType
-	LSN          uint64
-	RedoStartLSN uint64 // Redo start LSN for Checkpoint records
-	Key          string
-	Payload      []byte
-	CRC32C       uint32
+	Type    RecordType
+	LSN     uint64
+	Key     string
+	Payload []byte
+	CRC32C  uint32
 }
 
 // EncodeRecord serializes a record into binary format with a valid CRC32C.
@@ -130,15 +128,14 @@ func EncodeRecord(r Record) []byte {
 	buf[3] = 0 // reserved
 
 	binary.BigEndian.PutUint64(buf[4:12], r.LSN)
-	binary.BigEndian.PutUint64(buf[12:20], r.RedoStartLSN)
-	binary.BigEndian.PutUint32(buf[20:24], uint32(len(keyBytes)))
-	binary.BigEndian.PutUint32(buf[24:28], uint32(len(r.Payload)))
+	binary.BigEndian.PutUint32(buf[12:16], uint32(len(keyBytes)))
+	binary.BigEndian.PutUint32(buf[16:20], uint32(len(r.Payload)))
 
 	// Zero CRC field before calculation
-	buf[28] = 0
-	buf[29] = 0
-	buf[30] = 0
-	buf[31] = 0
+	buf[20] = 0
+	buf[21] = 0
+	buf[22] = 0
+	buf[23] = 0
 
 	off := RecordHeaderSize
 	copy(buf[off:], keyBytes)
@@ -150,7 +147,7 @@ func EncodeRecord(r Record) []byte {
 	_, _ = h.Write(buf)
 	crc := h.Sum32()
 
-	binary.BigEndian.PutUint32(buf[28:32], crc)
+	binary.BigEndian.PutUint32(buf[20:24], crc)
 	return buf
 }
 
@@ -169,10 +166,9 @@ func DecodeRecord(r io.Reader) (Record, error) {
 
 	recType := RecordType(header[2])
 	lsn := binary.BigEndian.Uint64(header[4:12])
-	redoStartLSN := binary.BigEndian.Uint64(header[12:20])
-	keyLen := binary.BigEndian.Uint32(header[20:24])
-	payloadLen := binary.BigEndian.Uint32(header[24:28])
-	storedCRC := binary.BigEndian.Uint32(header[28:32])
+	keyLen := binary.BigEndian.Uint32(header[12:16])
+	payloadLen := binary.BigEndian.Uint32(header[16:20])
+	storedCRC := binary.BigEndian.Uint32(header[20:24])
 
 	if keyLen > MaxRecordFieldLength || payloadLen > MaxRecordFieldLength {
 		return Record{}, fmt.Errorf("%w: field length exceeds limit", ErrCorruptRecord)
@@ -187,10 +183,10 @@ func DecodeRecord(r io.Reader) (Record, error) {
 	// Verify CRC
 	headerCopy := make([]byte, RecordHeaderSize)
 	copy(headerCopy, header)
-	headerCopy[28] = 0
-	headerCopy[29] = 0
-	headerCopy[30] = 0
-	headerCopy[31] = 0
+	headerCopy[20] = 0
+	headerCopy[21] = 0
+	headerCopy[22] = 0
+	headerCopy[23] = 0
 
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	_, _ = h.Write(headerCopy)
@@ -205,11 +201,10 @@ func DecodeRecord(r io.Reader) (Record, error) {
 	payload := body[keyLen : keyLen+payloadLen]
 
 	return Record{
-		Type:         recType,
-		LSN:          lsn,
-		RedoStartLSN: redoStartLSN,
-		Key:          key,
-		Payload:      payload,
-		CRC32C:       storedCRC,
+		Type:    recType,
+		LSN:     lsn,
+		Key:     key,
+		Payload: payload,
+		CRC32C:  storedCRC,
 	}, nil
 }

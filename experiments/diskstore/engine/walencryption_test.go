@@ -385,7 +385,7 @@ func TestWALEncryption_DamagedRecordLength_NoExcessiveAllocation(t *testing.T) {
 		plaintextBlock := make([]byte, WALBlockSize)
 		segmentCipher.Decrypt(plaintextBlock, rawBlock, 0)
 		// Overwrite the payload length in the record header at SegmentHeaderSize (offset 32)
-		binary.BigEndian.PutUint32(plaintextBlock[SegmentHeaderSize+24:SegmentHeaderSize+28], uint32(excessiveLength))
+		binary.BigEndian.PutUint32(plaintextBlock[SegmentHeaderSize+16:SegmentHeaderSize+20], uint32(excessiveLength))
 
 		encryptedBlock := make([]byte, WALBlockSize)
 		segmentCipher.Encrypt(encryptedBlock, plaintextBlock, 0)
@@ -436,7 +436,7 @@ func TestWALEncryption_DamagedRecordLength_NoExcessiveAllocation(t *testing.T) {
 
 		plaintextBlock := make([]byte, WALBlockSize)
 		segmentCipher.Decrypt(plaintextBlock, rawBlock, 0)
-		binary.BigEndian.PutUint32(plaintextBlock[SegmentHeaderSize+24:SegmentHeaderSize+28], uint32(excessiveLength))
+		binary.BigEndian.PutUint32(plaintextBlock[SegmentHeaderSize+16:SegmentHeaderSize+20], uint32(excessiveLength))
 
 		encryptedBlock := make([]byte, WALBlockSize)
 		segmentCipher.Encrypt(encryptedBlock, plaintextBlock, 0)

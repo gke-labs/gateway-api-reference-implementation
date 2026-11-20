@@ -700,17 +700,16 @@ func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 		w.tailBlockOpenTime = now
 	}
 
-	// Format record header into 32-byte stack buffer and compute CRC incrementally
+	// Format record header into 24-byte stack buffer and compute CRC incrementally
 	var hdr [RecordHeaderSize]byte
 	hdr[0] = RecordMagic
 	hdr[1] = RecordFormatVersion
 	hdr[2] = byte(r.Type)
 	hdr[3] = 0 // reserved
 	binary.BigEndian.PutUint64(hdr[4:12], r.LSN)
-	binary.BigEndian.PutUint64(hdr[12:20], r.RedoStartLSN)
-	binary.BigEndian.PutUint32(hdr[20:24], uint32(keyLen))
-	binary.BigEndian.PutUint32(hdr[24:28], uint32(payloadLen))
-	// bytes 28..32 are zero for CRC calculation
+	binary.BigEndian.PutUint32(hdr[12:16], uint32(keyLen))
+	binary.BigEndian.PutUint32(hdr[16:20], uint32(payloadLen))
+	// bytes 20..24 are zero for CRC calculation
 
 	crc := crc32.Update(0, castagnoliTable, hdr[:])
 	if keyLen > 0 {
@@ -719,7 +718,7 @@ func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 	if payloadLen > 0 {
 		crc = crc32.Update(crc, castagnoliTable, payloadBytes)
 	}
-	binary.BigEndian.PutUint32(hdr[28:32], crc)
+	binary.BigEndian.PutUint32(hdr[20:24], crc)
 
 	copyToRing := func(p []byte) error {
 		for len(p) > 0 {
@@ -1222,8 +1221,8 @@ func (it *WALIterator) Next() (Record, error) {
 			return Record{}, io.EOF
 		}
 
-		keyLen := binary.BigEndian.Uint32(recordHeader[20:24])
-		payloadLen := binary.BigEndian.Uint32(recordHeader[24:28])
+		keyLen := binary.BigEndian.Uint32(recordHeader[12:16])
+		payloadLen := binary.BigEndian.Uint32(recordHeader[16:20])
 		// Stop a corrupted length field from triggering a huge allocation.
 		if keyLen > MaxRecordFieldLength || payloadLen > MaxRecordFieldLength {
 			it.done = true

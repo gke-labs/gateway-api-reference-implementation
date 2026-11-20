@@ -358,9 +358,7 @@ func TestWAL_FiveSecondBound_UnsyncedBlocks(t *testing.T) {
 	// Append record 1 that fills exactly the rest of the first 4 KiB block.
 	// Block 0 has 32 bytes segment header.
 	// Space remaining in block 0: 4096 - 32 = 4064 bytes.
-	// Record header is 32 bytes.
-	// Payload needed: 4064 - 32 = 4032 bytes.
-	p1 := make([]byte, 4032)
+	p1 := make([]byte, WALBlockSize-SegmentHeaderSize-RecordHeaderSize)
 	_, err = wal.AppendRecord(&Record{
 		Type:    RecordTypePut,
 		Payload: p1,
@@ -370,8 +368,7 @@ func TestWAL_FiveSecondBound_UnsyncedBlocks(t *testing.T) {
 	}
 
 	// Append record 2 that fills exactly the next 4 KiB block (4096 bytes).
-	// Payload needed: 4096 - 32 = 4064 bytes.
-	p2 := make([]byte, 4064)
+	p2 := make([]byte, WALBlockSize-RecordHeaderSize)
 	lsn2, err := wal.AppendRecord(&Record{
 		Type:    RecordTypePut,
 		Payload: p2,

@@ -387,7 +387,7 @@ func TestEngine_BlockEncryption_OpenKeyVerification(t *testing.T) {
 		if err := store.Put("Table1", "key1", []byte("payload1")); err != nil {
 			t.Fatalf("Put failed: %v", err)
 		}
-		if _, err := store.Checkpoint(); err != nil {
+		if err := store.Checkpoint(); err != nil {
 			t.Fatalf("Checkpoint failed: %v", err)
 		}
 		if err := store.Put("Table1", "key2", []byte("payload2")); err != nil {
