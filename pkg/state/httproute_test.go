@@ -972,7 +972,7 @@ func TestCompileHTTPRoute(t *testing.T) {
 			},
 		}
 
-		internal := CompileHTTPRoute(route, services, policies, nil, nil)
+		internal := CompileHTTPRoute(route, services, ResolveBackendTLSPolicyTargets(policies, services), nil, nil)
 		if internal == nil {
 			t.Fatalf("expected non-nil InternalHTTPRoute")
 		}
@@ -2177,7 +2177,7 @@ func TestCompileHTTPRoute_BackendTLSWithoutPolicy_ResolvedRefsMessage(t *testing
 			},
 		}
 
-		compiled := CompileHTTPRoute(route, services, policies, nil, nil)
+		compiled := CompileHTTPRoute(route, services, ResolveBackendTLSPolicyTargets(policies, services), nil, nil)
 		if compiled == nil {
 			t.Fatalf("expected non-nil InternalHTTPRoute")
 		}

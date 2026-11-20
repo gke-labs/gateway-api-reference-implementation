@@ -83,7 +83,7 @@ func TestHeadlessService_BackendTLSPolicy(t *testing.T) {
 	services := map[types.NamespacedName]*corev1.Service{
 		{Namespace: "default", Name: "headless-svc"}: svc,
 	}
-	compiled := state.CompileGRPCRoute(route, services, []*gatewayv1.BackendTLSPolicy{policy}, nil, nil)
+	compiled := state.CompileGRPCRoute(route, services, state.ResolveBackendTLSPolicyTargets([]*gatewayv1.BackendTLSPolicy{policy}, services), nil, nil)
 	if len(compiled.Rules) == 0 || len(compiled.Rules[0].Backends) == 0 {
 		t.Fatalf("expected compiled backends")
 	}

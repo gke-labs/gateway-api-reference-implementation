@@ -23,71 +23,79 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-// ServicePortKey identifies a named port on a Service.
+// ServicePortKey identifies a named port on a Service, or the whole Service when Port is empty.
 type ServicePortKey struct {
+	// Service is the namespaced name of the target Service.
 	Service types.NamespacedName
-	Port    string
+
+	// Port is the port name (sectionName) on the Service, or empty to select the whole Service.
+	Port string
 }
 
 // TargetRefResult represents the resolution result of a single BackendTLSPolicy targetRef that names a core Service.
 type TargetRefResult struct {
-	TargetRef     gatewayv1.LocalPolicyTargetReferenceWithSectionName
+	// TargetRef is the local policy target reference.
+	TargetRef gatewayv1.LocalPolicyTargetReferenceWithSectionName
+
+	// ServiceExists reports whether the targeted Service exists.
+	// The status change for a port name that is not found reads this.
 	ServiceExists bool
-	PortExists    bool
+
+	// PortExists reports whether the named port exists on the Service.
+	// The status change for a port name that is not found reads this.
+	PortExists bool
 }
 
 // MissingPort reports whether this targetRef specifies a named port (sectionName)
 // on a Service that exists, but that named port does not exist on the Service.
-func (tr TargetRefResult) MissingPort() bool {
-	return tr.TargetRef.SectionName != nil && *tr.TargetRef.SectionName != "" && tr.ServiceExists && !tr.PortExists
+// The status change for a port name that is not found reads this.
+func (targetResult TargetRefResult) MissingPort() bool {
+	return targetResult.TargetRef.SectionName != nil && *targetResult.TargetRef.SectionName != "" && targetResult.ServiceExists && !targetResult.PortExists
 }
 
 // BackendTLSPolicyResolution contains the resolved targets, winning policies, and conflict state for a set of BackendTLSPolicies.
 type BackendTLSPolicyResolution struct {
-	// ServicePolicy maps a Service to the winning policy targeting the whole Service.
-	ServicePolicy map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
+	// policies maps a Service and port name (or empty port for the whole Service) to the winning policy.
+	policies map[ServicePortKey]*gatewayv1.BackendTLSPolicy
 
-	// PortPolicy maps a Service and port name to the winning policy targeting that specific port.
-	PortPolicy map[ServicePortKey]*gatewayv1.BackendTLSPolicy
+	// conflicts maps each losing conflicted policy to the winning policy's "namespace/name".
+	conflicts map[types.NamespacedName]string
 
-	// Conflicts maps each losing conflicted policy to the winning policy's "namespace/name".
-	Conflicts map[types.NamespacedName]string
-
-	// TargetResults maps each policy's namespaced name to the resolution results of its core Service targetRefs.
-	TargetResults map[types.NamespacedName][]TargetRefResult
+	// targetResults maps each policy's namespaced name to the resolution results of its core Service targetRefs.
+	targetResults map[types.NamespacedName][]TargetRefResult
 }
 
 // PolicyForService returns the winning BackendTLSPolicy for the given Service and port name.
 // If portName is non-empty and a policy targets that specific port, that policy is returned.
 // Otherwise, any policy targeting the whole Service is returned.
-func (r *BackendTLSPolicyResolution) PolicyForService(svcKey types.NamespacedName, portName string) *gatewayv1.BackendTLSPolicy {
-	if r == nil {
+func (resolution *BackendTLSPolicyResolution) PolicyForService(serviceKey types.NamespacedName, portName string) *gatewayv1.BackendTLSPolicy {
+	if resolution == nil {
 		return nil
 	}
 	if portName != "" {
-		if p, ok := r.PortPolicy[ServicePortKey{Service: svcKey, Port: portName}]; ok {
-			return p
+		if policy, ok := resolution.policies[ServicePortKey{Service: serviceKey, Port: portName}]; ok {
+			return policy
 		}
 	}
-	return r.ServicePolicy[svcKey]
+	return resolution.policies[ServicePortKey{Service: serviceKey, Port: ""}]
 }
 
 // Conflict reports whether the policy is conflicted with an older policy, and if so, returns the conflicting policy.
-func (r *BackendTLSPolicyResolution) Conflict(policyKey types.NamespacedName) (string, bool) {
-	if r == nil {
+func (resolution *BackendTLSPolicyResolution) Conflict(policyKey types.NamespacedName) (string, bool) {
+	if resolution == nil {
 		return "", false
 	}
-	conflictingPolicy, ok := r.Conflicts[policyKey]
+	conflictingPolicy, ok := resolution.conflicts[policyKey]
 	return conflictingPolicy, ok
 }
 
 // TargetsService reports whether the given policy has a targetRef targeting the given Service.
-func (r *BackendTLSPolicyResolution) TargetsService(policyKey, svcKey types.NamespacedName) bool {
-	if r == nil || policyKey.Namespace != svcKey.Namespace {
+func (resolution *BackendTLSPolicyResolution) TargetsService(policyKey, serviceKey types.NamespacedName) bool {
+	if resolution == nil || policyKey.Namespace != serviceKey.Namespace {
 		return false
 	}
-	for _, tr := range r.TargetResults[policyKey] {
-		if string(tr.TargetRef.Name) == svcKey.Name {
+	for _, targetResult := range resolution.targetResults[policyKey] {
+		if string(targetResult.TargetRef.Name) == serviceKey.Name {
 			return true
 		}
 	}
@@ -95,11 +103,11 @@ func (r *BackendTLSPolicyResolution) TargetsService(policyKey, svcKey types.Name
 }
 
 // TargetResultsForPolicy returns the TargetRefResults for the given policy.
-func (r *BackendTLSPolicyResolution) TargetResultsForPolicy(policyKey types.NamespacedName) []TargetRefResult {
-	if r == nil {
+func (resolution *BackendTLSPolicyResolution) TargetResultsForPolicy(policyKey types.NamespacedName) []TargetRefResult {
+	if resolution == nil {
 		return nil
 	}
-	return r.TargetResults[policyKey]
+	return resolution.targetResults[policyKey]
 }
 
 // sortBackendTLSPolicies deterministically sorts BackendTLSPolicies by creation timestamp, then by namespaced name.
@@ -107,53 +115,52 @@ func sortBackendTLSPolicies(backendTLSPolicies []*gatewayv1.BackendTLSPolicy) []
 	if len(backendTLSPolicies) == 0 {
 		return nil
 	}
-	var nonNil []*gatewayv1.BackendTLSPolicy
-	for _, p := range backendTLSPolicies {
-		if p != nil {
-			nonNil = append(nonNil, p)
+	var nonNilPolicies []*gatewayv1.BackendTLSPolicy
+	for _, policy := range backendTLSPolicies {
+		if policy != nil {
+			nonNilPolicies = append(nonNilPolicies, policy)
 		}
 	}
-	sort.SliceStable(nonNil, func(i, j int) bool {
-		if nonNil[i].CreationTimestamp.Time.Before(nonNil[j].CreationTimestamp.Time) {
+	sort.SliceStable(nonNilPolicies, func(i, j int) bool {
+		if nonNilPolicies[i].CreationTimestamp.Time.Before(nonNilPolicies[j].CreationTimestamp.Time) {
 			return true
 		}
-		if nonNil[i].CreationTimestamp.Time.After(nonNil[j].CreationTimestamp.Time) {
+		if nonNilPolicies[i].CreationTimestamp.Time.After(nonNilPolicies[j].CreationTimestamp.Time) {
 			return false
 		}
-		if nonNil[i].Namespace != nonNil[j].Namespace {
-			return nonNil[i].Namespace < nonNil[j].Namespace
+		if nonNilPolicies[i].Namespace != nonNilPolicies[j].Namespace {
+			return nonNilPolicies[i].Namespace < nonNilPolicies[j].Namespace
 		}
-		return nonNil[i].Name < nonNil[j].Name
+		return nonNilPolicies[i].Name < nonNilPolicies[j].Name
 	})
-	return nonNil
+	return nonNilPolicies
 }
 
 // ResolveBackendTLSPolicyTargets resolves BackendTLSPolicy targets against Kubernetes Services
 // and determines winning policies and conflicts according to Gateway API Direct Policy Attachment
-// precedence rules (see https://gateway-api.sigs.k8s.io/geps/gep-713/ and
-// https://gateway-api.sigs.k8s.io/concepts/policy-attachment/#direct-policy-attachment):
+// precedence rules (see the targetRefs comment of apis/v1/backendtlspolicy_types.go):
 //
 //  1. A policy targeting a specific section (Service port by name via sectionName) takes precedence
 //     over a policy targeting the entire Service for that port.
-//  2. When multiple policies target the same target (the same Service and port name, or the same whole Service),
-//     the policy with the oldest CreationTimestamp takes precedence. If creation timestamps are equal,
-//     the policy that is alphabetically first by "{namespace}/{name}" takes precedence.
-//  3. Any policy that targets the same resource/section as a higher-precedence policy is considered
-//     conflicted and its Accepted condition is set to False with Reason "Conflicted".
+//  2. When more than one BackendTLSPolicy selects the same target and sectionName, implementations
+//     MUST determine precedence using the following criteria, continuing on ties:
+//     - The older policy by creation timestamp takes precedence.
+//     - The policy appearing first in alphabetical order by {namespace}/{name}.
+//  3. For any BackendTLSPolicy that does not take precedence, the implementation MUST ensure
+//     the Accepted Condition is set to status: False, with Reason: Conflicted.
 func ResolveBackendTLSPolicyTargets(
-	policies []*gatewayv1.BackendTLSPolicy,
+	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
 	services map[types.NamespacedName]*corev1.Service,
 ) *BackendTLSPolicyResolution {
-	res := &BackendTLSPolicyResolution{
-		ServicePolicy: make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
-		PortPolicy:    make(map[ServicePortKey]*gatewayv1.BackendTLSPolicy),
-		Conflicts:     make(map[types.NamespacedName]string),
-		TargetResults: make(map[types.NamespacedName][]TargetRefResult),
+	resolution := &BackendTLSPolicyResolution{
+		policies:      make(map[ServicePortKey]*gatewayv1.BackendTLSPolicy),
+		conflicts:     make(map[types.NamespacedName]string),
+		targetResults: make(map[types.NamespacedName][]TargetRefResult),
 	}
 
-	sorted := sortBackendTLSPolicies(policies)
+	sortedPolicies := sortBackendTLSPolicies(backendTLSPolicies)
 
-	for _, policy := range sorted {
+	for _, policy := range sortedPolicies {
 		policyKey := types.NamespacedName{Namespace: policy.Namespace, Name: policy.Name}
 
 		for _, targetRef := range policy.Spec.TargetRefs {
@@ -161,54 +168,43 @@ func ResolveBackendTLSPolicyTargets(
 				continue
 			}
 
-			svcKey := types.NamespacedName{Namespace: policy.Namespace, Name: string(targetRef.Name)}
-			var svc *corev1.Service
+			serviceKey := types.NamespacedName{Namespace: policy.Namespace, Name: string(targetRef.Name)}
+			var service *corev1.Service
 			if services != nil {
-				svc = services[svcKey]
+				service = services[serviceKey]
 			}
-			svcExists := svc != nil
+			serviceExists := service != nil
 
 			portName := string(ValueOf(targetRef.SectionName))
 			portExists := false
-			if portName != "" && svcExists {
-				for _, p := range svc.Spec.Ports {
-					if p.Name == portName {
+			if portName != "" && serviceExists {
+				for _, servicePort := range service.Spec.Ports {
+					if servicePort.Name == portName {
 						portExists = true
 						break
 					}
 				}
 			}
 
-			res.TargetResults[policyKey] = append(res.TargetResults[policyKey], TargetRefResult{
+			targetResult := TargetRefResult{
 				TargetRef:     targetRef,
-				ServiceExists: svcExists,
+				ServiceExists: serviceExists,
 				PortExists:    portExists,
-			})
+			}
+			resolution.targetResults[policyKey] = append(resolution.targetResults[policyKey], targetResult)
 
-			if portName != "" {
-				portKey := ServicePortKey{Service: svcKey, Port: portName}
-				if winner, exists := res.PortPolicy[portKey]; exists {
-					if winner.Namespace != policy.Namespace || winner.Name != policy.Name {
-						if _, alreadyConflicted := res.Conflicts[policyKey]; !alreadyConflicted {
-							res.Conflicts[policyKey] = fmt.Sprintf("%s/%s", winner.Namespace, winner.Name)
-						}
+			portKey := ServicePortKey{Service: serviceKey, Port: portName}
+			if winner, exists := resolution.policies[portKey]; exists {
+				if winner.Namespace != policy.Namespace || winner.Name != policy.Name {
+					if _, alreadyConflicted := resolution.conflicts[policyKey]; !alreadyConflicted {
+						resolution.conflicts[policyKey] = fmt.Sprintf("%s/%s", winner.Namespace, winner.Name)
 					}
-				} else {
-					res.PortPolicy[portKey] = policy
 				}
 			} else {
-				if winner, exists := res.ServicePolicy[svcKey]; exists {
-					if winner.Namespace != policy.Namespace || winner.Name != policy.Name {
-						if _, alreadyConflicted := res.Conflicts[policyKey]; !alreadyConflicted {
-							res.Conflicts[policyKey] = fmt.Sprintf("%s/%s", winner.Namespace, winner.Name)
-						}
-					}
-				} else {
-					res.ServicePolicy[svcKey] = policy
-				}
+				resolution.policies[portKey] = policy
 			}
 		}
 	}
 
-	return res
+	return resolution
 }

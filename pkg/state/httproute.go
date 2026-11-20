@@ -48,7 +48,7 @@ type HTTPRouteState struct {
 // verifying permissions, compiling regexes and filters, and recording conditions.
 func (s *HTTPRouteState) Compile(
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	backendTLSPolicies *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalHTTPRoute {
@@ -59,34 +59,11 @@ func (s *HTTPRouteState) Compile(
 	return s.Internal
 }
 
-func (s *HTTPRouteState) CompileWithResolution(
-	services map[types.NamespacedName]*corev1.Service,
-	btlsResolution *BackendTLSPolicyResolution,
-	configMaps map[types.NamespacedName]*corev1.ConfigMap,
-	refValidator ReferenceGrantValidator,
-) *InternalHTTPRoute {
-	if s.HTTPRoute == nil {
-		return nil
-	}
-	s.Internal = compileHTTPRoute(s.HTTPRoute, services, btlsResolution, configMaps, refValidator)
-	return s.Internal
-}
-
 // CompileHTTPRoute parses and compiles an HTTPRoute object into an InternalHTTPRoute.
 func CompileHTTPRoute(
 	route *gatewayv1.HTTPRoute,
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
-	configMaps map[types.NamespacedName]*corev1.ConfigMap,
-	refValidator ReferenceGrantValidator,
-) *InternalHTTPRoute {
-	return compileHTTPRoute(route, services, ResolveBackendTLSPolicyTargets(backendTLSPolicies, services), configMaps, refValidator)
-}
-
-func compileHTTPRoute(
-	route *gatewayv1.HTTPRoute,
-	services map[types.NamespacedName]*corev1.Service,
-	btlsResolution *BackendTLSPolicyResolution,
+	backendTLSPolicies *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalHTTPRoute {
@@ -208,7 +185,7 @@ func compileHTTPRoute(
 						route.Namespace,
 						route.Generation,
 						services,
-						btlsResolution,
+						backendTLSPolicies,
 						configMaps,
 						refValidator,
 					)
@@ -323,7 +300,7 @@ func compileHTTPRoute(
 					route.Namespace,
 					route.Generation,
 					services,
-					btlsResolution,
+					backendTLSPolicies,
 					configMaps,
 					refValidator,
 				)
@@ -492,7 +469,7 @@ func resolveBackendTarget(
 	routeNamespace string,
 	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
-	btlsResolution *BackendTLSPolicyResolution,
+	backendTLSPolicies *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) (*InternalBackend, *ErrorState) {
@@ -611,9 +588,9 @@ func resolveBackendTarget(
 			}
 		}
 
-		selectedPolicy = btlsResolution.PolicyForService(svcKey, portName)
+		selectedPolicy = backendTLSPolicies.PolicyForService(svcKey, portName)
 	} else {
-		selectedPolicy = btlsResolution.PolicyForService(svcKey, "")
+		selectedPolicy = backendTLSPolicies.PolicyForService(svcKey, "")
 	}
 
 	if selectedPolicy != nil {
@@ -722,7 +699,7 @@ func compileRequestMirrorFilter(
 	routeNamespace string,
 	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
-	btlsResolution *BackendTLSPolicyResolution,
+	backendTLSPolicies *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) (*InternalMirror, *ErrorState, *ErrorState) {
@@ -791,7 +768,7 @@ func compileRequestMirrorFilter(
 		routeNamespace,
 		routeGeneration,
 		services,
-		btlsResolution,
+		backendTLSPolicies,
 		configMaps,
 		refValidator,
 	)

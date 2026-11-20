@@ -81,7 +81,7 @@ func (s *GRPCRouteState) Validate() error {
 // verifying permissions, compiling matches, and recording conditions.
 func (s *GRPCRouteState) Compile(
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	backendTLSPolicies *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalGRPCRoute {
@@ -92,34 +92,11 @@ func (s *GRPCRouteState) Compile(
 	return s.Internal
 }
 
-func (s *GRPCRouteState) CompileWithResolution(
-	services map[types.NamespacedName]*corev1.Service,
-	btlsResolution *BackendTLSPolicyResolution,
-	configMaps map[types.NamespacedName]*corev1.ConfigMap,
-	refValidator ReferenceGrantValidator,
-) *InternalGRPCRoute {
-	if s == nil || s.GRPCRoute == nil {
-		return nil
-	}
-	s.Internal = compileGRPCRoute(s.GRPCRoute, services, btlsResolution, configMaps, refValidator)
-	return s.Internal
-}
-
 // CompileGRPCRoute parses and compiles a GRPCRoute object into an InternalGRPCRoute.
 func CompileGRPCRoute(
 	route *gatewayv1.GRPCRoute,
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
-	configMaps map[types.NamespacedName]*corev1.ConfigMap,
-	refValidator ReferenceGrantValidator,
-) *InternalGRPCRoute {
-	return compileGRPCRoute(route, services, ResolveBackendTLSPolicyTargets(backendTLSPolicies, services), configMaps, refValidator)
-}
-
-func compileGRPCRoute(
-	route *gatewayv1.GRPCRoute,
-	services map[types.NamespacedName]*corev1.Service,
-	btlsResolution *BackendTLSPolicyResolution,
+	backendTLSPolicies *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalGRPCRoute {
@@ -181,7 +158,7 @@ func compileGRPCRoute(
 						route.Namespace,
 						route.Generation,
 						services,
-						btlsResolution,
+						backendTLSPolicies,
 						configMaps,
 						refValidator,
 					)
@@ -268,7 +245,7 @@ func compileGRPCRoute(
 					route.Namespace,
 					route.Generation,
 					services,
-					btlsResolution,
+					backendTLSPolicies,
 					configMaps,
 					refValidator,
 				)

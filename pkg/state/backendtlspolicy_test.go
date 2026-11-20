@@ -28,8 +28,8 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 	t0 := metav1.NewTime(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	t1 := metav1.NewTime(time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC))
 
-	svcKey := types.NamespacedName{Namespace: "default", Name: "my-service"}
-	svcWithPorts := &corev1.Service{
+	serviceKey := types.NamespacedName{Namespace: "default", Name: "my-service"}
+	serviceWithPorts := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-service"},
 		Spec: corev1.ServiceSpec{
 			Ports: []corev1.ServicePort{
@@ -46,7 +46,7 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 		name     string
 		policies []*gatewayv1.BackendTLSPolicy
 		services map[types.NamespacedName]*corev1.Service
-		check    func(t *testing.T, res *BackendTLSPolicyResolution)
+		check    func(t *testing.T, resolution *BackendTLSPolicyResolution)
 	}{
 		{
 			name: "a named port",
@@ -67,10 +67,10 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					},
 				},
 			},
-			services: map[types.NamespacedName]*corev1.Service{svcKey: svcWithPorts},
-			check: func(t *testing.T, res *BackendTLSPolicyResolution) {
+			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
+			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
 				policyKey := types.NamespacedName{Namespace: "default", Name: "p-named-port"}
-				targets := res.TargetResults[policyKey]
+				targets := resolution.TargetResultsForPolicy(policyKey)
 				if len(targets) != 1 {
 					t.Fatalf("expected 1 target result, got %d", len(targets))
 				}
@@ -84,17 +84,17 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					t.Errorf("expected MissingPort=false")
 				}
 
-				if p := res.PolicyForService(svcKey, "https"); p == nil || p.Name != "p-named-port" {
-					t.Errorf("expected PolicyForService(https) to be p-named-port, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, "https"); policy == nil || policy.Name != "p-named-port" {
+					t.Errorf("expected PolicyForService(https) to be p-named-port, got %v", policy)
 				}
-				if p := res.PolicyForService(svcKey, "http"); p != nil {
-					t.Errorf("expected PolicyForService(http) to be nil, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, "http"); policy != nil {
+					t.Errorf("expected PolicyForService(http) to be nil, got %v", policy)
 				}
-				if p := res.PolicyForService(svcKey, ""); p != nil {
-					t.Errorf("expected PolicyForService('') to be nil, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, ""); policy != nil {
+					t.Errorf("expected PolicyForService('') to be nil, got %v", policy)
 				}
 
-				if _, conflicted := res.Conflict(policyKey); conflicted {
+				if _, conflicted := resolution.Conflict(policyKey); conflicted {
 					t.Errorf("expected policy not to be conflicted")
 				}
 			},
@@ -118,10 +118,10 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					},
 				},
 			},
-			services: map[types.NamespacedName]*corev1.Service{svcKey: svcWithPorts},
-			check: func(t *testing.T, res *BackendTLSPolicyResolution) {
+			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
+			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
 				policyKey := types.NamespacedName{Namespace: "default", Name: "p-whole-svc"}
-				targets := res.TargetResults[policyKey]
+				targets := resolution.TargetResultsForPolicy(policyKey)
 				if len(targets) != 1 {
 					t.Fatalf("expected 1 target result, got %d", len(targets))
 				}
@@ -135,17 +135,17 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					t.Errorf("expected MissingPort=false")
 				}
 
-				if p := res.PolicyForService(svcKey, "https"); p == nil || p.Name != "p-whole-svc" {
-					t.Errorf("expected PolicyForService(https) to be p-whole-svc, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, "https"); policy == nil || policy.Name != "p-whole-svc" {
+					t.Errorf("expected PolicyForService(https) to be p-whole-svc, got %v", policy)
 				}
-				if p := res.PolicyForService(svcKey, "http"); p == nil || p.Name != "p-whole-svc" {
-					t.Errorf("expected PolicyForService(http) to be p-whole-svc, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, "http"); policy == nil || policy.Name != "p-whole-svc" {
+					t.Errorf("expected PolicyForService(http) to be p-whole-svc, got %v", policy)
 				}
-				if p := res.PolicyForService(svcKey, ""); p == nil || p.Name != "p-whole-svc" {
-					t.Errorf("expected PolicyForService('') to be p-whole-svc, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, ""); policy == nil || policy.Name != "p-whole-svc" {
+					t.Errorf("expected PolicyForService('') to be p-whole-svc, got %v", policy)
 				}
 
-				if _, conflicted := res.Conflict(policyKey); conflicted {
+				if _, conflicted := resolution.Conflict(policyKey); conflicted {
 					t.Errorf("expected policy not to be conflicted")
 				}
 			},
@@ -184,25 +184,25 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					},
 				},
 			},
-			services: map[types.NamespacedName]*corev1.Service{svcKey: svcWithPorts},
-			check: func(t *testing.T, res *BackendTLSPolicyResolution) {
+			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
+			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
 				// The named port policy wins for the named port "https"
-				if p := res.PolicyForService(svcKey, "https"); p == nil || p.Name != "p-named-port" {
-					t.Errorf("expected PolicyForService(https) to be p-named-port, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, "https"); policy == nil || policy.Name != "p-named-port" {
+					t.Errorf("expected PolicyForService(https) to be p-named-port, got %v", policy)
 				}
 				// The whole Service policy applies to other ports like "http" and unspecified ports
-				if p := res.PolicyForService(svcKey, "http"); p == nil || p.Name != "p-whole-svc" {
-					t.Errorf("expected PolicyForService(http) to be p-whole-svc, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, "http"); policy == nil || policy.Name != "p-whole-svc" {
+					t.Errorf("expected PolicyForService(http) to be p-whole-svc, got %v", policy)
 				}
-				if p := res.PolicyForService(svcKey, ""); p == nil || p.Name != "p-whole-svc" {
-					t.Errorf("expected PolicyForService('') to be p-whole-svc, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, ""); policy == nil || policy.Name != "p-whole-svc" {
+					t.Errorf("expected PolicyForService('') to be p-whole-svc, got %v", policy)
 				}
 
 				// Neither policy conflicts because one targets a section and one targets the whole service
-				if _, conflicted := res.Conflict(types.NamespacedName{Namespace: "default", Name: "p-whole-svc"}); conflicted {
+				if _, conflicted := resolution.Conflict(types.NamespacedName{Namespace: "default", Name: "p-whole-svc"}); conflicted {
 					t.Errorf("expected p-whole-svc not to be conflicted")
 				}
-				if _, conflicted := res.Conflict(types.NamespacedName{Namespace: "default", Name: "p-named-port"}); conflicted {
+				if _, conflicted := resolution.Conflict(types.NamespacedName{Namespace: "default", Name: "p-named-port"}); conflicted {
 					t.Errorf("expected p-named-port not to be conflicted")
 				}
 			},
@@ -242,20 +242,20 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					},
 				},
 			},
-			services: map[types.NamespacedName]*corev1.Service{svcKey: svcWithPorts},
-			check: func(t *testing.T, res *BackendTLSPolicyResolution) {
+			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
+			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
 				// Older policy wins
-				if p := res.PolicyForService(svcKey, "https"); p == nil || p.Name != "p-older" {
-					t.Errorf("expected PolicyForService(https) to be p-older, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, "https"); policy == nil || policy.Name != "p-older" {
+					t.Errorf("expected PolicyForService(https) to be p-older, got %v", policy)
 				}
 
 				olderKey := types.NamespacedName{Namespace: "default", Name: "p-older"}
-				if _, conflicted := res.Conflict(olderKey); conflicted {
+				if _, conflicted := resolution.Conflict(olderKey); conflicted {
 					t.Errorf("expected p-older not to be conflicted")
 				}
 
 				newerKey := types.NamespacedName{Namespace: "default", Name: "p-newer"}
-				conflicting, conflicted := res.Conflict(newerKey)
+				conflicting, conflicted := resolution.Conflict(newerKey)
 				if !conflicted {
 					t.Errorf("expected p-newer to be conflicted")
 				}
@@ -299,20 +299,20 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					},
 				},
 			},
-			services: map[types.NamespacedName]*corev1.Service{svcKey: svcWithPorts},
-			check: func(t *testing.T, res *BackendTLSPolicyResolution) {
+			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
+			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
 				// p-a wins alphabetically
-				if p := res.PolicyForService(svcKey, ""); p == nil || p.Name != "p-a" {
-					t.Errorf("expected PolicyForService to be p-a, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, ""); policy == nil || policy.Name != "p-a" {
+					t.Errorf("expected PolicyForService to be p-a, got %v", policy)
 				}
 
 				aKey := types.NamespacedName{Namespace: "default", Name: "p-a"}
-				if _, conflicted := res.Conflict(aKey); conflicted {
+				if _, conflicted := resolution.Conflict(aKey); conflicted {
 					t.Errorf("expected p-a not to be conflicted")
 				}
 
 				bKey := types.NamespacedName{Namespace: "default", Name: "p-b"}
-				conflicting, conflicted := res.Conflict(bKey)
+				conflicting, conflicted := resolution.Conflict(bKey)
 				if !conflicted {
 					t.Errorf("expected p-b to be conflicted")
 				}
@@ -340,10 +340,10 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					},
 				},
 			},
-			services: map[types.NamespacedName]*corev1.Service{svcKey: svcWithPorts},
-			check: func(t *testing.T, res *BackendTLSPolicyResolution) {
+			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
+			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
 				policyKey := types.NamespacedName{Namespace: "default", Name: "p-missing-svc"}
-				targets := res.TargetResults[policyKey]
+				targets := resolution.TargetResultsForPolicy(policyKey)
 				if len(targets) != 1 {
 					t.Fatalf("expected 1 target result, got %d", len(targets))
 				}
@@ -357,8 +357,8 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					t.Errorf("expected MissingPort=false when Service does not exist")
 				}
 
-				missingSvcKey := types.NamespacedName{Namespace: "default", Name: "nonexistent-service"}
-				if !res.TargetsService(policyKey, missingSvcKey) {
+				missingServiceKey := types.NamespacedName{Namespace: "default", Name: "nonexistent-service"}
+				if !resolution.TargetsService(policyKey, missingServiceKey) {
 					t.Errorf("expected TargetsService to be true")
 				}
 			},
@@ -382,10 +382,10 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					},
 				},
 			},
-			services: map[types.NamespacedName]*corev1.Service{svcKey: svcWithPorts},
-			check: func(t *testing.T, res *BackendTLSPolicyResolution) {
+			services: map[types.NamespacedName]*corev1.Service{serviceKey: serviceWithPorts},
+			check: func(t *testing.T, resolution *BackendTLSPolicyResolution) {
 				policyKey := types.NamespacedName{Namespace: "default", Name: "p-missing-port"}
-				targets := res.TargetResults[policyKey]
+				targets := resolution.TargetResultsForPolicy(policyKey)
 				if len(targets) != 1 {
 					t.Fatalf("expected 1 target result, got %d", len(targets))
 				}
@@ -399,23 +399,23 @@ func TestResolveBackendTLSPolicyTargets(t *testing.T) {
 					t.Errorf("expected MissingPort=true when Service exists but port is missing")
 				}
 
-				if p := res.PolicyForService(svcKey, "http"); p != nil {
-					t.Errorf("expected PolicyForService(http) to be nil, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, "http"); policy != nil {
+					t.Errorf("expected PolicyForService(http) to be nil, got %v", policy)
 				}
-				if p := res.PolicyForService(svcKey, "https"); p != nil {
-					t.Errorf("expected PolicyForService(https) to be nil, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, "https"); policy != nil {
+					t.Errorf("expected PolicyForService(https) to be nil, got %v", policy)
 				}
-				if p := res.PolicyForService(svcKey, ""); p != nil {
-					t.Errorf("expected PolicyForService('') to be nil, got %v", p)
+				if policy := resolution.PolicyForService(serviceKey, ""); policy != nil {
+					t.Errorf("expected PolicyForService('') to be nil, got %v", policy)
 				}
 			},
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			res := ResolveBackendTLSPolicyTargets(tt.policies, tt.services)
-			tt.check(t, res)
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			resolution := ResolveBackendTLSPolicyTargets(testCase.policies, testCase.services)
+			testCase.check(t, resolution)
 		})
 	}
 }

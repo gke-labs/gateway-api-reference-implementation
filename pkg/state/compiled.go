@@ -2212,7 +2212,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 		rs := &HTTPRouteState{HTTPRoute: route}
-		rs.CompileWithResolution(inputs.Services, cm.BackendTLSPolicyResolution, inputs.ConfigMaps, refValidator)
+		rs.Compile(inputs.Services, cm.BackendTLSPolicyResolution, inputs.ConfigMaps, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
 		boundListenersForRoute := make(map[*EffectiveListener]bool)
@@ -2244,7 +2244,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 		rs := &TLSRouteState{TLSRoute: route}
-		rs.CompileWithResolution(inputs.Services, cm.BackendTLSPolicyResolution, inputs.ConfigMaps, refValidator)
+		rs.Compile(inputs.Services, cm.BackendTLSPolicyResolution, inputs.ConfigMaps, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
 		boundListenersForRoute := make(map[*EffectiveListener]bool)
@@ -2280,7 +2280,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 		rs := &GRPCRouteState{GRPCRoute: route}
-		rs.CompileWithResolution(inputs.Services, cm.BackendTLSPolicyResolution, inputs.ConfigMaps, refValidator)
+		rs.Compile(inputs.Services, cm.BackendTLSPolicyResolution, inputs.ConfigMaps, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
 		boundListenersForRoute := make(map[*EffectiveListener]bool)
@@ -3154,7 +3154,6 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 			policy,
 			compiled,
 			inputs.ConfigMaps,
-			inputs.BackendTLSPolicies,
 			inputs.ControllerName,
 		)
 	}
@@ -3573,18 +3572,15 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	policy *gatewayv1.BackendTLSPolicy,
 	compiled *CompiledModel,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
-	allPolicies []*gatewayv1.BackendTLSPolicy,
 	controllerName string,
 ) gatewayv1.PolicyStatus {
 	policyKey := types.NamespacedName{Namespace: policy.Namespace, Name: policy.Name}
-	var btlsResolution *BackendTLSPolicyResolution
-	if compiled != nil && compiled.BackendTLSPolicyResolution != nil {
-		btlsResolution = compiled.BackendTLSPolicyResolution
-	} else if len(allPolicies) > 0 {
-		btlsResolution = ResolveBackendTLSPolicyTargets(allPolicies, nil)
+	var resolution *BackendTLSPolicyResolution
+	if compiled != nil {
+		resolution = compiled.BackendTLSPolicyResolution
 	}
 
-	conflictingPolicy, isConflicted := btlsResolution.Conflict(policyKey)
+	conflictingPolicy, isConflicted := resolution.Conflict(policyKey)
 
 	var unresolvedRefs []string
 	hasInvalidKind := false
@@ -3673,12 +3669,12 @@ func ComputeDesiredBackendTLSPolicyStatus(
 				if routeMatchesGw {
 					for _, backendRef := range route.backendRefs {
 						if string(ValueOf(backendRef.Kind)) == "Service" || ValueOf(backendRef.Kind) == "" {
-							svcNs := route.namespace
+							serviceNamespace := route.namespace
 							if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
-								svcNs = string(*backendRef.Namespace)
+								serviceNamespace = string(*backendRef.Namespace)
 							}
-							svcKey := types.NamespacedName{Namespace: svcNs, Name: string(backendRef.Name)}
-							if btlsResolution.TargetsService(policyKey, svcKey) {
+							serviceKey := types.NamespacedName{Namespace: serviceNamespace, Name: string(backendRef.Name)}
+							if resolution.TargetsService(policyKey, serviceKey) {
 								usesPolicy = true
 								break
 							}
