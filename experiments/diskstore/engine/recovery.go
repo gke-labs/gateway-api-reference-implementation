@@ -327,12 +327,9 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		}
 
 		desc := &PageDesc{
-			LogicalPage:       logicalPage,
-			NumBlocks:         cand.numBlocks,
-			PhysicalBlock:     cand.startBlock,
-			FlushedLoc:        NoBlock,
-			FlushedBeforeSync: NoBlock,
-			DurableLoc:        cand.startBlock,
+			LogicalPage:   logicalPage,
+			NumBlocks:     cand.numBlocks,
+			PhysicalBlock: cand.startBlock,
 		}
 		desc.PageLSN.Store(cand.lsn)
 		pageDescs[logicalPage] = desc

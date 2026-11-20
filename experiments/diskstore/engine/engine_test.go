@@ -166,7 +166,7 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 	// Capture version 1's disk block
 	v1Block := make([]byte, BlockSize)
 	store.bp.mu.Lock()
-	locV1 := store.bp.pageTable[entryV1.LogicalPage].DurableLoc
+	locV1 := store.bp.pageTable[entryV1.LogicalPage].PhysicalBlock
 	store.bp.mu.Unlock()
 	_, _ = store.heapFile.ReadAt(v1Block, int64(locV1*BlockSize))
 
@@ -191,8 +191,8 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 	}
 }
 
-// TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync asserts locations flushed after sync starts aren't promoted.
-func TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync(t *testing.T) {
+// TestRegression_Item11_ReuseRuleFlushedAfterSyncStartsNotFreed asserts locations flushed after sync starts aren't freed by the running sync.
+func TestRegression_Item11_ReuseRuleFlushedAfterSyncStartsNotFreed(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
@@ -202,38 +202,60 @@ func TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Put page 1, flush it
+	// Put page 1, flush it and checkpoint to make loc1 durable
 	_ = store.Put("ConfigMap", "k1", []byte("v1"))
+	if err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
 	store.bp.mu.Lock()
 	desc := store.bp.pageTable[store.keyIndex[qualifyKey("ConfigMap", "k1")].LogicalPage]
+	loc1 := desc.PhysicalBlock
+	store.bp.mu.Unlock()
+
+	// Start heap sync
+	store.bp.startHeapSync()
+
+	// Put version 2 and flush it AFTER startHeapSync was called
+	_ = store.Put("ConfigMap", "k1", []byte("v2"))
+	store.bp.mu.Lock()
 	_ = store.bp.FlushPageLocked(desc)
-	loc1 := desc.FlushedLoc
+	loc2 := desc.PhysicalBlock
 	store.bp.mu.Unlock()
 
-	// Snapshot for sync
-	store.bp.SnapshotFlushedForSync()
-
-	// Put page 2 and flush it AFTER snapshot was taken
-	_ = store.Put("ConfigMap", "k2", []byte("v2"))
-	store.bp.mu.Lock()
-	desc2 := store.bp.pageTable[store.keyIndex[qualifyKey("ConfigMap", "k2")].LogicalPage]
-	_ = store.bp.FlushPageLocked(desc2)
-	loc2 := desc2.FlushedLoc
-	store.bp.mu.Unlock()
-
-	// Now promote flushed locations
-	_ = store.bp.PromoteFlushedToDurable()
-
-	store.bp.mu.Lock()
-	defer store.bp.mu.Unlock()
-
-	// loc1 was before snapshot -> promoted to durable!
-	if desc.DurableLoc != loc1 {
-		t.Fatalf("desc 1 DurableLoc=%d, expected %d", desc.DurableLoc, loc1)
+	// Complete the ongoing fsync: loc1 was superseded after startHeapSync, so it must NOT be freed!
+	if err := store.heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
 	}
-	// loc2 was flushed AFTER snapshot -> must NOT be promoted to durable yet!
-	if desc2.DurableLoc == loc2 {
-		t.Fatalf("desc 2 DurableLoc was prematurely promoted to durable before its fsync!")
+	if err := store.bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("heapSyncSucceeded failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	_, loc1Allocated := store.bp.buddy.allocated[loc1]
+	store.bp.mu.Unlock()
+
+	// loc1 was superseded after sync started -> must NOT be freed by this fsync!
+	if !loc1Allocated {
+		t.Fatalf("loc1 %d was prematurely freed by fsync that started before replacement was written!", loc1)
+	}
+	if loc2 == loc1 {
+		t.Fatalf("loc2 should be out-of-place write, got same %d", loc2)
+	}
+
+	// Subsequent heap sync makes loc2 durable and frees loc1
+	store.bp.startHeapSync()
+	if err := store.heapFile.Sync(); err != nil {
+		t.Fatalf("second heapFile.Sync failed: %v", err)
+	}
+	if err := store.bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("second heapSyncSucceeded failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	_, loc1AllocatedAfter := store.bp.buddy.allocated[loc1]
+	store.bp.mu.Unlock()
+	if loc1AllocatedAfter {
+		t.Fatalf("loc1 %d should be freed after second heap sync", loc1)
 	}
 }
 
@@ -1568,9 +1590,6 @@ func TestPut_PinFailureDoesNotAllocate(t *testing.T) {
 	}
 	if err := store.heapFile.Sync(); err != nil {
 		t.Fatalf("heapFile.Sync failed: %v", err)
-	}
-	if err := store.bp.PromoteFlushedToDurable(); err != nil {
-		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
 	}
 
 	// Evict page from memory pool blocks

@@ -69,9 +69,6 @@ func TestBlockPool_PinAndEviction(t *testing.T) {
 	if err := heapFile.Sync(); err != nil {
 		t.Fatalf("heapFile.Sync failed: %v", err)
 	}
-	if err := bp.PromoteFlushedToDurable(); err != nil {
-		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
-	}
 
 	// Allocate 4 new pages (pages 2, 3, 4, 5) to force eviction of page 1 from the 4-block pool
 	for i := uint64(2); i <= 5; i++ {
@@ -84,7 +81,7 @@ func TestBlockPool_PinAndEviction(t *testing.T) {
 	}
 
 	// Re-pin page 1 from disk
-	loc := h1.Desc.DurableLoc
+	loc := h1.Desc.PhysicalBlock
 	h1Reloaded, err := bp.PinPageWithLocation(1, loc, 1)
 	if err != nil {
 		t.Fatalf("PinPageWithLocation failed: %v", err)
@@ -145,8 +142,8 @@ func TestBlockPool_MultiBlockPageNonAdjacentPoolBlocks(t *testing.T) {
 	}
 }
 
-// TestBlockPool_InFlightWriteNotPromoted asserts that in-flight page writes are not promoted
-// during a checkpoint, satisfying the Reuse Rule.
+// TestBlockPool_InFlightWriteNotPromoted asserts that in-flight page writes do not cause
+// superseded durable blocks to be released during a concurrent heap fsync.
 func TestBlockPool_InFlightWriteNotPromoted(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
@@ -181,21 +178,21 @@ func TestBlockPool_InFlightWriteNotPromoted(t *testing.T) {
 	copy(h1.Block(0)[BlockHeaderSize:], []byte("v1-content"))
 	h1.Unpin()
 
-	// Flush and checkpoint to establish initial durable location
+	// Flush and sync to establish initial durable location
 	if err := bp.FlushPage(1); err != nil {
 		t.Fatalf("FlushPage failed: %v", err)
 	}
-	bp.SnapshotFlushedForSync()
+	bp.startHeapSync()
 	if err := heapFile.Sync(); err != nil {
 		t.Fatalf("heapFile.Sync failed: %v", err)
 	}
-	if err := bp.PromoteFlushedToDurable(); err != nil {
-		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	if err := bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("heapSyncSucceeded failed: %v", err)
 	}
 
 	bp.mu.Lock()
 	desc := bp.pageTable[1]
-	initialDurableLoc := desc.DurableLoc
+	initialLoc := desc.PhysicalBlock
 	bp.mu.Unlock()
 
 	// Dirty page 1 again at LSN 20
@@ -238,25 +235,25 @@ func TestBlockPool_InFlightWriteNotPromoted(t *testing.T) {
 	}
 	bp.mu.Unlock()
 
-	// Checkpoint runs while the write is in flight
-	bp.SnapshotFlushedForSync()
+	// Heap sync runs while the write is in flight
+	bp.startHeapSync()
 	if err := heapFile.Sync(); err != nil {
 		close(releaseWrite)
 		t.Fatalf("heapFile.Sync failed: %v", err)
 	}
-	if err := bp.PromoteFlushedToDurable(); err != nil {
+	if err := bp.heapSyncSucceeded(); err != nil {
 		close(releaseWrite)
-		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+		t.Fatalf("heapSyncSucceeded failed: %v", err)
 	}
 
-	// Assert that in-flight location was NOT promoted
+	// Assert that initial location was NOT freed while write was in flight
 	bp.mu.Lock()
-	if desc.DurableLoc != initialDurableLoc {
-		bp.mu.Unlock()
-		close(releaseWrite)
-		t.Fatalf("in-flight location was promoted to durable! DurableLoc=%d, expected=%d", desc.DurableLoc, initialDurableLoc)
-	}
+	_, initialAllocated := bp.buddy.allocated[initialLoc]
 	bp.mu.Unlock()
+	if !initialAllocated {
+		close(releaseWrite)
+		t.Fatalf("initial location %d was prematurely freed while write was in flight!", initialLoc)
+	}
 
 	// Release in-flight write to complete
 	close(releaseWrite)
@@ -264,21 +261,28 @@ func TestBlockPool_InFlightWriteNotPromoted(t *testing.T) {
 		t.Fatalf("FlushPage failed after unblocking write: %v", err)
 	}
 
-	// Now that write completed, next checkpoint must promote it safely
-	bp.SnapshotFlushedForSync()
+	bp.mu.Lock()
+	newLoc := desc.PhysicalBlock
+	bp.mu.Unlock()
+	if newLoc == initialLoc {
+		t.Fatalf("expected write to land on new location, still %d", newLoc)
+	}
+
+	// Next heap sync makes the new write durable and safely frees the superseded initial location
+	bp.startHeapSync()
 	if err := heapFile.Sync(); err != nil {
 		t.Fatalf("heapFile.Sync failed: %v", err)
 	}
-	if err := bp.PromoteFlushedToDurable(); err != nil {
-		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	if err := bp.heapSyncSucceeded(); err != nil {
+		t.Fatalf("heapSyncSucceeded failed: %v", err)
 	}
 
 	bp.mu.Lock()
-	if desc.DurableLoc == initialDurableLoc {
-		bp.mu.Unlock()
-		t.Fatalf("expected DurableLoc to be promoted after write completed, still %d", desc.DurableLoc)
-	}
+	_, initialAllocatedAfter := bp.buddy.allocated[initialLoc]
 	bp.mu.Unlock()
+	if initialAllocatedAfter {
+		t.Fatalf("expected initial location %d to be freed after subsequent sync", initialLoc)
+	}
 }
 
 func TestBlockPool_BatchedEviction(t *testing.T) {
@@ -337,13 +341,8 @@ func TestBlockPool_BatchedEviction(t *testing.T) {
 	}
 
 	// Verify page 1 (which was evicted) can be reloaded and matches data
-	// First sync heap to establish durable locations
-	bp.SnapshotFlushedForSync()
-	_ = countingHeap.Sync()
-	_ = bp.PromoteFlushedToDurable()
-
 	bp.mu.Lock()
-	loc1 := bp.pageTable[1].DurableLoc
+	loc1 := bp.pageTable[1].PhysicalBlock
 	bp.mu.Unlock()
 
 	h1Reloaded, err := bp.PinPageWithLocation(1, loc1, 1)
@@ -460,9 +459,12 @@ func TestBlockPool_ConcurrentReuseWhileFlushing(t *testing.T) {
 	}
 
 	// 5. Verify the block written by the flusher contains incarnation 1's data
-	flushedLoc := h2.Desc.FlushedLoc
+	if len(h2.Desc.replacedBlocks) == 0 {
+		t.Fatalf("expected page 1 to retain replaced block after flush completed")
+	}
+	flushedLoc := h2.Desc.replacedBlocks[0]
 	if flushedLoc == NoBlock {
-		t.Fatalf("expected page 1 to retain FlushedLoc after flush completed")
+		t.Fatalf("expected page 1 to retain valid replaced block after flush completed")
 	}
 	buf := make([]byte, BlockSize)
 	if _, err := heapFile.ReadAt(buf, int64(flushedLoc*BlockSize)); err != nil {
@@ -1364,15 +1366,11 @@ func TestBlockPool_DeferredFrees_NoRunDeferredOrFreedTwice(t *testing.T) {
 	bp.mu.Unlock()
 	assertNoDuplicates()
 
-	// Promote loc1 to durable
-	bp.SnapshotFlushedForSync()
+	// Make loc1 durable
 	bp.startHeapSync()
 	assertNoDuplicates()
 	if err := bp.heapSyncSucceeded(); err != nil {
 		t.Fatalf("heapSyncSucceeded failed: %v", err)
-	}
-	if err := bp.PromoteFlushedToDurable(); err != nil {
-		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
 	}
 	assertNoDuplicates()
 

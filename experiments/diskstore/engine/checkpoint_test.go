@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestCheckpointer_BasicCheckpoint(t *testing.T) {
@@ -77,7 +78,7 @@ func TestCheckpointer_BasicCheckpoint(t *testing.T) {
 	if h1.Desc.Dirty || h2.Desc.Dirty {
 		t.Fatalf("pages should not be dirty after checkpoint")
 	}
-	if h1.Desc.DurableLoc == NoBlock || h2.Desc.DurableLoc == NoBlock {
+	if h1.Desc.PhysicalBlock == NoBlock || h2.Desc.PhysicalBlock == NoBlock {
 		t.Fatalf("pages should have durable locations after checkpoint")
 	}
 }
@@ -219,7 +220,7 @@ func runCountingCheckpointTest(t *testing.T, numPages int, expectedWrites int64)
 			bp.mu.Unlock()
 			t.Fatalf("page %d still dirty after checkpoint", i)
 		}
-		if desc.DurableLoc == NoBlock {
+		if desc.PhysicalBlock == NoBlock {
 			bp.mu.Unlock()
 			t.Fatalf("page %d has no durable location", i)
 		}
@@ -774,7 +775,7 @@ func TestCheckpointer_DeterministicDeferredFreesSequence(t *testing.T) {
 	pageID := entry.LogicalPage
 
 	store.bp.mu.Lock()
-	durableLoc0 := store.bp.pageTable[pageID].DurableLoc
+	durableLoc0 := store.bp.pageTable[pageID].PhysicalBlock
 	store.bp.mu.Unlock()
 	if durableLoc0 == NoBlock {
 		t.Fatalf("expected page %d to have a durable location after checkpoint", pageID)
@@ -786,7 +787,6 @@ func TestCheckpointer_DeterministicDeferredFreesSequence(t *testing.T) {
 	}
 
 	// 3. Start a heap fsync
-	store.bp.SnapshotFlushedForSync()
 	store.bp.startHeapSync()
 
 	// 4. Flush the page while the fsync runs
@@ -808,9 +808,6 @@ func TestCheckpointer_DeterministicDeferredFreesSequence(t *testing.T) {
 	}
 	if err := store.bp.heapSyncSucceeded(); err != nil {
 		t.Fatalf("heapSyncSucceeded failed: %v", err)
-	}
-	if err := store.bp.PromoteFlushedToDurable(); err != nil {
-		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
 	}
 
 	// Verify durableLoc0 is NOT freed because it was superseded after startHeapSync was called
@@ -960,5 +957,95 @@ func TestCheckpointer_PageDeletionDefersOldLocation(t *testing.T) {
 	store.bp.mu.Unlock()
 	if loc1Allocated {
 		t.Fatalf("old location %d should be freed after checkpoint", loc1)
+	}
+}
+
+// TestCheckpointer_FlushStartedWhileHeapFsyncBlockedCompletes verifies that flushers do not wait
+// for a heap fsync: a flush started while an fsync is blocked completes.
+func TestCheckpointer_FlushStartedWhileHeapFsyncBlockedCompletes(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	faultFS.SetAssertReuseRule(true)
+
+	storeDir := "test_flush_while_fsync_blocked"
+	store, err := Open(WithFS(faultFS), WithDir(storeDir), WithCreate())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	// 1. Establish an initial durable page
+	if err := store.Put("table", "k1", []byte("val1")); err != nil {
+		t.Fatalf("initial Put failed: %v", err)
+	}
+	if err := store.Checkpoint(); err != nil {
+		t.Fatalf("initial Checkpoint failed: %v", err)
+	}
+
+	// 2. Prepare page 2 with modifications to flush
+	if err := store.Put("table", "k2", []byte("val2")); err != nil {
+		t.Fatalf("second Put failed: %v", err)
+	}
+
+	store.keyMu.RLock()
+	entryK2 := store.keyIndex[qualifyKey("table", "k2")]
+	store.keyMu.RUnlock()
+	pageID := entryK2.LogicalPage
+
+	// 3. Set up hook to block heapFile.Sync() when checkpoint runs
+	fsyncBlocked := make(chan struct{})
+	allowFsyncFinish := make(chan struct{})
+	checkpointDone := make(chan struct{})
+	var checkpointErr error
+
+	var once sync.Once
+	faultFS.SetBeforeSync(func(path string) {
+		if filepath.Base(path) == "heap.db" {
+			once.Do(func() {
+				close(fsyncBlocked)
+				<-allowFsyncFinish
+			})
+		}
+	})
+
+	// Start checkpoint in background goroutine
+	go func() {
+		checkpointErr = store.Checkpoint()
+		close(checkpointDone)
+	}()
+
+	// Wait until heapFile.Sync() is blocked
+	<-fsyncBlocked
+
+	// 4. Start a flush while the fsync is blocked
+	flushDone := make(chan struct{})
+	var flushErr error
+	go func() {
+		flushErr = store.bp.FlushPage(pageID)
+		close(flushDone)
+	}()
+
+	// 5. Verify the flush completes while the fsync is still blocked
+	select {
+	case <-flushDone:
+		if flushErr != nil {
+			t.Fatalf("FlushPage failed: %v", flushErr)
+		}
+	case <-time.After(5 * time.Second):
+		close(allowFsyncFinish)
+		t.Fatalf("FlushPage blocked waiting for heap fsync; must complete independently")
+	}
+
+	// 6. Release fsync and verify checkpoint finishes cleanly
+	close(allowFsyncFinish)
+	<-checkpointDone
+	if checkpointErr != nil {
+		t.Fatalf("Checkpoint failed: %v", checkpointErr)
+	}
+
+	// 7. Verify the flushed page is valid and readable
+	val, exists, err := store.Get("table", "k2")
+	if err != nil || !exists || !bytes.Equal(val, []byte("val2")) {
+		t.Fatalf("Get k2 returned val=%q, exists=%v, err=%v", string(val), exists, err)
 	}
 }

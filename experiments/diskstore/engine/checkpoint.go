@@ -88,8 +88,6 @@ func (c *Checkpointer) flushPagesLocked() error {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
 	}
 
-	// Record locations flushed before fsync begins (Reuse Rule / Item 11)
-	c.bp.SnapshotFlushedForSync()
 	c.bp.startHeapSync()
 
 	// Fsync heap file
@@ -107,23 +105,16 @@ func (c *Checkpointer) flushPagesLocked() error {
 		return fmt.Errorf("failed to free deferred blocks: %w", err)
 	}
 
-	// Promote flushed locations to durable (frees superseded locations)
-	if err := c.bp.PromoteFlushedToDurable(); err != nil {
-		return fmt.Errorf("failed to promote flushed pages: %w", err)
-	}
-
 	return nil
 }
 
 // Checkpoint performs a non-blocking checkpoint:
 // 1. Snapshot dirty pages and capture current max LSN at snapshot time.
 // 2. Flush dirty pages to new physical locations (out-of-place write).
-// 3. Snapshot flushed locations before heap fsync begins (Reuse Rule).
-// 4. Fsync heap file.
-// 5. Promote pre-sync flushed locations to durable; free older superseded durable locations.
-// 6. Write recovery start LSN page to meta.db and fsync meta.db.
-// 7. Fsync WAL.
-// 8. Truncate eligible WAL segments strictly prior to redo start LSN.
+// 3. Fsync heap file and release deferred frees.
+// 4. Write recovery start LSN page to meta.db and fsync meta.db.
+// 5. Fsync WAL.
+// 6. Truncate eligible WAL segments strictly prior to redo start LSN.
 func (c *Checkpointer) Checkpoint() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
