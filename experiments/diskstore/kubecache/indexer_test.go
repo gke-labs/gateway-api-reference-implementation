@@ -737,7 +737,7 @@ func TestIndexer_ResourceVersionSurvivesCheckpointTruncation(t *testing.T) {
 	if err := idx.Close(); err != nil {
 		t.Fatalf("idx.Close failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 1 failed: %v", err)
 	}
 
@@ -751,11 +751,11 @@ func TestIndexer_ResourceVersionSurvivesCheckpointTruncation(t *testing.T) {
 		}
 	}
 	putPads(0, 560)
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 2 failed: %v", err)
 	}
 	putPads(560, 580)
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 3 failed: %v", err)
 	}
 

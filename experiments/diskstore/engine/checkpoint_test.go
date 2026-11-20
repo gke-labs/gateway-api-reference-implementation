@@ -69,13 +69,8 @@ func TestCheckpointer_BasicCheckpoint(t *testing.T) {
 	h2.Unpin()
 
 	// Checkpoint
-	chkLSN, err := checkpointer.Checkpoint()
-	if err != nil {
+	if err := checkpointer.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
-	}
-
-	if chkLSN <= 5 {
-		t.Fatalf("expected checkpoint LSN > 5, got %d", chkLSN)
 	}
 
 	// Verify both pages are now durable and not dirty
@@ -206,7 +201,7 @@ func runCountingCheckpointTest(t *testing.T, numPages int, expectedWrites int64)
 	countingHeap.writeCalls.Store(0)
 
 	// Perform checkpoint
-	if _, err := checkpointer.Checkpoint(); err != nil {
+	if err := checkpointer.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 
@@ -303,7 +298,7 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		r1 := bp.pageTable[1].PhysicalBlock
 		bp.mu.Unlock()
 
-		if _, err := checkpointer.Checkpoint(); err != nil {
+		if err := checkpointer.Checkpoint(); err != nil {
 			t.Fatalf("initial Checkpoint failed: %v", err)
 		}
 
@@ -320,7 +315,7 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		}
 
 		// Checkpoint calls startHeapSync, Sync, and heapSyncSucceeded
-		if _, err := checkpointer.Checkpoint(); err != nil {
+		if err := checkpointer.Checkpoint(); err != nil {
 			t.Fatalf("Checkpoint failed: %v", err)
 		}
 
@@ -380,7 +375,7 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		r1 := bp.pageTable[1].PhysicalBlock
 		bp.mu.Unlock()
 
-		if _, err := checkpointer.Checkpoint(); err != nil {
+		if err := checkpointer.Checkpoint(); err != nil {
 			t.Fatalf("initial Checkpoint failed: %v", err)
 		}
 
@@ -408,7 +403,7 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		})
 
 		// Checkpoint must fail at heap fsync
-		if _, err := checkpointer.Checkpoint(); err == nil {
+		if err := checkpointer.Checkpoint(); err == nil {
 			t.Fatalf("expected checkpoint to fail on sync error, but it succeeded")
 		}
 
@@ -418,7 +413,7 @@ func TestCheckpointer_DeferredFreesIntegration(t *testing.T) {
 		}
 
 		// Next checkpoint must succeed and free r1
-		if _, err := checkpointer.Checkpoint(); err != nil {
+		if err := checkpointer.Checkpoint(); err != nil {
 			t.Fatalf("subsequent checkpoint failed: %v", err)
 		}
 
@@ -442,7 +437,7 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	if err := store.Put("table", "k1", []byte("v1_initial")); err != nil {
 		t.Fatalf("initial Put failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("initial Checkpoint failed: %v", err)
 	}
 
@@ -514,8 +509,7 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	})
 
 	// 4. Run Checkpoint
-	chkLSN, cpErr := store.Checkpoint()
-	if cpErr != nil {
+	if cpErr := store.Checkpoint(); cpErr != nil {
 		t.Fatalf("Checkpoint failed: %v", cpErr)
 	}
 	if flushErr != nil {
@@ -524,24 +518,6 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 
 	// 5. Verify acceptance criterion:
 	// "The checkpoint's redo start LSN is at or below that page's first un-synced LSN"
-	walScanIt, err := NewWALIterator(faultFS, filepath.Join(storeDir, "wal"), store.dbID, chkLSN, WALIteratorOptions{})
-	if err != nil {
-		t.Fatalf("NewWALIterator failed: %v", err)
-	}
-	defer func() {
-		if err := walScanIt.Close(); err != nil {
-			t.Errorf("walScanIt.Close failed: %v", err)
-		}
-	}()
-
-	chkRecord, err := walScanIt.Next()
-	if err != nil {
-		t.Fatalf("reading checkpoint record failed: %v", err)
-	}
-	if chkRecord.Type != RecordTypeCheckpoint {
-		t.Fatalf("expected RecordTypeCheckpoint, got %v", chkRecord.Type)
-	}
-
 	metaFile, err := faultFS.OpenFile(filepath.Join(storeDir, "meta.db"), 0, 0)
 	if err != nil {
 		t.Fatalf("OpenFile meta.db failed: %v", err)
@@ -615,7 +591,7 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 	if err := store.Put("table", "mb1", mbVal1); err != nil {
 		t.Fatalf("initial multi-block Put failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("initial Checkpoint failed: %v", err)
 	}
 
@@ -661,16 +637,12 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 		}
 	})
 
-	chkLSN1, cpErr := store.Checkpoint()
-	if cpErr != nil {
+	if cpErr := store.Checkpoint(); cpErr != nil {
 		t.Fatalf("Checkpoint failed: %v", cpErr)
 	}
 	<-deleteAndReallocDone
 	if opErr != nil {
 		t.Fatalf("concurrent operations during fsync failed: %v", opErr)
-	}
-	if chkLSN1 == 0 {
-		t.Fatalf("expected non-zero checkpoint LSN")
 	}
 	if deleteLSN == 0 || putLSN == 0 || deleteLSN >= putLSN {
 		t.Fatalf("expected deleteLSN (%d) < putLSN (%d)", deleteLSN, putLSN)
@@ -708,27 +680,8 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 
 	// 4. Second checkpoint records redo start at or below deleteLSN
 	faultFS.SetBeforeSync(nil)
-	chkLSN2, cpErr2 := store.Checkpoint()
-	if cpErr2 != nil {
+	if cpErr2 := store.Checkpoint(); cpErr2 != nil {
 		t.Fatalf("second Checkpoint failed: %v", cpErr2)
-	}
-
-	walScanIt, err := NewWALIterator(faultFS, filepath.Join(storeDir, "wal"), store.dbID, chkLSN2, WALIteratorOptions{})
-	if err != nil {
-		t.Fatalf("NewWALIterator failed: %v", err)
-	}
-	defer func() {
-		if err := walScanIt.Close(); err != nil {
-			t.Errorf("walScanIt.Close failed: %v", err)
-		}
-	}()
-
-	chkRecord, err := walScanIt.Next()
-	if err != nil {
-		t.Fatalf("reading second checkpoint record failed: %v", err)
-	}
-	if chkRecord.Type != RecordTypeCheckpoint {
-		t.Fatalf("expected RecordTypeCheckpoint, got %v", chkRecord.Type)
 	}
 
 	metaFile2, err := faultFS.OpenFile(filepath.Join(storeDir, "meta.db"), 0, 0)
@@ -808,7 +761,7 @@ func TestCheckpointer_DeterministicDeferredFreesSequence(t *testing.T) {
 	if err := store.Put("table", "k1", []byte("val_v1")); err != nil {
 		t.Fatalf("initial Put failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("initial Checkpoint failed: %v", err)
 	}
 
@@ -926,7 +879,7 @@ func TestCheckpointer_DeterministicDeferredFreesSequence(t *testing.T) {
 	}
 
 	// 9. Now run a full checkpoint; fsync will make loc2 durable and release durableLoc0 and loc1
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("final Checkpoint failed: %v", err)
 	}
 
@@ -958,7 +911,7 @@ func TestCheckpointer_PageDeletionDefersOldLocation(t *testing.T) {
 	if err := store.Put("table", "k1", []byte("val_v1")); err != nil {
 		t.Fatalf("Put k1 failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 
@@ -998,7 +951,7 @@ func TestCheckpointer_PageDeletionDefersOldLocation(t *testing.T) {
 	}
 
 	// Checkpoint fsyncs the empty page and frees loc1
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("final Checkpoint failed: %v", err)
 	}
 

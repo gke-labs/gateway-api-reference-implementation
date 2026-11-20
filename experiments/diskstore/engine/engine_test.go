@@ -156,7 +156,7 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 
 	// Put version 1 and checkpoint to disk
 	_ = store.Put("ConfigMap", "default/cm-stale", []byte("val-v1"))
-	_, _ = store.Checkpoint()
+	_ = store.Checkpoint()
 
 	qKey := qualifyKey("ConfigMap", "default/cm-stale")
 	store.keyMu.RLock()
@@ -256,7 +256,7 @@ func TestRegression_Item15_16_NoOldRecordResurrection(t *testing.T) {
 	}
 
 	// Checkpoint to truncate WAL
-	_, err = store.Checkpoint()
+	err = store.Checkpoint()
 	if err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestRegression_Item17_OversizeObjectPersistence(t *testing.T) {
 	}
 
 	// Checkpoint and close
-	_, _ = store.Checkpoint()
+	_ = store.Checkpoint()
 	_ = store.Close()
 
 	// Reopen store: oversize object must still be readable!
@@ -1075,7 +1075,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 					}
 
 					// Checkpoint so val1 is durable on disk
-					if _, err := store.Checkpoint(); err != nil {
+					if err := store.Checkpoint(); err != nil {
 						t.Fatalf("Checkpoint 1 failed: %v", err)
 					}
 
@@ -1107,7 +1107,7 @@ func TestPageTransitions_NoResurrection(t *testing.T) {
 
 					// 4. Reopen either after Checkpoint (Heap scan) or without Checkpoint (Redo replay)
 					if m.checkpointPostDelete {
-						if _, err := store.Checkpoint(); err != nil {
+						if err := store.Checkpoint(); err != nil {
 							t.Fatalf("Checkpoint 2 failed: %v", err)
 						}
 						if err := store.Close(); err != nil {
@@ -1340,7 +1340,7 @@ func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
 			case <-stopCh:
 				return
 			default:
-				_, _ = store.Checkpoint()
+				_ = store.Checkpoint()
 				time.Sleep(5 * time.Millisecond)
 			}
 		}
@@ -2535,7 +2535,7 @@ func TestEngine_DeferredFreeFailureTransitionsToFailedState(t *testing.T) {
 	store.bp.mu.Unlock()
 
 	// Checkpoint triggers startHeapSync, heap fsync, and heapSyncSucceeded
-	_, cpErr := store.Checkpoint()
+	cpErr := store.Checkpoint()
 	if cpErr == nil {
 		t.Fatalf("expected Checkpoint to fail on failed buddy.Free, but it succeeded")
 	}

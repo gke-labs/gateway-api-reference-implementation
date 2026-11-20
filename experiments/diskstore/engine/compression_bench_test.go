@@ -615,7 +615,7 @@ func runCorpusHeapSizeBenchmark(b *testing.B, corpus []corpusItem, codec Compres
 	}
 	writeDur := time.Since(start)
 
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		b.Fatalf("Checkpoint failed: %v", err)
 	}
 	if err := store.Sync(); err != nil {

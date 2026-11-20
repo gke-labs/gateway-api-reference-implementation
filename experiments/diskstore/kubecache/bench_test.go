@@ -670,10 +670,10 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			cm := getCorpusObject(corpus, i)
 			_ = diskIndexer.Add(cm)
 			if (i+1)%2500 == 0 {
-				_, _ = diskStore.Checkpoint()
+				_ = diskStore.Checkpoint()
 			}
 		}
-		_, _ = diskStore.Checkpoint()
+		_ = diskStore.Checkpoint()
 		writeDur := time.Since(t0)
 
 		memAfter := readMemStats()

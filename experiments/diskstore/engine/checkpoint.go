@@ -122,10 +122,9 @@ func (c *Checkpointer) flushPagesLocked() error {
 // 4. Fsync heap file.
 // 5. Promote pre-sync flushed locations to durable; free older superseded durable locations.
 // 6. Write recovery start LSN page to meta.db and fsync meta.db.
-// 7. Append checkpoint record to WAL as a completion marker and to advance the WAL LSN.
-// 8. Fsync WAL.
-// 9. Truncate eligible WAL segments strictly prior to redo start LSN.
-func (c *Checkpointer) Checkpoint() (uint64, error) {
+// 7. Fsync WAL.
+// 8. Truncate eligible WAL segments strictly prior to redo start LSN.
+func (c *Checkpointer) Checkpoint() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -146,7 +145,7 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 
 	// 2-5. Flush dirty pages, sync heap file, and promote flushed locations
 	if err := c.flushPagesLocked(); err != nil {
-		return 0, fmt.Errorf("checkpoint failed to flush dirty pages: %w", err)
+		return fmt.Errorf("checkpoint failed to flush dirty pages: %w", err)
 	}
 
 	// 6. Write the recovery start LSN page to meta.db only after the heap fsync completes,
@@ -160,27 +159,18 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 	// across all unpersisted pages and the heap flush has synced the log past it; when no
 	// dirty pages exist, it is MaxLSN (snapshotLSN) reflecting that all earlier changes are durable.
 	if err := c.writeRecoveryPageLocked(redoStartLSN); err != nil {
-		return 0, fmt.Errorf("checkpoint failed to write recovery start page to meta.db: %w", err)
+		return fmt.Errorf("checkpoint failed to write recovery start page to meta.db: %w", err)
 	}
 
-	// 7. Append checkpoint record to WAL, assigning LSN under WAL lock
-	chkRec := Record{
-		Type: RecordTypeCheckpoint,
-	}
-	chkLSN, err := c.wal.AppendRecord(&chkRec)
-	if err != nil {
-		return 0, fmt.Errorf("checkpoint failed to write WAL record: %w", err)
-	}
-
-	// 8. Fsync WAL
+	// 7. Fsync WAL
 	if err := c.wal.Sync(); err != nil {
-		return 0, fmt.Errorf("checkpoint failed to fsync WAL: %w", err)
+		return fmt.Errorf("checkpoint failed to fsync WAL: %w", err)
 	}
 
-	// 9. Truncate finished WAL segments prior to redoStartLSN
+	// 8. Truncate finished WAL segments prior to redoStartLSN
 	if err := c.wal.TruncateBefore(redoStartLSN); err != nil {
-		return 0, fmt.Errorf("checkpoint failed to truncate WAL: %w", err)
+		return fmt.Errorf("checkpoint failed to truncate WAL: %w", err)
 	}
 
-	return chkLSN, nil
+	return nil
 }

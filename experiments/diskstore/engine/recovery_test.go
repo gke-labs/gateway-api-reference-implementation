@@ -168,18 +168,18 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	slotted.Finalize()
 	h1.Unpin()
 
-	_, _ = cp.Checkpoint()
+	_ = cp.Checkpoint()
 
 	// Now delete key-1
-	_ = wal.Append(Record{Type: RecordTypeDelete, LSN: 3, Key: "key-1"})
+	_ = wal.Append(Record{Type: RecordTypeDelete, LSN: 2, Key: "key-1"})
 	h1Reload, _ := bp.PinPage(1)
 	slottedReload, _ := WrapSlottedPage(h1Reload.Block(0))
-	_ = slottedReload.Delete(0, 3)
+	_ = slottedReload.Delete(0, 2)
 	slottedReload.Finalize()
-	bp.MarkDirty(1, 3)
+	bp.MarkDirty(1, 2)
 	h1Reload.Unpin()
 
-	_, _ = cp.Checkpoint()
+	_ = cp.Checkpoint()
 
 	_ = bp.Close()
 	_ = heapFile.Close()
@@ -414,8 +414,7 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 	_ = store.Put("ConfigMap", "key-large", largeVal)
 	model["key-large"] = string(largeVal)
 
-	chk1, err := store.Checkpoint()
-	if err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 1 failed: %v", err)
 	}
 
@@ -427,12 +426,8 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 	model["key3"] = "val3-initial"
 
 	// Checkpoint 2
-	chk2, err := store.Checkpoint()
-	if err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 2 failed: %v", err)
-	}
-	if chk2 <= chk1 {
-		t.Fatalf("checkpoint LSN did not advance: chk2=%d <= chk1=%d", chk2, chk1)
 	}
 
 	// Un-checkpointed writes before crash
@@ -480,8 +475,7 @@ func testRecovery_CrashConsistency(t *testing.T, key []byte) {
 	_ = store2.Put("ConfigMap", "key5", []byte("val5-cycle2"))
 	model["key5"] = "val5-cycle2"
 
-	_, err = store2.Checkpoint()
-	if err != nil {
+	if err := store2.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 3 failed: %v", err)
 	}
 
@@ -530,7 +524,9 @@ func TestRegression_Item1_LSNReopenContinuation(t *testing.T) {
 
 	_ = store.Put("ConfigMap", "k1", []byte("v1"))
 	_ = store.Put("ConfigMap", "k2", []byte("v2"))
-	chkLSN, _ := store.Checkpoint()
+	if err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
 	_ = store.Close()
 
 	// Reopen store
@@ -540,17 +536,18 @@ func TestRegression_Item1_LSNReopenContinuation(t *testing.T) {
 	}
 	defer store2.Close()
 
-	// First Put after reopen must NOT fail with "segment already used" and must have LSN > chkLSN
+	// First Put after reopen must NOT fail with "segment already used" and must have LSN > previous puts
 	if err := store2.Put("ConfigMap", "k3", []byte("v3")); err != nil {
 		t.Fatalf("first Put after reopen failed: %v", err)
 	}
 
 	store2.keyMu.RLock()
+	entryK2 := store2.keyIndex[qualifyKey("ConfigMap", "k2")]
 	entryK3 := store2.keyIndex[qualifyKey("ConfigMap", "k3")]
 	store2.keyMu.RUnlock()
 
-	if entryK3.LSN <= chkLSN {
-		t.Fatalf("LSN went backwards after reopen: k3 LSN=%d <= checkpoint LSN=%d", entryK3.LSN, chkLSN)
+	if entryK3.LSN <= entryK2.LSN {
+		t.Fatalf("LSN went backwards after reopen: k3 LSN=%d <= k2 LSN=%d", entryK3.LSN, entryK2.LSN)
 	}
 }
 
@@ -718,13 +715,13 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 
 	// Step 1: Occupy block 0
 	_ = store.Put("ConfigMap", "dummy-0", bytes.Repeat([]byte("0"), 3000))
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint dummy 0 failed: %v", err)
 	}
 
 	// Step 2: Occupy block 1
 	_ = store.Put("ConfigMap", "dummy-1", bytes.Repeat([]byte("1"), 3000))
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint dummy 1 failed: %v", err)
 	}
 
@@ -732,7 +729,7 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	if err := store.Put("ConfigMap", "key1", []byte("val1-v1")); err != nil {
 		t.Fatalf("Put key1 failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint key1 v1 failed: %v", err)
 	}
 
@@ -744,7 +741,7 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 
 	// Step 4: Occupy block 3
 	_ = store.Put("ConfigMap", "dummy-3", bytes.Repeat([]byte("3"), 3000))
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint dummy 3 failed: %v", err)
 	}
 
@@ -753,7 +750,7 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	if err := store.Put("ConfigMap", "key1", []byte("val1-v2")); err != nil {
 		t.Fatalf("Put key1 v2 failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint key1 v2 failed: %v", err)
 	}
 
@@ -764,7 +761,7 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 
 	// Step 6: Free block 1 by updating dummy-1 so block 1 is the lowest free block
 	_ = store.Put("ConfigMap", "dummy-1", bytes.Repeat([]byte("x"), 3000))
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint dummy-1 v2 failed: %v", err)
 	}
 
@@ -779,11 +776,11 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	_ = w.createSegmentLocked(w.nextLSN)
 	w.mu.Unlock()
 
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint delete failed: %v", err)
 	}
 	// Second checkpoint with clean block pool advances redoStartLSN and truncates completed segment 1
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 2 delete failed: %v", err)
 	}
 
@@ -948,7 +945,7 @@ func TestRegression_RecoveryStep6ReuseRule(t *testing.T) {
 	defer metaFile.Close()
 
 	cp := NewCheckpointer(bp, rawHeapFile, wal, metaFile, 0, 1)
-	if _, err := cp.Checkpoint(); err != nil {
+	if err := cp.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 
@@ -1028,7 +1025,7 @@ func setupDeletedOversizeStore(t *testing.T, dir string) (*MemFS, string, []byte
 			t.Fatalf("Put pad failed: %v", err)
 		}
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	qKey := qualifyKey("ConfigMap", "largeKey")
@@ -1259,9 +1256,8 @@ func TestRecovery_WALRecordLengthExceedsSegment_NoAllocation(t *testing.T) {
 		hdr[2] = byte(RecordTypePut)
 		hdr[3] = 0
 		binary.BigEndian.PutUint64(hdr[4:12], lsn)
-		binary.BigEndian.PutUint64(hdr[12:20], 0)
-		binary.BigEndian.PutUint32(hdr[20:24], 0)
-		binary.BigEndian.PutUint32(hdr[24:28], uint32(excessiveLen))
+		binary.BigEndian.PutUint32(hdr[12:16], 0)
+		binary.BigEndian.PutUint32(hdr[16:20], uint32(excessiveLen))
 		return hdr
 	}
 
@@ -1355,7 +1351,7 @@ func TestRecovery_WALCorruptBelowHeapLSN_FailsOpen(t *testing.T) {
 	if err := store.Put("ConfigMap", "k1", []byte("val1")); err != nil {
 		t.Fatalf("Put k1 failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	if err := store.Close(); err != nil {
@@ -1410,7 +1406,7 @@ func TestRecovery_WALTornTailAboveHeapLSN_SucceedsOpen(t *testing.T) {
 	if err := store.Put("ConfigMap", "k1", []byte("val1")); err != nil {
 		t.Fatalf("Put k1 failed: %v", err)
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	// Write k2 (LSN > heap LSN) and sync to WAL
@@ -1533,7 +1529,7 @@ func testRecovery_UncheckpointedMixReopenTwice(t *testing.T, key []byte) {
 	}
 
 	// Checkpoint partway through the workload (truncates WAL prior to checkpoint redo start).
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 
@@ -2238,7 +2234,7 @@ func TestRecovery_CrashTornBlockReopenCleanCloseReopen(t *testing.T) {
 		if err := store.Put("ConfigMap", "key2", []byte("val2-initial")); err != nil {
 			t.Fatalf("iteration %d: Put key2 failed: %v", iteration, err)
 		}
-		if _, err := store.Checkpoint(); err != nil {
+		if err := store.Checkpoint(); err != nil {
 			t.Fatalf("iteration %d: Checkpoint failed: %v", iteration, err)
 		}
 
@@ -2325,7 +2321,7 @@ func testTornReplaceDeletedKeyStaysDeleted(t *testing.T, directory string, initi
 	}
 
 	// 2. Checkpoint: initial record becomes durable on disk
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 
@@ -2379,7 +2375,7 @@ func testTornReplaceDeletedKeyStaysDeleted(t *testing.T, directory string, initi
 		t.Fatalf("Delete failed: %v", err)
 	}
 
-	if _, err := store2.Checkpoint(); err != nil {
+	if err := store2.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint store2 failed: %v", err)
 	}
 

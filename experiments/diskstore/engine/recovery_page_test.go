@@ -219,7 +219,7 @@ func TestRecoveryPage_CorruptOnePage_SeveralPages_AllPages(t *testing.T) {
 		if err := store.Put("Table", key, []byte(val)); err != nil {
 			t.Fatalf("Put %s failed: %v", key, err)
 		}
-		if _, err := store.Checkpoint(); err != nil {
+		if err := store.Checkpoint(); err != nil {
 			t.Fatalf("Checkpoint %d failed: %v", i, err)
 		}
 	}
@@ -382,7 +382,7 @@ func TestRecoveryPage_Block0UnchangedAfterManyCheckpoints(t *testing.T) {
 		if err := store.Put("Table", key, []byte(val)); err != nil {
 			t.Fatalf("Put failed at step %d: %v", i, err)
 		}
-		if _, err := store.Checkpoint(); err != nil {
+		if err := store.Checkpoint(); err != nil {
 			t.Fatalf("Checkpoint failed at step %d: %v", i, err)
 		}
 	}
@@ -438,7 +438,7 @@ func TestRecoveryPage_ReplayFromOlderRecordWithTruncation(t *testing.T) {
 			t.Fatalf("Put batch 1 failed: %v", err)
 		}
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 1 failed: %v", err)
 	}
 
@@ -450,7 +450,7 @@ func TestRecoveryPage_ReplayFromOlderRecordWithTruncation(t *testing.T) {
 			t.Fatalf("Put batch 2 failed: %v", err)
 		}
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 2 failed: %v", err)
 	}
 
@@ -462,7 +462,7 @@ func TestRecoveryPage_ReplayFromOlderRecordWithTruncation(t *testing.T) {
 			t.Fatalf("Put batch 3 failed: %v", err)
 		}
 	}
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 3 failed: %v", err)
 	}
 
@@ -611,7 +611,7 @@ func TestRecoveryPage_CrashRecoveryReplaysFromStoredLSN(t *testing.T) {
 		}
 	}
 
-	if _, err := store.Checkpoint(); err != nil {
+	if err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 

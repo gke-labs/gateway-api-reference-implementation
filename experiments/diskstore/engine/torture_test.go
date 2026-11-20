@@ -560,7 +560,7 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *torture
 			case triggerRandomCheckpoint:
 				inFlightModel = copyModel(model)
 				setPhase(phaseCheckpoint)
-				_, err := currentStore.Checkpoint()
+				err := currentStore.Checkpoint()
 				setPhase(phaseNormal)
 				if err != nil {
 					if config.stopOnCrash && isCrashed() {
@@ -633,7 +633,7 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *torture
 			if config.checkpointInterval > 0 && operationNumber%config.checkpointInterval == 0 {
 				inFlightModel = copyModel(model)
 				setPhase(phaseCheckpoint)
-				_, err := currentStore.Checkpoint()
+				err := currentStore.Checkpoint()
 				setPhase(phaseNormal)
 				if err != nil {
 					if config.stopOnCrash && isCrashed() {

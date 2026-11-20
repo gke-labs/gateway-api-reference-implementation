@@ -24,11 +24,10 @@ import (
 
 func TestRecord_EncodeDecode(t *testing.T) {
 	orig := Record{
-		Type:         RecordTypePut,
-		LSN:          105,
-		RedoStartLSN: 90,
-		Key:          "default/my-configmap",
-		Payload:      []byte("sample payload data 12345"),
+		Type:    RecordTypePut,
+		LSN:     105,
+		Key:     "default/my-configmap",
+		Payload: []byte("sample payload data 12345"),
 	}
 
 	encoded := EncodeRecord(orig)
@@ -39,7 +38,6 @@ func TestRecord_EncodeDecode(t *testing.T) {
 
 	if decoded.Type != orig.Type ||
 		decoded.LSN != orig.LSN ||
-		decoded.RedoStartLSN != orig.RedoStartLSN ||
 		decoded.Key != orig.Key ||
 		!bytes.Equal(decoded.Payload, orig.Payload) {
 		t.Fatalf("decoded record does not match original: got %+v, want %+v", decoded, orig)
@@ -90,8 +88,8 @@ func TestRecord_RejectsOldFormatVersion(t *testing.T) {
 	}
 
 	encoded := EncodeRecord(orig)
-	// Set version byte to 1 (old WAL record version)
-	encoded[1] = 1
+	// Set version byte to 2 (old WAL record version)
+	encoded[1] = 2
 
 	_, err := DecodeRecord(bytes.NewReader(encoded))
 	if !errors.Is(err, ErrCorruptRecord) {

@@ -16,7 +16,7 @@ The engine uses the following terms:
 - **Table.** A table is a named set of keys, with no schema or columns.
 - **WAL terms:**
   - **Segment.** An append-only log file named by its starting 64-bit LSN, formatted as a 20-digit zero-padded decimal number with a `.wal` extension. The engine appends records to the active segment. In accordance with invariant 4, once a 4 KiB block within a segment is fsynced to disk, the engine never rewrites that block.
-  - **Record.** A single log entry recording an operation, such as a write, deletion, or checkpoint.
+  - **Record.** A single log entry recording an operation, such as a write or deletion.
   - **LSN.** A 64-bit monotonically increasing Log Sequence Number.
   - **Durable LSN.** The highest LSN confirmed flushed and fsynced to disk.
 
@@ -215,27 +215,25 @@ The segment header remains in plaintext in all stores. Recovery reads the segmen
 
 ### WAL Record
 
-Each WAL record contains a 32-byte header followed by variable-length fields:
+Each WAL record contains a 24-byte header followed by variable-length fields:
 
 ```
-+-----------+-----------+-----------+---------------+-----------+-------------------+-------------+----------------+------------+
-| Magic(1B) |Format(1B) | Type (1B) | Reserved (1B) |  LSN (8B) | RedoStartLSN (8B) | KeyLen (4B) | PayloadLen (4B)| CRC32C(4B) |
-+-----------+-----------+-----------+---------------+-----------+-------------------+-------------+----------------+------------+
++-----------+-----------+-----------+---------------+-----------+-------------+----------------+------------+
+| Magic(1B) |Format(1B) | Type (1B) | Reserved (1B) |  LSN (8B) | KeyLen (4B) | PayloadLen (4B)| CRC32C(4B) |
++-----------+-----------+-----------+---------------+-----------+-------------+----------------+------------+
 | Key bytes (KeyLen) ...                    | Payload bytes (PayloadLen) ...                         |
 +-------------------------------------------+--------------------------------------------------------+
 ```
 
 The record fields contain:
 - **Magic (1 byte):** The constant `0x52` (ASCII `'R'`).
-- **Format Version (1 byte):** The integer `2`.
+- **Format Version (1 byte):** The integer `3`.
 - **Operation Type (1 byte):** The operation code:
   - `1`: `Put`
   - `2`: `Delete`
-  - `3`: `Checkpoint`
-  - `4`: `PutPointer`
+  - `3`: `PutPointer`
 - **Reserved (1 byte):** Zero padding.
 - **LSN (8 bytes):** The monotonically assigned log sequence number.
-- **RedoStartLSN (8 bytes):** Legacy field on Checkpoint records. Recovery now takes its redo starting LSN from meta.db; checkpoints no longer write this field into WAL records.
 - **KeyLen (4 bytes):** Length of the key in bytes.
 - **PayloadLen (4 bytes):** Length of the payload in bytes.
 - **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the record header and body with the CRC field zeroed.
@@ -430,7 +428,7 @@ The engine serializes mutating operations (`Put`, `Delete`). A single active wri
 
 ### Non-Blocking Checkpointing
 
-The checkpointer runs concurrently with user writes. It does not serialize behind the engine writer lock. Instead, the checkpointer snapshots dirty page state and flushed locations under brief block pool synchronization, flushes dirty pages itself while writes continue, invokes heap fsync, and appends a checkpoint record to the WAL.
+The checkpointer runs concurrently with user writes. It does not serialize behind the engine writer lock. Instead, the checkpointer snapshots dirty page state and flushed locations under brief block pool synchronization, flushes dirty pages itself while writes continue, invokes heap fsync, writes the recovery start LSN to meta.db, and syncs the WAL.
 
 ### Synchronization Boundaries
 
@@ -492,7 +490,7 @@ The design trades disk space headroom for operational simplicity:
   - `Dirty` (bool) on `PageDesc` indicates that the in-memory copy has unwritten modifications. It is set when a page is modified in memory and clears as soon as direct I/O flush completes, allowing eviction to reclaim pool blocks by LRU immediately without waiting for an fsync. If `Dirty` remained set until an fsync, a pool full of flushed pages could not evict without an fsync, reintroducing the stall this design removes.
   - `RedoLSN` (uint64) on `PageDesc` records the earliest LSN whose effect on the page is not yet confirmed durable by a completed heap fsync. A page descriptor stays in the page table after its pool blocks are evicted, which is why the field can live there. `RedoLSN` replaces the existing `DirtyLSN` field: whereas `DirtyLSN` was tied to whether the in-memory copy was dirty, `RedoLSN` tracks durability independently of whether page blocks are resident or dirty in memory. It is set to the mutating operation's LSN when a page without un-synced modifications (`RedoLSN == 0`) is dirtied. When direct I/O completes, `Dirty` clears, but `RedoLSN` remains set. If the page is modified again in memory before an fsync occurs, `Dirty` becomes true again while `RedoLSN` continues to hold the earlier LSN across subsequent flushes.
   - `RedoLSN` clears at sync boundaries using the same two-generation rotation as the pending free list. When a flush completes, the page is recorded in `current`. At fsync start, `current` rotates to `prior`. When the fsync completes, the engine clears `RedoLSN` (to zero) for pages in `prior` that received no newer modifications, or resets `RedoLSN` to the earliest LSN of those newer modifications if they arrived while the fsync ran.
-  - When a checkpoint runs, `redoStartLSN` is computed from the minimum `RedoLSN` across all pages with `RedoLSN > 0`. Consider a page that was dirty at the checkpoint's snapshot with `RedoLSN` equal to `L1`, whose flush completes during the checkpoint's fsync. Because `L1` was captured in the snapshot, the checkpoint's `redoStartLSN` is at or below `L1`. Because the flush returned during the fsync (after generation rotation), the write is in `current`, so its superseded block remains held and this fsync does not clear its `RedoLSN`. The checkpoint writes the redo start LSN to meta.db, appends its record to the WAL, and truncates WAL segments strictly prior to `redoStartLSN`. Because `redoStartLSN` is at or below `L1`, all log records from `L1` onward remain in the WAL. If a crash occurs before the next fsync, recovery finds either the valid new copy on disk or the older durable copy (which was never freed), and replays WAL records from `redoStartLSN` forward to reconstruct the page.
+  - When a checkpoint runs, `redoStartLSN` is computed from the minimum `RedoLSN` across all pages with `RedoLSN > 0`. Consider a page that was dirty at the checkpoint's snapshot with `RedoLSN` equal to `L1`, whose flush completes during the checkpoint's fsync. Because `L1` was captured in the snapshot, the checkpoint's `redoStartLSN` is at or below `L1`. Because the flush returned during the fsync (after generation rotation), the write is in `current`, so its superseded block remains held and this fsync does not clear its `RedoLSN`. The checkpoint writes the redo start LSN to meta.db, and truncates WAL segments strictly prior to `redoStartLSN`. Because `redoStartLSN` is at or below `L1`, all log records from `L1` onward remain in the WAL. If a crash occurs before the next fsync, recovery finds either the valid new copy on disk or the older durable copy (which was never freed), and replays WAL records from `redoStartLSN` forward to reconstruct the page.
 - **Fault filesystem reuse check:** `FaultFS` updates its durable page set during `heapFile.Sync()`. Under deferred frees, pending blocks are released to the allocator only after `Sync()` finishes. Any subsequent write to a reallocated block occurs after `FaultFS` has updated its durable set, satisfying the reuse rule assertion without timing dependencies or special cases.
 
 ### Decisions

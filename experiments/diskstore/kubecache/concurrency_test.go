@@ -102,7 +102,7 @@ func TestConcurrency_ReadersWritersAndCheckpoints(t *testing.T) {
 			case <-stopCh:
 				return
 			default:
-				_, _ = store.Checkpoint()
+				_ = store.Checkpoint()
 				time.Sleep(10 * time.Millisecond)
 			}
 		}
