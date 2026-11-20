@@ -2254,12 +2254,7 @@ func TestEngine_MetaDBChecksumAndValidation(t *testing.T) {
 		metaBytes := createStoreAndReadMeta(t, filesystem, directory)
 		metaPath := filepath.Join(directory, "meta.db")
 
-		for i := 0; i < metaFileSize; i++ {
-			if i >= metaOffsetRecoverySlot0 && i < metaOffsetReserved {
-				// The two recovery start LSN slots are tested separately for redundancy and recovery;
-				// when slot 0 is valid, a single flipped bit in slot 1 falls back to slot 0.
-				continue
-			}
+		for i := 0; i < metaBlockSize; i++ {
 			corrupt := make([]byte, metaFileSize)
 			copy(corrupt, metaBytes)
 			corrupt[i] ^= 0x01
@@ -2361,31 +2356,31 @@ func TestEngine_MetaDBChecksumAndValidation(t *testing.T) {
 			{
 				name: "FlipLastCRCByte",
 				mutate: func(metaBytes []byte) {
-					metaBytes[metaFileSize-1] ^= 0x01
+					metaBytes[metaBlockSize-1] ^= 0x01
 				},
 			},
 			{
 				name: "NonZeroReservedBytesWithValidCRC",
 				mutate: func(metaBytes []byte) {
 					metaBytes[metaOffsetReserved+50] = 0xff
-					crc := computeMetaBlockCRC(metaBytes)
-					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
+					crc := computeMetaBlockCRC(metaBytes[:metaBlockSize])
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaBlockSize], crc)
 				},
 			},
 			{
 				name: "InvalidMagicWithValidCRC",
 				mutate: func(metaBytes []byte) {
 					binary.BigEndian.PutUint32(metaBytes[metaOffsetMagic:metaOffsetVersion], 0x12345678)
-					crc := computeMetaBlockCRC(metaBytes)
-					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
+					crc := computeMetaBlockCRC(metaBytes[:metaBlockSize])
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaBlockSize], crc)
 				},
 			},
 			{
 				name: "UnknownFlagsWithValidCRC",
 				mutate: func(metaBytes []byte) {
 					binary.BigEndian.PutUint64(metaBytes[metaOffsetFlags:metaOffsetKeyCheck], 1<<2)
-					crc := computeMetaBlockCRC(metaBytes)
-					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaFileSize], crc)
+					crc := computeMetaBlockCRC(metaBytes[:metaBlockSize])
+					binary.BigEndian.PutUint32(metaBytes[metaOffsetCRC:metaBlockSize], crc)
 				},
 			},
 		}

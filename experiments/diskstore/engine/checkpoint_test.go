@@ -553,9 +553,9 @@ func TestCheckpointer_FlushCompletingDuringHeapSync_LostFlushRebuiltFromWAL(t *t
 	if err := metaFile.Close(); err != nil {
 		t.Fatalf("Close meta.db failed: %v", err)
 	}
-	redoStartLSN, _, _, err := readRecoveryStartSlots(metaBuf[:], "meta.db")
+	redoStartLSN, _, _, err := readRecoveryStartPages(metaBuf[:], "meta.db")
 	if err != nil {
-		t.Fatalf("readRecoveryStartSlots failed: %v", err)
+		t.Fatalf("readRecoveryStartPages failed: %v", err)
 	}
 	if redoStartLSN > firstUnsyncedLSN {
 		t.Fatalf("expected checkpoint redo start LSN <= firstUnsyncedLSN (%d), got %d",
@@ -742,9 +742,9 @@ func TestCheckpointer_AllocateNewPageCarriesDirtyLSNAcrossFsync(t *testing.T) {
 	if err := metaFile2.Close(); err != nil {
 		t.Fatalf("Close meta.db failed: %v", err)
 	}
-	redoStartLSN2, _, _, err := readRecoveryStartSlots(metaBuf2[:], "meta.db")
+	redoStartLSN2, _, _, err := readRecoveryStartPages(metaBuf2[:], "meta.db")
 	if err != nil {
-		t.Fatalf("readRecoveryStartSlots failed: %v", err)
+		t.Fatalf("readRecoveryStartPages failed: %v", err)
 	}
 	if redoStartLSN2 > deleteLSN {
 		t.Fatalf("expected second checkpoint redo start LSN <= deleteLSN (%d), got %d (putLSN=%d)",
