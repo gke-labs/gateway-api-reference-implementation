@@ -15,15 +15,29 @@
 package main
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"flag"
+	"fmt"
+	"math/big"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -333,5 +347,182 @@ func TestSetup_ModeSelection(t *testing.T) {
 	}
 	if optsDP.DataplaneGatewayNamespace != "ns" || optsDP.DataplaneGatewayName != "gw" {
 		t.Errorf("expected gateway ns/gw, got %s/%s", optsDP.DataplaneGatewayNamespace, optsDP.DataplaneGatewayName)
+	}
+}
+
+type staticTokenReviewer struct {
+	expectedToken, namespace, sa string
+}
+
+func (r *staticTokenReviewer) ReviewToken(_ context.Context, token string) (string, string, error) {
+	if token == r.expectedToken {
+		return r.namespace, r.sa, nil
+	}
+	return "", "", fmt.Errorf("invalid token")
+}
+
+func generateTestCertificate(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	keyBytes, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+}
+
+func TestController_InternalAPIPush_DataPlaneReceivesConfig(t *testing.T) {
+	env := testenv.Start(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const (
+		gwNamespace = "default"
+		gwName      = "push-gw"
+		tokenVal    = "valid-test-token"
+	)
+	saName := singlepod.ResourceNameForGateway(gwName)
+
+	certPEM, keyPEM := generateTestCertificate(t)
+	dir := t.TempDir()
+	writeFile := func(name string, data []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, data, 0600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return p
+	}
+	caFile := writeFile("ca.crt", certPEM)
+	certFile := writeFile("tls.crt", certPEM)
+	keyFile := writeFile("tls.key", keyPEM)
+	tokenFile := writeFile("token", []byte(tokenVal))
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	internalAPIAddr := lis.Addr().String()
+
+	t.Setenv("POD_NAMESPACE", gwNamespace)
+	ctrlOpts, err := Setup([]string{
+		"--internal-api-bind-address=" + internalAPIAddr,
+		"--internal-api-tls-cert-file=" + certFile,
+		"--internal-api-tls-key-file=" + keyFile,
+	})
+	if err != nil {
+		t.Fatalf("Setup controller failed: %v", err)
+	}
+	ctrlOpts.RestConfig, ctrlOpts.Scheme = env.Config, env.Scheme
+	ctrlOpts.MetricsAddr, ctrlOpts.HealthProbeBindAddress = "0", "0"
+	ctrlOpts.ProxyAddr, ctrlOpts.ProxyHTTPSAddr = "", ""
+	ctrlOpts.InternalAPIListener = lis
+	ctrlOpts.PushTokenReviewer = &staticTokenReviewer{expectedToken: tokenVal, namespace: gwNamespace, sa: saName}
+
+	ctrlServer, err := gari.New(ctrlOpts)
+	if err != nil {
+		t.Fatalf("gari.New controller failed: %v", err)
+	}
+	ctrlErrCh := make(chan error, 1)
+	go func() {
+		if err := ctrlServer.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			ctrlErrCh <- err
+		}
+	}()
+
+	if err := env.Client.Create(ctx, &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: controller.DefaultControllerName},
+	}); err != nil {
+		t.Fatalf("create GatewayClass: %v", err)
+	}
+	if err := env.Client.Create(ctx, &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: gwName, Namespace: gwNamespace},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners:        []gatewayv1.Listener{{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType}},
+		},
+	}); err != nil {
+		t.Fatalf("create Gateway: %v", err)
+	}
+
+	probeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocate probe listener: %v", err)
+	}
+	probeAddr := probeLn.Addr().String()
+	if err := probeLn.Close(); err != nil {
+		t.Fatalf("close probe listener: %v", err)
+	}
+
+	dpOpts, err := Setup([]string{
+		"--dataplane-mode",
+		"--gateway-namespace=" + gwNamespace,
+		"--gateway-name=" + gwName,
+		"--proxy-bind-address=127.0.0.1:0",
+		"--proxy-https-bind-address=127.0.0.1:0",
+		"--health-probe-bind-address=" + probeAddr,
+		"--internal-api-address=" + internalAPIAddr,
+		"--internal-api-ca-file=" + caFile,
+		"--internal-api-token-file=" + tokenFile,
+	})
+	if err != nil {
+		t.Fatalf("Setup data plane failed: %v", err)
+	}
+	dpOpts.MetricsAddr = "0"
+
+	dpServer, err := gari.New(dpOpts)
+	if err != nil {
+		t.Fatalf("gari.New data plane failed: %v", err)
+	}
+	dpErrCh := make(chan error, 1)
+	go func() {
+		if err := dpServer.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			dpErrCh <- err
+		}
+	}()
+
+	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}.String()
+	deadline := time.Now().Add(10 * time.Second)
+	for dpServer.AppliedRevision(gwKey) == "" {
+		select {
+		case err := <-ctrlErrCh:
+			t.Fatalf("controller exited with error: %v", err)
+		case err := <-dpErrCh:
+			t.Fatalf("data plane exited with error: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("data plane never received config for %s from controller internal API", gwKey)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+probeAddr+"/readyz", nil)
+	if err != nil {
+		t.Fatalf("create readyz request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("readyz request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected readyz 200 OK after receiving config, got %d", resp.StatusCode)
 	}
 }

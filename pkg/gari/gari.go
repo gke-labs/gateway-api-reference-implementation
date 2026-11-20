@@ -657,16 +657,9 @@ func New(opts Options) (*Server, error) {
 
 	s.manager = mgr
 
-	if err := s.SetupWithManager(mgr); err != nil {
-		return nil, err
-	}
-
-	if s.opts.SetupWithManager != nil {
-		if err := s.opts.SetupWithManager(mgr, s); err != nil {
-			return nil, fmt.Errorf("custom SetupWithManager failed: %w", err)
-		}
-	}
-
+	// The internal API push server must be initialized before SetupWithManager runs
+	// because SetupWithManager constructs the combined DataplanePublisher that includes
+	// the push server.
 	if !opts.DataplaneMode && (opts.InternalAPIListener != nil || opts.InternalAPIBindAddress != "") {
 		tokenReviewer := opts.PushTokenReviewer
 		if tokenReviewer == nil {
@@ -694,6 +687,16 @@ func New(opts Options) (*Server, error) {
 			return nil, fmt.Errorf("creating push server: %w", err)
 		}
 		s.pushServer = pushServer
+	}
+
+	if err := s.SetupWithManager(mgr); err != nil {
+		return nil, err
+	}
+
+	if s.opts.SetupWithManager != nil {
+		if err := s.opts.SetupWithManager(mgr, s); err != nil {
+			return nil, fmt.Errorf("custom SetupWithManager failed: %w", err)
+		}
 	}
 
 	return s, nil
