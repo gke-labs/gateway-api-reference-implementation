@@ -92,11 +92,34 @@ func (s *GRPCRouteState) Compile(
 	return s.Internal
 }
 
+func (s *GRPCRouteState) CompileWithResolution(
+	services map[types.NamespacedName]*corev1.Service,
+	btlsResolution *BackendTLSPolicyResolution,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	refValidator ReferenceGrantValidator,
+) *InternalGRPCRoute {
+	if s == nil || s.GRPCRoute == nil {
+		return nil
+	}
+	s.Internal = compileGRPCRoute(s.GRPCRoute, services, btlsResolution, configMaps, refValidator)
+	return s.Internal
+}
+
 // CompileGRPCRoute parses and compiles a GRPCRoute object into an InternalGRPCRoute.
 func CompileGRPCRoute(
 	route *gatewayv1.GRPCRoute,
 	services map[types.NamespacedName]*corev1.Service,
 	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	refValidator ReferenceGrantValidator,
+) *InternalGRPCRoute {
+	return compileGRPCRoute(route, services, ResolveBackendTLSPolicyTargets(backendTLSPolicies, services), configMaps, refValidator)
+}
+
+func compileGRPCRoute(
+	route *gatewayv1.GRPCRoute,
+	services map[types.NamespacedName]*corev1.Service,
+	btlsResolution *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalGRPCRoute {
@@ -124,8 +147,6 @@ func CompileGRPCRoute(
 	for _, h := range route.Spec.Hostnames {
 		hostnames = append(hostnames, string(h))
 	}
-
-	sortedTLSPolicies := sortBackendTLSPolicies(backendTLSPolicies)
 
 	var compiledRules []InternalRule
 	seenRuleNames := make(map[gatewayv1.SectionName]bool)
@@ -160,7 +181,7 @@ func CompileGRPCRoute(
 						route.Namespace,
 						route.Generation,
 						services,
-						sortedTLSPolicies,
+						btlsResolution,
 						configMaps,
 						refValidator,
 					)
@@ -247,7 +268,7 @@ func CompileGRPCRoute(
 					route.Namespace,
 					route.Generation,
 					services,
-					sortedTLSPolicies,
+					btlsResolution,
 					configMaps,
 					refValidator,
 				)

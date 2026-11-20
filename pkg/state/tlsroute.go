@@ -103,11 +103,34 @@ func (s *TLSRouteState) Compile(
 	return s.Internal
 }
 
+func (s *TLSRouteState) CompileWithResolution(
+	services map[types.NamespacedName]*corev1.Service,
+	btlsResolution *BackendTLSPolicyResolution,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	refValidator ReferenceGrantValidator,
+) *InternalTLSRoute {
+	if s == nil || s.TLSRoute == nil {
+		return nil
+	}
+	s.Internal = compileTLSRoute(s.TLSRoute, services, btlsResolution, configMaps, refValidator)
+	return s.Internal
+}
+
 // CompileTLSRoute parses and compiles a TLSRoute object into an InternalTLSRoute.
 func CompileTLSRoute(
 	route *gatewayv1.TLSRoute,
 	services map[types.NamespacedName]*corev1.Service,
 	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	refValidator ReferenceGrantValidator,
+) *InternalTLSRoute {
+	return compileTLSRoute(route, services, ResolveBackendTLSPolicyTargets(backendTLSPolicies, services), configMaps, refValidator)
+}
+
+func compileTLSRoute(
+	route *gatewayv1.TLSRoute,
+	services map[types.NamespacedName]*corev1.Service,
+	btlsResolution *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalTLSRoute {
@@ -136,8 +159,6 @@ func CompileTLSRoute(
 		hostnames = append(hostnames, string(h))
 	}
 
-	sortedTLSPolicies := sortBackendTLSPolicies(backendTLSPolicies)
-
 	var compiledRules []InternalTLSRule
 	for _, rule := range route.Spec.Rules {
 		iRule := InternalTLSRule{
@@ -151,7 +172,7 @@ func CompileTLSRoute(
 				route.Namespace,
 				route.Generation,
 				services,
-				sortedTLSPolicies,
+				btlsResolution,
 				configMaps,
 				refValidator,
 			)

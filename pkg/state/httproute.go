@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
-	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -60,11 +59,34 @@ func (s *HTTPRouteState) Compile(
 	return s.Internal
 }
 
+func (s *HTTPRouteState) CompileWithResolution(
+	services map[types.NamespacedName]*corev1.Service,
+	btlsResolution *BackendTLSPolicyResolution,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	refValidator ReferenceGrantValidator,
+) *InternalHTTPRoute {
+	if s.HTTPRoute == nil {
+		return nil
+	}
+	s.Internal = compileHTTPRoute(s.HTTPRoute, services, btlsResolution, configMaps, refValidator)
+	return s.Internal
+}
+
 // CompileHTTPRoute parses and compiles an HTTPRoute object into an InternalHTTPRoute.
 func CompileHTTPRoute(
 	route *gatewayv1.HTTPRoute,
 	services map[types.NamespacedName]*corev1.Service,
 	backendTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	refValidator ReferenceGrantValidator,
+) *InternalHTTPRoute {
+	return compileHTTPRoute(route, services, ResolveBackendTLSPolicyTargets(backendTLSPolicies, services), configMaps, refValidator)
+}
+
+func compileHTTPRoute(
+	route *gatewayv1.HTTPRoute,
+	services map[types.NamespacedName]*corev1.Service,
+	btlsResolution *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalHTTPRoute {
@@ -92,9 +114,6 @@ func CompileHTTPRoute(
 	for _, h := range route.Spec.Hostnames {
 		hostnames = append(hostnames, string(h))
 	}
-
-	// Deterministically sort a copy of BackendTLSPolicies by creation timestamp, then by namespaced name.
-	sortedTLSPolicies := sortBackendTLSPolicies(backendTLSPolicies)
 
 	var compiledRules []InternalRule
 	seenRuleNames := make(map[gatewayv1.SectionName]bool)
@@ -189,7 +208,7 @@ func CompileHTTPRoute(
 						route.Namespace,
 						route.Generation,
 						services,
-						sortedTLSPolicies,
+						btlsResolution,
 						configMaps,
 						refValidator,
 					)
@@ -304,7 +323,7 @@ func CompileHTTPRoute(
 					route.Namespace,
 					route.Generation,
 					services,
-					sortedTLSPolicies,
+					btlsResolution,
 					configMaps,
 					refValidator,
 				)
@@ -464,28 +483,6 @@ func (s *HTTPRouteState) MatchesGateway(gw *gatewayv1.Gateway, controllerName st
 	return false
 }
 
-// sortBackendTLSPolicies deterministically sorts BackendTLSPolicies by creation timestamp, then by namespaced name.
-func sortBackendTLSPolicies(backendTLSPolicies []*gatewayv1.BackendTLSPolicy) []*gatewayv1.BackendTLSPolicy {
-	if len(backendTLSPolicies) == 0 {
-		return nil
-	}
-	sortedTLSPolicies := make([]*gatewayv1.BackendTLSPolicy, len(backendTLSPolicies))
-	copy(sortedTLSPolicies, backendTLSPolicies)
-	sort.SliceStable(sortedTLSPolicies, func(i, j int) bool {
-		if sortedTLSPolicies[i].CreationTimestamp.Time.Before(sortedTLSPolicies[j].CreationTimestamp.Time) {
-			return true
-		}
-		if sortedTLSPolicies[i].CreationTimestamp.Time.After(sortedTLSPolicies[j].CreationTimestamp.Time) {
-			return false
-		}
-		if sortedTLSPolicies[i].Namespace != sortedTLSPolicies[j].Namespace {
-			return sortedTLSPolicies[i].Namespace < sortedTLSPolicies[j].Namespace
-		}
-		return sortedTLSPolicies[i].Name < sortedTLSPolicies[j].Name
-	})
-	return sortedTLSPolicies
-}
-
 // resolveBackendTarget resolves a BackendObjectReference to an InternalBackend,
 // performing kind/group checks, cross-namespace ReferenceGrant validation, Service resolution,
 // and BackendTLSPolicy matching.
@@ -495,7 +492,7 @@ func resolveBackendTarget(
 	routeNamespace string,
 	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
-	sortedTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	btlsResolution *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) (*InternalBackend, *ErrorState) {
@@ -614,50 +611,9 @@ func resolveBackendTarget(
 			}
 		}
 
-		if portName != "" {
-			for _, policy := range sortedTLSPolicies {
-				if policy.Namespace != svcNamespace {
-					continue
-				}
-				matched := false
-				for _, targetRef := range policy.Spec.TargetRefs {
-					if string(targetRef.Group) == "" &&
-						string(targetRef.Kind) == "Service" &&
-						string(targetRef.Name) == string(backendRef.Name) &&
-						targetRef.SectionName != nil &&
-						string(*targetRef.SectionName) == portName {
-						matched = true
-						break
-					}
-				}
-				if matched {
-					selectedPolicy = policy
-					break
-				}
-			}
-		}
-	}
-
-	if selectedPolicy == nil {
-		for _, policy := range sortedTLSPolicies {
-			if policy.Namespace != svcNamespace {
-				continue
-			}
-			matched := false
-			for _, targetRef := range policy.Spec.TargetRefs {
-				if string(targetRef.Group) == "" &&
-					string(targetRef.Kind) == "Service" &&
-					string(targetRef.Name) == string(backendRef.Name) &&
-					(targetRef.SectionName == nil || *targetRef.SectionName == "") {
-					matched = true
-					break
-				}
-			}
-			if matched {
-				selectedPolicy = policy
-				break
-			}
-		}
+		selectedPolicy = btlsResolution.PolicyForService(svcKey, portName)
+	} else {
+		selectedPolicy = btlsResolution.PolicyForService(svcKey, "")
 	}
 
 	if selectedPolicy != nil {
@@ -766,7 +722,7 @@ func compileRequestMirrorFilter(
 	routeNamespace string,
 	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
-	sortedTLSPolicies []*gatewayv1.BackendTLSPolicy,
+	btlsResolution *BackendTLSPolicyResolution,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) (*InternalMirror, *ErrorState, *ErrorState) {
@@ -835,7 +791,7 @@ func compileRequestMirrorFilter(
 		routeNamespace,
 		routeGeneration,
 		services,
-		sortedTLSPolicies,
+		btlsResolution,
 		configMaps,
 		refValidator,
 	)
