@@ -48,7 +48,7 @@ type HTTPRouteState struct {
 // verifying permissions, compiling regexes and filters, and recording conditions.
 func (s *HTTPRouteState) Compile(
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies *BackendTLSPolicyResolution,
+	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalHTTPRoute {
@@ -63,7 +63,7 @@ func (s *HTTPRouteState) Compile(
 func CompileHTTPRoute(
 	route *gatewayv1.HTTPRoute,
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies *BackendTLSPolicyResolution,
+	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalHTTPRoute {
@@ -469,7 +469,7 @@ func resolveBackendTarget(
 	routeNamespace string,
 	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies *BackendTLSPolicyResolution,
+	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) (*InternalBackend, *ErrorState) {
@@ -699,7 +699,7 @@ func compileRequestMirrorFilter(
 	routeNamespace string,
 	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies *BackendTLSPolicyResolution,
+	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) (*InternalMirror, *ErrorState, *ErrorState) {

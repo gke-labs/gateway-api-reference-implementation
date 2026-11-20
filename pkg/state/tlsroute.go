@@ -92,7 +92,7 @@ func (s *TLSRouteState) Validate() error {
 // Compile compiles the TLSRoute into an InternalTLSRoute, resolving references and recording conditions.
 func (s *TLSRouteState) Compile(
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies *BackendTLSPolicyResolution,
+	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalTLSRoute {
@@ -107,7 +107,7 @@ func (s *TLSRouteState) Compile(
 func CompileTLSRoute(
 	route *gatewayv1.TLSRoute,
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies *BackendTLSPolicyResolution,
+	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalTLSRoute {

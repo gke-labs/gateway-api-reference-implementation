@@ -81,7 +81,7 @@ func (s *GRPCRouteState) Validate() error {
 // verifying permissions, compiling matches, and recording conditions.
 func (s *GRPCRouteState) Compile(
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies *BackendTLSPolicyResolution,
+	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalGRPCRoute {
@@ -96,7 +96,7 @@ func (s *GRPCRouteState) Compile(
 func CompileGRPCRoute(
 	route *gatewayv1.GRPCRoute,
 	services map[types.NamespacedName]*corev1.Service,
-	backendTLSPolicies *BackendTLSPolicyResolution,
+	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
 ) *InternalGRPCRoute {
