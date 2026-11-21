@@ -27,7 +27,7 @@ This design separates key custody from TLS termination. GARI selects certificate
 
 ## Goals
 
-1. **Keep private keys and DNS credentials out of Kubernetes clusters (end-state goal).** GARI clusters run no ACME clients and store no DNS update credentials. In phase 1, private keys travel from certserver to the controller over gRPC and to the data plane over the internal API's TLS stream, held only in process memory and never written to etcd or Secrets. In the end state, certserver keeps private keys out of cluster memory entirely by retaining them on certserver for keyless signing.
+1. **Keep private keys and DNS credentials out of Kubernetes clusters (end-state goal).** GARI clusters run no ACME clients and store no DNS update credentials. In phase 1, private keys travel from certserver to the controller over gRPC and to the data plane over the internal API's TLS stream. In the end state, with direct retrieval the controller does not hold keys, and with keyless signing certserver keeps private keys out of cluster memory entirely.
 2. **Centralize issuance and renewal.** certserver caches certificates by normalized hostname set. Multiple Gateways and clusters that serve the same hostnames share one certificate, which avoids duplicate orders and conserves certificate authority rate limits.
 3. **Derive authorization from the real network path.** certserver validates domain control by routing HTTP-01 challenges through public DNS and the data plane. It requires no secondary policy language to grant certificates for public hostnames.
 4. **Prevent cross-Gateway certificate hijacking.** certserver binds each challenge by returning it to the requesting Gateway (and its shared-front-end candidates). A Gateway cannot obtain certificates for hostnames that route to a different Gateway.
@@ -378,18 +378,18 @@ certserver supports three operational modes across three design phases:
 
 In phase 1, certserver operates in release mode. certserver acts as the ACME client, generates private keys, completes HTTP-01 challenges, and stores certificates and keys in its local cache.
 
-certserver releases both certificate chains and private keys to the GARI controller over gRPC. The controller pushes them to the data plane as part of `DataplaneConfig` (`CertificateData.PrivateKey`) over the controller's internal API TLS stream. The controller and data plane hold private keys in process memory only; keys are never written to etcd or Kubernetes Secrets.
+certserver releases both certificate chains and private keys to the GARI controller over gRPC. The controller pushes them to the data plane as part of `DataplaneConfig` (`CertificateData.PrivateKey`) over the controller's internal API TLS stream.
 
-This phase eliminates in-cluster ACME clients and removes all DNS credentials from Kubernetes clusters, while keeping private keys out of etcd storage.
+This phase eliminates in-cluster ACME clients and removes all DNS credentials from Kubernetes clusters.
 
 ### Key Delivery Architecture
 
 Key delivery follows a phased progression:
 
-- **Phase 1 Decision:** The GARI controller receives private keys from certserver over gRPC and delivers them to the data plane over the internal API's TLS stream. Within the cluster, private keys reside only in process memory (on the controller and the data plane) and never in etcd or Secrets. This decision avoids adding direct network dependencies or token exchange logic between data planes and certserver in the initial release, utilizing GARI's authenticated internal API pipeline.
-- **End-State Target:** In the end state, certserver keeps private keys out of cluster memory entirely:
-  1. **Keyless Signing (Phase 2):** certserver retains private keys in secure host storage, and data planes delegate handshake signatures to certserver over RPC.
-  2. **Direct Data-Plane Retrieval:** As an alternative release architecture, data planes could fetch certificates and private keys directly from certserver at startup using their own projected service-account tokens, bypassing the controller while still holding keys in process memory only.
+- **Phase 1 Decision:** The GARI controller receives private keys from certserver over gRPC and delivers them to the data plane over the internal API's TLS stream. GARI does not write these keys to etcd, a Secret or disk, because the controller keeps them in memory and sends them on the internal API's stream, and the data plane keeps no local cache. This decision avoids adding direct network dependencies or token exchange logic between data planes and certserver in the initial release.
+- **End-State Target:** In the end state, certserver advances beyond phase 1 through one of two mechanisms:
+  1. **Direct Data-Plane Retrieval:** Data planes fetch certificates and private keys directly from certserver at startup using their own projected service-account tokens. The data plane holds keys in process memory only and never writes them to Secrets or disk. With direct retrieval the controller does not hold keys.
+  2. **Keyless Signing (Phase 2):** certserver retains private keys in secure host storage, and data planes delegate handshake signatures to certserver over RPC. With keyless signing, certserver keeps private keys out of cluster memory entirely; no process in the cluster holds them.
 
 ### Phase 2: Keyless Sign Mode
 
