@@ -608,9 +608,6 @@ func NewNotAnsweredError(notAnswered int) *NotAnsweredError {
 }
 
 func (e *NotAnsweredError) Error() string {
-	if e == nil {
-		return ""
-	}
 	if e.NotAnswered == 1 {
 		return "1 data plane has not applied the revision"
 	}
@@ -715,7 +712,7 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 	// Beyond the Gateway API specification: the specification leaves the Gateway
 	// Programmed condition open when data planes have not yet applied the published
 	// configuration revision. This implementation reports Programmed=False with
-	// reason Pending until every known data plane has applied the revision. See issue #1528.
+	// reason Pending until every known data plane has applied the revision.
 	if result.NotAnswered > 0 {
 		notAnsweredErr := NewNotAnsweredError(result.NotAnswered)
 		s.recordPublishError(gwKey, notAnsweredErr)
@@ -744,7 +741,6 @@ func (s *State) clearPublishErrorLocked(gwKey types.NamespacedName) {
 
 // publishErrorsEqual reports whether two publish errors are equivalent.
 // If both errors wrap RejectedError, their rejections are compared rather than their error messages.
-// If both errors wrap NotAnsweredError, their unanswered counts are compared.
 // For other error types, the error messages are compared.
 func publishErrorsEqual(firstError, secondError error) bool {
 	if firstError == nil || secondError == nil {
@@ -758,16 +754,6 @@ func publishErrorsEqual(firstError, secondError error) bool {
 		return slices.Equal(firstRejected.Rejections, secondRejected.Rejections)
 	}
 	if errors.As(firstError, &firstRejected) || errors.As(secondError, &secondRejected) {
-		return false
-	}
-	var firstNotAnswered, secondNotAnswered *NotAnsweredError
-	if errors.As(firstError, &firstNotAnswered) && errors.As(secondError, &secondNotAnswered) {
-		if firstNotAnswered == nil || secondNotAnswered == nil {
-			return firstNotAnswered == secondNotAnswered
-		}
-		return firstNotAnswered.NotAnswered == secondNotAnswered.NotAnswered
-	}
-	if errors.As(firstError, &firstNotAnswered) || errors.As(secondError, &secondNotAnswered) {
 		return false
 	}
 	return firstError.Error() == secondError.Error()

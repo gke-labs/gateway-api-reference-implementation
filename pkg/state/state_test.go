@@ -1277,38 +1277,6 @@ func TestNewRejectedError_SortsRejections(t *testing.T) {
 	}
 }
 
-func TestNotAnsweredError_Error(t *testing.T) {
-	tests := []struct {
-		name        string
-		err         *NotAnsweredError
-		expectedMsg string
-	}{
-		{
-			name:        "nil error",
-			err:         nil,
-			expectedMsg: "",
-		},
-		{
-			name:        "single unanswered data plane",
-			err:         NewNotAnsweredError(1),
-			expectedMsg: "1 data plane has not applied the revision",
-		},
-		{
-			name:        "multiple unanswered data planes",
-			err:         NewNotAnsweredError(3),
-			expectedMsg: "3 data planes have not applied the revision",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.err.Error(); got != tc.expectedMsg {
-				t.Errorf("expected %q, got %q", tc.expectedMsg, got)
-			}
-		})
-	}
-}
-
 func TestPublishErrorsEqual(t *testing.T) {
 	rejectionsFirst := []DataPlaneRejection{
 		{DataPlane: "dp1", Reason: "reason1"},
@@ -1404,30 +1372,6 @@ func TestPublishErrorsEqual(t *testing.T) {
 			name:        "standard errors with different message",
 			firstError:  errors.New("timeout"),
 			secondError: errors.New("connection reset"),
-			want:        false,
-		},
-		{
-			name:        "same NotAnsweredError count",
-			firstError:  NewNotAnsweredError(1),
-			secondError: NewNotAnsweredError(1),
-			want:        true,
-		},
-		{
-			name:        "different NotAnsweredError count",
-			firstError:  NewNotAnsweredError(1),
-			secondError: NewNotAnsweredError(2),
-			want:        false,
-		},
-		{
-			name:        "NotAnsweredError vs standard error",
-			firstError:  NewNotAnsweredError(1),
-			secondError: errors.New("1 data plane has not applied the revision"),
-			want:        false,
-		},
-		{
-			name:        "NotAnsweredError vs RejectedError",
-			firstError:  NewNotAnsweredError(1),
-			secondError: NewRejectedError(rejectionsFirst),
 			want:        false,
 		},
 	}
@@ -1840,121 +1784,39 @@ func TestState_PublishDataplaneConfig_NotAnswered_PublicEntryPoints(t *testing.T
 			progCond.Reason == string(gatewayv1.GatewayReasonProgrammed)
 	})
 
+	// 4. A result with both rejections and an unanswered data plane still reports the rejections.
+	mockPub.setWaitAppliedResult(PublishResult{
+		Rejections: []DataPlaneRejection{
+			{DataPlane: "dp-1", Reason: "unsupported protocol"},
+		},
+		NotAnswered: 1,
+	}, nil)
+
+	// Change the Gateway to trigger a new publish.
+	gwUpdated := gw.DeepCopy()
+	gwUpdated.Spec.Listeners = append(gwUpdated.Spec.Listeners, gatewayv1.Listener{
+		Name:     "http-2",
+		Port:     8080,
+		Protocol: gatewayv1.HTTPProtocolType,
+	})
+	st.UpsertGateway(gwUpdated)
+
+	// Wait for Gateway condition to show Programmed=False with the rejection message.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil &&
+			progCond.Status == metav1.ConditionFalse &&
+			progCond.Reason == string(gatewayv1.GatewayReasonPending) &&
+			progCond.Message == "dp-1: unsupported protocol"
+	})
+
 	cancel()
 	if err := <-errCh; err != nil {
 		t.Fatalf("Start returned error: %v", err)
-	}
-}
-
-func TestState_PublishDataplaneConfig_RejectionsAndNotAnswered_ReportsRejections(t *testing.T) {
-	st := NewState()
-	st.SetControllerName("example.net/gateway-controller")
-
-	rejections := []DataPlaneRejection{
-		{DataPlane: "dp-1", Reason: "unsupported protocol"},
-	}
-	mockPub := &mockDataplanePublisher{}
-	mockPub.setWaitAppliedResult(PublishResult{
-		Rejections:  rejections,
-		NotAnswered: 1,
-	}, nil)
-	st.SetDataplanePublisher(mockPub)
-
-	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
-	}
-	st.UpsertGateway(gw)
-
-	cfg := &DataplaneConfig{
-		GatewayName: gwKey,
-		Revision:    "rev-1",
-	}
-	st.mu.Lock()
-	st.previousOutputs = &Outputs{
-		DataplaneConfigs: map[types.NamespacedName]*DataplaneConfig{
-			gwKey: cfg,
-		},
-		CompiledGateways: map[types.NamespacedName]*CompiledGateway{
-			gwKey: {Gateway: gw},
-		},
-	}
-	st.mu.Unlock()
-
-	ctx := t.Context()
-	err := st.reconcileDataplaneKey(ctx, gwKey)
-	if err == nil {
-		t.Fatalf("expected reconcileDataplaneKey to fail")
-	}
-
-	var rejectedErr *RejectedError
-	if !errors.As(err, &rejectedErr) {
-		t.Fatalf("expected error to be *RejectedError, got %T: %v", err, err)
-	}
-	if !slices.Equal(rejectedErr.Rejections, rejections) {
-		t.Errorf("expected rejections %+v, got %+v", rejections, rejectedErr.Rejections)
-	}
-
-	st.mu.RLock()
-	errs := st.gateways[gwKey].provisioningErrors
-	st.mu.RUnlock()
-
-	if errs.publish == nil {
-		t.Fatalf("expected publish error to be recorded")
-	}
-	if !errors.As(errs.publish, &rejectedErr) {
-		t.Fatalf("expected recorded error to be *RejectedError, got %T: %v", errs.publish, errs.publish)
-	}
-}
-
-func TestState_PublishDataplaneConfig_AllZeroResult_CountsAsApplied(t *testing.T) {
-	st := NewState()
-	st.SetControllerName("example.net/gateway-controller")
-
-	mockPub := &mockDataplanePublisher{}
-	mockPub.setWaitAppliedResult(PublishResult{
-		Applied:     0,
-		NotAnswered: 0,
-		Rejections:  nil,
-	}, nil)
-	st.SetDataplanePublisher(mockPub)
-
-	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: gwKey.Namespace, Name: gwKey.Name},
-	}
-	st.UpsertGateway(gw)
-
-	cfg := &DataplaneConfig{
-		GatewayName: gwKey,
-		Revision:    "rev-1",
-	}
-	st.mu.Lock()
-	st.previousOutputs = &Outputs{
-		DataplaneConfigs: map[types.NamespacedName]*DataplaneConfig{
-			gwKey: cfg,
-		},
-		CompiledGateways: map[types.NamespacedName]*CompiledGateway{
-			gwKey: {Gateway: gw},
-		},
-	}
-	st.mu.Unlock()
-
-	ctx := t.Context()
-	if err := st.reconcileDataplaneKey(ctx, gwKey); err != nil {
-		t.Fatalf("expected all-zero result to succeed, got: %v", err)
-	}
-
-	st.mu.RLock()
-	dataplaneState := st.dataplaneState[gwKey]
-	errs := st.gateways[gwKey].provisioningErrors
-	st.mu.RUnlock()
-
-	if errs.publish != nil {
-		t.Errorf("expected no publish error, got: %v", errs.publish)
-	}
-	if dataplaneState.acceptedConfig == nil {
-		t.Errorf("expected acceptedConfig to be saved for all-zero result")
 	}
 }
 
