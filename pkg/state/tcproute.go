@@ -97,19 +97,14 @@ func CompileTCPRoute(
 		route.Generation,
 	)
 
-	resolvedRefsCondition := NewCondition(
-		string(gatewayv1.RouteConditionResolvedRefs),
-		metav1.ConditionTrue,
-		string(gatewayv1.RouteReasonResolvedRefs),
-		"All references resolved",
-		route.Generation,
-	)
-
+	var refErrors []*ConditionError
 	var compiledRules []InternalTCPRule
 	for _, rule := range route.Spec.Rules {
+		backends, errs := resolveL4BackendRefs(rule.BackendRefs, route.Namespace, "TCPRoute", services, refValidator)
+		refErrors = append(refErrors, errs...)
 		compiledRules = append(compiledRules, InternalTCPRule{
 			Name:     rule.Name,
-			Backends: resolveL4BackendRefs(rule.BackendRefs, route.Namespace, route.Generation, "TCPRoute", services, refValidator, &resolvedRefsCondition),
+			Backends: backends,
 		})
 	}
 
@@ -118,7 +113,7 @@ func CompileTCPRoute(
 		Rules:                 compiledRules,
 		ParentRefs:            route.Spec.ParentRefs,
 		ValidationCondition:   validationCondition,
-		ResolvedRefsCondition: resolvedRefsCondition,
+		ResolvedRefsCondition: buildResolvedRefsCondition(refErrors, route.Generation),
 	}
 }
 

@@ -223,7 +223,6 @@ func recordRuleValidationError(validationCond *metav1.Condition, rule *InternalR
 	}
 	if rule != nil && rule.Error == nil {
 		rule.Error = &ErrorState{
-			Condition:      errCond,
 			HTTPStatusCode: http.StatusInternalServerError,
 			HTTPMessage:    msg,
 		}

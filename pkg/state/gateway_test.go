@@ -814,12 +814,6 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Rules: []InternalRule{
 						{
 							Error: &ErrorState{
-								Condition: metav1.Condition{
-									Type:    string(gatewayv1.RouteConditionResolvedRefs),
-									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonInvalidKind),
-									Message: "Unsupported backend kind: Unknown",
-								},
 								HTTPStatusCode: 500,
 								HTTPMessage:    "Unsupported backend kind: Unknown",
 							},
@@ -905,12 +899,6 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Rules: []InternalRule{
 						{
 							Error: &ErrorState{
-								Condition: metav1.Condition{
-									Type:    string(gatewayv1.RouteConditionResolvedRefs),
-									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonInvalidKind),
-									Message: "Unsupported backend: unknownkind.example.com/NonExistent",
-								},
 								HTTPStatusCode: 500,
 								HTTPMessage:    "Unsupported backend: unknownkind.example.com/NonExistent",
 							},
@@ -1859,12 +1847,6 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Rules: []InternalRule{
 						{
 							Error: &ErrorState{
-								Condition: metav1.Condition{
-									Type:    string(gatewayv1.RouteConditionResolvedRefs),
-									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonBackendNotFound),
-									Message: "Backend service default/nonexistent-svc not found",
-								},
 								HTTPStatusCode: http.StatusInternalServerError,
 								HTTPMessage:    "Backend service default/nonexistent-svc not found",
 							},
@@ -1956,12 +1938,6 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Rules: []InternalRule{
 						{
 							Error: &ErrorState{
-								Condition: metav1.Condition{
-									Type:    string(gatewayv1.RouteConditionResolvedRefs),
-									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
-									Message: "Cross-namespace reference to service other-ns/web-backend is not permitted by any ReferenceGrant",
-								},
 								HTTPStatusCode: http.StatusInternalServerError,
 								HTTPMessage:    "Cross-namespace reference to service other-ns/web-backend is not permitted by any ReferenceGrant",
 							},
@@ -2222,12 +2198,6 @@ func TestBuildInternalRoutes(t *testing.T) {
 								},
 							},
 							Error: &ErrorState{
-								Condition: metav1.Condition{
-									Type:    string(gatewayv1.RouteConditionResolvedRefs),
-									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
-									Message: "Cross-namespace reference to service app-ns/app-backend-v2 is not permitted by any ReferenceGrant",
-								},
 								HTTPStatusCode: http.StatusInternalServerError,
 								HTTPMessage:    "Cross-namespace reference to service app-ns/app-backend-v2 is not permitted by any ReferenceGrant",
 							},

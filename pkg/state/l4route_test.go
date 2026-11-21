@@ -77,23 +77,14 @@ func TestResolveL4BackendRefs(t *testing.T) {
 
 				for _, tc := range tests {
 					t.Run(tc.name, func(t *testing.T) {
-						cond := NewCondition(
-							string(gatewayv1.RouteConditionResolvedRefs),
-							metav1.ConditionTrue,
-							string(gatewayv1.RouteReasonResolvedRefs),
-							"All references resolved",
-							1,
-						)
-
-						backends := resolveL4BackendRefs(
+						backends, refErrors := resolveL4BackendRefs(
 							tc.backendRefs,
 							"default",
-							1,
 							routeKind,
 							map[types.NamespacedName]*corev1.Service{},
 							nil,
-							&cond,
 						)
+						cond := buildResolvedRefsCondition(refErrors, 1)
 
 						if len(backends) != 0 {
 							t.Fatalf("expected 0 backends, got %d", len(backends))
@@ -121,15 +112,7 @@ func TestResolveL4BackendRefs(t *testing.T) {
 					{Namespace: "default", Name: "backend-svc"}: svc,
 				}
 
-				cond := NewCondition(
-					string(gatewayv1.RouteConditionResolvedRefs),
-					metav1.ConditionTrue,
-					string(gatewayv1.RouteReasonResolvedRefs),
-					"All references resolved",
-					1,
-				)
-
-				backends := resolveL4BackendRefs(
+				backends, refErrors := resolveL4BackendRefs(
 					[]gatewayv1.BackendRef{
 						{
 							BackendObjectReference: gatewayv1.BackendObjectReference{
@@ -138,12 +121,11 @@ func TestResolveL4BackendRefs(t *testing.T) {
 						},
 					},
 					"default",
-					1,
 					routeKind,
 					services,
 					nil,
-					&cond,
 				)
+				cond := buildResolvedRefsCondition(refErrors, 1)
 
 				if cond.Status != metav1.ConditionTrue {
 					t.Errorf("expected ResolvedRefs Status True, got %s", cond.Status)

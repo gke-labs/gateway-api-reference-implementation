@@ -2424,3 +2424,56 @@ func TestHTTPRouteStatus_PartiallyInvalid(t *testing.T) {
 		}
 	})
 }
+
+func TestResolvedRefsCondition_FirstFailingBackendDecides(t *testing.T) {
+	route := &HTTPRouteState{
+		HTTPRoute: &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:  "default",
+				Generation: 2,
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Kind: Ptr(gatewayv1.Kind("UnknownKind")),
+										Name: "backend-1",
+									},
+								},
+							},
+						},
+					},
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "nonexistent-svc",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cond := route.ComputeResolvedRefsCondition(map[types.NamespacedName]*corev1.Service{}, nil)
+	if cond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected status False, got %s", cond.Status)
+	}
+	if cond.Reason != string(gatewayv1.RouteReasonInvalidKind) {
+		t.Fatalf("expected reason %s, got %s", gatewayv1.RouteReasonInvalidKind, cond.Reason)
+	}
+	expectedMsg := "Unsupported backend kind: UnknownKind"
+	if cond.Message != expectedMsg {
+		t.Fatalf("expected message %q, got %q", expectedMsg, cond.Message)
+	}
+	if cond.ObservedGeneration != 2 {
+		t.Fatalf("expected observedGeneration 2, got %d", cond.ObservedGeneration)
+	}
+}
