@@ -85,16 +85,9 @@ func makeTestNode(name, zone, instance string) *corev1.Node {
 }
 
 func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nodeName, ip string, containersReady, overallReady bool, isTerminating bool) *corev1.Pod {
-	bundleCM := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      spiffe.BundleConfigMapName,
-		},
-		Data: map[string]string{
-			spiffe.BundleDataKey: "test-trust-bundle",
-		},
+	if err := spiffe.EnsureCredentials(t.Context(), c, "default"); err != nil {
+		t.Fatalf("ensuring credentials: %v", err)
 	}
-	_ = c.Create(t.Context(), bundleCM)
 
 	drainVol := corev1ac.Volume().
 		WithName("drain-volume").

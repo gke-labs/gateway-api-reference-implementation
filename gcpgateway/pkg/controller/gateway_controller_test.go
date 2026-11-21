@@ -71,16 +71,9 @@ func getConditionFromStatus(status *gatewayv1.GatewayStatus, condType string) *m
 }
 
 func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nodeName, ip string, extraConditions []corev1.PodCondition) *corev1.Pod {
-	bundleCM := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      spiffe.BundleConfigMapName,
-		},
-		Data: map[string]string{
-			spiffe.BundleDataKey: "test-trust-bundle",
-		},
+	if err := spiffe.EnsureCredentials(t.Context(), c, "default"); err != nil {
+		t.Fatalf("ensuring credentials: %v", err)
 	}
-	_ = c.Create(t.Context(), bundleCM)
 
 	drainVol := corev1ac.Volume().
 		WithName("drain-volume").
@@ -1402,16 +1395,9 @@ func TestGateway_PeriodicResyncPrunesOrphanedEndpoints(t *testing.T) {
 		},
 	})
 
-	bundleCM := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      spiffe.BundleConfigMapName,
-		},
-		Data: map[string]string{
-			spiffe.BundleDataKey: "test-trust-bundle",
-		},
+	if err := spiffe.EnsureCredentials(t.Context(), env.Client, "default"); err != nil {
+		t.Fatalf("ensuring credentials: %v", err)
 	}
-	_ = env.Client.Create(t.Context(), bundleCM)
 
 	ap := singlepod.NewAddressProvider(
 		env.Client,
@@ -1925,16 +1911,9 @@ func TestGateway_DeleteDetachesEndpoints_EnvTest(t *testing.T) {
 		},
 	})
 
-	bundleCM := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      spiffe.BundleConfigMapName,
-		},
-		Data: map[string]string{
-			spiffe.BundleDataKey: "test-trust-bundle",
-		},
+	if err := spiffe.EnsureCredentials(t.Context(), env.Client, "default"); err != nil {
+		t.Fatalf("ensuring credentials: %v", err)
 	}
-	_ = env.Client.Create(t.Context(), bundleCM)
 
 	ap := singlepod.NewAddressProvider(
 		env.Client,

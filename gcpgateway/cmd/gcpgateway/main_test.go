@@ -374,10 +374,48 @@ func TestSetupDataplane_ProvisionerArgs_ACMEChallenge(t *testing.T) {
 	}
 }
 
+func TestSetupController_RequiresInternalAPIFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "missing all",
+			args: []string{"--cluster-id=c1", "--fake-compute"},
+		},
+		{
+			name: "missing tls files",
+			args: []string{"--cluster-id=c1", "--fake-compute", "--internal-api-bind-address=:8443"},
+		},
+		{
+			name: "missing key file",
+			args: []string{"--cluster-id=c1", "--fake-compute", "--internal-api-bind-address=:8443", "--internal-api-tls-cert-file=/etc/cert.pem"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := SetupController(t.Context(), tc.args, nil)
+			if err == nil {
+				t.Fatalf("expected error when internal API flags are missing, got nil")
+			}
+			for _, flag := range []string{"--internal-api-bind-address", "--internal-api-tls-cert-file", "--internal-api-tls-key-file"} {
+				if !strings.Contains(err.Error(), flag) {
+					t.Errorf("expected error to name %s, got %v", flag, err)
+				}
+			}
+		})
+	}
+}
+
 func TestSetupController_NoSilentFallback(t *testing.T) {
 	// Without --fake-compute, SetupController initializes the real Compute client.
 	// It must never silently substitute a FakeComputeClient.
-	opts, err := SetupController(t.Context(), []string{"--cluster-id=c1"}, nil)
+	opts, err := SetupController(t.Context(), []string{
+		"--cluster-id=c1",
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
+	}, nil)
 	if err != nil {
 		// Error returned instead of silent fallback is valid
 		return
@@ -388,7 +426,13 @@ func TestSetupController_NoSilentFallback(t *testing.T) {
 }
 
 func TestSetupController_FakeComputeFlag(t *testing.T) {
-	opts, err := SetupController(t.Context(), []string{"--cluster-id=c1", "--fake-compute"}, nil)
+	opts, err := SetupController(t.Context(), []string{
+		"--cluster-id=c1",
+		"--fake-compute",
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
+	}, nil)
 	if err != nil {
 		t.Fatalf("SetupController failed with --fake-compute: %v", err)
 	}
@@ -401,7 +445,14 @@ func TestSetupController_FakeComputeFlag(t *testing.T) {
 }
 
 func TestSetupController_DebugErrorResponsesFlag(t *testing.T) {
-	opts, err := SetupController(t.Context(), []string{"--cluster-id=c1", "--fake-compute", "--debug-error-responses"}, nil)
+	baseArgs := []string{
+		"--cluster-id=c1",
+		"--fake-compute",
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
+	}
+	opts, err := SetupController(t.Context(), append(baseArgs, "--debug-error-responses"), nil)
 	if err != nil {
 		t.Fatalf("SetupController failed: %v", err)
 	}
@@ -409,7 +460,7 @@ func TestSetupController_DebugErrorResponsesFlag(t *testing.T) {
 		t.Errorf("expected DebugErrorResponses=true, got %v", opts.DebugErrorResponses)
 	}
 
-	optsDefault, err := SetupController(t.Context(), []string{"--cluster-id=c1", "--fake-compute"}, nil)
+	optsDefault, err := SetupController(t.Context(), baseArgs, nil)
 	if err != nil {
 		t.Fatalf("SetupController failed: %v", err)
 	}
@@ -513,18 +564,27 @@ func assertProductionDeployment(t *testing.T, deploy *appsv1.Deployment, expecte
 
 func createBundleConfigMap(t *testing.T, c client.Client) {
 	t.Helper()
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      spiffe.BundleConfigMapName,
-		},
-		Data: map[string]string{
-			spiffe.BundleDataKey: "test-ca-bundle-data",
-		},
-	}
-	if err := c.Create(t.Context(), cm); err != nil && !apierrors.IsAlreadyExists(err) {
+	if err := spiffe.EnsureCredentials(t.Context(), c, "default"); err != nil {
 		t.Fatalf("creating bundle ConfigMap: %v", err)
 	}
+}
+
+func setupTestInternalAPIFiles(t *testing.T, env *testenv.Environment) (string, string) {
+	t.Helper()
+	var svidSec corev1.Secret
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: spiffe.ControllerSVIDSecretName}, &svidSec); err != nil {
+		t.Fatalf("reading controller SVID secret: %v", err)
+	}
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "svid.pem")
+	keyFile := filepath.Join(tmpDir, "svid_key.pem")
+	if err := os.WriteFile(certFile, svidSec.Data[corev1.TLSCertKey], 0600); err != nil {
+		t.Fatalf("writing cert file: %v", err)
+	}
+	if err := os.WriteFile(keyFile, svidSec.Data[corev1.TLSPrivateKeyKey], 0600); err != nil {
+		t.Fatalf("writing key file: %v", err)
+	}
+	return certFile, keyFile
 }
 
 // TestSetupController_EndToEndRealSetup verifies that the full controller setup wiring
@@ -615,6 +675,7 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 	})
 
 	// 1. Run SetupController with real arguments
+	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
 		"--neg-prefix=gcpgw",
@@ -622,6 +683,9 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 		"--zones=us-central1-a",
 		"--drain-seconds=35",
 		"--fake-compute",
+		"--internal-api-bind-address=127.0.0.1:0",
+		"--internal-api-tls-cert-file=" + certFile,
+		"--internal-api-tls-key-file=" + keyFile,
 	}, fakeGCP)
 	if err != nil {
 		t.Fatalf("SetupController failed: %v", err)
@@ -855,6 +919,7 @@ func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) 
 
 	fakeGCP := gcp.NewFakeComputeClient()
 
+	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
 		"--neg-prefix=gcpgw",
@@ -862,6 +927,9 @@ func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) 
 		"--zones=us-central1-a",
 		"--drain-seconds=45",
 		"--fake-compute",
+		"--internal-api-bind-address=127.0.0.1:0",
+		"--internal-api-tls-cert-file=" + certFile,
+		"--internal-api-tls-key-file=" + keyFile,
 	}, fakeGCP)
 	if err != nil {
 		t.Fatalf("SetupController failed: %v", err)
@@ -1001,6 +1069,7 @@ func TestSetupController_SteadyStateZeroWritesAndNoFlapping(t *testing.T) {
 		},
 	})
 
+	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
 		"--neg-prefix=gcpgw",
@@ -1009,6 +1078,9 @@ func TestSetupController_SteadyStateZeroWritesAndNoFlapping(t *testing.T) {
 		"--health-poll-interval=100ms",
 		"--resync-interval=250ms",
 		"--fake-compute",
+		"--internal-api-bind-address=127.0.0.1:0",
+		"--internal-api-tls-cert-file=" + certFile,
+		"--internal-api-tls-key-file=" + keyFile,
 	}, fakeGCP)
 	if err != nil {
 		t.Fatalf("SetupController failed: %v", err)
@@ -1383,6 +1455,7 @@ func TestSetupController_DataplaneConfigFromInternalAPI(t *testing.T) {
 	}
 
 	fakeGCP := gcp.NewFakeComputeClient()
+	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=c1",
 		"--neg-prefix=gcpgw",
@@ -1390,6 +1463,9 @@ func TestSetupController_DataplaneConfigFromInternalAPI(t *testing.T) {
 		"--zones=us-central1-a",
 		"--drain-seconds=35",
 		"--fake-compute",
+		"--internal-api-bind-address=127.0.0.1:0",
+		"--internal-api-tls-cert-file=" + certFile,
+		"--internal-api-tls-key-file=" + keyFile,
 	}, fakeGCP)
 	if err != nil {
 		t.Fatalf("SetupController failed: %v", err)

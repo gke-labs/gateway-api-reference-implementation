@@ -282,12 +282,16 @@ func TestSetupController_CertserverIntegration(t *testing.T) {
 	// 5. Initialize controller with certserver flags
 	createBundleConfigMap(t, env.Client)
 	fakeGCP := gcp.NewFakeComputeClient()
+	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
 		"--neg-prefix=gcpgw",
 		"--project=my-project",
 		"--zones=us-central1-a",
 		"--fake-compute",
+		"--internal-api-bind-address=127.0.0.1:0",
+		"--internal-api-tls-cert-file=" + certFile,
+		"--internal-api-tls-key-file=" + keyFile,
 		fmt.Sprintf("--certserver-address=%s", lis.Addr().String()),
 		fmt.Sprintf("--certserver-ca-bundle-path=%s", caBundleFile),
 		fmt.Sprintf("--certserver-token-path=%s", tokenFile),
@@ -428,6 +432,7 @@ func TestSetupController_CertserverUnregistered(t *testing.T) {
 
 	createBundleConfigMap(t, env.Client)
 	fakeGCP := gcp.NewFakeComputeClient()
+	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	// Run SetupController WITHOUT any certserver flags
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
@@ -436,6 +441,9 @@ func TestSetupController_CertserverUnregistered(t *testing.T) {
 		"--zones=us-central1-a",
 		"--controller-name=gke-labs.io/gcpgateway-unreg",
 		"--fake-compute",
+		"--internal-api-bind-address=127.0.0.1:0",
+		"--internal-api-tls-cert-file=" + certFile,
+		"--internal-api-tls-key-file=" + keyFile,
 	}, fakeGCP)
 	if err != nil {
 		t.Fatalf("SetupController failed: %v", err)

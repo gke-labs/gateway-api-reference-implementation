@@ -20,7 +20,8 @@
 | `gateway.networking.k8s.io` | `gateways`, `gatewayclasses`, `httproutes`, `backendtlspolicies`, `referencegrants`, `listenersets` | `get`, `list`, `watch`, `update`, `patch` | Core Gateway API reconciliation and status condition updates. |
 | `gateway.networking.k8s.io` | `tlsroutes`, `grpcroutes`, `tcproutes`, `udproutes` | `get`, `list`, `watch` | Route discovery for cross-protocol Gateway listeners. |
 | `gateway.networking.k8s.io` | `*/status` subresources | `update`, `patch` | Updating `Accepted`, `Programmed`, and address status on Gateways and Routes. |
-| `""` (core) | `services`, `serviceaccounts`, `secrets` | `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` | Singlepod provisioner manages per-Gateway ServiceAccount, headless/ClusterIP Service, and data-plane configuration Secrets. |
+| `""` (core) | `services`, `serviceaccounts` | `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` | Singlepod provisioner manages per-Gateway ServiceAccount and headless/ClusterIP Service. |
+| `""` (core) | `secrets` | `get`, `list`, `watch` | Resolving TLS certificates referenced by Gateway listeners. |
 | `apps` | `deployments` | `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` | Singlepod provisioner creates and manages the per-Gateway data-plane Deployment. |
 | `""` (core) | `configmaps`, `namespaces` | `get`, `list`, `watch` | Resolving parameters ConfigMaps referenced by `spec.infrastructure.parametersRef`. |
 | `""` (core) | `nodes` | `get`, `list`, `watch` | Resolving node `spec.providerID` to GCE zone and instance name for NEG attachment. |

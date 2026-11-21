@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -255,6 +256,10 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 	controllerNamespace := os.Getenv("POD_NAMESPACE")
 	if controllerNamespace == "" {
 		controllerNamespace = "default"
+	}
+
+	if opts.InternalAPIBindAddress == "" || opts.InternalAPITLSCertFile == "" || opts.InternalAPITLSKeyFile == "" {
+		return gari.Options{}, errors.New("--internal-api-bind-address, --internal-api-tls-cert-file, and --internal-api-tls-key-file are required")
 	}
 
 	gcpClient := computeClient
