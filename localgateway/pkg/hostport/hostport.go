@@ -114,7 +114,7 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 		return nil, readiness, nil
 	}
 
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 
 	var deployment appsv1.Deployment
 	if err := provider.reader.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {

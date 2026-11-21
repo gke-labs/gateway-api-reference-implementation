@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"net/url"
 	"time"
 
@@ -37,6 +38,9 @@ import (
 const (
 	// TrustDomain is the name that all SPIFFE identities in this cluster share.
 	TrustDomain = "cluster.local"
+
+	// ClusterDNSDomain is the DNS domain name of the Kubernetes cluster (e.g., "cluster.local").
+	ClusterDNSDomain = "cluster.local"
 
 	// AuthorityLifetime is the duration for which the SPIFFE trust domain authority certificate is valid (10 years).
 	// We choose 10 years because the authority is an internal cluster trust anchor; rotating the CA
@@ -120,19 +124,29 @@ func SPIFFEID(trustDomain, namespace, serviceAccount string) (*url.URL, error) {
 	return url.Parse(fmt.Sprintf("spiffe://%s/ns/%s/sa/%s", trustDomain, namespace, serviceAccount))
 }
 
-// ServiceDNSNames returns the list of DNS names for a Service in the specified namespace.
-func ServiceDNSNames(serviceName, namespace string) ([]string, error) {
+// ServiceClusterDNSName returns the fully qualified cluster DNS name for a Service in the specified namespace
+// (e.g., "<serviceName>.<namespace>.svc.cluster.local").
+func ServiceClusterDNSName(serviceName, namespace string) (string, error) {
 	if namespace == "" {
-		return nil, errors.New("namespace is required")
+		return "", errors.New("namespace is required")
 	}
 	if serviceName == "" {
-		return nil, errors.New("serviceName is required")
+		return "", errors.New("serviceName is required")
+	}
+	return fmt.Sprintf("%s.%s.svc.%s", serviceName, namespace, ClusterDNSDomain), nil
+}
+
+// ServiceDNSNames returns the list of DNS names for a Service in the specified namespace.
+func ServiceDNSNames(serviceName, namespace string) ([]string, error) {
+	clusterDNS, err := ServiceClusterDNSName(serviceName, namespace)
+	if err != nil {
+		return nil, err
 	}
 	return []string{
 		serviceName,
 		fmt.Sprintf("%s.%s", serviceName, namespace),
 		fmt.Sprintf("%s.%s.svc", serviceName, namespace),
-		fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace),
+		clusterDNS,
 	}, nil
 }
 
@@ -356,6 +370,7 @@ func generateSVIDCertificate(authorityCert *x509.Certificate, authorityKey *ecds
 		},
 		URIs:                  []*url.URL{spiffeID},
 		DNSNames:              dnsNames,
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 		NotBefore:             now,
 		NotAfter:              now.Add(SVIDLifetime),
 		KeyUsage:              x509.KeyUsageDigitalSignature,

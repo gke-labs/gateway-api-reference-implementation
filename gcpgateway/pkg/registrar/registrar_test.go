@@ -17,6 +17,7 @@ package registrar
 import (
 	"errors"
 	"fmt"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"strings"
 	"testing"
 	"time"
@@ -104,7 +105,7 @@ func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nod
 		t.Fatalf("failed to reconcile deployment for pod template: %v", err)
 	}
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resName := state.ResourceNameForGateway(gw.Name)
 	var deploy appsv1.Deployment
 	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)

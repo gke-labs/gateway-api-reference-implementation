@@ -1791,7 +1791,7 @@ func TestDataplaneSecretReconciler(t *testing.T) {
 	}
 
 	gwName := "test-gw"
-	secretName := singlepod.ResourceNameForGateway(gwName)
+	secretName := state.ResourceNameForGateway(gwName)
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1868,7 +1868,7 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 		gwName      = "test-gw"
 	)
 	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
-	secretName := singlepod.ResourceNameForGateway(gwName)
+	secretName := state.ResourceNameForGateway(gwName)
 
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2071,7 +2071,7 @@ func TestDataplaneSecretReconciler_MissingSecretLeavesProxyNotSynced(t *testing.
 	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	gwName := "test-gw"
-	secretName := singlepod.ResourceNameForGateway(gwName)
+	secretName := state.ResourceNameForGateway(gwName)
 
 	server := &Server{
 		opts: Options{
@@ -2832,7 +2832,7 @@ func TestDataplane_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t 
 	}
 
 	gwName := "test-gw"
-	secretName := singlepod.ResourceNameForGateway(gwName)
+	secretName := state.ResourceNameForGateway(gwName)
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2994,7 +2994,7 @@ func TestDataplane_HTTPS_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerSt
 	}
 
 	gwName := "test-gw"
-	secretName := singlepod.ResourceNameForGateway(gwName)
+	secretName := state.ResourceNameForGateway(gwName)
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3202,7 +3202,7 @@ func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testin
 	if err != nil {
 		t.Fatalf("failed to marshal config: %v", err)
 	}
-	secretName := singlepod.ResourceNameForGateway(gwName)
+	secretName := state.ResourceNameForGateway(gwName)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "test-ns",
@@ -3329,7 +3329,7 @@ func TestDataplane_InvalidCIDRsRejectedAndNotStored(t *testing.T) {
 	p := proxy.NewProxy()
 
 	gwName := "test-gw"
-	secretName := singlepod.ResourceNameForGateway(gwName)
+	secretName := state.ResourceNameForGateway(gwName)
 
 	server := &Server{
 		opts: Options{

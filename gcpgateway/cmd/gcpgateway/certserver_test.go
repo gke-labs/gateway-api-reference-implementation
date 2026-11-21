@@ -24,6 +24,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"log"
 	"math/big"
 	"net"
@@ -51,7 +52,6 @@ import (
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 )
 
@@ -196,7 +196,7 @@ func TestSetupController_CertserverIntegration(t *testing.T) {
 	const hostname = "my-host.example.com"
 
 	expectedGateway := fmt.Sprintf("%s/%s", gwNamespace, gwName)
-	expectedDPSA := fmt.Sprintf("%s/%s", gwNamespace, singlepod.ResourceNameForGateway(gwName))
+	expectedDPSA := fmt.Sprintf("%s/%s", gwNamespace, state.ResourceNameForGateway(gwName))
 
 	// 1. Generate fake server TLS and leaf certificate
 	srvTLS, srvCertPEM, _, caBundlePEM := generateServerCert(t, "127.0.0.1")
@@ -363,7 +363,7 @@ func TestSetupController_CertserverIntegration(t *testing.T) {
 	}
 
 	// 7. Verify per-Gateway Secret was created with certificates
-	secretName := singlepod.ResourceNameForGateway(gwName)
+	secretName := state.ResourceNameForGateway(gwName)
 	var sec corev1.Secret
 	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: secretName}, &sec); err != nil {
 		t.Fatalf("reading Gateway dataplane secret %s: %v", secretName, err)

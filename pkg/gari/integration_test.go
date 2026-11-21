@@ -142,7 +142,7 @@ func TestGARI_Integration_SinglePodProvisioning(t *testing.T) {
 	}
 
 	// 4. Poll until singlepod Deployment, Service, and Secret are created
-	resName := singlepod.ResourceNameForGateway(gwName)
+	resName := state.ResourceNameForGateway(gwName)
 	resKey := types.NamespacedName{Namespace: gwNamespace, Name: resName}
 
 	var deploy appsv1.Deployment
@@ -296,7 +296,7 @@ func TestGARI_Integration_SinglePodProvisioning(t *testing.T) {
 		t.Fatalf("failed to create Gateway %s: %v", dotGwName, err)
 	}
 
-	dotResName := singlepod.ResourceNameForGateway(dotGwName)
+	dotResName := state.ResourceNameForGateway(dotGwName)
 	dotResKey := types.NamespacedName{Namespace: gwNamespace, Name: dotResName}
 	var dotDeploy appsv1.Deployment
 	var dotSvc corev1.Service

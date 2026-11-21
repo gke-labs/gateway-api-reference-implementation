@@ -26,7 +26,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -43,6 +42,9 @@ import (
 )
 
 const (
+	// InternalAPIPort is the TCP port for the controller's internal API service.
+	InternalAPIPort = 8443
+
 	// DefaultAudience is the expected audience for projected ServiceAccount tokens.
 	DefaultAudience = "gari-controller"
 
@@ -486,7 +488,7 @@ func (server *Server) StreamConfig(stream grpc.BidiStreamingServer[DataplaneMess
 	}
 
 	// 3. Scoping check
-	expectedServiceAccount := singlepod.ResourceNameForGateway(hello.GatewayName)
+	expectedServiceAccount := state.ResourceNameForGateway(hello.GatewayName)
 	if callerNamespace != hello.GatewayNamespace || callerServiceAccount != expectedServiceAccount {
 		logger.Error(nil, "permission denied",
 			"callerNamespace", callerNamespace,

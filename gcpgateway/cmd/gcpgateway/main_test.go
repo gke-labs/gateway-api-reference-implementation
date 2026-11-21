@@ -211,7 +211,7 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	}
 
 	var deploy appsv1.Deployment
-	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: state.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
 	}
 
@@ -321,7 +321,7 @@ func TestSetupDataplane_ProvisionerArgs_ACMEChallenge(t *testing.T) {
 	}
 
 	var deploy appsv1.Deployment
-	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: state.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
 	}
 
@@ -354,7 +354,7 @@ func TestSetupDataplane_ProvisionerArgs_ACMEChallenge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
-	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: state.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
 		t.Fatalf("failed to get updated Deployment: %v", err)
 	}
 	offArgs := deploy.Spec.Template.Spec.Containers[0].Args
@@ -627,7 +627,7 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 		}
 	})
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resName := state.ResourceNameForGateway(gw.Name)
 	var deploy appsv1.Deployment
 	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
 		if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err == nil {
@@ -849,7 +849,7 @@ func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) 
 		}
 	})
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resName := state.ResourceNameForGateway(gw.Name)
 	var deploy appsv1.Deployment
 	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
 		if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err == nil {
@@ -994,7 +994,7 @@ func TestSetupController_SteadyStateZeroWritesAndNoFlapping(t *testing.T) {
 		}
 	})
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resName := state.ResourceNameForGateway(gw.Name)
 	var deploy appsv1.Deployment
 	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
 		if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err == nil {

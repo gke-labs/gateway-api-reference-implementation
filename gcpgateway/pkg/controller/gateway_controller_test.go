@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -90,7 +91,7 @@ func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nod
 		t.Fatalf("failed to reconcile deployment for pod template: %v", err)
 	}
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resName := state.ResourceNameForGateway(gw.Name)
 	var deploy appsv1.Deployment
 	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
@@ -1398,7 +1399,7 @@ func TestGateway_PeriodicResyncPrunesOrphanedEndpoints(t *testing.T) {
 		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resName := state.ResourceNameForGateway(gw.Name)
 	var deploy appsv1.Deployment
 	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
 		t.Fatalf("failed to get Deployment: %v", err)
@@ -1700,8 +1701,8 @@ func TestGateway_DeleteDetachesEndpointsAndRemovesFinalizer(t *testing.T) {
 	}
 	rec.statusMu.Unlock()
 
-	delDeployName := singlepod.ResourceNameForGateway("del-gw")
-	otherDeployName := singlepod.ResourceNameForGateway("other-gw")
+	delDeployName := state.ResourceNameForGateway("del-gw")
+	otherDeployName := state.ResourceNameForGateway("other-gw")
 	delPodKey := fmt.Sprintf("default/%s-pod-1", delDeployName)
 	otherPodKey := fmt.Sprintf("default/%s-pod-1", otherDeployName)
 
@@ -1909,7 +1910,7 @@ func TestGateway_DeleteDetachesEndpoints_EnvTest(t *testing.T) {
 		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 
-	resName := singlepod.ResourceNameForGateway(gw.Name)
+	resName := state.ResourceNameForGateway(gw.Name)
 	var deploy appsv1.Deployment
 	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
 		t.Fatalf("failed to get Deployment: %v", err)
@@ -2290,7 +2291,7 @@ func TestGateway_ControllerRestartWithNoDeletionDetachesNothing(t *testing.T) {
 		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
 	}
 
-	deployName := singlepod.ResourceNameForGateway("restart-gw")
+	deployName := state.ResourceNameForGateway("restart-gw")
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "default",

@@ -25,8 +25,8 @@ import (
 
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
 
 func TestGatewayAPI(t *testing.T) {
@@ -250,7 +250,7 @@ spec:
 	}
 
 	// Verify Service, Deployment, ServiceAccount, Role, RoleBinding, and Secret were created for second-gateway
-	secondResName := singlepod.ResourceNameForGateway("second-gateway")
+	secondResName := state.ResourceNameForGateway("second-gateway")
 	out := h.RunCmd("kubectl", "get", "svc", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(out) != secondResName {
 		t.Errorf("Expected Service %s to exist, got: %s", secondResName, out)
@@ -335,7 +335,7 @@ spec:
 		t.Fatalf("Expected live-switch-gw to get an address")
 	}
 
-	liveResName := singlepod.ResourceNameForGateway("live-switch-gw")
+	liveResName := state.ResourceNameForGateway("live-switch-gw")
 	svcType := strings.TrimSpace(h.RunCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
 	if svcType != "LoadBalancer" {
 		t.Errorf("Expected Service type LoadBalancer, got: %s", svcType)

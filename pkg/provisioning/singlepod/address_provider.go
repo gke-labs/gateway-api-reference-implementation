@@ -16,8 +16,6 @@ package singlepod
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -111,31 +109,6 @@ const (
 	DefaultACMEChallengeTokenPath = "/var/run/secrets/tokens/certserver/token"
 )
 
-// ResourceNameForGateway computes the resource name for a Gateway within its namespace.
-// The derived name is guaranteed to be a valid DNS-1035 label (at most 63 characters,
-// lowercase alphanumeric and hyphens, starting with an alphabetic character and ending
-// with an alphanumeric character) of the form "gari-<name>-<hash>".
-func ResourceNameForGateway(gwName string) string {
-	h := sha256.Sum256([]byte(gwName))
-	hash := hex.EncodeToString(h[:4])
-
-	var b strings.Builder
-	for _, r := range strings.ToLower(gwName) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteRune('-')
-		}
-	}
-	clean := b.String()
-	// Limit clean name length so "gari-<clean>-<hash>" stays within 63 characters.
-	maxCleanLen := 63 - len("gari-") - len("-") - len(hash)
-	if len(clean) > maxCleanLen {
-		clean = clean[:maxCleanLen]
-	}
-	return fmt.Sprintf("gari-%s-%s", clean, hash)
-}
-
 // LabelValueForGateway returns a valid Kubernetes label value for the parent Gateway name.
 // Generated resources carry the standard gateway.networking.k8s.io/gateway-name label,
 // whose value must be the Gateway's name, as checked by Gateway API conformance.
@@ -145,7 +118,7 @@ func LabelValueForGateway(gwName string) string {
 	if len(gwName) <= MaxLabelValueLength {
 		return gwName
 	}
-	return ResourceNameForGateway(gwName)
+	return state.ResourceNameForGateway(gwName)
 }
 
 // Option configures an AddressProvider.
@@ -464,7 +437,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		params = state.DefaultParameters()
 	}
 
-	name := ResourceNameForGateway(gw.Name)
+	name := state.ResourceNameForGateway(gw.Name)
 	labelGwName := LabelValueForGateway(gw.Name)
 	gwNamespace := gw.Namespace
 
@@ -1254,7 +1227,7 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 	if p.client == nil || gw == nil {
 		return nil
 	}
-	name := ResourceNameForGateway(gw.Name)
+	name := state.ResourceNameForGateway(gw.Name)
 	return PublishDataplaneConfig(ctx, p.client, gw.Namespace, name, gw, config)
 }
 
