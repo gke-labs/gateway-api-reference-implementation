@@ -71,15 +71,7 @@ func CompileHTTPRoute(
 		return nil
 	}
 
-	validationCondition := NewCondition(
-		string(gatewayv1.RouteConditionAccepted),
-		metav1.ConditionTrue,
-		string(gatewayv1.RouteReasonAccepted),
-		"Route validation succeeded",
-		route.Generation,
-	)
-
-	var refErrors []*ConditionError
+	var routeErrors []*ConditionError
 
 	var hostnames []string
 	for _, h := range route.Spec.Hostnames {
@@ -97,21 +89,21 @@ func CompileHTTPRoute(
 		if rule.Name != nil {
 			if seenRuleNames[*rule.Name] {
 				msg := fmt.Sprintf("duplicate rule name: %s", *rule.Name)
-				recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
+				routeErrors = append(routeErrors, recordRuleValidationError(&iRule, msg))
 			}
 			seenRuleNames[*rule.Name] = true
 		}
 
 		// 0. Process rule timeouts
 		if timeouts, err := ParseTimeouts(rule.Timeouts); err != nil {
-			recordRuleValidationError(&validationCondition, &iRule, err.Error(), route.Generation)
+			routeErrors = append(routeErrors, recordRuleValidationError(&iRule, err.Error()))
 		} else {
 			iRule.Timeouts = timeouts
 		}
 
 		// 0b. Process rule retry
 		if retry, err := ParseRetry(rule.Retry); err != nil {
-			recordRuleValidationError(&validationCondition, &iRule, err.Error(), route.Generation)
+			routeErrors = append(routeErrors, recordRuleValidationError(&iRule, err.Error()))
 		} else {
 			iRule.Retry = retry
 		}
@@ -147,7 +139,7 @@ func CompileHTTPRoute(
 						}
 					default:
 						msg := fmt.Sprintf("Unsupported redirect path modifier type: %s", r.Path.Type)
-						recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
+						routeErrors = append(routeErrors, recordRuleValidationError(&iRule, msg))
 					}
 				}
 				if iRule.Error == nil {
@@ -157,7 +149,7 @@ func CompileHTTPRoute(
 			case gatewayv1.HTTPRouteFilterURLRewrite:
 				iRw, err := compileURLRewriteFilter(filter.URLRewrite)
 				if err != nil {
-					recordRuleValidationError(&validationCondition, &iRule, err.Error(), route.Generation)
+					routeErrors = append(routeErrors, recordRuleValidationError(&iRule, err.Error()))
 				} else if iRule.Error == nil && iRw != nil {
 					iRule.Rewrite = iRw
 				}
@@ -173,7 +165,7 @@ func CompileHTTPRoute(
 
 			case gatewayv1.HTTPRouteFilterRequestMirror:
 				if filter.RequestMirror != nil {
-					mirror, filterErr, refErr := compileRequestMirrorFilter(
+					mirror, mirrorErrs := compileRequestMirrorFilter(
 						filter.RequestMirror,
 						"HTTPRoute",
 						route.Namespace,
@@ -182,12 +174,12 @@ func CompileHTTPRoute(
 						configMaps,
 						refValidator,
 					)
-					if filterErr != nil {
-						recordRuleValidationError(&validationCondition, &iRule, filterErr.Error(), route.Generation)
+					for _, err := range mirrorErrs {
+						if err.Type == string(gatewayv1.RouteConditionAccepted) {
+							recordRuleError(&iRule, err)
+						}
 					}
-					if refErr != nil {
-						refErrors = append(refErrors, refErr)
-					}
+					routeErrors = append(routeErrors, mirrorErrs...)
 					if mirror != nil {
 						iRule.Mirrors = append(iRule.Mirrors, *mirror)
 					}
@@ -195,7 +187,7 @@ func CompileHTTPRoute(
 
 			default:
 				msg := fmt.Sprintf("unsupported filter type: %s", filter.Type)
-				recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
+				routeErrors = append(routeErrors, recordRuleValidationError(&iRule, msg))
 			}
 		}
 
@@ -236,7 +228,7 @@ func CompileHTTPRoute(
 					re, err := regexp.Compile(header.Value)
 					if err != nil {
 						msg := fmt.Sprintf("invalid regular expression in header match: %v", err)
-						recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
+						routeErrors = append(routeErrors, recordRuleValidationError(&iRule, msg))
 					} else {
 						hm.MatchRegularExpressionValue = re
 					}
@@ -264,13 +256,13 @@ func CompileHTTPRoute(
 					re, err := regexp.Compile(qp.Value)
 					if err != nil {
 						msg := fmt.Sprintf("invalid regular expression in query param match: %v", err)
-						recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
+						routeErrors = append(routeErrors, recordRuleValidationError(&iRule, msg))
 					} else {
 						iqp.MatchRegularExpressionValue = re
 					}
 				} else if qpType != gatewayv1.QueryParamMatchExact {
 					msg := fmt.Sprintf("unsupported query param match type: %s", qpType)
-					recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
+					routeErrors = append(routeErrors, recordRuleValidationError(&iRule, msg))
 				}
 				iMatch.QueryParams = append(iMatch.QueryParams, iqp)
 			}
@@ -290,10 +282,8 @@ func CompileHTTPRoute(
 					refValidator,
 				)
 				if refErr != nil {
-					refErrors = append(refErrors, refErr)
-					if iRule.Error == nil {
-						iRule.Error = refErr.toErrorState()
-					}
+					routeErrors = append(routeErrors, refErr)
+					recordRuleError(&iRule, refErr)
 					break
 				}
 
@@ -322,7 +312,7 @@ func CompileHTTPRoute(
 				}
 
 				if backendFilterErr != nil {
-					recordRuleValidationError(&validationCondition, &iRule, backendFilterErr.Error(), route.Generation)
+					routeErrors = append(routeErrors, recordRuleValidationError(&iRule, backendFilterErr.Error()))
 					break
 				}
 
@@ -343,7 +333,7 @@ func CompileHTTPRoute(
 		compiledRules = append(compiledRules, iRule)
 	}
 
-	resolvedRefsCondition := buildResolvedRefsCondition(refErrors, route.Generation)
+	resolvedRefsCondition := buildResolvedRefsCondition(routeErrors, route.Generation)
 	applyNoPolicyTLSMessage(&resolvedRefsCondition, compiledRules)
 
 	return &InternalHTTPRoute{
@@ -351,7 +341,7 @@ func CompileHTTPRoute(
 		Rules:                 compiledRules,
 		Hostnames:             hostnames,
 		ParentRefs:            route.Spec.ParentRefs,
-		ValidationCondition:   validationCondition,
+		ValidationCondition:   buildCondition(routeErrors, string(gatewayv1.RouteConditionAccepted), string(gatewayv1.RouteReasonAccepted), "Route validation succeeded", route.Generation),
 		ResolvedRefsCondition: resolvedRefsCondition,
 	}
 }
@@ -661,15 +651,16 @@ func compileRequestMirrorFilter(
 	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
-) (*InternalMirror, error, *ConditionError) {
+) (*InternalMirror, []*ConditionError) {
 	numerator := int32(100)
 	denominator := int32(100)
 
+	var validationErr *ConditionError
 	if m.Percent != nil && m.Fraction != nil {
-		return nil, errors.New("cannot specify both percent and fraction for request mirror filter"), nil
+		validationErr = newValidationError("cannot specify both percent and fraction for request mirror filter")
 	} else if m.Percent != nil {
 		if *m.Percent < 0 || *m.Percent > 100 {
-			return nil, fmt.Errorf("invalid percent %d for request mirror filter: must be between 0 and 100", *m.Percent), nil
+			validationErr = newValidationError(fmt.Sprintf("invalid percent %d for request mirror filter: must be between 0 and 100", *m.Percent))
 		}
 		numerator = *m.Percent
 		denominator = 100
@@ -679,10 +670,13 @@ func compileRequestMirrorFilter(
 			denom = *m.Fraction.Denominator
 		}
 		if m.Fraction.Numerator < 0 || denom < 1 || m.Fraction.Numerator > denom {
-			return nil, fmt.Errorf("invalid fraction %d/%d for request mirror filter", m.Fraction.Numerator, denom), nil
+			validationErr = newValidationError(fmt.Sprintf("invalid fraction %d/%d for request mirror filter", m.Fraction.Numerator, denom))
 		}
 		numerator = m.Fraction.Numerator
 		denominator = denom
+	}
+	if validationErr != nil {
+		return nil, []*ConditionError{validationErr}
 	}
 
 	backend, refErr := resolveBackendTarget(
@@ -695,12 +689,12 @@ func compileRequestMirrorFilter(
 		refValidator,
 	)
 	if refErr != nil {
-		return nil, nil, refErr
+		return nil, []*ConditionError{refErr}
 	}
 
 	return &InternalMirror{
 		Backend:     *backend,
 		Numerator:   numerator,
 		Denominator: denominator,
-	}, nil, nil
+	}, nil
 }

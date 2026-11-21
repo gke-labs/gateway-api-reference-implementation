@@ -115,15 +115,7 @@ func CompileTLSRoute(
 		return nil
 	}
 
-	validationCondition := NewCondition(
-		string(gatewayv1.RouteConditionAccepted),
-		metav1.ConditionTrue,
-		string(gatewayv1.RouteReasonAccepted),
-		"Route validation succeeded",
-		route.Generation,
-	)
-
-	var refErrors []*ConditionError
+	var routeErrors []*ConditionError
 
 	var hostnames []string
 	for _, h := range route.Spec.Hostnames {
@@ -147,7 +139,7 @@ func CompileTLSRoute(
 				refValidator,
 			)
 			if resolutionErr != nil {
-				refErrors = append(refErrors, resolutionErr)
+				routeErrors = append(routeErrors, resolutionErr)
 				continue
 			}
 
@@ -176,8 +168,8 @@ func CompileTLSRoute(
 		Rules:                 compiledRules,
 		Hostnames:             hostnames,
 		ParentRefs:            route.Spec.ParentRefs,
-		ValidationCondition:   validationCondition,
-		ResolvedRefsCondition: buildResolvedRefsCondition(refErrors, route.Generation),
+		ValidationCondition:   buildCondition(routeErrors, string(gatewayv1.RouteConditionAccepted), string(gatewayv1.RouteReasonAccepted), "Route validation succeeded", route.Generation),
+		ResolvedRefsCondition: buildResolvedRefsCondition(routeErrors, route.Generation),
 	}
 }
 

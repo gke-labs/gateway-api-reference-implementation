@@ -104,15 +104,7 @@ func CompileGRPCRoute(
 		return nil
 	}
 
-	validationCondition := NewCondition(
-		string(gatewayv1.RouteConditionAccepted),
-		metav1.ConditionTrue,
-		string(gatewayv1.RouteReasonAccepted),
-		"Route validation succeeded",
-		route.Generation,
-	)
-
-	var refErrors []*ConditionError
+	var routeErrors []*ConditionError
 
 	var hostnames []string
 	for _, h := range route.Spec.Hostnames {
@@ -130,7 +122,7 @@ func CompileGRPCRoute(
 		if rule.Name != nil {
 			if seenRuleNames[*rule.Name] {
 				msg := fmt.Sprintf("duplicate rule name: %s", *rule.Name)
-				recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
+				routeErrors = append(routeErrors, recordRuleValidationError(&iRule, msg))
 			}
 			seenRuleNames[*rule.Name] = true
 		}
@@ -146,7 +138,7 @@ func CompileGRPCRoute(
 
 			case gatewayv1.GRPCRouteFilterRequestMirror:
 				if filter.RequestMirror != nil {
-					mirror, filterErr, refErr := compileRequestMirrorFilter(
+					mirror, mirrorErrs := compileRequestMirrorFilter(
 						filter.RequestMirror,
 						"GRPCRoute",
 						route.Namespace,
@@ -155,12 +147,12 @@ func CompileGRPCRoute(
 						configMaps,
 						refValidator,
 					)
-					if filterErr != nil {
-						recordRuleValidationError(&validationCondition, &iRule, filterErr.Error(), route.Generation)
+					for _, err := range mirrorErrs {
+						if err.Type == string(gatewayv1.RouteConditionAccepted) {
+							recordRuleError(&iRule, err)
+						}
 					}
-					if refErr != nil {
-						refErrors = append(refErrors, refErr)
-					}
+					routeErrors = append(routeErrors, mirrorErrs...)
 					if mirror != nil {
 						iRule.Mirrors = append(iRule.Mirrors, *mirror)
 					}
@@ -168,7 +160,7 @@ func CompileGRPCRoute(
 
 			default:
 				msg := fmt.Sprintf("unsupported filter type: %s", filter.Type)
-				recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
+				routeErrors = append(routeErrors, recordRuleValidationError(&iRule, msg))
 			}
 		}
 
@@ -212,7 +204,7 @@ func CompileGRPCRoute(
 					re, err := regexp.Compile(header.Value)
 					if err != nil {
 						msg := fmt.Sprintf("invalid regular expression in header match: %v", err)
-						recordRuleValidationError(&validationCondition, &iRule, msg, route.Generation)
+						routeErrors = append(routeErrors, recordRuleValidationError(&iRule, msg))
 					} else {
 						hm.MatchRegularExpressionValue = re
 					}
@@ -235,10 +227,8 @@ func CompileGRPCRoute(
 					refValidator,
 				)
 				if refErr != nil {
-					refErrors = append(refErrors, refErr)
-					if iRule.Error == nil {
-						iRule.Error = refErr.toErrorState()
-					}
+					routeErrors = append(routeErrors, refErr)
+					recordRuleError(&iRule, refErr)
 					break
 				}
 
@@ -261,7 +251,7 @@ func CompileGRPCRoute(
 				}
 
 				if backendFilterErr != nil {
-					recordRuleValidationError(&validationCondition, &iRule, backendFilterErr.Error(), route.Generation)
+					routeErrors = append(routeErrors, recordRuleValidationError(&iRule, backendFilterErr.Error()))
 					break
 				}
 
@@ -280,7 +270,7 @@ func CompileGRPCRoute(
 		compiledRules = append(compiledRules, iRule)
 	}
 
-	resolvedRefsCondition := buildResolvedRefsCondition(refErrors, route.Generation)
+	resolvedRefsCondition := buildResolvedRefsCondition(routeErrors, route.Generation)
 	applyNoPolicyTLSMessage(&resolvedRefsCondition, compiledRules)
 
 	return &InternalGRPCRoute{
@@ -288,7 +278,7 @@ func CompileGRPCRoute(
 		Rules:                 compiledRules,
 		Hostnames:             hostnames,
 		ParentRefs:            route.Spec.ParentRefs,
-		ValidationCondition:   validationCondition,
+		ValidationCondition:   buildCondition(routeErrors, string(gatewayv1.RouteConditionAccepted), string(gatewayv1.RouteReasonAccepted), "Route validation succeeded", route.Generation),
 		ResolvedRefsCondition: resolvedRefsCondition,
 	}
 }

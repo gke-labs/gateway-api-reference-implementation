@@ -48,24 +48,30 @@ func (e *ConditionError) toErrorState() *ErrorState {
 	}
 }
 
+// newValidationError builds a ConditionError for an unsupported or invalid route value.
+func newValidationError(msg string) *ConditionError {
+	return &ConditionError{
+		Type:    string(gatewayv1.RouteConditionAccepted),
+		Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+		Message: msg,
+	}
+}
+
+// buildCondition constructs a condition of the specified type from collected route errors.
+// If the error list contains no error of that type, it returns a True condition with trueReason and trueMessage.
+// Otherwise, it returns a False condition with the reason and message from the first error of that type.
+func buildCondition(errs []*ConditionError, condType, trueReason, trueMessage string, generation int64) metav1.Condition {
+	for _, err := range errs {
+		if err.Type == condType {
+			return NewCondition(condType, metav1.ConditionFalse, err.Reason, err.Message, generation)
+		}
+	}
+	return NewCondition(condType, metav1.ConditionTrue, trueReason, trueMessage, generation)
+}
+
 // buildResolvedRefsCondition constructs a RouteConditionResolvedRefs condition from collected errors.
 func buildResolvedRefsCondition(errs []*ConditionError, generation int64) metav1.Condition {
-	if len(errs) == 0 {
-		return NewCondition(
-			string(gatewayv1.RouteConditionResolvedRefs),
-			metav1.ConditionTrue,
-			string(gatewayv1.RouteReasonResolvedRefs),
-			"All references resolved",
-			generation,
-		)
-	}
-	return NewCondition(
-		string(gatewayv1.RouteConditionResolvedRefs),
-		metav1.ConditionFalse,
-		errs[0].Reason,
-		errs[0].Message,
-		generation,
-	)
+	return buildCondition(errs, string(gatewayv1.RouteConditionResolvedRefs), string(gatewayv1.RouteReasonResolvedRefs), "All references resolved", generation)
 }
 
 // NewCondition constructs a metav1.Condition with the current transition time.

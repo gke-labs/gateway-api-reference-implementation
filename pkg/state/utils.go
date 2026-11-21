@@ -17,7 +17,6 @@ package state
 import (
 	"encoding/pem"
 	"fmt"
-	"net/http"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -208,25 +207,19 @@ func noPolicyTLSBackendHosts(rules []InternalRule) []string {
 	return hosts
 }
 
-// recordRuleValidationError sets a RouteConditionAccepted=False condition with reason UnsupportedValue,
+// recordRuleError records an ErrorState on the rule from a ConditionError if not already present.
+func recordRuleError(rule *InternalRule, err *ConditionError) {
+	if rule != nil && rule.Error == nil && err != nil {
+		rule.Error = err.toErrorState()
+	}
+}
+
+// recordRuleValidationError creates a ConditionError for a rule validation failure
 // and records an ErrorState on the rule if not already present.
-func recordRuleValidationError(validationCond *metav1.Condition, rule *InternalRule, msg string, generation int64) {
-	errCond := NewCondition(
-		string(gatewayv1.RouteConditionAccepted),
-		metav1.ConditionFalse,
-		string(gatewayv1.RouteReasonUnsupportedValue),
-		msg,
-		generation,
-	)
-	if validationCond != nil && validationCond.Status == metav1.ConditionTrue {
-		*validationCond = errCond
-	}
-	if rule != nil && rule.Error == nil {
-		rule.Error = &ErrorState{
-			HTTPStatusCode: http.StatusInternalServerError,
-			HTTPMessage:    msg,
-		}
-	}
+func recordRuleValidationError(rule *InternalRule, msg string) *ConditionError {
+	err := newValidationError(msg)
+	recordRuleError(rule, err)
+	return err
 }
 
 // resolveBackendWeight returns the backend weight, defaulting to 1 if nil and clamping negative values to 0.
