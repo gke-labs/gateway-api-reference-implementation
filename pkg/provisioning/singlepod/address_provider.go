@@ -253,7 +253,12 @@ type AddressProvider struct {
 	acmeChallengeTokenPath        string
 	acmeChallengeAudience         string
 	acmeChallengeTokenExpiration  int64
-	controllerNamespace           string
+
+	// dataplaneConfigFromInternalAPI indicates whether data planes receive configuration directly from the controller's internal API.
+	dataplaneConfigFromInternalAPI bool
+
+	// controllerNamespace is the namespace where the controller runs, used to locate the trust bundle and address the internal API.
+	controllerNamespace string
 }
 
 // WithDataplaneConfigFromInternalAPI configures the AddressProvider to provide data planes
@@ -261,6 +266,7 @@ type AddressProvider struct {
 // controller's internal API instead of reading a Secret from the Kubernetes API.
 func WithDataplaneConfigFromInternalAPI(controllerNamespace string) Option {
 	return func(p *AddressProvider) {
+		p.dataplaneConfigFromInternalAPI = true
 		p.controllerNamespace = controllerNamespace
 	}
 }
@@ -508,7 +514,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 
 	// Reconcile per-Gateway trust bundle ConfigMap in Gateway namespace when internal API is enabled
-	if p.controllerNamespace != "" {
+	if p.dataplaneConfigFromInternalAPI {
 		var sourceConfigMap corev1.ConfigMap
 		if err := p.client.Get(ctx, types.NamespacedName{Namespace: p.controllerNamespace, Name: spiffe.BundleConfigMapName}, &sourceConfigMap); err != nil {
 			return nil, state.GatewayReadiness{}, fmt.Errorf("reading bundle configmap %s/%s: %w", p.controllerNamespace, spiffe.BundleConfigMapName, err)
@@ -605,7 +611,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			args = append(args, fmt.Sprintf("--acme-challenge-ca-bundle-path=%s", p.acmeChallengeCABundlePath))
 		}
 	}
-	if p.controllerNamespace != "" {
+	if p.dataplaneConfigFromInternalAPI {
 		host, err := spiffe.ServiceClusterDNSName(spiffe.ControllerServiceName, p.controllerNamespace)
 		if err != nil {
 			return nil, state.GatewayReadiness{}, fmt.Errorf("building internal API address: %w", err)
@@ -855,7 +861,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		)
 	}
 
-	if p.controllerNamespace != "" {
+	if p.dataplaneConfigFromInternalAPI {
 		volumeMounts = append(volumeMounts,
 			corev1ac.VolumeMount().
 				WithName(internalAPIBundleVolumeName).
@@ -1353,7 +1359,7 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 	}
 	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
 
-	if p.controllerNamespace != "" {
+	if p.dataplaneConfigFromInternalAPI {
 		bldr.Watches(&corev1.ConfigMap{}, ownerHandler, builder.WithPredicates(pred))
 		// This watch uses the manager's ConfigMap informer and the predicate limits it to the bundle.
 		bldr.Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
