@@ -66,3 +66,13 @@ func (s stringSliceValue) Set(val string) error {
 func StringSlice(slice *[]string) flag.Value {
 	return stringSliceValue{slice: slice}
 }
+
+// BindInternalAPIFlags registers the internal API server and client command-line flags on the given FlagSet.
+func BindInternalAPIFlags(fs *flag.FlagSet, opts *Options) {
+	fs.StringVar(&opts.InternalAPIAddress, "internal-api-address", opts.InternalAPIAddress, "Host and port of the controller's Service.")
+	fs.StringVar(&opts.InternalAPIBindAddress, "internal-api-bind-address", opts.InternalAPIBindAddress, "The address the internal API server binds to (disabled by default).")
+	fs.StringVar(&opts.InternalAPICAFile, "internal-api-ca-file", opts.InternalAPICAFile, "The trust bundle that verifies the controller's certificate.")
+	fs.StringVar(&opts.InternalAPITLSCertFile, "internal-api-tls-cert-file", opts.InternalAPITLSCertFile, "Path to TLS server certificate file for internal API endpoint. The listener stays off until a certificate that data planes can verify is provided, and how it is provided is not settled.")
+	fs.StringVar(&opts.InternalAPITLSKeyFile, "internal-api-tls-key-file", opts.InternalAPITLSKeyFile, "Path to TLS server private key file for internal API endpoint.")
+	fs.StringVar(&opts.InternalAPITokenFile, "internal-api-token-file", opts.InternalAPITokenFile, "A projected ServiceAccount token with the audience the server expects.")
+}
