@@ -128,7 +128,7 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 
 	// 2. Actual: run HostPortAddressProvider
 	actualClient := setupTestClient(t)
-	hostPortProvider, err := New(actualClient, actualClient)
+	hostPortProvider, err := New(actualClient, actualClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 	}
 
 	actualClient := setupTestClient(t)
-	hostPortProvider, err := New(actualClient, actualClient)
+	hostPortProvider, err := New(actualClient, actualClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 	}
 
 	actualClient := setupTestClient(t)
-	hostPortProvider, err := New(actualClient, actualClient)
+	hostPortProvider, err := New(actualClient, actualClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestHostPortAddressProvider_ListenerSetListener(t *testing.T) {
 	}
 
 	actualClient := setupTestClient(t)
-	hostPortProvider, err := New(actualClient, actualClient)
+	hostPortProvider, err := New(actualClient, actualClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -528,7 +528,7 @@ func TestHostPortAddressProvider_ConflictedListenerSkipped(t *testing.T) {
 	resourceName := state.ResourceNameForGateway(gateway.Name)
 
 	actualClient := setupTestClient(t)
-	hostPortProvider, err := New(actualClient, actualClient)
+	hostPortProvider, err := New(actualClient, actualClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -604,7 +604,7 @@ func TestHostPortAddressProvider_AddressRequestRejected(t *testing.T) {
 		WithObjects(gateway, gatewayClass, bundleCM).
 		Build()
 
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -672,7 +672,7 @@ func TestHostPortAddressProvider_AddressRequestRejected(t *testing.T) {
 
 func TestHostPortAddressProvider_GatewayAddresses(t *testing.T) {
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -704,7 +704,7 @@ func TestHostPortAddressProvider_GatewayAddresses(t *testing.T) {
 
 func TestHostPortAddressProvider_SetupWatches(t *testing.T) {
 	testClient := setupTestClient(t)
-	provider, err := New(nil, testClient)
+	provider, err := New(nil, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -717,7 +717,7 @@ func TestHostPortAddressProvider_SetupWatches(t *testing.T) {
 
 func TestHostPortAddressProvider_NewRequiresReader(t *testing.T) {
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, nil)
+	provider, err := New(testClient, nil, "default")
 	if err == nil {
 		t.Fatalf("expected error when reader is nil, got nil")
 	}
@@ -726,9 +726,20 @@ func TestHostPortAddressProvider_NewRequiresReader(t *testing.T) {
 	}
 }
 
+func TestHostPortAddressProvider_NewRequiresControllerNamespace(t *testing.T) {
+	testClient := setupTestClient(t)
+	provider, err := New(testClient, testClient, "")
+	if err == nil {
+		t.Fatalf("expected error when controllerNamespace is empty, got nil")
+	}
+	if provider != nil {
+		t.Fatalf("expected nil provider when controllerNamespace is empty, got %+v", provider)
+	}
+}
+
 func TestHostPortAddressProvider_SetState(t *testing.T) {
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -739,7 +750,7 @@ func TestHostPortAddressProvider_SetState(t *testing.T) {
 
 func TestHostPortAddressProvider_WrappedReadinessPropagated(t *testing.T) {
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -829,7 +840,7 @@ func setupHostPortsFixture(t *testing.T) (*hostPortsFixture, context.Context) {
 		},
 	}
 
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -1463,7 +1474,7 @@ func TestHostPortAddressProvider_GatewayReconciler_EndToEnd(t *testing.T) {
 		Build()
 
 	ctx := t.Context()
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -1614,7 +1625,7 @@ func TestHostPortAddressProvider_GatewayReconciler_EndToEnd(t *testing.T) {
 func TestHostPortAddressProvider_MultipleHTTPListeners_AddressNotUsable(t *testing.T) {
 	ctx := t.Context()
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -1667,7 +1678,7 @@ func TestHostPortAddressProvider_MultipleHTTPListeners_AddressNotUsable(t *testi
 func TestHostPortAddressProvider_MultipleHTTPSListeners_AddressNotUsable(t *testing.T) {
 	ctx := t.Context()
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -1720,7 +1731,7 @@ func TestHostPortAddressProvider_MultipleHTTPSListeners_AddressNotUsable(t *test
 func TestHostPortAddressProvider_HTTPSAndTLSListenersDifferentPorts_AddressNotUsable(t *testing.T) {
 	ctx := t.Context()
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -1773,7 +1784,7 @@ func TestHostPortAddressProvider_HTTPSAndTLSListenersDifferentPorts_AddressNotUs
 func TestHostPortAddressProvider_HTTPSAndTLSListenersSamePort_Provisioned(t *testing.T) {
 	ctx := t.Context()
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -1816,7 +1827,7 @@ func TestHostPortAddressProvider_HTTPSAndTLSListenersSamePort_Provisioned(t *tes
 func TestHostPortAddressProvider_OneHTTPOneHTTPSSeveralTCPUDP_Provisioned(t *testing.T) {
 	ctx := t.Context()
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -1881,7 +1892,7 @@ func TestHostPortAddressProvider_OneHTTPOneHTTPSSeveralTCPUDP_Provisioned(t *tes
 func TestHostPortAddressProvider_TwoHTTPListenersSamePortDifferentHostnames(t *testing.T) {
 	ctx := t.Context()
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -1933,7 +1944,7 @@ func TestHostPortAddressProvider_TwoHTTPListenersSamePortDifferentHostnames(t *t
 func TestHostPortAddressProvider_ConflictedListenerSkippedInPortCount(t *testing.T) {
 	ctx := t.Context()
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
@@ -1996,7 +2007,7 @@ func TestHostPortAddressProvider_ConflictedListenerSkippedInPortCount(t *testing
 func TestHostPortAddressProvider_ExistingDeploymentUnchangedWhenPortLimitExceeded(t *testing.T) {
 	ctx := t.Context()
 	testClient := setupTestClient(t)
-	provider, err := New(testClient, testClient)
+	provider, err := New(testClient, testClient, "default")
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
