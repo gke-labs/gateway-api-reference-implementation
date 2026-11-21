@@ -183,6 +183,61 @@ func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gate
 	return nil, state.GatewayReadiness{}, nil
 }
 
+func TestGatewayReconciler_DeletingGateway_Skipped(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("clientgoscheme.AddToScheme failed: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("gatewayv1.AddToScheme failed: %v", err)
+	}
+
+	st := state.NewState()
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: DefaultControllerName,
+		},
+	}
+	st.UpsertGatewayClass(gwClass)
+
+	now := metav1.Now()
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "deleting-gw",
+			Namespace:         "default",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"test.gateway.networking.k8s.io/dummy"},
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+		},
+	}
+	st.UpsertGateway(gw)
+
+	provider := &trackingAddressProvider{}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gwClass, gw).Build()
+	r := &GatewayReconciler{
+		Client:          cl,
+		Scheme:          scheme,
+		State:           st,
+		ControllerName:  DefaultControllerName,
+		AddressProvider: provider,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "deleting-gw"}}
+	res, err := r.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile returned error: %v", err)
+	}
+	if res.Requeue {
+		t.Errorf("expected no requeue")
+	}
+	if provider.called {
+		t.Errorf("expected AddressProvider not to be called for deleting Gateway")
+	}
+}
+
 func TestGatewayReconciler_SkipsOtherControllersGateways(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
