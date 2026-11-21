@@ -42,6 +42,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -363,11 +364,11 @@ func TestSetupController_CertserverIntegration(t *testing.T) {
 		t.Errorf("expected at least 2 calls to fake source server (pending then issued), got %d", fakeSrv.calls.Load())
 	}
 
-	// 7. Verify per-Gateway Secret was created with certificates
+	// 7. Verify no per-Gateway config Secret was created
 	secretName := state.ResourceNameForGateway(gwName)
 	var sec corev1.Secret
-	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: secretName}, &sec); err != nil {
-		t.Fatalf("reading Gateway dataplane secret %s: %v", secretName, err)
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: secretName}, &sec); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no Gateway dataplane secret %s, got: %v", secretName, err)
 	}
 
 	// 8. Verify no tokens or private keys are logged

@@ -291,6 +291,7 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 
 	opts.AddressProvider = singlepod.NewAddressProvider(
 		nil,
+		controllerNamespace,
 		singlepod.WithDataplaneImage(cfg.DataplaneImage),
 		singlepod.WithExtraReadinessGates(LoadBalancerReadyGate),
 		singlepod.WithPreStopCommand(preStopCmd...),
@@ -300,7 +301,6 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
 		singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
 		singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
-		singlepod.WithDataplaneConfigFromInternalAPI(controllerNamespace),
 	)
 
 	reconcilerCfg := controller.GatewayReconcilerConfig{

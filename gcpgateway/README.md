@@ -22,7 +22,6 @@
 | `gateway.networking.k8s.io` | `*/status` subresources | `update`, `patch` | Updating `Accepted`, `Programmed`, and address status on Gateways and Routes. |
 | `""` (core) | `services`, `serviceaccounts`, `secrets` | `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` | Singlepod provisioner manages per-Gateway ServiceAccount, headless/ClusterIP Service, and data-plane configuration Secrets. |
 | `apps` | `deployments` | `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` | Singlepod provisioner creates and manages the per-Gateway data-plane Deployment. |
-| `rbac.authorization.k8s.io` | `roles`, `rolebindings` | `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` | Scoping data-plane ServiceAccount read permissions to its own Gateway Secret. |
 | `""` (core) | `configmaps`, `namespaces` | `get`, `list`, `watch` | Resolving parameters ConfigMaps referenced by `spec.infrastructure.parametersRef`. |
 | `""` (core) | `nodes` | `get`, `list`, `watch` | Resolving node `spec.providerID` to GCE zone and instance name for NEG attachment. |
 | `discovery.k8s.io` | `endpointslices` | `get`, `list`, `watch` | Detecting live backend endpoints for Gateway routing. |

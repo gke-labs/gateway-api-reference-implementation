@@ -126,6 +126,7 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, cm, bundleCM).Build()
 	p := singlepod.NewAddressProvider(
 		c,
+		"default",
 		singlepod.WithState(st),
 		singlepod.WithEnableH2C(true),
 		singlepod.WithForwardedForMode("append"),
@@ -133,7 +134,6 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 		singlepod.WithACMEChallengeUpstreamURL("https://certserver.example.internal:8443"),
 		singlepod.WithACMEChallengeCABundlePath("/etc/ssl/certs/certserver-ca.crt"),
 		singlepod.WithACMEChallengeTokenPath("/var/run/secrets/tokens/certserver/token"),
-		singlepod.WithDataplaneConfigFromInternalAPI("default"),
 	)
 
 	_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
@@ -200,10 +200,9 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	}
 }
 
-func TestSetupController_DataplaneConfigFromInternalAPI(t *testing.T) {
+func TestSetupController_RequiresPodNamespace(t *testing.T) {
 	t.Setenv("POD_NAMESPACE", "")
-	args := []string{"--dataplane-config-from-internal-api"}
-	_, err := Setup(args)
+	_, err := Setup(nil)
 	if err == nil {
 		t.Fatalf("expected error when POD_NAMESPACE is empty, got nil")
 	}
@@ -233,7 +232,6 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "certserver-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify certserver TLS"},
 		{Name: "certserver-token-path", DefValue: "", Usage: "Path to the projected service-account token file for controller identity"},
 		{Name: "controller-name", DefValue: "github.com/gke-labs/gateway-api-reference-implementation", Usage: "The GatewayClass controller name."},
-		{Name: "dataplane-config-from-internal-api", DefValue: "false", Usage: "The provisioner gives each data plane the bundle, the token and the flags for the internal API."},
 		{Name: "dataplane-image", DefValue: "gari-controller:latest", Usage: "The container image to use for provisioned per-Gateway data-plane Deployments."},
 		{Name: "dataplane-mode", DefValue: "false", Usage: "Run in data-plane mode serving a single Gateway."},
 		{Name: "debug-error-responses", DefValue: "false", Usage: "Include detailed error messages in unmatched responses."},
@@ -288,6 +286,7 @@ func TestFlagsGolden(t *testing.T) {
 }
 
 func TestSetupController_CertserverRegistered(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "default")
 	t.Setenv("CERTSERVER_ADDRESS", "")
 	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
 	t.Setenv("CERTSERVER_TOKEN_PATH", "")
@@ -314,6 +313,7 @@ func TestSetupController_CertserverRegistered(t *testing.T) {
 }
 
 func TestSetupController_CertserverUnregistered(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "default")
 	t.Setenv("CERTSERVER_ADDRESS", "")
 	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
 	t.Setenv("CERTSERVER_TOKEN_PATH", "")
@@ -329,6 +329,7 @@ func TestSetupController_CertserverUnregistered(t *testing.T) {
 }
 
 func TestSetupController_CertserverValidationErrors(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "default")
 	t.Setenv("CERTSERVER_ADDRESS", "")
 	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
 	t.Setenv("CERTSERVER_TOKEN_PATH", "")
@@ -357,6 +358,7 @@ func TestSetupController_CertserverValidationErrors(t *testing.T) {
 }
 
 func TestSetup_ModeSelection(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "default")
 	// 1. Controller mode by default
 	optsCtrl, err := Setup([]string{})
 	if err != nil {

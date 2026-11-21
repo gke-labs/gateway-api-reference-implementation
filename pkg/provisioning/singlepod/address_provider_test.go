@@ -27,7 +27,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
@@ -128,6 +127,18 @@ func ssaNoOpInterceptor() interceptor.Funcs {
 	}
 }
 
+func testBundleConfigMap() *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      spiffe.BundleConfigMapName,
+		},
+		Data: map[string]string{
+			spiffe.BundleDataKey: "test-trust-bundle-pem",
+		},
+	}
+}
+
 func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -135,6 +146,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithObjects(testBundleConfigMap()).
 		WithReturnManagedFields().
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
@@ -194,7 +206,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 		},
 	}
 
-	p := NewAddressProvider(client, WithEnableH2C(true))
+	p := NewAddressProvider(client, "default", WithEnableH2C(true))
 
 	// 1. Initial reconcile creates SA, adds to CRB, creates Deployment and Service in my-ns, but no Ingress and replicas not ready yet
 	addrs, readiness, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
@@ -243,46 +255,29 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 		t.Errorf("expected custom-label on ServiceAccount, got %s", sa.Labels["custom-label"])
 	}
 
-	// Verify Role was created in my-ns
+	// Verify destination ConfigMap was created in my-ns with bundle data
+	var destCM corev1.ConfigMap
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &destCM); err != nil {
+		t.Fatalf("failed to get created ConfigMap: %v", err)
+	}
+	if destCM.Data[spiffe.BundleDataKey] != "test-trust-bundle-pem" {
+		t.Errorf("expected bundle data %q, got %q", "test-trust-bundle-pem", destCM.Data[spiffe.BundleDataKey])
+	}
+
+	// Verify no Role or RoleBinding was created in my-ns
 	var role rbacv1.Role
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &role); err != nil {
-		t.Fatalf("failed to get created Role: %v", err)
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &role); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected Role to not exist, got: %v", err)
 	}
-	if role.Labels["custom-label"] != "custom-val" {
-		t.Errorf("expected custom-label on Role, got %s", role.Labels["custom-label"])
-	}
-	if len(role.Rules) != 1 || role.Rules[0].Resources[0] != "secrets" || role.Rules[0].ResourceNames[0] != name {
-		t.Errorf("expected Role rule to permit secrets/%s, got %+v", name, role.Rules)
-	}
-
-	// Verify RoleBinding was created in my-ns
 	var rb rbacv1.RoleBinding
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &rb); err != nil {
-		t.Fatalf("failed to get created RoleBinding: %v", err)
-	}
-	if rb.RoleRef.Name != name {
-		t.Errorf("expected RoleBinding roleRef %s, got %s", name, rb.RoleRef.Name)
-	}
-	if len(rb.Subjects) != 1 || rb.Subjects[0].Name != name || rb.Subjects[0].Namespace != "my-ns" {
-		t.Errorf("expected RoleBinding subject to be SA %s in my-ns, got %+v", name, rb.Subjects)
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &rb); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected RoleBinding to not exist, got: %v", err)
 	}
 
-	// Verify Secret is NOT created by GatewayAddresses (placeholder secrets are not created;
-	// config secret is created only when real config is published).
+	// Verify no Secret was created in my-ns
 	var sec corev1.Secret
 	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &sec); !apierrors.IsNotFound(err) {
-		t.Fatalf("expected Secret to not exist before publish, got: %v", err)
-	}
-
-	// Publish DataplaneConfig -> Secret is created
-	dpCfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: "my-ns", Name: "my-gw"},
-	}
-	if err := p.PublishDataplaneConfig(ctx, gw, dpCfg); err != nil {
-		t.Fatalf("failed to publish config: %v", err)
-	}
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &sec); err != nil {
-		t.Fatalf("failed to get created Secret: %v", err)
+		t.Fatalf("expected Secret to not exist, got: %v", err)
 	}
 
 	// Verify Deployment was created in my-ns
@@ -341,16 +336,17 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	// 4. (Namespaced resources have controller ownerReferences verified in step 1 and are deleted by k8s garbage collector)
 }
 
-func TestSinglePodAddressProvider_NamespacedRolesAndSecrets(t *testing.T) {
+func TestSinglePodAddressProvider_NamespacedConfigMaps(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithObjects(testBundleConfigMap()).
 		Build()
 
-	p := NewAddressProvider(client)
+	p := NewAddressProvider(client, "default")
 	ctx := t.Context()
 
 	gw1 := &gatewayv1.Gateway{
@@ -378,54 +374,46 @@ func TestSinglePodAddressProvider_NamespacedRolesAndSecrets(t *testing.T) {
 	resName1 := state.ResourceNameForGateway("gw-1")
 	resName2 := state.ResourceNameForGateway("gw-2")
 
-	// Verify ns-1 has Role, RoleBinding
+	// Verify ns-1 has ConfigMap with bundle, but no Role, RoleBinding, or Secret
+	var cm1 corev1.ConfigMap
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &cm1); err != nil {
+		t.Fatalf("failed to get ConfigMap for gw-1: %v", err)
+	}
+	if cm1.Data[spiffe.BundleDataKey] != "test-trust-bundle-pem" {
+		t.Errorf("unexpected bundle data in ns-1: %q", cm1.Data[spiffe.BundleDataKey])
+	}
 	var role1 rbacv1.Role
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &role1); err != nil {
-		t.Fatalf("failed to get Role for gw-1: %v", err)
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &role1); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected Role for gw-1 to not exist, got: %v", err)
 	}
 	var rb1 rbacv1.RoleBinding
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &rb1); err != nil {
-		t.Fatalf("failed to get RoleBinding for gw-1: %v", err)
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &rb1); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected RoleBinding for gw-1 to not exist, got: %v", err)
 	}
 	var sec1 corev1.Secret
 	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &sec1); !apierrors.IsNotFound(err) {
-		t.Fatalf("expected Secret for gw-1 to not exist before publish, got: %v", err)
+		t.Fatalf("expected Secret for gw-1 to not exist, got: %v", err)
 	}
 
-	// Verify ns-2 has Role, RoleBinding
+	// Verify ns-2 has ConfigMap with bundle, but no Role, RoleBinding, or Secret
+	var cm2 corev1.ConfigMap
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: resName2}, &cm2); err != nil {
+		t.Fatalf("failed to get ConfigMap for gw-2: %v", err)
+	}
+	if cm2.Data[spiffe.BundleDataKey] != "test-trust-bundle-pem" {
+		t.Errorf("unexpected bundle data in ns-2: %q", cm2.Data[spiffe.BundleDataKey])
+	}
 	var role2 rbacv1.Role
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: resName2}, &role2); err != nil {
-		t.Fatalf("failed to get Role for gw-2: %v", err)
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: resName2}, &role2); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected Role for gw-2 to not exist, got: %v", err)
 	}
 	var rb2 rbacv1.RoleBinding
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: resName2}, &rb2); err != nil {
-		t.Fatalf("failed to get RoleBinding for gw-2: %v", err)
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: resName2}, &rb2); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected RoleBinding for gw-2 to not exist, got: %v", err)
 	}
 	var sec2 corev1.Secret
 	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: resName2}, &sec2); !apierrors.IsNotFound(err) {
-		t.Fatalf("expected Secret for gw-2 to not exist before publish, got: %v", err)
-	}
-
-	// Publish DataplaneConfig for gw1
-	dpCfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: "ns-1", Name: "gw-1"},
-		Routes: []state.InternalRoute{
-			{Hostnames: []state.RouteHostname{state.NewRouteHostname("test.com", "test.com")}},
-		},
-	}
-	if err := p.PublishDataplaneConfig(ctx, gw1, dpCfg); err != nil {
-		t.Fatalf("PublishDataplaneConfig failed: %v", err)
-	}
-
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &sec1); err != nil {
-		t.Fatalf("failed to get updated Secret for gw-1: %v", err)
-	}
-	unmarshaled, err := state.UnmarshalDataplaneConfig(sec1.Data[DataplaneSecretDataKey])
-	if err != nil {
-		t.Fatalf("failed to unmarshal published config: %v", err)
-	}
-	if len(unmarshaled.Routes) != 1 || unmarshaled.Routes[0].Hostnames[0].Hostname != "test.com" {
-		t.Errorf("unexpected published config: %+v", unmarshaled)
+		t.Fatalf("expected Secret for gw-2 to not exist, got: %v", err)
 	}
 }
 
@@ -552,8 +540,8 @@ func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
 			},
 		},
 		{
-			name: "role with managed labels and ownerRef with different UID",
-			object: &rbacv1.Role{
+			name: "configmap with managed labels but no ownerRef",
+			object: &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      resName,
 					Namespace: "default",
@@ -561,27 +549,12 @@ func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
 						LabelGatewayName: "conflict-gw",
 						LabelManagedBy:   ManagedByValue,
 					},
-					OwnerReferences: []metav1.OwnerReference{diffOwnerRef},
 				},
 			},
 		},
 		{
-			name: "rolebinding with managed labels and ownerRef with different UID",
-			object: &rbacv1.RoleBinding{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      resName,
-					Namespace: "default",
-					Labels: map[string]string{
-						LabelGatewayName: "conflict-gw",
-						LabelManagedBy:   ManagedByValue,
-					},
-					OwnerReferences: []metav1.OwnerReference{diffOwnerRef},
-				},
-			},
-		},
-		{
-			name: "secret with managed labels and ownerRef with different UID",
-			object: &corev1.Secret{
+			name: "configmap with managed labels and ownerRef with different UID",
+			object: &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      resName,
 					Namespace: "default",
@@ -599,10 +572,10 @@ func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(tc.object).
+				WithObjects(tc.object, testBundleConfigMap()).
 				Build()
 
-			p := NewAddressProvider(cl)
+			p := NewAddressProvider(cl, "default")
 			ctx := t.Context()
 
 			_, _, err := p.GatewayAddresses(ctx, gw, nil)
@@ -615,287 +588,6 @@ func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = gatewayv1.AddToScheme(scheme)
-
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-gw",
-			Namespace: "default",
-			UID:       types.UID("gw-uid-123"),
-		},
-		Spec: gatewayv1.GatewaySpec{
-			GatewayClassName: "my-class",
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-			},
-		},
-	}
-	resName := state.ResourceNameForGateway("my-gw")
-
-	trueVal := true
-	diffOwnerRef := metav1.OwnerReference{
-		APIVersion: gatewayv1.GroupVersion.String(),
-		Kind:       "Gateway",
-		Name:       "my-gw",
-		UID:        types.UID("different-uid-456"),
-		Controller: &trueVal,
-	}
-
-	existingSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            resName,
-			Namespace:       "default",
-			OwnerReferences: []metav1.OwnerReference{diffOwnerRef},
-		},
-		Data: map[string][]byte{
-			"custom-key": []byte("original-payload"),
-		},
-	}
-
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(existingSecret).
-		Build()
-
-	p := NewAddressProvider(cl)
-	ctx := t.Context()
-
-	dpCfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: "default", Name: "my-gw"},
-	}
-
-	// 1. Direct call to PublishDataplaneConfig returns OwnershipConflictError
-	err := p.PublishDataplaneConfig(ctx, gw, dpCfg)
-	if err == nil {
-		t.Fatalf("expected OwnershipConflictError, got nil")
-	}
-	var conflictErr *controller.OwnershipConflictError
-	if !errors.As(err, &conflictErr) {
-		t.Fatalf("expected OwnershipConflictError, got: %v", err)
-	}
-	expectedMsg := fmt.Sprintf("conflict: existing Secret default/%s is not owned by Gateway my-gw", resName)
-	if conflictErr.Error() != expectedMsg {
-		t.Errorf("expected error message %q, got %q", expectedMsg, conflictErr.Error())
-	}
-
-	// 2. Secret data and ownerReferences are unchanged
-	var fetchedSec corev1.Secret
-	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &fetchedSec); err != nil {
-		t.Fatalf("failed to fetch secret: %v", err)
-	}
-	if string(fetchedSec.Data["custom-key"]) != "original-payload" {
-		t.Errorf("expected secret data to remain unchanged, got %+v", fetchedSec.Data)
-	}
-	if _, ok := fetchedSec.Data[DataplaneSecretDataKey]; ok {
-		t.Errorf("dataplane config key should NOT be present on conflicted secret")
-	}
-	if len(fetchedSec.OwnerReferences) != 1 || fetchedSec.OwnerReferences[0].UID != "different-uid-456" {
-		t.Errorf("expected ownerReferences to remain unchanged, got %+v", fetchedSec.OwnerReferences)
-	}
-
-	// 3. Gateway reports Programmed=False with the conflict message when state runs and publishes
-	st := state.NewState()
-	st.SetControllerName("test-controller")
-	st.SetDataplanePublisher(p)
-
-	stCtx, stCancel := context.WithCancel(ctx)
-	defer stCancel()
-	go func() {
-		_ = st.Start(stCtx)
-	}()
-
-	gc := &gatewayv1.GatewayClass{
-		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
-		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
-	}
-	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
-	st.UpsertGatewayClass(gc)
-	st.UpsertGateway(gw)
-	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-
-	var progCond *metav1.Condition
-	pollDeadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(pollDeadline) {
-		status, ok := st.GetDesiredGatewayStatus(gwKey)
-		if ok {
-			for i := range status.Conditions {
-				if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
-					progCond = &status.Conditions[i]
-					break
-				}
-			}
-			if progCond != nil && progCond.Status == metav1.ConditionFalse && strings.Contains(progCond.Message, conflictErr.Error()) {
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonPending) {
-		t.Fatalf("expected Programmed=False/Pending on conflict, got %+v", progCond)
-	}
-	if !strings.Contains(progCond.Message, conflictErr.Error()) {
-		t.Errorf("expected conflict message in condition, got %s", progCond.Message)
-	}
-
-	// 4. Resolve conflict by deleting conflicting secret -> publish succeeds and restores Programmed=True
-	if err := cl.Delete(ctx, &fetchedSec); err != nil {
-		t.Fatalf("failed to delete conflicting secret: %v", err)
-	}
-
-	progCond = nil
-	pollDeadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(pollDeadline) {
-		status, ok := st.GetDesiredGatewayStatus(gwKey)
-		if ok {
-			for i := range status.Conditions {
-				if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
-					progCond = &status.Conditions[i]
-					break
-				}
-			}
-			if progCond != nil && progCond.Status == metav1.ConditionTrue && progCond.Reason == string(gatewayv1.GatewayReasonProgrammed) {
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Fatalf("expected Programmed=True when conflict resolved, got %+v", progCond)
-	}
-}
-
-func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnedAndNew(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = gatewayv1.AddToScheme(scheme)
-
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-gw",
-			Namespace: "default",
-			UID:       types.UID("gw-uid-current"),
-		},
-		Spec: gatewayv1.GatewaySpec{
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-			},
-		},
-	}
-	resName := state.ResourceNameForGateway("test-gw")
-	dpCfg := &state.DataplaneConfig{
-		GatewayName: types.NamespacedName{Namespace: "default", Name: "test-gw"},
-	}
-
-	t.Run("no existing secret -> created with controller ownerRef", func(t *testing.T) {
-		cl := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithReturnManagedFields().
-			WithInterceptorFuncs(ssaNoOpInterceptor()).
-			Build()
-		p := NewAddressProvider(cl)
-		ctx := t.Context()
-
-		if err := p.PublishDataplaneConfig(ctx, gw, dpCfg); err != nil {
-			t.Fatalf("PublishDataplaneConfig failed: %v", err)
-		}
-
-		var sec corev1.Secret
-		if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &sec); err != nil {
-			t.Fatalf("failed to get created Secret: %v", err)
-		}
-		if _, ok := sec.Data[DataplaneSecretDataKey]; !ok {
-			t.Fatalf("expected DataplaneSecretDataKey in secret data")
-		}
-		ref := metav1.GetControllerOf(&sec)
-		if ref == nil {
-			t.Fatalf("expected controller ownerRef on created secret")
-		}
-		if ref.Kind != "Gateway" || ref.Name != "test-gw" || ref.UID != "gw-uid-current" {
-			t.Errorf("unexpected ownerRef: %+v", ref)
-		}
-	})
-
-	t.Run("secret owned by this Gateway -> applied and updated", func(t *testing.T) {
-		trueVal := true
-		existingSecret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      resName,
-				Namespace: "default",
-				OwnerReferences: []metav1.OwnerReference{
-					{
-						APIVersion: gatewayv1.GroupVersion.String(),
-						Kind:       "Gateway",
-						Name:       "test-gw",
-						UID:        types.UID("gw-uid-current"),
-						Controller: &trueVal,
-					},
-				},
-			},
-			Data: map[string][]byte{
-				DataplaneSecretDataKey: []byte(`{"old":"data"}`),
-			},
-		}
-
-		cl := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(existingSecret).
-			WithReturnManagedFields().
-			WithInterceptorFuncs(ssaNoOpInterceptor()).
-			Build()
-		p := NewAddressProvider(cl)
-		ctx := t.Context()
-
-		if err := p.PublishDataplaneConfig(ctx, gw, dpCfg); err != nil {
-			t.Fatalf("PublishDataplaneConfig failed: %v", err)
-		}
-
-		var sec corev1.Secret
-		if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &sec); err != nil {
-			t.Fatalf("failed to get updated Secret: %v", err)
-		}
-		if string(sec.Data[DataplaneSecretDataKey]) == `{"old":"data"}` {
-			t.Errorf("expected Secret data to be updated from old value")
-		}
-		ref := metav1.GetControllerOf(&sec)
-		if ref == nil || ref.UID != "gw-uid-current" {
-			t.Errorf("expected controller ownerRef with matching UID, got: %+v", ref)
-		}
-	})
-
-	t.Run("secret with no ownerRef -> conflict error", func(t *testing.T) {
-		unownedSecret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      resName,
-				Namespace: "default",
-			},
-			Data: map[string][]byte{
-				"foo": []byte("bar"),
-			},
-		}
-
-		cl := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(unownedSecret).
-			Build()
-		p := NewAddressProvider(cl)
-		ctx := t.Context()
-
-		err := p.PublishDataplaneConfig(ctx, gw, dpCfg)
-		if err == nil {
-			t.Fatalf("expected OwnershipConflictError, got nil")
-		}
-		var conflictErr *controller.OwnershipConflictError
-		if !errors.As(err, &conflictErr) {
-			t.Fatalf("expected OwnershipConflictError, got: %v", err)
-		}
-	})
 }
 
 func TestSinglePodAddressProvider_Watches(t *testing.T) {
@@ -1051,14 +743,17 @@ func TestSinglePodAddressProvider_Watches(t *testing.T) {
 	}
 }
 
-func setupTestClient(t *testing.T) client.Client {
+func setupTestClient(t *testing.T, extraObjs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)
 
+	objs := append([]client.Object{testBundleConfigMap()}, extraObjs...)
+
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithObjects(objs...).
 		WithReturnManagedFields().
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
@@ -1067,7 +762,7 @@ func setupTestClient(t *testing.T) client.Client {
 func TestSinglePodAddressProvider_InfrastructureLabelsAndAnnotationsLandOnAllFour(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1147,7 +842,7 @@ func TestSinglePodAddressProvider_InfrastructureLabelsAndAnnotationsLandOnAllFou
 func TestSinglePodAddressProvider_InfrastructureValueUpdate(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1234,7 +929,7 @@ func TestSinglePodAddressProvider_InfrastructureValueUpdate(t *testing.T) {
 func TestSinglePodAddressProvider_InfrastructureKeyRemoval(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1347,7 +1042,7 @@ func TestSinglePodAddressProvider_InfrastructureKeyRemoval(t *testing.T) {
 func TestSinglePodAddressProvider_InfrastructureUserKeysCannotOverrideReservedLabelsOrSelectors(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1442,7 +1137,7 @@ func TestSinglePodAddressProvider_InfrastructureUserKeysCannotOverrideReservedLa
 func TestSinglePodAddressProvider_PreservesForeignLabelsAndAnnotations(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1597,7 +1292,7 @@ func TestSinglePodAddressProvider_PreservesForeignLabelsAndAnnotations(t *testin
 func TestSinglePodAddressProvider_NoChangesIssuesNoWrite(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1705,7 +1400,7 @@ func TestSinglePodAddressProvider_NoChangesIssuesNoWrite(t *testing.T) {
 func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1803,7 +1498,7 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw1 := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1877,7 +1572,7 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 func TestSinglePodAddressProvider_MultipleRequestedIPs(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1926,7 +1621,7 @@ func TestSinglePodAddressProvider_MultipleRequestedIPs(t *testing.T) {
 
 func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testing.T) {
 	c := setupTestClient(t)
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 	ctx := t.Context()
 
 	gw := &gatewayv1.Gateway{
@@ -2111,7 +1806,7 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 
 func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testing.T) {
 	c := setupTestClient(t)
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 	ctx := t.Context()
 
 	gw := &gatewayv1.Gateway{
@@ -2278,7 +1973,7 @@ func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testin
 func TestSinglePodAddressProvider_ForwardedForModeArg(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithForwardedForMode("replace"))
+	p := NewAddressProvider(c, "default", WithForwardedForMode("replace"))
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2351,14 +2046,14 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gc, gw).
+		WithObjects(gc, gw, testBundleConfigMap()).
 		WithStatusSubresource(gw).
 		WithReturnManagedFields().
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
 
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 	st.SetSupportedAddressTypes(p.SupportedAddressTypes())
 
 	r := &controller.GatewayReconciler{
@@ -2638,7 +2333,7 @@ func TestSinglePodAddressProvider_ParametersRef_MergeOrder(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gcCM, gwCM, gc, gw).
+		WithObjects(gcCM, gwCM, gc, gw, testBundleConfigMap()).
 		WithReturnManagedFields().
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
@@ -2651,7 +2346,7 @@ func TestSinglePodAddressProvider_ParametersRef_MergeOrder(t *testing.T) {
 	st.UpsertConfigMap(gwCM)
 	st.Recompute()
 
-	p := NewAddressProvider(c, WithState(st))
+	p := NewAddressProvider(c, "default", WithState(st))
 	_, _, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2732,7 +2427,7 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		_ = gatewayv1.AddToScheme(scheme)
 		c := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(gwCM, gw).
+			WithObjects(gwCM, gw, testBundleConfigMap()).
 			WithReturnManagedFields().
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
@@ -2747,7 +2442,7 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		st.UpsertConfigMap(gwCM)
 		st.Recompute()
 
-		p := NewAddressProvider(c, WithState(st))
+		p := NewAddressProvider(c, "default", WithState(st))
 		_, _, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -2801,7 +2496,7 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		_ = gatewayv1.AddToScheme(scheme)
 		c := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(gwCM, gw).
+			WithObjects(gwCM, gw, testBundleConfigMap()).
 			WithReturnManagedFields().
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
@@ -2816,7 +2511,7 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		st.UpsertConfigMap(gwCM)
 		st.Recompute()
 
-		p := NewAddressProvider(c, WithState(st))
+		p := NewAddressProvider(c, "default", WithState(st))
 		_, _, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -2894,7 +2589,7 @@ func TestSinglePodAddressProvider_ParametersRef_InvalidValues(t *testing.T) {
 
 			c := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(cm, gw).
+				WithObjects(cm, gw, testBundleConfigMap()).
 				WithReturnManagedFields().
 				WithInterceptorFuncs(ssaNoOpInterceptor()).
 				Build()
@@ -2909,7 +2604,7 @@ func TestSinglePodAddressProvider_ParametersRef_InvalidValues(t *testing.T) {
 			st.UpsertConfigMap(cm)
 			st.Recompute()
 
-			p := NewAddressProvider(c, WithState(st))
+			p := NewAddressProvider(c, "default", WithState(st))
 			addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 			if err != nil {
 				t.Fatalf("expected nil error (reported via readiness), got: %v", err)
@@ -2979,7 +2674,7 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		st.UpsertGateway(gw)
 		st.Recompute()
 
-		p := NewAddressProvider(c, WithState(st))
+		p := NewAddressProvider(c, "default", WithState(st))
 		_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("expected nil error, got: %v", err)
@@ -3034,7 +2729,7 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		st.UpsertGateway(gw)
 		st.Recompute()
 
-		p := NewAddressProvider(c, WithState(st))
+		p := NewAddressProvider(c, "default", WithState(st))
 		_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("expected nil error, got: %v", err)
@@ -3106,7 +2801,7 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		st.UpsertGateway(gw)
 		st.Recompute()
 
-		p := NewAddressProvider(c, WithState(st))
+		p := NewAddressProvider(c, "default", WithState(st))
 		_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("expected nil error, got: %v", err)
@@ -3169,7 +2864,7 @@ func TestSinglePodAddressProvider_ParametersRef_NotComputedYet(t *testing.T) {
 	st.SetControllerName("test-controller")
 	// State has not computed outputs for gw yet
 
-	p := NewAddressProvider(c, WithState(st))
+	p := NewAddressProvider(c, "default", WithState(st))
 	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
@@ -3230,7 +2925,7 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 
 		c := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(cm, gw).
+			WithObjects(cm, gw, testBundleConfigMap()).
 			WithReturnManagedFields().
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
@@ -3245,7 +2940,7 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		st.UpsertConfigMap(cm)
 		st.Recompute()
 
-		p := NewAddressProvider(c, WithState(st))
+		p := NewAddressProvider(c, "default", WithState(st))
 		addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -3299,7 +2994,7 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 
 		c := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithObjects(cm, gw).
+			WithObjects(cm, gw, testBundleConfigMap()).
 			WithReturnManagedFields().
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
@@ -3314,7 +3009,7 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		st.UpsertConfigMap(cm)
 		st.Recompute()
 
-		p := NewAddressProvider(c, WithState(st))
+		p := NewAddressProvider(c, "default", WithState(st))
 
 		// 1. Initial reconcile: Deployment has 0 available replicas -> addresses withheld
 		addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
@@ -3413,13 +3108,13 @@ func TestSinglePodAddressProvider_LiveSwitch_LoadBalancer_To_ClusterIP(t *testin
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gc, cm, gw).
+		WithObjects(gc, cm, gw, testBundleConfigMap()).
 		WithStatusSubresource(gw).
 		WithReturnManagedFields().
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
 
-	p := NewAddressProvider(c, WithState(st))
+	p := NewAddressProvider(c, "default", WithState(st))
 	st.SetSupportedAddressTypes(p.SupportedAddressTypes())
 
 	r := &controller.GatewayReconciler{
@@ -3500,7 +3195,7 @@ func TestSinglePodAddressProvider_LiveSwitch_LoadBalancer_To_ClusterIP(t *testin
 func TestSinglePodAddressProvider_UpgradeUpdatesServiceAndDeploymentInPlace(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3693,13 +3388,14 @@ func TestAddressProvider_GcpGatewayHooks(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gw).
+		WithObjects(gw, testBundleConfigMap()).
 		WithReturnManagedFields().
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
 
 	p := NewAddressProvider(
 		c,
+		"default",
 		WithExtraReadinessGates("gcpgateway.gke-labs.io/load-balancer-ready"),
 		WithPreStopCommand("/gcpgateway", "hook", "pre-stop", "--drain-seconds=35"),
 		WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{volApply}, []*corev1ac.VolumeMountApplyConfiguration{mountApply}),
@@ -3795,8 +3491,8 @@ func TestAddressProvider_DebugErrorResponses(t *testing.T) {
 
 	// 1. WithDebugErrorResponses(true) adds --debug-error-responses to container args
 	{
-		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).Build()
-		p := NewAddressProvider(client, WithDebugErrorResponses(true))
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, testBundleConfigMap()).Build()
+		p := NewAddressProvider(client, "default", WithDebugErrorResponses(true))
 		_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -3815,8 +3511,8 @@ func TestAddressProvider_DebugErrorResponses(t *testing.T) {
 
 	// 2. Default (WithDebugErrorResponses not set or false) does NOT add --debug-error-responses
 	{
-		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).Build()
-		p := NewAddressProvider(client)
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, testBundleConfigMap()).Build()
+		p := NewAddressProvider(client, "default")
 		_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -3885,7 +3581,7 @@ func TestSinglePodAddressProvider_ACMEChallengeForwarding(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gw, cm).
+		WithObjects(gw, cm, testBundleConfigMap()).
 		WithReturnManagedFields().
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
@@ -3894,6 +3590,7 @@ func TestSinglePodAddressProvider_ACMEChallengeForwarding(t *testing.T) {
 	caBundlePath := "/etc/ssl/certs/certserver-ca.crt"
 	p := NewAddressProvider(
 		c,
+		"default",
 		WithState(st),
 		WithACMEChallengeUpstreamURL(upstreamURL),
 		WithACMEChallengeCABundlePath(caBundlePath),
@@ -4038,7 +3735,7 @@ func TestSinglePodAddressProvider_ACMEChallengeForwarding(t *testing.T) {
 	st.UpsertConfigMap(cm)
 	st.Recompute()
 
-	pNoURL := NewAddressProvider(c, WithState(st))
+	pNoURL := NewAddressProvider(c, "default", WithState(st))
 	_, _, err = pNoURL.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error in phase 4: %v", err)
@@ -4110,7 +3807,7 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gw, cm).
+		WithObjects(gw, cm, testBundleConfigMap()).
 		WithReturnManagedFields().
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
@@ -4121,6 +3818,7 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 
 	p := NewAddressProvider(
 		c,
+		"default",
 		WithState(st),
 		WithEnableH2C(true),
 		WithForwardedForMode("append"),
@@ -4160,6 +3858,9 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 			challengeUpstreamURL     string
 			challengeCABundlePath    string
 			challengeTokenPath       string
+			internalAPIAddress       string
+			internalAPICAFile        string
+			internalAPITokenFile     string
 		)
 		fs.BoolVar(&dataplaneMode, "dataplane-mode", false, "")
 		fs.StringVar(&gatewayNamespace, "gateway-namespace", "", "")
@@ -4171,6 +3872,9 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 		fs.StringVar(&challengeUpstreamURL, "acme-challenge-upstream-url", "", "")
 		fs.StringVar(&challengeCABundlePath, "acme-challenge-ca-bundle-path", "", "")
 		fs.StringVar(&challengeTokenPath, "acme-challenge-token-path", "", "")
+		fs.StringVar(&internalAPIAddress, "internal-api-address", "", "")
+		fs.StringVar(&internalAPICAFile, "internal-api-ca-file", "", "")
+		fs.StringVar(&internalAPITokenFile, "internal-api-token-file", "", "")
 
 		if err := fs.Parse(generatedArgs); err != nil {
 			t.Fatalf("main FlagSet failed to parse provisioner args %v: %v", generatedArgs, err)
@@ -4186,6 +3890,9 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 		}
 		if challengeTokenPath != tokenPath {
 			t.Errorf("challengeTokenPath = %q, want %q", challengeTokenPath, tokenPath)
+		}
+		if internalAPIAddress == "" || internalAPICAFile == "" || internalAPITokenFile == "" {
+			t.Errorf("expected internal-api flags to be populated")
 		}
 	})
 
@@ -4203,6 +3910,9 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 			challengeUpstreamURL     string
 			challengeCABundlePath    string
 			challengeTokenPath       string
+			internalAPIAddress       string
+			internalAPICAFile        string
+			internalAPITokenFile     string
 		)
 		fs.BoolVar(&dataplaneMode, "dataplane-mode", false, "")
 		fs.StringVar(&gatewayNamespace, "gateway-namespace", "", "")
@@ -4214,6 +3924,9 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 		fs.StringVar(&challengeUpstreamURL, "acme-challenge-upstream-url", "", "")
 		fs.StringVar(&challengeCABundlePath, "acme-challenge-ca-bundle-path", "", "")
 		fs.StringVar(&challengeTokenPath, "acme-challenge-token-path", "", "")
+		fs.StringVar(&internalAPIAddress, "internal-api-address", "", "")
+		fs.StringVar(&internalAPICAFile, "internal-api-ca-file", "", "")
+		fs.StringVar(&internalAPITokenFile, "internal-api-token-file", "", "")
 
 		if err := fs.Parse(generatedArgs); err != nil {
 			t.Fatalf("gcpgateway FlagSet failed to parse provisioner args %v: %v", generatedArgs, err)
@@ -4226,6 +3939,9 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 		}
 		if challengeTokenPath != tokenPath {
 			t.Errorf("challengeTokenPath = %q, want %q", challengeTokenPath, tokenPath)
+		}
+		if internalAPIAddress == "" || internalAPICAFile == "" || internalAPITokenFile == "" {
+			t.Errorf("expected internal-api flags to be populated")
 		}
 	})
 }
@@ -4270,10 +3986,10 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gw).
+		WithObjects(gw, testBundleConfigMap()).
 		Build()
 
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, "default")
 
 	effectiveListeners := []*state.EffectiveListener{
 		{
@@ -4313,20 +4029,21 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 		t.Errorf("ServiceAccount LabelGatewayName = %q, want %q", sa.Labels[LabelGatewayName], expectedLabelGwName)
 	}
 
-	// 3. Verify Role and RoleBinding exist
+	// 3. Verify ConfigMap exists and no Role or RoleBinding exists
+	var cm corev1.ConfigMap
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &cm); err != nil {
+		t.Fatalf("failed to get ConfigMap %s: %v", expectedName, err)
+	}
+	if cm.Data[spiffe.BundleDataKey] != "test-trust-bundle-pem" {
+		t.Errorf("expected bundle data in ConfigMap %s", expectedName)
+	}
 	var role rbacv1.Role
-	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &role); err != nil {
-		t.Fatalf("failed to get Role %s: %v", expectedName, err)
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &role); !apierrors.IsNotFound(err) {
+		t.Errorf("expected Role to not exist, got: %v", err)
 	}
 	var rb rbacv1.RoleBinding
-	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &rb); err != nil {
-		t.Fatalf("failed to get RoleBinding %s: %v", expectedName, err)
-	}
-	if rb.RoleRef.Name != expectedName {
-		t.Errorf("RoleBinding roleRef.name = %q, want %q", rb.RoleRef.Name, expectedName)
-	}
-	if len(rb.Subjects) == 0 || rb.Subjects[0].Name != expectedName {
-		t.Errorf("RoleBinding subject name = %v, want %q", rb.Subjects, expectedName)
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: expectedName}, &rb); !apierrors.IsNotFound(err) {
+		t.Errorf("expected RoleBinding to not exist, got: %v", err)
 	}
 
 	// 4. Verify Deployment exists
@@ -4357,7 +4074,7 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 	dpCfg := &state.DataplaneConfig{
 		GatewayName: types.NamespacedName{Namespace: gwNamespace, Name: gwName},
 	}
-	if err := p.PublishDataplaneConfig(t.Context(), gw, dpCfg); err != nil {
+	if err := PublishDataplaneConfig(t.Context(), c, gwNamespace, expectedName, gw, dpCfg); err != nil {
 		t.Fatalf("PublishDataplaneConfig failed for max length gateway: %v", err)
 	}
 
@@ -4469,8 +4186,8 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 			Listeners:        []gatewayv1.Listener{{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType}},
 		},
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).Build()
-	p := NewAddressProvider(c)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, testBundleConfigMap()).Build()
+	p := NewAddressProvider(c, "default")
 	listeners := []*state.EffectiveListener{{Port: 80, Protocol: gatewayv1.HTTPProtocolType}}
 	if _, _, err := p.GatewayAddresses(t.Context(), gw, listeners); err != nil {
 		t.Fatalf("GatewayAddresses failed: %v", err)
@@ -4682,35 +4399,10 @@ func TestPublishDataplaneConfig(t *testing.T) {
 	})
 }
 
-func TestAddressProvider_WaitApplied(t *testing.T) {
-	p := &AddressProvider{}
-	ctx := t.Context()
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "my-gw",
-		},
-	}
-
-	res, err := p.WaitApplied(ctx, gw, "rev-1")
-	if err != nil {
-		t.Fatalf("expected nil error from WaitApplied, got: %v", err)
-	}
-	if res.Applied != 0 {
-		t.Errorf("expected Applied=0, got %d", res.Applied)
-	}
-	if len(res.Rejections) != 0 {
-		t.Errorf("expected 0 rejections, got %d", len(res.Rejections))
-	}
-	if res.NotAnswered != 0 {
-		t.Errorf("expected NotAnswered=0, got %d", res.NotAnswered)
-	}
-}
-
 func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithHostPorts())
+	p := NewAddressProvider(c, "default", WithHostPorts())
 
 	if supported := p.SupportedAddressTypes(); supported != nil {
 		t.Fatalf("expected SupportedAddressTypes() to be nil with host ports, got %+v", supported)
@@ -4832,7 +4524,7 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 	}
 
 	// 2. Switching from Service mode to host-port mode deletes existing owned Service
-	pDefault := NewAddressProvider(c)
+	pDefault := NewAddressProvider(c, "default")
 	_, _, err = pDefault.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error creating Service with default provider: %v", err)
@@ -4868,7 +4560,7 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 func TestSinglePodAddressProvider_HostPorts_MultipleHTTPListenersConflict(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithHostPorts())
+	p := NewAddressProvider(c, "default", WithHostPorts())
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -4913,7 +4605,7 @@ func TestSinglePodAddressProvider_HostPorts_MultipleHTTPListenersConflict(t *tes
 func TestSinglePodAddressProvider_HostPorts_MultipleHTTPSListenersConflict(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithHostPorts())
+	p := NewAddressProvider(c, "default", WithHostPorts())
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -4951,7 +4643,7 @@ func TestSinglePodAddressProvider_HostPorts_MultipleHTTPSListenersConflict(t *te
 func TestSinglePodAddressProvider_HostPorts_ReservedPortsSkipped(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithHostPorts())
+	p := NewAddressProvider(c, "default", WithHostPorts())
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -4993,7 +4685,7 @@ func TestSinglePodAddressProvider_HostPorts_ReservedPortsSkipped(t *testing.T) {
 func TestSinglePodAddressProvider_WithNoService(t *testing.T) {
 	c := setupTestClient(t)
 	ctx := t.Context()
-	p := NewAddressProvider(c, WithNoService())
+	p := NewAddressProvider(c, "default", WithNoService())
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5127,7 +4819,7 @@ func TestSinglePodAddressProvider_WithDeploymentMutator(t *testing.T) {
 		return nil
 	}
 
-	p := NewAddressProvider(c, WithDeploymentMutator(mutator))
+	p := NewAddressProvider(c, "default", WithDeploymentMutator(mutator))
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5212,7 +4904,7 @@ func TestSinglePodAddressProvider_WithDeploymentMutator_Error(t *testing.T) {
 		return expectedErr
 	}
 
-	p := NewAddressProvider(c, WithDeploymentMutator(mutator))
+	p := NewAddressProvider(c, "default", WithDeploymentMutator(mutator))
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5286,7 +4978,7 @@ func TestSinglePodAddressProvider_DataplaneConfigFromInternalAPI(t *testing.T) {
 					t.Errorf("expected destination bundle ConfigMap to be owned by Gateway %v, got %v", gw.UID, destinationConfigMap.OwnerReferences)
 				}
 
-				// 2. Role and RoleBinding are skipped
+				// 2. Role and RoleBinding are skipped, and no Secret is created
 				var role rbacv1.Role
 				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &role); !apierrors.IsNotFound(err) {
 					t.Errorf("expected Role to not exist when internal API is enabled, got err: %v", err)
@@ -5294,6 +4986,10 @@ func TestSinglePodAddressProvider_DataplaneConfigFromInternalAPI(t *testing.T) {
 				var roleBinding rbacv1.RoleBinding
 				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &roleBinding); !apierrors.IsNotFound(err) {
 					t.Errorf("expected RoleBinding to not exist when internal API is enabled, got err: %v", err)
+				}
+				var sec corev1.Secret
+				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &sec); !apierrors.IsNotFound(err) {
+					t.Errorf("expected Secret to not exist when internal API is enabled, got err: %v", err)
 				}
 
 				// 3. Deployment has internal API flags, bundle volume, and projected token volume
@@ -5355,29 +5051,6 @@ func TestSinglePodAddressProvider_DataplaneConfigFromInternalAPI(t *testing.T) {
 				}
 				if !hasTokenVol {
 					t.Errorf("expected internal-api-token projected volume with audience %q", push.DefaultAudience)
-				}
-			},
-		},
-		{
-			name:                "disabled_by_default_creates_roles_and_omits_bundle",
-			controllerNamespace: "",
-			verify: func(t *testing.T, c client.Client, p *AddressProvider, gw *gatewayv1.Gateway, resName string) {
-				ctx := t.Context()
-
-				// Role and RoleBinding exist
-				var role rbacv1.Role
-				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &role); err != nil {
-					t.Errorf("expected Role to exist when option is off, got err: %v", err)
-				}
-				var roleBinding rbacv1.RoleBinding
-				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &roleBinding); err != nil {
-					t.Errorf("expected RoleBinding to exist when option is off, got err: %v", err)
-				}
-
-				// No bundle ConfigMap
-				var destinationConfigMap corev1.ConfigMap
-				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &destinationConfigMap); !apierrors.IsNotFound(err) {
-					t.Errorf("expected bundle ConfigMap to not exist when option is off, got err: %v", err)
 				}
 			},
 		},
@@ -5448,12 +5121,7 @@ func TestSinglePodAddressProvider_DataplaneConfigFromInternalAPI(t *testing.T) {
 
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 
-			var opts []Option
-			if tc.controllerNamespace != "" {
-				opts = append(opts, WithDataplaneConfigFromInternalAPI(tc.controllerNamespace))
-			}
-
-			p := NewAddressProvider(c, opts...)
+			p := NewAddressProvider(c, tc.controllerNamespace)
 
 			_, _, err := p.GatewayAddresses(ctx, gw, nil)
 			if tc.wantErrSubstring != "" {

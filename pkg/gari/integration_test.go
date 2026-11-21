@@ -23,6 +23,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -33,6 +34,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 )
@@ -59,8 +61,22 @@ func TestGARI_Integration_SinglePodProvisioning(t *testing.T) {
 	opts.ProxyAddr = ""
 	opts.ProxyHTTPSAddr = ""
 	opts.LeaderElection = false
+	bundleCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      spiffe.BundleConfigMapName,
+		},
+		Data: map[string]string{
+			spiffe.BundleDataKey: "test-trust-bundle",
+		},
+	}
+	if err := env.Client.Create(ctx, bundleCM); err != nil {
+		t.Fatalf("failed to create bundle ConfigMap: %v", err)
+	}
+
 	opts.AddressProvider = singlepod.NewAddressProvider(
 		nil,
+		"default",
 		singlepod.WithDataplaneImage(dataplaneImage),
 		singlepod.WithEnableH2C(true),
 		singlepod.WithForwardedForMode(string(proxy.ForwardedForModeReplace)),
@@ -141,24 +157,24 @@ func TestGARI_Integration_SinglePodProvisioning(t *testing.T) {
 		t.Fatalf("failed to create Gateway: %v", err)
 	}
 
-	// 4. Poll until singlepod Deployment, Service, and Secret are created
+	// 4. Poll until singlepod Deployment, Service, and ConfigMap are created
 	resName := state.ResourceNameForGateway(gwName)
 	resKey := types.NamespacedName{Namespace: gwNamespace, Name: resName}
 
 	var deploy appsv1.Deployment
 	var svc corev1.Service
-	var secret corev1.Secret
+	var destCM corev1.ConfigMap
 
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		errDep := env.Client.Get(ctx, resKey, &deploy)
 		errSvc := env.Client.Get(ctx, resKey, &svc)
-		errSec := env.Client.Get(ctx, resKey, &secret)
-		if errDep == nil && errSvc == nil && errSec == nil {
+		errCM := env.Client.Get(ctx, resKey, &destCM)
+		if errDep == nil && errSvc == nil && errCM == nil {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for singlepod resources (dep: %v, svc: %v, sec: %v)", errDep, errSvc, errSec)
+			t.Fatalf("timed out waiting for singlepod resources (dep: %v, svc: %v, cm: %v)", errDep, errSvc, errCM)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -222,17 +238,14 @@ func TestGARI_Integration_SinglePodProvisioning(t *testing.T) {
 		t.Errorf("expected Service selector %s=%q, got %q", state.LabelAppName, state.AppNameValue, svc.Spec.Selector[state.LabelAppName])
 	}
 
-	// 7. Assert Secret
-	secData, ok := secret.Data[singlepod.DataplaneSecretDataKey]
-	if !ok || len(secData) == 0 {
-		t.Fatalf("expected non-empty key %q in Secret data", singlepod.DataplaneSecretDataKey)
+	// 7. Assert destination ConfigMap and no Secret
+	if destCM.Data[spiffe.BundleDataKey] != "test-trust-bundle" {
+		t.Errorf("unexpected bundle data in ConfigMap: %q", destCM.Data[spiffe.BundleDataKey])
 	}
-	dpCfg, err := state.UnmarshalDataplaneConfig(secData)
-	if err != nil {
-		t.Fatalf("failed to unmarshal published DataplaneConfig: %v", err)
-	}
-	if dpCfg.GatewayName.Namespace != gwNamespace || dpCfg.GatewayName.Name != gwName {
-		t.Errorf("unexpected GatewayName in published config: %+v", dpCfg.GatewayName)
+
+	var sec corev1.Secret
+	if err := env.Client.Get(ctx, resKey, &sec); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Secret for Gateway, got %v", err)
 	}
 
 	// 8. Test BuildPodFromDeployment helper

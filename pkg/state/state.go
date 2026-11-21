@@ -679,10 +679,6 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		return err
 	}
 
-	if len(data) > 1024*1024 {
-		klog.Errorf("dataplane config size for %s (%d bytes) exceeds 1MiB secret limit", gwKey, len(data))
-	}
-
 	if bytes.Equal(data, cachedData) {
 		return nil
 	}

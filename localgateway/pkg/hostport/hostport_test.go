@@ -38,6 +38,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
 
@@ -47,8 +48,19 @@ func setupTestClient(t *testing.T) client.Client {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)
 
+	bundleCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      spiffe.BundleConfigMapName,
+		},
+		Data: map[string]string{
+			spiffe.BundleDataKey: "test-trust-bundle",
+		},
+	}
+
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithObjects(bundleCM).
 		WithReturnManagedFields().
 		Build()
 }
@@ -103,7 +115,7 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 
 	// 1. Expected: run existing singlepod provider with WithHostPorts()
 	expectedClient := setupTestClient(t)
-	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
+	singlePodHP := singlepod.NewAddressProvider(expectedClient, "default", singlepod.WithHostPorts())
 	expectedAddresses, expectedReadiness, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
@@ -210,7 +222,7 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 	resourceName := state.ResourceNameForGateway(gateway.Name)
 
 	expectedClient := setupTestClient(t)
-	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
+	singlePodHP := singlepod.NewAddressProvider(expectedClient, "default", singlepod.WithHostPorts())
 	_, _, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
@@ -280,7 +292,7 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 	resourceName := state.ResourceNameForGateway(gateway.Name)
 
 	expectedClient := setupTestClient(t)
-	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
+	singlePodHP := singlepod.NewAddressProvider(expectedClient, "default", singlepod.WithHostPorts())
 	_, _, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
@@ -430,7 +442,7 @@ func TestHostPortAddressProvider_ListenerSetListener(t *testing.T) {
 	resourceName := state.ResourceNameForGateway(gateway.Name)
 
 	expectedClient := setupTestClient(t)
-	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
+	singlePodHP := singlepod.NewAddressProvider(expectedClient, "default", singlepod.WithHostPorts())
 	_, _, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
 		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
@@ -576,10 +588,20 @@ func TestHostPortAddressProvider_AddressRequestRejected(t *testing.T) {
 		},
 	}
 
+	bundleCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      spiffe.BundleConfigMapName,
+		},
+		Data: map[string]string{
+			spiffe.BundleDataKey: "test-trust-bundle",
+		},
+	}
+
 	testClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&gatewayv1.Gateway{}).
-		WithObjects(gateway, gatewayClass).
+		WithObjects(gateway, gatewayClass, bundleCM).
 		Build()
 
 	provider, err := New(testClient, testClient)
@@ -1423,9 +1445,19 @@ func TestHostPortAddressProvider_GatewayReconciler_EndToEnd(t *testing.T) {
 	stateStore.UpsertGateway(gateway)
 	stateStore.Recompute()
 
+	bundleCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      spiffe.BundleConfigMapName,
+		},
+		Data: map[string]string{
+			spiffe.BundleDataKey: "test-trust-bundle",
+		},
+	}
+
 	testClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gatewayClass, gateway, node1, node2).
+		WithObjects(gatewayClass, gateway, node1, node2, bundleCM).
 		WithStatusSubresource(gateway).
 		WithReturnManagedFields().
 		Build()

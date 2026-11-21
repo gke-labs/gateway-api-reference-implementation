@@ -15,15 +15,11 @@ rules:
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["tlsroutes", "grpcroutes", "tcproutes", "udproutes"]
   verbs: ["get", "list", "watch"]
-# Write access on secrets, roles, and rolebindings is required to provision per-Gateway data-plane RBAC and config Secrets.
 - apiGroups: [""]
   resources: ["services", "serviceaccounts", "secrets"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["rbac.authorization.k8s.io"]
-  resources: ["roles", "rolebindings"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
   resources: ["namespaces", "endpoints"]
@@ -208,7 +204,6 @@ spec:
         - --internal-api-bind-address=:8443
         - --internal-api-tls-cert-file=/etc/gari/svid/svid.pem
         - --internal-api-tls-key-file=/etc/gari/svid/svid_key.pem
-        - --dataplane-config-from-internal-api
         ports:
         - name: metrics
           containerPort: 8999

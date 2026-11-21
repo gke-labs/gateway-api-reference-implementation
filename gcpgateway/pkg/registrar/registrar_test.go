@@ -25,6 +25,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	compute "google.golang.org/api/compute/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -84,6 +85,17 @@ func makeTestNode(name, zone, instance string) *corev1.Node {
 }
 
 func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nodeName, ip string, containersReady, overallReady bool, isTerminating bool) *corev1.Pod {
+	bundleCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      spiffe.BundleConfigMapName,
+		},
+		Data: map[string]string{
+			spiffe.BundleDataKey: "test-trust-bundle",
+		},
+	}
+	_ = c.Create(t.Context(), bundleCM)
+
 	drainVol := corev1ac.Volume().
 		WithName("drain-volume").
 		WithEmptyDir(corev1ac.EmptyDirVolumeSource().WithMedium(corev1.StorageMediumMemory))
@@ -94,6 +106,7 @@ func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nod
 
 	p := singlepod.NewAddressProvider(
 		c,
+		"default",
 		singlepod.WithExtraReadinessGates(LoadBalancerReadyGate),
 		singlepod.WithPreStopCommand(preStopCmd...),
 		singlepod.WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{drainVol}, []*corev1ac.VolumeMountApplyConfiguration{drainMount}),

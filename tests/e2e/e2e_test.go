@@ -270,9 +270,11 @@ spec:
 	if strings.TrimSpace(cmOut) != secondResName {
 		t.Errorf("Expected ConfigMap %s to exist, got: %s", secondResName, cmOut)
 	}
-	secOut := h.RunCmd("kubectl", "get", "secret", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
-	if strings.TrimSpace(secOut) != secondResName {
-		t.Errorf("Expected Secret %s to exist, got: %s", secondResName, secOut)
+
+	// Verify no Secret was created for second-gateway
+	secOut := runCmdAllowError(h, "kubectl", "get", "secret", secondResName, "--namespace=default")
+	if !strings.Contains(secOut, "NotFound") && !strings.Contains(secOut, "not found") {
+		t.Errorf("Expected Secret %s to not exist, got: %s", secondResName, secOut)
 	}
 
 	// Verify no Role or RoleBinding was created for second-gateway
@@ -301,13 +303,12 @@ spec:
 		t.Errorf("Expected GatewayClass SupportedVersion reason=SupportedVersion, got: %s", gcSupportedReason)
 	}
 
-	// Delete second-gateway and verify Service, Deployment, ServiceAccount, ConfigMap, and Secret are cleaned up
+	// Delete second-gateway and verify Service, Deployment, ServiceAccount, and ConfigMap are cleaned up
 	h.RunCmd("kubectl", "delete", "gateway", "second-gateway", "--namespace=default")
 	h.WaitForResourceDeletion("svc", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("serviceaccount", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("configmap", secondResName, "default", 30*time.Second)
-	h.WaitForResourceDeletion("secret", secondResName, "default", 30*time.Second)
 
 	// 10. Verify Live Switch between LoadBalancer and ClusterIP via parametersRef ConfigMap
 	liveSwitchCM := `
@@ -426,8 +427,8 @@ spec:
 	h.WaitForResourceDeletion("svc", liveResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", liveResName, "default", 30*time.Second)
 
-	// 11. Test --dataplane-config-from-internal-api
-	t.Log("Testing --dataplane-config-from-internal-api flag on controller")
+	// 11. Test internal API data-plane config delivery
+	t.Log("Testing internal API data-plane config delivery")
 
 	// Read existing bundle ConfigMap data so we can verify the copied ConfigMap
 	bundleCMJSON := h.RunCmd("kubectl", "get", "configmap", spiffe.BundleConfigMapName, "--namespace=default", "-o", "json")
@@ -484,6 +485,10 @@ spec:
 	noRoleBindingOut := runCmdAllowError(h, "kubectl", "get", "rolebinding", internalAPIResName, "--namespace=default")
 	if !strings.Contains(noRoleBindingOut, "NotFound") && !strings.Contains(noRoleBindingOut, "not found") {
 		t.Errorf("Expected RoleBinding %s to not exist, got: %s", internalAPIResName, noRoleBindingOut)
+	}
+	noSecretOut := runCmdAllowError(h, "kubectl", "get", "secret", internalAPIResName, "--namespace=default")
+	if !strings.Contains(noSecretOut, "NotFound") && !strings.Contains(noSecretOut, "not found") {
+		t.Errorf("Expected Secret %s to not exist, got: %s", internalAPIResName, noSecretOut)
 	}
 
 	// Update the source bundle ConfigMap and verify the copy updates

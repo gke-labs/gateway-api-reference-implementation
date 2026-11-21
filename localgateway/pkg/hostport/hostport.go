@@ -71,7 +71,7 @@ func New(client client.Client, reader client.Reader, options ...singlepod.Option
 	)
 	return &HostPortAddressProvider{
 		reader:  reader,
-		wrapped: singlepod.NewAddressProvider(client, wrappedOptions...),
+		wrapped: singlepod.NewAddressProvider(client, "default", wrappedOptions...),
 	}, nil
 }
 

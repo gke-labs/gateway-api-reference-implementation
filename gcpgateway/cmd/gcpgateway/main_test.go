@@ -182,7 +182,8 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	}
 
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
-	p := singlepod.NewAddressProvider(c)
+	createBundleConfigMap(t, c)
+	p := singlepod.NewAddressProvider(c, "default")
 
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -310,8 +311,10 @@ func TestSetupDataplane_ProvisionerArgs_ACMEChallenge(t *testing.T) {
 	st.Recompute()
 
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, cm).Build()
+	createBundleConfigMap(t, c)
 	p := singlepod.NewAddressProvider(
 		c,
+		"default",
 		singlepod.WithState(st),
 		singlepod.WithACMEChallengeUpstreamURL("https://certserver.gcp.internal:8443"),
 		singlepod.WithACMEChallengeCABundlePath("/etc/ssl/certs/certserver-ca.crt"),
@@ -685,6 +688,10 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 	var roleBinding rbacv1.RoleBinding
 	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &roleBinding); !apierrors.IsNotFound(err) {
 		t.Errorf("expected no RoleBinding for data plane, got: %v (roleBinding=%+v)", err, roleBinding)
+	}
+	var sec corev1.Secret
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &sec); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Secret for data plane, got: %v", err)
 	}
 
 	// 3. Create real data-plane Pod matching the Deployment template via testenv.BuildPodFromDeployment
@@ -1435,5 +1442,9 @@ func TestSetupController_DataplaneConfigFromInternalAPI(t *testing.T) {
 	var roleBinding rbacv1.RoleBinding
 	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &roleBinding); !apierrors.IsNotFound(err) {
 		t.Errorf("expected no RoleBinding for data plane, got: %v", err)
+	}
+	var sec corev1.Secret
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &sec); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Secret for data plane, got: %v", err)
 	}
 }

@@ -2183,8 +2183,11 @@ func TestDataplane_RoutesAndCertificates(t *testing.T) {
 		t.Fatalf("ComputeRevision failed: %v", err)
 	}
 
-	publisher := singlepod.NewAddressProvider(env.Client)
-	if err := publisher.PublishDataplaneConfig(ctx, gw, dpConfig); err != nil {
+	publishConfig := func(gw *gatewayv1.Gateway, cfg *state.DataplaneConfig) error {
+		name := state.ResourceNameForGateway(gw.Name)
+		return singlepod.PublishDataplaneConfig(ctx, env.Client, gw.Namespace, name, gw, cfg)
+	}
+	if err := publishConfig(gw, dpConfig); err != nil {
 		t.Fatalf("PublishDataplaneConfig failed: %v", err)
 	}
 
@@ -2310,7 +2313,7 @@ func TestDataplane_RoutesAndCertificates(t *testing.T) {
 		t.Fatalf("ComputeRevision 2 failed: %v", err)
 	}
 
-	if err := publisher.PublishDataplaneConfig(ctx, gw, dpConfig2); err != nil {
+	if err := publishConfig(gw, dpConfig2); err != nil {
 		t.Fatalf("PublishDataplaneConfig 2 failed: %v", err)
 	}
 

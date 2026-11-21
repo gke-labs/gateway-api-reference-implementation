@@ -26,7 +26,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -35,12 +34,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	authenticationv1 "k8s.io/api/authentication/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	authenticationv1client "k8s.io/client-go/kubernetes/typed/authentication/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -1312,77 +1308,6 @@ func TestStreamConfig_ClosedStreamWhileMessagesArriveCleansUp(t *testing.T) {
 	}
 	if err := stream2.CloseSend(); err != nil {
 		t.Fatalf("stream2.CloseSend error: %v", err)
-	}
-}
-
-func TestStreamConfig_SecretPathUnchanged(t *testing.T) {
-	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
-	secretName := state.ResourceNameForGateway(gatewayKey.Name)
-
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("corev1.AddToScheme failed: %v", err)
-	}
-	if err := gatewayv1.AddToScheme(scheme); err != nil {
-		t.Fatalf("gatewayv1.AddToScheme failed: %v", err)
-	}
-
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	addrProvider := singlepod.NewAddressProvider(fakeClient)
-
-	reviewer := &staticTokenReviewer{
-		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
-			if token == "valid-token" {
-				return gatewayKey.Namespace, expectedServiceAccount, nil
-			}
-			return "", "", errors.New("unauthorized")
-		},
-	}
-
-	pushServer, err := push.NewServer(push.ServerOptions{
-		TokenReviewer: reviewer,
-	})
-	if err != nil {
-		t.Fatalf("NewServer failed: %v", err)
-	}
-
-	multiPub := state.NewMultiDataplanePublisher(addrProvider, pushServer)
-	stateEngine := setupTestState(t, multiPub)
-	addTestGateway(stateEngine, gatewayKey, 80)
-
-	client := startInProcessServer(t, pushServer)
-	stream, reader := openTestStream(t, client, gatewayKey, "valid-token", "")
-
-	// 1. Verify push stream receives the config
-	pushedConfig, err := reader.recv(2 * time.Second)
-	if err != nil {
-		t.Fatalf("failed to receive config on push stream: %v", err)
-	}
-
-	// 2. Verify Secret is published in the fake client
-	var secret corev1.Secret
-	pollUntil(t, 2*time.Second, func() bool {
-		err := fakeClient.Get(t.Context(), types.NamespacedName{Namespace: gatewayKey.Namespace, Name: secretName}, &secret)
-		return err == nil && len(secret.Data[singlepod.DataplaneSecretDataKey]) > 0
-	})
-
-	secretData := secret.Data[singlepod.DataplaneSecretDataKey]
-	secretConfig, err := state.UnmarshalDataplaneConfig(secretData)
-	if err != nil {
-		t.Fatalf("failed to unmarshal secret config: %v", err)
-	}
-
-	// 3. Secret config and push stream config must carry identical revision and gateway name
-	if secretConfig.Revision != pushedConfig.Revision {
-		t.Fatalf("revision mismatch: Secret has %s, push stream has %s", secretConfig.Revision, pushedConfig.Revision)
-	}
-	if secretConfig.GatewayName != gatewayKey {
-		t.Fatalf("expected gateway name %v in Secret, got %v", gatewayKey, secretConfig.GatewayName)
-	}
-
-	if err := stream.CloseSend(); err != nil {
-		t.Fatalf("stream.CloseSend error: %v", err)
 	}
 }
 
