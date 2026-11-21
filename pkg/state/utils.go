@@ -209,15 +209,15 @@ func noPolicyTLSBackendHosts(rules []InternalRule) []string {
 
 // recordRuleError records an ErrorState on the rule from a ConditionError if not already present.
 func recordRuleError(rule *InternalRule, err *ConditionError) {
-	if rule != nil && rule.Error == nil && err != nil {
+	if rule.Error == nil {
 		rule.Error = err.toErrorState()
 	}
 }
 
 // recordRuleValidationError creates a ConditionError for a rule validation failure
 // and records an ErrorState on the rule if not already present.
-func recordRuleValidationError(rule *InternalRule, msg string) *ConditionError {
-	err := newValidationError(msg)
+func recordRuleValidationError(rule *InternalRule, message string) *ConditionError {
+	err := newValidationError(message)
 	recordRuleError(rule, err)
 	return err
 }

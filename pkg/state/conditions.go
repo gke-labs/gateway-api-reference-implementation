@@ -49,29 +49,46 @@ func (e *ConditionError) toErrorState() *ErrorState {
 }
 
 // newValidationError builds a ConditionError for an unsupported or invalid route value.
-func newValidationError(msg string) *ConditionError {
+func newValidationError(message string) *ConditionError {
 	return &ConditionError{
 		Type:    string(gatewayv1.RouteConditionAccepted),
 		Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
-		Message: msg,
+		Message: message,
 	}
 }
 
 // buildCondition constructs a condition of the specified type from collected route errors.
 // If the error list contains no error of that type, it returns a True condition with trueReason and trueMessage.
 // Otherwise, it returns a False condition with the reason and message from the first error of that type.
-func buildCondition(errs []*ConditionError, condType, trueReason, trueMessage string, generation int64) metav1.Condition {
+func buildCondition(errs []*ConditionError, conditionType, trueReason, trueMessage string, generation int64) metav1.Condition {
 	for _, err := range errs {
-		if err.Type == condType {
-			return NewCondition(condType, metav1.ConditionFalse, err.Reason, err.Message, generation)
+		if err.Type == conditionType {
+			return NewCondition(conditionType, metav1.ConditionFalse, err.Reason, err.Message, generation)
 		}
 	}
-	return NewCondition(condType, metav1.ConditionTrue, trueReason, trueMessage, generation)
+	return NewCondition(conditionType, metav1.ConditionTrue, trueReason, trueMessage, generation)
+}
+
+// buildAcceptedCondition constructs a RouteConditionAccepted condition from collected errors.
+func buildAcceptedCondition(errs []*ConditionError, generation int64) metav1.Condition {
+	return buildCondition(
+		errs,
+		string(gatewayv1.RouteConditionAccepted),
+		string(gatewayv1.RouteReasonAccepted),
+		"Route validation succeeded",
+		generation,
+	)
 }
 
 // buildResolvedRefsCondition constructs a RouteConditionResolvedRefs condition from collected errors.
 func buildResolvedRefsCondition(errs []*ConditionError, generation int64) metav1.Condition {
-	return buildCondition(errs, string(gatewayv1.RouteConditionResolvedRefs), string(gatewayv1.RouteReasonResolvedRefs), "All references resolved", generation)
+	return buildCondition(
+		errs,
+		string(gatewayv1.RouteConditionResolvedRefs),
+		string(gatewayv1.RouteReasonResolvedRefs),
+		"All references resolved",
+		generation,
+	)
 }
 
 // NewCondition constructs a metav1.Condition with the current transition time.

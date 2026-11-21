@@ -2521,8 +2521,9 @@ func TestRouteConditions_ValidationAndRefErrors(t *testing.T) {
 	if compiled.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
 		t.Fatalf("expected ValidationCondition reason %s, got %s", gatewayv1.RouteReasonUnsupportedValue, compiled.ValidationCondition.Reason)
 	}
-	if compiled.ValidationCondition.Message == "" {
-		t.Fatalf("expected non-empty ValidationCondition message")
+	expectedValidationMsg := "invalid regular expression in header match: error parsing regexp: missing closing ]: `[invalid regex`"
+	if compiled.ValidationCondition.Message != expectedValidationMsg {
+		t.Fatalf("expected ValidationCondition message %q, got %q", expectedValidationMsg, compiled.ValidationCondition.Message)
 	}
 	if compiled.ResolvedRefsCondition.Status != metav1.ConditionFalse {
 		t.Fatalf("expected ResolvedRefsCondition False, got %s", compiled.ResolvedRefsCondition.Status)
@@ -2530,10 +2531,8 @@ func TestRouteConditions_ValidationAndRefErrors(t *testing.T) {
 	if compiled.ResolvedRefsCondition.Reason != string(gatewayv1.RouteReasonBackendNotFound) {
 		t.Fatalf("expected ResolvedRefsCondition reason %s, got %s", gatewayv1.RouteReasonBackendNotFound, compiled.ResolvedRefsCondition.Reason)
 	}
-	if compiled.ResolvedRefsCondition.Message == "" {
-		t.Fatalf("expected non-empty ResolvedRefsCondition message")
-	}
-	if compiled.ValidationCondition.Message == compiled.ResolvedRefsCondition.Message {
-		t.Fatalf("expected each condition to have its own message, but both are %q", compiled.ValidationCondition.Message)
+	expectedResolvedRefsMsg := "Backend service default/nonexistent-svc not found"
+	if compiled.ResolvedRefsCondition.Message != expectedResolvedRefsMsg {
+		t.Fatalf("expected ResolvedRefsCondition message %q, got %q", expectedResolvedRefsMsg, compiled.ResolvedRefsCondition.Message)
 	}
 }

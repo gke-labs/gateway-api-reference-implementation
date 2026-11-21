@@ -100,12 +100,15 @@ func CompileTCPRoute(
 		})
 	}
 
+	validationCondition := buildAcceptedCondition(routeErrors, route.Generation)
+	resolvedRefsCondition := buildResolvedRefsCondition(routeErrors, route.Generation)
+
 	return &InternalTCPRoute{
 		Route:                 route,
 		Rules:                 compiledRules,
 		ParentRefs:            route.Spec.ParentRefs,
-		ValidationCondition:   buildCondition(routeErrors, string(gatewayv1.RouteConditionAccepted), string(gatewayv1.RouteReasonAccepted), "Route validation succeeded", route.Generation),
-		ResolvedRefsCondition: buildResolvedRefsCondition(routeErrors, route.Generation),
+		ValidationCondition:   validationCondition,
+		ResolvedRefsCondition: resolvedRefsCondition,
 	}
 }
 

@@ -138,8 +138,9 @@ func CompileGRPCRoute(
 
 			case gatewayv1.GRPCRouteFilterRequestMirror:
 				if filter.RequestMirror != nil {
-					mirror, mirrorErrs := compileRequestMirrorFilter(
+					mirror, err := compileRequestMirrorFilter(
 						filter.RequestMirror,
+						&iRule,
 						"GRPCRoute",
 						route.Namespace,
 						services,
@@ -147,12 +148,9 @@ func CompileGRPCRoute(
 						configMaps,
 						refValidator,
 					)
-					for _, err := range mirrorErrs {
-						if err.Type == string(gatewayv1.RouteConditionAccepted) {
-							recordRuleError(&iRule, err)
-						}
+					if err != nil {
+						routeErrors = append(routeErrors, err)
 					}
-					routeErrors = append(routeErrors, mirrorErrs...)
 					if mirror != nil {
 						iRule.Mirrors = append(iRule.Mirrors, *mirror)
 					}
@@ -270,6 +268,7 @@ func CompileGRPCRoute(
 		compiledRules = append(compiledRules, iRule)
 	}
 
+	validationCondition := buildAcceptedCondition(routeErrors, route.Generation)
 	resolvedRefsCondition := buildResolvedRefsCondition(routeErrors, route.Generation)
 	applyNoPolicyTLSMessage(&resolvedRefsCondition, compiledRules)
 
@@ -278,7 +277,7 @@ func CompileGRPCRoute(
 		Rules:                 compiledRules,
 		Hostnames:             hostnames,
 		ParentRefs:            route.Spec.ParentRefs,
-		ValidationCondition:   buildCondition(routeErrors, string(gatewayv1.RouteConditionAccepted), string(gatewayv1.RouteReasonAccepted), "Route validation succeeded", route.Generation),
+		ValidationCondition:   validationCondition,
 		ResolvedRefsCondition: resolvedRefsCondition,
 	}
 }

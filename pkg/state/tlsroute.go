@@ -163,13 +163,16 @@ func CompileTLSRoute(
 		compiledRules = append(compiledRules, iRule)
 	}
 
+	validationCondition := buildAcceptedCondition(routeErrors, route.Generation)
+	resolvedRefsCondition := buildResolvedRefsCondition(routeErrors, route.Generation)
+
 	return &InternalTLSRoute{
 		Route:                 route,
 		Rules:                 compiledRules,
 		Hostnames:             hostnames,
 		ParentRefs:            route.Spec.ParentRefs,
-		ValidationCondition:   buildCondition(routeErrors, string(gatewayv1.RouteConditionAccepted), string(gatewayv1.RouteReasonAccepted), "Route validation succeeded", route.Generation),
-		ResolvedRefsCondition: buildResolvedRefsCondition(routeErrors, route.Generation),
+		ValidationCondition:   validationCondition,
+		ResolvedRefsCondition: resolvedRefsCondition,
 	}
 }
 

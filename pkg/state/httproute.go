@@ -165,8 +165,9 @@ func CompileHTTPRoute(
 
 			case gatewayv1.HTTPRouteFilterRequestMirror:
 				if filter.RequestMirror != nil {
-					mirror, mirrorErrs := compileRequestMirrorFilter(
+					mirror, err := compileRequestMirrorFilter(
 						filter.RequestMirror,
+						&iRule,
 						"HTTPRoute",
 						route.Namespace,
 						services,
@@ -174,12 +175,9 @@ func CompileHTTPRoute(
 						configMaps,
 						refValidator,
 					)
-					for _, err := range mirrorErrs {
-						if err.Type == string(gatewayv1.RouteConditionAccepted) {
-							recordRuleError(&iRule, err)
-						}
+					if err != nil {
+						routeErrors = append(routeErrors, err)
 					}
-					routeErrors = append(routeErrors, mirrorErrs...)
 					if mirror != nil {
 						iRule.Mirrors = append(iRule.Mirrors, *mirror)
 					}
@@ -333,6 +331,7 @@ func CompileHTTPRoute(
 		compiledRules = append(compiledRules, iRule)
 	}
 
+	validationCondition := buildAcceptedCondition(routeErrors, route.Generation)
 	resolvedRefsCondition := buildResolvedRefsCondition(routeErrors, route.Generation)
 	applyNoPolicyTLSMessage(&resolvedRefsCondition, compiledRules)
 
@@ -341,7 +340,7 @@ func CompileHTTPRoute(
 		Rules:                 compiledRules,
 		Hostnames:             hostnames,
 		ParentRefs:            route.Spec.ParentRefs,
-		ValidationCondition:   buildCondition(routeErrors, string(gatewayv1.RouteConditionAccepted), string(gatewayv1.RouteReasonAccepted), "Route validation succeeded", route.Generation),
+		ValidationCondition:   validationCondition,
 		ResolvedRefsCondition: resolvedRefsCondition,
 	}
 }
@@ -645,22 +644,22 @@ func compileURLRewriteFilter(rw *gatewayv1.HTTPURLRewriteFilter) (*InternalRewri
 // compileRequestMirrorFilter validates the filter settings and resolves the mirror backend target.
 func compileRequestMirrorFilter(
 	m *gatewayv1.HTTPRequestMirrorFilter,
+	rule *InternalRule,
 	routeKind string,
 	routeNamespace string,
 	services map[types.NamespacedName]*corev1.Service,
 	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
-) (*InternalMirror, []*ConditionError) {
+) (*InternalMirror, *ConditionError) {
 	numerator := int32(100)
 	denominator := int32(100)
 
-	var validationErr *ConditionError
 	if m.Percent != nil && m.Fraction != nil {
-		validationErr = newValidationError("cannot specify both percent and fraction for request mirror filter")
+		return nil, recordRuleValidationError(rule, "cannot specify both percent and fraction for request mirror filter")
 	} else if m.Percent != nil {
 		if *m.Percent < 0 || *m.Percent > 100 {
-			validationErr = newValidationError(fmt.Sprintf("invalid percent %d for request mirror filter: must be between 0 and 100", *m.Percent))
+			return nil, recordRuleValidationError(rule, fmt.Sprintf("invalid percent %d for request mirror filter: must be between 0 and 100", *m.Percent))
 		}
 		numerator = *m.Percent
 		denominator = 100
@@ -670,13 +669,10 @@ func compileRequestMirrorFilter(
 			denom = *m.Fraction.Denominator
 		}
 		if m.Fraction.Numerator < 0 || denom < 1 || m.Fraction.Numerator > denom {
-			validationErr = newValidationError(fmt.Sprintf("invalid fraction %d/%d for request mirror filter", m.Fraction.Numerator, denom))
+			return nil, recordRuleValidationError(rule, fmt.Sprintf("invalid fraction %d/%d for request mirror filter", m.Fraction.Numerator, denom))
 		}
 		numerator = m.Fraction.Numerator
 		denominator = denom
-	}
-	if validationErr != nil {
-		return nil, []*ConditionError{validationErr}
 	}
 
 	backend, refErr := resolveBackendTarget(
@@ -689,7 +685,7 @@ func compileRequestMirrorFilter(
 		refValidator,
 	)
 	if refErr != nil {
-		return nil, []*ConditionError{refErr}
+		return nil, refErr
 	}
 
 	return &InternalMirror{
