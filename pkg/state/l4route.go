@@ -35,16 +35,16 @@ type InternalTCPBackend = InternalL4Backend
 type InternalUDPBackend = InternalL4Backend
 
 // resolveL4BackendRefs compiles a slice of gatewayv1.BackendRef into InternalL4Backend targets
-// using resolveBackendTarget, recording resolution failures in refErrors.
+// using resolveBackendTarget, returning any resolution failures.
 func resolveL4BackendRefs(
 	backendRefs []gatewayv1.BackendRef,
 	routeNamespace string,
 	routeKind string,
 	services map[types.NamespacedName]*corev1.Service,
 	refValidator ReferenceGrantValidator,
-	refErrors *[]*ConditionError,
-) []InternalL4Backend {
+) ([]InternalL4Backend, []*ConditionError) {
 	var backends []InternalL4Backend
+	var refErrors []*ConditionError
 	for _, backendRef := range backendRefs {
 		backend, resolutionErr := resolveBackendTarget(
 			backendRef.BackendObjectReference,
@@ -56,9 +56,7 @@ func resolveL4BackendRefs(
 			refValidator,
 		)
 		if resolutionErr != nil {
-			if refErrors != nil {
-				*refErrors = append(*refErrors, resolutionErr)
-			}
+			refErrors = append(refErrors, resolutionErr)
 			continue
 		}
 
@@ -67,5 +65,5 @@ func resolveL4BackendRefs(
 			Weight: resolveBackendWeight(backendRef.Weight),
 		})
 	}
-	return backends
+	return backends, refErrors
 }

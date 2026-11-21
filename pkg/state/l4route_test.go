@@ -77,14 +77,12 @@ func TestResolveL4BackendRefs(t *testing.T) {
 
 				for _, tc := range tests {
 					t.Run(tc.name, func(t *testing.T) {
-						var refErrors []*ConditionError
-						backends := resolveL4BackendRefs(
+						backends, refErrors := resolveL4BackendRefs(
 							tc.backendRefs,
 							"default",
 							routeKind,
 							map[types.NamespacedName]*corev1.Service{},
 							nil,
-							&refErrors,
 						)
 						cond := buildResolvedRefsCondition(refErrors, 1)
 
@@ -114,8 +112,7 @@ func TestResolveL4BackendRefs(t *testing.T) {
 					{Namespace: "default", Name: "backend-svc"}: svc,
 				}
 
-				var refErrors []*ConditionError
-				backends := resolveL4BackendRefs(
+				backends, refErrors := resolveL4BackendRefs(
 					[]gatewayv1.BackendRef{
 						{
 							BackendObjectReference: gatewayv1.BackendObjectReference{
@@ -127,7 +124,6 @@ func TestResolveL4BackendRefs(t *testing.T) {
 					routeKind,
 					services,
 					nil,
-					&refErrors,
 				)
 				cond := buildResolvedRefsCondition(refErrors, 1)
 

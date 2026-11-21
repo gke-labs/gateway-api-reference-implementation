@@ -100,9 +100,11 @@ func CompileTCPRoute(
 	var refErrors []*ConditionError
 	var compiledRules []InternalTCPRule
 	for _, rule := range route.Spec.Rules {
+		backends, errs := resolveL4BackendRefs(rule.BackendRefs, route.Namespace, "TCPRoute", services, refValidator)
+		refErrors = append(refErrors, errs...)
 		compiledRules = append(compiledRules, InternalTCPRule{
 			Name:     rule.Name,
-			Backends: resolveL4BackendRefs(rule.BackendRefs, route.Namespace, "TCPRoute", services, refValidator, &refErrors),
+			Backends: backends,
 		})
 	}
 

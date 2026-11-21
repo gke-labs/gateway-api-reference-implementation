@@ -182,8 +182,8 @@ func CompileHTTPRoute(
 						configMaps,
 						refValidator,
 					)
-					if filterErr != "" {
-						recordRuleValidationError(&validationCondition, &iRule, filterErr, route.Generation)
+					if filterErr != nil {
+						recordRuleValidationError(&validationCondition, &iRule, filterErr.Error(), route.Generation)
 					}
 					if refErr != nil {
 						refErrors = append(refErrors, refErr)
@@ -661,15 +661,15 @@ func compileRequestMirrorFilter(
 	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
-) (*InternalMirror, string, *ConditionError) {
+) (*InternalMirror, error, *ConditionError) {
 	numerator := int32(100)
 	denominator := int32(100)
 
 	if m.Percent != nil && m.Fraction != nil {
-		return nil, "cannot specify both percent and fraction for request mirror filter", nil
+		return nil, errors.New("cannot specify both percent and fraction for request mirror filter"), nil
 	} else if m.Percent != nil {
 		if *m.Percent < 0 || *m.Percent > 100 {
-			return nil, fmt.Sprintf("invalid percent %d for request mirror filter: must be between 0 and 100", *m.Percent), nil
+			return nil, fmt.Errorf("invalid percent %d for request mirror filter: must be between 0 and 100", *m.Percent), nil
 		}
 		numerator = *m.Percent
 		denominator = 100
@@ -679,7 +679,7 @@ func compileRequestMirrorFilter(
 			denom = *m.Fraction.Denominator
 		}
 		if m.Fraction.Numerator < 0 || denom < 1 || m.Fraction.Numerator > denom {
-			return nil, fmt.Sprintf("invalid fraction %d/%d for request mirror filter", m.Fraction.Numerator, denom), nil
+			return nil, fmt.Errorf("invalid fraction %d/%d for request mirror filter", m.Fraction.Numerator, denom), nil
 		}
 		numerator = m.Fraction.Numerator
 		denominator = denom
@@ -695,12 +695,12 @@ func compileRequestMirrorFilter(
 		refValidator,
 	)
 	if refErr != nil {
-		return nil, "", refErr
+		return nil, nil, refErr
 	}
 
 	return &InternalMirror{
 		Backend:     *backend,
 		Numerator:   numerator,
 		Denominator: denominator,
-	}, "", nil
+	}, nil, nil
 }

@@ -2425,7 +2425,7 @@ func TestHTTPRouteStatus_PartiallyInvalid(t *testing.T) {
 	})
 }
 
-func TestBuildResolvedRefsCondition(t *testing.T) {
+func TestResolvedRefsCondition_FirstFailingBackendDecides(t *testing.T) {
 	route := &HTTPRouteState{
 		HTTPRoute: &gatewayv1.HTTPRoute{
 			ObjectMeta: metav1.ObjectMeta{
@@ -2444,6 +2444,10 @@ func TestBuildResolvedRefsCondition(t *testing.T) {
 									},
 								},
 							},
+						},
+					},
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
 							{
 								BackendRef: gatewayv1.BackendRef{
 									BackendObjectReference: gatewayv1.BackendObjectReference{
@@ -2464,6 +2468,10 @@ func TestBuildResolvedRefsCondition(t *testing.T) {
 	}
 	if cond.Reason != string(gatewayv1.RouteReasonInvalidKind) {
 		t.Fatalf("expected reason %s, got %s", gatewayv1.RouteReasonInvalidKind, cond.Reason)
+	}
+	expectedMsg := "Unsupported backend kind: UnknownKind"
+	if cond.Message != expectedMsg {
+		t.Fatalf("expected message %q, got %q", expectedMsg, cond.Message)
 	}
 	if cond.ObservedGeneration != 2 {
 		t.Fatalf("expected observedGeneration 2, got %d", cond.ObservedGeneration)

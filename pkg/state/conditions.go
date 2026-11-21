@@ -23,21 +23,25 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-// ConditionError represents a compilation error that causes a condition to be False.
+// ConditionError is an error that makes a status condition false, with the reason and message to report.
 type ConditionError struct {
-	Type    string
-	Reason  string
+	// Type is the condition type that becomes false.
+	Type string
+
+	// Reason is the machine-readable reason to report in the condition.
+	Reason string
+
+	// Message is the human-readable message to report in the condition.
 	Message string
 }
 
+// Error returns the error message.
 func (e *ConditionError) Error() string {
 	return e.Message
 }
 
+// toErrorState builds an ErrorState from the condition error for proxy responses.
 func (e *ConditionError) toErrorState() *ErrorState {
-	if e == nil {
-		return nil
-	}
 	return &ErrorState{
 		HTTPStatusCode: http.StatusInternalServerError,
 		HTTPMessage:    e.Message,
@@ -55,12 +59,8 @@ func buildResolvedRefsCondition(errs []*ConditionError, generation int64) metav1
 			generation,
 		)
 	}
-	condType := errs[0].Type
-	if condType == "" {
-		condType = string(gatewayv1.RouteConditionResolvedRefs)
-	}
 	return NewCondition(
-		condType,
+		string(gatewayv1.RouteConditionResolvedRefs),
 		metav1.ConditionFalse,
 		errs[0].Reason,
 		errs[0].Message,

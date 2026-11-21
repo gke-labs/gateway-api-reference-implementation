@@ -155,8 +155,8 @@ func CompileGRPCRoute(
 						configMaps,
 						refValidator,
 					)
-					if filterErr != "" {
-						recordRuleValidationError(&validationCondition, &iRule, filterErr, route.Generation)
+					if filterErr != nil {
+						recordRuleValidationError(&validationCondition, &iRule, filterErr.Error(), route.Generation)
 					}
 					if refErr != nil {
 						refErrors = append(refErrors, refErr)

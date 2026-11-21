@@ -100,9 +100,11 @@ func CompileUDPRoute(
 	var refErrors []*ConditionError
 	var compiledRules []InternalUDPRule
 	for _, rule := range route.Spec.Rules {
+		backends, errs := resolveL4BackendRefs(rule.BackendRefs, route.Namespace, "UDPRoute", services, refValidator)
+		refErrors = append(refErrors, errs...)
 		compiledRules = append(compiledRules, InternalUDPRule{
 			Name:     rule.Name,
-			Backends: resolveL4BackendRefs(rule.BackendRefs, route.Namespace, "UDPRoute", services, refValidator, &refErrors),
+			Backends: backends,
 		})
 	}
 
