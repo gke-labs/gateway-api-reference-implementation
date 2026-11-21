@@ -1665,9 +1665,10 @@ func TestState_PublishDataplaneConfig_NeverAnsweringPublisher(t *testing.T) {
 	}
 
 	// 2. State reconcile pass test: with publisher that never answers, WaitApplied returns when the limit ends,
-	// the result counts the data plane as not answered, and the reconcile pass continues.
+	// the result counts the data plane as not answered, and the state records a NotAnsweredError publish error.
 	st := NewState()
 	st.SetDataplanePublisher(pub)
+	st.UpsertGateway(gw)
 
 	st.mu.Lock()
 	st.previousOutputs = &Outputs{
@@ -1681,8 +1682,17 @@ func TestState_PublishDataplaneConfig_NeverAnsweringPublisher(t *testing.T) {
 	st.mu.Unlock()
 
 	ctx := t.Context()
-	if err := st.reconcileDataplaneKey(ctx, gwKey); err != nil {
-		t.Fatalf("expected reconcile pass to continue without error, got: %v", err)
+	err = st.reconcileDataplaneKey(ctx, gwKey)
+	if err == nil {
+		t.Fatalf("expected reconcileDataplaneKey to fail due to unanswered data plane")
+	}
+
+	var notAnsweredErr *NotAnsweredError
+	if !errors.As(err, &notAnsweredErr) {
+		t.Fatalf("expected error to be *NotAnsweredError, got %T: %v", err, err)
+	}
+	if notAnsweredErr.NotAnswered != 1 {
+		t.Errorf("expected NotAnswered=1, got %d", notAnsweredErr.NotAnswered)
 	}
 
 	st.mu.RLock()
@@ -1693,11 +1703,120 @@ func TestState_PublishDataplaneConfig_NeverAnsweringPublisher(t *testing.T) {
 	}
 	st.mu.RUnlock()
 
-	if errs.publish != nil {
-		t.Errorf("expected no publish error, got: %v", errs.publish)
+	if errs.publish == nil {
+		t.Fatalf("expected publish error to be recorded on gateway provisioning errors")
 	}
-	if dataplaneState.acceptedConfig == nil {
-		t.Errorf("expected acceptedConfig to be saved in dataplane state")
+	if !errors.As(errs.publish, &notAnsweredErr) {
+		t.Fatalf("expected recorded publish error to be *NotAnsweredError, got %T: %v", errs.publish, errs.publish)
+	}
+	if dataplaneState.acceptedConfig != nil {
+		t.Errorf("expected acceptedConfig NOT to be saved in dataplane state")
+	}
+}
+
+func TestState_PublishDataplaneConfig_NotAnswered_PublicEntryPoints(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	mockPub := &mockDataplanePublisher{}
+	mockPub.setWaitAppliedResult(PublishResult{
+		NotAnswered: 1,
+	}, nil)
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// 1. Wait for Gateway condition to show Programmed=False with reason Pending and count.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil &&
+			progCond.Status == metav1.ConditionFalse &&
+			progCond.Reason == string(gatewayv1.GatewayReasonPending) &&
+			progCond.Message == "1 data plane has not applied the revision"
+	})
+
+	// 2. The data plane answers: publisher reports that the data plane applied the revision.
+	// No change is made to the Gateway's spec. The existing retry mechanism in dataplaneWorker
+	// retries the publish pass and clears the publish error.
+	mockPub.setWaitAppliedResult(PublishResult{
+		Applied: 1,
+	}, nil)
+
+	// 3. Wait for Gateway condition to return to Programmed=True with reason Programmed.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil &&
+			progCond.Status == metav1.ConditionTrue &&
+			progCond.Reason == string(gatewayv1.GatewayReasonProgrammed)
+	})
+
+	// 4. A result with both rejections and an unanswered data plane still reports the rejections.
+	mockPub.setWaitAppliedResult(PublishResult{
+		Rejections: []DataPlaneRejection{
+			{DataPlane: "dp-1", Reason: "unsupported protocol"},
+		},
+		NotAnswered: 1,
+	}, nil)
+
+	// Change the Gateway to trigger a new publish.
+	gwUpdated := gw.DeepCopy()
+	gwUpdated.Spec.Listeners = append(gwUpdated.Spec.Listeners, gatewayv1.Listener{
+		Name:     "http-2",
+		Port:     8080,
+		Protocol: gatewayv1.HTTPProtocolType,
+	})
+	st.UpsertGateway(gwUpdated)
+
+	// Wait for Gateway condition to show Programmed=False with the rejection message.
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil &&
+			progCond.Status == metav1.ConditionFalse &&
+			progCond.Reason == string(gatewayv1.GatewayReasonPending) &&
+			progCond.Message == "dp-1: unsupported protocol"
+	})
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
 	}
 }
 

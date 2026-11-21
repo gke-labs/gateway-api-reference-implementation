@@ -594,6 +594,26 @@ func (rejected *RejectedError) Error() string {
 	return strings.Join(reasons, "; ")
 }
 
+// NotAnsweredError indicates that one or more data planes have not answered for the configuration.
+type NotAnsweredError struct {
+	// NotAnswered is the number of data planes that have not answered.
+	NotAnswered int
+}
+
+// NewNotAnsweredError creates a NotAnsweredError with the count of data planes that have not answered.
+func NewNotAnsweredError(notAnswered int) *NotAnsweredError {
+	return &NotAnsweredError{
+		NotAnswered: notAnswered,
+	}
+}
+
+func (e *NotAnsweredError) Error() string {
+	if e.NotAnswered == 1 {
+		return "1 data plane has not applied the revision"
+	}
+	return fmt.Sprintf("%d data planes have not applied the revision", e.NotAnswered)
+}
+
 // reconcileDataplaneKey reconciles the desired data-plane configuration for a single Gateway.
 // The worker updates the cache only after the publisher accepts the config.
 // For the in-process publisher, this means one proxy update for each changed Gateway
@@ -687,6 +707,16 @@ func (s *State) reconcileDataplaneKey(ctx context.Context, gwKey types.Namespace
 		rejectionErr := NewRejectedError(result.Rejections)
 		s.recordPublishError(gwKey, rejectionErr)
 		return rejectionErr
+	}
+
+	// Beyond the Gateway API specification: the specification leaves the Gateway
+	// Programmed condition open when data planes have not yet applied the published
+	// configuration revision. This implementation reports Programmed=False with
+	// reason Pending until every known data plane has applied the revision.
+	if result.NotAnswered > 0 {
+		notAnsweredErr := NewNotAnsweredError(result.NotAnswered)
+		s.recordPublishError(gwKey, notAnsweredErr)
+		return notAnsweredErr
 	}
 
 	s.mu.Lock()
