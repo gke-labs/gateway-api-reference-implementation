@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net"
 	"net/url"
 	"time"
 
@@ -370,7 +369,6 @@ func generateSVIDCertificate(authorityCert *x509.Certificate, authorityKey *ecds
 		},
 		URIs:                  []*url.URL{spiffeID},
 		DNSNames:              dnsNames,
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 		NotBefore:             now,
 		NotAfter:              now.Add(SVIDLifetime),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
