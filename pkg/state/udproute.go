@@ -89,31 +89,26 @@ func CompileUDPRoute(
 		return nil
 	}
 
-	validationCondition := NewCondition(
-		string(gatewayv1.RouteConditionAccepted),
-		metav1.ConditionTrue,
-		string(gatewayv1.RouteReasonAccepted),
-		"Route validation succeeded",
-		route.Generation,
-	)
-
-	var refErrors []*ConditionError
+	var routeErrors []*ConditionError
 	var compiledRules []InternalUDPRule
 	for _, rule := range route.Spec.Rules {
 		backends, errs := resolveL4BackendRefs(rule.BackendRefs, route.Namespace, "UDPRoute", services, refValidator)
-		refErrors = append(refErrors, errs...)
+		routeErrors = append(routeErrors, errs...)
 		compiledRules = append(compiledRules, InternalUDPRule{
 			Name:     rule.Name,
 			Backends: backends,
 		})
 	}
 
+	validationCondition := buildAcceptedCondition(routeErrors, route.Generation)
+	resolvedRefsCondition := buildResolvedRefsCondition(routeErrors, route.Generation)
+
 	return &InternalUDPRoute{
 		Route:                 route,
 		Rules:                 compiledRules,
 		ParentRefs:            route.Spec.ParentRefs,
 		ValidationCondition:   validationCondition,
-		ResolvedRefsCondition: buildResolvedRefsCondition(refErrors, route.Generation),
+		ResolvedRefsCondition: resolvedRefsCondition,
 	}
 }
 

@@ -2477,3 +2477,62 @@ func TestResolvedRefsCondition_FirstFailingBackendDecides(t *testing.T) {
 		t.Fatalf("expected observedGeneration 2, got %d", cond.ObservedGeneration)
 	}
 }
+
+func TestRouteConditions_ValidationAndRefErrors(t *testing.T) {
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Headers: []gatewayv1.HTTPHeaderMatch{
+								{
+									Type:  Ptr(gatewayv1.HeaderMatchRegularExpression),
+									Name:  "bad-header",
+									Value: "[invalid regex",
+								},
+							},
+						},
+					},
+				},
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "nonexistent-svc",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileHTTPRoute(route, map[types.NamespacedName]*corev1.Service{}, nil, nil, nil)
+	if compiled.ValidationCondition.Status != metav1.ConditionFalse {
+		t.Fatalf("expected ValidationCondition False, got %s", compiled.ValidationCondition.Status)
+	}
+	if compiled.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+		t.Fatalf("expected ValidationCondition reason %s, got %s", gatewayv1.RouteReasonUnsupportedValue, compiled.ValidationCondition.Reason)
+	}
+	expectedValidationMsg := "invalid regular expression in header match: error parsing regexp: missing closing ]: `[invalid regex`"
+	if compiled.ValidationCondition.Message != expectedValidationMsg {
+		t.Fatalf("expected ValidationCondition message %q, got %q", expectedValidationMsg, compiled.ValidationCondition.Message)
+	}
+	if compiled.ResolvedRefsCondition.Status != metav1.ConditionFalse {
+		t.Fatalf("expected ResolvedRefsCondition False, got %s", compiled.ResolvedRefsCondition.Status)
+	}
+	if compiled.ResolvedRefsCondition.Reason != string(gatewayv1.RouteReasonBackendNotFound) {
+		t.Fatalf("expected ResolvedRefsCondition reason %s, got %s", gatewayv1.RouteReasonBackendNotFound, compiled.ResolvedRefsCondition.Reason)
+	}
+	expectedResolvedRefsMsg := "Backend service default/nonexistent-svc not found"
+	if compiled.ResolvedRefsCondition.Message != expectedResolvedRefsMsg {
+		t.Fatalf("expected ResolvedRefsCondition message %q, got %q", expectedResolvedRefsMsg, compiled.ResolvedRefsCondition.Message)
+	}
+}
