@@ -125,6 +125,7 @@ func BindDataplaneFlags(fs *flag.FlagSet, opts *gari.Options) {
 	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to")
 	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
 	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
+	gari.BindInternalAPIFlags(fs, opts)
 }
 
 // SetupDataplane parses args and builds the gari.Options for data-plane mode.
@@ -221,6 +222,7 @@ func BindControllerFlags(fs *flag.FlagSet, opts *gari.Options, cfg *ControllerCo
 	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
 	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
 	certserversource.BindFlags(fs, &cfg.Certserver)
+	gari.BindInternalAPIFlags(fs, opts)
 }
 
 // SetupController parses args and builds the gari.Options for controller mode.
@@ -248,6 +250,11 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 
 	if err := certserversource.Register(&opts, cfg.Certserver); err != nil {
 		return gari.Options{}, err
+	}
+
+	controllerNamespace := os.Getenv("POD_NAMESPACE")
+	if controllerNamespace == "" {
+		controllerNamespace = "default"
 	}
 
 	gcpClient := computeClient
@@ -293,6 +300,7 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
 		singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
 		singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
+		singlepod.WithDataplaneConfigFromInternalAPI(controllerNamespace),
 	)
 
 	reconcilerCfg := controller.GatewayReconcilerConfig{

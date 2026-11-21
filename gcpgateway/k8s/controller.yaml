@@ -30,8 +30,16 @@ rules:
   resources: ["roles", "rolebindings"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
-  resources: ["configmaps", "namespaces"]
+  resources: ["namespaces"]
   verbs: ["get", "list", "watch"]
+# The controller creates and patches per-Gateway ConfigMaps to copy the trust bundle
+# into the Gateway namespace for data planes connecting to the internal API.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch", "create", "patch"]
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["tokenreviews"]
+  verbs: ["create"]
 # 3. NEG registrar discovery (nodes for zone/instance resolution, endpoint slices for endpoints)
 - apiGroups: [""]
   resources: ["nodes"]
@@ -84,6 +92,109 @@ metadata:
 spec:
   controllerName: gke-labs.io/gcpgateway
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gari-credentials
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gari-credentials
+  namespace: default
+rules:
+# Read verbs are restricted by resourceNames to the SPIFFE authority and SVID Secrets.
+# Kubernetes RBAC cannot limit 'create' operations by resource name because the resource name
+# is assigned upon creation. Therefore, the create rule permits creating any Secret in this
+# namespace beyond these names, while read access remains restricted to
+# gari-spiffe-authority and gari-controller-svid.
+# Note on authority key access: only the Job is intended to read the authority private key Secret
+# (gari-spiffe-authority). However, the controller's ClusterRole above currently grants
+# get/list/watch on all Secrets cluster-wide, meaning the controller technically has read access
+# as well; narrowing controller Secret RBAC is an open maintainer follow-up.
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames:
+  - "gari-spiffe-authority"
+  - "gari-controller-svid"
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create"]
+# Read access is restricted by resourceNames to the SPIFFE trust bundle ConfigMap.
+# As noted above, 'create' cannot be restricted by name in Kubernetes RBAC, allowing creation
+# of any ConfigMap in this namespace beyond this single name, while read access
+# remains restricted to gari-spiffe-bundle.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames:
+  - "gari-spiffe-bundle"
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gari-credentials
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gari-credentials
+subjects:
+- kind: ServiceAccount
+  name: gari-credentials
+  namespace: default
+---
+# The Job creates the cluster's SPIFFE credentials.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gari-credentials
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: gari-credentials
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+      - name: init-credentials
+        image: gari-credentials:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gari-controller
+  namespace: default
+spec:
+  selector:
+    app: gcpgateway-controller
+  ports:
+  - name: internal-api
+    port: 8443
+    targetPort: 8443
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -104,18 +215,30 @@ spec:
       - name: controller
         image: gcpgateway:latest
         env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: DATAPLANE_IMAGE
           value: gcpgateway:latest
         args:
         - --controller-name=gke-labs.io/gcpgateway
         - --dataplane-image=$(DATAPLANE_IMAGE)
+        - --internal-api-bind-address=:8443
+        - --internal-api-tls-cert-file=/etc/gari/svid/svid.pem
+        - --internal-api-tls-key-file=/etc/gari/svid/svid_key.pem
         - --certserver-address=certserver.gateway-system.svc:8443
         - --certserver-ca-bundle-path=/etc/ssl/certs/certserver-ca.crt
         - --certserver-token-path=/var/run/secrets/tokens/certserver/token
         ports:
         - name: metrics
           containerPort: 8999
+        - name: internal-api
+          containerPort: 8443
         volumeMounts:
+        - name: svid
+          mountPath: /etc/gari/svid
+          readOnly: true
         - name: certserver-token
           mountPath: /var/run/secrets/tokens/certserver
           readOnly: true
@@ -126,6 +249,9 @@ spec:
           initialDelaySeconds: 1
           periodSeconds: 2
       volumes:
+      - name: svid
+        secret:
+          secretName: gari-controller-svid
       - name: certserver-token
         projected:
           sources:

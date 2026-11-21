@@ -33,16 +33,20 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	compute "google.golang.org/api/compute/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -488,6 +492,36 @@ func assertProductionDeployment(t *testing.T, deploy *appsv1.Deployment, expecte
 	} else if !dpOpts.DataplaneMode {
 		t.Errorf("expected DataplaneMode=true, got false")
 	}
+
+	// 7. Data plane takes config from internal API
+	var foundInternalAPIAddr bool
+	for _, arg := range c.Args {
+		if strings.HasPrefix(arg, "--internal-api-address=") {
+			foundInternalAPIAddr = true
+		}
+		if strings.HasPrefix(arg, "--config-secret=") {
+			t.Errorf("expected no --config-secret arg, got: %s", arg)
+		}
+	}
+	if !foundInternalAPIAddr {
+		t.Errorf("expected container args to contain --internal-api-address, got: %v", c.Args)
+	}
+}
+
+func createBundleConfigMap(t *testing.T, c client.Client) {
+	t.Helper()
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      spiffe.BundleConfigMapName,
+		},
+		Data: map[string]string{
+			spiffe.BundleDataKey: "test-ca-bundle-data",
+		},
+	}
+	if err := c.Create(t.Context(), cm); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating bundle ConfigMap: %v", err)
+	}
 }
 
 // TestSetupController_EndToEndRealSetup verifies that the full controller setup wiring
@@ -496,6 +530,8 @@ func assertProductionDeployment(t *testing.T, deploy *appsv1.Deployment, expecte
 // sets the readiness gate, and marks the Gateway Programmed.
 func TestSetupController_EndToEndRealSetup(t *testing.T) {
 	env := testenv.Start(t)
+
+	createBundleConfigMap(t, env.Client)
 
 	// Create GatewayClass
 	gc := &gatewayv1.GatewayClass{
@@ -641,6 +677,16 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 	// Assert production-derived properties on real Deployment template (drain-seconds=35 -> grace period 60)
 	assertProductionDeployment(t, &deploy, 35, 60)
 
+	// Verify no Role or RoleBinding is created for the data plane
+	var role rbacv1.Role
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &role); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Role for data plane, got: %v (role=%+v)", err, role)
+	}
+	var roleBinding rbacv1.RoleBinding
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &roleBinding); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no RoleBinding for data plane, got: %v (roleBinding=%+v)", err, roleBinding)
+	}
+
 	// 3. Create real data-plane Pod matching the Deployment template via testenv.BuildPodFromDeployment
 	pod := testenv.BuildPodFromDeployment(
 		&deploy,
@@ -759,6 +805,8 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) {
 	env := testenv.Start(t)
 
+	createBundleConfigMap(t, env.Client)
+
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "gcpgateway",
@@ -870,6 +918,8 @@ func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) 
 // 3. A change in NEG health is reflected in Gateway status without waiting for GARI's resync interval.
 func TestSetupController_SteadyStateZeroWritesAndNoFlapping(t *testing.T) {
 	env := testenv.Start(t)
+
+	createBundleConfigMap(t, env.Client)
 
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1177,6 +1227,12 @@ func TestFlagsGolden(t *testing.T) {
 			{Name: "gateway-name", DefValue: "", Usage: "Gateway name"},
 			{Name: "gateway-namespace", DefValue: "", Usage: "Gateway namespace"},
 			{Name: "health-probe-bind-address", DefValue: ":8999", Usage: "Health probe bind address"},
+			{Name: "internal-api-address", DefValue: "", Usage: "Host and port of the controller's Service."},
+			{Name: "internal-api-bind-address", DefValue: "", Usage: "The address the internal API server binds to (disabled by default)."},
+			{Name: "internal-api-ca-file", DefValue: "", Usage: "The trust bundle that verifies the controller's certificate."},
+			{Name: "internal-api-tls-cert-file", DefValue: "", Usage: "Path to TLS server certificate file for internal API endpoint. The listener stays off until a certificate that data planes can verify is provided, and how it is provided is not settled."},
+			{Name: "internal-api-tls-key-file", DefValue: "", Usage: "Path to TLS server private key file for internal API endpoint."},
+			{Name: "internal-api-token-file", DefValue: "", Usage: "A projected ServiceAccount token with the audience the server expects."},
 			{Name: "metrics-bind-address", DefValue: ":8999", Usage: "Metrics bind address"},
 			{Name: "proxy-bind-address", DefValue: ":8080", Usage: "HTTP proxy bind address"},
 			{Name: "proxy-http3-advertised-port", DefValue: "0", Usage: "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address)"},
@@ -1223,6 +1279,12 @@ func TestFlagsGolden(t *testing.T) {
 			{Name: "drain-seconds", DefValue: "35", Usage: "Seconds to drain connections during rolling updates"},
 			{Name: "fake-compute", DefValue: "false", Usage: "Use in-memory fake Compute client for testing/offline mode"},
 			{Name: "health-poll-interval", DefValue: "5s", Usage: "Interval between load balancer health check polls"},
+			{Name: "internal-api-address", DefValue: "", Usage: "Host and port of the controller's Service."},
+			{Name: "internal-api-bind-address", DefValue: "", Usage: "The address the internal API server binds to (disabled by default)."},
+			{Name: "internal-api-ca-file", DefValue: "", Usage: "The trust bundle that verifies the controller's certificate."},
+			{Name: "internal-api-tls-cert-file", DefValue: "", Usage: "Path to TLS server certificate file for internal API endpoint. The listener stays off until a certificate that data planes can verify is provided, and how it is provided is not settled."},
+			{Name: "internal-api-tls-key-file", DefValue: "", Usage: "Path to TLS server private key file for internal API endpoint."},
+			{Name: "internal-api-token-file", DefValue: "", Usage: "A projected ServiceAccount token with the audience the server expects."},
 			{Name: "leader-elect", DefValue: "false", Usage: "Enable leader election"},
 			{Name: "neg-prefix", DefValue: "gcpgw", Usage: "Prefix for zonal NEG names"},
 			{Name: "project", DefValue: "", Usage: "GCP Project ID"},
@@ -1258,4 +1320,120 @@ func TestFlagsGolden(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestSetupController_DataplaneConfigFromInternalAPI(t *testing.T) {
+	// 1. Verify gcpgateway has no flag to turn this off
+	fs := flag.NewFlagSet("controller", flag.ContinueOnError)
+	BindControllerFlags(fs, &gari.Options{}, &ControllerConfig{})
+	if fs.Lookup("dataplane-config-from-internal-api") != nil {
+		t.Fatalf("expected no dataplane-config-from-internal-api flag")
+	}
+
+	// 2. Start-up path test: verify Deployment provisioned for a Gateway has --internal-api-address
+	// and creates no Role or RoleBinding for the data plane.
+	env := testenv.Start(t)
+
+	createBundleConfigMap(t, env.Client)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gcpgateway",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: DefaultControllerName,
+		},
+	}
+	if err := env.Client.Create(t.Context(), gc); err != nil {
+		t.Fatalf("creating GatewayClass: %v", err)
+	}
+
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-internalapi-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{
+					Type:  &ipAddrType,
+					Value: "34.120.254.20",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+	if err := env.Client.Create(t.Context(), gw); err != nil {
+		t.Fatalf("creating Gateway: %v", err)
+	}
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	opts, err := SetupController(t.Context(), []string{
+		"--cluster-id=c1",
+		"--neg-prefix=gcpgw",
+		"--project=my-project",
+		"--zones=us-central1-a",
+		"--drain-seconds=35",
+		"--fake-compute",
+	}, fakeGCP)
+	if err != nil {
+		t.Fatalf("SetupController failed: %v", err)
+	}
+
+	trueVal := true
+	mgr, err := ctrl.NewManager(env.Config, ctrl.Options{
+		Scheme:                 env.Scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+		Controller: config.Controller{
+			SkipNameValidation: &trueVal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	opts.Manager = mgr
+
+	server, err := gari.New(opts)
+	if err != nil {
+		t.Fatalf("gari.New failed: %v", err)
+	}
+
+	mgrCtx, cancelMgr := context.WithCancel(t.Context())
+	defer cancelMgr()
+	go func() {
+		_ = server.Manager().Start(mgrCtx)
+	}()
+
+	resName := state.ResourceNameForGateway(gw.Name)
+	var deploy appsv1.Deployment
+	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
+		if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err == nil {
+			break
+		}
+	}
+	if deploy.Name == "" {
+		t.Fatalf("timed out waiting for Deployment %s to be created by GARI", resName)
+	}
+
+	// Assert production-derived properties (readiness gate, pre-stop command, drain volume, grace period, --internal-api-address)
+	assertProductionDeployment(t, &deploy, 35, 60)
+
+	// Assert NO Role or RoleBinding created for the data plane
+	var role rbacv1.Role
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &role); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Role for data plane, got: %v", err)
+	}
+	var roleBinding rbacv1.RoleBinding
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &roleBinding); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no RoleBinding for data plane, got: %v", err)
+	}
 }

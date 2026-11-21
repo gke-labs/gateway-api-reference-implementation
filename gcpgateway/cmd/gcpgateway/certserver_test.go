@@ -279,6 +279,7 @@ func TestSetupController_CertserverIntegration(t *testing.T) {
 	}
 
 	// 5. Initialize controller with certserver flags
+	createBundleConfigMap(t, env.Client)
 	fakeGCP := gcp.NewFakeComputeClient()
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
@@ -424,6 +425,7 @@ func TestSetupController_CertserverUnregistered(t *testing.T) {
 		t.Fatalf("creating Gateway: %v", err)
 	}
 
+	createBundleConfigMap(t, env.Client)
 	fakeGCP := gcp.NewFakeComputeClient()
 	// Run SetupController WITHOUT any certserver flags
 	opts, err := SetupController(t.Context(), []string{

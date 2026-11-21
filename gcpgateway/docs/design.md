@@ -127,9 +127,9 @@ The `gcpgateway` controller does not create, modify, or delete Google Cloud Load
 
 `gcpgateway` compiles into a single multi-purpose binary:
 1. **Controller Mode (`gcpgateway`)**:
-   Runs as a Kubernetes Deployment in the controller namespace. It embeds GARI's controller-runtime manager (using the `singlepod` address provider) and starts the **NEG Registrar**.
+   Runs as a Kubernetes Deployment in the controller namespace. It embeds GARI's controller-runtime manager (using the `singlepod` address provider) and starts the **NEG Registrar**. It serves the internal API over TLS to push configuration directly to data planes.
 2. **Data-Plane Mode (`gcpgateway --dataplane-mode`)**:
-   Runs as per-Gateway data-plane pods provisioned by GARI's `singlepod` address provider. It serves HTTP (8080), HTTPS (8443), and the health check (8999), reading dynamic route configuration from the Gateway's generated Secret.
+   Runs as per-Gateway data-plane pods provisioned by GARI's `singlepod` address provider. It serves HTTP (8080), HTTPS (8443), and the health check (8999). Each data plane receives its dynamic route configuration directly from the controller's internal API over an authenticated TLS stream, using the controller's trust bundle mounted from a ConfigMap and an audience-bound projected ServiceAccount token.
 3. **Pre-Stop Hook Mode (`gcpgateway hook pre-stop`)**:
    Invoked by Kubernetes as the pod `lifecycle.preStop` hook. It triggers local draining (via local sentinel file `/var/run/gcpgateway/draining`) and sleeps for the backend service draining timeout in pure Go.
 
@@ -139,6 +139,7 @@ Data-plane Deployments and Services are provisioned using GARI's standard `singl
 - The Gateway references a `ConfigMap` via `spec.infrastructure.parametersRef` specifying `serviceType: ClusterIP`.
 - The singlepod provisioner creates a `ClusterIP` Service and a data-plane `Deployment`.
 - **Readiness Gate Injection**: The singlepod provisioner injects the Pod Readiness Gate `gcpgateway.gke-labs.io/load-balancer-ready` into `spec.readinessGates`.
+- **Internal API Configuration**: The provisioner mounts the trust bundle ConfigMap and a projected ServiceAccount token into the data-plane pod, passing `--internal-api-address`, `--internal-api-ca-file`, and `--internal-api-token-file` so the data plane receives configuration pushed from the controller rather than reading Secrets from the Kubernetes API.
 - Kubernetes creates an `EndpointSlice` (`discovery.k8s.io/v1`) for the Service, tracking each data-plane pod's IP, node, and readiness status.
 
 ### The NEG Registrar Reconciliation Loop
