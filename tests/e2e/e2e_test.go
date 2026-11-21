@@ -252,7 +252,7 @@ spec:
 		t.Errorf("Expected second Gateway to get distinct address, got same: %s", secondGwAddr)
 	}
 
-	// Verify Service, Deployment, ServiceAccount, Role, RoleBinding, and Secret were created for second-gateway
+	// Verify Service, Deployment, ServiceAccount, ConfigMap, and Secret were created for second-gateway
 	secondResName := state.ResourceNameForGateway("second-gateway")
 	out := h.RunCmd("kubectl", "get", "svc", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(out) != secondResName {
@@ -266,17 +266,23 @@ spec:
 	if strings.TrimSpace(saOut) != secondResName {
 		t.Errorf("Expected ServiceAccount %s to exist, got: %s", secondResName, saOut)
 	}
-	roleOut := h.RunCmd("kubectl", "get", "role", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
-	if strings.TrimSpace(roleOut) != secondResName {
-		t.Errorf("Expected Role %s to exist, got: %s", secondResName, roleOut)
-	}
-	rbOut := h.RunCmd("kubectl", "get", "rolebinding", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
-	if strings.TrimSpace(rbOut) != secondResName {
-		t.Errorf("Expected RoleBinding %s to exist, got: %s", secondResName, rbOut)
+	cmOut := h.RunCmd("kubectl", "get", "configmap", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(cmOut) != secondResName {
+		t.Errorf("Expected ConfigMap %s to exist, got: %s", secondResName, cmOut)
 	}
 	secOut := h.RunCmd("kubectl", "get", "secret", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
 	if strings.TrimSpace(secOut) != secondResName {
 		t.Errorf("Expected Secret %s to exist, got: %s", secondResName, secOut)
+	}
+
+	// Verify no Role or RoleBinding was created for second-gateway
+	roleOut := runCmdAllowError(h, "kubectl", "get", "role", secondResName, "--namespace=default")
+	if !strings.Contains(roleOut, "NotFound") && !strings.Contains(roleOut, "not found") {
+		t.Errorf("Expected Role %s to not exist, got: %s", secondResName, roleOut)
+	}
+	rbOut := runCmdAllowError(h, "kubectl", "get", "rolebinding", secondResName, "--namespace=default")
+	if !strings.Contains(rbOut, "NotFound") && !strings.Contains(rbOut, "not found") {
+		t.Errorf("Expected RoleBinding %s to not exist, got: %s", secondResName, rbOut)
 	}
 
 	// Verify gari-dataplane ClusterRole does not exist
@@ -295,13 +301,12 @@ spec:
 		t.Errorf("Expected GatewayClass SupportedVersion reason=SupportedVersion, got: %s", gcSupportedReason)
 	}
 
-	// Delete second-gateway and verify Service, Deployment, ServiceAccount, Role, RoleBinding, and Secret are cleaned up
+	// Delete second-gateway and verify Service, Deployment, ServiceAccount, ConfigMap, and Secret are cleaned up
 	h.RunCmd("kubectl", "delete", "gateway", "second-gateway", "--namespace=default")
 	h.WaitForResourceDeletion("svc", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("serviceaccount", secondResName, "default", 30*time.Second)
-	h.WaitForResourceDeletion("role", secondResName, "default", 30*time.Second)
-	h.WaitForResourceDeletion("rolebinding", secondResName, "default", 30*time.Second)
+	h.WaitForResourceDeletion("configmap", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("secret", secondResName, "default", 30*time.Second)
 
 	// 10. Verify Live Switch between LoadBalancer and ClusterIP via parametersRef ConfigMap
@@ -435,36 +440,13 @@ spec:
 		t.Fatalf("expected %s ConfigMap to contain %s", spiffe.BundleConfigMapName, spiffe.BundleDataKey)
 	}
 
-	// Restore controller configuration and cleanup resources when step 11 finishes
+	// Cleanup resources when step 11 finishes
 	defer func() {
 		h.RunCmd("kubectl", "delete", "gateway", "internal-api-gw", "--namespace=default", "--ignore-not-found")
 		h.RunCmd("kubectl", "delete", "httproute", "internal-api-route", "--namespace=default", "--ignore-not-found")
 		h.RunCmd("kubectl", "patch", "configmap", spiffe.BundleConfigMapName, "--namespace=default",
 			"--type=merge", "-p", fmt.Sprintf(`{"data":{"%s":%q}}`, spiffe.BundleDataKey, origBundle))
-		deployJSON := h.RunCmd("kubectl", "get", "deployment", "gari-controller", "--namespace=default", "-o", "json")
-		var deploy appsv1.Deployment
-		if err := json.Unmarshal([]byte(deployJSON), &deploy); err != nil {
-			t.Fatalf("failed to unmarshal controller Deployment JSON on restore: %v", err)
-		}
-		var newArgs []string
-		for _, arg := range deploy.Spec.Template.Spec.Containers[0].Args {
-			if arg != "--dataplane-config-from-internal-api" {
-				newArgs = append(newArgs, arg)
-			}
-		}
-		argsJSON, err := json.Marshal(newArgs)
-		if err != nil {
-			t.Fatalf("failed to marshal controller args on restore: %v", err)
-		}
-		h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "--namespace=default", "--type=json", "-p",
-			fmt.Sprintf(`[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": %s}]`, string(argsJSON)))
-		h.RunCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
 	}()
-
-	// Enable the option on the controller and wait for rollout.
-	h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "--type=json", "-p",
-		`[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--dataplane-config-from-internal-api"}]`)
-	h.RunCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
 
 	internalAPIGwManifest := `
 apiVersion: gateway.networking.k8s.io/v1

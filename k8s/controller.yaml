@@ -208,6 +208,7 @@ spec:
         - --internal-api-bind-address=:8443
         - --internal-api-tls-cert-file=/etc/gari/svid/svid.pem
         - --internal-api-tls-key-file=/etc/gari/svid/svid_key.pem
+        - --dataplane-config-from-internal-api
         ports:
         - name: metrics
           containerPort: 8999
