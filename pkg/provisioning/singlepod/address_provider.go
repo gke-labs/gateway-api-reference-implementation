@@ -253,10 +253,12 @@ type AddressProvider struct {
 	acmeChallengeTokenPath        string
 	acmeChallengeAudience         string
 	acmeChallengeTokenExpiration  int64
+
 	// dataplaneConfigFromInternalAPI indicates whether data planes receive configuration directly from the controller's internal API.
 	dataplaneConfigFromInternalAPI bool
+
 	// controllerNamespace is the namespace where the controller runs, used to locate the trust bundle and address the internal API.
-	controllerNamespace           string
+	controllerNamespace string
 }
 
 // WithDataplaneConfigFromInternalAPI configures the AddressProvider to provide data planes
