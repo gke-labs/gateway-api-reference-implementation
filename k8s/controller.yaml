@@ -26,8 +26,13 @@ rules:
   resources: ["roles", "rolebindings"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
-  resources: ["configmaps", "namespaces", "endpoints"]
+  resources: ["namespaces", "endpoints"]
   verbs: ["get", "list", "watch"]
+# The controller creates and patches per-Gateway ConfigMaps to copy the trust bundle
+# into the Gateway namespace for data planes connecting to the internal API.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch", "create", "patch"]
 - apiGroups: ["authentication.k8s.io"]
   resources: ["tokenreviews"]
   verbs: ["create"]
@@ -192,6 +197,10 @@ spec:
       - name: controller
         image: gari-controller:latest
         env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: DATAPLANE_IMAGE
           value: ${IMAGE_PREFIX}/gari-controller
         args:

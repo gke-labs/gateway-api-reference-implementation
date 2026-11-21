@@ -18,12 +18,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -44,6 +48,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -107,6 +112,24 @@ const (
 
 	// DefaultACMEChallengeTokenPath is the full file path to the projected service-account token.
 	DefaultACMEChallengeTokenPath = "/var/run/secrets/tokens/certserver/token"
+
+	// internalAPIBundleVolumeName is the name of the ConfigMap volume mounting the trust bundle.
+	internalAPIBundleVolumeName = "internal-api-bundle"
+
+	// internalAPIBundleMountPath is the mount directory for the internal API trust bundle.
+	internalAPIBundleMountPath = "/etc/gari/bundle"
+
+	// internalAPICAFilePath is the full file path to the internal API trust bundle CA certificate.
+	internalAPICAFilePath = internalAPIBundleMountPath + "/" + spiffe.BundleDataKey
+
+	// internalAPITokenVolumeName is the name of the projected ServiceAccount token volume for internal API.
+	internalAPITokenVolumeName = "internal-api-token"
+
+	// internalAPITokenPath is the full file path to the projected ServiceAccount token for internal API.
+	internalAPITokenPath = "/var/run/secrets/tokens/internal-api/token"
+
+	// internalAPITokenExpirationSeconds is the duration requested for projected internal API service-account tokens (1 hour).
+	internalAPITokenExpirationSeconds int64 = 3600
 )
 
 // LabelValueForGateway returns a valid Kubernetes label value for the parent Gateway name.
@@ -230,6 +253,16 @@ type AddressProvider struct {
 	acmeChallengeTokenPath        string
 	acmeChallengeAudience         string
 	acmeChallengeTokenExpiration  int64
+	controllerNamespace           string
+}
+
+// WithDataplaneConfigFromInternalAPI configures the AddressProvider to provide data planes
+// with the trust bundle, token, and flags to receive configuration directly from the
+// controller's internal API instead of reading a Secret from the Kubernetes API.
+func WithDataplaneConfigFromInternalAPI(controllerNamespace string) Option {
+	return func(p *AddressProvider) {
+		p.controllerNamespace = controllerNamespace
+	}
 }
 
 // WithACMEChallengeUpstreamURL configures the upstream certificate server URL for forwarding ACME HTTP-01 challenges.
@@ -474,9 +507,46 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
-	// 2. Reconcile per-Gateway Role and RoleBinding in Gateway namespace
-	if err := p.reconcileRoleAndRoleBinding(ctx, gw, name, ownerRef, labels, annotations); err != nil {
-		return nil, state.GatewayReadiness{}, err
+	// Reconcile per-Gateway trust bundle ConfigMap in Gateway namespace when internal API is enabled
+	if p.controllerNamespace != "" {
+		var sourceConfigMap corev1.ConfigMap
+		if err := p.client.Get(ctx, types.NamespacedName{Namespace: p.controllerNamespace, Name: spiffe.BundleConfigMapName}, &sourceConfigMap); err != nil {
+			return nil, state.GatewayReadiness{}, fmt.Errorf("reading bundle configmap %s/%s: %w", p.controllerNamespace, spiffe.BundleConfigMapName, err)
+		}
+		bundleData, ok := sourceConfigMap.Data[spiffe.BundleDataKey]
+		if !ok || bundleData == "" {
+			return nil, state.GatewayReadiness{}, fmt.Errorf("bundle configmap %s/%s missing key %s", p.controllerNamespace, spiffe.BundleConfigMapName, spiffe.BundleDataKey)
+		}
+
+		var existingConfigMap corev1.ConfigMap
+		err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingConfigMap)
+		if err == nil {
+			if !isOwnedByGateway(&existingConfigMap, gw) {
+				return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
+					Message: fmt.Sprintf("conflict: existing ConfigMap %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+				}
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return nil, state.GatewayReadiness{}, err
+		}
+
+		configMapApply := corev1ac.ConfigMap(name, gwNamespace).
+			WithOwnerReferences(ownerRef).
+			WithLabels(labels).
+			WithData(map[string]string{
+				spiffe.BundleDataKey: bundleData,
+			})
+		if len(annotations) > 0 {
+			configMapApply.WithAnnotations(annotations)
+		}
+		if err := p.client.Apply(ctx, configMapApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+			return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply ConfigMap for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		}
+	} else {
+		// 2. Reconcile per-Gateway Role and RoleBinding in Gateway namespace
+		if err := p.reconcileRoleAndRoleBinding(ctx, gw, name, ownerRef, labels, annotations); err != nil {
+			return nil, state.GatewayReadiness{}, err
+		}
 	}
 
 	// 2c. Verify ownership of existing Secret in Gateway namespace
@@ -534,6 +604,18 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		if p.acmeChallengeCABundlePath != "" {
 			args = append(args, fmt.Sprintf("--acme-challenge-ca-bundle-path=%s", p.acmeChallengeCABundlePath))
 		}
+	}
+	if p.controllerNamespace != "" {
+		host, err := spiffe.ServiceClusterDNSName(spiffe.ControllerServiceName, p.controllerNamespace)
+		if err != nil {
+			return nil, state.GatewayReadiness{}, fmt.Errorf("building internal API address: %w", err)
+		}
+		internalAPIAddress := net.JoinHostPort(host, strconv.Itoa(push.InternalAPIPort))
+		args = append(args,
+			fmt.Sprintf("--internal-api-address=%s", internalAPIAddress),
+			fmt.Sprintf("--internal-api-ca-file=%s", internalAPICAFilePath),
+			fmt.Sprintf("--internal-api-token-file=%s", internalAPITokenPath),
+		)
 	}
 
 	image := p.dataplaneImage
@@ -770,6 +852,38 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 					),
 				),
 			),
+		)
+	}
+
+	if p.controllerNamespace != "" {
+		volumeMounts = append(volumeMounts,
+			corev1ac.VolumeMount().
+				WithName(internalAPIBundleVolumeName).
+				WithMountPath(internalAPIBundleMountPath).
+				WithReadOnly(true),
+			corev1ac.VolumeMount().
+				WithName(internalAPITokenVolumeName).
+				WithMountPath(filepath.Dir(internalAPITokenPath)).
+				WithReadOnly(true),
+		)
+
+		volumes = append(volumes,
+			corev1ac.Volume().
+				WithName(internalAPIBundleVolumeName).
+				WithConfigMap(corev1ac.ConfigMapVolumeSource().
+					WithName(name),
+				),
+			corev1ac.Volume().
+				WithName(internalAPITokenVolumeName).
+				WithProjected(corev1ac.ProjectedVolumeSource().
+					WithSources(corev1ac.VolumeProjection().
+						WithServiceAccountToken(corev1ac.ServiceAccountTokenProjection().
+							WithAudience(push.DefaultAudience).
+							WithExpirationSeconds(internalAPITokenExpirationSeconds).
+							WithPath(filepath.Base(internalAPITokenPath)),
+						),
+					),
+				),
 		)
 	}
 
@@ -1238,6 +1352,33 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 		bldr.Watches(&corev1.Service{}, ownerHandler, builder.WithPredicates(pred))
 	}
 	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
+
+	if p.controllerNamespace != "" {
+		bldr.Watches(&corev1.ConfigMap{}, ownerHandler, builder.WithPredicates(pred))
+		// This watch uses the manager's ConfigMap informer and the predicate limits it to the bundle.
+		bldr.Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			var gatewayList gatewayv1.GatewayList
+			if err := p.client.List(ctx, &gatewayList); err != nil {
+				// A failed List is logged and the change is then lost until the next resync,
+				// because EnqueueRequestsFromMapFunc cannot return an error.
+				ctrl.LoggerFrom(ctx).Error(err, "failed to list Gateways on bundle ConfigMap change",
+					"namespace", p.controllerNamespace, "name", spiffe.BundleConfigMapName)
+				return nil
+			}
+			requests := make([]reconcile.Request, len(gatewayList.Items))
+			for i := range gatewayList.Items {
+				requests[i] = reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: gatewayList.Items[i].Namespace,
+						Name:      gatewayList.Items[i].Name,
+					},
+				}
+			}
+			return requests
+		}), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetNamespace() == p.controllerNamespace && obj.GetName() == spiffe.BundleConfigMapName
+		})))
+	}
 
 	return nil
 }

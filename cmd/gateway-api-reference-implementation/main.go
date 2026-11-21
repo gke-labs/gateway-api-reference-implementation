@@ -15,6 +15,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -53,6 +54,7 @@ func BindFlags(fs *flag.FlagSet, opts *gari.Options, cfg *Config) {
 	}
 
 	fs.BoolVar(&opts.DataplaneMode, "dataplane-mode", opts.DataplaneMode, "Run in data-plane mode serving a single Gateway.")
+	fs.BoolVar(&opts.DataplaneConfigFromInternalAPI, "dataplane-config-from-internal-api", opts.DataplaneConfigFromInternalAPI, "The provisioner gives each data plane the bundle, the token and the flags for the internal API.")
 	fs.StringVar(&opts.DataplaneGatewayNamespace, "gateway-namespace", opts.DataplaneGatewayNamespace, "The namespace of the Gateway to serve in data-plane mode.")
 	fs.StringVar(&opts.DataplaneGatewayName, "gateway-name", opts.DataplaneGatewayName, "The name of the Gateway to serve in data-plane mode.")
 	fs.StringVar(&cfg.DataplaneImage, "dataplane-image", cfg.DataplaneImage, "The container image to use for provisioned per-Gateway data-plane Deployments.")
@@ -143,11 +145,7 @@ func Setup(args []string) (gari.Options, error) {
 		return opts, err
 	}
 
-	opts.ProxyAddr = ""
-	opts.ProxyHTTPSAddr = ""
-	opts.ProxyHTTP3Addr = ""
-	opts.AddressProvider = singlepod.NewAddressProvider(
-		nil,
+	addressProviderOptions := []singlepod.Option{
 		singlepod.WithDataplaneImage(cfg.DataplaneImage),
 		singlepod.WithEnableH2C(opts.EnableH2C),
 		singlepod.WithForwardedForMode(string(opts.ForwardedForMode)),
@@ -155,7 +153,21 @@ func Setup(args []string) (gari.Options, error) {
 		singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
 		singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
 		singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
-	)
+	}
+	if opts.DataplaneConfigFromInternalAPI {
+		controllerNamespace := os.Getenv("POD_NAMESPACE")
+		if controllerNamespace == "" {
+			return opts, errors.New("POD_NAMESPACE environment variable is required when --dataplane-config-from-internal-api is enabled")
+		}
+		addressProviderOptions = append(addressProviderOptions,
+			singlepod.WithDataplaneConfigFromInternalAPI(controllerNamespace),
+		)
+	}
+
+	opts.ProxyAddr = ""
+	opts.ProxyHTTPSAddr = ""
+	opts.ProxyHTTP3Addr = ""
+	opts.AddressProvider = singlepod.NewAddressProvider(nil, addressProviderOptions...)
 
 	return opts, nil
 }

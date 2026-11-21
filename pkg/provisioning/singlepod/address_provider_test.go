@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -5245,5 +5247,230 @@ func TestSinglePodAddressProvider_WithDeploymentMutator_Error(t *testing.T) {
 	var svc corev1.Service
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
 		t.Errorf("expected Service to not exist after mutator error, got err: %v", err)
+	}
+}
+
+func TestSinglePodAddressProvider_DataplaneConfigFromInternalAPI(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("clientgoscheme.AddToScheme failed: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("gatewayv1.AddToScheme failed: %v", err)
+	}
+
+	tests := []struct {
+		name                string
+		controllerNamespace string
+		sourceBundleData    map[string]string
+		omitSourceBundle    bool
+		wantErrSubstring    string
+		verify              func(t *testing.T, c client.Client, p *AddressProvider, gw *gatewayv1.Gateway, resName string)
+	}{
+		{
+			name:                "enabled_copies_bundle_and_provisions_internal_api_flags",
+			controllerNamespace: "default",
+			sourceBundleData:    map[string]string{spiffe.BundleDataKey: "test-trust-bundle-pem"},
+			verify: func(t *testing.T, c client.Client, p *AddressProvider, gw *gatewayv1.Gateway, resName string) {
+				ctx := t.Context()
+
+				// 1. Destination ConfigMap copied to Gateway namespace with bundle data
+				var destinationConfigMap corev1.ConfigMap
+				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &destinationConfigMap); err != nil {
+					t.Fatalf("failed to get destination bundle ConfigMap: %v", err)
+				}
+				if destinationConfigMap.Data[spiffe.BundleDataKey] != "test-trust-bundle-pem" {
+					t.Errorf("expected bundle data %q, got %q", "test-trust-bundle-pem", destinationConfigMap.Data[spiffe.BundleDataKey])
+				}
+				if len(destinationConfigMap.OwnerReferences) == 0 || destinationConfigMap.OwnerReferences[0].UID != gw.UID {
+					t.Errorf("expected destination bundle ConfigMap to be owned by Gateway %v, got %v", gw.UID, destinationConfigMap.OwnerReferences)
+				}
+
+				// 2. Role and RoleBinding are skipped
+				var role rbacv1.Role
+				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &role); !apierrors.IsNotFound(err) {
+					t.Errorf("expected Role to not exist when internal API is enabled, got err: %v", err)
+				}
+				var roleBinding rbacv1.RoleBinding
+				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &roleBinding); !apierrors.IsNotFound(err) {
+					t.Errorf("expected RoleBinding to not exist when internal API is enabled, got err: %v", err)
+				}
+
+				// 3. Deployment has internal API flags, bundle volume, and projected token volume
+				var deploy appsv1.Deployment
+				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
+					t.Fatalf("failed to get Deployment: %v", err)
+				}
+				container := deploy.Spec.Template.Spec.Containers[0]
+
+				expectedAddrFlag := fmt.Sprintf("--internal-api-address=%s.default.svc.cluster.local:%d", spiffe.ControllerServiceName, push.InternalAPIPort)
+				expectedCAFlag := "--internal-api-ca-file=/etc/gari/bundle/" + spiffe.BundleDataKey
+				expectedTokenFlag := "--internal-api-token-file=/var/run/secrets/tokens/internal-api/token"
+
+				if !slices.Contains(container.Args, expectedAddrFlag) {
+					t.Errorf("expected args to contain %q, got: %v", expectedAddrFlag, container.Args)
+				}
+				if !slices.Contains(container.Args, expectedCAFlag) {
+					t.Errorf("expected args to contain %q, got: %v", expectedCAFlag, container.Args)
+				}
+				if !slices.Contains(container.Args, expectedTokenFlag) {
+					t.Errorf("expected args to contain %q, got: %v", expectedTokenFlag, container.Args)
+				}
+
+				// Check bundle volume mount
+				var hasBundleMount, hasTokenMount bool
+				for _, vm := range container.VolumeMounts {
+					if vm.Name == "internal-api-bundle" && vm.MountPath == "/etc/gari/bundle" && vm.ReadOnly {
+						hasBundleMount = true
+					}
+					if vm.Name == "internal-api-token" && vm.MountPath == "/var/run/secrets/tokens/internal-api" && vm.ReadOnly {
+						hasTokenMount = true
+					}
+				}
+				if !hasBundleMount {
+					t.Errorf("expected read-only bundle volume mount at /etc/gari/bundle")
+				}
+				if !hasTokenMount {
+					t.Errorf("expected read-only token volume mount at /var/run/secrets/tokens/internal-api")
+				}
+
+				// Check volumes
+				var hasBundleVol, hasTokenVol bool
+				for _, v := range deploy.Spec.Template.Spec.Volumes {
+					if v.Name == "internal-api-bundle" && v.ConfigMap != nil && v.ConfigMap.Name == resName {
+						hasBundleVol = true
+					}
+					if v.Name == "internal-api-token" && v.Projected != nil {
+						for _, src := range v.Projected.Sources {
+							if src.ServiceAccountToken != nil && src.ServiceAccountToken.Audience == push.DefaultAudience &&
+								src.ServiceAccountToken.ExpirationSeconds != nil && *src.ServiceAccountToken.ExpirationSeconds == 3600 &&
+								src.ServiceAccountToken.Path == "token" {
+								hasTokenVol = true
+							}
+						}
+					}
+				}
+				if !hasBundleVol {
+					t.Errorf("expected internal-api-bundle volume backed by ConfigMap %q", resName)
+				}
+				if !hasTokenVol {
+					t.Errorf("expected internal-api-token projected volume with audience %q", push.DefaultAudience)
+				}
+			},
+		},
+		{
+			name:                "disabled_by_default_creates_roles_and_omits_bundle",
+			controllerNamespace: "",
+			verify: func(t *testing.T, c client.Client, p *AddressProvider, gw *gatewayv1.Gateway, resName string) {
+				ctx := t.Context()
+
+				// Role and RoleBinding exist
+				var role rbacv1.Role
+				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &role); err != nil {
+					t.Errorf("expected Role to exist when option is off, got err: %v", err)
+				}
+				var roleBinding rbacv1.RoleBinding
+				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &roleBinding); err != nil {
+					t.Errorf("expected RoleBinding to exist when option is off, got err: %v", err)
+				}
+
+				// No bundle ConfigMap
+				var destinationConfigMap corev1.ConfigMap
+				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &destinationConfigMap); !apierrors.IsNotFound(err) {
+					t.Errorf("expected bundle ConfigMap to not exist when option is off, got err: %v", err)
+				}
+			},
+		},
+		{
+			name:                "missing_source_bundle_returns_error",
+			controllerNamespace: "default",
+			omitSourceBundle:    true,
+			wantErrSubstring:    "reading bundle configmap",
+		},
+		{
+			name:                "missing_bundle_key",
+			controllerNamespace: "default",
+			sourceBundleData:    map[string]string{"other-key": "some-val"},
+			wantErrSubstring:    "missing key bundle.pem",
+		},
+		{
+			name:                "enabled_custom_controller_namespace",
+			controllerNamespace: "custom-ctrl-ns",
+			sourceBundleData:    map[string]string{spiffe.BundleDataKey: "custom-bundle-pem"},
+			verify: func(t *testing.T, c client.Client, p *AddressProvider, gw *gatewayv1.Gateway, resName string) {
+				ctx := t.Context()
+				var deploy appsv1.Deployment
+				if err := c.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
+					t.Fatalf("failed to get Deployment: %v", err)
+				}
+				expectedAddrFlag := fmt.Sprintf("--internal-api-address=%s.custom-ctrl-ns.svc.cluster.local:%d", spiffe.ControllerServiceName, push.InternalAPIPort)
+				if !slices.Contains(deploy.Spec.Template.Spec.Containers[0].Args, expectedAddrFlag) {
+					t.Errorf("expected args to contain %q, got: %v", expectedAddrFlag, deploy.Spec.Template.Spec.Containers[0].Args)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "gw-ns",
+					Name:      "test-gw",
+					UID:       types.UID("gw-uid-1234"),
+				},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "gari",
+					Listeners: []gatewayv1.Listener{
+						{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+					},
+				},
+			}
+
+			var objs []client.Object
+			objs = append(objs, gw)
+
+			if !tc.omitSourceBundle && tc.controllerNamespace != "" {
+				bundleData := tc.sourceBundleData
+				if bundleData == nil {
+					bundleData = map[string]string{spiffe.BundleDataKey: "test-bundle"}
+				}
+				sourceCM := &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: tc.controllerNamespace,
+						Name:      spiffe.BundleConfigMapName,
+					},
+					Data: bundleData,
+				}
+				objs = append(objs, sourceCM)
+			}
+
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+
+			var opts []Option
+			if tc.controllerNamespace != "" {
+				opts = append(opts, WithDataplaneConfigFromInternalAPI(tc.controllerNamespace))
+			}
+
+			p := NewAddressProvider(c, opts...)
+
+			_, _, err := p.GatewayAddresses(ctx, gw, nil)
+			if tc.wantErrSubstring != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.wantErrSubstring)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrSubstring) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErrSubstring, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GatewayAddresses failed unexpectedly: %v", err)
+			}
+			if tc.verify != nil {
+				tc.verify(t, c, p, gw, state.ResourceNameForGateway(gw.Name))
+			}
+		})
 	}
 }

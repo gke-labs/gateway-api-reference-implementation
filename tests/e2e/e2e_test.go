@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
@@ -417,6 +420,164 @@ spec:
 	h.RunCmd("kubectl", "delete", "configmap", "live-switch-params", "--namespace=default")
 	h.WaitForResourceDeletion("svc", liveResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("deployment", liveResName, "default", 30*time.Second)
+
+	// 11. Test --dataplane-config-from-internal-api
+	t.Log("Testing --dataplane-config-from-internal-api flag on controller")
+
+	// Read existing bundle ConfigMap data so we can verify the copied ConfigMap
+	bundleCMJSON := h.RunCmd("kubectl", "get", "configmap", spiffe.BundleConfigMapName, "--namespace=default", "-o", "json")
+	var origBundleCM corev1.ConfigMap
+	if err := json.Unmarshal([]byte(bundleCMJSON), &origBundleCM); err != nil {
+		t.Fatalf("failed to parse %s ConfigMap JSON: %v", spiffe.BundleConfigMapName, err)
+	}
+	origBundle := origBundleCM.Data[spiffe.BundleDataKey]
+	if origBundle == "" {
+		t.Fatalf("expected %s ConfigMap to contain %s", spiffe.BundleConfigMapName, spiffe.BundleDataKey)
+	}
+
+	// Restore controller configuration and cleanup resources when step 11 finishes
+	defer func() {
+		h.RunCmd("kubectl", "delete", "gateway", "internal-api-gw", "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "httproute", "internal-api-route", "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "patch", "configmap", spiffe.BundleConfigMapName, "--namespace=default",
+			"--type=merge", "-p", fmt.Sprintf(`{"data":{"%s":%q}}`, spiffe.BundleDataKey, origBundle))
+		deployJSON := h.RunCmd("kubectl", "get", "deployment", "gari-controller", "--namespace=default", "-o", "json")
+		var deploy appsv1.Deployment
+		if err := json.Unmarshal([]byte(deployJSON), &deploy); err != nil {
+			t.Fatalf("failed to unmarshal controller Deployment JSON on restore: %v", err)
+		}
+		var newArgs []string
+		for _, arg := range deploy.Spec.Template.Spec.Containers[0].Args {
+			if arg != "--dataplane-config-from-internal-api" {
+				newArgs = append(newArgs, arg)
+			}
+		}
+		argsJSON, err := json.Marshal(newArgs)
+		if err != nil {
+			t.Fatalf("failed to marshal controller args on restore: %v", err)
+		}
+		h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "--namespace=default", "--type=json", "-p",
+			fmt.Sprintf(`[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": %s}]`, string(argsJSON)))
+		h.RunCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
+	}()
+
+	// Enable the option on the controller and wait for rollout.
+	h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "--type=json", "-p",
+		`[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--dataplane-config-from-internal-api"}]`)
+	h.RunCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
+
+	internalAPIGwManifest := `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: internal-api-gw
+  namespace: default
+spec:
+  gatewayClassName: reference-class
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+`
+	h.KubectlApplyContent(internalAPIGwManifest)
+
+	internalAPIResName := state.ResourceNameForGateway("internal-api-gw")
+	h.WaitForDeployment(internalAPIResName, 2*time.Minute)
+
+	// Verify the destination ConfigMap was copied into the Gateway's namespace with the bundle
+	gwBundleCMJSON := h.RunCmd("kubectl", "get", "configmap", internalAPIResName, "--namespace=default", "-o", "json")
+	var gwBundleCM corev1.ConfigMap
+	if err := json.Unmarshal([]byte(gwBundleCMJSON), &gwBundleCM); err != nil {
+		t.Fatalf("failed to parse gateway bundle ConfigMap JSON: %v", err)
+	}
+	if gwBundleCM.Data[spiffe.BundleDataKey] != origBundle {
+		t.Errorf("copied bundle ConfigMap data mismatch: expected %q, got %q", origBundle, gwBundleCM.Data[spiffe.BundleDataKey])
+	}
+
+	// Verify no Role or RoleBinding was created for this Gateway
+	rolesOut := runCmdAllowError(h, "kubectl", "get", "role", internalAPIResName, "--namespace=default")
+	if !strings.Contains(rolesOut, "NotFound") && !strings.Contains(rolesOut, "not found") {
+		t.Errorf("Expected Role %s to not exist, got: %s", internalAPIResName, rolesOut)
+	}
+	noRoleBindingOut := runCmdAllowError(h, "kubectl", "get", "rolebinding", internalAPIResName, "--namespace=default")
+	if !strings.Contains(noRoleBindingOut, "NotFound") && !strings.Contains(noRoleBindingOut, "not found") {
+		t.Errorf("Expected RoleBinding %s to not exist, got: %s", internalAPIResName, noRoleBindingOut)
+	}
+
+	// Update the source bundle ConfigMap and verify the copy updates
+	newBundleVal := origBundle + "\n# test-update-marker"
+	h.RunCmd("kubectl", "patch", "configmap", spiffe.BundleConfigMapName, "--namespace=default",
+		"--type=merge", "-p", fmt.Sprintf(`{"data":{"%s":%q}}`, spiffe.BundleDataKey, newBundleVal))
+
+	pollStart := time.Now()
+	for {
+		updatedCMJSON := h.RunCmd("kubectl", "get", "configmap", internalAPIResName, "--namespace=default", "-o", "json")
+		var updatedCM corev1.ConfigMap
+		if err := json.Unmarshal([]byte(updatedCMJSON), &updatedCM); err != nil {
+			t.Fatalf("failed to parse updated gateway bundle ConfigMap JSON: %v", err)
+		}
+		if updatedCM.Data[spiffe.BundleDataKey] == newBundleVal {
+			t.Log("Successfully observed updated bundle ConfigMap propagated to Gateway copy")
+			break
+		}
+		if time.Since(pollStart) > 1*time.Minute {
+			t.Fatalf("Timed out waiting for bundle update to propagate to %s/%s", "default", internalAPIResName)
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	// Route traffic through the Gateway to verify the data plane functions
+	internalAPIRouteManifest := `
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: internal-api-route
+  namespace: default
+spec:
+  parentRefs:
+  - name: internal-api-gw
+    namespace: default
+  rules:
+  - backendRefs:
+    - name: backend
+      port: 8080
+`
+	h.KubectlApplyContent(internalAPIRouteManifest)
+
+	// Wait for Gateway to obtain an assigned address
+	internalAPIIngressIP, _ := h.WaitForGatewayAddress("internal-api-gw", "default", 2*time.Minute)
+
+	internalAPIClientPodName := "test-client-internal-api"
+	h.DeletePod(internalAPIClientPodName)
+	h.KubectlApplyContent(h.ClientManifestWithArgs(internalAPIClientPodName, fmt.Sprintf("http://%s", internalAPIIngressIP), "example.com"))
+	h.WaitForPodSuccess(internalAPIClientPodName, 1*time.Minute)
+	internalAPIClientLogs := h.GetPodLogs(internalAPIClientPodName)
+	t.Logf("Client logs (internal-api): %s", internalAPIClientLogs)
+	if !strings.Contains(internalAPIClientLogs, "Status: 200 OK") {
+		t.Errorf("Expected HTTP 200 OK via internal-api-gw, got: %s", internalAPIClientLogs)
+	}
+	h.DeletePod(internalAPIClientPodName)
+
+	// Verify data plane Deployment has --internal-api-address
+	dataplaneDeployJSON := h.RunCmd("kubectl", "get", "deployment", internalAPIResName, "--namespace=default", "-o", "json")
+	var dataplaneDeploy appsv1.Deployment
+	if err := json.Unmarshal([]byte(dataplaneDeployJSON), &dataplaneDeploy); err != nil {
+		t.Fatalf("failed to parse data-plane Deployment JSON: %v", err)
+	}
+	if len(dataplaneDeploy.Spec.Template.Spec.Containers) == 0 {
+		t.Fatalf("expected at least 1 container in data-plane Deployment")
+	}
+	container := dataplaneDeploy.Spec.Template.Spec.Containers[0]
+	var hasInternalAPIAddress bool
+	for _, arg := range container.Args {
+		if strings.HasPrefix(arg, "--internal-api-address=") {
+			hasInternalAPIAddress = true
+			break
+		}
+	}
+	if !hasInternalAPIAddress {
+		t.Errorf("Expected data-plane container to have --internal-api-address flag, args: %v", container.Args)
+	}
 }
 
 func runCmdAllowError(h *Harness, name string, args ...string) string {
