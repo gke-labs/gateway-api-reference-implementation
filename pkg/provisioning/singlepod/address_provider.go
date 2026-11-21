@@ -474,66 +474,9 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
-	// 2. Reconcile per-Gateway Role in Gateway namespace
-	var existingRole rbacv1.Role
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRole)
-	if err == nil {
-		if !isOwnedByGateway(&existingRole, gw) {
-			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
-				Message: fmt.Sprintf("conflict: existing Role %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
+	// 2. Reconcile per-Gateway Role and RoleBinding in Gateway namespace
+	if err := p.reconcileRoleAndRoleBinding(ctx, gw, name, ownerRef, labels, annotations); err != nil {
 		return nil, state.GatewayReadiness{}, err
-	}
-
-	roleApply := rbacv1ac.Role(name, gwNamespace).
-		WithOwnerReferences(ownerRef).
-		WithLabels(labels).
-		WithRules(rbacv1ac.PolicyRule().
-			WithAPIGroups("").
-			WithResources("secrets").
-			WithResourceNames(name).
-			WithVerbs("get", "list", "watch"),
-		)
-	if len(annotations) > 0 {
-		roleApply.WithAnnotations(annotations)
-	}
-	if err := p.client.Apply(ctx, roleApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Role for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
-	}
-
-	// 2b. Reconcile per-Gateway RoleBinding in Gateway namespace
-	var existingRB rbacv1.RoleBinding
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRB)
-	if err == nil {
-		if !isOwnedByGateway(&existingRB, gw) {
-			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
-				Message: fmt.Sprintf("conflict: existing RoleBinding %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return nil, state.GatewayReadiness{}, err
-	}
-
-	rbApply := rbacv1ac.RoleBinding(name, gwNamespace).
-		WithOwnerReferences(ownerRef).
-		WithLabels(labels).
-		WithRoleRef(rbacv1ac.RoleRef().
-			WithAPIGroup(rbacv1.GroupName).
-			WithKind("Role").
-			WithName(name),
-		).
-		WithSubjects(rbacv1ac.Subject().
-			WithKind("ServiceAccount").
-			WithName(name).
-			WithNamespace(gwNamespace),
-		)
-	if len(annotations) > 0 {
-		rbApply.WithAnnotations(annotations)
-	}
-	if err := p.client.Apply(ctx, rbApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply RoleBinding for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 2c. Verify ownership of existing Secret in Gateway namespace
@@ -1182,6 +1125,83 @@ func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
 		return nil
 	}
 	return []gatewayv1.AddressType{gatewayv1.IPAddressType, gatewayv1.HostnameAddressType}
+}
+
+// reconcileRoleAndRoleBinding creates or updates the per-Gateway Role and RoleBinding
+// granting the data plane permissions to read its configuration Secret.
+func (p *AddressProvider) reconcileRoleAndRoleBinding(
+	ctx context.Context,
+	gw *gatewayv1.Gateway,
+	name string,
+	ownerRef *metav1ac.OwnerReferenceApplyConfiguration,
+	labels map[string]string,
+	annotations map[string]string,
+) error {
+	gwNamespace := gw.Namespace
+
+	// Reconcile per-Gateway Role in Gateway namespace
+	var existingRole rbacv1.Role
+	err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRole)
+	if err == nil {
+		if !isOwnedByGateway(&existingRole, gw) {
+			return &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing Role %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	roleApply := rbacv1ac.Role(name, gwNamespace).
+		WithOwnerReferences(ownerRef).
+		WithLabels(labels).
+		WithRules(rbacv1ac.PolicyRule().
+			WithAPIGroups("").
+			WithResources("secrets").
+			WithResourceNames(name).
+			WithVerbs("get", "list", "watch"),
+		)
+	if len(annotations) > 0 {
+		roleApply.WithAnnotations(annotations)
+	}
+	if err := p.client.Apply(ctx, roleApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return fmt.Errorf("failed to apply Role for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+	}
+
+	// Reconcile per-Gateway RoleBinding in Gateway namespace
+	var existingRB rbacv1.RoleBinding
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRB)
+	if err == nil {
+		if !isOwnedByGateway(&existingRB, gw) {
+			return &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing RoleBinding %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	rbApply := rbacv1ac.RoleBinding(name, gwNamespace).
+		WithOwnerReferences(ownerRef).
+		WithLabels(labels).
+		WithRoleRef(rbacv1ac.RoleRef().
+			WithAPIGroup(rbacv1.GroupName).
+			WithKind("Role").
+			WithName(name),
+		).
+		WithSubjects(rbacv1ac.Subject().
+			WithKind("ServiceAccount").
+			WithName(name).
+			WithNamespace(gwNamespace),
+		)
+	if len(annotations) > 0 {
+		rbApply.WithAnnotations(annotations)
+	}
+	if err := p.client.Apply(ctx, rbApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return fmt.Errorf("failed to apply RoleBinding for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+	}
+
+	return nil
 }
 
 func managedByPredicate() predicate.Predicate {
