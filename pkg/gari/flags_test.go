@@ -101,8 +101,8 @@ func TestOptionsComplete_InternalAPIFlags(t *testing.T) {
 	options.DataplaneGatewayName = "gw"
 	options.InternalAPIAddress = "127.0.0.1:8443"
 	options.InternalAPICAFile = "/path/to/ca.crt"
-	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "required together") {
-		t.Errorf("expected required together error, got %v", err)
+	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "--internal-api-token-file") {
+		t.Errorf("expected error naming --internal-api-token-file, got %v", err)
 	}
 
 	// Missing CA file
@@ -112,8 +112,8 @@ func TestOptionsComplete_InternalAPIFlags(t *testing.T) {
 	options.DataplaneGatewayName = "gw"
 	options.InternalAPIAddress = "127.0.0.1:8443"
 	options.InternalAPITokenFile = "/path/to/token"
-	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "required together") {
-		t.Errorf("expected required together error, got %v", err)
+	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "--internal-api-ca-file") {
+		t.Errorf("expected error naming --internal-api-ca-file, got %v", err)
 	}
 
 	// Missing address
@@ -123,8 +123,17 @@ func TestOptionsComplete_InternalAPIFlags(t *testing.T) {
 	options.DataplaneGatewayName = "gw"
 	options.InternalAPICAFile = "/path/to/ca.crt"
 	options.InternalAPITokenFile = "/path/to/token"
-	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "required together") {
-		t.Errorf("expected required together error, got %v", err)
+	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "--internal-api-address") {
+		t.Errorf("expected error naming --internal-api-address, got %v", err)
+	}
+
+	// Missing all internal API flags in dataplane mode
+	options = DefaultOptions()
+	options.DataplaneMode = true
+	options.DataplaneGatewayNamespace = "ns"
+	options.DataplaneGatewayName = "gw"
+	if err := options.complete(); err == nil || !strings.Contains(err.Error(), "--internal-api-address") {
+		t.Errorf("expected error naming --internal-api-address, got %v", err)
 	}
 
 	// Not in dataplane mode

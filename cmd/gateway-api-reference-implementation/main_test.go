@@ -245,6 +245,39 @@ func TestSetupController_RequiresInternalAPIFlags(t *testing.T) {
 	}
 }
 
+func TestSetupDataplane_RequiresInternalAPIFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "missing all",
+			args: []string{"--dataplane-mode", "--gateway-namespace=ns", "--gateway-name=gw"},
+		},
+		{
+			name: "missing ca and token",
+			args: []string{"--dataplane-mode", "--gateway-namespace=ns", "--gateway-name=gw", "--internal-api-address=127.0.0.1:8443"},
+		},
+		{
+			name: "missing token",
+			args: []string{"--dataplane-mode", "--gateway-namespace=ns", "--gateway-name=gw", "--internal-api-address=127.0.0.1:8443", "--internal-api-ca-file=/path/to/ca.crt"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Setup(tc.args)
+			if err == nil {
+				t.Fatalf("expected error when internal API flags are missing, got nil")
+			}
+			for _, flag := range []string{"--internal-api-address", "--internal-api-ca-file", "--internal-api-token-file"} {
+				if !strings.Contains(err.Error(), flag) {
+					t.Errorf("expected error to name %s, got %v", flag, err)
+				}
+			}
+		})
+	}
+}
+
 func TestFlagsGolden(t *testing.T) {
 	t.Setenv("GARI_IMAGE", "")
 	t.Setenv("CERTSERVER_ADDRESS", "")
@@ -430,7 +463,14 @@ func TestSetup_ModeSelection(t *testing.T) {
 	}
 
 	// 3. Dataplane mode selected via --dataplane-mode
-	optsDP, err := Setup([]string{"--dataplane-mode", "--gateway-namespace=ns", "--gateway-name=gw"})
+	optsDP, err := Setup([]string{
+		"--dataplane-mode",
+		"--gateway-namespace=ns",
+		"--gateway-name=gw",
+		"--internal-api-address=127.0.0.1:8443",
+		"--internal-api-ca-file=/path/to/ca.crt",
+		"--internal-api-token-file=/path/to/token",
+	})
 	if err != nil {
 		t.Fatalf("Setup failed for dataplane mode: %v", err)
 	}

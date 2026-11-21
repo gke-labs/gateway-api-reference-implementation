@@ -16,11 +16,9 @@ package singlepod
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,7 +41,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -86,9 +83,6 @@ const (
 
 	// HTTP3PortName is the container port name for HTTP/3 UDP traffic.
 	HTTP3PortName = "http3"
-
-	// DataplaneSecretDataKey is the key in the per-Gateway Secret holding the serialized DataplaneConfig.
-	DataplaneSecretDataKey = "config.json"
 
 	// DataPlaneHTTPPort is the default container port for HTTP traffic.
 	DataPlaneHTTPPort = state.DataPlaneHTTPPort
@@ -1266,119 +1260,6 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 		return obj.GetNamespace() == p.controllerNamespace && obj.GetName() == spiffe.BundleConfigMapName
 	})))
 
-	return nil
-}
-
-// PublishDataplaneConfig writes or deletes a data plane's config Secret.
-// It is used by localgateway (localgateway/pkg/dnsconfig) to publish DNS data-plane configuration.
-// It guarantees that it applies with the provider's field owner, it refuses an
-// object that another owner holds, and it deletes the object when the payload is nil.
-func PublishDataplaneConfig(ctx context.Context, cl client.Client, namespace, name string, owner client.Object, payload any) error {
-	if cl == nil {
-		return nil
-	}
-	if owner != nil && reflect.ValueOf(owner).Kind() == reflect.Pointer && reflect.ValueOf(owner).IsNil() {
-		owner = nil
-	}
-
-	var existingSecret corev1.Secret
-	err := cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &existingSecret)
-	if err == nil {
-		ref := metav1.GetControllerOf(&existingSecret)
-		if owner == nil {
-			if ref != nil {
-				return &controller.OwnershipConflictError{
-					Message: fmt.Sprintf("conflict: existing Secret %s/%s is owned by %s %s", namespace, name, ref.Kind, ref.Name),
-				}
-			}
-		} else {
-			if ref == nil || (owner.GetUID() != "" && ref.UID != "" && ref.UID != owner.GetUID()) || ref.Name != owner.GetName() {
-				ownerDesc := owner.GetName()
-				if _, ok := owner.(*gatewayv1.Gateway); ok {
-					ownerDesc = "Gateway " + ownerDesc
-				}
-				return &controller.OwnershipConflictError{
-					Message: fmt.Sprintf("conflict: existing Secret %s/%s is not owned by %s", namespace, name, ownerDesc),
-				}
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to get config Secret %s/%s: %w", namespace, name, err)
-	}
-
-	isNil := payload == nil
-	if !isNil {
-		val := reflect.ValueOf(payload)
-		switch val.Kind() {
-		case reflect.Pointer, reflect.Interface, reflect.Slice, reflect.Map:
-			isNil = val.IsNil()
-		}
-	}
-	if isNil {
-		if err == nil {
-			secret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: namespace,
-					Name:      name,
-				},
-			}
-			if err := cl.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete config Secret %s/%s: %w", namespace, name, err)
-			}
-		}
-		return nil
-	}
-
-	var configJSON []byte
-	if b, ok := payload.([]byte); ok {
-		configJSON = b
-	} else {
-		var marshalErr error
-		configJSON, marshalErr = json.Marshal(payload)
-		if marshalErr != nil {
-			return fmt.Errorf("failed to marshal dataplane config: %w", marshalErr)
-		}
-	}
-
-	secretApply := corev1ac.Secret(name, namespace).
-		WithData(map[string][]byte{
-			DataplaneSecretDataKey: configJSON,
-		})
-
-	if owner != nil {
-		apiVersion := gatewayv1.GroupVersion.String()
-		kind := "Gateway"
-		if cl.Scheme() != nil {
-			if gvk, err := apiutil.GVKForObject(owner, cl.Scheme()); err == nil && gvk.Kind != "" {
-				apiVersion = gvk.GroupVersion().String()
-				kind = gvk.Kind
-			}
-		}
-		ref := metav1ac.OwnerReference().
-			WithAPIVersion(apiVersion).
-			WithKind(kind).
-			WithName(owner.GetName()).
-			WithController(true).
-			WithBlockOwnerDeletion(true)
-		if owner.GetUID() != "" {
-			ref.WithUID(owner.GetUID())
-		}
-		secretApply.WithOwnerReferences(ref)
-
-		if gw, ok := owner.(*gatewayv1.Gateway); ok && gw != nil {
-			labels, annotations := buildLabelsAndAnnotations(gw)
-			if len(labels) > 0 {
-				secretApply.WithLabels(labels)
-			}
-			if len(annotations) > 0 {
-				secretApply.WithAnnotations(annotations)
-			}
-		}
-	}
-
-	if err := cl.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return fmt.Errorf("failed to apply config Secret %s/%s: %w", namespace, name, err)
-	}
 	return nil
 }
 

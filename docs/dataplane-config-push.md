@@ -2,9 +2,9 @@
 
 ## Context and Goals
 
-Previously the controller wrote each Gateway's data-plane config to a Kubernetes
-Secret (`config.json`), and the data plane watched that Secret. Direct push
-from the controller to each data plane eliminates the intermediate Secret:
+The controller pushes each Gateway's data-plane configuration directly to data
+planes over bidirectional gRPC streams. Direct push eliminates intermediate
+storage:
 
 - **Faster.** Eliminates API server write and watch overhead between the
   controller and the data plane.

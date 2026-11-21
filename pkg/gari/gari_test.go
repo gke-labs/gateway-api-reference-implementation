@@ -20,7 +20,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -36,7 +35,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -47,7 +45,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -282,28 +279,25 @@ func TestForwardedForModeOptions(t *testing.T) {
 }
 
 func TestOptions_SetupWithManagerCalled(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = gatewayv1.Install(scheme)
+	env := testenv.Start(t)
 
 	called := false
 	opts := DefaultOptions()
-	opts.DataplaneMode = true
-	opts.DataplaneGatewayNamespace = "default"
-	opts.DataplaneGatewayName = "test-gw"
+	opts.LeaderElection = false
+	opts.DisableStatusUpdates = true
 	opts.MetricsAddr = "0"
 	opts.HealthProbeBindAddress = "0"
 	opts.ProxyAddr = ""
 	opts.ProxyHTTPSAddr = ""
-	opts.Scheme = scheme
+	opts.Scheme = env.Scheme
 	opts.SetupWithManager = func(mgr ctrl.Manager, s *Server) error {
 		called = true
 		return nil
 	}
 
 	skipNameValidation := true
-	mgr, err := ctrl.NewManager(&rest.Config{}, ctrl.Options{
-		Scheme:  scheme,
+	mgr, err := ctrl.NewManager(env.Config, ctrl.Options{
+		Scheme:  env.Scheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
 		Controller: config.Controller{
 			SkipNameValidation: &skipNameValidation,
@@ -323,28 +317,25 @@ func TestOptions_SetupWithManagerCalled(t *testing.T) {
 }
 
 func TestOptions_SetupWithManagerServerAccess(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = gatewayv1.Install(scheme)
+	env := testenv.Start(t)
 
 	var serverFromSetup *Server
 	opts := DefaultOptions()
-	opts.DataplaneMode = true
-	opts.DataplaneGatewayNamespace = "default"
-	opts.DataplaneGatewayName = "test-gw"
+	opts.LeaderElection = false
+	opts.DisableStatusUpdates = true
 	opts.MetricsAddr = "0"
 	opts.HealthProbeBindAddress = "0"
 	opts.ProxyAddr = ""
 	opts.ProxyHTTPSAddr = ""
-	opts.Scheme = scheme
+	opts.Scheme = env.Scheme
 	opts.SetupWithManager = func(mgr ctrl.Manager, s *Server) error {
 		serverFromSetup = s
 		return nil
 	}
 
 	skipNameValidation := true
-	mgr, err := ctrl.NewManager(&rest.Config{}, ctrl.Options{
-		Scheme:  scheme,
+	mgr, err := ctrl.NewManager(env.Config, ctrl.Options{
+		Scheme:  env.Scheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
 		Controller: config.Controller{
 			SkipNameValidation: &skipNameValidation,
@@ -1743,123 +1734,7 @@ func TestHTTP3_CustomQUICConfig(t *testing.T) {
 	}
 }
 
-func TestDataplaneSecretReconciler(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = gatewayv1.AddToScheme(scheme)
-
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("backend ok"))
-	}))
-	defer backend.Close()
-
-	backendHost, backendPortStr, err := net.SplitHostPort(backend.Listener.Addr().String())
-	if err != nil {
-		t.Fatalf("failed to split backend addr: %v", err)
-	}
-	var backendPort int
-	_, _ = fmt.Sscanf(backendPortStr, "%d", &backendPort)
-
-	p := proxy.NewProxy()
-
-	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
-	route := state.InternalRoute{
-		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
-		Rules: []state.InternalRule{
-			{
-				Matches: []state.InternalMatch{
-					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/ok"}},
-				},
-				Backends: []state.InternalBackend{
-					{Host: backendHost, Port: int32(backendPort), Weight: 1},
-				},
-			},
-		},
-	}
-
-	dpConfig := &state.DataplaneConfig{
-		GatewayName: gwKey,
-		Listeners: []state.InternalListener{
-			{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route}},
-		},
-		Routes: []state.InternalRoute{route},
-	}
-	configBytes, err := dpConfig.Marshal()
-	if err != nil {
-		t.Fatalf("failed to marshal config: %v", err)
-	}
-
-	gwName := "test-gw"
-	secretName := state.ResourceNameForGateway(gwName)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-		Data: map[string][]byte{
-			singlepod.DataplaneSecretDataKey: configBytes,
-		},
-	}
-
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
-
-	server := &Server{
-		opts: Options{
-			DataplaneMode:             true,
-			DataplaneGatewayNamespace: "test-ns",
-			DataplaneGatewayName:      gwName,
-		},
-		proxy: p,
-	}
-
-	reconciler := &dataplaneSecretReconciler{
-		Client:               cl,
-		gatewayNamespace:     "test-ns",
-		secretName:           secretName,
-		applyDataplaneConfig: server.applyDataplaneConfig,
-	}
-
-	ctx := t.Context()
-	req := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-	}
-
-	// Reconcile secret
-	res, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
-	}
-	if res.Requeue {
-		t.Errorf("expected no requeue")
-	}
-
-	if !server.proxySynced.Load() {
-		t.Errorf("expected proxySynced to be true after reconcile")
-	}
-
-	// Verify request routing against the proxy
-	reqHTTP, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/ok", nil)
-	if err != nil {
-		t.Fatalf("failed to create request: %v", err)
-	}
-	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, reqHTTP)
-	if rec.Code != http.StatusOK {
-		t.Errorf("expected 200 OK from proxy, got %d", rec.Code)
-	}
-	if rec.Body.String() != "backend ok" {
-		t.Errorf("expected 'backend ok' body, got %q", rec.Body.String())
-	}
-}
-
 func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
-	env := testenv.Start(t)
-
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -1868,56 +1743,39 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 		gwName      = "test-gw"
 	)
 	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
-	secretName := state.ResourceNameForGateway(gwName)
-
-	ns := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: gwNamespace,
-		},
-	}
-	if err := env.Client.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
-		t.Fatalf("failed to create namespace: %v", err)
-	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to allocate free port: %v", err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	defer ln.Close()
+	healthAddr := ln.Addr().String()
 
-	healthAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	opts := DefaultOptions()
-	opts.RestConfig = env.Config
-	opts.Scheme = env.Scheme
-	opts.DataplaneMode = true
-	opts.DataplaneGatewayNamespace = gwNamespace
-	opts.DataplaneGatewayName = gwName
-	opts.HealthProbeBindAddress = healthAddr
-	opts.MetricsAddr = healthAddr
-	opts.ProxyAddr = ""
-	opts.ProxyHTTPSAddr = ""
-	opts.LeaderElection = false
-
-	server, err := New(opts)
-	if err != nil {
-		t.Fatalf("New failed: %v", err)
+	p := proxy.NewProxy()
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: gwNamespace,
+			DataplaneGatewayName:      gwName,
+			HealthProbeBindAddress:    healthAddr,
+		},
+		proxy: p,
 	}
 
-	errCh := make(chan error, 1)
+	mux := http.NewServeMux()
+	for path, handler := range server.healthEndpoints() {
+		mux.Handle(path, handler)
+	}
+	server.healthProbeServer = &http.Server{
+		Addr:    healthAddr,
+		Handler: mux,
+	}
+
 	go func() {
-		errCh <- server.Start(ctx)
+		_ = server.healthProbeServer.Serve(ln)
 	}()
 	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-errCh:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				t.Errorf("server exited with error: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Errorf("timed out waiting for server to stop")
-		}
+		_ = server.healthProbeServer.Close()
 	})
 
 	healthURL := fmt.Sprintf("http://%s/_gari/applied", healthAddr)
@@ -1953,7 +1811,7 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	// 1. Before config is applied: endpoint returns 200 OK with empty revisions list (Gateway appears only after config applied)
 	waitForRevision("")
 
-	// 2. Create initial config Secret
+	// 2. Apply initial config
 	route1 := state.InternalRoute{
 		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
@@ -1982,23 +1840,14 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 		t.Fatalf("failed to marshal dpConfig1: %v", err)
 	}
 
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: gwNamespace,
-			Name:      secretName,
-		},
-		Data: map[string][]byte{
-			singlepod.DataplaneSecretDataKey: configBytes1,
-		},
-	}
-	if err := env.Client.Create(ctx, secret); err != nil {
-		t.Fatalf("failed to create secret: %v", err)
+	if err := server.applyDataplaneConfig(configBytes1); err != nil {
+		t.Fatalf("applyDataplaneConfig 1 failed: %v", err)
 	}
 
 	// Wait for endpoint to report revision 1
 	waitForRevision(dpConfig1.Revision)
 
-	// 3. Update config Secret with new route and verify new revision reported
+	// 3. Update config with new route and verify new revision reported
 	route2 := state.InternalRoute{
 		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
@@ -2027,9 +1876,8 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 		t.Fatalf("failed to marshal dpConfig2: %v", err)
 	}
 
-	secret.Data[singlepod.DataplaneSecretDataKey] = configBytes2
-	if err := env.Client.Update(ctx, secret); err != nil {
-		t.Fatalf("failed to update secret: %v", err)
+	if err := server.applyDataplaneConfig(configBytes2); err != nil {
+		t.Fatalf("applyDataplaneConfig 2 failed: %v", err)
 	}
 
 	// Wait for endpoint to report revision 2
@@ -2059,54 +1907,6 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	server.Proxy().ServeHTTP(rec, proxyReq)
 	if strings.Contains(rec.Body.String(), dpConfig2.Revision) {
 		t.Errorf("security violation: proxy listener served revision endpoint: %s", rec.Body.String())
-	}
-}
-
-func TestDataplaneSecretReconciler_MissingSecretLeavesProxyNotSynced(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = gatewayv1.AddToScheme(scheme)
-
-	p := proxy.NewProxy()
-	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-	gwName := "test-gw"
-	secretName := state.ResourceNameForGateway(gwName)
-
-	server := &Server{
-		opts: Options{
-			DataplaneMode:             true,
-			DataplaneGatewayNamespace: "test-ns",
-			DataplaneGatewayName:      gwName,
-		},
-		proxy: p,
-	}
-
-	reconciler := &dataplaneSecretReconciler{
-		Client:               cl,
-		gatewayNamespace:     "test-ns",
-		secretName:           secretName,
-		applyDataplaneConfig: server.applyDataplaneConfig,
-	}
-
-	ctx := t.Context()
-	req := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-	}
-
-	res, err := reconciler.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("Reconcile returned error for missing secret: %v", err)
-	}
-	if res.Requeue {
-		t.Errorf("expected no requeue for missing secret")
-	}
-
-	if server.proxySynced.Load() {
-		t.Errorf("expected proxySynced to be false when Secret is missing")
 	}
 }
 
@@ -2183,15 +1983,7 @@ func TestDataplane_RoutesAndCertificates(t *testing.T) {
 		t.Fatalf("ComputeRevision failed: %v", err)
 	}
 
-	publishConfig := func(gw *gatewayv1.Gateway, cfg *state.DataplaneConfig) error {
-		name := state.ResourceNameForGateway(gw.Name)
-		return singlepod.PublishDataplaneConfig(ctx, env.Client, gw.Namespace, name, gw, cfg)
-	}
-	if err := publishConfig(gw, dpConfig); err != nil {
-		t.Fatalf("PublishDataplaneConfig failed: %v", err)
-	}
-
-	dp := testdataplane.StartDataplane(t, env, gwNamespace, gwName)
+	dp := testdataplane.StartDataplane(t, env, gwNamespace, gwName, testdataplane.WithInitialConfig(dpConfig))
 	initialPID := dp.PID
 
 	// 1. Assert proxy serves the compiled backend route
@@ -2313,8 +2105,8 @@ func TestDataplane_RoutesAndCertificates(t *testing.T) {
 		t.Fatalf("ComputeRevision 2 failed: %v", err)
 	}
 
-	if err := publishConfig(gw, dpConfig2); err != nil {
-		t.Fatalf("PublishDataplaneConfig 2 failed: %v", err)
+	if err := dp.Publish(ctx, dpConfig2); err != nil {
+		t.Fatalf("dp.Publish 2 failed: %v", err)
 	}
 
 	if err := dp.WaitApplied(ctx); err != nil {
@@ -2835,19 +2627,6 @@ func TestDataplane_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t 
 	}
 
 	gwName := "test-gw"
-	secretName := state.ResourceNameForGateway(gwName)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-		Data: map[string][]byte{
-			singlepod.DataplaneSecretDataKey: configBytes,
-		},
-	}
-
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 
 	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -2868,29 +2647,16 @@ func TestDataplane_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t 
 		proxy: p,
 	}
 
-	reconciler := &dataplaneSecretReconciler{
-		Client:               cl,
-		gatewayNamespace:     "test-ns",
-		secretName:           secretName,
-		applyDataplaneConfig: server.applyDataplaneConfig,
-	}
-
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	// 1. Reconcile Secret BEFORE StartProxyServers is invoked.
-	// This simulates a rollout where the config Secret already exists before the new pod's listeners are created.
-	req := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-	}
-	if _, err := reconciler.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+	// 1. Apply config BEFORE StartProxyServers is invoked.
+	// This simulates a rollout where the config arrives before the new pod's listeners are created.
+	if err := server.applyDataplaneConfig(configBytes); err != nil {
+		t.Fatalf("applyDataplaneConfig failed: %v", err)
 	}
 
-	// 2. Start proxy servers now (listeners created after secret sync).
+	// 2. Start proxy servers now (listeners created after config sync).
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- server.StartProxyServers(ctx)
@@ -2997,19 +2763,6 @@ func TestDataplane_HTTPS_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerSt
 	}
 
 	gwName := "test-gw"
-	secretName := state.ResourceNameForGateway(gwName)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-		Data: map[string][]byte{
-			singlepod.DataplaneSecretDataKey: configBytes,
-		},
-	}
-
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 
 	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -3031,25 +2784,12 @@ func TestDataplane_HTTPS_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerSt
 		proxy: p,
 	}
 
-	reconciler := &dataplaneSecretReconciler{
-		Client:               cl,
-		gatewayNamespace:     "test-ns",
-		secretName:           secretName,
-		applyDataplaneConfig: server.applyDataplaneConfig,
-	}
-
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	// 1. Reconcile Secret before StartProxyServers
-	req := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-	}
-	if _, err := reconciler.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+	// 1. Apply config before StartProxyServers
+	if err := server.applyDataplaneConfig(configBytes); err != nil {
+		t.Fatalf("applyDataplaneConfig failed: %v", err)
 	}
 
 	// 2. Start proxy servers
@@ -3191,7 +2931,7 @@ func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testin
 	}
 	_ = conn1.Close()
 
-	// 2. Now reconcile Secret enabling PROXY protocol
+	// 2. Now apply config enabling PROXY protocol
 	dpConfig := &state.DataplaneConfig{
 		GatewayName: gwKey,
 		Listeners: []state.InternalListener{
@@ -3205,32 +2945,9 @@ func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testin
 	if err != nil {
 		t.Fatalf("failed to marshal config: %v", err)
 	}
-	secretName := state.ResourceNameForGateway(gwName)
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-		Data: map[string][]byte{
-			singlepod.DataplaneSecretDataKey: configBytes,
-		},
-	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
-	reconciler := &dataplaneSecretReconciler{
-		Client:               cl,
-		gatewayNamespace:     "test-ns",
-		secretName:           secretName,
-		applyDataplaneConfig: server.applyDataplaneConfig,
-	}
 
-	req := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-	}
-	if _, err := reconciler.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+	if err := server.applyDataplaneConfig(configBytes); err != nil {
+		t.Fatalf("applyDataplaneConfig failed: %v", err)
 	}
 
 	// 3. Dial again with PROXY header: should now succeed with 200 OK
@@ -3332,7 +3049,6 @@ func TestDataplane_InvalidCIDRsRejectedAndNotStored(t *testing.T) {
 	p := proxy.NewProxy()
 
 	gwName := "test-gw"
-	secretName := state.ResourceNameForGateway(gwName)
 
 	server := &Server{
 		opts: Options{
@@ -3355,29 +3071,8 @@ func TestDataplane_InvalidCIDRsRejectedAndNotStored(t *testing.T) {
 		t.Fatalf("failed to marshal valid config: %v", err)
 	}
 
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "test-ns",
-			Name:      secretName,
-		},
-		Data: map[string][]byte{
-			singlepod.DataplaneSecretDataKey: validBytes,
-		},
-	}
-
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
-	reconciler := &dataplaneSecretReconciler{
-		Client:               cl,
-		gatewayNamespace:     "test-ns",
-		secretName:           secretName,
-		applyDataplaneConfig: server.applyDataplaneConfig,
-	}
-
-	req := ctrl.Request{
-		NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: secretName},
-	}
-	if _, err := reconciler.Reconcile(t.Context(), req); err != nil {
-		t.Fatalf("initial valid reconcile failed: %v", err)
+	if err := server.applyDataplaneConfig(validBytes); err != nil {
+		t.Fatalf("initial valid apply failed: %v", err)
 	}
 
 	// Verify options were stored
@@ -3388,7 +3083,7 @@ func TestDataplane_InvalidCIDRsRejectedAndNotStored(t *testing.T) {
 		t.Fatalf("unexpected stored options: %+v", opts)
 	}
 
-	// 2. Secret updated with invalid CIDR
+	// 2. Config updated with invalid CIDR
 	dpConfigInvalid := &state.DataplaneConfig{
 		GatewayName:               types.NamespacedName{Namespace: "test-ns", Name: gwName},
 		ProxyProtocol:             "enabled",
@@ -3400,15 +3095,10 @@ func TestDataplane_InvalidCIDRsRejectedAndNotStored(t *testing.T) {
 		t.Fatalf("failed to marshal invalid config: %v", err)
 	}
 
-	secret.Data[singlepod.DataplaneSecretDataKey] = invalidBytes
-	if err := cl.Update(t.Context(), secret); err != nil {
-		t.Fatalf("failed to update secret: %v", err)
-	}
-
-	// Reconcile should fail with an error
-	_, err = reconciler.Reconcile(t.Context(), req)
+	// Applying invalid CIDRs should fail with an error
+	err = server.applyDataplaneConfig(invalidBytes)
 	if err == nil {
-		t.Fatalf("expected Reconcile to fail for invalid CIDR, but succeeded")
+		t.Fatalf("expected applyDataplaneConfig to fail for invalid CIDR, but succeeded")
 	}
 
 	// Verify old valid options are preserved and invalid ones were not stored
