@@ -211,6 +211,40 @@ func TestSetupController_RequiresPodNamespace(t *testing.T) {
 	}
 }
 
+func TestSetupController_RequiresInternalAPIFlags(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "default")
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "missing all",
+			args: []string{},
+		},
+		{
+			name: "missing tls files",
+			args: []string{"--internal-api-bind-address=:8443"},
+		},
+		{
+			name: "missing key file",
+			args: []string{"--internal-api-bind-address=:8443", "--internal-api-tls-cert-file=/etc/cert.pem"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Setup(tc.args)
+			if err == nil {
+				t.Fatalf("expected error when internal API flags are missing, got nil")
+			}
+			for _, flag := range []string{"--internal-api-bind-address", "--internal-api-tls-cert-file", "--internal-api-tls-key-file"} {
+				if !strings.Contains(err.Error(), flag) {
+					t.Errorf("expected error to name %s, got %v", flag, err)
+				}
+			}
+		})
+	}
+}
+
 func TestFlagsGolden(t *testing.T) {
 	t.Setenv("GARI_IMAGE", "")
 	t.Setenv("CERTSERVER_ADDRESS", "")
@@ -297,6 +331,9 @@ func TestSetupController_CertserverRegistered(t *testing.T) {
 	}
 
 	opts, err := Setup([]string{
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
 		"--certserver-address=127.0.0.1:8443",
 		"--certserver-token-path=" + tokenFile,
 	})
@@ -318,7 +355,11 @@ func TestSetupController_CertserverUnregistered(t *testing.T) {
 	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
 	t.Setenv("CERTSERVER_TOKEN_PATH", "")
 
-	opts, err := Setup([]string{})
+	opts, err := Setup([]string{
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
+	})
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
@@ -336,6 +377,9 @@ func TestSetupController_CertserverValidationErrors(t *testing.T) {
 
 	// 1. Missing token
 	_, err := Setup([]string{
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
 		"--certserver-address=127.0.0.1:8443",
 	})
 	if err == nil {
@@ -347,6 +391,9 @@ func TestSetupController_CertserverValidationErrors(t *testing.T) {
 
 	// 2. Missing address
 	_, err = Setup([]string{
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
 		"--certserver-token-path=/path/to/token",
 	})
 	if err == nil {
@@ -359,8 +406,13 @@ func TestSetupController_CertserverValidationErrors(t *testing.T) {
 
 func TestSetup_ModeSelection(t *testing.T) {
 	t.Setenv("POD_NAMESPACE", "default")
+	ctrlArgs := []string{
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
+	}
 	// 1. Controller mode by default
-	optsCtrl, err := Setup([]string{})
+	optsCtrl, err := Setup(ctrlArgs)
 	if err != nil {
 		t.Fatalf("Setup failed for controller mode: %v", err)
 	}
@@ -369,7 +421,7 @@ func TestSetup_ModeSelection(t *testing.T) {
 	}
 
 	// 2. Explicit --dataplane-mode=false stays in controller mode
-	optsCtrlExplicit, err := Setup([]string{"--dataplane-mode=false"})
+	optsCtrlExplicit, err := Setup(append([]string{"--dataplane-mode=false"}, ctrlArgs...))
 	if err != nil {
 		t.Fatalf("Setup failed for --dataplane-mode=false: %v", err)
 	}

@@ -868,15 +868,11 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
-	// Build the combined DataplanePublisher for the controller. When the push
-	// server is enabled, configurations are pushed directly to data planes over
-	// gRPC streams.
+	// When the internal API push server is enabled, configurations are pushed
+	// directly to data planes over gRPC streams.
 	var dataplanePublisher state.DataplanePublisher
-	if provider, ok := s.opts.AddressProvider.(state.DataplanePublisher); ok {
-		dataplanePublisher = provider
-	}
 	if s.pushServer != nil {
-		dataplanePublisher = state.NewMultiDataplanePublisher(dataplanePublisher, s.pushServer)
+		dataplanePublisher = s.pushServer
 	}
 
 	return controller.RegisterReconcilers(mgr, s.state, s.proxy, controller.ReconcilerOptions{

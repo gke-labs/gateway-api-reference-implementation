@@ -154,9 +154,9 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, proxyServer *proxy.P
 			st.SetDataplanePublisher(dataplanePublisher)
 		} else if proxyServer != nil {
 			// When a dataplanePublisher is configured, data planes run as external pods
-			// and receive configuration updates through that publisher (via Secrets or
-			// gRPC push streams). The in-process proxy server is only used in all-in-one
-			// mode when no external data-plane publisher is configured.
+			// and receive configuration updates through that publisher (via gRPC push streams).
+			// The in-process proxy server is only used in all-in-one mode when no external
+			// data-plane publisher is configured.
 			st.SetProxy(proxyServer)
 		}
 

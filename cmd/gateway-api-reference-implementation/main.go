@@ -154,6 +154,10 @@ func Setup(args []string) (gari.Options, error) {
 		return opts, errors.New("POD_NAMESPACE environment variable is required")
 	}
 
+	if opts.InternalAPIBindAddress == "" || opts.InternalAPITLSCertFile == "" || opts.InternalAPITLSKeyFile == "" {
+		return opts, errors.New("--internal-api-bind-address, --internal-api-tls-cert-file, and --internal-api-tls-key-file are required")
+	}
+
 	opts.ProxyAddr = ""
 	opts.ProxyHTTPSAddr = ""
 	opts.ProxyHTTP3Addr = ""

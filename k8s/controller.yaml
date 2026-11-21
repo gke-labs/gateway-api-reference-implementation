@@ -16,13 +16,13 @@ rules:
   resources: ["tlsroutes", "grpcroutes", "tcproutes", "udproutes"]
   verbs: ["get", "list", "watch"]
 - apiGroups: [""]
-  resources: ["services", "serviceaccounts", "secrets"]
+  resources: ["services", "serviceaccounts"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
-  resources: ["namespaces", "endpoints"]
+  resources: ["namespaces", "endpoints", "secrets"]
   verbs: ["get", "list", "watch"]
 # The controller creates and patches per-Gateway ConfigMaps to copy the trust bundle
 # into the Gateway namespace for data planes connecting to the internal API.

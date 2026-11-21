@@ -215,15 +215,12 @@ func WithAPIReader(reader client.Reader) Option {
 	}
 }
 
-// AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
+// AddressProvider manages per-Gateway ServiceAccounts, Deployments, and Services.
+// Data planes connect to the controller's internal API push stream to receive configuration.
 //
 // Readiness approximation: reports ready when the per-Gateway Deployment has at least one ready/available
-// replica and addresses are assigned. Because data-plane pods only pass readiness probes after applying a
-// configuration Secret, ready guarantees a replica has applied a config.
-//
-// Gap: ready means "a replica has applied a config", not necessarily "the current configuration applied". The Secret-based
-// config distribution path has no acknowledgement channel carrying the applied configuration revision back from
-// data-plane replicas to the controller, so the provider cannot verify that the latest config is actively being served.
+// replica and addresses are assigned. Data planes pass readiness probes once they have received and applied
+// configuration from the internal API stream.
 type AddressProvider struct {
 	client         client.Client
 	apiReader      client.Reader
@@ -1273,6 +1270,7 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 }
 
 // PublishDataplaneConfig writes or deletes a data plane's config Secret.
+// It is used by localgateway (localgateway/pkg/dnsconfig) to publish DNS data-plane configuration.
 // It guarantees that it applies with the provider's field owner, it refuses an
 // object that another owner holds, and it deletes the object when the payload is nil.
 func PublishDataplaneConfig(ctx context.Context, cl client.Client, namespace, name string, owner client.Object, payload any) error {
