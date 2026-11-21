@@ -29,6 +29,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	compute "google.golang.org/api/compute/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -70,6 +71,10 @@ func getConditionFromStatus(status *gatewayv1.GatewayStatus, condType string) *m
 }
 
 func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nodeName, ip string, extraConditions []corev1.PodCondition) *corev1.Pod {
+	if err := spiffe.EnsureCredentials(t.Context(), c, "default"); err != nil {
+		t.Fatalf("ensuring credentials: %v", err)
+	}
+
 	drainVol := corev1ac.Volume().
 		WithName("drain-volume").
 		WithEmptyDir(corev1ac.EmptyDirVolumeSource().WithMedium(corev1.StorageMediumMemory))
@@ -80,6 +85,7 @@ func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nod
 
 	p := singlepod.NewAddressProvider(
 		c,
+		"default",
 		singlepod.WithExtraReadinessGates(registrar.LoadBalancerReadyGate),
 		singlepod.WithPreStopCommand(preStopCmd...),
 		singlepod.WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{drainVol}, []*corev1ac.VolumeMountApplyConfiguration{drainMount}),
@@ -1389,8 +1395,13 @@ func TestGateway_PeriodicResyncPrunesOrphanedEndpoints(t *testing.T) {
 		},
 	})
 
+	if err := spiffe.EnsureCredentials(t.Context(), env.Client, "default"); err != nil {
+		t.Fatalf("ensuring credentials: %v", err)
+	}
+
 	ap := singlepod.NewAddressProvider(
 		env.Client,
+		"default",
 		singlepod.WithExtraReadinessGates(registrar.LoadBalancerReadyGate),
 		singlepod.WithTerminationGracePeriodSeconds(60),
 	)
@@ -1900,8 +1911,13 @@ func TestGateway_DeleteDetachesEndpoints_EnvTest(t *testing.T) {
 		},
 	})
 
+	if err := spiffe.EnsureCredentials(t.Context(), env.Client, "default"); err != nil {
+		t.Fatalf("ensuring credentials: %v", err)
+	}
+
 	ap := singlepod.NewAddressProvider(
 		env.Client,
+		"default",
 		singlepod.WithExtraReadinessGates(registrar.LoadBalancerReadyGate),
 		singlepod.WithTerminationGracePeriodSeconds(60),
 	)

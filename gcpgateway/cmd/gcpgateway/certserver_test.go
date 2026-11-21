@@ -42,6 +42,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -281,12 +282,16 @@ func TestSetupController_CertserverIntegration(t *testing.T) {
 	// 5. Initialize controller with certserver flags
 	createBundleConfigMap(t, env.Client)
 	fakeGCP := gcp.NewFakeComputeClient()
+	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
 		"--neg-prefix=gcpgw",
 		"--project=my-project",
 		"--zones=us-central1-a",
 		"--fake-compute",
+		"--internal-api-bind-address=127.0.0.1:0",
+		"--internal-api-tls-cert-file=" + certFile,
+		"--internal-api-tls-key-file=" + keyFile,
 		fmt.Sprintf("--certserver-address=%s", lis.Addr().String()),
 		fmt.Sprintf("--certserver-ca-bundle-path=%s", caBundleFile),
 		fmt.Sprintf("--certserver-token-path=%s", tokenFile),
@@ -363,11 +368,11 @@ func TestSetupController_CertserverIntegration(t *testing.T) {
 		t.Errorf("expected at least 2 calls to fake source server (pending then issued), got %d", fakeSrv.calls.Load())
 	}
 
-	// 7. Verify per-Gateway Secret was created with certificates
+	// 7. Verify no per-Gateway config Secret was created
 	secretName := state.ResourceNameForGateway(gwName)
 	var sec corev1.Secret
-	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: secretName}, &sec); err != nil {
-		t.Fatalf("reading Gateway dataplane secret %s: %v", secretName, err)
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gwNamespace, Name: secretName}, &sec); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no Gateway dataplane secret %s, got: %v", secretName, err)
 	}
 
 	// 8. Verify no tokens or private keys are logged
@@ -427,6 +432,7 @@ func TestSetupController_CertserverUnregistered(t *testing.T) {
 
 	createBundleConfigMap(t, env.Client)
 	fakeGCP := gcp.NewFakeComputeClient()
+	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	// Run SetupController WITHOUT any certserver flags
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
@@ -435,6 +441,9 @@ func TestSetupController_CertserverUnregistered(t *testing.T) {
 		"--zones=us-central1-a",
 		"--controller-name=gke-labs.io/gcpgateway-unreg",
 		"--fake-compute",
+		"--internal-api-bind-address=127.0.0.1:0",
+		"--internal-api-tls-cert-file=" + certFile,
+		"--internal-api-tls-key-file=" + keyFile,
 	}, fakeGCP)
 	if err != nil {
 		t.Fatalf("SetupController failed: %v", err)

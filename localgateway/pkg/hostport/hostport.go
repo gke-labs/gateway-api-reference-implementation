@@ -59,9 +59,12 @@ type HostPortAddressProvider struct {
 // New creates a new HostPortAddressProvider wrapping a singlepod.AddressProvider
 // configured with WithNoService() and the host-port Deployment mutator.
 // The reader is required for uncached reads of Pods, ReplicaSets, and Nodes.
-func New(client client.Client, reader client.Reader, options ...singlepod.Option) (*HostPortAddressProvider, error) {
+func New(client client.Client, reader client.Reader, controllerNamespace string, options ...singlepod.Option) (*HostPortAddressProvider, error) {
 	if reader == nil {
 		return nil, fmt.Errorf("reader is required for HostPortAddressProvider")
+	}
+	if controllerNamespace == "" {
+		return nil, fmt.Errorf("controllerNamespace is required for HostPortAddressProvider")
 	}
 	wrappedOptions := make([]singlepod.Option, 0, len(options)+2)
 	wrappedOptions = append(wrappedOptions, options...)
@@ -71,7 +74,7 @@ func New(client client.Client, reader client.Reader, options ...singlepod.Option
 	)
 	return &HostPortAddressProvider{
 		reader:  reader,
-		wrapped: singlepod.NewAddressProvider(client, wrappedOptions...),
+		wrapped: singlepod.NewAddressProvider(client, controllerNamespace, wrappedOptions...),
 	}, nil
 }
 

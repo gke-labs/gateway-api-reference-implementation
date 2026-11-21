@@ -31,7 +31,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,7 +40,6 @@ import (
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
-	rbacv1ac "k8s.io/client-go/applyconfigurations/rbac/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -217,15 +215,12 @@ func WithAPIReader(reader client.Reader) Option {
 	}
 }
 
-// AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
+// AddressProvider manages per-Gateway ServiceAccounts, Deployments, and Services.
+// Data planes connect to the controller's internal API push stream to receive configuration.
 //
 // Readiness approximation: reports ready when the per-Gateway Deployment has at least one ready/available
-// replica and addresses are assigned. Because data-plane pods only pass readiness probes after applying a
-// configuration Secret, ready guarantees a replica has applied a config.
-//
-// Gap: ready means "a replica has applied a config", not necessarily "the current configuration applied". The Secret-based
-// config distribution path has no acknowledgement channel carrying the applied configuration revision back from
-// data-plane replicas to the controller, so the provider cannot verify that the latest config is actively being served.
+// replica and addresses are assigned. Data planes pass readiness probes once they have received and applied
+// configuration from the internal API stream.
 type AddressProvider struct {
 	client         client.Client
 	apiReader      client.Reader
@@ -254,21 +249,8 @@ type AddressProvider struct {
 	acmeChallengeAudience         string
 	acmeChallengeTokenExpiration  int64
 
-	// dataplaneConfigFromInternalAPI indicates whether data planes receive configuration directly from the controller's internal API.
-	dataplaneConfigFromInternalAPI bool
-
 	// controllerNamespace is the namespace where the controller runs, used to locate the trust bundle and address the internal API.
 	controllerNamespace string
-}
-
-// WithDataplaneConfigFromInternalAPI configures the AddressProvider to provide data planes
-// with the trust bundle, token, and flags to receive configuration directly from the
-// controller's internal API instead of reading a Secret from the Kubernetes API.
-func WithDataplaneConfigFromInternalAPI(controllerNamespace string) Option {
-	return func(p *AddressProvider) {
-		p.dataplaneConfigFromInternalAPI = true
-		p.controllerNamespace = controllerNamespace
-	}
 }
 
 // WithACMEChallengeUpstreamURL configures the upstream certificate server URL for forwarding ACME HTTP-01 challenges.
@@ -364,10 +346,11 @@ func (p *AddressProvider) acmeTokenPath() string {
 }
 
 // NewAddressProvider creates a new singlepod AddressProvider.
-func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
+func NewAddressProvider(c client.Client, controllerNamespace string, opts ...Option) *AddressProvider {
 	p := &AddressProvider{
-		client:         c,
-		dataplaneImage: DefaultDataplaneImage,
+		client:              c,
+		controllerNamespace: controllerNamespace,
+		dataplaneImage:      DefaultDataplaneImage,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -513,59 +496,39 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
-	// Reconcile per-Gateway trust bundle ConfigMap in Gateway namespace when internal API is enabled
-	if p.dataplaneConfigFromInternalAPI {
-		var sourceConfigMap corev1.ConfigMap
-		if err := p.client.Get(ctx, types.NamespacedName{Namespace: p.controllerNamespace, Name: spiffe.BundleConfigMapName}, &sourceConfigMap); err != nil {
-			return nil, state.GatewayReadiness{}, fmt.Errorf("reading bundle configmap %s/%s: %w", p.controllerNamespace, spiffe.BundleConfigMapName, err)
-		}
-		bundleData, ok := sourceConfigMap.Data[spiffe.BundleDataKey]
-		if !ok || bundleData == "" {
-			return nil, state.GatewayReadiness{}, fmt.Errorf("bundle configmap %s/%s missing key %s", p.controllerNamespace, spiffe.BundleConfigMapName, spiffe.BundleDataKey)
-		}
-
-		var existingConfigMap corev1.ConfigMap
-		err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingConfigMap)
-		if err == nil {
-			if !isOwnedByGateway(&existingConfigMap, gw) {
-				return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
-					Message: fmt.Sprintf("conflict: existing ConfigMap %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-				}
-			}
-		} else if !apierrors.IsNotFound(err) {
-			return nil, state.GatewayReadiness{}, err
-		}
-
-		configMapApply := corev1ac.ConfigMap(name, gwNamespace).
-			WithOwnerReferences(ownerRef).
-			WithLabels(labels).
-			WithData(map[string]string{
-				spiffe.BundleDataKey: bundleData,
-			})
-		if len(annotations) > 0 {
-			configMapApply.WithAnnotations(annotations)
-		}
-		if err := p.client.Apply(ctx, configMapApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-			return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply ConfigMap for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
-		}
-	} else {
-		// 2. Reconcile per-Gateway Role and RoleBinding in Gateway namespace
-		if err := p.reconcileRoleAndRoleBinding(ctx, gw, name, ownerRef, labels, annotations); err != nil {
-			return nil, state.GatewayReadiness{}, err
-		}
+	// 2. Reconcile per-Gateway trust bundle ConfigMap in Gateway namespace
+	var sourceConfigMap corev1.ConfigMap
+	if err := p.client.Get(ctx, types.NamespacedName{Namespace: p.controllerNamespace, Name: spiffe.BundleConfigMapName}, &sourceConfigMap); err != nil {
+		return nil, state.GatewayReadiness{}, fmt.Errorf("reading bundle configmap %s/%s: %w", p.controllerNamespace, spiffe.BundleConfigMapName, err)
+	}
+	bundleData, ok := sourceConfigMap.Data[spiffe.BundleDataKey]
+	if !ok || bundleData == "" {
+		return nil, state.GatewayReadiness{}, fmt.Errorf("bundle configmap %s/%s missing key %s", p.controllerNamespace, spiffe.BundleConfigMapName, spiffe.BundleDataKey)
 	}
 
-	// 2c. Verify ownership of existing Secret in Gateway namespace
-	var existingSecret corev1.Secret
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSecret)
+	var existingConfigMap corev1.ConfigMap
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingConfigMap)
 	if err == nil {
-		if !isOwnedByGateway(&existingSecret, gw) {
+		if !isOwnedByGateway(&existingConfigMap, gw) {
 			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
-				Message: fmt.Sprintf("conflict: existing Secret %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+				Message: fmt.Sprintf("conflict: existing ConfigMap %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return nil, state.GatewayReadiness{}, err
+	}
+
+	configMapApply := corev1ac.ConfigMap(name, gwNamespace).
+		WithOwnerReferences(ownerRef).
+		WithLabels(labels).
+		WithData(map[string]string{
+			spiffe.BundleDataKey: bundleData,
+		})
+	if len(annotations) > 0 {
+		configMapApply.WithAnnotations(annotations)
+	}
+	if err := p.client.Apply(ctx, configMapApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply ConfigMap for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 3. Reconcile per-Gateway Deployment in Gateway namespace
@@ -611,18 +574,16 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			args = append(args, fmt.Sprintf("--acme-challenge-ca-bundle-path=%s", p.acmeChallengeCABundlePath))
 		}
 	}
-	if p.dataplaneConfigFromInternalAPI {
-		host, err := spiffe.ServiceClusterDNSName(spiffe.ControllerServiceName, p.controllerNamespace)
-		if err != nil {
-			return nil, state.GatewayReadiness{}, fmt.Errorf("building internal API address: %w", err)
-		}
-		internalAPIAddress := net.JoinHostPort(host, strconv.Itoa(push.InternalAPIPort))
-		args = append(args,
-			fmt.Sprintf("--internal-api-address=%s", internalAPIAddress),
-			fmt.Sprintf("--internal-api-ca-file=%s", internalAPICAFilePath),
-			fmt.Sprintf("--internal-api-token-file=%s", internalAPITokenPath),
-		)
+	host, err := spiffe.ServiceClusterDNSName(spiffe.ControllerServiceName, p.controllerNamespace)
+	if err != nil {
+		return nil, state.GatewayReadiness{}, fmt.Errorf("building internal API address: %w", err)
 	}
+	internalAPIAddress := net.JoinHostPort(host, strconv.Itoa(push.InternalAPIPort))
+	args = append(args,
+		fmt.Sprintf("--internal-api-address=%s", internalAPIAddress),
+		fmt.Sprintf("--internal-api-ca-file=%s", internalAPICAFilePath),
+		fmt.Sprintf("--internal-api-token-file=%s", internalAPITokenPath),
+	)
 
 	image := p.dataplaneImage
 	if image == "" {
@@ -861,37 +822,35 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		)
 	}
 
-	if p.dataplaneConfigFromInternalAPI {
-		volumeMounts = append(volumeMounts,
-			corev1ac.VolumeMount().
-				WithName(internalAPIBundleVolumeName).
-				WithMountPath(internalAPIBundleMountPath).
-				WithReadOnly(true),
-			corev1ac.VolumeMount().
-				WithName(internalAPITokenVolumeName).
-				WithMountPath(filepath.Dir(internalAPITokenPath)).
-				WithReadOnly(true),
-		)
+	volumeMounts = append(volumeMounts,
+		corev1ac.VolumeMount().
+			WithName(internalAPIBundleVolumeName).
+			WithMountPath(internalAPIBundleMountPath).
+			WithReadOnly(true),
+		corev1ac.VolumeMount().
+			WithName(internalAPITokenVolumeName).
+			WithMountPath(filepath.Dir(internalAPITokenPath)).
+			WithReadOnly(true),
+	)
 
-		volumes = append(volumes,
-			corev1ac.Volume().
-				WithName(internalAPIBundleVolumeName).
-				WithConfigMap(corev1ac.ConfigMapVolumeSource().
-					WithName(name),
-				),
-			corev1ac.Volume().
-				WithName(internalAPITokenVolumeName).
-				WithProjected(corev1ac.ProjectedVolumeSource().
-					WithSources(corev1ac.VolumeProjection().
-						WithServiceAccountToken(corev1ac.ServiceAccountTokenProjection().
-							WithAudience(push.DefaultAudience).
-							WithExpirationSeconds(internalAPITokenExpirationSeconds).
-							WithPath(filepath.Base(internalAPITokenPath)),
-						),
+	volumes = append(volumes,
+		corev1ac.Volume().
+			WithName(internalAPIBundleVolumeName).
+			WithConfigMap(corev1ac.ConfigMapVolumeSource().
+				WithName(name),
+			),
+		corev1ac.Volume().
+			WithName(internalAPITokenVolumeName).
+			WithProjected(corev1ac.ProjectedVolumeSource().
+				WithSources(corev1ac.VolumeProjection().
+					WithServiceAccountToken(corev1ac.ServiceAccountTokenProjection().
+						WithAudience(push.DefaultAudience).
+						WithExpirationSeconds(internalAPITokenExpirationSeconds).
+						WithPath(filepath.Base(internalAPITokenPath)),
 					),
 				),
-		)
-	}
+			),
+	)
 
 	containerApply.WithVolumeMounts(volumeMounts...)
 	if len(p.preStopCommand) > 0 {
@@ -1247,83 +1206,6 @@ func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
 	return []gatewayv1.AddressType{gatewayv1.IPAddressType, gatewayv1.HostnameAddressType}
 }
 
-// reconcileRoleAndRoleBinding creates or updates the per-Gateway Role and RoleBinding
-// granting the data plane permissions to read its configuration Secret.
-func (p *AddressProvider) reconcileRoleAndRoleBinding(
-	ctx context.Context,
-	gw *gatewayv1.Gateway,
-	name string,
-	ownerRef *metav1ac.OwnerReferenceApplyConfiguration,
-	labels map[string]string,
-	annotations map[string]string,
-) error {
-	gwNamespace := gw.Namespace
-
-	// Reconcile per-Gateway Role in Gateway namespace
-	var existingRole rbacv1.Role
-	err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRole)
-	if err == nil {
-		if !isOwnedByGateway(&existingRole, gw) {
-			return &controller.OwnershipConflictError{
-				Message: fmt.Sprintf("conflict: existing Role %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	roleApply := rbacv1ac.Role(name, gwNamespace).
-		WithOwnerReferences(ownerRef).
-		WithLabels(labels).
-		WithRules(rbacv1ac.PolicyRule().
-			WithAPIGroups("").
-			WithResources("secrets").
-			WithResourceNames(name).
-			WithVerbs("get", "list", "watch"),
-		)
-	if len(annotations) > 0 {
-		roleApply.WithAnnotations(annotations)
-	}
-	if err := p.client.Apply(ctx, roleApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return fmt.Errorf("failed to apply Role for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
-	}
-
-	// Reconcile per-Gateway RoleBinding in Gateway namespace
-	var existingRB rbacv1.RoleBinding
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRB)
-	if err == nil {
-		if !isOwnedByGateway(&existingRB, gw) {
-			return &controller.OwnershipConflictError{
-				Message: fmt.Sprintf("conflict: existing RoleBinding %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	rbApply := rbacv1ac.RoleBinding(name, gwNamespace).
-		WithOwnerReferences(ownerRef).
-		WithLabels(labels).
-		WithRoleRef(rbacv1ac.RoleRef().
-			WithAPIGroup(rbacv1.GroupName).
-			WithKind("Role").
-			WithName(name),
-		).
-		WithSubjects(rbacv1ac.Subject().
-			WithKind("ServiceAccount").
-			WithName(name).
-			WithNamespace(gwNamespace),
-		)
-	if len(annotations) > 0 {
-		rbApply.WithAnnotations(annotations)
-	}
-	if err := p.client.Apply(ctx, rbApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return fmt.Errorf("failed to apply RoleBinding for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
-	}
-
-	return nil
-}
-
 func managedByPredicate() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		labels := obj.GetLabels()
@@ -1331,7 +1213,7 @@ func managedByPredicate() predicate.Predicate {
 	})
 }
 
-// SetupWatches registers watches on managed Services and Deployments.
+// SetupWatches registers watches on managed Services, Deployments, and ConfigMaps.
 func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error {
 	var scheme *runtime.Scheme
 	var mapper meta.RESTMapper
@@ -1359,46 +1241,36 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 	}
 	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
 
-	if p.dataplaneConfigFromInternalAPI {
-		bldr.Watches(&corev1.ConfigMap{}, ownerHandler, builder.WithPredicates(pred))
-		// This watch uses the manager's ConfigMap informer and the predicate limits it to the bundle.
-		bldr.Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-			var gatewayList gatewayv1.GatewayList
-			if err := p.client.List(ctx, &gatewayList); err != nil {
-				// A failed List is logged and the change is then lost until the next resync,
-				// because EnqueueRequestsFromMapFunc cannot return an error.
-				ctrl.LoggerFrom(ctx).Error(err, "failed to list Gateways on bundle ConfigMap change",
-					"namespace", p.controllerNamespace, "name", spiffe.BundleConfigMapName)
-				return nil
+	bldr.Watches(&corev1.ConfigMap{}, ownerHandler, builder.WithPredicates(pred))
+	// This watch uses the manager's ConfigMap informer and the predicate limits it to the bundle.
+	bldr.Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+		var gatewayList gatewayv1.GatewayList
+		if err := p.client.List(ctx, &gatewayList); err != nil {
+			// A failed List is logged and the change is then lost until the next resync,
+			// because EnqueueRequestsFromMapFunc cannot return an error.
+			ctrl.LoggerFrom(ctx).Error(err, "failed to list Gateways on bundle ConfigMap change",
+				"namespace", p.controllerNamespace, "name", spiffe.BundleConfigMapName)
+			return nil
+		}
+		requests := make([]reconcile.Request, len(gatewayList.Items))
+		for i := range gatewayList.Items {
+			requests[i] = reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: gatewayList.Items[i].Namespace,
+					Name:      gatewayList.Items[i].Name,
+				},
 			}
-			requests := make([]reconcile.Request, len(gatewayList.Items))
-			for i := range gatewayList.Items {
-				requests[i] = reconcile.Request{
-					NamespacedName: types.NamespacedName{
-						Namespace: gatewayList.Items[i].Namespace,
-						Name:      gatewayList.Items[i].Name,
-					},
-				}
-			}
-			return requests
-		}), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-			return obj.GetNamespace() == p.controllerNamespace && obj.GetName() == spiffe.BundleConfigMapName
-		})))
-	}
+		}
+		return requests
+	}), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		return obj.GetNamespace() == p.controllerNamespace && obj.GetName() == spiffe.BundleConfigMapName
+	})))
 
 	return nil
 }
 
-// PublishDataplaneConfig writes the Gateway's compiled data-plane config to its per-Gateway Secret.
-func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *state.DataplaneConfig) error {
-	if p.client == nil || gw == nil {
-		return nil
-	}
-	name := state.ResourceNameForGateway(gw.Name)
-	return PublishDataplaneConfig(ctx, p.client, gw.Namespace, name, gw, config)
-}
-
 // PublishDataplaneConfig writes or deletes a data plane's config Secret.
+// It is used by localgateway (localgateway/pkg/dnsconfig) to publish DNS data-plane configuration.
 // It guarantees that it applies with the provider's field owner, it refuses an
 // object that another owner holds, and it deletes the object when the payload is nil.
 func PublishDataplaneConfig(ctx context.Context, cl client.Client, namespace, name string, owner client.Object, payload any) error {
@@ -1510,16 +1382,8 @@ func PublishDataplaneConfig(ctx context.Context, cl client.Client, namespace, na
 	return nil
 }
 
-// WaitApplied implements state.DataplanePublisher. A Secret carries no reply,
-// so WaitApplied returns a result that says no data plane reports through this
-// publisher. The planned removal of the Secret path removes this case.
-func (p *AddressProvider) WaitApplied(ctx context.Context, gateway *gatewayv1.Gateway, revision string) (state.PublishResult, error) {
-	return state.PublishResult{}, nil
-}
-
 var (
 	_ controller.AddressProvider     = (*AddressProvider)(nil)
 	_ controller.AddressWatcher      = (*AddressProvider)(nil)
 	_ controller.AddressTypeProvider = (*AddressProvider)(nil)
-	_ state.DataplanePublisher       = (*AddressProvider)(nil)
 )

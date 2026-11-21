@@ -218,10 +218,6 @@ type Options struct {
 	// and applies updates directly to the proxy, without running state computation.
 	DataplaneMode bool
 
-	// DataplaneConfigFromInternalAPI enables the provisioner to configure data planes
-	// to receive configuration directly from the controller's internal API.
-	DataplaneConfigFromInternalAPI bool
-
 	// DataplaneGatewayNamespace is the namespace of the Gateway in DataplaneMode.
 	DataplaneGatewayNamespace string
 
@@ -872,17 +868,11 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
-	// Build the combined DataplanePublisher for the controller. In singlepod mode,
-	// AddressProvider writes configurations to per-Gateway Secrets. When the push
-	// server is enabled, configurations are also pushed directly to data planes over
-	// gRPC streams. NewMultiDataplanePublisher multiplexes to both publishers so that
-	// both paths carry the exact same configuration and revision.
+	// When the internal API push server is enabled, configurations are pushed
+	// directly to data planes over gRPC streams.
 	var dataplanePublisher state.DataplanePublisher
-	if provider, ok := s.opts.AddressProvider.(state.DataplanePublisher); ok {
-		dataplanePublisher = provider
-	}
 	if s.pushServer != nil {
-		dataplanePublisher = state.NewMultiDataplanePublisher(dataplanePublisher, s.pushServer)
+		dataplanePublisher = s.pushServer
 	}
 
 	return controller.RegisterReconcilers(mgr, s.state, s.proxy, controller.ReconcilerOptions{
