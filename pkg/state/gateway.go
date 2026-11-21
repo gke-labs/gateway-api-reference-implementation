@@ -25,7 +25,6 @@ import (
 	"strings"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -578,12 +577,8 @@ func (ir *InternalRoute) MatchHostnameScore(host string) (bool, int, int) {
 }
 
 // ErrorState represents an error that should be surfaced to the user.
-// It includes both the API condition for status reporting and the HTTP response details for the proxy.
+// It includes the HTTP response details for the proxy.
 type ErrorState struct {
-	// Condition is the status condition to be reported in the API.
-	// This provides a machine-readable reason for the error.
-	Condition metav1.Condition
-
 	// HTTPStatusCode is the status code to return in the HTTP response.
 	// This is the "user-facing" status code.
 	HTTPStatusCode int

@@ -16,11 +16,57 @@ package state
 
 import (
 	"cmp"
+	"net/http"
 	"slices"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
+
+// ConditionError represents a compilation error that causes a condition to be False.
+type ConditionError struct {
+	Type    string
+	Reason  string
+	Message string
+}
+
+func (e *ConditionError) Error() string {
+	return e.Message
+}
+
+func (e *ConditionError) toErrorState() *ErrorState {
+	if e == nil {
+		return nil
+	}
+	return &ErrorState{
+		HTTPStatusCode: http.StatusInternalServerError,
+		HTTPMessage:    e.Message,
+	}
+}
+
+// buildResolvedRefsCondition constructs a RouteConditionResolvedRefs condition from collected errors.
+func buildResolvedRefsCondition(errs []*ConditionError, generation int64) metav1.Condition {
+	if len(errs) == 0 {
+		return NewCondition(
+			string(gatewayv1.RouteConditionResolvedRefs),
+			metav1.ConditionTrue,
+			string(gatewayv1.RouteReasonResolvedRefs),
+			"All references resolved",
+			generation,
+		)
+	}
+	condType := errs[0].Type
+	if condType == "" {
+		condType = string(gatewayv1.RouteConditionResolvedRefs)
+	}
+	return NewCondition(
+		condType,
+		metav1.ConditionFalse,
+		errs[0].Reason,
+		errs[0].Message,
+		generation,
+	)
+}
 
 // NewCondition constructs a metav1.Condition with the current transition time.
 func NewCondition(condType string, status metav1.ConditionStatus, reason, message string, observedGeneration int64) metav1.Condition {

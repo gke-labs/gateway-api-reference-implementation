@@ -79,13 +79,7 @@ func CompileHTTPRoute(
 		route.Generation,
 	)
 
-	resolvedRefsCondition := NewCondition(
-		string(gatewayv1.RouteConditionResolvedRefs),
-		metav1.ConditionTrue,
-		string(gatewayv1.RouteReasonResolvedRefs),
-		"All references resolved",
-		route.Generation,
-	)
+	var refErrors []*ConditionError
 
 	var hostnames []string
 	for _, h := range route.Spec.Hostnames {
@@ -179,28 +173,20 @@ func CompileHTTPRoute(
 
 			case gatewayv1.HTTPRouteFilterRequestMirror:
 				if filter.RequestMirror != nil {
-					mirror, validationErr, refErr := compileRequestMirrorFilter(
+					mirror, filterErr, refErr := compileRequestMirrorFilter(
 						filter.RequestMirror,
 						"HTTPRoute",
 						route.Namespace,
-						route.Generation,
 						services,
 						backendTLSPolicies,
 						configMaps,
 						refValidator,
 					)
-					if validationErr != nil {
-						if validationCondition.Status == metav1.ConditionTrue {
-							validationCondition = validationErr.Condition
-						}
-						if iRule.Error == nil {
-							iRule.Error = validationErr
-						}
+					if filterErr != "" {
+						recordRuleValidationError(&validationCondition, &iRule, filterErr, route.Generation)
 					}
 					if refErr != nil {
-						if resolvedRefsCondition.Status == metav1.ConditionTrue {
-							resolvedRefsCondition = refErr.Condition
-						}
+						refErrors = append(refErrors, refErr)
 					}
 					if mirror != nil {
 						iRule.Mirrors = append(iRule.Mirrors, *mirror)
@@ -298,18 +284,15 @@ func CompileHTTPRoute(
 					backendRef.BackendObjectReference,
 					"HTTPRoute",
 					route.Namespace,
-					route.Generation,
 					services,
 					backendTLSPolicies,
 					configMaps,
 					refValidator,
 				)
 				if refErr != nil {
-					if resolvedRefsCondition.Status == metav1.ConditionTrue {
-						resolvedRefsCondition = refErr.Condition
-					}
+					refErrors = append(refErrors, refErr)
 					if iRule.Error == nil {
-						iRule.Error = refErr
+						iRule.Error = refErr.toErrorState()
 					}
 					break
 				}
@@ -360,6 +343,7 @@ func CompileHTTPRoute(
 		compiledRules = append(compiledRules, iRule)
 	}
 
+	resolvedRefsCondition := buildResolvedRefsCondition(refErrors, route.Generation)
 	applyNoPolicyTLSMessage(&resolvedRefsCondition, compiledRules)
 
 	return &InternalHTTPRoute{
@@ -467,12 +451,11 @@ func resolveBackendTarget(
 	backendRef gatewayv1.BackendObjectReference,
 	routeKind string,
 	routeNamespace string,
-	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
 	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
-) (*InternalBackend, *ErrorState) {
+) (*InternalBackend, *ConditionError) {
 	group := ValueOf(backendRef.Group)
 	kind := ValueOf(backendRef.Kind)
 	if kind == "" {
@@ -486,17 +469,10 @@ func resolveBackendTarget(
 		} else {
 			msg = fmt.Sprintf("Unsupported backend kind: %s", kind)
 		}
-		errCond := NewCondition(
-			string(gatewayv1.RouteConditionResolvedRefs),
-			metav1.ConditionFalse,
-			string(gatewayv1.RouteReasonInvalidKind),
-			msg,
-			routeGeneration,
-		)
-		return nil, &ErrorState{
-			Condition:      errCond,
-			HTTPStatusCode: http.StatusInternalServerError,
-			HTTPMessage:    msg,
+		return nil, &ConditionError{
+			Type:    string(gatewayv1.RouteConditionResolvedRefs),
+			Reason:  string(gatewayv1.RouteReasonInvalidKind),
+			Message: msg,
 		}
 	}
 
@@ -517,18 +493,10 @@ func resolveBackendTarget(
 			Name:      string(backendRef.Name),
 		}
 		if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
-			msg := fmt.Sprintf("Cross-namespace reference to service %s/%s is not permitted by any ReferenceGrant", svcNamespace, string(backendRef.Name))
-			errCond := NewCondition(
-				string(gatewayv1.RouteConditionResolvedRefs),
-				metav1.ConditionFalse,
-				string(gatewayv1.RouteReasonRefNotPermitted),
-				msg,
-				routeGeneration,
-			)
-			return nil, &ErrorState{
-				Condition:      errCond,
-				HTTPStatusCode: http.StatusInternalServerError,
-				HTTPMessage:    msg,
+			return nil, &ConditionError{
+				Type:    string(gatewayv1.RouteConditionResolvedRefs),
+				Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
+				Message: fmt.Sprintf("Cross-namespace reference to service %s/%s is not permitted by any ReferenceGrant", svcNamespace, string(backendRef.Name)),
 			}
 		}
 	}
@@ -561,18 +529,10 @@ func resolveBackendTarget(
 		var ok bool
 		svc, ok = services[svcKey]
 		if !ok || svc == nil {
-			msg := fmt.Sprintf("Backend service %s/%s not found", svcNamespace, string(backendRef.Name))
-			errCond := NewCondition(
-				string(gatewayv1.RouteConditionResolvedRefs),
-				metav1.ConditionFalse,
-				string(gatewayv1.RouteReasonBackendNotFound),
-				msg,
-				routeGeneration,
-			)
-			return nil, &ErrorState{
-				Condition:      errCond,
-				HTTPStatusCode: http.StatusInternalServerError,
-				HTTPMessage:    msg,
+			return nil, &ConditionError{
+				Type:    string(gatewayv1.RouteConditionResolvedRefs),
+				Reason:  string(gatewayv1.RouteReasonBackendNotFound),
+				Message: fmt.Sprintf("Backend service %s/%s not found", svcNamespace, string(backendRef.Name)),
 			}
 		}
 
@@ -697,44 +657,19 @@ func compileRequestMirrorFilter(
 	m *gatewayv1.HTTPRequestMirrorFilter,
 	routeKind string,
 	routeNamespace string,
-	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
 	backendTLSPolicies *CompiledBackendTLSPolicies,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	refValidator ReferenceGrantValidator,
-) (*InternalMirror, *ErrorState, *ErrorState) {
+) (*InternalMirror, string, *ConditionError) {
 	numerator := int32(100)
 	denominator := int32(100)
 
 	if m.Percent != nil && m.Fraction != nil {
-		msg := "cannot specify both percent and fraction for request mirror filter"
-		errCond := NewCondition(
-			string(gatewayv1.RouteConditionAccepted),
-			metav1.ConditionFalse,
-			string(gatewayv1.RouteReasonUnsupportedValue),
-			msg,
-			routeGeneration,
-		)
-		return nil, &ErrorState{
-			Condition:      errCond,
-			HTTPStatusCode: http.StatusInternalServerError,
-			HTTPMessage:    msg,
-		}, nil
+		return nil, "cannot specify both percent and fraction for request mirror filter", nil
 	} else if m.Percent != nil {
 		if *m.Percent < 0 || *m.Percent > 100 {
-			msg := fmt.Sprintf("invalid percent %d for request mirror filter: must be between 0 and 100", *m.Percent)
-			errCond := NewCondition(
-				string(gatewayv1.RouteConditionAccepted),
-				metav1.ConditionFalse,
-				string(gatewayv1.RouteReasonUnsupportedValue),
-				msg,
-				routeGeneration,
-			)
-			return nil, &ErrorState{
-				Condition:      errCond,
-				HTTPStatusCode: http.StatusInternalServerError,
-				HTTPMessage:    msg,
-			}, nil
+			return nil, fmt.Sprintf("invalid percent %d for request mirror filter: must be between 0 and 100", *m.Percent), nil
 		}
 		numerator = *m.Percent
 		denominator = 100
@@ -744,19 +679,7 @@ func compileRequestMirrorFilter(
 			denom = *m.Fraction.Denominator
 		}
 		if m.Fraction.Numerator < 0 || denom < 1 || m.Fraction.Numerator > denom {
-			msg := fmt.Sprintf("invalid fraction %d/%d for request mirror filter", m.Fraction.Numerator, denom)
-			errCond := NewCondition(
-				string(gatewayv1.RouteConditionAccepted),
-				metav1.ConditionFalse,
-				string(gatewayv1.RouteReasonUnsupportedValue),
-				msg,
-				routeGeneration,
-			)
-			return nil, &ErrorState{
-				Condition:      errCond,
-				HTTPStatusCode: http.StatusInternalServerError,
-				HTTPMessage:    msg,
-			}, nil
+			return nil, fmt.Sprintf("invalid fraction %d/%d for request mirror filter", m.Fraction.Numerator, denom), nil
 		}
 		numerator = m.Fraction.Numerator
 		denominator = denom
@@ -766,19 +689,18 @@ func compileRequestMirrorFilter(
 		m.BackendRef,
 		routeKind,
 		routeNamespace,
-		routeGeneration,
 		services,
 		backendTLSPolicies,
 		configMaps,
 		refValidator,
 	)
 	if refErr != nil {
-		return nil, nil, refErr
+		return nil, "", refErr
 	}
 
 	return &InternalMirror{
 		Backend:     *backend,
 		Numerator:   numerator,
 		Denominator: denominator,
-	}, nil, nil
+	}, "", nil
 }

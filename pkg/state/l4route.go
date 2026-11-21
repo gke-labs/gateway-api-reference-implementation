@@ -18,7 +18,6 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -36,15 +35,14 @@ type InternalTCPBackend = InternalL4Backend
 type InternalUDPBackend = InternalL4Backend
 
 // resolveL4BackendRefs compiles a slice of gatewayv1.BackendRef into InternalL4Backend targets
-// using resolveBackendTarget, recording the first resolution failure in resolvedRefsCondition.
+// using resolveBackendTarget, recording resolution failures in refErrors.
 func resolveL4BackendRefs(
 	backendRefs []gatewayv1.BackendRef,
 	routeNamespace string,
-	routeGeneration int64,
 	routeKind string,
 	services map[types.NamespacedName]*corev1.Service,
 	refValidator ReferenceGrantValidator,
-	resolvedRefsCondition *metav1.Condition,
+	refErrors *[]*ConditionError,
 ) []InternalL4Backend {
 	var backends []InternalL4Backend
 	for _, backendRef := range backendRefs {
@@ -52,15 +50,14 @@ func resolveL4BackendRefs(
 			backendRef.BackendObjectReference,
 			routeKind,
 			routeNamespace,
-			routeGeneration,
 			services,
 			nil,
 			nil,
 			refValidator,
 		)
 		if resolutionErr != nil {
-			if resolvedRefsCondition != nil && resolvedRefsCondition.Status == metav1.ConditionTrue {
-				*resolvedRefsCondition = resolutionErr.Condition
+			if refErrors != nil {
+				*refErrors = append(*refErrors, resolutionErr)
 			}
 			continue
 		}

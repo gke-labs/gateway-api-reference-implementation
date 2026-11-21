@@ -97,19 +97,12 @@ func CompileUDPRoute(
 		route.Generation,
 	)
 
-	resolvedRefsCondition := NewCondition(
-		string(gatewayv1.RouteConditionResolvedRefs),
-		metav1.ConditionTrue,
-		string(gatewayv1.RouteReasonResolvedRefs),
-		"All references resolved",
-		route.Generation,
-	)
-
+	var refErrors []*ConditionError
 	var compiledRules []InternalUDPRule
 	for _, rule := range route.Spec.Rules {
 		compiledRules = append(compiledRules, InternalUDPRule{
 			Name:     rule.Name,
-			Backends: resolveL4BackendRefs(rule.BackendRefs, route.Namespace, route.Generation, "UDPRoute", services, refValidator, &resolvedRefsCondition),
+			Backends: resolveL4BackendRefs(rule.BackendRefs, route.Namespace, "UDPRoute", services, refValidator, &refErrors),
 		})
 	}
 
@@ -118,7 +111,7 @@ func CompileUDPRoute(
 		Rules:                 compiledRules,
 		ParentRefs:            route.Spec.ParentRefs,
 		ValidationCondition:   validationCondition,
-		ResolvedRefsCondition: resolvedRefsCondition,
+		ResolvedRefsCondition: buildResolvedRefsCondition(refErrors, route.Generation),
 	}
 }
 

@@ -123,13 +123,7 @@ func CompileTLSRoute(
 		route.Generation,
 	)
 
-	resolvedRefsCondition := NewCondition(
-		string(gatewayv1.RouteConditionResolvedRefs),
-		metav1.ConditionTrue,
-		string(gatewayv1.RouteReasonResolvedRefs),
-		"All references resolved",
-		route.Generation,
-	)
+	var refErrors []*ConditionError
 
 	var hostnames []string
 	for _, h := range route.Spec.Hostnames {
@@ -147,16 +141,13 @@ func CompileTLSRoute(
 				backendRef.BackendObjectReference,
 				"TLSRoute",
 				route.Namespace,
-				route.Generation,
 				services,
 				backendTLSPolicies,
 				configMaps,
 				refValidator,
 			)
 			if resolutionErr != nil {
-				if resolvedRefsCondition.Status == metav1.ConditionTrue {
-					resolvedRefsCondition = resolutionErr.Condition
-				}
+				refErrors = append(refErrors, resolutionErr)
 				continue
 			}
 
@@ -186,7 +177,7 @@ func CompileTLSRoute(
 		Hostnames:             hostnames,
 		ParentRefs:            route.Spec.ParentRefs,
 		ValidationCondition:   validationCondition,
-		ResolvedRefsCondition: resolvedRefsCondition,
+		ResolvedRefsCondition: buildResolvedRefsCondition(refErrors, route.Generation),
 	}
 }
 

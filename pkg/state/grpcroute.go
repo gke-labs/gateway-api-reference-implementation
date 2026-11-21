@@ -112,13 +112,7 @@ func CompileGRPCRoute(
 		route.Generation,
 	)
 
-	resolvedRefsCondition := NewCondition(
-		string(gatewayv1.RouteConditionResolvedRefs),
-		metav1.ConditionTrue,
-		string(gatewayv1.RouteReasonResolvedRefs),
-		"All references resolved",
-		route.Generation,
-	)
+	var refErrors []*ConditionError
 
 	var hostnames []string
 	for _, h := range route.Spec.Hostnames {
@@ -152,28 +146,20 @@ func CompileGRPCRoute(
 
 			case gatewayv1.GRPCRouteFilterRequestMirror:
 				if filter.RequestMirror != nil {
-					mirror, validationErr, refErr := compileRequestMirrorFilter(
+					mirror, filterErr, refErr := compileRequestMirrorFilter(
 						filter.RequestMirror,
 						"GRPCRoute",
 						route.Namespace,
-						route.Generation,
 						services,
 						backendTLSPolicies,
 						configMaps,
 						refValidator,
 					)
-					if validationErr != nil {
-						if validationCondition.Status == metav1.ConditionTrue {
-							validationCondition = validationErr.Condition
-						}
-						if iRule.Error == nil {
-							iRule.Error = validationErr
-						}
+					if filterErr != "" {
+						recordRuleValidationError(&validationCondition, &iRule, filterErr, route.Generation)
 					}
 					if refErr != nil {
-						if resolvedRefsCondition.Status == metav1.ConditionTrue {
-							resolvedRefsCondition = refErr.Condition
-						}
+						refErrors = append(refErrors, refErr)
 					}
 					if mirror != nil {
 						iRule.Mirrors = append(iRule.Mirrors, *mirror)
@@ -243,18 +229,15 @@ func CompileGRPCRoute(
 					backendRef.BackendObjectReference,
 					"GRPCRoute",
 					route.Namespace,
-					route.Generation,
 					services,
 					backendTLSPolicies,
 					configMaps,
 					refValidator,
 				)
 				if refErr != nil {
-					if resolvedRefsCondition.Status == metav1.ConditionTrue {
-						resolvedRefsCondition = refErr.Condition
-					}
+					refErrors = append(refErrors, refErr)
 					if iRule.Error == nil {
-						iRule.Error = refErr
+						iRule.Error = refErr.toErrorState()
 					}
 					break
 				}
@@ -297,6 +280,7 @@ func CompileGRPCRoute(
 		compiledRules = append(compiledRules, iRule)
 	}
 
+	resolvedRefsCondition := buildResolvedRefsCondition(refErrors, route.Generation)
 	applyNoPolicyTLSMessage(&resolvedRefsCondition, compiledRules)
 
 	return &InternalGRPCRoute{
