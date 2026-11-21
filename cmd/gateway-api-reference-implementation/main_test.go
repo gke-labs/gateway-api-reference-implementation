@@ -34,8 +34,10 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	appsv1 "k8s.io/api/apps/v1"
@@ -111,7 +113,17 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	st.UpsertConfigMap(cm)
 	st.Recompute()
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, cm).Build()
+	bundleCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      spiffe.BundleConfigMapName,
+		},
+		Data: map[string]string{
+			spiffe.BundleDataKey: "test-bundle-pem",
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, cm, bundleCM).Build()
 	p := singlepod.NewAddressProvider(
 		c,
 		singlepod.WithState(st),
@@ -121,6 +133,7 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 		singlepod.WithACMEChallengeUpstreamURL("https://certserver.example.internal:8443"),
 		singlepod.WithACMEChallengeCABundlePath("/etc/ssl/certs/certserver-ca.crt"),
 		singlepod.WithACMEChallengeTokenPath("/var/run/secrets/tokens/certserver/token"),
+		singlepod.WithDataplaneConfigFromInternalAPI("default"),
 	)
 
 	_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
@@ -173,6 +186,30 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	if opts.ACMEChallengeTokenPath != "/var/run/secrets/tokens/certserver/token" {
 		t.Errorf("expected ACMEChallengeTokenPath='/var/run/secrets/tokens/certserver/token', got %q", opts.ACMEChallengeTokenPath)
 	}
+	expectedAddr := fmt.Sprintf("%s.default.svc.cluster.local:%d", spiffe.ControllerServiceName, push.InternalAPIPort)
+	if opts.InternalAPIAddress != expectedAddr {
+		t.Errorf("expected InternalAPIAddress=%q, got %q", expectedAddr, opts.InternalAPIAddress)
+	}
+	expectedCAFile := "/etc/gari/bundle/" + spiffe.BundleDataKey
+	if opts.InternalAPICAFile != expectedCAFile {
+		t.Errorf("expected InternalAPICAFile=%q, got %q", expectedCAFile, opts.InternalAPICAFile)
+	}
+	expectedTokenFile := "/var/run/secrets/tokens/internal-api/token"
+	if opts.InternalAPITokenFile != expectedTokenFile {
+		t.Errorf("expected InternalAPITokenFile=%q, got %q", expectedTokenFile, opts.InternalAPITokenFile)
+	}
+}
+
+func TestSetupController_DataplaneConfigFromInternalAPI(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "")
+	args := []string{"--dataplane-config-from-internal-api"}
+	_, err := Setup(args)
+	if err == nil {
+		t.Fatalf("expected error when POD_NAMESPACE is empty, got nil")
+	}
+	if !strings.Contains(err.Error(), "POD_NAMESPACE environment variable is required") {
+		t.Errorf("expected error mentioning POD_NAMESPACE, got %v", err)
+	}
 }
 
 func TestFlagsGolden(t *testing.T) {
@@ -196,6 +233,7 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "certserver-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify certserver TLS"},
 		{Name: "certserver-token-path", DefValue: "", Usage: "Path to the projected service-account token file for controller identity"},
 		{Name: "controller-name", DefValue: "github.com/gke-labs/gateway-api-reference-implementation", Usage: "The GatewayClass controller name."},
+		{Name: "dataplane-config-from-internal-api", DefValue: "false", Usage: "The provisioner gives each data plane the bundle, the token and the flags for the internal API."},
 		{Name: "dataplane-image", DefValue: "gari-controller:latest", Usage: "The container image to use for provisioned per-Gateway data-plane Deployments."},
 		{Name: "dataplane-mode", DefValue: "false", Usage: "Run in data-plane mode serving a single Gateway."},
 		{Name: "debug-error-responses", DefValue: "false", Usage: "Include detailed error messages in unmatched responses."},

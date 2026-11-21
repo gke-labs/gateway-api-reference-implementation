@@ -540,6 +540,19 @@ func (h *Harness) DumpDiagnostics() {
 	} else if strings.TrimSpace(logs) != "" {
 		h.T.Logf("Controller logs:\n%s", logs)
 	}
+
+	h.DumpDataPlaneLogs()
+}
+
+// DumpDataPlaneLogs dumps logs for data-plane pods matching the gateway name label.
+func (h *Harness) DumpDataPlaneLogs() {
+	h.T.Log("=== DUMPING DATA-PLANE POD LOGS ===")
+	logs, err := h.RunCommand("kubectl", "logs", "--namespace=default", "-l", singlepod.LabelGatewayName, "--all-containers=true", "--prefix=true", "--tail=2000")
+	if err != nil {
+		h.T.Logf("Failed to get data-plane logs: %v", err)
+	} else if strings.TrimSpace(logs) != "" {
+		h.T.Logf("Data-plane logs:\n%s", logs)
+	}
 }
 
 // SetupDiagnosticsCleanup sets up failure cleanup and a pre-timeout timer to dump diagnostics.

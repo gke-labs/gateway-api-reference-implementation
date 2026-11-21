@@ -218,6 +218,10 @@ type Options struct {
 	// and applies updates directly to the proxy, without running state computation.
 	DataplaneMode bool
 
+	// DataplaneConfigFromInternalAPI enables the provisioner to configure data planes
+	// to receive configuration directly from the controller's internal API.
+	DataplaneConfigFromInternalAPI bool
+
 	// DataplaneGatewayNamespace is the namespace of the Gateway in DataplaneMode.
 	DataplaneGatewayNamespace string
 
