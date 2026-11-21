@@ -44,7 +44,7 @@ Each component receives scoped RBAC:
   - `authentication.k8s.io`: `tokenreviews` (`create` to authenticate data planes).
   - `coordination.k8s.io`: `leases` (`get`, `list`, `watch`, `create`, `update`, `patch`, `delete`).
 - **Gateway Data Plane**:
-  - The data plane receives its configuration from the controller's internal API over a TLS stream. It authenticates to the internal API using its projected ServiceAccount token (`audience: gari-controller`) and validates the controller's TLS certificate against the mounted cluster trust bundle ConfigMap. It requires **no Kubernetes RBAC permissions** and makes no calls to the Kubernetes API server.
+  - The data plane receives its configuration from the controller's internal API over a TLS stream. It authenticates to the internal API using its projected ServiceAccount token (`audience: gari-controller`) and validates the controller's TLS certificate against the mounted cluster trust bundle ConfigMap. It requires no Kubernetes RBAC permissions and makes no calls to the Kubernetes API server.
 - **DNS (mDNS Responder)**:
   - `core`: `secrets` (`get`, `list`, `watch`) restricted by `resourceNames: ["localgateway-dns"]`.
   - The DNS component is a data plane. The controller computes the DNS records and publishes them in one Secret, `localgateway-dns`, and the DNS component reads that one Secret and nothing else. It watches no Gateways. Because the component runs with host networking, its Role names only this one object so it gets the smallest permission that works.
