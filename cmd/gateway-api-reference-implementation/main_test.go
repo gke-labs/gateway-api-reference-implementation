@@ -129,7 +129,7 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	}
 
 	var deploy appsv1.Deployment
-	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: state.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
 	}
 
@@ -397,7 +397,7 @@ func TestController_InternalAPIPush_DataPlaneReceivesConfig(t *testing.T) {
 		gwName      = "push-gw"
 		tokenVal    = "valid-test-token"
 	)
-	saName := singlepod.ResourceNameForGateway(gwName)
+	saName := state.ResourceNameForGateway(gwName)
 
 	certPEM, keyPEM := generateTestCertificate(t)
 	dir := t.TempDir()

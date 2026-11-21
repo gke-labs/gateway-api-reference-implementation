@@ -41,7 +41,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/client"
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
 
@@ -166,7 +165,7 @@ func TestSource_NamespaceQualifiedDataPlaneServiceAccount(t *testing.T) {
 		t.Fatalf("timed out waiting for GetCertificate request")
 	}
 
-	wantDPSA := fmt.Sprintf("traffic-system/%s", singlepod.ResourceNameForGateway("web-gateway"))
+	wantDPSA := fmt.Sprintf("traffic-system/%s", state.ResourceNameForGateway("web-gateway"))
 	if got := capturedReq.GetDataPlaneServiceAccount(); got != wantDPSA {
 		t.Errorf("GetDataPlaneServiceAccount() = %q, want namespace-qualified %q", got, wantDPSA)
 	}

@@ -219,7 +219,7 @@ func setupInternalAPITest(t *testing.T, initialRevision string) (*internalAPITes
 
 	reviewer := &fakeTokenReviewer{
 		validTokens: map[string]types.NamespacedName{
-			tokenVal: {Namespace: gwNamespace, Name: singlepod.ResourceNameForGateway(gwName)},
+			tokenVal: {Namespace: gwNamespace, Name: state.ResourceNameForGateway(gwName)},
 		},
 	}
 	pushServer, err := push.NewServer(push.ServerOptions{TokenReviewer: reviewer})
@@ -556,7 +556,7 @@ func TestInternalAPIClient_WrongTrustBundle(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	reviewer := &fakeTokenReviewer{
 		validTokens: map[string]types.NamespacedName{
-			"valid-token-1234": {Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")},
+			"valid-token-1234": {Namespace: "test-ns", Name: state.ResourceNameForGateway("test-gw")},
 		},
 	}
 	pushServer, err := push.NewServer(push.ServerOptions{TokenReviewer: reviewer})
@@ -713,7 +713,7 @@ func TestInternalAPIClient_FlagsUnset_BehavesAsToday(t *testing.T) {
 	}
 
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")},
+		ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: state.ResourceNameForGateway("test-gw")},
 		Data:       map[string][]byte{singlepod.DataplaneSecretDataKey: configBytes},
 	}
 	cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
@@ -734,11 +734,11 @@ func TestInternalAPIClient_FlagsUnset_BehavesAsToday(t *testing.T) {
 	reconciler := &dataplaneSecretReconciler{
 		Client:               cl,
 		gatewayNamespace:     "test-ns",
-		secretName:           singlepod.ResourceNameForGateway("test-gw"),
+		secretName:           state.ResourceNameForGateway("test-gw"),
 		applyDataplaneConfig: server.applyDataplaneConfig,
 	}
 
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: state.ResourceNameForGateway("test-gw")}}
 	res, err := reconciler.Reconcile(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Reconcile failed: %v", err)

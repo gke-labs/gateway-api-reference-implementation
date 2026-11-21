@@ -99,7 +99,7 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 		{Name: "udp", Port: 5353, Protocol: gatewayv1.UDPProtocolType},
 	}
 
-	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
+	resourceName := state.ResourceNameForGateway(gateway.Name)
 
 	// 1. Expected: run existing singlepod provider with WithHostPorts()
 	expectedClient := setupTestClient(t)
@@ -207,7 +207,7 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 		{Name: "health-reserved", Port: 8999, Protocol: gatewayv1.TCPProtocolType},
 	}
 
-	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
+	resourceName := state.ResourceNameForGateway(gateway.Name)
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
@@ -277,7 +277,7 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 		{Name: "https", Port: 8444, Protocol: gatewayv1.HTTPSProtocolType},
 	}
 
-	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
+	resourceName := state.ResourceNameForGateway(gateway.Name)
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
@@ -427,7 +427,7 @@ func TestHostPortAddressProvider_ListenerSetListener(t *testing.T) {
 		},
 	}
 
-	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
+	resourceName := state.ResourceNameForGateway(gateway.Name)
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, singlepod.WithHostPorts())
@@ -513,7 +513,7 @@ func TestHostPortAddressProvider_ConflictedListenerSkipped(t *testing.T) {
 		},
 	}
 
-	resourceName := singlepod.ResourceNameForGateway(gateway.Name)
+	resourceName := state.ResourceNameForGateway(gateway.Name)
 
 	actualClient := setupTestClient(t)
 	hostPortProvider, err := New(actualClient, actualClient)
@@ -817,7 +817,7 @@ func setupHostPortsFixture(t *testing.T) (*hostPortsFixture, context.Context) {
 		t.Fatalf("initial reconciliation failed: %v", err)
 	}
 
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
@@ -1452,7 +1452,7 @@ func TestHostPortAddressProvider_GatewayReconciler_EndToEnd(t *testing.T) {
 		t.Fatalf("unexpected error reconciling gateway: %v", err)
 	}
 
-	resName := singlepod.ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deployment); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
@@ -1625,7 +1625,7 @@ func TestHostPortAddressProvider_MultipleHTTPListeners_AddressNotUsable(t *testi
 	}
 
 	// Verify no Deployment exists
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); !apierrors.IsNotFound(err) {
 		t.Errorf("expected no Deployment to exist, got err: %v", err)
@@ -1678,7 +1678,7 @@ func TestHostPortAddressProvider_MultipleHTTPSListeners_AddressNotUsable(t *test
 	}
 
 	// Verify no Deployment exists
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); !apierrors.IsNotFound(err) {
 		t.Errorf("expected no Deployment to exist, got err: %v", err)
@@ -1731,7 +1731,7 @@ func TestHostPortAddressProvider_HTTPSAndTLSListenersDifferentPorts_AddressNotUs
 	}
 
 	// Verify no Deployment exists
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); !apierrors.IsNotFound(err) {
 		t.Errorf("expected no Deployment to exist, got err: %v", err)
@@ -1774,7 +1774,7 @@ func TestHostPortAddressProvider_HTTPSAndTLSListenersSamePort_Provisioned(t *tes
 	}
 
 	// Deployment should be provisioned
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
 		t.Fatalf("failed to get Deployment: %v", err)
@@ -1824,7 +1824,7 @@ func TestHostPortAddressProvider_OneHTTPOneHTTPSSeveralTCPUDP_Provisioned(t *tes
 		t.Errorf("mixed listener configuration with 1 HTTP and 1 HTTPS should be provisioned, got AddressNotUsable")
 	}
 
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
 		t.Fatalf("failed to get Deployment: %v", err)
@@ -1883,7 +1883,7 @@ func TestHostPortAddressProvider_TwoHTTPListenersSamePortDifferentHostnames(t *t
 		t.Errorf("two HTTP listeners on same port with different hostnames must count as one port, got AddressNotUsable")
 	}
 
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
 		t.Fatalf("failed to get Deployment: %v", err)
@@ -1946,7 +1946,7 @@ func TestHostPortAddressProvider_ConflictedListenerSkippedInPortCount(t *testing
 		t.Errorf("conflicted listener should be excluded from port count, got AddressNotUsable")
 	}
 
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var deployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
 		t.Fatalf("failed to get Deployment: %v", err)
@@ -1992,7 +1992,7 @@ func TestHostPortAddressProvider_ExistingDeploymentUnchangedWhenPortLimitExceede
 		t.Fatalf("initial reconcile failed: %v", err)
 	}
 
-	deploymentName := singlepod.ResourceNameForGateway(gateway.Name)
+	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var initialDeployment appsv1.Deployment
 	if err := testClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &initialDeployment); err != nil {
 		t.Fatalf("failed to get initial Deployment: %v", err)

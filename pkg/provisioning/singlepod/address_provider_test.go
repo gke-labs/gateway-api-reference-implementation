@@ -207,7 +207,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	}
 
 	// Verify Service was created in my-ns with all effective listener ports (including ListenerSet port 8080)
-	name := ResourceNameForGateway("my-gw")
+	name := state.ResourceNameForGateway("my-gw")
 	var svc corev1.Service
 	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &svc); err != nil {
 		t.Fatalf("failed to get created Service: %v", err)
@@ -373,8 +373,8 @@ func TestSinglePodAddressProvider_NamespacedRolesAndSecrets(t *testing.T) {
 	}()
 	wg.Wait()
 
-	resName1 := ResourceNameForGateway("gw-1")
-	resName2 := ResourceNameForGateway("gw-2")
+	resName1 := state.ResourceNameForGateway("gw-1")
+	resName2 := state.ResourceNameForGateway("gw-2")
 
 	// Verify ns-1 has Role, RoleBinding
 	var role1 rbacv1.Role
@@ -444,7 +444,7 @@ func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
 			},
 		},
 	}
-	resName := ResourceNameForGateway("conflict-gw")
+	resName := state.ResourceNameForGateway("conflict-gw")
 
 	trueVal := true
 	diffOwnerRef := metav1.OwnerReference{
@@ -633,7 +633,7 @@ func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnershipConflict(t *te
 			},
 		},
 	}
-	resName := ResourceNameForGateway("my-gw")
+	resName := state.ResourceNameForGateway("my-gw")
 
 	trueVal := true
 	diffOwnerRef := metav1.OwnerReference{
@@ -786,7 +786,7 @@ func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnedAndNew(t *testing.
 			},
 		},
 	}
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 	dpCfg := &state.DataplaneConfig{
 		GatewayName: types.NamespacedName{Namespace: "default", Name: "test-gw"},
 	}
@@ -962,7 +962,7 @@ func TestSinglePodAddressProvider_Watches(t *testing.T) {
 	// 1. Service with managed label and controller ownerReference -> enqueues owning Gateway
 	ownedSvc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            ResourceNameForGateway("gw-1"),
+			Name:            state.ResourceNameForGateway("gw-1"),
 			Namespace:       "custom-ns",
 			Labels:          map[string]string{LabelManagedBy: ManagedByValue},
 			OwnerReferences: []metav1.OwnerReference{ownerRef},
@@ -976,7 +976,7 @@ func TestSinglePodAddressProvider_Watches(t *testing.T) {
 	// 2. Deployment with managed label and controller ownerReference -> enqueues owning Gateway
 	ownedDeploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            ResourceNameForGateway("gw-1"),
+			Name:            state.ResourceNameForGateway("gw-1"),
 			Namespace:       "custom-ns",
 			Labels:          map[string]string{LabelManagedBy: ManagedByValue},
 			OwnerReferences: []metav1.OwnerReference{ownerRef},
@@ -990,7 +990,7 @@ func TestSinglePodAddressProvider_Watches(t *testing.T) {
 	// 3. Non-owned Service with managed labels (no ownerRef) -> does not enqueue
 	nonOwnedSvc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      ResourceNameForGateway("gw-1"),
+			Name:      state.ResourceNameForGateway("gw-1"),
 			Namespace: "custom-ns",
 			Labels:    map[string]string{LabelManagedBy: ManagedByValue, LabelGatewayName: "gw-1"},
 		},
@@ -1003,7 +1003,7 @@ func TestSinglePodAddressProvider_Watches(t *testing.T) {
 	// 4. Non-owned Deployment with managed labels (no ownerRef) -> does not enqueue
 	nonOwnedDeploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      ResourceNameForGateway("gw-1"),
+			Name:      state.ResourceNameForGateway("gw-1"),
 			Namespace: "custom-ns",
 			Labels:    map[string]string{LabelManagedBy: ManagedByValue, LabelGatewayName: "gw-1"},
 		},
@@ -1016,7 +1016,7 @@ func TestSinglePodAddressProvider_Watches(t *testing.T) {
 	// 5. Service with managed labels and non-controller ownerRef -> does not enqueue
 	nonCtrlSvc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            ResourceNameForGateway("gw-1"),
+			Name:            state.ResourceNameForGateway("gw-1"),
 			Namespace:       "custom-ns",
 			Labels:          map[string]string{LabelManagedBy: ManagedByValue},
 			OwnerReferences: []metav1.OwnerReference{nonControllerOwnerRef},
@@ -1095,7 +1095,7 @@ func TestSinglePodAddressProvider_InfrastructureLabelsAndAnnotationsLandOnAllFou
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 
 	// 1. ServiceAccount
 	var sa corev1.ServiceAccount
@@ -1173,7 +1173,7 @@ func TestSinglePodAddressProvider_InfrastructureValueUpdate(t *testing.T) {
 		t.Fatalf("unexpected error on initial reconcile: %v", err)
 	}
 
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 
 	// Update label and annotation values in Gateway infrastructure
 	gw.Spec.Infrastructure.Labels["tier"] = "frontend-v2"
@@ -1262,7 +1262,7 @@ func TestSinglePodAddressProvider_InfrastructureKeyRemoval(t *testing.T) {
 		t.Fatalf("unexpected error on initial reconcile: %v", err)
 	}
 
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 
 	// Remove keys from Gateway infrastructure
 	delete(gw.Spec.Infrastructure.Labels, "remove-me")
@@ -1375,7 +1375,7 @@ func TestSinglePodAddressProvider_InfrastructureUserKeysCannotOverrideReservedLa
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 
 	var sa corev1.ServiceAccount
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
@@ -1470,7 +1470,7 @@ func TestSinglePodAddressProvider_PreservesForeignLabelsAndAnnotations(t *testin
 		t.Fatalf("unexpected error on initial reconcile: %v", err)
 	}
 
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 
 	// Inject foreign annotation and foreign label onto existing ServiceAccount, Deployment, and Service
 	var sa corev1.ServiceAccount
@@ -1618,7 +1618,7 @@ func TestSinglePodAddressProvider_NoChangesIssuesNoWrite(t *testing.T) {
 		},
 	}
 
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 
 	// 1. Initial reconcile creates resources
 	_, _, err := p.GatewayAddresses(ctx, gw, nil)
@@ -1739,7 +1739,7 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 		t.Errorf("expected message mentioning 192.0.2.1, got %s", readiness.Message)
 	}
 
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 	var svc corev1.Service
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
 		t.Fatalf("failed to get Service: %v", err)
@@ -1839,7 +1839,7 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error on gw1: %v", err)
 	}
-	svc1Name := ResourceNameForGateway("gw-1")
+	svc1Name := state.ResourceNameForGateway("gw-1")
 	var svc1 corev1.Service
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: svc1Name}, &svc1); err != nil {
 		t.Fatalf("failed to get svc1: %v", err)
@@ -1900,7 +1900,7 @@ func TestSinglePodAddressProvider_MultipleRequestedIPs(t *testing.T) {
 	}
 
 	// Mock the first IP bound in service ingress
-	resName := ResourceNameForGateway("gw-multi")
+	resName := state.ResourceNameForGateway("gw-multi")
 	var svc corev1.Service
 	_ = c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc)
 	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "192.0.2.10"}}
@@ -2006,7 +2006,7 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	resName := ResourceNameForGateway("gw-tcp")
+	resName := state.ResourceNameForGateway("gw-tcp")
 
 	// 1. Verify Service ports
 	var svc corev1.Service
@@ -2181,7 +2181,7 @@ func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testin
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	resName := ResourceNameForGateway("gw-udp")
+	resName := state.ResourceNameForGateway("gw-udp")
 
 	// 1. Verify Service ports
 	var svc corev1.Service
@@ -2296,7 +2296,7 @@ func TestSinglePodAddressProvider_ForwardedForModeArg(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	name := ResourceNameForGateway("test-gw")
+	name := state.ResourceNameForGateway("test-gw")
 	var deploy appsv1.Deployment
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: name}, &deploy); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
@@ -2375,7 +2375,7 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 		t.Fatalf("unexpected error reconciling gateway: %v", err)
 	}
 
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 	var svc corev1.Service
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
 		t.Fatalf("failed to get Service: %v", err)
@@ -2656,7 +2656,7 @@ func TestSinglePodAddressProvider_ParametersRef_MergeOrder(t *testing.T) {
 	}
 
 	var svc corev1.Service
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
 		t.Fatalf("failed to get Service: %v", err)
 	}
@@ -2752,7 +2752,7 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		}
 
 		var svc corev1.Service
-		resName := ResourceNameForGateway("gw-clusterip")
+		resName := state.ResourceNameForGateway("gw-clusterip")
 		if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
 			t.Fatalf("failed to get Service: %v", err)
 		}
@@ -2821,7 +2821,7 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		}
 
 		var svc corev1.Service
-		resName := ResourceNameForGateway("gw-local")
+		resName := state.ResourceNameForGateway("gw-local")
 		if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
 			t.Fatalf("failed to get Service: %v", err)
 		}
@@ -2924,7 +2924,7 @@ func TestSinglePodAddressProvider_ParametersRef_InvalidValues(t *testing.T) {
 
 			// Verify no Service was created
 			var svc corev1.Service
-			resName := ResourceNameForGateway("bad-gw")
+			resName := state.ResourceNameForGateway("bad-gw")
 			if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
 				t.Errorf("expected NotFound for Service, got err: %v", err)
 			}
@@ -3128,7 +3128,7 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 
 		// Verify no Service was created
 		var svc corev1.Service
-		resName := ResourceNameForGateway("gw-class-bad-cm")
+		resName := state.ResourceNameForGateway("gw-class-bad-cm")
 		if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
 			t.Errorf("expected NotFound for Service, got err: %v", err)
 		}
@@ -3184,7 +3184,7 @@ func TestSinglePodAddressProvider_ParametersRef_NotComputedYet(t *testing.T) {
 
 	// Verify no Service was created
 	var svc corev1.Service
-	resName := ResourceNameForGateway("gw-not-computed")
+	resName := state.ResourceNameForGateway("gw-not-computed")
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
 		t.Errorf("expected NotFound for Service, got err: %v", err)
 	}
@@ -3330,7 +3330,7 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		}
 
 		// 2. Simulate Deployment becoming available
-		resName := ResourceNameForGateway("gw-with-addr")
+		resName := state.ResourceNameForGateway("gw-with-addr")
 		var deploy appsv1.Deployment
 		if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
 			t.Fatalf("failed to get Deployment: %v", err)
@@ -3436,7 +3436,7 @@ func TestSinglePodAddressProvider_LiveSwitch_LoadBalancer_To_ClusterIP(t *testin
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	resName := ResourceNameForGateway("live-gw")
+	resName := state.ResourceNameForGateway("live-gw")
 	var svc corev1.Service
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
 		t.Fatalf("failed to get Service: %v", err)
@@ -3537,7 +3537,7 @@ func TestSinglePodAddressProvider_UpgradeUpdatesServiceAndDeploymentInPlace(t *t
 		},
 	}
 
-	resName := ResourceNameForGateway(gw.Name)
+	resName := state.ResourceNameForGateway(gw.Name)
 	controllerTrue := true
 	ownerRef := metav1.OwnerReference{
 		APIVersion: gatewayv1.GroupVersion.String(),
@@ -3709,7 +3709,7 @@ func TestAddressProvider_GcpGatewayHooks(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	resName := ResourceNameForGateway("my-gw")
+	resName := state.ResourceNameForGateway("my-gw")
 	var deploy appsv1.Deployment
 	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
@@ -3800,7 +3800,7 @@ func TestAddressProvider_DebugErrorResponses(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		name := ResourceNameForGateway("test-gw")
+		name := state.ResourceNameForGateway("test-gw")
 		var deploy appsv1.Deployment
 		if err := client.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: name}, &deploy); err != nil {
 			t.Fatalf("failed to get deployment: %v", err)
@@ -3820,7 +3820,7 @@ func TestAddressProvider_DebugErrorResponses(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		name := ResourceNameForGateway("test-gw")
+		name := state.ResourceNameForGateway("test-gw")
 		var deploy appsv1.Deployment
 		if err := client.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: name}, &deploy); err != nil {
 			t.Fatalf("failed to get deployment: %v", err)
@@ -3868,7 +3868,7 @@ func TestSinglePodAddressProvider_ACMEChallengeForwarding(t *testing.T) {
 		},
 	}
 
-	resName := ResourceNameForGateway("test-gw")
+	resName := state.ResourceNameForGateway("test-gw")
 	ctx := t.Context()
 
 	st := state.NewState()
@@ -4133,7 +4133,7 @@ func TestSinglePodAddressProvider_ACMEChallenge_FlagSets(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	resName := ResourceNameForGateway("test-flag-gw")
+	resName := state.ResourceNameForGateway("test-flag-gw")
 	var deploy appsv1.Deployment
 	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
 		t.Fatalf("failed to get Deployment: %v", err)
@@ -4286,7 +4286,7 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 		t.Fatalf("GatewayAddresses failed for max length gateway: %v", err)
 	}
 
-	expectedName := ResourceNameForGateway(gwName)
+	expectedName := state.ResourceNameForGateway(gwName)
 	expectedLabelGwName := LabelValueForGateway(gwName)
 
 	if len(expectedName) > 63 {
@@ -4403,7 +4403,7 @@ func TestLabelValueForGateway(t *testing.T) {
 	// 2. Length 64: exceeds 63, returned as 63-character derived resource name
 	name64 := strings.Repeat("a", 64)
 	got64 := LabelValueForGateway(name64)
-	want64 := ResourceNameForGateway(name64)
+	want64 := state.ResourceNameForGateway(name64)
 	if got64 != want64 {
 		t.Errorf("LabelValueForGateway(64) = %q, want %q", got64, want64)
 	}
@@ -4417,7 +4417,7 @@ func TestLabelValueForGateway(t *testing.T) {
 	// 3. Length 253: maximum Kubernetes name length, returned as 63-character derived resource name
 	name253 := strings.Repeat("a", 253)
 	got253 := LabelValueForGateway(name253)
-	want253 := ResourceNameForGateway(name253)
+	want253 := state.ResourceNameForGateway(name253)
 	if got253 != want253 {
 		t.Errorf("LabelValueForGateway(253) = %q, want %q", got253, want253)
 	}
@@ -4451,42 +4451,6 @@ func TestLabelValueForGateway(t *testing.T) {
 	})
 }
 
-func TestResourceNameForGateway(t *testing.T) {
-	cases := []struct {
-		name, gwName, want, mustDiff string
-	}{
-		{name: "short valid", gwName: "my-gw", want: "gari-my-gw-b6402a44"},
-		{name: "exact 63 base", gwName: strings.Repeat("a", 58)},
-		{name: "valid 63", gwName: strings.Repeat("a", 63), want: "gari-" + strings.Repeat("a", 49) + "-7d3e74a0"},
-		{name: "valid 253", gwName: strings.Repeat("a", 253), want: "gari-" + strings.Repeat("a", 49) + "-32859a3a"},
-		// Collision test pairs: sanitized names and spelled-out hashes must differ
-		{name: "valid pair A", gwName: "my-gateway", want: "gari-my-gateway-6632e849"},
-		{name: "sanitized pair A", gwName: "my.gateway", want: "gari-my-gateway-0f568ee0", mustDiff: "gari-my-gateway-6632e849"},
-		{name: "spelled-out hash pair", gwName: "my-gateway-0f568ee0", mustDiff: "gari-my-gateway-0f568ee0"},
-		{name: "valid pair B", gwName: "g-1gw", want: "gari-g-1gw-02e06d46"},
-		{name: "sanitized pair B", gwName: "1gw", want: "gari-1gw-60bcb19e", mustDiff: "gari-g-1gw-02e06d46"},
-		{name: "multiple dots", gwName: "foo.bar.baz"},
-		{name: "leading dot", gwName: ".leading"},
-		{name: "trailing dot", gwName: "trailing."},
-		{name: "long with dots", gwName: "my.gateway." + strings.Repeat("a", 242)},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := ResourceNameForGateway(tc.gwName)
-			if tc.want != "" && got != tc.want {
-				t.Errorf("ResourceNameForGateway(%q) = %q, want %q", tc.gwName, got, tc.want)
-			}
-			if tc.mustDiff != "" && got == tc.mustDiff {
-				t.Errorf("expected ResourceNameForGateway(%q) != %q, got %q", tc.gwName, tc.mustDiff, got)
-			}
-			if len(got) > 63 || len(validation.IsDNS1035Label(got)) > 0 {
-				t.Errorf("ResourceNameForGateway(%q) = %q is not a valid DNS-1035 label", tc.gwName, got)
-			}
-		})
-	}
-}
-
 func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -4510,7 +4474,7 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 
-	expectedName := ResourceNameForGateway("my.gateway")
+	expectedName := state.ResourceNameForGateway("my.gateway")
 	var svc corev1.Service
 	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: expectedName}, &svc); err != nil {
 		t.Fatalf("failed to get Service %s: %v", expectedName, err)
@@ -4778,7 +4742,7 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 		t.Errorf("expected no addresses set by this step, got %+v", addrs)
 	}
 
-	resName := ResourceNameForGateway("gw-hp")
+	resName := state.ResourceNameForGateway("gw-hp")
 
 	var deploy appsv1.Deployment
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
@@ -4938,7 +4902,7 @@ func TestSinglePodAddressProvider_HostPorts_MultipleHTTPListenersConflict(t *tes
 
 	// Verify no Deployment was created for the invalid listener configuration
 	var deploy appsv1.Deployment
-	resName := ResourceNameForGateway("gw-two-http")
+	resName := state.ResourceNameForGateway("gw-two-http")
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); !apierrors.IsNotFound(err) {
 		t.Errorf("expected Deployment to not exist for invalid configuration, got err: %v", err)
 	}
@@ -5009,7 +4973,7 @@ func TestSinglePodAddressProvider_HostPorts_ReservedPortsSkipped(t *testing.T) {
 	}
 
 	var deploy appsv1.Deployment
-	resName := ResourceNameForGateway("gw-reserved")
+	resName := state.ResourceNameForGateway("gw-reserved")
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
 		t.Fatalf("failed to get Deployment: %v", err)
 	}
@@ -5058,7 +5022,7 @@ func TestSinglePodAddressProvider_WithNoService(t *testing.T) {
 		t.Errorf("expected no addresses, got %+v", addrs)
 	}
 
-	resName := ResourceNameForGateway("gw-no-svc")
+	resName := state.ResourceNameForGateway("gw-no-svc")
 
 	var deploy appsv1.Deployment
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
@@ -5198,7 +5162,7 @@ func TestSinglePodAddressProvider_WithDeploymentMutator(t *testing.T) {
 		t.Errorf("expected mutator to receive effective listeners, got %+v", passedListeners)
 	}
 
-	resName := ResourceNameForGateway("gw-mutated")
+	resName := state.ResourceNameForGateway("gw-mutated")
 	var deploy appsv1.Deployment
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
 		t.Fatalf("failed to get Deployment: %v", err)
@@ -5271,7 +5235,7 @@ func TestSinglePodAddressProvider_WithDeploymentMutator_Error(t *testing.T) {
 	}
 
 	// Deployment must not have been applied
-	resName := ResourceNameForGateway("gw-mut-err")
+	resName := state.ResourceNameForGateway("gw-mut-err")
 	var deploy appsv1.Deployment
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); !apierrors.IsNotFound(err) {
 		t.Errorf("expected Deployment to not exist after mutator error, got err: %v", err)

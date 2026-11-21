@@ -33,7 +33,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/client"
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
 
@@ -357,7 +356,7 @@ func (s *Source) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 
 	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
 	gwFormatted := gwKey.String()
-	dpSA := singlepod.ResourceNameForGateway(gw.Name)
+	dpSA := state.ResourceNameForGateway(gw.Name)
 	if gw.Namespace != "" {
 		dpSA = fmt.Sprintf("%s/%s", gw.Namespace, dpSA)
 	}

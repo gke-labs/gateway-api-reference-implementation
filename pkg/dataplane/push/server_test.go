@@ -241,7 +241,7 @@ func TestNewServer_RequiresTokenReviewer(t *testing.T) {
 
 func TestStreamConfig_Success_AuthenticationAndScoping(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -292,7 +292,7 @@ func TestStreamConfig_Success_AuthenticationAndScoping(t *testing.T) {
 func TestStreamConfig_Scoping_Refused(t *testing.T) {
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
-			return "default", singlepod.ResourceNameForGateway("other-gateway"), nil
+			return "default", state.ResourceNameForGateway("other-gateway"), nil
 		},
 	}
 
@@ -335,7 +335,7 @@ func TestStreamConfig_Authentication_MissingOrInvalidToken(t *testing.T) {
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
 			if token == "good-token" {
-				return "default", singlepod.ResourceNameForGateway("my-gateway"), nil
+				return "default", state.ResourceNameForGateway("my-gateway"), nil
 			}
 			return "", "", errors.New("signature verification failed")
 		},
@@ -403,7 +403,7 @@ func TestStreamConfig_Authentication_MissingOrInvalidToken(t *testing.T) {
 func TestStreamConfig_Ordering_MessageBeforeHello(t *testing.T) {
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
-			return "default", singlepod.ResourceNameForGateway("my-gateway"), nil
+			return "default", state.ResourceNameForGateway("my-gateway"), nil
 		},
 	}
 
@@ -443,7 +443,7 @@ func TestStreamConfig_Ordering_SecondHello(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
-			return gatewayKey.Namespace, singlepod.ResourceNameForGateway(gatewayKey.Name), nil
+			return gatewayKey.Namespace, state.ResourceNameForGateway(gatewayKey.Name), nil
 		},
 	}
 
@@ -504,10 +504,10 @@ func TestStreamConfig_Limits_MaxStreams(t *testing.T) {
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
 			if token == "token1" {
 				close(stream1Reviewed)
-				return gatewayKey.Namespace, singlepod.ResourceNameForGateway(gatewayKey.Name), nil
+				return gatewayKey.Namespace, state.ResourceNameForGateway(gatewayKey.Name), nil
 			}
 			<-stream2CanProceed
-			return gatewayKey.Namespace, singlepod.ResourceNameForGateway(gatewayKey.Name), nil
+			return gatewayKey.Namespace, state.ResourceNameForGateway(gatewayKey.Name), nil
 		},
 	}
 
@@ -758,7 +758,7 @@ func (r *testStreamReader) recv(timeout time.Duration) (*push.Config, error) {
 
 func TestStreamConfig_ReceivesConfigAfterHelloAndOnStateChange(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -862,7 +862,7 @@ func TestStreamConfig_ReceivesConfigAfterHelloAndOnStateChange(t *testing.T) {
 
 func TestStreamConfig_HelloWithLatestRevisionReceivesNothingUntilStateChanges(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -921,8 +921,8 @@ func TestStreamConfig_HelloWithLatestRevisionReceivesNothingUntilStateChanges(t 
 func TestStreamConfig_TwoGatewaysTwoStreamsIsolation(t *testing.T) {
 	gatewayKey1 := types.NamespacedName{Namespace: "default", Name: "gw-1"}
 	gatewayKey2 := types.NamespacedName{Namespace: "default", Name: "gw-2"}
-	serviceAccount1 := singlepod.ResourceNameForGateway(gatewayKey1.Name)
-	serviceAccount2 := singlepod.ResourceNameForGateway(gatewayKey2.Name)
+	serviceAccount1 := state.ResourceNameForGateway(gatewayKey1.Name)
+	serviceAccount2 := state.ResourceNameForGateway(gatewayKey2.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -1041,7 +1041,7 @@ func TestStreamConfig_TwoGatewaysTwoStreamsIsolation(t *testing.T) {
 
 func TestStreamConfig_NackRejectionWithReasonTruncatedUTF8(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -1125,7 +1125,7 @@ func TestStreamConfig_NackRejectionWithReasonTruncatedUTF8(t *testing.T) {
 
 func TestStreamConfig_NeverReplies_WaitAppliedReturnsNotAnswered(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -1215,7 +1215,7 @@ func TestPublishDataplaneConfig_RequiresRevision(t *testing.T) {
 
 func TestStreamConfig_ClosedStreamWhileMessagesArriveCleansUp(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -1317,8 +1317,8 @@ func TestStreamConfig_ClosedStreamWhileMessagesArriveCleansUp(t *testing.T) {
 
 func TestStreamConfig_SecretPathUnchanged(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
-	secretName := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
+	secretName := state.ResourceNameForGateway(gatewayKey.Name)
 
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -1388,7 +1388,7 @@ func TestStreamConfig_SecretPathUnchanged(t *testing.T) {
 
 func TestStreamConfig_OversizedConfigNotSentStreamStaysOpen(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -1496,7 +1496,7 @@ func slowSendInterceptor(delay time.Duration) grpc.StreamServerInterceptor {
 
 func TestStreamConfig_CoalesceIntermediateRevisions(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -1578,7 +1578,7 @@ func TestStreamConfig_CoalesceIntermediateRevisions(t *testing.T) {
 
 func TestStreamConfig_GatewayRemovedDropsConfig(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -1622,7 +1622,7 @@ func TestStreamConfig_GatewayRemovedDropsConfig(t *testing.T) {
 
 func TestStreamConfig_SlowReaderClosedAfterTimeout(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -1710,7 +1710,7 @@ func failSendInterceptor() grpc.StreamServerInterceptor {
 
 func TestStreamConfig_FailedSendPersistsAsRejectionUntilNextPublish(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {
@@ -1791,7 +1791,7 @@ func TestStreamConfig_FailedSendPersistsAsRejectionUntilNextPublish(t *testing.T
 
 func TestStreamConfig_TwoStreamsRejectionsHaveDistinctDataPlanes(t *testing.T) {
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
-	expectedServiceAccount := singlepod.ResourceNameForGateway(gatewayKey.Name)
+	expectedServiceAccount := state.ResourceNameForGateway(gatewayKey.Name)
 
 	reviewer := &staticTokenReviewer{
 		reviewFunc: func(ctx context.Context, token string) (string, string, error) {

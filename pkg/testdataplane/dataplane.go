@@ -288,7 +288,7 @@ func StartDataplane(t testing.TB, env *testenv.Environment, gatewayNamespace, ga
 // WaitApplied waits until the controller publishes a configuration revision for the Gateway
 // (differing from the last applied revision) and the data plane reports it as applied.
 func (d *Dataplane) WaitApplied(ctx context.Context) error {
-	secretName := singlepod.ResourceNameForGateway(d.gatewayName)
+	secretName := state.ResourceNameForGateway(d.gatewayName)
 	secretKey := types.NamespacedName{Namespace: d.gatewayNamespace, Name: secretName}
 
 	var targetRevision string

@@ -620,7 +620,7 @@ func New(opts Options) (*Server, error) {
 
 		var err error
 		if opts.DataplaneMode {
-			secretName := singlepod.ResourceNameForGateway(opts.DataplaneGatewayName)
+			secretName := state.ResourceNameForGateway(opts.DataplaneGatewayName)
 			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
 				Scheme:                 opts.Scheme,
 				Metrics:                metricsOpts,
@@ -830,7 +830,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 			// In internal API mode, config comes from the push stream only; do not watch the Secret.
 			return nil
 		}
-		secretName := singlepod.ResourceNameForGateway(s.opts.DataplaneGatewayName)
+		secretName := state.ResourceNameForGateway(s.opts.DataplaneGatewayName)
 		reconciler := &dataplaneSecretReconciler{
 			Client:               mgr.GetClient(),
 			gatewayNamespace:     s.opts.DataplaneGatewayNamespace,
