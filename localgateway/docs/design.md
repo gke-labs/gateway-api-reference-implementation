@@ -15,9 +15,9 @@ This document specifies the split of `localgateway` from an all-in-one host-netw
 The data plane exposes HTTP (port 80) and HTTPS (port 443) to clients on the local network:
 
 - **Host ports (`hostPort`)**: The pod runs in the standard pod network namespace (`hostNetwork: false`). The Deployment maps host ports 80 and 443 to unprivileged container ports (8080 and 8443). The node's CNI portmap plugin forwards incoming LAN traffic directly to the container ports. The container runs as an unprivileged user without `NET_BIND_SERVICE` or root privileges, and the host network stack remains isolated from the proxy process.
-- **Host networking (`hostNetwork: true`)**: The pod runs directly in the host network namespace. The proxy process binds directly to host interfaces on ports 80 and 443. Because ports 80 and 443 are privileged (< 1024), the container requires `securityContext.capabilities.add: [NET_BIND_SERVICE]` (and `allowPrivilegeEscalation: true`) or UID 0. Host networking grants the container access to all host network interfaces. Because the data plane reads its own TLS certificate Secret, host networking places a Secret-holding process directly onto the host network.
+- **Host networking (`hostNetwork: true`)**: The pod runs directly in the host network namespace. The proxy process binds directly to host interfaces on ports 80 and 443. Because ports 80 and 443 are privileged (< 1024), the container requires `securityContext.capabilities.add: [NET_BIND_SERVICE]` (and `allowPrivilegeEscalation: true`) or UID 0. Host networking grants the container access to all host network interfaces. Because the data plane holds TLS certificates and private keys, host networking places a key-holding process directly onto the host network.
 
-The trade-offs and recommendation follow. Host networking avoids CNI portmap overhead and works without CNI port-forwarding support, but grants host network access to the container, requires elevated capabilities, and compromises the network boundary around Secrets. Host ports require CNI portmap support, but preserve network namespace isolation, require no container capabilities, and uphold Secret isolation. The choice between host ports and host networking is the maintainer's; the recommendation is host ports.
+The trade-offs and recommendation follow. Host networking avoids CNI portmap overhead and works without CNI port-forwarding support, but grants host network access to the container, requires elevated capabilities, and compromises the network boundary around private keys. Host ports require CNI portmap support, but preserve network namespace isolation, require no container capabilities, and uphold credential isolation. The choice between host ports and host networking is the maintainer's; the recommendation is host ports.
 
 ## 2. Several Gateways on One Node
 
@@ -36,27 +36,28 @@ Each component receives scoped RBAC:
 - **Controller**:
   - `gateway.networking.k8s.io`: `gateways`, `gatewayclasses`, `httproutes`, `referencegrants` (`get`, `list`, `watch`, `update`, `patch`).
   - `gateway.networking.k8s.io`: `gateways/status`, `gatewayclasses/status`, `httproutes/status` (`update`, `patch`).
-  - `core`: `secrets` (`get`, `list`, `watch` to read referenced TLS certificates; `create`, `update`, `patch` for per-Gateway config Secrets).
-  - `core`: `services`, `namespaces`, `configmaps`, `nodes` (`get`, `list`, `watch`).
+  - `core`: `secrets` (`get`, `list`, `watch` to read referenced TLS certificates).
+  - `core`: `services`, `namespaces`, `nodes` (`get`, `list`, `watch`).
+  - `core`: `configmaps` (`get`, `list`, `watch`, `create`, `patch` to distribute the trust bundle into Gateway namespaces).
+  - `core`: `serviceaccounts` (`create`, `update`, `patch`, `delete` for per-Gateway data planes).
   - `apps`: `deployments` (`get`, `list`, `watch`, `create`, `update`, `patch`, `delete`).
-  - `core`, `rbac.authorization.k8s.io`: `serviceaccounts`, `roles`, `rolebindings` (`create`, `update`, `patch`, `delete`).
+  - `authentication.k8s.io`: `tokenreviews` (`create` to authenticate data planes).
   - `coordination.k8s.io`: `leases` (`get`, `list`, `watch`, `create`, `update`, `patch`, `delete`).
 - **Gateway Data Plane**:
-  - `core`: `secrets` (`get`, `list`, `watch`) restricted by `resourceNames: ["<gateway-name>"]` in its own namespace.
-  - Because Kubernetes RBAC does not authorize `list` and `watch` requests on Secrets with `resourceNames` alone, the data plane reads its Secret the way the reference implementation does today: running under a per-Gateway ServiceAccount with its informer cache restricted by a `metadata.name=<gateway-name>` field selector. The API server authorizes the filtered list and watch calls against the Role's resource name rule, and the data plane receives no access to other Secrets. The design keeps this approach.
+  - The data plane receives its configuration from the controller's internal API over a TLS stream. It authenticates to the internal API using its projected ServiceAccount token (`audience: gari-controller`) and validates the controller's TLS certificate against the mounted cluster trust bundle ConfigMap. It requires no Kubernetes RBAC permissions and makes no calls to the Kubernetes API server.
 - **DNS (mDNS Responder)**:
   - `core`: `secrets` (`get`, `list`, `watch`) restricted by `resourceNames: ["localgateway-dns"]`.
   - The DNS component is a data plane. The controller computes the DNS records and publishes them in one Secret, `localgateway-dns`, and the DNS component reads that one Secret and nothing else. It watches no Gateways. Because the component runs with host networking, its Role names only this one object so it gets the smallest permission that works.
 
 ## 4. What the Data Plane Holds
 
-The data plane holds only its compiled `DataplaneConfig` loaded from its dedicated per-Gateway Secret (`config.json`). This configuration carries:
+The data plane holds only its compiled `DataplaneConfig` received from the controller's internal API over a TLS stream. This configuration carries:
 
 - HTTP and HTTPS routing tables (paths, headers, query parameters, backend references).
 - TLS certificates and private keys for its own Gateway's listeners.
 - Local proxy filter settings (timeouts, client IP preservation).
 
-The data plane cannot read Secrets belonging to other Gateways or other namespaces, has no API access to Gateway API objects, and cannot access host network sockets when using host ports.
+The data plane has no access to Secrets or Gateway API objects in the Kubernetes API, holds only its own Gateway's configuration in memory, and cannot access host network sockets when using host ports.
 
 ## 5. Addresses and Readiness: HostPortAddressProvider
 
@@ -64,11 +65,11 @@ The architecture decouples host-port data-plane provisioning from the reference 
 
 ### 5.1 Architecture and the Seam
 
-`singlepod.AddressProvider` manages single-replica data-plane infrastructure for a Gateway. By default, it provisions a ServiceAccount, Role, RoleBinding, Secret ownership checks, a Deployment, and a LoadBalancer Service whose ingress address populates `Gateway.status.addresses`.
+`singlepod.AddressProvider` manages single-replica data-plane infrastructure for a Gateway. By default, it provisions a ServiceAccount, a trust bundle ConfigMap, a Deployment, and a LoadBalancer Service whose ingress address populates `Gateway.status.addresses`.
 
 `HostPortAddressProvider` wraps `singlepod.AddressProvider` rather than decomposing `singlepod` into exported building blocks:
 
-- **Why wrapping**: `singlepod` encapsulates per-Gateway RBAC (`ServiceAccount`, `Role`, `RoleBinding`), `Secret` ownership checks, server-side apply (SSA) field management (`FieldManager`), and base container flags (`--dataplane-mode`). Exposing exported building blocks (`ReconcileServiceAccount`, `ReconcileRole`, `ApplyDeployment`, etc.) would leak singlepod's internal orchestration order and error handling. Wrapping maintains singlepod's integrity as a cohesive provisioning engine while delegating host-port specifics to `HostPortAddressProvider`.
+- **Why wrapping**: `singlepod` encapsulates per-Gateway infrastructure (`ServiceAccount`, trust bundle `ConfigMap`), server-side apply (SSA) field management (`FieldManager`), and base container flags (`--dataplane-mode`, `--internal-api-address`). Exposing exported building blocks (`ReconcileServiceAccount`, `ReconcileConfigMap`, `ApplyDeployment`, etc.) would leak singlepod's internal orchestration order and error handling. Wrapping maintains singlepod's integrity as a cohesive provisioning engine while delegating host-port specifics to `HostPortAddressProvider`.
 - **Comparison with `gcpgateway`**: `gcpgateway` customizes `singlepod` through narrow options (`WithExtraReadinessGates`, `WithPreStopCommand`, `WithExtraVolumes`, `WithTerminationGracePeriodSeconds`). This fits `gcpgateway` because it operates within the standard Service-backed architecture (using `ClusterIP` Services) and delegates cloud load balancing to an external controller. `HostPortAddressProvider` differs from the Service model by binding directly to node host ports, eliminating the Service, enforcing zero-surge rolling updates, and discovering addresses from the scheduled Node.
 
 To support this without embedding host-port knowledge inside `singlepod`, `singlepod` exposes two general-purpose extension hooks:
@@ -78,7 +79,7 @@ To support this without embedding host-port knowledge inside `singlepod`, `singl
 
 `HostPortAddressProvider` implements `controller.AddressProvider`, `controller.AddressTypeProvider`, and `controller.AddressWatcher`. When reconciling a Gateway:
 1. It validates listener ports (rejecting listener configurations that exceed port limits before modifying infrastructure).
-2. It delegates underlying resource provisioning (RBAC, Secret check, Deployment apply) to the wrapped `singlepod.AddressProvider` configured with `WithNoService()` and the mutator hook.
+2. It delegates underlying resource provisioning (ServiceAccount, trust bundle ConfigMap, Deployment apply) to the wrapped `singlepod.AddressProvider` configured with `WithNoService()` and the mutator hook.
 3. It performs uncached queries against the API server to locate the scheduled data-plane pod and its Node.
 4. It computes the Gateway's addresses from the Node's `NodeInternalIP`s and reports readiness based on pod scheduling and Deployment availability.
 
@@ -156,7 +157,7 @@ Permissions are scoped to the component that needs them:
   - `apps`: `replicasets` (`get`)
   - `core`: `nodes` (`get`)
   - `apps`: `deployments` (`get`, `list`, `watch`, `create`, `update`, `patch`, `delete`)
-  - `core`: `secrets`, `serviceaccounts`, `roles`, `rolebindings` (per-Gateway data-plane provisioning)
+  - `core`: `serviceaccounts`, `configmaps` (per-Gateway data-plane provisioning)
 - **`gari-controller`** (`k8s/controller.yaml`): The default reference implementation controller provisions standard LoadBalancer Services. It requires **no** access to `pods`, `replicasets`, or `nodes`. With host ports removed from `singlepod`, the default ClusterRole remains free of Pod and Node permissions.
 
 ### 5.5 Port Conflicts Between Gateways
