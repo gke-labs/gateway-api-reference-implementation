@@ -52,8 +52,13 @@ func (e *ConditionError) toErrorState() *ErrorState {
 
 // ConditionWarning is a warning that leaves a status condition true, with the reason and message to report.
 type ConditionWarning struct {
-	Type    string
-	Reason  string
+	// Type is the condition type that receives the warning.
+	Type string
+
+	// Reason is the machine-readable reason to report in the condition.
+	Reason string
+
+	// Message is the human-readable message to report in the condition.
 	Message string
 }
 
@@ -90,13 +95,13 @@ func buildCondition(errs []*ConditionError, warnings []*ConditionWarning, condit
 		return NewCondition(conditionType, metav1.ConditionFalse, reason, joinMessages(messages), generation)
 	}
 
-	for _, w := range warnings {
-		if w.Type == conditionType {
+	for _, warning := range warnings {
+		if warning.Type == conditionType {
 			if len(messages) == 0 {
-				reason = w.Reason
+				reason = warning.Reason
 			}
-			if !slices.Contains(messages, w.Message) {
-				messages = append(messages, w.Message)
+			if !slices.Contains(messages, warning.Message) {
+				messages = append(messages, warning.Message)
 			}
 		}
 	}
@@ -107,11 +112,14 @@ func buildCondition(errs []*ConditionError, warnings []*ConditionWarning, condit
 	return NewCondition(conditionType, metav1.ConditionTrue, trueReason, trueMessage, generation)
 }
 
+// joinMessages joins distinct messages with semicolons up to maxJoinedMessages.
+// If more messages are present, it summarizes the remaining count.
 func joinMessages(messages []string) string {
-	if len(messages) <= 5 {
+	const maxJoinedMessages = 5
+	if len(messages) <= maxJoinedMessages {
 		return strings.Join(messages, "; ")
 	}
-	return fmt.Sprintf("%s; and %d more", strings.Join(messages[:5], "; "), len(messages)-5)
+	return fmt.Sprintf("%s; and %d more", strings.Join(messages[:maxJoinedMessages], "; "), len(messages)-maxJoinedMessages)
 }
 
 // buildAcceptedCondition constructs a RouteConditionAccepted condition from collected errors.

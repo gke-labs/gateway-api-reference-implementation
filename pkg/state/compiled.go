@@ -1590,12 +1590,12 @@ func ComputeGatewayConditions(
 	var errs []*ConditionError
 	var warnings []*ConditionWarning
 	acceptedType := string(gatewayv1.GatewayConditionAccepted)
-	progType := string(gatewayv1.GatewayConditionProgrammed)
-	addAcceptedErr := func(reason, message string) {
+	programmedType := string(gatewayv1.GatewayConditionProgrammed)
+	addAcceptedError := func(reason, message string) {
 		errs = append(errs, &ConditionError{Type: acceptedType, Reason: reason, Message: message})
 	}
-	addProgrammedErr := func(reason, message string) {
-		errs = append(errs, &ConditionError{Type: progType, Reason: reason, Message: message})
+	addProgrammedError := func(reason, message string) {
+		errs = append(errs, &ConditionError{Type: programmedType, Reason: reason, Message: message})
 	}
 
 	totalListeners := len(gw.Spec.Listeners)
@@ -1607,22 +1607,17 @@ func ComputeGatewayConditions(
 	}
 
 	if paramsErr != nil {
-		addAcceptedErr(string(gatewayv1.GatewayReasonInvalidParameters), paramsErr.Error())
+		addAcceptedError(string(gatewayv1.GatewayReasonInvalidParameters), paramsErr.Error())
 	}
 	if unsupp, unsuppType := HasUnsupportedAddress(gw.Spec.Addresses, supportedAddressTypes); unsupp {
-		addAcceptedErr(string(gatewayv1.GatewayReasonUnsupportedAddress), fmt.Sprintf("Address type %q is not supported", unsuppType))
+		addAcceptedError(string(gatewayv1.GatewayReasonUnsupportedAddress), fmt.Sprintf("Address type %q is not supported", unsuppType))
 	}
 	if totalListeners == 0 {
-		addAcceptedErr(string(gatewayv1.GatewayReasonListenersNotValid), "No listeners configured on Gateway")
+		addAcceptedError(string(gatewayv1.GatewayReasonListenersNotValid), "No listeners configured on Gateway")
 	} else if acceptedListenersCount == 0 {
-		addAcceptedErr(string(gatewayv1.GatewayReasonListenersNotValid), "No listeners are accepted")
+		addAcceptedError(string(gatewayv1.GatewayReasonListenersNotValid), "No listeners are accepted")
 	} else if acceptedListenersCount < totalListeners {
 		warnings = append(warnings, &ConditionWarning{Type: acceptedType, Reason: string(gatewayv1.GatewayReasonListenersNotValid), Message: "One or more listeners have invalid configuration"})
-	}
-
-	gen := int64(0)
-	if gw != nil {
-		gen = gw.Generation
 	}
 
 	acceptedCond := buildCondition(
@@ -1631,41 +1626,41 @@ func ComputeGatewayConditions(
 		acceptedType,
 		string(gatewayv1.GatewayReasonAccepted),
 		"Gateway accepted by reference implementation",
-		gen,
+		gw.Generation,
 	)
 
 	if acceptedCond.Status == metav1.ConditionFalse {
-		addProgrammedErr(string(gatewayv1.GatewayReasonInvalid), "Gateway is not accepted")
-	}
-	if provErr != nil {
-		reason := string(gatewayv1.GatewayReasonPending)
-		var condErr *ConditionError
-		if errors.As(provErr, &condErr) && condErr.Reason != "" {
-			reason = condErr.Reason
+		addProgrammedError(string(gatewayv1.GatewayReasonInvalid), "Gateway is not accepted")
+	} else {
+		if provErr != nil {
+			reason := string(gatewayv1.GatewayReasonPending)
+			var condErr *ConditionError
+			if errors.As(provErr, &condErr) && condErr.Type == programmedType && condErr.Reason != "" {
+				reason = condErr.Reason
+			}
+			addProgrammedError(reason, provErr.Error())
 		}
-		addProgrammedErr(reason, provErr.Error())
-	}
-	if !readiness.Ready && readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
-		addProgrammedErr(string(gatewayv1.GatewayReasonAddressNotUsable), cmp.Or(readiness.Message, "Requested address cannot be used"))
-	}
-	if !hasAddress {
-		msg := "Waiting for address to be assigned to the Gateway"
-		if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotAssigned) && readiness.Message != "" {
-			msg = readiness.Message
+		if !readiness.Ready && readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+			addProgrammedError(string(gatewayv1.GatewayReasonAddressNotUsable), cmp.Or(readiness.Message, "Requested address cannot be used"))
+		} else if !hasAddress {
+			msg := "Waiting for address to be assigned to the Gateway"
+			if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotAssigned) && readiness.Message != "" {
+				msg = readiness.Message
+			}
+			addProgrammedError(string(gatewayv1.GatewayReasonAddressNotAssigned), msg)
 		}
-		addProgrammedErr(string(gatewayv1.GatewayReasonAddressNotAssigned), msg)
-	}
-	if !readiness.Ready && readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		addProgrammedErr(cmp.Or(readiness.Reason, string(gatewayv1.GatewayReasonPending)), cmp.Or(readiness.Message, "Waiting for data-plane deployment to become available"))
+		if !readiness.Ready && readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+			addProgrammedError(cmp.Or(readiness.Reason, string(gatewayv1.GatewayReasonPending)), cmp.Or(readiness.Message, "Waiting for data-plane deployment to become available"))
+		}
 	}
 
 	programmedCond := buildCondition(
 		errs,
 		warnings,
-		progType,
+		programmedType,
 		string(gatewayv1.GatewayReasonProgrammed),
 		"Gateway programmed by reference implementation",
-		gen,
+		gw.Generation,
 	)
 
 	if resolvedRefsCond.Type == "" {
@@ -1674,7 +1669,7 @@ func ComputeGatewayConditions(
 			metav1.ConditionTrue,
 			string(gatewayv1.GatewayReasonResolvedRefs),
 			"Resolved references",
-			gen,
+			gw.Generation,
 		)
 	}
 
