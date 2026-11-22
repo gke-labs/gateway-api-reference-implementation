@@ -69,7 +69,7 @@ func buildCondition(errs []*ConditionError, conditionType, trueReason, trueMessa
 	var messages []string
 	var found bool
 	for _, err := range errs {
-		if err == nil || err.Type != conditionType {
+		if err.Type != conditionType {
 			continue
 		}
 		if !found {

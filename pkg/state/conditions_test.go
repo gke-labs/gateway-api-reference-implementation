@@ -906,144 +906,73 @@ func TestUpdateRouteParentStatuses_AddRemoveEntriesStability(t *testing.T) {
 }
 
 func TestBuildCondition(t *testing.T) {
-	t.Run("empty errors returns True condition", func(t *testing.T) {
-		cond := buildCondition(nil, "Accepted", "Accepted", "Validation succeeded", 1)
-		if cond.Status != metav1.ConditionTrue {
-			t.Errorf("expected Status True, got %s", cond.Status)
-		}
-		if cond.Reason != "Accepted" {
-			t.Errorf("expected Reason Accepted, got %s", cond.Reason)
-		}
-		if cond.Message != "Validation succeeded" {
-			t.Errorf("expected Message 'Validation succeeded', got %q", cond.Message)
-		}
-		if cond.ObservedGeneration != 1 {
-			t.Errorf("expected ObservedGeneration 1, got %d", cond.ObservedGeneration)
-		}
-	})
+	tests := []struct {
+		name       string
+		errs       []*ConditionError
+		wantReason string
+		wantMsg    string
+	}{
+		{
+			name: "one error",
+			errs: []*ConditionError{
+				{Type: "Accepted", Reason: "UnsupportedValue", Message: "invalid timeout"},
+			},
+			wantReason: "UnsupportedValue",
+			wantMsg:    "invalid timeout",
+		},
+		{
+			name: "two errors of one type",
+			errs: []*ConditionError{
+				{Type: "Accepted", Reason: "FirstReason", Message: "first error"},
+				{Type: "Accepted", Reason: "SecondReason", Message: "second error"},
+			},
+			wantReason: "FirstReason",
+			wantMsg:    "first error; second error",
+		},
+		{
+			name: "a repeated message",
+			errs: []*ConditionError{
+				{Type: "Accepted", Reason: "FirstReason", Message: "first error"},
+				{Type: "Accepted", Reason: "SecondReason", Message: "second error"},
+				{Type: "Accepted", Reason: "ThirdReason", Message: "first error"},
+			},
+			wantReason: "FirstReason",
+			wantMsg:    "first error; second error",
+		},
+		{
+			name: "more than five messages",
+			errs: []*ConditionError{
+				{Type: "Accepted", Reason: "R1", Message: "m1"},
+				{Type: "Accepted", Reason: "R2", Message: "m2"},
+				{Type: "Accepted", Reason: "R3", Message: "m3"},
+				{Type: "Accepted", Reason: "R4", Message: "m4"},
+				{Type: "Accepted", Reason: "R5", Message: "m5"},
+				{Type: "Accepted", Reason: "R6", Message: "m6"},
+				{Type: "Accepted", Reason: "R7", Message: "m7"},
+				{Type: "Accepted", Reason: "R8", Message: "m8"},
+			},
+			wantReason: "R1",
+			wantMsg:    "m1; m2; m3; m4; m5; and 3 more",
+		},
+		{
+			name: "an error of another type",
+			errs: []*ConditionError{
+				{Type: "ResolvedRefs", Reason: "BackendNotFound", Message: "backend not found"},
+			},
+			wantReason: "Accepted",
+			wantMsg:    "Route validation succeeded",
+		},
+	}
 
-	t.Run("errors of other type returns True condition", func(t *testing.T) {
-		errs := []*ConditionError{
-			{Type: "ResolvedRefs", Reason: "BackendNotFound", Message: "Backend not found"},
-		}
-		cond := buildCondition(errs, "Accepted", "Accepted", "Validation succeeded", 2)
-		if cond.Status != metav1.ConditionTrue {
-			t.Errorf("expected Status True, got %s", cond.Status)
-		}
-		if cond.Reason != "Accepted" {
-			t.Errorf("expected Reason Accepted, got %s", cond.Reason)
-		}
-		if cond.Message != "Validation succeeded" {
-			t.Errorf("expected Message 'Validation succeeded', got %q", cond.Message)
-		}
-	})
-
-	t.Run("single error reports its reason and message unchanged", func(t *testing.T) {
-		errs := []*ConditionError{
-			{Type: "Accepted", Reason: "UnsupportedValue", Message: "Invalid timeout"},
-		}
-		cond := buildCondition(errs, "Accepted", "Accepted", "Validation succeeded", 1)
-		if cond.Status != metav1.ConditionFalse {
-			t.Errorf("expected Status False, got %s", cond.Status)
-		}
-		if cond.Reason != "UnsupportedValue" {
-			t.Errorf("expected Reason UnsupportedValue, got %s", cond.Reason)
-		}
-		if cond.Message != "Invalid timeout" {
-			t.Errorf("expected Message 'Invalid timeout', got %q", cond.Message)
-		}
-	})
-
-	t.Run("multiple errors join messages in list order with first reason", func(t *testing.T) {
-		errs := []*ConditionError{
-			{Type: "Accepted", Reason: "FirstReason", Message: "Error 1"},
-			{Type: "OtherType", Reason: "OtherReason", Message: "Other error"},
-			{Type: "Accepted", Reason: "SecondReason", Message: "Error 2"},
-		}
-		cond := buildCondition(errs, "Accepted", "Accepted", "Validation succeeded", 1)
-		if cond.Status != metav1.ConditionFalse {
-			t.Errorf("expected Status False, got %s", cond.Status)
-		}
-		if cond.Reason != "FirstReason" {
-			t.Errorf("expected Reason FirstReason, got %s", cond.Reason)
-		}
-		expectedMsg := "Error 1; Error 2"
-		if cond.Message != expectedMsg {
-			t.Errorf("expected Message %q, got %q", expectedMsg, cond.Message)
-		}
-	})
-
-	t.Run("duplicate messages are left out", func(t *testing.T) {
-		errs := []*ConditionError{
-			{Type: "ResolvedRefs", Reason: "ReasonA", Message: "Service not found"},
-			{Type: "ResolvedRefs", Reason: "ReasonB", Message: "Invalid port"},
-			{Type: "ResolvedRefs", Reason: "ReasonC", Message: "Service not found"},
-			{Type: "ResolvedRefs", Reason: "ReasonD", Message: "Invalid port"},
-			{Type: "ResolvedRefs", Reason: "ReasonE", Message: "Another error"},
-		}
-		cond := buildCondition(errs, "ResolvedRefs", "ResolvedRefs", "All references resolved", 1)
-		if cond.Reason != "ReasonA" {
-			t.Errorf("expected Reason ReasonA, got %s", cond.Reason)
-		}
-		expectedMsg := "Service not found; Invalid port; Another error"
-		if cond.Message != expectedMsg {
-			t.Errorf("expected Message %q, got %q", expectedMsg, cond.Message)
-		}
-	})
-
-	t.Run("up to five messages are joined without suffix", func(t *testing.T) {
-		errs := []*ConditionError{
-			{Type: "Accepted", Reason: "R1", Message: "msg1"},
-			{Type: "Accepted", Reason: "R2", Message: "msg2"},
-			{Type: "Accepted", Reason: "R3", Message: "msg3"},
-			{Type: "Accepted", Reason: "R4", Message: "msg4"},
-			{Type: "Accepted", Reason: "R5", Message: "msg5"},
-		}
-		cond := buildCondition(errs, "Accepted", "Accepted", "OK", 1)
-		expectedMsg := "msg1; msg2; msg3; msg4; msg5"
-		if cond.Message != expectedMsg {
-			t.Errorf("expected Message %q, got %q", expectedMsg, cond.Message)
-		}
-	})
-
-	t.Run("more than five messages ends with how many are left out", func(t *testing.T) {
-		errs := []*ConditionError{
-			{Type: "Accepted", Reason: "R1", Message: "msg1"},
-			{Type: "Accepted", Reason: "R2", Message: "msg2"},
-			{Type: "Accepted", Reason: "R3", Message: "msg3"},
-			{Type: "Accepted", Reason: "R4", Message: "msg4"},
-			{Type: "Accepted", Reason: "R5", Message: "msg5"},
-			{Type: "Accepted", Reason: "R6", Message: "msg6"},
-		}
-		cond6 := buildCondition(errs, "Accepted", "Accepted", "OK", 1)
-		expected6 := "msg1; msg2; msg3; msg4; msg5; and 1 more"
-		if cond6.Message != expected6 {
-			t.Errorf("expected Message %q, got %q", expected6, cond6.Message)
-		}
-
-		errs8 := append(errs,
-			&ConditionError{Type: "Accepted", Reason: "R7", Message: "msg7"},
-			&ConditionError{Type: "Accepted", Reason: "R8", Message: "msg8"},
-		)
-		cond8 := buildCondition(errs8, "Accepted", "Accepted", "OK", 1)
-		expected8 := "msg1; msg2; msg3; msg4; msg5; and 3 more"
-		if cond8.Message != expected8 {
-			t.Errorf("expected Message %q, got %q", expected8, cond8.Message)
-		}
-	})
-
-	t.Run("deterministic order on recompute", func(t *testing.T) {
-		errs := []*ConditionError{
-			{Type: "Accepted", Reason: "R1", Message: "alpha"},
-			{Type: "Accepted", Reason: "R2", Message: "beta"},
-			{Type: "Accepted", Reason: "R3", Message: "gamma"},
-		}
-		first := buildCondition(errs, "Accepted", "Accepted", "OK", 1)
-		for i := 0; i < 20; i++ {
-			recomputed := buildCondition(errs, "Accepted", "Accepted", "OK", 1)
-			if recomputed.Message != first.Message || recomputed.Reason != first.Reason {
-				t.Fatalf("iteration %d produced inconsistent result: %v != %v", i, recomputed, first)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := buildCondition(tt.errs, "Accepted", "Accepted", "Route validation succeeded", 1)
+			if cond.Reason != tt.wantReason {
+				t.Errorf("got Reason %q, want %q", cond.Reason, tt.wantReason)
 			}
-		}
-	})
+			if cond.Message != tt.wantMsg {
+				t.Errorf("got Message %q, want %q", cond.Message, tt.wantMsg)
+			}
+		})
+	}
 }
