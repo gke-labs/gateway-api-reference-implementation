@@ -133,16 +133,13 @@ type gatewayProvisioningErrors struct {
 	publish error
 }
 
-// message returns the error message for the Gateway's Programmed condition.
+// err returns the provisioning error for the Gateway's Programmed condition.
 // The address provider's error is shown first, then the publish error.
-func (e gatewayProvisioningErrors) message() string {
+func (e gatewayProvisioningErrors) err() error {
 	if e.addressProvider != nil {
-		return e.addressProvider.Error()
+		return e.addressProvider
 	}
-	if e.publish != nil {
-		return e.publish.Error()
-	}
-	return ""
+	return e.publish
 }
 
 type State struct {
@@ -829,7 +826,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 
 	gwAddrs := make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress)
 	gwReady := make(map[types.NamespacedName]GatewayReadiness)
-	gwProvErrs := make(map[types.NamespacedName]string)
+	gwProvErrs := make(map[types.NamespacedName]error)
 	for k, gwState := range s.gateways {
 		if gwState != nil {
 			if len(gwState.addresses) > 0 {
@@ -838,8 +835,8 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 			if gwState.readiness != nil {
 				gwReady[k] = *gwState.readiness
 			}
-			if msg := gwState.provisioningErrors.message(); msg != "" {
-				gwProvErrs[k] = msg
+			if err := gwState.provisioningErrors.err(); err != nil {
+				gwProvErrs[k] = err
 			}
 		}
 	}
@@ -1581,8 +1578,19 @@ func (s *State) SetGatewayReadiness(key types.NamespacedName, readiness GatewayR
 	s.markDirtyLocked()
 }
 
+func sameError(a, b error) bool {
+	if a == b || a == nil || b == nil {
+		return a == b
+	}
+	var ca, cb *ConditionError
+	if errors.As(a, &ca) && errors.As(b, &cb) {
+		return *ca == *cb
+	}
+	return !errors.As(a, &ca) && !errors.As(b, &cb) && a.Error() == b.Error()
+}
+
 // SetGatewayProvisioningError sets the address provider provisioning error only for a Gateway.
-func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr string) {
+func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1592,13 +1600,14 @@ func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr st
 	}
 
 	var newErr error
-	if provErr != "" {
-		newErr = errors.New(provErr)
+	if err, ok := provErr.(error); ok {
+		newErr = err
+	} else if str, ok := provErr.(string); ok && str != "" {
+		newErr = errors.New(str)
 	}
 
 	errs := gw.provisioningErrors
-	if (errs.addressProvider == nil && newErr == nil) ||
-		(errs.addressProvider != nil && newErr != nil && errs.addressProvider.Error() == newErr.Error()) {
+	if sameError(errs.addressProvider, newErr) {
 		return
 	}
 

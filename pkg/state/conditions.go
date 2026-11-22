@@ -50,6 +50,13 @@ func (e *ConditionError) toErrorState() *ErrorState {
 	}
 }
 
+// ConditionWarning is a warning that leaves a status condition true, with the reason and message to report.
+type ConditionWarning struct {
+	Type    string
+	Reason  string
+	Message string
+}
+
 // newValidationError builds a ConditionError for an unsupported or invalid route value.
 func newValidationError(message string) *ConditionError {
 	return &ConditionError{
@@ -59,45 +66,59 @@ func newValidationError(message string) *ConditionError {
 	}
 }
 
-// buildCondition constructs a condition of the specified type from collected route errors.
-// If the error list contains no error of that type, it returns a True condition with trueReason and trueMessage.
-// Otherwise, it returns a False condition whose reason comes from the first error of that type and whose message
-// joins up to five distinct error messages of that type in list order. List order decides which error is first,
-// so callers append in a fixed order.
-func buildCondition(errs []*ConditionError, conditionType, trueReason, trueMessage string, generation int64) metav1.Condition {
+// buildCondition constructs a condition of the specified type from collected errors and warnings.
+// If the error list contains an error of that type, it returns a False condition whose reason comes from the
+// first error of that type and whose message joins up to five distinct error messages of that type in list order.
+// Otherwise, if the warning list contains a warning of that type, it returns a True condition whose reason comes
+// from the first warning of that type and whose message joins up to five distinct warning messages of that type.
+// Otherwise, it returns a True condition with trueReason and trueMessage.
+// List order decides which item is first, so callers append in a fixed order.
+func buildCondition(errs []*ConditionError, warnings []*ConditionWarning, conditionType, trueReason, trueMessage string, generation int64) metav1.Condition {
 	var reason string
 	var messages []string
-	var found bool
 	for _, err := range errs {
-		if err.Type != conditionType {
-			continue
-		}
-		if !found {
-			reason = err.Reason
-			found = true
-		}
-		if !slices.Contains(messages, err.Message) {
-			messages = append(messages, err.Message)
+		if err.Type == conditionType {
+			if len(messages) == 0 {
+				reason = err.Reason
+			}
+			if !slices.Contains(messages, err.Message) {
+				messages = append(messages, err.Message)
+			}
 		}
 	}
-	if !found {
-		return NewCondition(conditionType, metav1.ConditionTrue, trueReason, trueMessage, generation)
+	if len(messages) > 0 {
+		return NewCondition(conditionType, metav1.ConditionFalse, reason, joinMessages(messages), generation)
 	}
 
-	const maxJoinedMessages = 5
-	var message string
-	if len(messages) <= maxJoinedMessages {
-		message = strings.Join(messages, "; ")
-	} else {
-		message = fmt.Sprintf("%s; and %d more", strings.Join(messages[:maxJoinedMessages], "; "), len(messages)-maxJoinedMessages)
+	for _, w := range warnings {
+		if w.Type == conditionType {
+			if len(messages) == 0 {
+				reason = w.Reason
+			}
+			if !slices.Contains(messages, w.Message) {
+				messages = append(messages, w.Message)
+			}
+		}
 	}
-	return NewCondition(conditionType, metav1.ConditionFalse, reason, message, generation)
+	if len(messages) > 0 {
+		return NewCondition(conditionType, metav1.ConditionTrue, reason, joinMessages(messages), generation)
+	}
+
+	return NewCondition(conditionType, metav1.ConditionTrue, trueReason, trueMessage, generation)
+}
+
+func joinMessages(messages []string) string {
+	if len(messages) <= 5 {
+		return strings.Join(messages, "; ")
+	}
+	return fmt.Sprintf("%s; and %d more", strings.Join(messages[:5], "; "), len(messages)-5)
 }
 
 // buildAcceptedCondition constructs a RouteConditionAccepted condition from collected errors.
 func buildAcceptedCondition(errs []*ConditionError, generation int64) metav1.Condition {
 	return buildCondition(
 		errs,
+		nil,
 		string(gatewayv1.RouteConditionAccepted),
 		string(gatewayv1.RouteReasonAccepted),
 		"Route validation succeeded",
@@ -109,6 +130,7 @@ func buildAcceptedCondition(errs []*ConditionError, generation int64) metav1.Con
 func buildResolvedRefsCondition(errs []*ConditionError, generation int64) metav1.Condition {
 	return buildCondition(
 		errs,
+		nil,
 		string(gatewayv1.RouteConditionResolvedRefs),
 		string(gatewayv1.RouteReasonResolvedRefs),
 		"All references resolved",

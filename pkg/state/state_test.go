@@ -788,6 +788,82 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 	}
 }
 
+func TestState_GatewayProvisioningError_NoAddress_ReportsFirstReasonAndBothMessages(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// Gateway has a provisioning error and no address assigned.
+	provErr := "conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw"
+	st.SetGatewayProvisioningError(gwKey, provErr)
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil {
+		t.Fatalf("expected Programmed condition")
+	}
+	if progCond.Status != metav1.ConditionFalse {
+		t.Errorf("expected Programmed=False, got %s", progCond.Status)
+	}
+	if progCond.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Errorf("expected Reason=Pending, got %s", progCond.Reason)
+	}
+	expectedMsg := provErr + "; Waiting for address to be assigned to the Gateway"
+	if progCond.Message != expectedMsg {
+		t.Errorf("expected Message=%q, got %q", expectedMsg, progCond.Message)
+	}
+
+	// Also verify that a *ConditionError provisioning error reports its own reason.
+	customReason := "CustomConflictReason"
+	customCondErr := &ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
+		Reason:  customReason,
+		Message: provErr,
+	}
+	st.SetGatewayProvisioningError(gwKey, customCondErr)
+	st.Recompute()
+
+	status, ok = st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	progCond = findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil {
+		t.Fatalf("expected Programmed condition")
+	}
+	if progCond.Status != metav1.ConditionFalse {
+		t.Errorf("expected Programmed=False, got %s", progCond.Status)
+	}
+	if progCond.Reason != customReason {
+		t.Errorf("expected Reason=%s, got %s", customReason, progCond.Reason)
+	}
+	if progCond.Message != expectedMsg {
+		t.Errorf("expected Message=%q, got %q", expectedMsg, progCond.Message)
+	}
+}
+
 type mockDataplanePublisher struct {
 	mu                sync.Mutex
 	publishErr        error
@@ -1020,8 +1096,8 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	if errs.publish.Error() != err.Error() {
 		t.Errorf("expected recorded error %q, got %q", err.Error(), errs.publish.Error())
 	}
-	if msg := errs.message(); msg != err.Error() {
-		t.Errorf("expected provisioning error message %q, got %q", err.Error(), msg)
+	if errs.err() == nil || errs.err().Error() != err.Error() {
+		t.Errorf("expected provisioning error %q, got %v", err.Error(), errs.err())
 	}
 	var rejectedErr *RejectedError
 	if !errors.As(errs.publish, &rejectedErr) {
@@ -1054,8 +1130,8 @@ func TestState_PublishDataplaneConfig_InProcessApplyError(t *testing.T) {
 	if clearedErrs.publish != nil {
 		t.Errorf("expected publish error to be cleared, got %v", clearedErrs.publish)
 	}
-	if msg := clearedErrs.message(); msg != "" {
-		t.Errorf("expected provisioning error to be cleared, got %q", msg)
+	if clearedErrs.err() != nil {
+		t.Errorf("expected provisioning error to be cleared, got %v", clearedErrs.err())
 	}
 	if dataplaneState.acceptedConfig == nil {
 		t.Errorf("expected acceptedConfig to be saved in dataplane state")
@@ -1126,8 +1202,8 @@ func TestState_PublishDataplaneConfig_MultipleRejections_ErrorsAs(t *testing.T) 
 	if !slices.Equal(rejectedErr.Rejections, twoRejections) {
 		t.Errorf("expected rejections %+v, got %+v", twoRejections, rejectedErr.Rejections)
 	}
-	if msg := errs.message(); msg != expectedErrMsg {
-		t.Errorf("expected provisioning error message %q, got %q", expectedErrMsg, msg)
+	if errs.err() == nil || errs.err().Error() != expectedErrMsg {
+		t.Errorf("expected provisioning error %q, got %v", expectedErrMsg, errs.err())
 	}
 }
 
@@ -2588,8 +2664,9 @@ func TestState_GatewayAddresses_AddressNotUsable(t *testing.T) {
 		t.Errorf("expected Accepted=True Reason=Accepted, got %+v", acceptedCond)
 	}
 	progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
-	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) || progCond.Message != notUsableMsg {
-		t.Errorf("expected Programmed=False Reason=AddressNotUsable Message=%q, got %+v", notUsableMsg, progCond)
+	expectedProgMsg := notUsableMsg + "; Waiting for address to be assigned to the Gateway"
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) || progCond.Message != expectedProgMsg {
+		t.Errorf("expected Programmed=False Reason=AddressNotUsable Message=%q, got %+v", expectedProgMsg, progCond)
 	}
 	if len(status.Addresses) != 0 {
 		t.Errorf("expected no status addresses when address is not usable, got %+v", status.Addresses)
