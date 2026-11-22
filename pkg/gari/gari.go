@@ -415,6 +415,13 @@ type Server struct {
 
 	healthProbeServer *http.Server
 
+	// httpListener is the startup listener bound for HTTP proxy traffic.
+	httpListener net.Listener
+	// httpsListener is the startup listener bound for HTTPS proxy traffic.
+	httpsListener net.Listener
+	// listenersBound indicates whether startup listeners have been bound.
+	listenersBound bool
+
 	proxySynced atomic.Bool
 
 	// filterMu guards listenerOpts, httpFilter, and httpsFilter.
@@ -927,35 +934,39 @@ func (s *Server) newHTTPServer(handler http.Handler, tlsConfig *tls.Config) *htt
 	}
 }
 
+// bindStartupListeners binds the HTTP and HTTPS proxy sockets before the health
+// server starts reporting readiness, ensuring clients do not receive connection
+// refused errors when connecting immediately after the data plane reports ready.
 func (s *Server) bindStartupListeners() error {
-	var openedHTTP net.Listener
+	if s.listenersBound {
+		return nil
+	}
+
 	if s.opts.HTTPListener == nil && s.opts.ProxyAddr != "" {
 		lis, err := net.Listen("tcp", s.opts.ProxyAddr)
 		if err != nil {
 			return fmt.Errorf("failed to listen on HTTP proxy address %q: %w", s.opts.ProxyAddr, err)
 		}
-		s.opts.HTTPListener = lis
-		openedHTTP = lis
+		s.httpListener = lis
 	}
 
-	hasHTTPS := s.opts.HTTPSListener != nil || s.opts.ProxyHTTPSAddr != ""
-	if hasHTTPS && s.opts.HTTPSListener == nil && s.opts.ProxyHTTPSAddr != "" {
+	if s.opts.HTTPSListener == nil && s.opts.ProxyHTTPSAddr != "" {
 		lis, err := net.Listen("tcp", s.opts.ProxyHTTPSAddr)
 		if err != nil {
-			if openedHTTP != nil {
-				_ = openedHTTP.Close()
-				s.opts.HTTPListener = nil
-			}
 			return fmt.Errorf("failed to listen on HTTPS proxy address %q: %w", s.opts.ProxyHTTPSAddr, err)
 		}
-		s.opts.HTTPSListener = lis
+		s.httpsListener = lis
 	}
+
+	s.listenersBound = true
 	return nil
 }
 
 func (s *Server) StartProxyServers(ctx context.Context) error {
-	if err := s.bindStartupListeners(); err != nil {
-		return err
+	if !s.listenersBound {
+		if err := s.bindStartupListeners(); err != nil {
+			return err
+		}
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
@@ -967,21 +978,29 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 		}
 	}()
 
-	hasHTTPS := s.opts.HTTPSListener != nil || s.opts.ProxyHTTPSAddr != ""
+	httpLis := s.httpListener
+	if httpLis == nil {
+		httpLis = s.opts.HTTPListener
+	}
+
+	httpsLis := s.httpsListener
+	if httpsLis == nil {
+		httpsLis = s.opts.HTTPSListener
+	}
+
 	hasHTTP3 := s.opts.HTTP3PacketConn != nil || s.opts.ProxyHTTP3Addr != ""
-	if hasHTTPS || hasHTTP3 {
+	if httpsLis != nil || hasHTTP3 {
 		if err := s.initDefaultCertificate(); err != nil {
 			return err
 		}
 	}
 
 	// HTTP Proxy Server
-	if s.opts.HTTPListener != nil {
-		lis := s.opts.HTTPListener
+	if httpLis != nil {
 		g.Go(func() error {
-			filterLis, err := s.initHTTPFilter(lis)
+			filterLis, err := s.initHTTPFilter(httpLis)
 			if err != nil {
-				if closeErr := lis.Close(); closeErr != nil {
+				if closeErr := httpLis.Close(); closeErr != nil {
 					klog.V(4).Infof("closing HTTP listener: %v", closeErr)
 				}
 				return fmt.Errorf("failed to create HTTP listener filter: %w", err)
@@ -1041,12 +1060,11 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 	}
 
 	// HTTPS Proxy Server
-	if s.opts.HTTPSListener != nil {
-		lis := s.opts.HTTPSListener
+	if httpsLis != nil {
 		g.Go(func() error {
-			filterLis, err := s.initHTTPSFilter(lis)
+			filterLis, err := s.initHTTPSFilter(httpsLis)
 			if err != nil {
-				if closeErr := lis.Close(); closeErr != nil {
+				if closeErr := httpsLis.Close(); closeErr != nil {
 					klog.V(4).Infof("closing HTTPS listener: %v", closeErr)
 				}
 				return fmt.Errorf("failed to create HTTPS listener filter: %w", err)
