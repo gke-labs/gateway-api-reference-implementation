@@ -181,13 +181,9 @@ func (p *Publisher) publishOnce(ctx context.Context) error {
 // publishSecret writes or deletes the DNS configuration Secret.
 // It verifies that no other owner holds the Secret, deletes the Secret when the payload is empty,
 // and otherwise applies the Secret using server-side apply.
-func publishSecret(ctx context.Context, cl client.Client, namespace, name string, payload []byte) error {
-	if cl == nil {
-		return nil
-	}
-
+func publishSecret(ctx context.Context, kubernetesClient client.Client, namespace, name string, payload []byte) error {
 	var existingSecret corev1.Secret
-	err := cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &existingSecret)
+	err := kubernetesClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &existingSecret)
 	if err == nil {
 		if ref := metav1.GetControllerOf(&existingSecret); ref != nil {
 			return &state.OwnershipConflictError{
@@ -206,7 +202,7 @@ func publishSecret(ctx context.Context, cl client.Client, namespace, name string
 					Name:      name,
 				},
 			}
-			if err := cl.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			if err := kubernetesClient.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
 				return fmt.Errorf("failed to delete config Secret %s/%s: %w", namespace, name, err)
 			}
 		}
@@ -218,7 +214,7 @@ func publishSecret(ctx context.Context, cl client.Client, namespace, name string
 			ConfigSecretDataKey: payload,
 		})
 
-	if err := cl.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+	if err := kubernetesClient.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply config Secret %s/%s: %w", namespace, name, err)
 	}
 	return nil
