@@ -102,6 +102,16 @@ func TestDataplaneMissingFlags(t *testing.T) {
 	}
 }
 
+func TestDataplaneMissingInternalAPIFlags(t *testing.T) {
+	err := Run(t.Context(), []string{"--dataplane-mode", "--gateway-namespace=test-ns", "--gateway-name=test-gw"})
+	if err == nil {
+		t.Fatalf("expected error when internal API flags missing in dataplane mode, got nil")
+	}
+	if !strings.Contains(err.Error(), "--internal-api-address") {
+		t.Errorf("expected error to name --internal-api-address, got: %v", err)
+	}
+}
+
 func TestSetupDataplane_Flags(t *testing.T) {
 	tests := []struct {
 		name               string

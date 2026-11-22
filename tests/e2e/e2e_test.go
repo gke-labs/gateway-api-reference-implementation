@@ -219,6 +219,25 @@ spec:
 		t.Errorf("Expected HTTP/3 200 OK with hostname example.com, got: %s", h3Logs)
 	}
 
+	// Verify that the data-plane ServiceAccount has no RBAC and serves traffic with no Role bound to it
+	refResName := state.ResourceNameForGateway("reference-gateway")
+	saCheck := h.RunCmd("kubectl", "get", "serviceaccount", refResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(saCheck) != refResName {
+		t.Errorf("Expected ServiceAccount %s to exist, got: %s", refResName, saCheck)
+	}
+	roleCheck := runCmdAllowError(h, "kubectl", "get", "role", refResName, "--namespace=default")
+	if !strings.Contains(roleCheck, "NotFound") && !strings.Contains(roleCheck, "not found") {
+		t.Errorf("Expected Role %s to not exist (data plane serves traffic with no Role bound to it), got: %s", refResName, roleCheck)
+	}
+	rbCheck := runCmdAllowError(h, "kubectl", "get", "rolebinding", refResName, "--namespace=default")
+	if !strings.Contains(rbCheck, "NotFound") && !strings.Contains(rbCheck, "not found") {
+		t.Errorf("Expected RoleBinding %s to not exist (data plane serves traffic with no Role bound to it), got: %s", refResName, rbCheck)
+	}
+	secCheck := runCmdAllowError(h, "kubectl", "get", "secret", refResName, "--namespace=default")
+	if !strings.Contains(secCheck, "NotFound") && !strings.Contains(secCheck, "not found") {
+		t.Errorf("Expected Secret %s to not exist, got: %s", refResName, secCheck)
+	}
+
 	// 9. Verify Multi-Gateway Isolation & Deletion Cleanup
 	secondGwManifest := `
 apiVersion: gateway.networking.k8s.io/v1

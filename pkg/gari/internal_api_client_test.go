@@ -37,19 +37,13 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testdataplane"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -97,55 +91,9 @@ func generateTestCA(t *testing.T) []byte {
 
 func generateTestCAAndServerCert(t *testing.T) ([]byte, tls.Certificate) {
 	t.Helper()
-	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	caPEM, serverTLSCert, err := testdataplane.GenerateTestCAAndServerCert()
 	if err != nil {
-		t.Fatalf("failed to generate CA key: %v", err)
-	}
-
-	caTemplate := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"Test CA"}},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-	}
-
-	caBytes, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("failed to create CA certificate: %v", err)
-	}
-	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caBytes})
-
-	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("failed to generate server key: %v", err)
-	}
-
-	serverTemplate := x509.Certificate{
-		SerialNumber:          big.NewInt(2),
-		Subject:               pkix.Name{Organization: []string{"Internal API Server"}},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-		DNSNames:              []string{"localhost"},
-		BasicConstraintsValid: true,
-	}
-
-	serverCertBytes, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("failed to create server cert: %v", err)
-	}
-
-	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertBytes})
-	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
-
-	serverTLSCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
-	if err != nil {
-		t.Fatalf("failed to create X509KeyPair: %v", err)
+		t.Fatalf("testdataplane.GenerateTestCAAndServerCert failed: %v", err)
 	}
 	return caPEM, serverTLSCert
 }
@@ -677,80 +625,5 @@ func TestInternalAPIClient_RejectedToken(t *testing.T) {
 	cancel()
 	if startErr := <-serverErr; startErr != nil && !errors.Is(startErr, context.Canceled) {
 		t.Errorf("server.Start error: %v", startErr)
-	}
-}
-
-// TestInternalAPIClient_FlagsUnset_BehavesAsToday tests:
-// - With the flags unset, the data plane behaves as it does today (watches Secret).
-func TestInternalAPIClient_FlagsUnset_BehavesAsToday(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		t.Fatalf("failed to add clientgoscheme: %v", err)
-	}
-	if err := gatewayv1.AddToScheme(scheme); err != nil {
-		t.Fatalf("failed to add gatewayv1 scheme: %v", err)
-	}
-
-	route := state.InternalRoute{
-		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
-		Rules: []state.InternalRule{
-			{
-				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/ok"}}},
-				Backends: []state.InternalBackend{{Host: "backend-ok", Port: 8080, Weight: 1}},
-			},
-		},
-	}
-	dataplaneConfig, err := state.BuildDataplaneConfig(types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}, []state.InternalListener{
-		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route}},
-	}, []state.InternalRoute{route}, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("BuildDataplaneConfig failed: %v", err)
-	}
-	dataplaneConfig.Revision = "rev-secret"
-	configBytes, err := dataplaneConfig.Marshal()
-	if err != nil {
-		t.Fatalf("Marshal failed: %v", err)
-	}
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: state.ResourceNameForGateway("test-gw")},
-		Data:       map[string][]byte{singlepod.DataplaneSecretDataKey: configBytes},
-	}
-	cl := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
-
-	server := &Server{
-		opts: Options{
-			DataplaneMode:             true,
-			DataplaneGatewayNamespace: "test-ns",
-			DataplaneGatewayName:      "test-gw",
-		},
-		proxy: proxy.NewProxy(),
-	}
-
-	if server.internalAPIClient != nil {
-		t.Errorf("expected internalAPIClient to be nil when flags are unset")
-	}
-
-	reconciler := &dataplaneSecretReconciler{
-		Client:               cl,
-		gatewayNamespace:     "test-ns",
-		secretName:           state.ResourceNameForGateway("test-gw"),
-		applyDataplaneConfig: server.applyDataplaneConfig,
-	}
-
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: state.ResourceNameForGateway("test-gw")}}
-	res, err := reconciler.Reconcile(t.Context(), req)
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
-	}
-	if res.Requeue {
-		t.Errorf("expected no requeue")
-	}
-
-	if !server.proxySynced.Load() {
-		t.Errorf("expected proxySynced=true after secret reconcile")
-	}
-	if revs := server.appliedRevisionsList(); len(revs) != 1 || revs[0] != "rev-secret" {
-		t.Errorf("expected applied revisions ['rev-secret'], got %v", revs)
 	}
 }

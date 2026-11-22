@@ -31,7 +31,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -42,10 +41,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -54,8 +50,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -394,19 +388,15 @@ func (o *Options) complete() error {
 		o.LeaderElection = false
 		o.DisableStatusUpdates = true
 		o.AddressProvider = nil
-	}
-	hasAddress := o.InternalAPIAddress != ""
-	hasCAFile := o.InternalAPICAFile != ""
-	hasTokenFile := o.InternalAPITokenFile != ""
-	if hasAddress || hasCAFile || hasTokenFile {
-		if !hasAddress || !hasCAFile || !hasTokenFile {
-			return errors.New("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file are all required together")
-		}
-		if !o.DataplaneMode {
-			return errors.New("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file require --dataplane-mode")
-		}
 		if o.DataplaneGatewayNamespace == "" || o.DataplaneGatewayName == "" {
 			return errors.New("--gateway-namespace and --gateway-name are required in --dataplane-mode")
+		}
+		if o.InternalAPIAddress == "" || o.InternalAPICAFile == "" || o.InternalAPITokenFile == "" {
+			return errors.New("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file are required in --dataplane-mode")
+		}
+	} else {
+		if o.InternalAPIAddress != "" || o.InternalAPICAFile != "" || o.InternalAPITokenFile != "" {
+			return errors.New("--internal-api-address, --internal-api-ca-file, and --internal-api-token-file require --dataplane-mode")
 		}
 	}
 	return nil
@@ -575,8 +565,8 @@ func New(opts Options) (*Server, error) {
 		proxy: p,
 	}
 
-	if opts.DataplaneMode && opts.InternalAPIAddress != "" {
-		// In stream mode, the data plane starts no controller manager because it needs
+	if opts.DataplaneMode {
+		// In data-plane mode, the data plane starts no controller manager because it needs
 		// no access to the Kubernetes API. Health and readiness endpoints are served directly.
 		if opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
 			mux := http.NewServeMux()
@@ -619,37 +609,16 @@ func New(opts Options) (*Server, error) {
 		}
 
 		var err error
-		if opts.DataplaneMode {
-			secretName := state.ResourceNameForGateway(opts.DataplaneGatewayName)
-			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
-				Scheme:                 opts.Scheme,
-				Metrics:                metricsOpts,
-				HealthProbeBindAddress: healthProbeBindAddress,
-				LeaderElection:         false,
-				Cache: cache.Options{
-					ByObject: map[client.Object]cache.ByObject{
-						&corev1.Secret{}: {
-							Namespaces: map[string]cache.Config{
-								opts.DataplaneGatewayNamespace: {
-									FieldSelector: fields.OneTermEqualSelector("metadata.name", secretName),
-								},
-							},
-						},
-					},
-				},
-			})
-		} else {
-			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
-				Scheme:  opts.Scheme,
-				Metrics: metricsOpts,
-				WebhookServer: webhook.NewServer(webhook.Options{
-					Port: 9443,
-				}),
-				HealthProbeBindAddress: healthProbeBindAddress,
-				LeaderElection:         opts.LeaderElection,
-				LeaderElectionID:       opts.LeaderElectionID,
-			})
-		}
+		mgr, err = ctrl.NewManager(cfg, ctrl.Options{
+			Scheme:  opts.Scheme,
+			Metrics: metricsOpts,
+			WebhookServer: webhook.NewServer(webhook.Options{
+				Port: 9443,
+			}),
+			HealthProbeBindAddress: healthProbeBindAddress,
+			LeaderElection:         opts.LeaderElection,
+			LeaderElectionID:       opts.LeaderElectionID,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("unable to start manager: %w", err)
 		}
@@ -658,9 +627,8 @@ func New(opts Options) (*Server, error) {
 	s.manager = mgr
 
 	// The internal API push server must be initialized before SetupWithManager runs
-	// because SetupWithManager constructs the combined DataplanePublisher that includes
-	// the push server.
-	if !opts.DataplaneMode && (opts.InternalAPIListener != nil || opts.InternalAPIBindAddress != "") {
+	// because SetupWithManager uses it as the DataplanePublisher.
+	if opts.InternalAPIListener != nil || opts.InternalAPIBindAddress != "" {
 		tokenReviewer := opts.PushTokenReviewer
 		if tokenReviewer == nil {
 			cfg := opts.RestConfig
@@ -825,26 +793,6 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("failed to register healthz check: %w", err)
 	}
 
-	if s.opts.DataplaneMode {
-		if s.opts.InternalAPIAddress != "" {
-			// In internal API mode, config comes from the push stream only; do not watch the Secret.
-			return nil
-		}
-		secretName := state.ResourceNameForGateway(s.opts.DataplaneGatewayName)
-		reconciler := &dataplaneSecretReconciler{
-			Client:               mgr.GetClient(),
-			gatewayNamespace:     s.opts.DataplaneGatewayNamespace,
-			secretName:           secretName,
-			applyDataplaneConfig: s.applyDataplaneConfig,
-		}
-		if err := ctrl.NewControllerManagedBy(mgr).
-			For(&corev1.Secret{}).
-			Complete(reconciler); err != nil {
-			return fmt.Errorf("failed to create dataplane secret controller: %w", err)
-		}
-		return nil
-	}
-
 	userHook := s.opts.OnGatewaysUpdate
 	wrappedHook := func(gateways []*gatewayv1.Gateway) {
 		s.proxySynced.Store(true)
@@ -887,38 +835,6 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 
 		CertificateSources: s.opts.CertificateSources,
 	})
-}
-
-type dataplaneSecretReconciler struct {
-	client.Client
-	gatewayNamespace     string
-	secretName           string
-	applyDataplaneConfig func(data []byte) error
-}
-
-func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	if req.Namespace != r.gatewayNamespace || req.Name != r.secretName {
-		return ctrl.Result{}, nil
-	}
-
-	var sec corev1.Secret
-	if err := r.Get(ctx, req.NamespacedName, &sec); err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, err
-	}
-
-	data, ok := sec.Data[singlepod.DataplaneSecretDataKey]
-	if !ok || len(data) == 0 {
-		return ctrl.Result{}, nil
-	}
-
-	if err := r.applyDataplaneConfig(data); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to apply dataplane config: %w", err)
-	}
-
-	return ctrl.Result{}, nil
 }
 
 func (s *Server) applyDataplaneConfig(data []byte) error {

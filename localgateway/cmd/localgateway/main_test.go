@@ -26,7 +26,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -41,6 +40,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 )
 
 func TestBuildOptions(t *testing.T) {
@@ -426,19 +426,13 @@ func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
 
 	WirePublisher(&opts, mdnsPublisher)
 
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("AddToScheme failed: %v", err)
-	}
-	if err := gatewayv1.Install(scheme); err != nil {
-		t.Fatalf("Install failed: %v", err)
-	}
+	env := testenv.Start(t)
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(env.Scheme).Build()
 
 	skipNameValidation := true
-	realManager, err := ctrl.NewManager(&rest.Config{}, ctrl.Options{
-		Scheme:  scheme,
+	realManager, err := ctrl.NewManager(env.Config, ctrl.Options{
+		Scheme:  env.Scheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
 		Controller: config.Controller{
 			SkipNameValidation: &skipNameValidation,
@@ -453,10 +447,10 @@ func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
 		client:  fakeClient,
 	}
 
-	opts.DataplaneMode = true
-	opts.DataplaneGatewayNamespace = "default"
-	opts.DataplaneGatewayName = "test-gw"
+	opts.LeaderElection = false
+	opts.DisableStatusUpdates = true
 	opts.Manager = mockManager
+	opts.Scheme = env.Scheme
 	server, err := gari.NewWithManager(mockManager, opts)
 	if err != nil {
 		t.Fatalf("NewWithManager failed: %v", err)
