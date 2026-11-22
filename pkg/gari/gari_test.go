@@ -1972,6 +1972,159 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	}
 }
 
+func TestDataplane_HTTPPortBoundBeforeReady(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	const (
+		gwNamespace = "test-ns"
+		gwName      = "test-gw"
+		testToken   = "test-token"
+	)
+	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
+	saName := state.ResourceNameForGateway(gwName)
+
+	caPEM, serverTLSCert, err := testdataplane.GenerateTestCAAndServerCert()
+	if err != nil {
+		t.Fatalf("generating TLS credentials: %v", err)
+	}
+
+	tempDir := t.TempDir()
+	caFile := filepath.Join(tempDir, "ca.crt")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatalf("writing CA file: %v", err)
+	}
+
+	tokenFile := filepath.Join(tempDir, "token")
+	if err := os.WriteFile(tokenFile, []byte(testToken), 0o600); err != nil {
+		t.Fatalf("writing token file: %v", err)
+	}
+
+	reviewer := &testdataplane.StaticTokenReviewer{
+		ExpectedToken:  testToken,
+		Namespace:      gwNamespace,
+		ServiceAccount: saName,
+	}
+
+	pushServer, err := push.NewServer(push.ServerOptions{
+		TokenReviewer: reviewer,
+	})
+	if err != nil {
+		t.Fatalf("creating push server: %v", err)
+	}
+
+	internalAPILis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening for internal API: %v", err)
+	}
+	internalAPIAddr := internalAPILis.Addr().String()
+
+	grpcServer := grpc.NewServer(
+		grpc.Creds(credentials.NewServerTLSFromCert(&serverTLSCert)),
+		grpc.MaxRecvMsgSize(push.MaxMessageBytes),
+		grpc.MaxSendMsgSize(push.MaxMessageBytes),
+	)
+	push.RegisterPushServiceServer(grpcServer, pushServer)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- grpcServer.Serve(internalAPILis)
+	}()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		if err := <-serverErr; err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			t.Errorf("internal API push server error: %v", err)
+		}
+	})
+
+	// Pre-publish initial config so proxySynced will be set as soon as the client receives it.
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: gwNamespace,
+			Name:      gwName,
+		},
+	}
+	dpConfig := &state.DataplaneConfig{
+		GatewayName: gwKey,
+		Revision:    "rev-1",
+	}
+	if err := pushServer.PublishDataplaneConfig(ctx, gw, dpConfig); err != nil {
+		t.Fatalf("publishing initial config: %v", err)
+	}
+
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocating http port: %v", err)
+	}
+	httpAddr := httpLis.Addr().String()
+	if err := httpLis.Close(); err != nil {
+		t.Fatalf("closing http listener: %v", err)
+	}
+
+	healthLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocating health port: %v", err)
+	}
+	healthAddr := healthLis.Addr().String()
+	if err := healthLis.Close(); err != nil {
+		t.Fatalf("closing health listener: %v", err)
+	}
+
+	opts := DefaultOptions()
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = gwNamespace
+	opts.DataplaneGatewayName = gwName
+	opts.ProxyAddr = httpAddr
+	opts.ProxyHTTPSAddr = ""
+	opts.HealthProbeBindAddress = healthAddr
+	opts.MetricsAddr = "0"
+	opts.InternalAPIAddress = internalAPIAddr
+	opts.InternalAPICAFile = caFile
+	opts.InternalAPITokenFile = tokenFile
+
+	server, err := New(opts)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- server.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-startErr; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("server.Start error: %v", err)
+		}
+	})
+
+	readyzURL := fmt.Sprintf("http://%s/readyz", healthAddr)
+	httpClient := &http.Client{Timeout: 1 * time.Second}
+
+	for {
+		resp, err := httpClient.Get(readyzURL)
+		if err == nil {
+			status := resp.StatusCode
+			_ = resp.Body.Close()
+			if status == http.StatusOK {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for /readyz to pass: %v", ctx.Err())
+		default:
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+
+	conn, err := net.DialTimeout("tcp", httpAddr, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to connect to HTTP port %s after readyz passed: %v", httpAddr, err)
+	}
+	_ = conn.Close()
+}
+
 func TestDataplane_RoutesAndCertificates(t *testing.T) {
 	ctx := t.Context()
 

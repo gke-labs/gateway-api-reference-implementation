@@ -692,6 +692,8 @@ func samePortOrAddr(addr1, addr2 string) bool {
 	return false
 }
 
+// readyzChecker returns a healthz.Checker for readiness checks.
+// The data plane reports ready only after it has bound its startup listeners.
 func (s *Server) readyzChecker() healthz.Checker {
 	return func(req *http.Request) error {
 		if s.opts.DrainSentinelPath != "" {
@@ -925,7 +927,37 @@ func (s *Server) newHTTPServer(handler http.Handler, tlsConfig *tls.Config) *htt
 	}
 }
 
+func (s *Server) bindStartupListeners() error {
+	var openedHTTP net.Listener
+	if s.opts.HTTPListener == nil && s.opts.ProxyAddr != "" {
+		lis, err := net.Listen("tcp", s.opts.ProxyAddr)
+		if err != nil {
+			return fmt.Errorf("failed to listen on HTTP proxy address %q: %w", s.opts.ProxyAddr, err)
+		}
+		s.opts.HTTPListener = lis
+		openedHTTP = lis
+	}
+
+	hasHTTPS := s.opts.HTTPSListener != nil || s.opts.ProxyHTTPSAddr != ""
+	if hasHTTPS && s.opts.HTTPSListener == nil && s.opts.ProxyHTTPSAddr != "" {
+		lis, err := net.Listen("tcp", s.opts.ProxyHTTPSAddr)
+		if err != nil {
+			if openedHTTP != nil {
+				_ = openedHTTP.Close()
+				s.opts.HTTPListener = nil
+			}
+			return fmt.Errorf("failed to listen on HTTPS proxy address %q: %w", s.opts.ProxyHTTPSAddr, err)
+		}
+		s.opts.HTTPSListener = lis
+	}
+	return nil
+}
+
 func (s *Server) StartProxyServers(ctx context.Context) error {
+	if err := s.bindStartupListeners(); err != nil {
+		return err
+	}
+
 	g, ctx := errgroup.WithContext(ctx)
 
 	go func() {
@@ -944,19 +976,9 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 	}
 
 	// HTTP Proxy Server
-	if s.opts.HTTPListener != nil || s.opts.ProxyAddr != "" {
+	if s.opts.HTTPListener != nil {
+		lis := s.opts.HTTPListener
 		g.Go(func() error {
-			var lis net.Listener
-			if s.opts.HTTPListener != nil {
-				lis = s.opts.HTTPListener
-			} else {
-				var err error
-				lis, err = net.Listen("tcp", s.opts.ProxyAddr)
-				if err != nil {
-					return fmt.Errorf("failed to listen on HTTP proxy address %q: %w", s.opts.ProxyAddr, err)
-				}
-			}
-
 			filterLis, err := s.initHTTPFilter(lis)
 			if err != nil {
 				if closeErr := lis.Close(); closeErr != nil {
@@ -1019,19 +1041,9 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 	}
 
 	// HTTPS Proxy Server
-	if hasHTTPS {
+	if s.opts.HTTPSListener != nil {
+		lis := s.opts.HTTPSListener
 		g.Go(func() error {
-			var lis net.Listener
-			if s.opts.HTTPSListener != nil {
-				lis = s.opts.HTTPSListener
-			} else {
-				var err error
-				lis, err = net.Listen("tcp", s.opts.ProxyHTTPSAddr)
-				if err != nil {
-					return fmt.Errorf("failed to listen on HTTPS proxy address %q: %w", s.opts.ProxyHTTPSAddr, err)
-				}
-			}
-
 			filterLis, err := s.initHTTPSFilter(lis)
 			if err != nil {
 				if closeErr := lis.Close(); closeErr != nil {
@@ -1173,6 +1185,10 @@ func (s *Server) StartPushServer(ctx context.Context) error {
 
 // Start starts the proxy servers, push server, and controller manager, running until ctx is canceled.
 func (s *Server) Start(ctx context.Context) error {
+	if err := s.bindStartupListeners(); err != nil {
+		return err
+	}
+
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
