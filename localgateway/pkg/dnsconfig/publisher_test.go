@@ -31,7 +31,6 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
@@ -103,7 +102,7 @@ func waitForConfig(t *testing.T, ctx context.Context, kubernetesClient client.Cl
 		var secret corev1.Secret
 		err := kubernetesClient.Get(ctx, types.NamespacedName{Namespace: DefaultConfigSecretNamespace, Name: DefaultConfigSecretName}, &secret)
 		if err == nil {
-			payload, ok := secret.Data[singlepod.DataplaneSecretDataKey]
+			payload, ok := secret.Data[ConfigSecretDataKey]
 			if ok && len(payload) > 0 {
 				var config Config
 				if err := json.Unmarshal(payload, &config); err == nil {
@@ -180,7 +179,7 @@ func TestPublisher_UnsyncedStateDoesNotDeleteExistingSecret(t *testing.T) {
 			Name:      DefaultConfigSecretName,
 		},
 		Data: map[string][]byte{
-			singlepod.DataplaneSecretDataKey: payload,
+			ConfigSecretDataKey: payload,
 		},
 	}
 
@@ -227,9 +226,10 @@ func TestPublisher_UnsyncedStateDoesNotDeleteExistingSecret(t *testing.T) {
 	})
 }
 
-// TestPublisher_PublishesAndDeletesConfig verifies that Publisher writes the Secret
-// when Gateways become programmed, and deletes the Secret when all Gateways are removed.
-func TestPublisher_PublishesAndDeletesConfig(t *testing.T) {
+// TestPublisher_PublishesUpdatesAndDeletesConfig verifies that Publisher writes the Secret
+// when Gateways become programmed, updates it when Gateway configuration changes,
+// and deletes the Secret when all Gateways are removed.
+func TestPublisher_PublishesUpdatesAndDeletesConfig(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -259,11 +259,77 @@ func TestPublisher_PublishesAndDeletesConfig(t *testing.T) {
 		t.Fatalf("expected Gateway to hold app.local")
 	}
 
-	// 2. Gateway loses Programmed -> Secret is deleted
+	// 2. Gateway addresses update -> Secret is updated
+	controllerState.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.200"}})
+	controllerState.Recompute()
+
+	updatedConfig := waitForConfig(t, ctx, fakeClient, func(config *Config) bool {
+		return config != nil && len(config.Records) == 1 && slices.Contains(config.Records[0].Addresses, "192.168.1.200")
+	})
+	if updatedConfig == nil {
+		t.Fatalf("expected Secret to be updated with 192.168.1.200")
+	}
+
+	// 3. Gateway loses Programmed -> Secret is deleted
 	controllerState.SetGatewayReadiness(gatewayKey, state.GatewayReadiness{Ready: false})
 	controllerState.Recompute()
 
 	waitForConfig(t, ctx, fakeClient, func(config *Config) bool {
 		return config == nil || len(config.Records) == 0
 	})
+}
+
+// TestPublisher_RefusesConflictingOwner verifies that Publisher refuses to overwrite
+// or delete an existing Secret owned by another controller.
+func TestPublisher_RefusesConflictingOwner(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	isController := true
+	ownedSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: DefaultConfigSecretNamespace,
+			Name:      DefaultConfigSecretName,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "gateway.networking.k8s.io/v1",
+					Kind:       "Gateway",
+					Name:       "other-gateway",
+					UID:        "other-uid",
+					Controller: &isController,
+				},
+			},
+		},
+		Data: map[string][]byte{
+			ConfigSecretDataKey: []byte("foreign-content"),
+		},
+	}
+
+	controllerState, fakeClient, _ := setupStateAndPublisher(t, ctx, ownedSecret)
+
+	gatewayClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "localgateway"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "github.com/gke-labs/gateway-api-reference-implementation/localgateway",
+		},
+	}
+	controllerState.UpsertGatewayClass(gatewayClass)
+
+	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gateway := makePublisherTestGateway("my-gw", "app.local", time.Now())
+	controllerState.UpsertGateway(gateway)
+	controllerState.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
+	controllerState.SetGatewayReadiness(gatewayKey, state.GatewayReadiness{Ready: true})
+	controllerState.SetSynced(true)
+	controllerState.Recompute()
+
+	// Wait briefly and verify the existing Secret was NOT overwritten
+	time.Sleep(100 * time.Millisecond)
+	var secret corev1.Secret
+	if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: DefaultConfigSecretNamespace, Name: DefaultConfigSecretName}, &secret); err != nil {
+		t.Fatalf("failed to get Secret: %v", err)
+	}
+	if string(secret.Data[ConfigSecretDataKey]) != "foreign-content" {
+		t.Fatalf("expected existing owned Secret to be preserved, got %q", string(secret.Data[ConfigSecretDataKey]))
+	}
 }

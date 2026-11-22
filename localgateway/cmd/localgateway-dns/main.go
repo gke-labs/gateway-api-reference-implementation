@@ -39,7 +39,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/dnsconfig"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 )
 
 // Reconciler watches the DNS config Secret and publishes records with mDNS.
@@ -85,7 +84,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	data := secret.Data[singlepod.DataplaneSecretDataKey]
+	data := secret.Data[dnsconfig.ConfigSecretDataKey]
 	if len(data) == 0 {
 		r.Prober.SetNames(nil)
 		return ctrl.Result{}, nil

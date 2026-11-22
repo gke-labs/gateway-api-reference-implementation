@@ -20,12 +20,16 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
 
@@ -35,6 +39,12 @@ const (
 
 	// DefaultConfigSecretNamespace is the fallback namespace if the controller namespace is unset.
 	DefaultConfigSecretNamespace = "default"
+
+	// ConfigSecretDataKey is the key in the Secret holding serialized DNS configuration.
+	ConfigSecretDataKey = "config.json"
+
+	// FieldManager is the field manager name used for server-side apply of the DNS config Secret.
+	FieldManager = "gari-provisioner"
 
 	// retryBaseDelay is the initial backoff delay for retrying failed publishes.
 	retryBaseDelay = 5 * time.Millisecond
@@ -165,5 +175,47 @@ func (p *Publisher) publishOnce(ctx context.Context) error {
 		}
 	}
 
-	return singlepod.PublishDataplaneConfig(publishCtx, p.client, p.namespace, p.secretName, nil, payload)
+	return publishSecret(publishCtx, p.client, p.namespace, p.secretName, payload)
+}
+
+// publishSecret writes or deletes the DNS configuration Secret.
+// It verifies that no other owner holds the Secret, deletes the Secret when the payload is empty,
+// and otherwise applies the Secret using server-side apply.
+func publishSecret(ctx context.Context, kubernetesClient client.Client, namespace, name string, payload []byte) error {
+	var existingSecret corev1.Secret
+	err := kubernetesClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &existingSecret)
+	if err == nil {
+		if ref := metav1.GetControllerOf(&existingSecret); ref != nil {
+			return &state.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing Secret %s/%s is owned by %s %s", namespace, name, ref.Kind, ref.Name),
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get config Secret %s/%s: %w", namespace, name, err)
+	}
+
+	if len(payload) == 0 {
+		if err == nil {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      name,
+				},
+			}
+			if err := kubernetesClient.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete config Secret %s/%s: %w", namespace, name, err)
+			}
+		}
+		return nil
+	}
+
+	secretApply := corev1ac.Secret(name, namespace).
+		WithData(map[string][]byte{
+			ConfigSecretDataKey: payload,
+		})
+
+	if err := kubernetesClient.Apply(ctx, secretApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return fmt.Errorf("failed to apply config Secret %s/%s: %w", namespace, name, err)
+	}
+	return nil
 }
