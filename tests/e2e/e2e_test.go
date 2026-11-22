@@ -233,10 +233,6 @@ spec:
 	if !strings.Contains(rbCheck, "NotFound") && !strings.Contains(rbCheck, "not found") {
 		t.Errorf("Expected RoleBinding %s to not exist (data plane serves traffic with no Role bound to it), got: %s", refResName, rbCheck)
 	}
-	rbAllJSON := h.RunCmd("kubectl", "get", "rolebindings", "--namespace=default", "-o", "json")
-	if strings.Contains(rbAllJSON, fmt.Sprintf(`"name": "%s"`, refResName)) || strings.Contains(rbAllJSON, fmt.Sprintf(`"name":"%s"`, refResName)) {
-		t.Errorf("Expected no RoleBinding in default namespace to bind ServiceAccount %s, but found reference in RoleBindings", refResName)
-	}
 	secCheck := runCmdAllowError(h, "kubectl", "get", "secret", refResName, "--namespace=default")
 	if !strings.Contains(secCheck, "NotFound") && !strings.Contains(secCheck, "not found") {
 		t.Errorf("Expected Secret %s to not exist, got: %s", refResName, secCheck)

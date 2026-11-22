@@ -48,7 +48,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 )
 
 var (
@@ -164,20 +163,22 @@ func (s *safeBuffer) String() string {
 	return s.Buffer.String()
 }
 
-type staticTokenReviewer struct {
-	expectedToken string
-	namespace     string
-	sa            string
+// StaticTokenReviewer is a test TokenReviewer that authenticates a single expected token.
+type StaticTokenReviewer struct {
+	ExpectedToken  string
+	Namespace      string
+	ServiceAccount string
 }
 
-func (r *staticTokenReviewer) ReviewToken(_ context.Context, token string) (string, string, error) {
-	if token == r.expectedToken {
-		return r.namespace, r.sa, nil
+func (r *StaticTokenReviewer) ReviewToken(_ context.Context, token string) (string, string, error) {
+	if token == r.ExpectedToken {
+		return r.Namespace, r.ServiceAccount, nil
 	}
 	return "", "", errors.New("unauthorized token")
 }
 
-func generateTestCAAndServerCert() ([]byte, tls.Certificate, error) {
+// GenerateTestCAAndServerCert creates an in-memory CA certificate and server TLS certificate for testing.
+func GenerateTestCAAndServerCert() ([]byte, tls.Certificate, error) {
 	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, tls.Certificate{}, fmt.Errorf("generating CA key: %w", err)
@@ -264,12 +265,12 @@ type Dataplane struct {
 // as a subprocess against an in-memory internal API push server on free local ports.
 // It waits until the initial revision is reported as applied (if provided), returns the running Dataplane,
 // and automatically stops the subprocess and push server when the test ends.
-func StartDataplane(t testing.TB, env *testenv.Environment, gatewayNamespace, gatewayName string, opts ...Option) *Dataplane {
+func StartDataplane(t testing.TB, gatewayNamespace, gatewayName string, opts ...Option) *Dataplane {
 	t.Helper()
 
-	var dopts dataplaneOptions
+	var dataplaneOptions dataplaneOptions
 	for _, opt := range opts {
-		opt(&dopts)
+		opt(&dataplaneOptions)
 	}
 
 	binary, err := getOrBuildBinary()
@@ -293,7 +294,7 @@ func StartDataplane(t testing.TB, env *testenv.Environment, gatewayNamespace, ga
 	healthAddress := allocatePort()
 
 	// 1. Setup internal API server credentials
-	caPEM, serverTLSCert, err := generateTestCAAndServerCert()
+	caPEM, serverTLSCert, err := GenerateTestCAAndServerCert()
 	if err != nil {
 		t.Fatalf("StartDataplane: generating TLS credentials: %v", err)
 	}
@@ -312,10 +313,10 @@ func StartDataplane(t testing.TB, env *testenv.Environment, gatewayNamespace, ga
 
 	// 2. Start internal API push server
 	saName := state.ResourceNameForGateway(gatewayName)
-	reviewer := &staticTokenReviewer{
-		expectedToken: testToken,
-		namespace:     gatewayNamespace,
-		sa:            saName,
+	reviewer := &StaticTokenReviewer{
+		ExpectedToken:  testToken,
+		Namespace:      gatewayNamespace,
+		ServiceAccount: saName,
 	}
 
 	pushServer, err := push.NewServer(push.ServerOptions{
@@ -345,20 +346,23 @@ func StartDataplane(t testing.TB, env *testenv.Environment, gatewayNamespace, ga
 
 	t.Cleanup(func() {
 		grpcServer.Stop()
+		if err := <-serverErr; err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			t.Errorf("internal API push server error: %v", err)
+		}
 	})
 
 	var initialRevision string
-	if dopts.initialConfig != nil {
+	if dataplaneOptions.initialConfig != nil {
 		gw := &gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: gatewayNamespace,
 				Name:      gatewayName,
 			},
 		}
-		if err := pushServer.PublishDataplaneConfig(t.Context(), gw, dopts.initialConfig); err != nil {
+		if err := pushServer.PublishDataplaneConfig(t.Context(), gw, dataplaneOptions.initialConfig); err != nil {
 			t.Fatalf("StartDataplane: publishing initial config: %v", err)
 		}
-		initialRevision = dopts.initialConfig.Revision
+		initialRevision = dataplaneOptions.initialConfig.Revision
 	}
 
 	cmd := exec.Command(binary,
@@ -418,7 +422,7 @@ func StartDataplane(t testing.TB, env *testenv.Environment, gatewayNamespace, ga
 		output:           output,
 	}
 
-	if dopts.initialConfig != nil {
+	if dataplaneOptions.initialConfig != nil {
 		if err := dp.WaitApplied(t.Context()); err != nil {
 			t.Fatalf("StartDataplane: %v", err)
 		}

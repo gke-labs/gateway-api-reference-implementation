@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1741,42 +1742,105 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	const (
 		gwNamespace = "test-ns"
 		gwName      = "test-gw"
+		testToken   = "test-token"
 	)
 	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
+	saName := state.ResourceNameForGateway(gwName)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	caPEM, serverTLSCert, err := testdataplane.GenerateTestCAAndServerCert()
 	if err != nil {
-		t.Fatalf("failed to allocate free port: %v", err)
-	}
-	defer ln.Close()
-	healthAddr := ln.Addr().String()
-
-	p := proxy.NewProxy()
-	server := &Server{
-		opts: Options{
-			DataplaneMode:             true,
-			DataplaneGatewayNamespace: gwNamespace,
-			DataplaneGatewayName:      gwName,
-			HealthProbeBindAddress:    healthAddr,
-		},
-		proxy: p,
+		t.Fatalf("generating TLS credentials: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	for path, handler := range server.healthEndpoints() {
-		mux.Handle(path, handler)
-	}
-	server.healthProbeServer = &http.Server{
-		Addr:    healthAddr,
-		Handler: mux,
+	tempDir := t.TempDir()
+	caFile := filepath.Join(tempDir, "ca.crt")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatalf("writing CA file: %v", err)
 	}
 
+	tokenFile := filepath.Join(tempDir, "token")
+	if err := os.WriteFile(tokenFile, []byte(testToken), 0o600); err != nil {
+		t.Fatalf("writing token file: %v", err)
+	}
+
+	reviewer := &testdataplane.StaticTokenReviewer{
+		ExpectedToken:  testToken,
+		Namespace:      gwNamespace,
+		ServiceAccount: saName,
+	}
+
+	pushServer, err := push.NewServer(push.ServerOptions{
+		TokenReviewer: reviewer,
+	})
+	if err != nil {
+		t.Fatalf("creating push server: %v", err)
+	}
+
+	internalAPILis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening for internal API: %v", err)
+	}
+	internalAPIAddr := internalAPILis.Addr().String()
+
+	grpcServer := grpc.NewServer(
+		grpc.Creds(credentials.NewServerTLSFromCert(&serverTLSCert)),
+		grpc.MaxRecvMsgSize(push.MaxMessageBytes),
+		grpc.MaxSendMsgSize(push.MaxMessageBytes),
+	)
+	push.RegisterPushServiceServer(grpcServer, pushServer)
+
+	serverErr := make(chan error, 1)
 	go func() {
-		_ = server.healthProbeServer.Serve(ln)
+		serverErr <- grpcServer.Serve(internalAPILis)
 	}()
 	t.Cleanup(func() {
-		_ = server.healthProbeServer.Close()
+		grpcServer.Stop()
+		if err := <-serverErr; err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			t.Errorf("internal API push server error: %v", err)
+		}
 	})
+
+	healthLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocating health port: %v", err)
+	}
+	healthAddr := healthLis.Addr().String()
+	if err := healthLis.Close(); err != nil {
+		t.Fatalf("closing health listener: %v", err)
+	}
+
+	opts := DefaultOptions()
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = gwNamespace
+	opts.DataplaneGatewayName = gwName
+	opts.HealthProbeBindAddress = healthAddr
+	opts.MetricsAddr = "0"
+	opts.InternalAPIAddress = internalAPIAddr
+	opts.InternalAPICAFile = caFile
+	opts.InternalAPITokenFile = tokenFile
+
+	server, err := New(opts)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- server.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-startErr; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("server.Start error: %v", err)
+		}
+	})
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: gwNamespace,
+			Name:      gwName,
+		},
+	}
 
 	healthURL := fmt.Sprintf("http://%s/_gari/applied", healthAddr)
 	httpClient := &http.Client{Timeout: 2 * time.Second}
@@ -1811,7 +1875,7 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	// 1. Before config is applied: endpoint returns 200 OK with empty revisions list (Gateway appears only after config applied)
 	waitForRevision("")
 
-	// 2. Apply initial config
+	// 2. Publish initial config via internal API push server
 	route1 := state.InternalRoute{
 		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
@@ -1835,13 +1899,12 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComputeRevision 1 failed: %v", err)
 	}
-	configBytes1, err := dpConfig1.Marshal()
-	if err != nil {
-		t.Fatalf("failed to marshal dpConfig1: %v", err)
-	}
 
-	if err := server.applyDataplaneConfig(configBytes1); err != nil {
-		t.Fatalf("applyDataplaneConfig 1 failed: %v", err)
+	if err := pushServer.PublishDataplaneConfig(ctx, gw, dpConfig1); err != nil {
+		t.Fatalf("PublishDataplaneConfig 1 failed: %v", err)
+	}
+	if _, err := pushServer.WaitApplied(ctx, gw, dpConfig1.Revision); err != nil {
+		t.Fatalf("pushServer.WaitApplied 1 failed: %v", err)
 	}
 
 	// Wait for endpoint to report revision 1
@@ -1871,13 +1934,12 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComputeRevision 2 failed: %v", err)
 	}
-	configBytes2, err := dpConfig2.Marshal()
-	if err != nil {
-		t.Fatalf("failed to marshal dpConfig2: %v", err)
-	}
 
-	if err := server.applyDataplaneConfig(configBytes2); err != nil {
-		t.Fatalf("applyDataplaneConfig 2 failed: %v", err)
+	if err := pushServer.PublishDataplaneConfig(ctx, gw, dpConfig2); err != nil {
+		t.Fatalf("PublishDataplaneConfig 2 failed: %v", err)
+	}
+	if _, err := pushServer.WaitApplied(ctx, gw, dpConfig2.Revision); err != nil {
+		t.Fatalf("pushServer.WaitApplied 2 failed: %v", err)
 	}
 
 	// Wait for endpoint to report revision 2
@@ -1911,7 +1973,6 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 }
 
 func TestDataplane_RoutesAndCertificates(t *testing.T) {
-	env := testenv.Start(t)
 	ctx := t.Context()
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1937,22 +1998,6 @@ func TestDataplane_RoutesAndCertificates(t *testing.T) {
 		gwName      = "test-gw"
 	)
 	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: gwName}
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: gwNamespace,
-			Name:      gwName,
-		},
-		Spec: gatewayv1.GatewaySpec{
-			GatewayClassName: "test-class",
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-				{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
-			},
-		},
-	}
-	if err := env.Client.Create(ctx, gw); err != nil {
-		t.Fatalf("failed to create gateway: %v", err)
-	}
 	route := state.InternalRoute{
 		Hostnames: []state.RouteHostname{state.NewRouteHostname("example.com", "example.com")},
 		Rules: []state.InternalRule{
@@ -1983,7 +2028,7 @@ func TestDataplane_RoutesAndCertificates(t *testing.T) {
 		t.Fatalf("ComputeRevision failed: %v", err)
 	}
 
-	dp := testdataplane.StartDataplane(t, env, gwNamespace, gwName, testdataplane.WithInitialConfig(dpConfig))
+	dp := testdataplane.StartDataplane(t, gwNamespace, gwName, testdataplane.WithInitialConfig(dpConfig))
 	initialPID := dp.PID
 
 	// 1. Assert proxy serves the compiled backend route
@@ -2574,7 +2619,7 @@ func TestGari_HealthProbeReadyz_And_DrainingSentinel(t *testing.T) {
 	}
 }
 
-func TestDataplane_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t *testing.T) {
+func TestDataplane_ListenerOptionsPreservedWhenConfigSyncsBeforeListenerStart(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)
@@ -2704,7 +2749,7 @@ func TestDataplane_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t 
 	}
 }
 
-func TestDataplane_HTTPS_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t *testing.T) {
+func TestDataplane_HTTPS_ListenerOptionsPreservedWhenConfigSyncsBeforeListenerStart(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)

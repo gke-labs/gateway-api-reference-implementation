@@ -110,9 +110,6 @@ type DataplanePublisher interface {
 - **In-process publisher.** The in-process publisher applies configuration synchronously
   during `PublishDataplaneConfig`. `WaitApplied` answers immediately with one data
   plane, applied or rejected with the apply error.
-- **Secret publisher.** A Secret carries no reply. `WaitApplied` returns an empty
-  result indicating no data plane reports through `singlepod.AddressProvider`.
-  The planned removal of the Secret path removes this case.
 - **State tracking.** The state machine calls `WaitApplied` after each publish with a
   limit held in a named constant (`dataplaneWaitAppliedLimit`). A rejection becomes the
   Gateway's recorded publish error.
@@ -138,24 +135,6 @@ Non-standard data planes receive configuration through the same mechanism:
 - **What is shared.** All data planes share the push client and server transport
   library (`pkg/dataplane/push`), the `DataplaneConfig` schema, token validation,
   and ACK and NACK lifecycle semantics.
-
-## 7. Order of Work
-
-The migration proceeds in small, backward-compatible steps where the controller
-serves and data planes connect and receive:
-
-1. **Protocol library.** Add the push transport package (`pkg/dataplane/push`)
-   defining the gRPC service, token authentication, and ACK and NACK types.
-2. **Controller push server.** Add the gRPC push server to the controller to
-   accept data-plane connections, validate tokens, and stream configurations
-   alongside Secret publishing.
-3. **Data-plane push client.** Add the push client to `pkg/gari` so data planes
-   dial the controller Service, receive configuration streams, and send ACKs.
-   When the internal API flags are set, the data plane takes configuration from
-   the stream only and does not watch the Secret; when unset, it watches the Secret.
-4. **Switch status derivation.** Derive `Programmed` from direct push ACKs.
-5. **Remove Secret path.** Remove `PublishDataplaneConfig` Secret generation,
-   delete `dataplaneSecretReconciler`, and drop data-plane Secret RBAC.
 
 ## Open Questions
 

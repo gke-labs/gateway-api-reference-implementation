@@ -38,6 +38,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testdataplane"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -90,55 +91,9 @@ func generateTestCA(t *testing.T) []byte {
 
 func generateTestCAAndServerCert(t *testing.T) ([]byte, tls.Certificate) {
 	t.Helper()
-	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	caPEM, serverTLSCert, err := testdataplane.GenerateTestCAAndServerCert()
 	if err != nil {
-		t.Fatalf("failed to generate CA key: %v", err)
-	}
-
-	caTemplate := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"Test CA"}},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-	}
-
-	caBytes, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("failed to create CA certificate: %v", err)
-	}
-	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caBytes})
-
-	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("failed to generate server key: %v", err)
-	}
-
-	serverTemplate := x509.Certificate{
-		SerialNumber:          big.NewInt(2),
-		Subject:               pkix.Name{Organization: []string{"Internal API Server"}},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-		DNSNames:              []string{"localhost"},
-		BasicConstraintsValid: true,
-	}
-
-	serverCertBytes, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("failed to create server cert: %v", err)
-	}
-
-	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertBytes})
-	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
-
-	serverTLSCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
-	if err != nil {
-		t.Fatalf("failed to create X509KeyPair: %v", err)
+		t.Fatalf("testdataplane.GenerateTestCAAndServerCert failed: %v", err)
 	}
 	return caPEM, serverTLSCert
 }

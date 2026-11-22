@@ -627,9 +627,8 @@ func New(opts Options) (*Server, error) {
 	s.manager = mgr
 
 	// The internal API push server must be initialized before SetupWithManager runs
-	// because SetupWithManager constructs the combined DataplanePublisher that includes
-	// the push server.
-	if !opts.DataplaneMode && (opts.InternalAPIListener != nil || opts.InternalAPIBindAddress != "") {
+	// because SetupWithManager uses it as the DataplanePublisher.
+	if opts.InternalAPIListener != nil || opts.InternalAPIBindAddress != "" {
 		tokenReviewer := opts.PushTokenReviewer
 		if tokenReviewer == nil {
 			cfg := opts.RestConfig
@@ -792,10 +791,6 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if err := mgr.AddHealthzCheck("ping", healthz.Ping); err != nil {
 		return fmt.Errorf("failed to register healthz check: %w", err)
-	}
-
-	if s.opts.DataplaneMode {
-		return nil
 	}
 
 	userHook := s.opts.OnGatewaysUpdate

@@ -39,6 +39,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testdataplane"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -245,7 +246,7 @@ func TestSetupController_RequiresInternalAPIFlags(t *testing.T) {
 	}
 }
 
-func TestSetupDataplane_RequiresInternalAPIFlags(t *testing.T) {
+func TestDataplane_RequiresInternalAPIFlags(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
@@ -265,7 +266,11 @@ func TestSetupDataplane_RequiresInternalAPIFlags(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Setup(tc.args)
+			opts, err := Setup(tc.args)
+			if err != nil {
+				t.Fatalf("unexpected Setup error: %v", err)
+			}
+			_, err = gari.New(opts)
 			if err == nil {
 				t.Fatalf("expected error when internal API flags are missing, got nil")
 			}
@@ -463,14 +468,7 @@ func TestSetup_ModeSelection(t *testing.T) {
 	}
 
 	// 3. Dataplane mode selected via --dataplane-mode
-	optsDP, err := Setup([]string{
-		"--dataplane-mode",
-		"--gateway-namespace=ns",
-		"--gateway-name=gw",
-		"--internal-api-address=127.0.0.1:8443",
-		"--internal-api-ca-file=/path/to/ca.crt",
-		"--internal-api-token-file=/path/to/token",
-	})
+	optsDP, err := Setup([]string{"--dataplane-mode", "--gateway-namespace=ns", "--gateway-name=gw"})
 	if err != nil {
 		t.Fatalf("Setup failed for dataplane mode: %v", err)
 	}
@@ -480,17 +478,6 @@ func TestSetup_ModeSelection(t *testing.T) {
 	if optsDP.DataplaneGatewayNamespace != "ns" || optsDP.DataplaneGatewayName != "gw" {
 		t.Errorf("expected gateway ns/gw, got %s/%s", optsDP.DataplaneGatewayNamespace, optsDP.DataplaneGatewayName)
 	}
-}
-
-type staticTokenReviewer struct {
-	expectedToken, namespace, sa string
-}
-
-func (r *staticTokenReviewer) ReviewToken(_ context.Context, token string) (string, string, error) {
-	if token == r.expectedToken {
-		return r.namespace, r.sa, nil
-	}
-	return "", "", fmt.Errorf("invalid token")
 }
 
 func generateTestCertificate(t *testing.T) ([]byte, []byte) {
@@ -564,7 +551,7 @@ func TestController_InternalAPIPush_DataPlaneReceivesConfig(t *testing.T) {
 	ctrlOpts.MetricsAddr, ctrlOpts.HealthProbeBindAddress = "0", "0"
 	ctrlOpts.ProxyAddr, ctrlOpts.ProxyHTTPSAddr = "", ""
 	ctrlOpts.InternalAPIListener = lis
-	ctrlOpts.PushTokenReviewer = &staticTokenReviewer{expectedToken: tokenVal, namespace: gwNamespace, sa: saName}
+	ctrlOpts.PushTokenReviewer = &testdataplane.StaticTokenReviewer{ExpectedToken: tokenVal, Namespace: gwNamespace, ServiceAccount: saName}
 
 	ctrlServer, err := gari.New(ctrlOpts)
 	if err != nil {
