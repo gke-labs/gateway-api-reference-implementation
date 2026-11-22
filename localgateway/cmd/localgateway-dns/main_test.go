@@ -39,7 +39,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/dnsconfig"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
@@ -355,7 +354,7 @@ func waitForConfigInClient(t *testing.T, ctx context.Context, kubernetesClient c
 			Name:      dnsconfig.DefaultConfigSecretName,
 		}, &secret)
 		if err == nil {
-			payload, ok := secret.Data[singlepod.DataplaneSecretDataKey]
+			payload, ok := secret.Data[dnsconfig.ConfigSecretDataKey]
 			if ok && len(payload) > 0 {
 				var config dnsconfig.Config
 				if err := json.Unmarshal(payload, &config); err == nil {
@@ -517,7 +516,7 @@ func TestReconciler_MalformedPayloadKeepsLastGoodRecords(t *testing.T) {
 	}, &secret); err != nil {
 		t.Fatalf("failed to get Secret: %v", err)
 	}
-	secret.Data[singlepod.DataplaneSecretDataKey] = []byte("not-valid-json")
+	secret.Data[dnsconfig.ConfigSecretDataKey] = []byte("not-valid-json")
 	if err := fixture.fakeClient.Update(ctx, &secret); err != nil {
 		t.Fatalf("failed to update Secret: %v", err)
 	}
@@ -569,7 +568,7 @@ func TestReconciler_InvalidConfigRecordsSkipped(t *testing.T) {
 	}, &secret); err != nil {
 		t.Fatalf("failed to get Secret: %v", err)
 	}
-	secret.Data[singlepod.DataplaneSecretDataKey] = payload
+	secret.Data[dnsconfig.ConfigSecretDataKey] = payload
 	if err := fixture.fakeClient.Update(ctx, &secret); err != nil {
 		t.Fatalf("failed to update Secret: %v", err)
 	}

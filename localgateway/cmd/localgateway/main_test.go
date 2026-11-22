@@ -39,7 +39,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/dnsconfig"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
@@ -516,9 +515,9 @@ func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
 	for {
 		var secret corev1.Secret
 		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "localgateway-dns"}, &secret); err == nil {
-			if len(secret.Data[singlepod.DataplaneSecretDataKey]) > 0 {
+			if len(secret.Data[dnsconfig.ConfigSecretDataKey]) > 0 {
 				var config dnsconfig.Config
-				if err := json.Unmarshal(secret.Data[singlepod.DataplaneSecretDataKey], &config); err == nil {
+				if err := json.Unmarshal(secret.Data[dnsconfig.ConfigSecretDataKey], &config); err == nil {
 					if len(config.Records) == 1 && config.Records[0].Name == "app.local" {
 						break
 					}
