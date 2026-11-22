@@ -2469,7 +2469,7 @@ func TestResolvedRefsCondition_FirstFailingBackendDecides(t *testing.T) {
 	if cond.Reason != string(gatewayv1.RouteReasonInvalidKind) {
 		t.Fatalf("expected reason %s, got %s", gatewayv1.RouteReasonInvalidKind, cond.Reason)
 	}
-	expectedMsg := "Unsupported backend kind: UnknownKind"
+	expectedMsg := "Unsupported backend kind: UnknownKind; Backend service default/nonexistent-svc not found"
 	if cond.Message != expectedMsg {
 		t.Fatalf("expected message %q, got %q", expectedMsg, cond.Message)
 	}

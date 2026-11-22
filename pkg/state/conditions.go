@@ -16,8 +16,10 @@ package state
 
 import (
 	"cmp"
+	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -59,14 +61,37 @@ func newValidationError(message string) *ConditionError {
 
 // buildCondition constructs a condition of the specified type from collected route errors.
 // If the error list contains no error of that type, it returns a True condition with trueReason and trueMessage.
-// Otherwise, it returns a False condition with the reason and message from the first error of that type.
+// Otherwise, it returns a False condition whose reason comes from the first error of that type and whose message
+// joins up to five distinct error messages of that type in list order. List order decides which error is first,
+// so callers append in a fixed order.
 func buildCondition(errs []*ConditionError, conditionType, trueReason, trueMessage string, generation int64) metav1.Condition {
+	var reason string
+	var messages []string
+	var found bool
 	for _, err := range errs {
-		if err.Type == conditionType {
-			return NewCondition(conditionType, metav1.ConditionFalse, err.Reason, err.Message, generation)
+		if err == nil || err.Type != conditionType {
+			continue
+		}
+		if !found {
+			reason = err.Reason
+			found = true
+		}
+		if !slices.Contains(messages, err.Message) {
+			messages = append(messages, err.Message)
 		}
 	}
-	return NewCondition(conditionType, metav1.ConditionTrue, trueReason, trueMessage, generation)
+	if !found {
+		return NewCondition(conditionType, metav1.ConditionTrue, trueReason, trueMessage, generation)
+	}
+
+	const maxJoinedMessages = 5
+	var message string
+	if len(messages) <= maxJoinedMessages {
+		message = strings.Join(messages, "; ")
+	} else {
+		message = fmt.Sprintf("%s; and %d more", strings.Join(messages[:maxJoinedMessages], "; "), len(messages)-maxJoinedMessages)
+	}
+	return NewCondition(conditionType, metav1.ConditionFalse, reason, message, generation)
 }
 
 // buildAcceptedCondition constructs a RouteConditionAccepted condition from collected errors.
