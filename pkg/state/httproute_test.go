@@ -2425,6 +2425,9 @@ func TestHTTPRouteStatus_PartiallyInvalid(t *testing.T) {
 	})
 }
 
+// TestResolvedRefsCondition_FirstFailingBackendDecides verifies that a route with two failures
+// of one type in two rules reports the reason of the first and both messages in order through
+// the route's computed status.
 func TestResolvedRefsCondition_FirstFailingBackendDecides(t *testing.T) {
 	route := &HTTPRouteState{
 		HTTPRoute: &gatewayv1.HTTPRoute{
@@ -2433,6 +2436,13 @@ func TestResolvedRefsCondition_FirstFailingBackendDecides(t *testing.T) {
 				Generation: 2,
 			},
 			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Name: "test-gateway",
+						},
+					},
+				},
 				Rules: []gatewayv1.HTTPRouteRule{
 					{
 						BackendRefs: []gatewayv1.HTTPBackendRef{
@@ -2469,12 +2479,37 @@ func TestResolvedRefsCondition_FirstFailingBackendDecides(t *testing.T) {
 	if cond.Reason != string(gatewayv1.RouteReasonInvalidKind) {
 		t.Fatalf("expected reason %s, got %s", gatewayv1.RouteReasonInvalidKind, cond.Reason)
 	}
-	expectedMsg := "Unsupported backend kind: UnknownKind"
+	expectedMsg := "Unsupported backend kind: UnknownKind; Backend service default/nonexistent-svc not found"
 	if cond.Message != expectedMsg {
 		t.Fatalf("expected message %q, got %q", expectedMsg, cond.Message)
 	}
 	if cond.ObservedGeneration != 2 {
 		t.Fatalf("expected observedGeneration 2, got %d", cond.ObservedGeneration)
+	}
+
+	compiled := &CompiledRoute{
+		HTTPRoute:  route.HTTPRoute,
+		RouteState: route,
+		ParentConditions: []metav1.Condition{
+			NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionTrue, string(gatewayv1.RouteReasonAccepted), "Accepted", 2),
+		},
+	}
+	status := ComputeDesiredHTTPRouteStatus(route.HTTPRoute, compiled, "test-controller")
+	if len(status.Parents) != 1 {
+		t.Fatalf("expected 1 parent status, got %d", len(status.Parents))
+	}
+	statusCond := FindCondition(status.Parents[0].Conditions, string(gatewayv1.RouteConditionResolvedRefs))
+	if statusCond == nil {
+		t.Fatalf("expected ResolvedRefs condition in computed status, got nil")
+	}
+	if statusCond.Status != metav1.ConditionFalse {
+		t.Errorf("expected status False, got %s", statusCond.Status)
+	}
+	if statusCond.Reason != string(gatewayv1.RouteReasonInvalidKind) {
+		t.Errorf("expected reason %s, got %s", gatewayv1.RouteReasonInvalidKind, statusCond.Reason)
+	}
+	if statusCond.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, statusCond.Message)
 	}
 }
 

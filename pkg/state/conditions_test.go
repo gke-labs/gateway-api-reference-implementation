@@ -904,3 +904,75 @@ func TestUpdateRouteParentStatuses_AddRemoveEntriesStability(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildCondition(t *testing.T) {
+	tests := []struct {
+		name       string
+		errs       []*ConditionError
+		wantReason string
+		wantMsg    string
+	}{
+		{
+			name: "one error",
+			errs: []*ConditionError{
+				{Type: "Accepted", Reason: "UnsupportedValue", Message: "invalid timeout"},
+			},
+			wantReason: "UnsupportedValue",
+			wantMsg:    "invalid timeout",
+		},
+		{
+			name: "two errors of one type",
+			errs: []*ConditionError{
+				{Type: "Accepted", Reason: "FirstReason", Message: "first error"},
+				{Type: "Accepted", Reason: "SecondReason", Message: "second error"},
+			},
+			wantReason: "FirstReason",
+			wantMsg:    "first error; second error",
+		},
+		{
+			name: "a repeated message",
+			errs: []*ConditionError{
+				{Type: "Accepted", Reason: "FirstReason", Message: "first error"},
+				{Type: "Accepted", Reason: "SecondReason", Message: "second error"},
+				{Type: "Accepted", Reason: "ThirdReason", Message: "first error"},
+			},
+			wantReason: "FirstReason",
+			wantMsg:    "first error; second error",
+		},
+		{
+			name: "more than five messages",
+			errs: []*ConditionError{
+				{Type: "Accepted", Reason: "R1", Message: "m1"},
+				{Type: "Accepted", Reason: "R2", Message: "m2"},
+				{Type: "Accepted", Reason: "R3", Message: "m3"},
+				{Type: "Accepted", Reason: "R4", Message: "m4"},
+				{Type: "Accepted", Reason: "R5", Message: "m5"},
+				{Type: "Accepted", Reason: "R6", Message: "m6"},
+				{Type: "Accepted", Reason: "R7", Message: "m7"},
+				{Type: "Accepted", Reason: "R8", Message: "m8"},
+			},
+			wantReason: "R1",
+			wantMsg:    "m1; m2; m3; m4; m5; and 3 more",
+		},
+		{
+			name: "an error of another type",
+			errs: []*ConditionError{
+				{Type: "ResolvedRefs", Reason: "BackendNotFound", Message: "backend not found"},
+			},
+			wantReason: "Accepted",
+			wantMsg:    "Route validation succeeded",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := buildCondition(tt.errs, "Accepted", "Accepted", "Route validation succeeded", 1)
+			if cond.Reason != tt.wantReason {
+				t.Errorf("got Reason %q, want %q", cond.Reason, tt.wantReason)
+			}
+			if cond.Message != tt.wantMsg {
+				t.Errorf("got Message %q, want %q", cond.Message, tt.wantMsg)
+			}
+		})
+	}
+}
