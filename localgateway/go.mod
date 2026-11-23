@@ -4,7 +4,7 @@ go 1.27.2
 
 require (
 	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261024134123-7373c0c33da0
-	golang.org/x/net v0.62.0
+	golang.org/x/net v0.63.0
 	golang.org/x/sys v0.50.0
 	k8s.io/api v0.37.2
 	k8s.io/apimachinery v0.37.2

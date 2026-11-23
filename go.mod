@@ -8,12 +8,12 @@ require (
 	github.com/gke-labs/gateway-api-reference-implementation/certserver/api v0.0.0-00010101000000-000000000000
 	github.com/go-logr/logr v1.4.4
 	github.com/google/go-cmp v0.7.0
-	github.com/klauspost/compress v1.20.4
+	github.com/klauspost/compress v1.20.5
 	github.com/prometheus/client_golang v1.25.0
 	github.com/quic-go/quic-go v0.65.0
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/crypto v0.59.0
-	golang.org/x/net v0.62.0
+	golang.org/x/net v0.63.0
 	golang.org/x/sync v0.25.0
 	golang.org/x/sys v0.50.0
 	golang.org/x/time v0.16.0
