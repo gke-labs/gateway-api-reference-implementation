@@ -743,8 +743,8 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. With provisioning error -> Programmed=False, Message=error
-	provErr := errors.New("conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw")
-	st.SetGatewayProvisioningError(gwKey, provErr)
+	provisioningError := errors.New("conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw")
+	st.SetGatewayProvisioningError(gwKey, provisioningError)
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -761,8 +761,8 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 	if progCond == nil {
 		t.Fatalf("expected Programmed condition")
 	}
-	if progCond.Status != metav1.ConditionFalse || progCond.Message != provErr.Error() {
-		t.Errorf("expected Programmed=False Message=%q when provisioning error present, got Status=%s Message=%q", provErr.Error(), progCond.Status, progCond.Message)
+	if progCond.Status != metav1.ConditionFalse || progCond.Message != provisioningError.Error() {
+		t.Errorf("expected Programmed=False Message=%q when provisioning error present, got Status=%s Message=%q", provisioningError.Error(), progCond.Status, progCond.Message)
 	}
 
 	// 2. Clear provisioning error -> Programmed=True restored (given address and readiness)
@@ -812,8 +812,8 @@ func TestState_GatewayProvisioningError_NoAddress_ReportsFirstReasonAndBothMessa
 	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// Gateway has a provisioning error and no address assigned.
-	provErrMsg := "conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw"
-	st.SetGatewayProvisioningError(gwKey, errors.New(provErrMsg))
+	provisioningErrorMessage := "conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw"
+	st.SetGatewayProvisioningError(gwKey, errors.New(provisioningErrorMessage))
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -830,7 +830,7 @@ func TestState_GatewayProvisioningError_NoAddress_ReportsFirstReasonAndBothMessa
 	if progCond.Reason != string(gatewayv1.GatewayReasonPending) {
 		t.Errorf("expected Reason=Pending, got %s", progCond.Reason)
 	}
-	expectedMsg := provErrMsg + "; Waiting for address to be assigned to the Gateway"
+	expectedMsg := provisioningErrorMessage + "; Waiting for address to be assigned to the Gateway"
 	if progCond.Message != expectedMsg {
 		t.Errorf("expected Message=%q, got %q", expectedMsg, progCond.Message)
 	}
@@ -840,7 +840,7 @@ func TestState_GatewayProvisioningError_NoAddress_ReportsFirstReasonAndBothMessa
 	customCondErr := &ConditionError{
 		Type:    string(gatewayv1.GatewayConditionProgrammed),
 		Reason:  customReason,
-		Message: provErrMsg,
+		Message: provisioningErrorMessage,
 	}
 	st.SetGatewayProvisioningError(gwKey, customCondErr)
 	st.Recompute()
@@ -867,7 +867,7 @@ func TestState_GatewayProvisioningError_NoAddress_ReportsFirstReasonAndBothMessa
 	otherTypeCondErr := &ConditionError{
 		Type:    string(gatewayv1.GatewayConditionAccepted),
 		Reason:  "OtherReason",
-		Message: provErrMsg,
+		Message: provisioningErrorMessage,
 	}
 	st.SetGatewayProvisioningError(gwKey, otherTypeCondErr)
 	st.Recompute()
