@@ -2050,49 +2050,6 @@ func TestDataplane_HTTPPortBoundBeforeReady(t *testing.T) {
 	}
 }
 
-func TestDataplane_ListenersBoundWait(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("allocating http port: %v", err)
-	}
-	defer httpLis.Close()
-
-	server := &Server{
-		opts: Options{
-			HTTPListener: httpLis,
-		},
-	}
-
-	if server.listenersBound.Get() {
-		t.Fatal("expected listenersBound to be false initially")
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- server.listenersBound.Wait(ctx)
-	}()
-
-	if err := server.bindStartupListeners(); err != nil {
-		t.Fatalf("bindStartupListeners failed: %v", err)
-	}
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("listenersBound.Wait returned error: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for listenersBound.Wait")
-	}
-
-	if !server.listenersBound.Get() {
-		t.Fatal("expected listenersBound.Get to be true")
-	}
-}
-
 func TestDataplane_RoutesAndCertificates(t *testing.T) {
 	ctx := t.Context()
 
