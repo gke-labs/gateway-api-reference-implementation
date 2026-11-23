@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/concurrent"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
@@ -422,7 +423,7 @@ type Server struct {
 	httpsListener net.Listener
 
 	// listenersBound indicates whether startup listeners have been bound.
-	listenersBound bool
+	listenersBound concurrent.WaitableBool
 
 	proxySynced atomic.Bool
 
@@ -940,7 +941,7 @@ func (s *Server) newHTTPServer(handler http.Handler, tlsConfig *tls.Config) *htt
 // server starts reporting readiness, ensuring clients do not receive connection
 // refused errors when connecting immediately after the data plane reports ready.
 func (s *Server) bindStartupListeners() error {
-	if s.listenersBound {
+	if s.listenersBound.Get() {
 		return nil
 	}
 
@@ -964,7 +965,7 @@ func (s *Server) bindStartupListeners() error {
 		s.httpsListener = lis
 	}
 
-	s.listenersBound = true
+	s.listenersBound.Set(true)
 	return nil
 }
 
