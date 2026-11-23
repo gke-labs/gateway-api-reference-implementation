@@ -1591,7 +1591,7 @@ func (s *State) SetGatewayReadiness(key types.NamespacedName, readiness GatewayR
 }
 
 // SetGatewayProvisioningError sets the address provider provisioning error only for a Gateway.
-func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr error) {
+func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provisioningError error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1601,11 +1601,11 @@ func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr er
 	}
 
 	errs := gw.provisioningErrors
-	if provisioningErrorsEqual(errs.addressProvider, provErr) {
+	if provisioningErrorsEqual(errs.addressProvider, provisioningError) {
 		return
 	}
 
-	errs.addressProvider = provErr
+	errs.addressProvider = provisioningError
 	gw.provisioningErrors = errs
 	s.revision++
 	s.markDirtyLocked()
