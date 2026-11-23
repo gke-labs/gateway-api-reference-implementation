@@ -1972,6 +1972,84 @@ func TestDataplane_AppliedRevisionEndpoint(t *testing.T) {
 	}
 }
 
+func TestDataplane_HTTPPortBoundBeforeReady(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocating http port: %v", err)
+	}
+	httpAddr := httpLis.Addr().String()
+	if err := httpLis.Close(); err != nil {
+		t.Fatalf("closing http listener: %v", err)
+	}
+
+	healthLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocating health port: %v", err)
+	}
+	healthAddr := healthLis.Addr().String()
+	if err := healthLis.Close(); err != nil {
+		t.Fatalf("closing health listener: %v", err)
+	}
+
+	server := &Server{
+		opts: Options{
+			ProxyAddr: httpAddr,
+		},
+		proxy: proxy.NewProxy(),
+	}
+	server.proxySynced.Store(true)
+
+	mux := http.NewServeMux()
+	for path, handler := range server.healthEndpoints() {
+		mux.Handle(path, handler)
+	}
+	server.healthProbeServer = &http.Server{
+		Addr:    healthAddr,
+		Handler: mux,
+	}
+
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- server.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-startErr; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("server.Start error: %v", err)
+		}
+	})
+
+	readyzURL := fmt.Sprintf("http://%s/readyz", healthAddr)
+	httpClient := &http.Client{Timeout: 1 * time.Second}
+	for {
+		resp, err := httpClient.Get(readyzURL)
+		if err == nil {
+			status := resp.StatusCode
+			_ = resp.Body.Close()
+			if status == http.StatusOK {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for /readyz to pass: %v", ctx.Err())
+		default:
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+
+	conn, err := net.DialTimeout("tcp", httpAddr, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to connect to HTTP port %s after readyz passed: %v", httpAddr, err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("closing connection: %v", err)
+	}
+}
+
 func TestDataplane_RoutesAndCertificates(t *testing.T) {
 	ctx := t.Context()
 
