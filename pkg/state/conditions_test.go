@@ -909,6 +909,8 @@ func TestBuildCondition(t *testing.T) {
 	tests := []struct {
 		name       string
 		errs       []*ConditionError
+		warnings   []*ConditionWarning
+		wantStatus metav1.ConditionStatus
 		wantReason string
 		wantMsg    string
 	}{
@@ -917,6 +919,7 @@ func TestBuildCondition(t *testing.T) {
 			errs: []*ConditionError{
 				{Type: "Accepted", Reason: "UnsupportedValue", Message: "invalid timeout"},
 			},
+			wantStatus: metav1.ConditionFalse,
 			wantReason: "UnsupportedValue",
 			wantMsg:    "invalid timeout",
 		},
@@ -926,6 +929,7 @@ func TestBuildCondition(t *testing.T) {
 				{Type: "Accepted", Reason: "FirstReason", Message: "first error"},
 				{Type: "Accepted", Reason: "SecondReason", Message: "second error"},
 			},
+			wantStatus: metav1.ConditionFalse,
 			wantReason: "FirstReason",
 			wantMsg:    "first error; second error",
 		},
@@ -936,6 +940,7 @@ func TestBuildCondition(t *testing.T) {
 				{Type: "Accepted", Reason: "SecondReason", Message: "second error"},
 				{Type: "Accepted", Reason: "ThirdReason", Message: "first error"},
 			},
+			wantStatus: metav1.ConditionFalse,
 			wantReason: "FirstReason",
 			wantMsg:    "first error; second error",
 		},
@@ -951,6 +956,7 @@ func TestBuildCondition(t *testing.T) {
 				{Type: "Accepted", Reason: "R7", Message: "m7"},
 				{Type: "Accepted", Reason: "R8", Message: "m8"},
 			},
+			wantStatus: metav1.ConditionFalse,
 			wantReason: "R1",
 			wantMsg:    "m1; m2; m3; m4; m5; and 3 more",
 		},
@@ -959,6 +965,47 @@ func TestBuildCondition(t *testing.T) {
 			errs: []*ConditionError{
 				{Type: "ResolvedRefs", Reason: "BackendNotFound", Message: "backend not found"},
 			},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: "Accepted",
+			wantMsg:    "Route validation succeeded",
+		},
+		{
+			name: "one warning",
+			warnings: []*ConditionWarning{
+				{Type: "Accepted", Reason: "ListenersNotValid", Message: "One or more listeners have invalid configuration"},
+			},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: "ListenersNotValid",
+			wantMsg:    "One or more listeners have invalid configuration",
+		},
+		{
+			name: "two warnings join messages in list order with first reason",
+			warnings: []*ConditionWarning{
+				{Type: "Accepted", Reason: "FirstWarning", Message: "warning 1"},
+				{Type: "Accepted", Reason: "SecondWarning", Message: "warning 2"},
+			},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: "FirstWarning",
+			wantMsg:    "warning 1; warning 2",
+		},
+		{
+			name: "error takes precedence over warning",
+			errs: []*ConditionError{
+				{Type: "Accepted", Reason: "InvalidParameters", Message: "bad param"},
+			},
+			warnings: []*ConditionWarning{
+				{Type: "Accepted", Reason: "ListenersNotValid", Message: "invalid listener"},
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: "InvalidParameters",
+			wantMsg:    "bad param",
+		},
+		{
+			name: "warnings of other type ignored",
+			warnings: []*ConditionWarning{
+				{Type: "OtherType", Reason: "OtherReason", Message: "other warning"},
+			},
+			wantStatus: metav1.ConditionTrue,
 			wantReason: "Accepted",
 			wantMsg:    "Route validation succeeded",
 		},
@@ -966,7 +1013,10 @@ func TestBuildCondition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cond := buildCondition(tt.errs, "Accepted", "Accepted", "Route validation succeeded", 1)
+			cond := buildCondition(tt.errs, tt.warnings, "Accepted", "Accepted", "Route validation succeeded", 1)
+			if cond.Status != tt.wantStatus {
+				t.Errorf("got Status %s, want %s", cond.Status, tt.wantStatus)
+			}
 			if cond.Reason != tt.wantReason {
 				t.Errorf("got Reason %q, want %q", cond.Reason, tt.wantReason)
 			}

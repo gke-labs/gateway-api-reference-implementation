@@ -133,16 +133,13 @@ type gatewayProvisioningErrors struct {
 	publish error
 }
 
-// message returns the error message for the Gateway's Programmed condition.
+// provisioningError returns the error for the Gateway's Programmed condition.
 // The address provider's error is shown first, then the publish error.
-func (e gatewayProvisioningErrors) message() string {
+func (e gatewayProvisioningErrors) provisioningError() error {
 	if e.addressProvider != nil {
-		return e.addressProvider.Error()
+		return e.addressProvider
 	}
-	if e.publish != nil {
-		return e.publish.Error()
-	}
-	return ""
+	return e.publish
 }
 
 type State struct {
@@ -735,10 +732,12 @@ func (s *State) clearPublishErrorLocked(gwKey types.NamespacedName) {
 	}
 }
 
-// publishErrorsEqual reports whether two publish errors are equivalent.
+// provisioningErrorsEqual reports whether two provisioning errors are equivalent.
 // If both errors wrap RejectedError, their rejections are compared rather than their error messages.
+// If both errors wrap ConditionError, their fields are compared.
+// If only one error wraps either type, they are not equal.
 // For other error types, the error messages are compared.
-func publishErrorsEqual(firstError, secondError error) bool {
+func provisioningErrorsEqual(firstError, secondError error) bool {
 	if firstError == nil || secondError == nil {
 		return firstError == secondError
 	}
@@ -752,6 +751,16 @@ func publishErrorsEqual(firstError, secondError error) bool {
 	if errors.As(firstError, &firstRejected) || errors.As(secondError, &secondRejected) {
 		return false
 	}
+	var firstCondition, secondCondition *ConditionError
+	if errors.As(firstError, &firstCondition) && errors.As(secondError, &secondCondition) {
+		if firstCondition == nil || secondCondition == nil {
+			return firstCondition == secondCondition
+		}
+		return *firstCondition == *secondCondition
+	}
+	if errors.As(firstError, &firstCondition) || errors.As(secondError, &secondCondition) {
+		return false
+	}
 	return firstError.Error() == secondError.Error()
 }
 
@@ -762,7 +771,7 @@ func (s *State) recordPublishError(gwKey types.NamespacedName, err error) {
 	defer s.mu.Unlock()
 
 	gw, ok := s.gateways[gwKey]
-	if !ok || publishErrorsEqual(gw.provisioningErrors.publish, err) {
+	if !ok || provisioningErrorsEqual(gw.provisioningErrors.publish, err) {
 		return
 	}
 	gw.provisioningErrors.publish = err
@@ -829,7 +838,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 
 	gwAddrs := make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress)
 	gwReady := make(map[types.NamespacedName]GatewayReadiness)
-	gwProvErrs := make(map[types.NamespacedName]string)
+	gwProvErrs := make(map[types.NamespacedName]error)
 	for k, gwState := range s.gateways {
 		if gwState != nil {
 			if len(gwState.addresses) > 0 {
@@ -838,8 +847,8 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 			if gwState.readiness != nil {
 				gwReady[k] = *gwState.readiness
 			}
-			if msg := gwState.provisioningErrors.message(); msg != "" {
-				gwProvErrs[k] = msg
+			if err := gwState.provisioningErrors.provisioningError(); err != nil {
+				gwProvErrs[k] = err
 			}
 		}
 	}
@@ -1582,7 +1591,7 @@ func (s *State) SetGatewayReadiness(key types.NamespacedName, readiness GatewayR
 }
 
 // SetGatewayProvisioningError sets the address provider provisioning error only for a Gateway.
-func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr string) {
+func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1591,18 +1600,12 @@ func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr st
 		return
 	}
 
-	var newErr error
-	if provErr != "" {
-		newErr = errors.New(provErr)
-	}
-
 	errs := gw.provisioningErrors
-	if (errs.addressProvider == nil && newErr == nil) ||
-		(errs.addressProvider != nil && newErr != nil && errs.addressProvider.Error() == newErr.Error()) {
+	if provisioningErrorsEqual(errs.addressProvider, provErr) {
 		return
 	}
 
-	errs.addressProvider = newErr
+	errs.addressProvider = provErr
 	gw.provisioningErrors = errs
 	s.revision++
 	s.markDirtyLocked()

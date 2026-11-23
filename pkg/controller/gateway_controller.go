@@ -215,7 +215,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 			if paramsErr != nil {
 				// Parameters resolution error (Gateway or GatewayClass): fail closed, leave existing resources as they are.
-				r.State.SetGatewayProvisioningError(req.NamespacedName, "")
+				r.State.SetGatewayProvisioningError(req.NamespacedName, nil)
 				r.State.SetGatewayAddresses(req.NamespacedName, nil)
 				r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{
 					Ready:   false,
@@ -223,7 +223,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					Message: paramsErr.Error(),
 				})
 			} else if unsupp, _ := state.HasUnsupportedAddress(gw.Spec.Addresses, supportedTypes); unsupp {
-				r.State.SetGatewayProvisioningError(req.NamespacedName, "")
+				r.State.SetGatewayProvisioningError(req.NamespacedName, nil)
 				r.State.SetGatewayAddresses(req.NamespacedName, nil)
 				r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{Ready: false})
 			} else {
@@ -233,7 +233,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					var conflictErr *OwnershipConflictError
 					if errors.As(err, &conflictErr) {
 						l.Error(err, "ownership conflict provisioning gateway")
-						r.State.SetGatewayProvisioningError(req.NamespacedName, conflictErr.Error())
+						r.State.SetGatewayProvisioningError(req.NamespacedName, conflictErr)
 						r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{Ready: false})
 						delay := r.ConflictRequeueDelay
 						if delay == 0 {
@@ -247,7 +247,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 						return ctrl.Result{}, err
 					}
 				} else {
-					r.State.SetGatewayProvisioningError(req.NamespacedName, "")
+					r.State.SetGatewayProvisioningError(req.NamespacedName, nil)
 					r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
 					r.State.SetGatewayReadiness(req.NamespacedName, readiness)
 				}
