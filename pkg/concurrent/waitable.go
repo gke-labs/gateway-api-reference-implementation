@@ -22,10 +22,14 @@ import (
 // WaitableBool holds a boolean that goroutines can set, read, and wait on.
 // The zero value is ready to use and is false.
 type WaitableBool struct {
-	// mu guards val and cond.
-	mu   sync.Mutex
+	// mu guards cond and value.
+	mu sync.Mutex
+
+	// cond coordinates waiters with Set.
 	cond sync.Cond
-	val  bool
+
+	// value is the held boolean value.
+	value bool
 }
 
 func (b *WaitableBool) initLocked() {
@@ -39,7 +43,7 @@ func (b *WaitableBool) Set(value bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.val = value
+	b.value = value
 	b.initLocked()
 	b.cond.Broadcast()
 }
@@ -49,7 +53,7 @@ func (b *WaitableBool) Get() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	return b.val
+	return b.value
 }
 
 // Wait returns nil when the value is true. It returns the context's error when
@@ -59,11 +63,8 @@ func (b *WaitableBool) Wait(ctx context.Context) error {
 	defer b.mu.Unlock()
 
 	b.initLocked()
-	if b.val {
+	if b.value {
 		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		return err
 	}
 
 	stop := context.AfterFunc(ctx, func() {
@@ -73,7 +74,7 @@ func (b *WaitableBool) Wait(ctx context.Context) error {
 	})
 	defer stop()
 
-	for !b.val {
+	for !b.value {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
