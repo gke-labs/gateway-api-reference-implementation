@@ -1262,6 +1262,140 @@ func TestCompileHTTPRoute(t *testing.T) {
 		}
 	})
 
+	t.Run("compiles valid path regex match", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "valid-path-regex", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								Path: &gatewayv1.HTTPPathMatch{
+									Type:  Ptr(gatewayv1.PathMatchRegularExpression),
+									Value: Ptr("^/users/[0-9]+$"),
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		internal := CompileHTTPRoute(route, nil, nil, nil, nil)
+		if internal.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Fatalf("expected ValidationCondition True, got %+v", internal.ValidationCondition)
+		}
+		if len(internal.Rules) != 1 || internal.Rules[0].Error != nil {
+			t.Fatalf("expected 1 valid rule, got %+v", internal.Rules)
+		}
+		pathMatch := internal.Rules[0].Matches[0].Path
+		if pathMatch == nil || pathMatch.Type != gatewayv1.PathMatchRegularExpression || pathMatch.MatchRegularExpressionValue == nil {
+			t.Fatalf("expected compiled regex path match, got %+v", pathMatch)
+		}
+		if !pathMatch.MatchRegularExpressionValue.MatchString("/users/42") || pathMatch.MatchRegularExpressionValue.MatchString("/users/abc") {
+			t.Errorf("compiled regex did not evaluate expected paths")
+		}
+	})
+
+	t.Run("rejects invalid path regex with Accepted False", func(t *testing.T) {
+		gateway := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-gw", Namespace: "default"},
+			Spec: gatewayv1.GatewaySpec{
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80},
+				},
+			},
+		}
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "bad-path-regex", Namespace: "default", Generation: 2},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{Name: "test-gw"}},
+				},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								Path: &gatewayv1.HTTPPathMatch{
+									Type:  Ptr(gatewayv1.PathMatchRegularExpression),
+									Value: Ptr("[invalid"),
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileModel(ModelInputs{
+			Gateways:   []*gatewayv1.Gateway{gateway},
+			HTTPRoutes: []*gatewayv1.HTTPRoute{route},
+			Namespaces: map[string]*corev1.Namespace{"default": {ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		})
+		routeKey := types.NamespacedName{Namespace: "default", Name: "bad-path-regex"}
+		compiledRoute := compiled.HTTPRoutes[routeKey]
+		if compiledRoute == nil || compiledRoute.RouteState == nil || compiledRoute.RouteState.Internal == nil {
+			t.Fatalf("expected compiled route")
+		}
+		internal := compiledRoute.RouteState.Internal
+		if internal.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", internal.ValidationCondition.Status)
+		}
+		if internal.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %s", internal.ValidationCondition.Reason)
+		}
+		if len(internal.Rules) != 1 || internal.Rules[0].Error == nil {
+			t.Fatalf("expected rule with ErrorState, got %+v", internal.Rules)
+		}
+		if internal.Rules[0].Matches[0].Path.MatchRegularExpressionValue != nil {
+			t.Errorf("expected nil compiled regex for invalid pattern")
+		}
+
+		if len(compiledRoute.ParentConditions) != 1 {
+			t.Fatalf("expected 1 parent condition, got %d", len(compiledRoute.ParentConditions))
+		}
+		accepted := compiledRoute.ParentConditions[0]
+		if accepted.Type != string(gatewayv1.RouteConditionAccepted) || accepted.Status != metav1.ConditionFalse || accepted.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Fatalf("expected Accepted=False UnsupportedValue condition, got %+v", accepted)
+		}
+		_, proxyRoutes := BuildProxyConfig([]*CompiledGateway{compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "test-gw"}]})
+		if len(proxyRoutes) != 0 {
+			t.Errorf("expected invalid route not to bind to proxy, got %d routes", len(proxyRoutes))
+		}
+	})
+
+	t.Run("rejects unsupported path match type", func(t *testing.T) {
+		unknownType := gatewayv1.PathMatchType("UnknownType")
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "unknown-path-type", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								Path: &gatewayv1.HTTPPathMatch{
+									Type:  &unknownType,
+									Value: Ptr("/foo"),
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		internal := CompileHTTPRoute(route, nil, nil, nil, nil)
+		if internal.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", internal.ValidationCondition.Status)
+		}
+		if internal.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %s", internal.ValidationCondition.Reason)
+		}
+		if len(internal.Rules) != 1 || internal.Rules[0].Error == nil {
+			t.Fatalf("expected rule with ErrorState, got %+v", internal.Rules)
+		}
+	})
+
 	t.Run("compiles named rules and rejects duplicate rule names", func(t *testing.T) {
 		ruleName1 := gatewayv1.SectionName("rule-1")
 		ruleName2 := gatewayv1.SectionName("rule-2")

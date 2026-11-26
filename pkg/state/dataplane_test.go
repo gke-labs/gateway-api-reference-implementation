@@ -1323,3 +1323,86 @@ func TestMultiDataplanePublisher(t *testing.T) {
 		t.Errorf("unexpected rejections order: %+v", res.Rejections)
 	}
 }
+
+func TestDataplaneConfigPathRegexRoundTrip(t *testing.T) {
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "regex-gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Protocol: gatewayv1.HTTPProtocolType, Port: 80},
+			},
+		},
+	}
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "items-svc", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 8080}},
+		},
+	}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "regex-route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "regex-gw"}},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  Ptr(gatewayv1.PathMatchRegularExpression),
+								Value: Ptr("^/items/[0-9]+$"),
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "items-svc",
+									Port: Ptr(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:   []*gatewayv1.Gateway{gateway},
+		HTTPRoutes: []*gatewayv1.HTTPRoute{route},
+		Services: map[types.NamespacedName]*corev1.Service{
+			{Namespace: "default", Name: "items-svc"}: service,
+		},
+		Namespaces: map[string]*corev1.Namespace{
+			"default": {ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+		},
+	})
+	compiledGateway := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "regex-gw"}]
+	config, err := BuildGatewayDataplaneConfig(compiledGateway)
+	if err != nil {
+		t.Fatalf("BuildGatewayDataplaneConfig failed: %v", err)
+	}
+
+	data, err := config.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	restored, err := UnmarshalDataplaneConfig(data)
+	if err != nil {
+		t.Fatalf("UnmarshalDataplaneConfig failed: %v", err)
+	}
+
+	matchingRequest := httptest.NewRequest("GET", "http://example.com/items/42", nil)
+	matchedRule, _ := MatchRoute(restored.Routes, matchingRequest)
+	if matchedRule == nil || len(matchedRule.Backends) != 1 || matchedRule.Backends[0].Host != "items-svc.default.svc.cluster.local" {
+		t.Fatalf("expected matching path after round-trip, got %+v", matchedRule)
+	}
+
+	nonMatchingRequest := httptest.NewRequest("GET", "http://example.com/items/abc", nil)
+	if unmatchedRule, _ := MatchRoute(restored.Routes, nonMatchingRequest); unmatchedRule != nil {
+		t.Errorf("expected non-matching path to return nil after round-trip, got %+v", unmatchedRule)
+	}
+}

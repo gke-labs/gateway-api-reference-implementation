@@ -200,10 +200,26 @@ func CompileHTTPRoute(
 				if pathType == "" {
 					pathType = gatewayv1.PathMatchPathPrefix
 				}
-				iMatch.Path = &InternalPathMatch{
+				pathValue := ValueOf(match.Path.Value)
+				pathMatch := &InternalPathMatch{
 					Type:  pathType,
-					Value: ValueOf(match.Path.Value),
+					Value: pathValue,
 				}
+				switch pathType {
+				case gatewayv1.PathMatchExact, gatewayv1.PathMatchPathPrefix:
+				case gatewayv1.PathMatchRegularExpression:
+					compiledPattern, err := regexp.Compile(pathValue)
+					if err != nil {
+						message := fmt.Sprintf("invalid regular expression in path match: %v", err)
+						routeErrors = append(routeErrors, recordRuleValidationError(&iRule, message))
+					} else {
+						pathMatch.MatchRegularExpressionValue = compiledPattern
+					}
+				default:
+					message := fmt.Sprintf("unsupported path match type: %s", pathType)
+					routeErrors = append(routeErrors, recordRuleValidationError(&iRule, message))
+				}
+				iMatch.Path = pathMatch
 			}
 			seenHeaders := make(map[string]bool)
 			for _, header := range match.Headers {
