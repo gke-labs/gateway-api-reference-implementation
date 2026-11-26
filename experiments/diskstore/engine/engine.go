@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -430,7 +431,8 @@ const (
 	// Version 6 stores oversize values in separate files and logs only pointers in the WAL.
 	// Version 7 adds the HMAC-SHA256 key check token for block-level encryption.
 	// Version 8 adds the recovery start LSN ring in meta.db.
-	StoreFormatVersion uint32 = 8
+	// Version 9 encrypts oversize value files and stores the SHA-256 checksum of stored value bytes in pointer records.
+	StoreFormatVersion uint32 = 9
 
 	// metaBlockSize is the fixed size of the static meta.db header block (4 KiB).
 	metaBlockSize = BlockSize
@@ -1206,13 +1208,29 @@ func (s *Engine) removeOversizeFileByName(fileName string) error {
 	return nil
 }
 
-func (s *Engine) writeOversizeValueFile(qualifiedKey string, payload []byte) (string, error) {
+func randomOversizeFileName() (string, error) {
+	var id [16]byte
+	if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
+		return "", fmt.Errorf("failed to generate random oversize file name: %w", err)
+	}
+	return fmt.Sprintf("%x.obj", id), nil
+}
+
+func (s *Engine) writeOversizeValueFile(fileName string, payload []byte) error {
 	dir := filepath.Join(s.dir, "oversize")
 	if err := s.fs.MkdirAll(dir, StoreDirMode); err != nil {
-		return "", fmt.Errorf("failed to create oversize dir: %w", err)
+		return fmt.Errorf("failed to create oversize dir: %w", err)
 	}
 
-	fileName := OversizeFileName(qualifiedKey, payload)
+	var oversizeCipher *xts.Cipher
+	if len(s.encryptionKey) > 0 {
+		var err error
+		oversizeCipher, err = newOversizeCipher(s.encryptionKey, s.dbID, fileName)
+		if err != nil {
+			return fmt.Errorf("failed to create oversize cipher: %w", err)
+		}
+	}
+
 	finalPath := filepath.Join(dir, fileName)
 
 	tempName := fmt.Sprintf(".tmp-%s-%d", fileName, s.inFlightSeq.Add(1))
@@ -1228,33 +1246,40 @@ func (s *Engine) writeOversizeValueFile(qualifiedKey string, payload []byte) (st
 
 	tempFile, err := s.fs.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
 	if err != nil {
-		return "", cleanup(fmt.Errorf("failed to create temp oversize file: %w", err))
+		return cleanup(fmt.Errorf("failed to create temp oversize file: %w", err))
 	}
 
-	if _, err := tempFile.WriteAt(payload, 0); err != nil {
-		closeErr := tempFile.Close()
-		return "", cleanup(errors.Join(fmt.Errorf("failed to write temp oversize file: %w", err), closeErr))
+	if oversizeCipher != nil {
+		if err := encryptOversizeFile(tempFile, payload, oversizeCipher); err != nil {
+			closeErr := tempFile.Close()
+			return cleanup(errors.Join(fmt.Errorf("failed to write encrypted temp oversize file: %w", err), closeErr))
+		}
+	} else {
+		if _, err := tempFile.WriteAt(payload, 0); err != nil {
+			closeErr := tempFile.Close()
+			return cleanup(errors.Join(fmt.Errorf("failed to write temp oversize file: %w", err), closeErr))
+		}
 	}
 
 	if err := tempFile.Sync(); err != nil {
 		closeErr := tempFile.Close()
-		return "", cleanup(errors.Join(fmt.Errorf("failed to sync temp oversize file: %w", err), closeErr))
+		return cleanup(errors.Join(fmt.Errorf("failed to sync temp oversize file: %w", err), closeErr))
 	}
 
 	if err := tempFile.Close(); err != nil {
-		return "", cleanup(fmt.Errorf("failed to close temp oversize file: %w", err))
+		return cleanup(fmt.Errorf("failed to close temp oversize file: %w", err))
 	}
 
 	if err := s.fs.Rename(tempPath, finalPath); err != nil {
-		return "", cleanup(fmt.Errorf("failed to rename temp oversize file to final: %w", err))
+		return cleanup(fmt.Errorf("failed to rename temp oversize file to final: %w", err))
 	}
 
 	if err := s.fs.SyncDir(dir); err != nil {
-		return "", cleanup(fmt.Errorf("failed to sync oversize dir: %w", err))
+		return cleanup(fmt.Errorf("failed to sync oversize dir: %w", err))
 	}
 
 	s.unregisterInFlight(tempName)
-	return fileName, nil
+	return nil
 }
 
 // setFailed transitions the engine into the permanent failed state and notifies listeners.
@@ -1652,16 +1677,28 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 	// Handle oversize object: records exceeding 512-block multi-block capacity persist to disk under oversize directory
 	if !fitsInMultiBlockPage(len(qKey), len(toStore)) {
 		isOversize = true
-		fileName := OversizeFileName(qKey, toStore)
-		checksum := OversizeHash(qKey, toStore)
+		encrypted := len(s.encryptionKey) > 0
+		var fileName string
+		if encrypted {
+			var err error
+			fileName, err = randomOversizeFileName()
+			if err != nil {
+				return err
+			}
+		} else {
+			fileName = OversizeFileName(qKey, toStore)
+		}
+		checksum := sha256.Sum256(toStore)
 
-		s.keyMu.RLock()
-		existing, inIndex := s.keyIndex[qKey]
-		s.keyMu.RUnlock()
-
-		skipWrite := inIndex && existing.IsOversize && existing.OversizeFileName == fileName
+		var skipWrite bool
+		if !encrypted {
+			s.keyMu.RLock()
+			existing, inIndex := s.keyIndex[qKey]
+			s.keyMu.RUnlock()
+			skipWrite = inIndex && existing.IsOversize && existing.OversizeFileName == fileName
+		}
 		if !skipWrite {
-			if _, err := s.writeOversizeValueFile(qKey, toStore); err != nil {
+			if err := s.writeOversizeValueFile(fileName, toStore); err != nil {
 				return err
 			}
 		}
@@ -1678,13 +1715,13 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		}
 
 		s.keyMu.RLock()
-		existing, inIndex = s.keyIndex[qKey]
+		existing, inIndex := s.keyIndex[qKey]
 		s.keyMu.RUnlock()
 
 		// Re-check the skip decision under writerMu lock.
 		// If the index changed while waiting for the lock, write the file now.
 		if skipWrite && (!inIndex || !existing.IsOversize || existing.OversizeFileName != fileName) {
-			if _, err := s.writeOversizeValueFile(qKey, toStore); err != nil {
+			if err := s.writeOversizeValueFile(fileName, toStore); err != nil {
 				return err
 			}
 			defer s.unregisterInFlight(fileName)
@@ -1934,12 +1971,18 @@ func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry
 			closeErr := f.Close()
 			return nil, false, fmt.Errorf("%w: failed to get size of oversize file %s: %v", ErrCorruptStore, fileName, errors.Join(sizeErr, closeErr))
 		}
-		if uint64(sz) != expectedLen {
+		if len(s.encryptionKey) > 0 {
+			if sz < 0 || sz%BlockSize != 0 || expectedLen > uint64(sz) || uint64(sz) != paddedOversizeSize(expectedLen) {
+				closeErr := f.Close()
+				return nil, false, errors.Join(fmt.Errorf("%w: oversize file %s size mismatch (expected unpadded %d, got %d)", ErrCorruptStore, fileName, expectedLen, sz), closeErr)
+			}
+		} else if sz < 0 || uint64(sz) != expectedLen {
 			closeErr := f.Close()
 			return nil, false, errors.Join(fmt.Errorf("%w: oversize file %s size mismatch (want %d, got %d)", ErrCorruptStore, fileName, expectedLen, sz), closeErr)
 		}
 		fileData := make([]byte, sz)
-		if _, readErr := f.ReadAt(fileData, 0); readErr != nil && !errors.Is(readErr, io.EOF) {
+		n, readErr := f.ReadAt(fileData, 0)
+		if (readErr != nil && !errors.Is(readErr, io.EOF)) || int64(n) != sz {
 			closeErr := f.Close()
 			return nil, false, fmt.Errorf("%w: failed to read oversize file %s: %v", ErrCorruptStore, fileName, errors.Join(readErr, closeErr))
 		}
@@ -1947,7 +1990,19 @@ func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry
 			return nil, false, fmt.Errorf("%w: failed to close oversize file %s: %v", ErrCorruptStore, fileName, closeErr)
 		}
 
-		actualChecksum := OversizeHash(qKey, fileData)
+		if len(s.encryptionKey) > 0 {
+			oversizeCipher, cipherErr := newOversizeCipher(s.encryptionKey, s.dbID, fileName)
+			if cipherErr != nil {
+				return nil, false, fmt.Errorf("failed to create oversize cipher for %s: %w", fileName, cipherErr)
+			}
+			var decryptErr error
+			fileData, decryptErr = decryptOversizeBytes(fileData, expectedLen, oversizeCipher)
+			if decryptErr != nil {
+				return nil, false, fmt.Errorf("corrupt oversize file %s: %w", fileName, decryptErr)
+			}
+		}
+
+		actualChecksum := sha256.Sum256(fileData)
 		if actualChecksum != expectedChecksum {
 			return nil, false, fmt.Errorf("%w: corrupt oversize file %s (checksum mismatch)", ErrCorruptStore, fileName)
 		}

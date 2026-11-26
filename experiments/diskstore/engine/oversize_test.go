@@ -84,6 +84,62 @@ func (h *oversizeHookFS) Rename(oldpath, newpath string) error {
 	return h.FS.Rename(oldpath, newpath)
 }
 
+func runOversizeEncryptionModes(t *testing.T, fn func(t *testing.T, key []byte)) {
+	t.Helper()
+	t.Run("Unencrypted", func(t *testing.T) {
+		fn(t, nil)
+	})
+	t.Run("Encrypted", func(t *testing.T) {
+		var key [32]byte
+		copy(key[:], []byte("oversize-crash-test-master-key32"))
+		fn(t, key[:])
+	})
+}
+
+func openOversizeStoreOnFaultFS(faultFS *FaultFS, hookFS *oversizeHookFS, dir string, key []byte, opts ...Option) (*Engine, error) {
+	if len(key) > 0 {
+		faultFS.SetEncryptionKey(key)
+		dbID, exists, err := readDBIDFromMeta(faultFS, dir)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			cipher, err := newHeapCipher(key, dbID)
+			if err != nil {
+				return nil, err
+			}
+			faultFS.SetHeapCipher(cipher)
+		}
+	}
+
+	var targetFS FS = faultFS
+	if hookFS != nil {
+		targetFS = hookFS
+	}
+	openOpts := make([]Option, 0, len(opts)+3)
+	openOpts = append(openOpts, WithFS(targetFS), WithDir(dir))
+	if len(key) > 0 {
+		openOpts = append(openOpts, WithEncryptionKey(key))
+	}
+	openOpts = append(openOpts, opts...)
+
+	store, err := Open(openOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(key) > 0 {
+		cipher, err := newHeapCipher(key, store.DBID())
+		if err != nil {
+			closeErr := store.Close()
+			return nil, errors.Join(err, closeErr)
+		}
+		faultFS.SetHeapCipher(cipher)
+	}
+
+	return store, nil
+}
+
 // Review Feedback Item 1:
 // Checkpoint survival: Put a 3 MiB value, do 3,000 small Puts with periodic Checkpoint(),
 // Close, reopen, then Get returns the value.
@@ -244,94 +300,99 @@ func TestOversize_ConcurrentPut_InterleavedRace(t *testing.T) {
 
 // Crash after pointer record durable recovers new value.
 func TestOversize_CrashAfterPointerRecordDurable_RecoversNewValue(t *testing.T) {
-	memFS := NewMemFS()
-	faultFS := NewFaultFS(memFS)
-	dir := "test_oversize_crash_after_ptr"
+	runOversizeEncryptionModes(t, func(t *testing.T, encKey []byte) {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := "test_oversize_crash_after_ptr"
 
-	store, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
+		store, err := openOversizeStoreOnFaultFS(faultFS, nil, dir, encKey, WithCompressionCodec(CodecNone), WithCreate())
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
 
-	table := "TestTable"
-	key := "targetKey"
-	val := append([]byte("durable-oversize-content"), make([]byte, 2100*1024)...)
-	if err := store.Put(table, key, val); err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
-	if err := store.Sync(); err != nil {
-		t.Fatalf("Sync failed: %v", err)
-	}
+		table := "TestTable"
+		key := "targetKey"
+		val := append([]byte("durable-oversize-content"), make([]byte, 2100*1024)...)
+		if err := store.Put(table, key, val); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+		if err := store.Sync(); err != nil {
+			t.Fatalf("Sync failed: %v", err)
+		}
 
-	// Pointer record is durable. Crash faultFS dropping any unsynced data and reopen.
-	// Abandon the crashed engine without calling Close() so that nothing is written after the crash.
-	if err := faultFS.Crash(true, 0); err != nil {
-		t.Fatalf("Crash failed: %v", err)
-	}
+		// Pointer record is durable. Crash faultFS dropping any unsynced data and reopen.
+		// Abandon the crashed engine without calling Close() so that nothing is written after the crash.
+		if err := faultFS.Crash(true, 0); err != nil {
+			t.Fatalf("Crash failed: %v", err)
+		}
 
-	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
-	if err != nil {
-		t.Fatalf("Open after crash failed: %v", err)
-	}
-	defer store2.Close()
+		store2, err := openOversizeStoreOnFaultFS(NewFaultFS(memFS), nil, dir, encKey, WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("Open after crash failed: %v", err)
+		}
+		defer store2.Close()
 
-	gotVal, exists, err := store2.Get(table, key)
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
-	}
-	if !exists {
-		t.Fatalf("expected key to exist after crash recovery")
-	}
-	if !bytes.Equal(gotVal, val) {
-		t.Fatalf("value mismatch: got len=%d, want len=%d", len(gotVal), len(val))
-	}
+		gotVal, exists, err := store2.Get(table, key)
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if !exists {
+			t.Fatalf("expected key to exist after crash recovery")
+		}
+		if !bytes.Equal(gotVal, val) {
+			t.Fatalf("value mismatch: got len=%d, want len=%d", len(gotVal), len(val))
+		}
+	})
 }
 
 // Overwriting an oversize key never deletes the old file before the new pointer record is durable.
 func TestOversize_Overwrite_NeverDeletesOldFileBeforePointerRecordDurable(t *testing.T) {
-	memFS := NewMemFS()
-	faultFS := NewFaultFS(memFS)
-	dir := "test_oversize_overwrite_old_retention"
+	runOversizeEncryptionModes(t, func(t *testing.T, encKey []byte) {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := "test_oversize_overwrite_old_retention"
 
-	hookedFS := &oversizeHookFS{FS: faultFS}
+		hookedFS := &oversizeHookFS{FS: faultFS}
 
-	store, err := Open(WithFS(hookedFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
+		store, err := openOversizeStoreOnFaultFS(faultFS, hookedFS, dir, encKey, WithCompressionCodec(CodecNone), WithCreate())
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer store.Close()
 
-	table := "TestTable"
-	key := "targetKey"
-	v1 := append([]byte("oversize-version-1"), make([]byte, 2100*1024)...)
-	if err := store.Put(table, key, v1); err != nil {
-		t.Fatalf("Put v1 failed: %v", err)
-	}
+		table := "TestTable"
+		key := "targetKey"
+		v1 := append([]byte("oversize-version-1"), make([]byte, 2100*1024)...)
+		if err := store.Put(table, key, v1); err != nil {
+			t.Fatalf("Put v1 failed: %v", err)
+		}
 
-	oldFileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
-	oldFilePath := filepath.Join(dir, "oversize", oldFileName)
+		oldFileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
+		oldFilePath := filepath.Join(dir, "oversize", oldFileName)
 
-	var oldFileRemovedBeforeDurable bool
-	hookedFS.onRemove = func(name string) {
-		if filepath.Clean(name) == filepath.Clean(oldFilePath) {
-			if asWAL(store.wal).FsyncedLSN() < asWAL(store.wal).MaxLSN() {
-				oldFileRemovedBeforeDurable = true
+		var oldFileRemovedBeforeDurable bool
+		hookedFS.onRemove = func(name string) {
+			if filepath.Clean(name) == filepath.Clean(oldFilePath) {
+				if asWAL(store.wal).FsyncedLSN() < asWAL(store.wal).MaxLSN() {
+					oldFileRemovedBeforeDurable = true
+				}
 			}
 		}
-	}
 
-	v2 := append([]byte("oversize-version-2"), make([]byte, 2100*1024)...)
-	if err := store.Put(table, key, v2); err != nil {
-		t.Fatalf("Put v2 failed: %v", err)
-	}
+		v2 := append([]byte("oversize-version-2"), make([]byte, 2100*1024)...)
+		if err := store.Put(table, key, v2); err != nil {
+			t.Fatalf("Put v2 failed: %v", err)
+		}
 
-	if oldFileRemovedBeforeDurable {
-		t.Fatalf("Invariant violated: old oversize file was deleted before new pointer record was durable")
-	}
+		if oldFileRemovedBeforeDurable {
+			t.Fatalf("Invariant violated: old oversize file was deleted before new pointer record was durable")
+		}
 
-	// Verify old file was eventually deleted after durable sync
-	if _, err := memFS.Open(oldFilePath); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("expected old oversize file to be removed after successful sync, got err: %v", err)
-	}
+		// Verify old file was eventually deleted after durable sync
+		if _, err := memFS.Open(oldFilePath); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("expected old oversize file to be removed after successful sync, got err: %v", err)
+		}
+	})
 }
 
 // WAL segments no longer contain oversize payloads. Check this through the segment size after an oversize Put.
@@ -430,56 +491,59 @@ func TestOversize_IdenticalValueRewrite_SkipsWrite(t *testing.T) {
 // Old-version rule when transitioning from oversize back to slotted page:
 // Delete the previous version's file only after the new pointer record is durable.
 func TestOversize_KeyMovingBackToPage_DeletesOldFileOnlyAfterWALSync(t *testing.T) {
-	memFS := NewMemFS()
-	faultFS := NewFaultFS(memFS)
-	dir := "test_oversize_to_page_old_retention"
+	runOversizeEncryptionModes(t, func(t *testing.T, encKey []byte) {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := "test_oversize_to_page_old_retention"
 
-	hookedFS := &oversizeHookFS{FS: faultFS}
+		hookedFS := &oversizeHookFS{FS: faultFS}
 
-	store, err := Open(WithFS(hookedFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
+		store, err := openOversizeStoreOnFaultFS(faultFS, hookedFS, dir, encKey, WithCompressionCodec(CodecNone), WithCreate())
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer store.Close()
 
-	table := "TestTable"
-	key := "targetKey"
-	v1 := append([]byte("oversize-version-1"), make([]byte, 2100*1024)...)
-	if err := store.Put(table, key, v1); err != nil {
-		t.Fatalf("Put v1 failed: %v", err)
-	}
+		table := "TestTable"
+		key := "targetKey"
+		v1 := append([]byte("oversize-version-1"), make([]byte, 2100*1024)...)
+		if err := store.Put(table, key, v1); err != nil {
+			t.Fatalf("Put v1 failed: %v", err)
+		}
 
-	oldFileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
-	oldFilePath := filepath.Join(dir, "oversize", oldFileName)
+		oldFileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
+		oldFilePath := filepath.Join(dir, "oversize", oldFileName)
 
-	var oldFileRemovedBeforeDurable bool
-	hookedFS.onRemove = func(name string) {
-		if filepath.Clean(name) == filepath.Clean(oldFilePath) {
-			if asWAL(store.wal).FsyncedLSN() < asWAL(store.wal).MaxLSN() {
-				oldFileRemovedBeforeDurable = true
+		var oldFileRemovedBeforeDurable bool
+		hookedFS.onRemove = func(name string) {
+			if filepath.Clean(name) == filepath.Clean(oldFilePath) {
+				if asWAL(store.wal).FsyncedLSN() < asWAL(store.wal).MaxLSN() {
+					oldFileRemovedBeforeDurable = true
+				}
 			}
 		}
-	}
 
-	// Update to small value (slotted page)
-	v2 := []byte("small-slotted-value")
-	if err := store.Put(table, key, v2); err != nil {
-		t.Fatalf("Put v2 failed: %v", err)
-	}
+		// Update to small value (slotted page)
+		v2 := []byte("small-slotted-value")
+		if err := store.Put(table, key, v2); err != nil {
+			t.Fatalf("Put v2 failed: %v", err)
+		}
 
-	if oldFileRemovedBeforeDurable {
-		t.Fatalf("old oversize file removed before WAL was durable")
-	}
+		if oldFileRemovedBeforeDurable {
+			t.Fatalf("old oversize file removed before WAL was durable")
+		}
 
-	// Verify old oversize file is now removed
-	if _, err := memFS.Open(oldFilePath); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("expected old oversize file to be removed after successful sync, got err: %v", err)
-	}
+		// Verify old oversize file is now removed
+		if _, err := memFS.Open(oldFilePath); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("expected old oversize file to be removed after successful sync, got err: %v", err)
+		}
 
-	// Verify value
-	got, exists, err := store.Get(table, key)
-	if err != nil || !exists || !bytes.Equal(got, v2) {
-		t.Fatalf("Get after moving back to page failed")
-	}
+		// Verify value
+		got, exists, err := store.Get(table, key)
+		if err != nil || !exists || !bytes.Equal(got, v2) {
+			t.Fatalf("Get after moving back to page failed")
+		}
+	})
 }
 
 // Review Feedback Item 1:
@@ -974,109 +1038,111 @@ func TestOversize_ConcurrentReadersWriter_NoError(t *testing.T) {
 // its pointer record (fault-injecting filesystem), reopen. The orphan is quarantined to lost+found,
 // and the key keeps its previous value.
 func TestOversize_Recovery_CrashBeforePointerRecord_QuarantinesOrphanAndPreservesPreviousValue(t *testing.T) {
-	memFS := NewMemFS()
-	faultFS := NewFaultFS(memFS)
-	hookFS := &oversizeHookFS{FS: faultFS}
-	dir := "test_oversize_recovery_orphan"
+	runOversizeEncryptionModes(t, func(t *testing.T, encKey []byte) {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		hookFS := &oversizeHookFS{FS: faultFS}
+		dir := "test_oversize_recovery_orphan"
 
-	store, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
+		store, err := openOversizeStoreOnFaultFS(faultFS, hookFS, dir, encKey, WithCompressionCodec(CodecNone), WithCreate())
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
 
-	table := "TestTable"
-	key := "targetKey"
-	prevVal := []byte("previous-durable-value")
-	if err := store.Put(table, key, prevVal); err != nil {
-		t.Fatalf("Put prevVal failed: %v", err)
-	}
-	if err := store.Checkpoint(); err != nil {
-		t.Fatalf("Checkpoint failed: %v", err)
-	}
+		table := "TestTable"
+		key := "targetKey"
+		prevVal := []byte("previous-durable-value")
+		if err := store.Put(table, key, prevVal); err != nil {
+			t.Fatalf("Put prevVal failed: %v", err)
+		}
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint failed: %v", err)
+		}
 
-	oversizeVal := append([]byte("orphan-oversize-content"), make([]byte, 2100*1024)...)
-	oversizeDir := filepath.Join(dir, "oversize")
+		oversizeVal := append([]byte("orphan-oversize-content"), make([]byte, 2100*1024)...)
+		oversizeDir := filepath.Join(dir, "oversize")
 
-	var crashed bool
-	var orphanFileName string
-	doneCh := make(chan struct{})
-	hookFS.onSyncDir = func(dirname string) {
-		if filepath.Clean(dirname) == filepath.Clean(oversizeDir) && !crashed {
-			crashed = true
-			entries, _ := memFS.ReadDir(oversizeDir)
-			for _, e := range entries {
-				if !e.IsDir() && strings.HasSuffix(e.Name(), ".obj") {
-					orphanFileName = e.Name()
+		var crashed bool
+		var orphanFileName string
+		doneCh := make(chan struct{})
+		hookFS.onSyncDir = func(dirname string) {
+			if filepath.Clean(dirname) == filepath.Clean(oversizeDir) && !crashed {
+				crashed = true
+				entries, _ := memFS.ReadDir(oversizeDir)
+				for _, e := range entries {
+					if !e.IsDir() && strings.HasSuffix(e.Name(), ".obj") {
+						orphanFileName = e.Name()
+					}
 				}
+				_ = faultFS.Crash(true, 0)
+				close(doneCh)
+				runtime.Goexit()
 			}
-			_ = faultFS.Crash(true, 0)
-			close(doneCh)
-			runtime.Goexit()
 		}
-	}
 
-	go func() {
-		_ = store.Put(table, key, oversizeVal)
-	}()
+		go func() {
+			_ = store.Put(table, key, oversizeVal)
+		}()
 
-	<-doneCh
+		<-doneCh
 
-	if orphanFileName == "" {
-		t.Fatalf("expected orphan file to have been created before crash")
-	}
-
-	orphanPath := filepath.Join(oversizeDir, orphanFileName)
-	if f, err := memFS.Open(orphanPath); err != nil {
-		t.Fatalf("expected orphan file %s to exist on disk before recovery: %v", orphanPath, err)
-	} else if err := f.Close(); err != nil {
-		t.Fatalf("close orphan file failed: %v", err)
-	}
-
-	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
-	if err != nil {
-		t.Fatalf("Reopen after crash failed: %v", err)
-	}
-	defer func() {
-		if err := store2.Close(); err != nil {
-			t.Fatalf("store2.Close failed: %v", err)
+		if orphanFileName == "" {
+			t.Fatalf("expected orphan file to have been created before crash")
 		}
-	}()
 
-	// Orphan file must no longer reside in oversize/
-	if f, err := memFS.Open(orphanPath); err == nil {
-		_ = f.Close()
-		t.Fatalf("expected orphan file %s to be moved out of oversize directory, but it exists", orphanPath)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("expected orphan file %s to not exist in oversize dir, got err: %v", orphanPath, err)
-	}
-
-	// Orphan file must be quarantined in lost+found
-	lostDir := filepath.Join(oversizeDir, "lost+found")
-	lostEntries, err := memFS.ReadDir(lostDir)
-	if err != nil {
-		t.Fatalf("ReadDir lost+found failed: %v", err)
-	}
-	var foundQuarantined bool
-	for _, entry := range lostEntries {
-		if strings.HasPrefix(entry.Name(), orphanFileName) {
-			foundQuarantined = true
-			break
+		orphanPath := filepath.Join(oversizeDir, orphanFileName)
+		if f, err := memFS.Open(orphanPath); err != nil {
+			t.Fatalf("expected orphan file %s to exist on disk before recovery: %v", orphanPath, err)
+		} else if err := f.Close(); err != nil {
+			t.Fatalf("close orphan file failed: %v", err)
 		}
-	}
-	if !foundQuarantined {
-		t.Fatalf("expected orphan file %s to be quarantined in %s", orphanFileName, lostDir)
-	}
 
-	gotVal, exists, err := store2.Get(table, key)
-	if err != nil {
-		t.Fatalf("Get key failed: %v", err)
-	}
-	if !exists {
-		t.Fatalf("expected key %s to exist with previous value", key)
-	}
-	if !bytes.Equal(gotVal, prevVal) {
-		t.Fatalf("value mismatch: got %q, want %q", string(gotVal), string(prevVal))
-	}
+		store2, err := openOversizeStoreOnFaultFS(NewFaultFS(memFS), nil, dir, encKey, WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("Reopen after crash failed: %v", err)
+		}
+		defer func() {
+			if err := store2.Close(); err != nil {
+				t.Fatalf("store2.Close failed: %v", err)
+			}
+		}()
+
+		// Orphan file must no longer reside in oversize/
+		if f, err := memFS.Open(orphanPath); err == nil {
+			_ = f.Close()
+			t.Fatalf("expected orphan file %s to be moved out of oversize directory, but it exists", orphanPath)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("expected orphan file %s to not exist in oversize dir, got err: %v", orphanPath, err)
+		}
+
+		// Orphan file must be quarantined in lost+found
+		lostDir := filepath.Join(oversizeDir, "lost+found")
+		lostEntries, err := memFS.ReadDir(lostDir)
+		if err != nil {
+			t.Fatalf("ReadDir lost+found failed: %v", err)
+		}
+		var foundQuarantined bool
+		for _, entry := range lostEntries {
+			if strings.HasPrefix(entry.Name(), orphanFileName) {
+				foundQuarantined = true
+				break
+			}
+		}
+		if !foundQuarantined {
+			t.Fatalf("expected orphan file %s to be quarantined in %s", orphanFileName, lostDir)
+		}
+
+		gotVal, exists, err := store2.Get(table, key)
+		if err != nil {
+			t.Fatalf("Get key failed: %v", err)
+		}
+		if !exists {
+			t.Fatalf("expected key %s to exist with previous value", key)
+		}
+		if !bytes.Equal(gotVal, prevVal) {
+			t.Fatalf("value mismatch: got %q, want %q", string(gotVal), string(prevVal))
+		}
+	})
 }
 
 // A test: a referenced file is never quarantined by the startup pass.
@@ -1182,70 +1248,72 @@ func TestOversize_Recovery_ReferencedFileNeverQuarantinedByStartupPass(t *testin
 // crash with the fault-injecting filesystem before any checkpoint, and reopen.
 // The file is still there and the value reads back.
 func TestOversize_Recovery_WALOnlyPointer_ReferencedFileNeverQuarantined(t *testing.T) {
-	memFS := NewMemFS()
-	faultFS := NewFaultFS(memFS)
-	dir := "test_oversize_wal_only_pointer"
+	runOversizeEncryptionModes(t, func(t *testing.T, encKey []byte) {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := "test_oversize_wal_only_pointer"
 
-	store, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-
-	table := "TestTable"
-	key := "walOnlyKey"
-	val := append([]byte("wal-only-oversize-content"), make([]byte, 2100*1024)...)
-	if err := store.Put(table, key, val); err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
-
-	// Sync fsyncs WAL records without checkpointing or flushing heap pages
-	if err := store.Sync(); err != nil {
-		t.Fatalf("Sync failed: %v", err)
-	}
-
-	oversizeDir := filepath.Join(dir, "oversize")
-	entries, err := memFS.ReadDir(oversizeDir)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("expected 1 oversize file in directory, got %d (err: %v)", len(entries), err)
-	}
-	oversizePath := filepath.Join(oversizeDir, entries[0].Name())
-
-	// Crash drops un-fsynced heap data before any checkpoint.
-	// Abandon the crashed engine without calling Close() so that nothing is written after the crash.
-	if err := faultFS.Crash(true, 0); err != nil {
-		t.Fatalf("Crash failed: %v", err)
-	}
-
-	// Reopen store: pointer must be recovered from WAL redo replay, and recovery
-	// startup pass must never quarantine this referenced file.
-	store2, err := Open(WithFS(NewFaultFS(memFS)), WithDir(dir), WithCompressionCodec(CodecNone))
-	if err != nil {
-		t.Fatalf("Reopen failed: %v", err)
-	}
-	defer func() {
-		if err := store2.Close(); err != nil {
-			t.Fatalf("store2.Close failed: %v", err)
+		store, err := openOversizeStoreOnFaultFS(faultFS, nil, dir, encKey, WithCompressionCodec(CodecNone), WithCreate())
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
 		}
-	}()
 
-	f, err := memFS.Open(oversizePath)
-	if err != nil {
-		t.Fatalf("referenced oversize file %s was moved by recovery: %v", oversizePath, err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close oversize file failed: %v", err)
-	}
+		table := "TestTable"
+		key := "walOnlyKey"
+		val := append([]byte("wal-only-oversize-content"), make([]byte, 2100*1024)...)
+		if err := store.Put(table, key, val); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
 
-	gotVal, exists, err := store2.Get(table, key)
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
-	}
-	if !exists {
-		t.Fatalf("expected key %s to exist after WAL replay", key)
-	}
-	if !bytes.Equal(gotVal, val) {
-		t.Fatalf("value mismatch: got len=%d, want len=%d", len(gotVal), len(val))
-	}
+		// Sync fsyncs WAL records without checkpointing or flushing heap pages
+		if err := store.Sync(); err != nil {
+			t.Fatalf("Sync failed: %v", err)
+		}
+
+		oversizeDir := filepath.Join(dir, "oversize")
+		entries, err := memFS.ReadDir(oversizeDir)
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("expected 1 oversize file in directory, got %d (err: %v)", len(entries), err)
+		}
+		oversizePath := filepath.Join(oversizeDir, entries[0].Name())
+
+		// Crash drops un-fsynced heap data before any checkpoint.
+		// Abandon the crashed engine without calling Close() so that nothing is written after the crash.
+		if err := faultFS.Crash(true, 0); err != nil {
+			t.Fatalf("Crash failed: %v", err)
+		}
+
+		// Reopen store: pointer must be recovered from WAL redo replay, and recovery
+		// startup pass must never quarantine this referenced file.
+		store2, err := openOversizeStoreOnFaultFS(NewFaultFS(memFS), nil, dir, encKey, WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("Reopen failed: %v", err)
+		}
+		defer func() {
+			if err := store2.Close(); err != nil {
+				t.Fatalf("store2.Close failed: %v", err)
+			}
+		}()
+
+		f, err := memFS.Open(oversizePath)
+		if err != nil {
+			t.Fatalf("referenced oversize file %s was moved by recovery: %v", oversizePath, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close oversize file failed: %v", err)
+		}
+
+		gotVal, exists, err := store2.Get(table, key)
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if !exists {
+			t.Fatalf("expected key %s to exist after WAL replay", key)
+		}
+		if !bytes.Equal(gotVal, val) {
+			t.Fatalf("value mismatch: got len=%d, want len=%d", len(gotVal), len(val))
+		}
+	})
 }
 
 // A test with a filesystem whose Rename returns an error when quarantining an unreferenced file:
@@ -1607,72 +1675,74 @@ func TestOversize_PeriodicSweep_UnreferencedFileFromFailedPutQuarantinedWithoutR
 // an unreferenced oversize file created by a crash point in the fault-injecting filesystem is moved
 // to lost+found after the next sweep, without reopening the store.
 func TestOversize_PeriodicSweep_UnreferencedFileFromCrashPointQuarantinedWithoutReopen(t *testing.T) {
-	filesBefore := QuarantineSweepFilesCount()
+	runOversizeEncryptionModes(t, func(t *testing.T, encKey []byte) {
+		filesBefore := QuarantineSweepFilesCount()
 
-	memFS := NewMemFS()
-	faultFS := NewFaultFS(memFS)
-	hookFS := &oversizeHookFS{FS: faultFS}
-	dir := "test_oversize_crash_point_quarantine_no_reopen"
-	oversizeDir := filepath.Join(dir, "oversize")
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		hookFS := &oversizeHookFS{FS: faultFS}
+		dir := "test_oversize_crash_point_quarantine_no_reopen"
+		oversizeDir := filepath.Join(dir, "oversize")
 
-	store, err := Open(WithFS(hookFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate(),
-		WithQuarantine(QuarantineOptions{SweepInterval: 10 * time.Millisecond}))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer func() {
-		if err := store.Close(); err != nil {
-			t.Fatalf("store.Close failed: %v", err)
+		store, err := openOversizeStoreOnFaultFS(faultFS, hookFS, dir, encKey, WithCompressionCodec(CodecNone), WithCreate(),
+			WithQuarantine(QuarantineOptions{SweepInterval: 10 * time.Millisecond}))
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
 		}
-	}()
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Fatalf("store.Close failed: %v", err)
+			}
+		}()
 
-	if err := faultFS.MkdirAll(oversizeDir, StoreDirMode); err != nil {
-		t.Fatalf("MkdirAll failed: %v", err)
-	}
-
-	// Create an unreferenced file at a crash point
-	orphanName := "crash-orphan-12345.obj"
-	orphanPath := filepath.Join(oversizeDir, orphanName)
-	orphanData := []byte("crash-point-unreferenced-data")
-	f, err := faultFS.OpenFile(orphanPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
-	if err != nil {
-		t.Fatalf("OpenFile failed: %v", err)
-	}
-	if _, err := f.WriteAt(orphanData, 0); err != nil {
-		if closeErr := f.Close(); closeErr != nil {
-			t.Fatalf("f.Close failed: %v", closeErr)
+		if err := faultFS.MkdirAll(oversizeDir, StoreDirMode); err != nil {
+			t.Fatalf("MkdirAll failed: %v", err)
 		}
-		t.Fatalf("WriteAt failed: %v", err)
-	}
-	if err := f.Sync(); err != nil {
-		if closeErr := f.Close(); closeErr != nil {
-			t.Fatalf("f.Close failed: %v", closeErr)
+
+		// Create an unreferenced file at a crash point
+		orphanName := "crash-orphan-12345.obj"
+		orphanPath := filepath.Join(oversizeDir, orphanName)
+		orphanData := []byte("crash-point-unreferenced-data")
+		f, err := faultFS.OpenFile(orphanPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %v", err)
 		}
-		t.Fatalf("Sync failed: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	// Wait for the next sweep to quarantine the unreferenced file without reopening
-	deadline := time.Now().Add(5 * time.Second)
-	for QuarantineSweepFilesCount() < filesBefore+1 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	if got := QuarantineSweepFilesCount() - filesBefore; got < 1 {
-		t.Fatalf("expected QuarantineSweepFilesCount increase >= 1, got %d", got)
-	}
-
-	// Verify the file is no longer in oversize/
-	if f, err := faultFS.Open(orphanPath); err == nil {
-		if closeErr := f.Close(); closeErr != nil {
-			t.Fatalf("f.Close failed: %v", closeErr)
+		if _, err := f.WriteAt(orphanData, 0); err != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				t.Fatalf("f.Close failed: %v", closeErr)
+			}
+			t.Fatalf("WriteAt failed: %v", err)
 		}
-		t.Fatalf("expected orphan file %s to be removed from oversize dir", orphanPath)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("expected ErrNotExist, got: %v", err)
-	}
+		if err := f.Sync(); err != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				t.Fatalf("f.Close failed: %v", closeErr)
+			}
+			t.Fatalf("Sync failed: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		// Wait for the next sweep to quarantine the unreferenced file without reopening
+		deadline := time.Now().Add(5 * time.Second)
+		for QuarantineSweepFilesCount() < filesBefore+1 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		if got := QuarantineSweepFilesCount() - filesBefore; got < 1 {
+			t.Fatalf("expected QuarantineSweepFilesCount increase >= 1, got %d", got)
+		}
+
+		// Verify the file is no longer in oversize/
+		if f, err := faultFS.Open(orphanPath); err == nil {
+			if closeErr := f.Close(); closeErr != nil {
+				t.Fatalf("f.Close failed: %v", closeErr)
+			}
+			t.Fatalf("expected orphan file %s to be removed from oversize dir", orphanPath)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("expected ErrNotExist, got: %v", err)
+		}
+	})
 }
 
 // TestOversize_PeriodicSweep_InFlightPutPreservedDuringSweep asserts that a file for a Put
