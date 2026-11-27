@@ -295,7 +295,7 @@ func runKubecacheWatch(t *testing.T, count int, tmpDir string) WatchBenchResult 
 		t.Fatalf("Checkpoint failed: %v", err)
 	}
 	snap := readMemStats()
-	_, _, totalDiskMB, err := getDiskBreakdown(tmpDir)
+	heapMB, _, err := getDiskBreakdown(tmpDir)
 	if err != nil {
 		t.Fatalf("getDiskBreakdown failed: %v", err)
 	}
@@ -310,7 +310,7 @@ func runKubecacheWatch(t *testing.T, count int, tmpDir string) WatchBenchResult 
 		SteadyInUseMB: snap.HeapInUseMB - baseMem.HeapInUseMB,
 		SteadyRSSMB:   snap.RSSMB,
 		BytesPerObj:   (deltaHeap * 1024 * 1024) / float64(count),
-		DiskMB:        totalDiskMB,
+		DiskMB:        heapMB,
 	}
 }
 
