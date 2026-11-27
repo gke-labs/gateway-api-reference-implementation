@@ -1061,9 +1061,11 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile, activePageIndex, pageCounter)
 
 		// Replay WAL records from redo start LSN through write path apply functions.
-		if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.SupersededPages); err != nil {
-			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
-			return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeErr)
+		if recoveryRes.RedoStartLSN <= recoveryRes.MaxLSN {
+			if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.RedoStartPosition, recoveryRes.SupersededPages); err != nil {
+				closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+				return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeErr)
+			}
 		}
 
 		// Track empty logical pages recovered from disk only after WAL replay completes,

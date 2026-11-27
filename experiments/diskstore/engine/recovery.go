@@ -63,6 +63,9 @@ type RecoveryResult struct {
 	MaxLSN          uint64
 	NextLogicalPage uint64
 	RedoStartLSN    uint64
+	// RedoStartPosition records the segment and byte offset of the first WAL record
+	// at or after RedoStartLSN found during recovery, or nil when no such record exists.
+	RedoStartPosition *LogPosition
 }
 
 type candidatePageCopy struct {
@@ -451,26 +454,31 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		redoStartLSN = 1
 	}
 	var maxWAL_LSN uint64
+	var redoStartPosition *LogPosition
 
-	walScanIt, err := NewWALIterator(fs, walDir, dbID, 1, WALIteratorOptions{
+	walScanIterator, err := NewWALIterator(fs, walDir, dbID, 1, WALIteratorOptions{
 		EncryptionKey: options.EncryptionKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WAL scan iterator: %w", err)
 	}
 	for {
-		rec, err := walScanIt.Next()
+		rec, err := walScanIterator.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			return nil, fmt.Errorf("error during WAL scan: %w", err)
 		}
+		if redoStartPosition == nil && rec.LSN >= redoStartLSN {
+			position := walScanIterator.lastRecordPosition
+			redoStartPosition = &position
+		}
 		if rec.LSN > maxWAL_LSN {
 			maxWAL_LSN = rec.LSN
 		}
 	}
-	if closeErr := walScanIt.Close(); closeErr != nil {
+	if closeErr := walScanIterator.Close(); closeErr != nil {
 		return nil, fmt.Errorf("failed to close WAL scan iterator: %w", closeErr)
 	}
 
@@ -492,6 +500,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		MaxLSN:            maxWAL_LSN,
 		NextLogicalPage:   maxRecoveredLogicalPage + 1,
 		RedoStartLSN:      redoStartLSN,
+		RedoStartPosition: redoStartPosition,
 	}, nil
 }
 
@@ -595,10 +604,10 @@ func (s *Engine) replay(iterator LogIterator, superseded map[string][]KeyIndexEn
 }
 
 // replayWAL builds a LogIterator from s.wal starting at redoStartLSN and passes it to replay.
-func (s *Engine) replayWAL(redoStartLSN uint64, superseded map[string][]KeyIndexEntry) error {
-	walRedoIt, err := s.wal.NewIterator(redoStartLSN)
+func (s *Engine) replayWAL(redoStartLSN uint64, redoStartPosition *LogPosition, superseded map[string][]KeyIndexEntry) error {
+	walRedoIterator, err := s.wal.NewIterator(redoStartLSN, redoStartPosition)
 	if err != nil {
 		return fmt.Errorf("failed to create WAL redo iterator: %w", err)
 	}
-	return s.replay(walRedoIt, superseded)
+	return s.replay(walRedoIterator, superseded)
 }
