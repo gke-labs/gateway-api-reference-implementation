@@ -384,7 +384,25 @@ func TestSetupDataplane_ProvisionerArgs_ACMEChallenge(t *testing.T) {
 	}
 }
 
+func TestSetupController_RequiresPodNamespace(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "")
+	_, err := SetupController(t.Context(), []string{
+		"--cluster-id=c1",
+		"--fake-compute",
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
+	}, nil)
+	if err == nil {
+		t.Fatalf("expected error when POD_NAMESPACE is empty, got nil")
+	}
+	if !strings.Contains(err.Error(), "POD_NAMESPACE") {
+		t.Errorf("expected error mentioning POD_NAMESPACE, got %v", err)
+	}
+}
+
 func TestSetupController_RequiresInternalAPIFlags(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "default")
 	tests := []struct {
 		name string
 		args []string
@@ -418,6 +436,7 @@ func TestSetupController_RequiresInternalAPIFlags(t *testing.T) {
 }
 
 func TestSetupController_NoSilentFallback(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "default")
 	// Without --fake-compute, SetupController initializes the real Compute client.
 	// It must never silently substitute a FakeComputeClient.
 	opts, err := SetupController(t.Context(), []string{
@@ -436,6 +455,7 @@ func TestSetupController_NoSilentFallback(t *testing.T) {
 }
 
 func TestSetupController_FakeComputeFlag(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "default")
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=c1",
 		"--fake-compute",
@@ -455,6 +475,7 @@ func TestSetupController_FakeComputeFlag(t *testing.T) {
 }
 
 func TestSetupController_DebugErrorResponsesFlag(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "default")
 	baseArgs := []string{
 		"--cluster-id=c1",
 		"--fake-compute",
@@ -685,6 +706,7 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 	})
 
 	// 1. Run SetupController with real arguments
+	t.Setenv("POD_NAMESPACE", "default")
 	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
@@ -929,6 +951,7 @@ func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) 
 
 	fakeGCP := gcp.NewFakeComputeClient()
 
+	t.Setenv("POD_NAMESPACE", "default")
 	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
@@ -1079,6 +1102,7 @@ func TestSetupController_SteadyStateZeroWritesAndNoFlapping(t *testing.T) {
 		},
 	})
 
+	t.Setenv("POD_NAMESPACE", "default")
 	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
@@ -1465,6 +1489,7 @@ func TestSetupController_DataplaneConfigFromInternalAPI(t *testing.T) {
 	}
 
 	fakeGCP := gcp.NewFakeComputeClient()
+	t.Setenv("POD_NAMESPACE", "default")
 	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=c1",

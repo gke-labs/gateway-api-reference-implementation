@@ -15,7 +15,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -149,13 +148,9 @@ func Setup(args []string) (gari.Options, error) {
 		singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
 	}
 
-	controllerNamespace := os.Getenv("POD_NAMESPACE")
-	if controllerNamespace == "" {
-		return opts, errors.New("POD_NAMESPACE environment variable is required")
-	}
-
-	if opts.InternalAPIBindAddress == "" || opts.InternalAPITLSCertFile == "" || opts.InternalAPITLSKeyFile == "" {
-		return opts, errors.New("--internal-api-bind-address, --internal-api-tls-cert-file, and --internal-api-tls-key-file are required")
+	controllerNamespace, err := gari.ProvisioningControllerNamespace(opts)
+	if err != nil {
+		return opts, err
 	}
 
 	opts.ProxyAddr = ""
