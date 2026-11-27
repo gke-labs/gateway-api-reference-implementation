@@ -24,7 +24,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -2428,5 +2430,361 @@ func TestRecovery_TornReplaceDeletedKeyStayDeleted(t *testing.T) {
 
 	t.Run("SlottedToMultiBlock", func(t *testing.T) {
 		testTornReplaceDeletedKeyStaysDeleted(t, "test_torn_replace_slotted_to_mb", slottedValue1, multiBlockValue)
+	})
+}
+
+type walBlockKey struct {
+	segment string
+	block   int64
+}
+
+type walSegmentBlocks struct {
+	name      string
+	startLSN  uint64
+	numBlocks int64
+}
+
+type walBlockCountingFS struct {
+	FS
+	mu     sync.Mutex
+	counts map[walBlockKey]int
+}
+
+func newWALBlockCountingFS(base FS) *walBlockCountingFS {
+	return &walBlockCountingFS{
+		FS:     base,
+		counts: make(map[walBlockKey]int),
+	}
+}
+
+func (c *walBlockCountingFS) recordRead(name string, off int64, n int) {
+	if n <= 0 || !strings.HasSuffix(name, ".wal") {
+		return
+	}
+	segment := filepath.Base(name)
+	firstBlock := off / WALBlockSize
+	lastBlock := (off + int64(n) - 1) / WALBlockSize
+	c.mu.Lock()
+	for block := firstBlock; block <= lastBlock; block++ {
+		c.counts[walBlockKey{segment: segment, block: block}]++
+	}
+	c.mu.Unlock()
+}
+
+func (c *walBlockCountingFS) Open(name string) (File, error) {
+	file, err := c.FS.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(name, ".wal") {
+		return &walBlockCountingFile{File: file, name: name, fs: c}, nil
+	}
+	return file, nil
+}
+
+func (c *walBlockCountingFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	file, err := c.FS.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(name, ".wal") {
+		return &walBlockCountingFile{File: file, name: name, fs: c}, nil
+	}
+	return file, nil
+}
+
+func (c *walBlockCountingFS) blockCount(segment string, block int64) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.counts[walBlockKey{segment: segment, block: block}]
+}
+
+type walBlockCountingFile struct {
+	File
+	name string
+	fs   *walBlockCountingFS
+}
+
+func (f *walBlockCountingFile) ReadAt(p []byte, off int64) (int, error) {
+	n, err := f.File.ReadAt(p, off)
+	f.fs.recordRead(f.name, off, n)
+	return n, err
+}
+
+func listWALSegmentBlocks(t *testing.T, fs FS, walDir string) []walSegmentBlocks {
+	t.Helper()
+	entries, err := fs.ReadDir(walDir)
+	if err != nil {
+		t.Fatalf("ReadDir %s failed: %v", walDir, err)
+	}
+	var segments []walSegmentBlocks
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".wal") {
+			continue
+		}
+		lsn, err := strconv.ParseUint(strings.TrimSuffix(entry.Name(), ".wal"), 10, 64)
+		if err != nil {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			t.Fatalf("Info %s failed: %v", entry.Name(), err)
+		}
+		segments = append(segments, walSegmentBlocks{
+			name:      entry.Name(),
+			startLSN:  lsn,
+			numBlocks: (info.Size() + WALBlockSize - 1) / WALBlockSize,
+		})
+	}
+	sort.Slice(segments, func(i, j int) bool {
+		return segments[i].startLSN < segments[j].startLSN
+	})
+	return segments
+}
+
+// TestRecovery_OpenReadsWALOnce counts WAL block reads performed by Open through the
+// filesystem it is opened with:
+//   - After a clean close, Open reads no block before the redo start a second time.
+//   - After a crash with records to replay, Open reads no block before the redo start a second time.
+//   - After a crash across two segments with encryption on, Open reads no block before the redo start a second time.
+func TestRecovery_OpenReadsWALOnce(t *testing.T) {
+	putRange := func(t *testing.T, store *Engine, start, end int, pad byte) {
+		t.Helper()
+		suffix := strings.Repeat(string(pad), 900)
+		for i := start; i < end; i++ {
+			val := fmt.Sprintf("val-%03d-%s", i, suffix)
+			if err := store.Put("Table", fmt.Sprintf("k-%03d", i), []byte(val)); err != nil {
+				t.Fatalf("Put %d failed: %v", i, err)
+			}
+		}
+	}
+
+	verifyRange := func(t *testing.T, store *Engine, start, end int, pad byte) {
+		t.Helper()
+		suffix := strings.Repeat(string(pad), 900)
+		for i := start; i < end; i++ {
+			want := fmt.Sprintf("val-%03d-%s", i, suffix)
+			got, exists, err := store.Get("Table", fmt.Sprintf("k-%03d", i))
+			if err != nil || !exists || string(got) != want {
+				t.Fatalf("Get k-%03d failed: exists=%v len=%d err=%v", i, exists, len(got), err)
+			}
+		}
+	}
+
+	t.Run("CleanClose", func(t *testing.T) {
+		memFS := NewMemFS()
+		dir := "clean_close"
+		store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+
+		// Sync pads the WAL to a 4 KiB block boundary so the final record sits alone in the last block.
+		putRange(t, store, 0, 40, 'v')
+		if err := store.Sync(); err != nil {
+			t.Fatalf("Sync failed: %v", err)
+		}
+		blocksBeforeRedo := listWALSegmentBlocks(t, memFS, filepath.Join(dir, "wal"))[0].numBlocks
+		if blocksBeforeRedo < 5 {
+			t.Fatalf("expected at least 5 WAL blocks before redo start, got %d", blocksBeforeRedo)
+		}
+		if err := store.Put("Table", "final", []byte("done")); err != nil {
+			t.Fatalf("Put final failed: %v", err)
+		}
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint failed: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		segments := listWALSegmentBlocks(t, memFS, filepath.Join(dir, "wal"))
+		if len(segments) != 1 || segments[0].numBlocks <= blocksBeforeRedo {
+			t.Fatalf("unexpected WAL segments after close: %+v (blocksBeforeRedo=%d)", segments, blocksBeforeRedo)
+		}
+
+		countingFS := newWALBlockCountingFS(memFS)
+		reopened, err := Open(WithFS(countingFS), WithDir(dir), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("reopen failed: %v", err)
+		}
+		defer func() {
+			if err := reopened.Close(); err != nil {
+				t.Fatalf("reopened.Close failed: %v", err)
+			}
+		}()
+
+		for block := int64(0); block < blocksBeforeRedo; block++ {
+			if got := countingFS.blockCount(segments[0].name, block); got != 1 {
+				t.Fatalf("clean close: block %d before redo start read %d times, want 1", block, got)
+			}
+		}
+		for block := blocksBeforeRedo; block < segments[0].numBlocks; block++ {
+			if got := countingFS.blockCount(segments[0].name, block); got < 1 || got > 2 {
+				t.Fatalf("clean close: block %d at/after redo start read %d times, want 1 or 2", block, got)
+			}
+		}
+
+		verifyRange(t, reopened, 0, 40, 'v')
+		got, exists, err := reopened.Get("Table", "final")
+		if err != nil || !exists || string(got) != "done" {
+			t.Fatalf("Get final failed: exists=%v val=%q err=%v", exists, string(got), err)
+		}
+	})
+
+	t.Run("CrashWithReplay", func(t *testing.T) {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := "crash_replay"
+		store, err := Open(WithFS(faultFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+
+		// Checkpoint 1 flushes batch 1 and pads WAL to a block boundary before batch 2 starts.
+		putRange(t, store, 0, 25, 'x')
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 1 failed: %v", err)
+		}
+		blocksBeforeRedo := listWALSegmentBlocks(t, memFS, filepath.Join(dir, "wal"))[0].numBlocks
+		if blocksBeforeRedo < 5 {
+			t.Fatalf("expected at least 5 WAL blocks before redo start, got %d", blocksBeforeRedo)
+		}
+
+		// Checkpoint 2 records recoveryStartLSN at the start of batch 2 (block blocksBeforeRedo).
+		putRange(t, store, 25, 40, 'x')
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 2 failed: %v", err)
+		}
+
+		// Batch 3 is synced in WAL only and dropped from the heap on crash.
+		putRange(t, store, 40, 60, 'x')
+		if err := store.Sync(); err != nil {
+			t.Fatalf("Sync failed: %v", err)
+		}
+		if err := faultFS.Crash(true, 0); err != nil {
+			t.Fatalf("Crash failed: %v", err)
+		}
+
+		segments := listWALSegmentBlocks(t, memFS, filepath.Join(dir, "wal"))
+		if len(segments) != 1 {
+			t.Fatalf("expected 1 WAL segment, got %d", len(segments))
+		}
+
+		countingFS := newWALBlockCountingFS(NewFaultFS(memFS))
+		reopened, err := Open(WithFS(countingFS), WithDir(dir), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("reopen after crash failed: %v", err)
+		}
+		defer func() {
+			if err := reopened.Close(); err != nil {
+				t.Fatalf("reopened.Close failed: %v", err)
+			}
+		}()
+
+		for block := int64(0); block < blocksBeforeRedo; block++ {
+			if got := countingFS.blockCount(segments[0].name, block); got != 1 {
+				t.Fatalf("crash recovery: block %d before redo start %d read %d times, want 1", block, blocksBeforeRedo, got)
+			}
+		}
+		for block := blocksBeforeRedo; block < segments[0].numBlocks; block++ {
+			if got := countingFS.blockCount(segments[0].name, block); got < 1 || got > 2 {
+				t.Fatalf("crash recovery: block %d at/after redo start %d read %d times, want 1 or 2", block, blocksBeforeRedo, got)
+			}
+		}
+
+		verifyRange(t, reopened, 0, 60, 'x')
+	})
+
+	t.Run("CrashAcrossTwoSegmentsEncrypted", func(t *testing.T) {
+		encKey, err := NewEncryptionKey()
+		if err != nil {
+			t.Fatalf("NewEncryptionKey failed: %v", err)
+		}
+
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		dir := "crash_two_segments_enc"
+		const maxSegmentSize = 4 * WALBlockSize
+
+		store, err := Open(
+			WithFS(faultFS),
+			WithDir(dir),
+			WithCreate(),
+			WithCompressionCodec(CodecNone),
+			WithEncryptionKey(encKey),
+			WithWALMaxSegmentSize(maxSegmentSize),
+		)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+
+		// Batch 1 fills segment 1 and spills past block 0 of segment 2; Checkpoint 1 pads to a block boundary.
+		putRange(t, store, 0, 22, 'y')
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 1 failed: %v", err)
+		}
+		beforeRedoBySegment := make(map[string]int64)
+		for _, segment := range listWALSegmentBlocks(t, memFS, filepath.Join(dir, "wal")) {
+			beforeRedoBySegment[segment.name] = segment.numBlocks
+		}
+
+		// Batch 2 + Checkpoint 2 advances recoveryStartLSN to the start of batch 2 (midway into segment 2).
+		putRange(t, store, 22, 30, 'y')
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 2 failed: %v", err)
+		}
+
+		// Batch 3 rolls into the next segment and is synced in WAL only before crash.
+		putRange(t, store, 30, 50, 'y')
+		if err := store.Sync(); err != nil {
+			t.Fatalf("Sync failed: %v", err)
+		}
+		if err := faultFS.Crash(true, 0); err != nil {
+			t.Fatalf("Crash failed: %v", err)
+		}
+
+		segments := listWALSegmentBlocks(t, memFS, filepath.Join(dir, "wal"))
+		if len(segments) < 2 {
+			t.Fatalf("expected at least 2 WAL segments, got %+v", segments)
+		}
+
+		countingFS := newWALBlockCountingFS(NewFaultFS(memFS))
+		reopened, err := Open(
+			WithFS(countingFS),
+			WithDir(dir),
+			WithCompressionCodec(CodecNone),
+			WithEncryptionKey(encKey),
+			WithWALMaxSegmentSize(maxSegmentSize),
+		)
+		if err != nil {
+			t.Fatalf("reopen after encrypted two-segment crash failed: %v", err)
+		}
+		defer func() {
+			if err := reopened.Close(); err != nil {
+				t.Fatalf("reopened.Close failed: %v", err)
+			}
+		}()
+
+		checkedBeforeRedo := 0
+		for _, segment := range segments {
+			beforeLimit := beforeRedoBySegment[segment.name]
+			for block := int64(0); block < segment.numBlocks; block++ {
+				got := countingFS.blockCount(segment.name, block)
+				if block < beforeLimit {
+					checkedBeforeRedo++
+					if got != 1 {
+						t.Fatalf("encrypted crash: segment %s block %d before redo start read %d times, want 1", segment.name, block, got)
+					}
+				} else if got < 1 || got > 2 {
+					t.Fatalf("encrypted crash: segment %s block %d read %d times, want 1 or 2", segment.name, block, got)
+				}
+			}
+		}
+		if checkedBeforeRedo == 0 {
+			t.Fatalf("expected at least one WAL block before redo start across %+v", segments)
+		}
+
+		verifyRange(t, reopened, 0, 50, 'y')
 	})
 }

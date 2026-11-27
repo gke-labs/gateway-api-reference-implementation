@@ -898,9 +898,11 @@ func (w *WAL) Close() error {
 }
 
 // NewIterator creates an iterator to read records forward in sequence starting from startLSN.
-func (w *WAL) NewIterator(startLSN uint64) (LogIterator, error) {
+// When startPosition is non-nil, iteration begins directly at that validated record position.
+func (w *WAL) NewIterator(startLSN uint64, startPosition *LogPosition) (LogIterator, error) {
 	return NewWALIterator(w.fs, w.dir, w.dbID, startLSN, WALIteratorOptions{
 		EncryptionKey: w.encryptionKey,
+		StartPosition: startPosition,
 	})
 }
 
@@ -911,6 +913,10 @@ type WALIteratorOptions struct {
 	// EncryptionKey is the 32-byte master key for decrypting WAL segment blocks.
 	// An empty key means the WAL is not encrypted.
 	EncryptionKey EncryptionKey
+	// StartPosition, when non-nil, positions the iterator directly at a record
+	// boundary validated by an earlier scan, skipping earlier blocks and the
+	// starting segment header.
+	StartPosition *LogPosition
 }
 
 // WALIterator replays records across segment files starting from a given LSN.
@@ -965,6 +971,8 @@ type WALIterator struct {
 	rawBlock         []byte // Raw 4 KiB block read from disk before decryption
 	cachedBlockIndex int64  // Block index within current segment currently held in cachedBlock; -1 when empty
 	cachedBlockLen   int    // Valid bytes in cachedBlock (less than WALBlockSize only on torn tail)
+	// lastRecordPosition holds the segment start LSN and byte offset of the record most recently returned by Next.
+	lastRecordPosition LogPosition
 }
 
 var _ LogIterator = (*WALIterator)(nil)
@@ -1002,17 +1010,24 @@ func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, options W
 		return segments[i].startLSN < segments[j].startLSN
 	})
 
-	// Find the segment that could contain startLSN
+	// Find the segment that could contain startLSN (or the exact segment for StartPosition).
+	targetLSN := startLSN
+	if options.StartPosition != nil {
+		targetLSN = options.StartPosition.SegmentStartLSN
+	}
 	startIdx := 0
-	for i, seg := range segments {
-		if seg.startLSN <= startLSN {
-			startIdx = i
+	for index, segment := range segments {
+		if segment.startLSN <= targetLSN {
+			startIdx = index
 		} else {
 			break
 		}
 	}
+	if options.StartPosition != nil && (len(segments) == 0 || segments[startIdx].startLSN != options.StartPosition.SegmentStartLSN) {
+		return nil, fmt.Errorf("%w: redo start segment %d not found", ErrCorruptWAL, options.StartPosition.SegmentStartLSN)
+	}
 
-	it := &WALIterator{
+	iterator := &WALIterator{
 		fs:               fs,
 		segments:         segments,
 		dbID:             dbID,
@@ -1027,11 +1042,29 @@ func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, options W
 	}
 
 	// Advance to first valid segment
-	if err := it.nextSegment(); err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
+	var openErr error
+	if options.StartPosition != nil {
+		openErr = iterator.openSegmentAt(startIdx, options.StartPosition.Offset)
+	} else {
+		openErr = iterator.nextSegment()
+	}
+	if openErr != nil && !errors.Is(openErr, io.EOF) {
+		return nil, openErr
 	}
 
-	return it, nil
+	return iterator, nil
+}
+
+// openSegmentAt opens the segment at segmentIndex and positions the iterator at startOffset
+// without re-reading the segment header, which an earlier scan already validated.
+func (iterator *WALIterator) openSegmentAt(segmentIndex int, startOffset int64) error {
+	iterator.currSegIdx = segmentIndex
+	segment := iterator.segments[segmentIndex]
+	file, err := iterator.fs.Open(segment.path)
+	if err != nil {
+		return err
+	}
+	return iterator.attachSegment(file, segment, startOffset)
 }
 
 func (it *WALIterator) nextSegment() error {
@@ -1049,19 +1082,18 @@ func (it *WALIterator) nextSegment() error {
 		return io.EOF
 	}
 
-	seg := it.segments[it.currSegIdx]
-	file, err := it.fs.Open(seg.path)
+	segment := it.segments[it.currSegIdx]
+	file, err := it.fs.Open(segment.path)
 	if err != nil {
 		return err
 	}
 
-	// Read and verify segment header: Magic(4) + Version(4) + Reserved(8) + DBID(16)
-	header := make([]byte, SegmentHeaderSize)
-	n, readErr := file.ReadAt(header, 0)
+	// Read block 0 and verify segment header: Magic(4) + Version(4) + Reserved(8) + DBID(16)
+	n, readErr := file.ReadAt(it.rawBlock, 0)
 	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
 		closeErr := file.Close()
 		it.done = true
-		return errors.Join(fmt.Errorf("read error reading segment header in %s: %w", seg.name, readErr), closeErr)
+		return errors.Join(fmt.Errorf("read error reading segment header in %s: %w", segment.name, readErr), closeErr)
 	}
 
 	if n < SegmentHeaderSize {
@@ -1069,7 +1101,7 @@ func (it *WALIterator) nextSegment() error {
 		it.done = true
 		if !it.isLastSegment() {
 			// Not the last segment, so this is corruption; see WALIterator.
-			return errors.Join(fmt.Errorf("%w: corrupt segment header in %s", ErrCorruptWAL, seg.name), closeErr)
+			return errors.Join(fmt.Errorf("%w: corrupt segment header in %s", ErrCorruptWAL, segment.name), closeErr)
 		}
 		// A crash right after rotation can leave an empty or headerless last segment; see WALIterator.
 		if closeErr != nil {
@@ -1078,14 +1110,14 @@ func (it *WALIterator) nextSegment() error {
 		return io.EOF
 	}
 
-	magic := binary.BigEndian.Uint32(header[0:4])
-	ver := binary.BigEndian.Uint32(header[4:8])
-	if magic != WALMagic || ver != WALVersion || !bytes.Equal(header[16:32], it.dbID[:]) {
+	magic := binary.BigEndian.Uint32(it.rawBlock[0:4])
+	version := binary.BigEndian.Uint32(it.rawBlock[4:8])
+	if magic != WALMagic || version != WALVersion || !bytes.Equal(it.rawBlock[16:32], it.dbID[:]) {
 		closeErr := file.Close()
 		it.done = true
 		if !it.isLastSegment() {
 			// Not the last segment, so this is corruption; see WALIterator.
-			return errors.Join(fmt.Errorf("%w: foreign or invalid segment header in %s", ErrCorruptWAL, seg.name), closeErr)
+			return errors.Join(fmt.Errorf("%w: foreign or invalid segment header in %s", ErrCorruptWAL, segment.name), closeErr)
 		}
 		// An invalid header in the last segment ends the log; see WALIterator.
 		if closeErr != nil {
@@ -1094,26 +1126,35 @@ func (it *WALIterator) nextSegment() error {
 		return io.EOF
 	}
 
+	if err := it.attachSegment(file, segment, int64(SegmentHeaderSize)); err != nil {
+		return err
+	}
+	it.cacheLoadedBlock(0, n)
+	return nil
+}
+
+// attachSegment initializes segment size, cipher, cache state, and offset for an opened segment file.
+func (iterator *WALIterator) attachSegment(file File, segment segmentMeta, startOffset int64) error {
 	size, sizeErr := file.Size()
 	if sizeErr != nil {
 		closeErr := file.Close()
-		it.done = true
-		return errors.Join(fmt.Errorf("read error getting segment size in %s: %w", seg.name, sizeErr), closeErr)
+		iterator.done = true
+		return errors.Join(fmt.Errorf("read error getting segment size in %s: %w", segment.name, sizeErr), closeErr)
 	}
 
-	segmentCipher, err := newWALSegmentCipher(it.encryptionKey, it.dbID, seg.startLSN)
+	segmentCipher, err := newWALSegmentCipher(iterator.encryptionKey, iterator.dbID, segment.startLSN)
 	if err != nil {
 		closeErr := file.Close()
-		it.done = true
-		return errors.Join(fmt.Errorf("failed to create WAL cipher for segment %s: %w", seg.name, err), closeErr)
+		iterator.done = true
+		return errors.Join(fmt.Errorf("failed to create WAL cipher for segment %s: %w", segment.name, err), closeErr)
 	}
 
-	it.currFile = file
-	it.currCipher = segmentCipher
-	it.cachedBlockIndex = -1
-	it.cachedBlockLen = 0
-	it.currOffset = int64(SegmentHeaderSize)
-	it.currSegSize = size
+	iterator.currFile = file
+	iterator.currCipher = segmentCipher
+	iterator.cachedBlockIndex = -1
+	iterator.cachedBlockLen = 0
+	iterator.currOffset = startOffset
+	iterator.currSegSize = size
 	return nil
 }
 
@@ -1129,26 +1170,31 @@ func (it *WALIterator) loadBlock(blockIndex int64) error {
 		it.cachedBlockLen = 0
 		return io.EOF
 	}
+	it.cacheLoadedBlock(blockIndex, n)
+	return nil
+}
 
+// cacheLoadedBlock zero-pads any trailing bytes in rawBlock, decrypts blockIndex into cachedBlock
+// (preserving the plaintext header in block 0), and marks that block cached.
+func (iterator *WALIterator) cacheLoadedBlock(blockIndex int64, n int) {
 	for i := n; i < WALBlockSize; i++ {
-		it.rawBlock[i] = 0
+		iterator.rawBlock[i] = 0
 	}
 
-	if it.currCipher != nil {
-		it.currCipher.Decrypt(it.cachedBlock, it.rawBlock, uint64(blockIndex))
+	if iterator.currCipher != nil {
+		iterator.currCipher.Decrypt(iterator.cachedBlock, iterator.rawBlock, uint64(blockIndex))
 		if blockIndex == 0 {
 			// SegmentHeaderSize (32 bytes) is a multiple of the 16-byte AES block size,
 			// so the plaintext header on disk decrypts into scrambled bytes that we overwrite
 			// with the plaintext header while the remaining 16-byte blocks decrypt properly.
-			copy(it.cachedBlock[:SegmentHeaderSize], it.rawBlock[:SegmentHeaderSize])
+			copy(iterator.cachedBlock[:SegmentHeaderSize], iterator.rawBlock[:SegmentHeaderSize])
 		}
 	} else {
-		copy(it.cachedBlock[:n], it.rawBlock[:n])
+		copy(iterator.cachedBlock[:n], iterator.rawBlock[:n])
 	}
 
-	it.cachedBlockIndex = blockIndex
-	it.cachedBlockLen = n
-	return nil
+	iterator.cachedBlockIndex = blockIndex
+	iterator.cachedBlockLen = n
 }
 
 // readAt reads len(p) decrypted bytes starting at logical offset off within the current segment.
@@ -1260,13 +1306,14 @@ func (it *WALIterator) Next() (Record, error) {
 		}
 
 		recordBytes := make([]byte, totalRecordLen)
-		n, err = it.readAt(recordBytes, it.currOffset)
+		copy(recordBytes, recordHeader)
+		n, err = it.readAt(recordBytes[RecordHeaderSize:], it.currOffset+int64(RecordHeaderSize))
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			it.done = true
 			return Record{}, fmt.Errorf("read error reading record body at offset %d: %w", it.currOffset, err)
 		}
 
-		if n < totalRecordLen {
+		if n < totalRecordLen-RecordHeaderSize {
 			it.done = true
 			if !it.isLastSegment() {
 				// Not the last segment, so this is corruption; see WALIterator.
@@ -1301,6 +1348,10 @@ func (it *WALIterator) Next() (Record, error) {
 			return Record{}, io.EOF
 		}
 
+		it.lastRecordPosition = LogPosition{
+			SegmentStartLSN: it.segments[it.currSegIdx].startLSN,
+			Offset:          it.currOffset,
+		}
 		it.expectedLSN = rec.LSN + 1
 		it.currOffset += int64(totalRecordLen)
 		return rec, nil

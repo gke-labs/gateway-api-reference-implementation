@@ -16,6 +16,14 @@ package engine
 
 import "io"
 
+// LogPosition identifies the start of a log record within a segment.
+type LogPosition struct {
+	// SegmentStartLSN is the starting LSN of the segment containing the record.
+	SegmentStartLSN uint64
+	// Offset is the byte offset of the record within the segment.
+	Offset int64
+}
+
 // Log abstracts the append-only write-ahead log relied upon by the engine.
 // Implementations preserve monotonically increasing LSN ordering.
 type Log interface {
@@ -57,11 +65,13 @@ type Log interface {
 	BytesWritten() int64
 
 	// NewIterator creates an iterator to read records forward in sequence starting
-	// from startLSN. The iterator yields records in increasing LSN order beginning
+	// from startLSN. When startPosition is non-nil, the iterator begins directly at
+	// that previously validated record boundary instead of scanning from the start
+	// of the segment. The iterator yields records in increasing LSN order beginning
 	// at or after startLSN. Unacknowledged torn writes in the active log tail are
 	// treated as end-of-log (io.EOF), whereas corruption or unexpected gaps in earlier
 	// completed segments return ErrCorruptWAL.
-	NewIterator(startLSN uint64) (LogIterator, error)
+	NewIterator(startLSN uint64, startPosition *LogPosition) (LogIterator, error)
 
 	// TruncateBefore drops completed log records or segments prior to oldestNeededLSN.
 	// Records with LSN < oldestNeededLSN covered by a completed checkpoint may be
