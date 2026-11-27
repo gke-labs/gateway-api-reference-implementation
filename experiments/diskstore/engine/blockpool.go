@@ -692,35 +692,45 @@ func (bp *BlockPool) flushPageUnlocked(desc *PageDesc) error {
 	return bp.flushBlockRunUnlocked([]*PageDesc{desc})
 }
 
-// flushBatchUnlocked flushes a batch of pages to disk in contiguous block runs with a single direct write per block run,
-// releasing bp.mu during direct I/O and WAL sync.
-// Must be called with bp.mu held; returns with bp.mu held.
-func (bp *BlockPool) flushBatchUnlocked(batch []*PageDesc) error {
-	var valid []*PageDesc
-	for _, desc := range batch {
-		if desc.Dirty && !desc.InFlight && len(desc.PoolBlocks) > 0 {
-			valid = append(valid, desc)
-		}
-	}
-	if len(valid) == 0 {
-		return nil
-	}
+// canFlushBatchPageLocked reports whether desc still qualifies for a batch flush
+// without modifying desc. The caller must hold bp.mu.
+func (bp *BlockPool) canFlushBatchPageLocked(desc *PageDesc) bool {
+	return desc != nil &&
+		bp.pageTable[desc.LogicalPage] == desc &&
+		desc.Dirty &&
+		!desc.InFlight &&
+		len(desc.PoolBlocks) > 0 &&
+		desc.PinCount.Load() == 0
+}
 
-	// Chunk the batch so each block run is at most MaxBatchBlocks (512 blocks = 1 << MaxOrder)
-	for len(valid) > 0 {
+// flushBatchUnlocked flushes unpinned dirty pages in contiguous block runs of at
+// most MaxBatchBlocks blocks. Each flushBlockRunUnlocked call releases bp.mu during
+// direct I/O and WAL sync, so flushBatchUnlocked re-checks each waiting page under
+// bp.mu before building the next chunk and drops pages that no longer qualify.
+// The caller must hold bp.mu, and flushBatchUnlocked returns with bp.mu held.
+func (bp *BlockPool) flushBatchUnlocked(batch []*PageDesc) error {
+	remaining := batch
+	for len(remaining) > 0 {
+		var chunk []*PageDesc
 		chunkTotalBlocks := 0
-		chunkEnd := 0
-		for chunkEnd < len(valid) {
-			nextBlocks := valid[chunkEnd].NumBlocks
-			if chunkEnd > 0 && chunkTotalBlocks+nextBlocks > MaxBatchBlocks {
+		consumed := 0
+		for consumed < len(remaining) {
+			desc := remaining[consumed]
+			if !bp.canFlushBatchPageLocked(desc) {
+				consumed++
+				continue
+			}
+			if len(chunk) > 0 && chunkTotalBlocks+desc.NumBlocks > MaxBatchBlocks {
 				break
 			}
-			chunkTotalBlocks += nextBlocks
-			chunkEnd++
+			chunk = append(chunk, desc)
+			chunkTotalBlocks += desc.NumBlocks
+			consumed++
 		}
-
-		chunk := valid[:chunkEnd]
-		valid = valid[chunkEnd:]
+		remaining = remaining[consumed:]
+		if len(chunk) == 0 {
+			break
+		}
 
 		if err := bp.flushBlockRunUnlocked(chunk); err != nil {
 			return err
