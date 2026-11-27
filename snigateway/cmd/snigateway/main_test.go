@@ -26,9 +26,6 @@ func TestFlagsGolden(t *testing.T) {
 		Usage    string
 	}
 	golden := []flagInfo{
-		{Name: "acme-challenge-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify the upstream certificate server."},
-		{Name: "acme-challenge-token-path", DefValue: "", Usage: "Path to the projected service-account token file for data-plane identity."},
-		{Name: "acme-challenge-upstream-url", DefValue: "", Usage: "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to."},
 		{Name: "ca-cert", DefValue: "", Usage: "Path to the CA certificate PEM file used to verify snigateway-frontend."},
 		{Name: "client-cert", DefValue: "", Usage: "Path to the client certificate PEM file for mTLS authentication."},
 		{Name: "client-key", DefValue: "", Usage: "Path to the client private key PEM file for mTLS authentication."},
