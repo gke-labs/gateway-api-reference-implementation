@@ -38,7 +38,6 @@ import (
 
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
-	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/audit"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
@@ -116,7 +115,6 @@ type selfCheckHarness struct {
 	pebble           *testserver.Server
 	testServer       *httptest.Server
 	testServerIP     string
-	challengeSrv     *httptest.Server
 	mu               sync.RWMutex
 	servedChallenges map[string]string
 }
@@ -127,9 +125,7 @@ type selfCheckHarnessConfig struct {
 	clock               *testClock
 	bindingStore        registry.BindingStore
 	pebbleTransportWrap func(http.RoundTripper) http.RoundTripper
-	challengeServerWrap func(http.Handler) http.Handler
 	managerOptions      func(*manager.Options)
-	withChallengeServer bool
 	twoClusters         bool
 	seededCertificates  []*cache.Certificate
 	lookupIP            func(ctx context.Context, host string) ([]net.IP, error)
@@ -245,22 +241,6 @@ func setupSelfCheckTest(t *testing.T, cfg selfCheckHarnessConfig) *selfCheckHarn
 		auditLogger:      auditLogger,
 		challengeStore:   challengeStore,
 		servedChallenges: make(map[string]string),
-	}
-
-	if cfg.withChallengeServer {
-		var challengeHandler http.Handler = challenge.NewHandler(challengeStore,
-			challenge.WithRegistry(reg),
-			challenge.WithBindingStore(bindingStore),
-			challenge.WithAuditLogger(auditLogger),
-		)
-		if cfg.challengeServerWrap != nil {
-			challengeHandler = cfg.challengeServerWrap(challengeHandler)
-		}
-		harness.challengeSrv = httptest.NewServer(audit.WrapHTTP(auditLogger, challengeHandler))
-		t.Cleanup(func() {
-			harness.challengeSrv.CloseClientConnections()
-			harness.challengeSrv.Close()
-		})
 	}
 
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -653,97 +633,6 @@ func testPebbleRenewalUnprovedCandidate(t *testing.T, bFirst bool) {
 	}
 }
 
-// TestChallengeEndpoint_DoesNotValidateGatewayBinding verifies that:
-// Gateway A holds a certificate, and HTTP for the hostname reaches only A.
-// Gateway B calls GetCertificate and receives its pending challenge.
-// A request with B's data-plane identity and that token goes to the challenge endpoint.
-// B's next GetCertificate returns no certificate.
-func TestChallengeEndpoint_DoesNotValidateGatewayBinding(t *testing.T) {
-	const host = "endpoint-protect.example.com"
-	h := setupSelfCheckTest(t, selfCheckHarnessConfig{
-		allowedHostnames:    []string{host},
-		withChallengeServer: true,
-		managerOptions: func(o *manager.Options) {
-			o.SelfCheckTimeout = 1 * time.Second
-			o.SelfCheckInterval = 50 * time.Millisecond
-		},
-	})
-
-	reqA := &certserverv1.GetCertificateRequest{
-		Hostnames:               []string{host},
-		Gateway:                 "namespace-a/gw-a",
-		DataPlaneServiceAccount: "namespace-a/dp-sa-a",
-		ClusterId:               h.clusterID,
-		Addresses:               []string{h.testServerIP},
-	}
-
-	// 1. Gateway A initial issuance
-	h.obtainCertificate(t, reqA)
-	if !h.bindingStore.HasValidatedBinding(h.clusterID, "namespace-a/gw-a", host, time.Now()) {
-		t.Fatalf("expected Gateway A to have validated binding after initial issuance")
-	}
-
-	// 2. Gateway B in another namespace calls GetCertificate and receives its pending challenge
-	reqB := &certserverv1.GetCertificateRequest{
-		Hostnames:               []string{host},
-		Gateway:                 "namespace-b/gw-b",
-		DataPlaneServiceAccount: "namespace-b/dp-sa-b",
-		ClusterId:               h.clusterID,
-		Addresses:               []string{h.testServerIP},
-	}
-	var challengeTokenB string
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		respB, err := h.client.GetCertificate(h.callCtx, reqB)
-		if err != nil {
-			t.Fatalf("Gateway B GetCertificate failed: %v", err)
-		}
-		if len(respB.CertificateChain) > 0 {
-			t.Fatalf("security violation: Gateway B received certificate chain without validation")
-		}
-		if len(respB.Challenges) > 0 {
-			challengeTokenB = respB.Challenges[0].Token
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if challengeTokenB == "" {
-		t.Fatalf("expected Gateway B to receive a pending challenge")
-	}
-
-	// 3. A request with B's data-plane identity and that token goes to the challenge endpoint
-	dpTokenB := signControllerToken(t, h.issuerURL, "system:serviceaccount:namespace-b:dp-sa-b", h.clusterKey, h.kid)
-	fwdReq, err := http.NewRequestWithContext(h.ctx, http.MethodGet, h.challengeSrv.URL+"/.well-known/acme-challenge/"+challengeTokenB, nil)
-	if err != nil {
-		t.Fatalf("failed to create forwarder request: %v", err)
-	}
-	fwdReq.Host = host
-	fwdReq.Header.Set("Authorization", "Bearer "+dpTokenB)
-
-	resp, err := http.DefaultClient.Do(fwdReq)
-	if err != nil {
-		t.Fatalf("challenge endpoint request failed: %v", err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK from challenge endpoint, got %d", resp.StatusCode)
-	}
-
-	// 4. Assert that B has no validated binding
-	if h.bindingStore.HasValidatedBinding(h.clusterID, "namespace-b/gw-b", host, time.Now()) {
-		t.Fatalf("security violation: challenge endpoint must not record a validated binding for Gateway B")
-	}
-
-	// 5. B's next GetCertificate returns no certificate
-	respBNext, err := h.client.GetCertificate(h.callCtx, reqB)
-	if err != nil {
-		t.Fatalf("Gateway B next GetCertificate failed: %v", err)
-	}
-	if len(respBNext.CertificateChain) > 0 {
-		t.Fatalf("security violation: Gateway B next GetCertificate returned cached certificate after challenge endpoint call!")
-	}
-}
-
 // TestPebble_RenewalDoesNotRefreshCandidateValidatedBinding verifies that:
 // Gateway B holds a validated binding that is still valid when renewal runs for Gateway A,
 // so B is a candidate on renewal. After Gateway A serves and the renewal succeeds,
@@ -852,26 +741,17 @@ func TestPebble_RenewalDoesNotRefreshCandidateValidatedBinding(t *testing.T) {
 	}
 }
 
-// TestPebble_RenewalWithValidatedBinding_ReturnsChallenges_CompletesWithoutForwardingEndpoint verifies that:
+// TestPebble_RenewalWithValidatedBinding_ReturnsChallenges verifies that:
 // A renewal for a Gateway with a validated binding receives pending challenges alongside the cached
-// certificate on GetCertificate, serves them directly on its data plane, and completes renewal
-// with the old forwarding endpoint unused.
-func TestPebble_RenewalWithValidatedBinding_ReturnsChallenges_CompletesWithoutForwardingEndpoint(t *testing.T) {
+// certificate on GetCertificate, serves them directly on its data plane, and completes renewal.
+func TestPebble_RenewalWithValidatedBinding_ReturnsChallenges(t *testing.T) {
 	const host = "renew-direct-serve.example.com"
 	clock := &testClock{now: time.Now()}
 
-	var forwardingCalls atomic.Int32
 	h := setupSelfCheckTest(t, selfCheckHarnessConfig{
-		allowedHostnames:    []string{host},
-		validityPeriod:      60,
-		clock:               clock,
-		withChallengeServer: true,
-		challengeServerWrap: func(base http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				forwardingCalls.Add(1)
-				base.ServeHTTP(w, r)
-			})
-		},
+		allowedHostnames: []string{host},
+		validityPeriod:   60,
+		clock:            clock,
 		managerOptions: func(o *manager.Options) {
 			o.RenewalCheckInterval = 50 * time.Millisecond
 			o.RenewalJitterPercent = 0
@@ -900,9 +780,6 @@ func TestPebble_RenewalWithValidatedBinding_ReturnsChallenges_CompletesWithoutFo
 		t.Fatalf("failed to get cached cert: %v", err)
 	}
 	clock.Set(cachedCert.IssuedAt.Add(45 * time.Second))
-
-	// Reset forwardingCalls counter to ensure we track calls during renewal
-	forwardingCalls.Store(0)
 
 	// In the background, Gateway A polls GetCertificate. It should receive pending challenges
 	// alongside the cached certificate, and serve them on its simulated data plane (testServer).
@@ -950,10 +827,5 @@ func TestPebble_RenewalWithValidatedBinding_ReturnsChallenges_CompletesWithoutFo
 
 	if !receivedRenewalChallenges.Load() {
 		t.Fatalf("expected Gateway A to receive renewal challenges alongside cached certificate")
-	}
-
-	// Confirm that the old forwarding endpoint remained unused during renewal
-	if calls := forwardingCalls.Load(); calls != 0 {
-		t.Fatalf("expected old forwarding endpoint to be unused during renewal, got %d calls", calls)
 	}
 }

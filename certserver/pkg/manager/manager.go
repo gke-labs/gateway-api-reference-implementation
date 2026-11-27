@@ -42,7 +42,29 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
+
+// DefaultValidatedBindingTTL is the default validity duration for recorded Gateway bindings.
+const DefaultValidatedBindingTTL = 24 * time.Hour
+
+// RecordValidatedBinding records a validated binding in the binding store for the requester with the specified TTL.
+//
+// Invariant: a Gateway holds a validated binding for a set of hostnames only after that Gateway
+// itself proved that it serves them. Callers must only pass requesters whose domain
+// control has been verified.
+func RecordValidatedBinding(bindingStore registry.BindingStore, requester challenge.Requester, now time.Time, ttl time.Duration) {
+	if bindingStore == nil || requester.ClusterID == "" || requester.HostnamesKey == "" {
+		return
+	}
+	bindingStore.RecordValidatedBinding(registry.ValidatedBinding{
+		ClusterID:    requester.ClusterID,
+		Gateway:      requester.Gateway,
+		HostnamesKey: requester.HostnamesKey,
+		ValidatedAt:  now,
+		ExpiresAt:    now.Add(ttl),
+	})
+}
 
 var (
 	// ErrTooManyPendingOrders is returned when the number of concurrent pending orders exceeds the configured cap.
@@ -422,9 +444,9 @@ func (m *Manager) revalidateControl(ctx context.Context, normalized []string, re
 
 	ttl := m.opts.ValidatedBindingTTL
 	if ttl <= 0 {
-		ttl = challenge.DefaultValidatedBindingTTL
+		ttl = DefaultValidatedBindingTTL
 	}
-	challenge.RecordValidatedBinding(m.opts.BindingStore, req, m.opts.Clock.Now(), ttl)
+	RecordValidatedBinding(m.opts.BindingStore, req, m.opts.Clock.Now(), ttl)
 
 	return nil
 }
@@ -753,9 +775,9 @@ func (m *Manager) fulfillAuthorization(ctx context.Context, authzURL string, req
 	if len(candidates) == 0 {
 		ttl := m.opts.ValidatedBindingTTL
 		if ttl <= 0 {
-			ttl = challenge.DefaultValidatedBindingTTL
+			ttl = DefaultValidatedBindingTTL
 		}
-		challenge.RecordValidatedBinding(m.opts.BindingStore, req, m.opts.Clock.Now(), ttl)
+		RecordValidatedBinding(m.opts.BindingStore, req, m.opts.Clock.Now(), ttl)
 	}
 
 	return nil

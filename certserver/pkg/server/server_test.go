@@ -25,7 +25,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
-	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -43,7 +42,6 @@ import (
 
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
-	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/audit"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
@@ -196,47 +194,11 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 	m := metrics.New(prometheus.NewRegistry())
 
 	challengeStore := challenge.NewMemoryStore()
-	challengeHandler := challenge.NewHandler(
-		challengeStore,
-		challenge.WithRegistry(reg),
-		challenge.WithBindingStore(bindingStore),
-		challenge.WithAuditLogger(auditLogger),
-		challenge.WithMetrics(m),
-	)
-	challengeSrv := httptest.NewServer(audit.WrapHTTP(auditLogger, challengeHandler))
-	defer challengeSrv.Close()
 
-	// Data plane forwarder forwards Pebble challenge validation requests to challengeSrv
-	// carrying the requesting Gateway's data-plane token.
-	dpToken := signControllerToken(t, issuerURL, "system:serviceaccount:default:dp-sa", clusterKey, kid)
-	dataPlaneForwarder := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fwdReq, err := http.NewRequestWithContext(r.Context(), r.Method, challengeSrv.URL+r.URL.RequestURI(), nil)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		fwdReq.Host = r.Host
-		fwdReq.Header.Set("Authorization", "Bearer "+dpToken)
-		resp, err := http.DefaultClient.Do(fwdReq)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer resp.Body.Close()
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-	})
-
-	// 3. Start Pebble ACME test server pointed at dataPlaneForwarder
+	// 3. Start Pebble ACME test server backed by challengeStore
 	pebble := testserver.StartPebble(t, testserver.ServerConfig{
-		ValidityPeriod:   86400,
-		ChallengeStore:   challengeStore,
-		ChallengeHandler: dataPlaneForwarder,
+		ValidityPeriod: 86400,
+		ChallengeStore: challengeStore,
 	})
 
 	// 4. Initialize Manager with Pebble ACME client and temp cache

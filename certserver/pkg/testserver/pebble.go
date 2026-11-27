@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -92,7 +93,21 @@ func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 	}
 	challengeHandler := cfg.ChallengeHandler
 	if challengeHandler == nil {
-		challengeHandler = challenge.NewHandler(challengeStore)
+		challengeHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token, ok := strings.CutPrefix(r.URL.Path, "/.well-known/acme-challenge/")
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			keyAuth, resolveErr := challengeStore.ResolveChallenge(r.Context(), "", r.Host, token)
+			if resolveErr != nil {
+				http.NotFound(w, r)
+				return
+			}
+			if _, writeErr := w.Write([]byte(keyAuth)); writeErr != nil {
+				log.Printf("testserver: write challenge response: %v", writeErr)
+			}
+		})
 	}
 	challengeSrv := httptest.NewServer(challengeHandler)
 

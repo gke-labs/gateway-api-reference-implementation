@@ -38,7 +38,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
-	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/audit"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
@@ -52,7 +51,6 @@ type Config struct {
 	EABKID                 string
 	EABHMACKeyFile         string
 	CacheDir               string
-	ChallengeListenAddr    string
 	MetricsListenAddr      string
 	GRPCListenAddr         string
 	TLSCertFile            string
@@ -79,7 +77,6 @@ func parseFlags(args []string) (*Config, error) {
 	fs.StringVar(&cfg.EABKID, "eab-kid", "", "External Account Binding Key Identifier (KID)")
 	fs.StringVar(&cfg.EABHMACKeyFile, "eab-hmac-key-file", "", "Path to file containing External Account Binding HMAC key")
 	fs.StringVar(&cfg.CacheDir, "cache-dir", "/var/cache/certserver", "Directory path for certificate and key disk cache")
-	fs.StringVar(&cfg.ChallengeListenAddr, "challenge-listen-addr", ":8080", "HTTP listen address for /.well-known/acme-challenge/")
 	fs.StringVar(&cfg.MetricsListenAddr, "metrics-listen-addr", ":9090", "HTTP listen address for Prometheus metrics")
 	fs.StringVar(&cfg.GRPCListenAddr, "grpc-listen-addr", ":8443", "gRPC listen address for GetCertificate API (TLS)")
 	fs.StringVar(&cfg.TLSCertFile, "tls-cert-file", "", "Path to TLS server certificate for gRPC endpoint")
@@ -92,7 +89,7 @@ func parseFlags(args []string) (*Config, error) {
 	fs.IntVar(&cfg.RateLimitBurst, "rate-limit-burst", 20, "Per-identity rate limit burst size")
 	fs.IntVar(&cfg.MaxHostnames, "max-hostnames", 100, "Maximum number of hostnames permitted per certificate set")
 	fs.Int64Var(&cfg.MaxPendingOrders, "max-pending-orders", 50, "Maximum number of concurrent pending ACME orders")
-	fs.DurationVar(&cfg.ValidatedBindingTTL, "validated-binding-ttl", challenge.DefaultValidatedBindingTTL, "Validity duration for recorded Gateway binding validations")
+	fs.DurationVar(&cfg.ValidatedBindingTTL, "validated-binding-ttl", manager.DefaultValidatedBindingTTL, "Validity duration for recorded Gateway binding validations")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -434,28 +431,8 @@ func run(ctx context.Context, cfg *Config) error {
 		}()
 	}
 
-	// Initialize Challenge Store and HTTP Handler
+	// Initialize Challenge Store
 	challengeStore := challenge.NewMemoryStore()
-	var chalOpts []challenge.HandlerOption
-	if clusterReg != nil {
-		chalOpts = append(chalOpts,
-			challenge.WithRegistry(clusterReg),
-			challenge.WithBindingStore(bindingStore),
-			challenge.WithAuditLogger(auditLogger),
-			challenge.WithMetrics(m),
-		)
-	}
-	challengeHandler := challenge.NewHandler(challengeStore, chalOpts...)
-
-	var challengeHTTPHandler http.Handler = challengeHandler
-	if auditLogger != nil {
-		challengeHTTPHandler = audit.WrapHTTP(auditLogger, challengeHandler)
-	}
-
-	challengeServer := &http.Server{
-		Addr:    cfg.ChallengeListenAddr,
-		Handler: challengeHTTPHandler,
-	}
 
 	// Initialize ACME Client
 	acmeCli, err := acmeclient.NewClient(ctx, acmeclient.Config{
@@ -514,14 +491,7 @@ func run(ctx context.Context, cfg *Config) error {
 		}
 	}
 
-	// Start HTTP servers in background
-	go func() {
-		logger.Printf("Serving ACME HTTP-01 challenges on %s", cfg.ChallengeListenAddr)
-		if err := challengeServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Printf("Challenge server error: %v", err)
-		}
-	}()
-
+	// Start HTTP metrics server in background
 	go func() {
 		logger.Printf("Serving Prometheus metrics on %s/metrics", cfg.MetricsListenAddr)
 		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -536,9 +506,6 @@ func run(ctx context.Context, cfg *Config) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := challengeServer.Shutdown(shutdownCtx); err != nil {
-		logger.Printf("Challenge server shutdown error: %v", err)
-	}
 	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 		logger.Printf("Metrics server shutdown error: %v", err)
 	}
