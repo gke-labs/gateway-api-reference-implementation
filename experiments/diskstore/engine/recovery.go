@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/crypto/xts"
@@ -67,22 +68,39 @@ type RecoveryResult struct {
 	RedoStartPosition *LogPosition
 }
 
+// candidateRecord holds the key index metadata extracted from one active record
+// during the Step 1 heap scan without retaining the record payload.
 type candidateRecord struct {
-	key              string
+	// key is the qualified table/key string stored in the record.
+	key string
+	// oversizeFileName is the backing .obj file name when isOversize is true.
 	oversizeFileName string
-	lsn              uint64
-	slot             uint32
-	isOversize       bool
+	// lsn is the WAL log sequence number recorded inside the record.
+	lsn uint64
+	// slot is the slotted-page slot index, or 0 for multi-block records.
+	slot uint32
+	// isOversize reports whether the record stores an oversize pointer instead of inline bytes.
+	isOversize bool
 }
 
+// candidatePageCopy tracks the highest-LSN valid on-disk copy of a logical page
+// found during the Step 1 heap scan together with the metadata Step 3 needs.
 type candidatePageCopy struct {
+	// logicalPage identifies the logical page recovered from the block headers.
 	logicalPage uint64
-	lsn         uint64
-	startBlock  uint64
-	records     []candidateRecord
-	decodeErr   error
-	numBlocks   int
-	empty       bool
+	// lsn is the highest page LSN observed in the block headers of this copy.
+	lsn uint64
+	// startBlock is the starting 4 KiB physical block index of this copy in heap.db.
+	startBlock uint64
+	// records holds the active records extracted from this copy during Step 1.
+	records []candidateRecord
+	// decodeErr stores any record-decoding error encountered while extracting this copy,
+	// deferred until Step 3 so a losing copy's error does not fail recovery.
+	decodeErr error
+	// numBlocks is the power-of-two block count of this copy (1 for slotted, 2..512 for multi-block).
+	numBlocks int
+	// empty reports whether this copy holds zero active records and belongs in EmptyLogicalPages.
+	empty bool
 }
 
 // extractSlottedPageRecords reads only the key index metadata from a 1-block slotted page
@@ -459,9 +477,10 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		}
 	}
 
-	// Step 3: Build the key index and empty-page list from winning candidates.
-	// Step 1 already extracted each candidate's key metadata during the heap scan,
-	// so Step 3 reads no heap blocks.
+	// Step 3: Build the key index and empty-page list from winning candidates in
+	// start-block order so EmptyLogicalPages, SupersededPages, and any decode error
+	// are deterministic across runs. Step 1 already extracted each candidate's key
+	// metadata during the heap scan, so Step 3 reads no heap blocks.
 	// Item 4: Always keep the copy with the highest LSN when a key appears multiple times.
 	// Older copies on other pages are tracked as superseded so that WAL redo can clear
 	// them even if the key's current page is already up to date.
@@ -469,7 +488,17 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	supersededPages := make(map[string][]KeyIndexEntry)
 	var emptyPages []uint64
 
-	for logicalPage, cand := range bestCandidates {
+	sortedCandidates := make([]candidatePageCopy, 0, len(bestCandidates))
+	for _, cand := range bestCandidates {
+		sortedCandidates = append(sortedCandidates, cand)
+	}
+	bestCandidates = nil
+	sort.Slice(sortedCandidates, func(i, j int) bool {
+		return sortedCandidates[i].startBlock < sortedCandidates[j].startBlock
+	})
+
+	for _, cand := range sortedCandidates {
+		logicalPage := cand.logicalPage
 		if cand.decodeErr != nil {
 			return nil, cand.decodeErr
 		}
@@ -501,7 +530,6 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 			}
 		}
 	}
-	bestCandidates = nil
 
 	// Step 4: Scan WAL to find maxWAL_LSN and verify the write-ahead rule.
 	// Recovery takes its start LSN from meta.db only; it does not read checkpoint records.

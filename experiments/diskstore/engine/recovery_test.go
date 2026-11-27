@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2433,9 +2434,9 @@ func TestRecovery_TornReplaceDeletedKeyStayDeleted(t *testing.T) {
 	})
 }
 
-type walBlockKey struct {
-	segment string
-	block   int64
+type fileBlockKey struct {
+	name  string
+	block int64
 }
 
 type walSegmentBlocks struct {
@@ -2444,68 +2445,85 @@ type walSegmentBlocks struct {
 	numBlocks int64
 }
 
-type walBlockCountingFS struct {
+type blockCountingFS struct {
 	FS
-	mu     sync.Mutex
-	counts map[walBlockKey]int
+	match     func(name string) bool
+	blockSize int64
+	mu        sync.Mutex
+	counts    map[fileBlockKey]int
 }
 
-func newWALBlockCountingFS(base FS) *walBlockCountingFS {
-	return &walBlockCountingFS{
-		FS:     base,
-		counts: make(map[walBlockKey]int),
+func newBlockCountingFS(base FS, blockSize int64, match func(name string) bool) *blockCountingFS {
+	return &blockCountingFS{
+		FS:        base,
+		match:     match,
+		blockSize: blockSize,
+		counts:    make(map[fileBlockKey]int),
 	}
 }
 
-func (c *walBlockCountingFS) recordRead(name string, off int64, n int) {
-	if n <= 0 || !strings.HasSuffix(name, ".wal") {
+func newWALBlockCountingFS(base FS) *blockCountingFS {
+	return newBlockCountingFS(base, WALBlockSize, func(name string) bool {
+		return strings.HasSuffix(name, ".wal")
+	})
+}
+
+func newHeapBlockCountingFS(base FS) *blockCountingFS {
+	return newBlockCountingFS(base, BlockSize, func(name string) bool {
+		return filepath.Base(name) == "heap.db"
+	})
+}
+
+func (c *blockCountingFS) recordRead(name string, off int64, n int) {
+	if n <= 0 || !c.match(name) {
 		return
 	}
-	segment := filepath.Base(name)
-	firstBlock := off / WALBlockSize
-	lastBlock := (off + int64(n) - 1) / WALBlockSize
+	baseName := filepath.Base(name)
+	firstBlock := off / c.blockSize
+	lastBlock := (off + int64(n) - 1) / c.blockSize
 	c.mu.Lock()
 	for block := firstBlock; block <= lastBlock; block++ {
-		c.counts[walBlockKey{segment: segment, block: block}]++
+		c.counts[fileBlockKey{name: baseName, block: block}]++
 	}
 	c.mu.Unlock()
 }
 
-func (c *walBlockCountingFS) Open(name string) (File, error) {
+func (c *blockCountingFS) wrapFile(name string, file File) File {
+	if c.match(name) {
+		return &blockCountingFile{File: file, name: name, fs: c}
+	}
+	return file
+}
+
+func (c *blockCountingFS) Open(name string) (File, error) {
 	file, err := c.FS.Open(name)
 	if err != nil {
 		return nil, err
 	}
-	if strings.HasSuffix(name, ".wal") {
-		return &walBlockCountingFile{File: file, name: name, fs: c}, nil
-	}
-	return file, nil
+	return c.wrapFile(name, file), nil
 }
 
-func (c *walBlockCountingFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+func (c *blockCountingFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 	file, err := c.FS.OpenFile(name, flag, perm)
 	if err != nil {
 		return nil, err
 	}
-	if strings.HasSuffix(name, ".wal") {
-		return &walBlockCountingFile{File: file, name: name, fs: c}, nil
-	}
-	return file, nil
+	return c.wrapFile(name, file), nil
 }
 
-func (c *walBlockCountingFS) blockCount(segment string, block int64) int {
+func (c *blockCountingFS) blockCount(name string, block int64) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.counts[walBlockKey{segment: segment, block: block}]
+	return c.counts[fileBlockKey{name: name, block: block}]
 }
 
-type walBlockCountingFile struct {
+type blockCountingFile struct {
 	File
 	name string
-	fs   *walBlockCountingFS
+	fs   *blockCountingFS
 }
 
-func (f *walBlockCountingFile) ReadAt(p []byte, off int64) (int, error) {
+func (f *blockCountingFile) ReadAt(p []byte, off int64) (int, error) {
 	n, err := f.File.ReadAt(p, off)
 	f.fs.recordRead(f.name, off, n)
 	return n, err
@@ -2789,72 +2807,6 @@ func TestRecovery_OpenReadsWALOnce(t *testing.T) {
 	})
 }
 
-type heapBlockCountingFS struct {
-	FS
-	mu     sync.Mutex
-	counts map[int64]int
-}
-
-func newHeapBlockCountingFS(base FS) *heapBlockCountingFS {
-	return &heapBlockCountingFS{
-		FS:     base,
-		counts: make(map[int64]int),
-	}
-}
-
-func (c *heapBlockCountingFS) recordRead(off int64, n int) {
-	if n <= 0 {
-		return
-	}
-	firstBlock := off / BlockSize
-	lastBlock := (off + int64(n) - 1) / BlockSize
-	c.mu.Lock()
-	for block := firstBlock; block <= lastBlock; block++ {
-		c.counts[block]++
-	}
-	c.mu.Unlock()
-}
-
-func (c *heapBlockCountingFS) wrapIfHeap(name string, file File) File {
-	if filepath.Base(name) == "heap.db" {
-		return &heapBlockCountingFile{File: file, fs: c}
-	}
-	return file
-}
-
-func (c *heapBlockCountingFS) Open(name string) (File, error) {
-	file, err := c.FS.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	return c.wrapIfHeap(name, file), nil
-}
-
-func (c *heapBlockCountingFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
-	file, err := c.FS.OpenFile(name, flag, perm)
-	if err != nil {
-		return nil, err
-	}
-	return c.wrapIfHeap(name, file), nil
-}
-
-func (c *heapBlockCountingFS) blockCount(block int64) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.counts[block]
-}
-
-type heapBlockCountingFile struct {
-	File
-	fs *heapBlockCountingFS
-}
-
-func (f *heapBlockCountingFile) ReadAt(p []byte, off int64) (int, error) {
-	n, err := f.File.ReadAt(p, off)
-	f.fs.recordRead(off, n)
-	return n, err
-}
-
 func heapFileBlockCount(t *testing.T, fs FS, heapPath string) int64 {
 	t.Helper()
 	file, err := fs.Open(heapPath)
@@ -2874,7 +2826,8 @@ func heapFileBlockCount(t *testing.T, fs FS, heapPath string) int64 {
 }
 
 // TestRecovery_OpenReadsHeapOnce counts heap block reads performed by Open through
-// the filesystem it is opened with and verifies Open reads every heap block once.
+// the filesystem it is opened with and verifies Open reads every heap block once
+// and recovers empty pages in a deterministic order across opens.
 func TestRecovery_OpenReadsHeapOnce(t *testing.T) {
 	runMixedWorkload := func(t *testing.T, encrypted bool) {
 		t.Helper()
@@ -2910,8 +2863,8 @@ func TestRecovery_OpenReadsHeapOnce(t *testing.T) {
 		}
 
 		expected := make(map[string][]byte)
-		// Slotted records across multiple pages, plus updates and deletes to leave empty and losing copies.
-		for i := 0; i < 40; i++ {
+		// Slotted records across multiple pages, plus updates and deletes to leave several empty and losing copies.
+		for i := 0; i < 80; i++ {
 			key := fmt.Sprintf("small-%03d", i)
 			val := bytes.Repeat([]byte{byte('a' + i%26)}, 400)
 			if err := store.Put("Table", key, val); err != nil {
@@ -2951,15 +2904,22 @@ func TestRecovery_OpenReadsHeapOnce(t *testing.T) {
 			t.Fatalf("Checkpoint 1 failed: %v", err)
 		}
 
-		// Overwrite and delete keys so the heap file holds losing page copies and empty pages.
-		for i := 0; i < 20; i++ {
+		// Overwrite and delete keys so the heap file holds losing page copies and multiple empty pages.
+		for i := 0; i < 60; i++ {
 			key := fmt.Sprintf("small-%03d", i)
 			if err := store.Delete("Table", key); err != nil {
 				t.Fatalf("Delete %s failed: %v", key, err)
 			}
 			delete(expected, key)
 		}
-		for i := 20; i < 30; i++ {
+		for i := 0; i < 2; i++ {
+			key := fmt.Sprintf("medium-%02d", i)
+			if err := store.Delete("Table", key); err != nil {
+				t.Fatalf("Delete %s failed: %v", key, err)
+			}
+			delete(expected, key)
+		}
+		for i := 60; i < 70; i++ {
 			key := fmt.Sprintf("small-%03d", i)
 			val := bytes.Repeat([]byte{byte('0' + i%10)}, 400)
 			if err := store.Put("Table", key, val); err != nil {
@@ -2985,34 +2945,46 @@ func TestRecovery_OpenReadsHeapOnce(t *testing.T) {
 			t.Fatalf("expected heap file > 128 blocks to exercise multi-chunk scan, got %d", totalBlocks)
 		}
 
-		countingFS := newHeapBlockCountingFS(memFS)
-		reopened, err := Open(openOpts(countingFS, false)...)
-		if err != nil {
-			t.Fatalf("reopen failed: %v", err)
-		}
-		defer func() {
-			if closeErr := reopened.Close(); closeErr != nil {
-				t.Fatalf("reopened.Close failed: %v", closeErr)
+		reopenAndVerify := func() []uint64 {
+			countingFS := newHeapBlockCountingFS(memFS)
+			reopened, err := Open(openOpts(countingFS, false)...)
+			if err != nil {
+				t.Fatalf("reopen failed: %v", err)
 			}
-		}()
+			defer func() {
+				if closeErr := reopened.Close(); closeErr != nil {
+					t.Fatalf("reopened.Close failed: %v", closeErr)
+				}
+			}()
 
-		for block := int64(0); block < totalBlocks; block++ {
-			if got := countingFS.blockCount(block); got != 1 {
-				t.Fatalf("heap block %d (of %d) read %d times, want 1", block, totalBlocks, got)
+			for block := int64(0); block < totalBlocks; block++ {
+				if got := countingFS.blockCount("heap.db", block); got != 1 {
+					t.Fatalf("heap block %d (of %d) read %d times, want 1", block, totalBlocks, got)
+				}
 			}
+
+			for key, want := range expected {
+				got, exists, err := reopened.Get("Table", key)
+				if err != nil || !exists || !bytes.Equal(got, want) {
+					t.Fatalf("Get %q failed: exists=%v len=%d wantLen=%d err=%v", key, exists, len(got), len(want), err)
+				}
+			}
+			for i := 0; i < 60; i++ {
+				key := fmt.Sprintf("small-%03d", i)
+				if _, exists, err := reopened.Get("Table", key); err != nil || exists {
+					t.Fatalf("deleted key %s still exists=%v err=%v", key, exists, err)
+				}
+			}
+			return slices.Clone(reopened.emptyPages.pages)
 		}
 
-		for key, want := range expected {
-			got, exists, err := reopened.Get("Table", key)
-			if err != nil || !exists || !bytes.Equal(got, want) {
-				t.Fatalf("Get %q failed: exists=%v len=%d wantLen=%d err=%v", key, exists, len(got), len(want), err)
-			}
+		firstEmptyPages := reopenAndVerify()
+		if len(firstEmptyPages) < 4 {
+			t.Fatalf("expected at least 4 empty pages to test deterministic ordering, got %v", firstEmptyPages)
 		}
-		for i := 0; i < 20; i++ {
-			key := fmt.Sprintf("small-%03d", i)
-			if _, exists, err := reopened.Get("Table", key); err != nil || exists {
-				t.Fatalf("deleted key %s still exists=%v err=%v", key, exists, err)
-			}
+		secondEmptyPages := reopenAndVerify()
+		if !slices.Equal(firstEmptyPages, secondEmptyPages) {
+			t.Fatalf("empty page order differed across opens: first=%v second=%v", firstEmptyPages, secondEmptyPages)
 		}
 	}
 
@@ -3101,7 +3073,7 @@ func TestRecovery_OpenReadsHeapOnce(t *testing.T) {
 		}()
 
 		for block := int64(0); block < totalBlocks; block++ {
-			if got := countingFS.blockCount(block); got != 1 {
+			if got := countingFS.blockCount("heap.db", block); got != 1 {
 				t.Fatalf("torn recovery: heap block %d (of %d) read %d times, want 1", block, totalBlocks, got)
 			}
 		}
