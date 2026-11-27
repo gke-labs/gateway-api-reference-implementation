@@ -3074,12 +3074,16 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 			}
 		}
 		var compiledGw *CompiledGateway
+		var parentProgrammed *metav1.Condition
 		if parentGW != nil {
 			parentKey := types.NamespacedName{Namespace: parentGW.Namespace, Name: parentGW.Name}
 			compiledGw = compiled.Gateways[parentKey]
+			if status, ok := outputs.GatewayStatuses[parentKey]; ok {
+				parentProgrammed = FindCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+			}
 		}
 		if parentGW != nil && (inputs.ControllerName == "" || compiledGw != nil) {
-			outputs.ListenerSetStatuses[lsKey] = ComputeDesiredListenerSetStatus(ls, parentGW, inputs.Namespaces, compiledGw)
+			outputs.ListenerSetStatuses[lsKey] = ComputeDesiredListenerSetStatus(ls, parentGW, inputs.Namespaces, compiledGw, parentProgrammed)
 		}
 	}
 
@@ -3253,12 +3257,14 @@ func ComputeDesiredGatewayStatus(
 	}
 }
 
-// ComputeDesiredListenerSetStatus computes the desired ListenerSetStatus from the compiled model.
+// ComputeDesiredListenerSetStatus computes the desired ListenerSetStatus from the compiled model
+// and the parent Gateway's computed Programmed condition.
 func ComputeDesiredListenerSetStatus(
 	ls *gatewayv1.ListenerSet,
 	parentGW *gatewayv1.Gateway,
 	namespaces map[string]*corev1.Namespace,
 	compiledGw *CompiledGateway,
+	parentProgrammed *metav1.Condition,
 ) gatewayv1.ListenerSetStatus {
 	var effectiveListeners []*EffectiveListener
 	if compiledGw != nil {
@@ -3266,6 +3272,23 @@ func ComputeDesiredListenerSetStatus(
 	}
 
 	acceptedCond, programmedCond := ComputeListenerSetConditions(ls, parentGW, namespaces, effectiveListeners)
+
+	parentNotProgrammed := acceptedCond.Status == metav1.ConditionTrue &&
+		parentProgrammed != nil &&
+		parentProgrammed.Status != metav1.ConditionTrue
+	var parentNotProgrammedMessage string
+	if parentNotProgrammed {
+		parentNotProgrammedMessage = fmt.Sprintf("Parent Gateway is not programmed (%s): %s", parentProgrammed.Reason, parentProgrammed.Message)
+		if programmedCond.Status == metav1.ConditionTrue {
+			programmedCond = NewCondition(
+				string(gatewayv1.ListenerSetConditionProgrammed),
+				parentProgrammed.Status,
+				string(gatewayv1.ListenerSetReasonPending),
+				parentNotProgrammedMessage,
+				ls.Generation,
+			)
+		}
+	}
 	desiredConditions := []metav1.Condition{programmedCond, acceptedCond}
 
 	var desiredListeners []gatewayv1.ListenerEntryStatus
@@ -3289,6 +3312,18 @@ func ComputeDesiredListenerSetStatus(
 			attachedRoutes := matchedEl.AttachedRoutes
 			conds := make([]metav1.Condition, len(matchedEl.ListenerInfo.Conditions))
 			copy(conds, matchedEl.ListenerInfo.Conditions)
+
+			if parentNotProgrammed {
+				if listenerProgrammed := FindCondition(conds, string(gatewayv1.ListenerEntryConditionProgrammed)); listenerProgrammed != nil && listenerProgrammed.Status == metav1.ConditionTrue {
+					SetCondition(&conds, NewCondition(
+						string(gatewayv1.ListenerEntryConditionProgrammed),
+						parentProgrammed.Status,
+						string(gatewayv1.ListenerEntryReasonPending),
+						parentNotProgrammedMessage,
+						ls.Generation,
+					))
+				}
+			}
 
 			desiredListeners = append(desiredListeners, gatewayv1.ListenerEntryStatus{
 				Name:           l.Name,
