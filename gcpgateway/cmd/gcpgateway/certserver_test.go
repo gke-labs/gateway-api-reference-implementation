@@ -282,6 +282,7 @@ func TestSetupController_CertserverIntegration(t *testing.T) {
 	// 5. Initialize controller with certserver flags
 	createBundleConfigMap(t, env.Client)
 	fakeGCP := gcp.NewFakeComputeClient()
+	t.Setenv("POD_NAMESPACE", "default")
 	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	opts, err := SetupController(t.Context(), []string{
 		"--cluster-id=cluster-1",
@@ -432,6 +433,7 @@ func TestSetupController_CertserverUnregistered(t *testing.T) {
 
 	createBundleConfigMap(t, env.Client)
 	fakeGCP := gcp.NewFakeComputeClient()
+	t.Setenv("POD_NAMESPACE", "default")
 	certFile, keyFile := setupTestInternalAPIFiles(t, env)
 	// Run SetupController WITHOUT any certserver flags
 	opts, err := SetupController(t.Context(), []string{
