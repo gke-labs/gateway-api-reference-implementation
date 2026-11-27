@@ -1208,6 +1208,9 @@ func (s *Engine) removeOversizeFileByName(fileName string) error {
 	return nil
 }
 
+// randomOversizeFileName returns a random 128-bit hex-encoded oversize value file name
+// with a .obj suffix. The name is not derived from the key or the value, so directory
+// listings in encrypted stores do not reveal content hashes.
 func randomOversizeFileName() (string, error) {
 	var id [16]byte
 	if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
@@ -1971,14 +1974,13 @@ func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry
 			closeErr := f.Close()
 			return nil, false, fmt.Errorf("%w: failed to get size of oversize file %s: %v", ErrCorruptStore, fileName, errors.Join(sizeErr, closeErr))
 		}
+		expectedSize := expectedLen
 		if len(s.encryptionKey) > 0 {
-			if sz < 0 || sz%BlockSize != 0 || expectedLen > uint64(sz) || uint64(sz) != paddedOversizeSize(expectedLen) {
-				closeErr := f.Close()
-				return nil, false, errors.Join(fmt.Errorf("%w: oversize file %s size mismatch (expected unpadded %d, got %d)", ErrCorruptStore, fileName, expectedLen, sz), closeErr)
-			}
-		} else if sz < 0 || uint64(sz) != expectedLen {
+			expectedSize = paddedOversizeSize(expectedLen)
+		}
+		if uint64(sz) != expectedSize {
 			closeErr := f.Close()
-			return nil, false, errors.Join(fmt.Errorf("%w: oversize file %s size mismatch (want %d, got %d)", ErrCorruptStore, fileName, expectedLen, sz), closeErr)
+			return nil, false, errors.Join(fmt.Errorf("%w: oversize file %s size mismatch (want %d, got %d)", ErrCorruptStore, fileName, expectedSize, sz), closeErr)
 		}
 		fileData := make([]byte, sz)
 		n, readErr := f.ReadAt(fileData, 0)

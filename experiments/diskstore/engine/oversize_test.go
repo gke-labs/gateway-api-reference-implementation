@@ -550,97 +550,107 @@ func TestOversize_KeyMovingBackToPage_DeletesOldFileOnlyAfterWALSync(t *testing.
 // A missing value file must be an error. Deleting the file after a checkpoint makes Get
 // report ErrCorruptStore, not "not-found".
 func TestOversize_MissingFile_GetReturnsCorruptionError(t *testing.T) {
-	memFS := NewMemFS()
-	dir := "test_oversize_missing_file_err"
+	runOversizeEncryptionModes(t, func(t *testing.T, encKey []byte) {
+		memFS := NewMemFS()
+		dir := "test_oversize_missing_file_err"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
+		opts := []Option{WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone)}
+		if len(encKey) > 0 {
+			opts = append(opts, WithEncryptionKey(encKey))
+		}
+		store, err := Open(append(opts, WithCreate())...)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
 
-	table := "TestTable"
-	key := "targetKey"
-	val := append([]byte("oversize-data-to-delete"), make([]byte, 2100*1024)...)
-	if err := store.Put(table, key, val); err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
-	if err := store.Checkpoint(); err != nil {
-		t.Fatalf("Checkpoint failed: %v", err)
-	}
-	fileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
+		table := "TestTable"
+		key := "targetKey"
+		val := append([]byte("oversize-data-to-delete"), make([]byte, 2100*1024)...)
+		if err := store.Put(table, key, val); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint failed: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
 
-	// Delete the backing oversize file
-	oversizePath := filepath.Join(dir, "oversize", fileName)
-	if err := memFS.Remove(oversizePath); err != nil {
-		t.Fatalf("Remove failed: %v", err)
-	}
+		// Delete the backing oversize file
+		oversizePath := filepath.Join(dir, "oversize", singleOversizeFileName(t, memFS, dir))
+		if err := memFS.Remove(oversizePath); err != nil {
+			t.Fatalf("Remove failed: %v", err)
+		}
 
-	// Reopen store
-	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer store2.Close()
+		// Reopen store
+		store2, err := Open(opts...)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer store2.Close()
 
-	// Get must return ErrCorruptStore
-	_, _, err = store2.Get(table, key)
-	if err == nil {
-		t.Fatalf("expected ErrCorruptStore on missing oversize file, got nil")
-	}
-	if !errors.Is(err, ErrCorruptStore) {
-		t.Fatalf("expected ErrCorruptStore, got: %v", err)
-	}
+		// Get must return ErrCorruptStore
+		_, _, err = store2.Get(table, key)
+		if err == nil {
+			t.Fatalf("expected ErrCorruptStore on missing oversize file, got nil")
+		}
+		if !errors.Is(err, ErrCorruptStore) {
+			t.Fatalf("expected ErrCorruptStore, got: %v", err)
+		}
+	})
 }
 
 // Review Feedback Item 1:
 // A truncated value file must return ErrCorruptStore on length or checksum mismatch.
 func TestOversize_TruncatedFile_GetReturnsCorruptionError(t *testing.T) {
-	memFS := NewMemFS()
-	dir := "test_oversize_truncated_file_err"
+	runOversizeEncryptionModes(t, func(t *testing.T, encKey []byte) {
+		memFS := NewMemFS()
+		dir := "test_oversize_truncated_file_err"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone), WithCreate())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
+		opts := []Option{WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone)}
+		if len(encKey) > 0 {
+			opts = append(opts, WithEncryptionKey(encKey))
+		}
+		store, err := Open(append(opts, WithCreate())...)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
 
-	table := "TestTable"
-	key := "targetKey"
-	val := append([]byte("oversize-data-to-truncate"), make([]byte, 2100*1024)...)
-	if err := store.Put(table, key, val); err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
-	if err := store.Checkpoint(); err != nil {
-		t.Fatalf("Checkpoint failed: %v", err)
-	}
-	fileName := store.keyIndex[qualifyKey(table, key)].OversizeFileName
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
+		table := "TestTable"
+		key := "targetKey"
+		val := append([]byte("oversize-data-to-truncate"), make([]byte, 2100*1024)...)
+		if err := store.Put(table, key, val); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint failed: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
 
-	// Truncate the backing oversize file to 100 bytes
-	oversizePath := filepath.Join(dir, "oversize", fileName)
-	memFS.mu.Lock()
-	memFS.files[oversizePath] = memFS.files[oversizePath][:100]
-	memFS.mu.Unlock()
+		// Truncate the backing oversize file to 100 bytes
+		oversizePath := filepath.Join(dir, "oversize", singleOversizeFileName(t, memFS, dir))
+		memFS.mu.Lock()
+		memFS.files[oversizePath] = memFS.files[oversizePath][:100]
+		memFS.mu.Unlock()
 
-	// Reopen store
-	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer store2.Close()
+		// Reopen store
+		store2, err := Open(opts...)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer store2.Close()
 
-	// Get must return ErrCorruptStore
-	_, _, err = store2.Get(table, key)
-	if err == nil {
-		t.Fatalf("expected ErrCorruptStore on truncated oversize file, got nil")
-	}
-	if !errors.Is(err, ErrCorruptStore) {
-		t.Fatalf("expected ErrCorruptStore, got: %v", err)
-	}
+		// Get must return ErrCorruptStore
+		_, _, err = store2.Get(table, key)
+		if err == nil {
+			t.Fatalf("expected ErrCorruptStore on truncated oversize file, got nil")
+		}
+		if !errors.Is(err, ErrCorruptStore) {
+			t.Fatalf("expected ErrCorruptStore, got: %v", err)
+		}
+	})
 }
 
 type magicPrefixCipher struct{}

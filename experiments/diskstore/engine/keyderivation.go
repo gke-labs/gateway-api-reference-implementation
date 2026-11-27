@@ -20,6 +20,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
+	"math"
 	"strconv"
 
 	"golang.org/x/crypto/xts"
@@ -117,9 +118,6 @@ func newWALSegmentCipher(key EncryptionKey, dbID [16]byte, startLSN uint64) (*xt
 
 // newOversizeCipher creates an AES-256-XTS cipher for an oversize value file using the derived oversize key.
 func newOversizeCipher(key EncryptionKey, dbID [16]byte, filename string) (*xts.Cipher, error) {
-	if len(key) == 0 {
-		return nil, nil
-	}
 	oversizeKey, err := deriveOversizeKey(key, dbID, filename)
 	if err != nil {
 		return nil, err
@@ -135,6 +133,9 @@ func paddedOversizeSize(length uint64) uint64 {
 	rem := length % BlockSize
 	if rem == 0 {
 		return length
+	}
+	if length > math.MaxUint64-(BlockSize-rem) {
+		return math.MaxUint64
 	}
 	return length + (BlockSize - rem)
 }
@@ -174,11 +175,8 @@ func encryptOversizeFile(dst File, payload []byte, cipher *xts.Cipher) error {
 
 // decryptOversizeBytes decrypts data in place in 4 KiB units using AES-256-XTS with the unit index
 // as the tweak, verifies that any trailing padding bytes beyond expectedLen are zero, and returns
-// the unpadded slice of length expectedLen.
+// the unpadded slice of length expectedLen. Callers must pass data of length paddedOversizeSize(expectedLen).
 func decryptOversizeBytes(data []byte, expectedLen uint64, cipher *xts.Cipher) ([]byte, error) {
-	if len(data)%BlockSize != 0 || expectedLen > uint64(len(data)) || uint64(len(data)) != paddedOversizeSize(expectedLen) {
-		return nil, fmt.Errorf("%w: invalid encrypted oversize size %d for length %d", ErrCorruptStore, len(data), expectedLen)
-	}
 	numUnits := uint64(len(data)) / BlockSize
 	for unit := uint64(0); unit < numUnits; unit++ {
 		unitSlice := data[unit*BlockSize : (unit+1)*BlockSize]
