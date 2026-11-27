@@ -20,6 +20,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
+	"math"
 	"strconv"
 
 	"golang.org/x/crypto/xts"
@@ -115,6 +116,80 @@ func newWALSegmentCipher(key EncryptionKey, dbID [16]byte, startLSN uint64) (*xt
 	return xts.NewCipher(aes.NewCipher, walKey)
 }
 
+// newOversizeCipher creates an AES-256-XTS cipher for an oversize value file using the derived oversize key.
+func newOversizeCipher(key EncryptionKey, dbID [16]byte, filename string) (*xts.Cipher, error) {
+	oversizeKey, err := deriveOversizeKey(key, dbID, filename)
+	if err != nil {
+		return nil, err
+	}
+	return xts.NewCipher(aes.NewCipher, oversizeKey)
+}
+
+// paddedOversizeSize returns length rounded up to a 4 KiB (BlockSize) boundary.
+func paddedOversizeSize(length uint64) uint64 {
+	if length == 0 {
+		return 0
+	}
+	rem := length % BlockSize
+	if rem == 0 {
+		return length
+	}
+	if length > math.MaxUint64-(BlockSize-rem) {
+		return math.MaxUint64
+	}
+	return length + (BlockSize - rem)
+}
+
+// encryptOversizeFile encrypts payload in 4 KiB units using AES-256-XTS with the unit index as the tweak,
+// zero-padding the final unit to a 4 KiB boundary, and writes the ciphertext to dst.
+func encryptOversizeFile(dst File, payload []byte, cipher *xts.Cipher) error {
+	const chunkUnits = 64
+	chunkBuf := make([]byte, chunkUnits*BlockSize)
+	totalUnits := paddedOversizeSize(uint64(len(payload))) / BlockSize
+	for unit := uint64(0); unit < totalUnits; {
+		nUnits := totalUnits - unit
+		if nUnits > chunkUnits {
+			nUnits = chunkUnits
+		}
+		chunkBytes := int(nUnits) * BlockSize
+		buf := chunkBuf[:chunkBytes]
+		start := int(unit) * BlockSize
+		end := start + chunkBytes
+		if end <= len(payload) {
+			copy(buf, payload[start:end])
+		} else {
+			copied := copy(buf, payload[start:])
+			clear(buf[copied:])
+		}
+		for i := uint64(0); i < nUnits; i++ {
+			unitSlice := buf[i*BlockSize : (i+1)*BlockSize]
+			cipher.Encrypt(unitSlice, unitSlice, unit+i)
+		}
+		if _, err := dst.WriteAt(buf, int64(unit*BlockSize)); err != nil {
+			return err
+		}
+		unit += nUnits
+	}
+	return nil
+}
+
+// decryptOversizeBytes decrypts data in place in 4 KiB units using AES-256-XTS with the unit index
+// as the tweak, verifies that any trailing padding bytes beyond expectedLen are zero, and returns
+// the unpadded slice of length expectedLen. Callers must pass data of length paddedOversizeSize(expectedLen).
+func decryptOversizeBytes(data []byte, expectedLen uint64, cipher *xts.Cipher) ([]byte, error) {
+	numUnits := uint64(len(data)) / BlockSize
+	for unit := uint64(0); unit < numUnits; unit++ {
+		unitSlice := data[unit*BlockSize : (unit+1)*BlockSize]
+		cipher.Decrypt(unitSlice, unitSlice, unit)
+	}
+	for _, b := range data[expectedLen:] {
+		if b != 0 {
+			return nil, fmt.Errorf("%w: non-zero padding in encrypted oversize file", ErrCorruptStore)
+		}
+	}
+	return data[:expectedLen], nil
+}
+
 // encryptHeapBlock encrypts a 4 KiB heap block with AES-256-XTS using blockNum as tweak.
 func encryptHeapBlock(dst, src []byte, blockNum uint64, cipher *xts.Cipher) {
 	if cipher != nil {
@@ -139,8 +214,3 @@ func deriveKey(key EncryptionKey, dbID [16]byte, info string, length int) ([]byt
 	}
 	return hkdf.Key(sha256.New, []byte(key), dbID[:], info, length)
 }
-
-// Suppress unused linter warning until oversize-file encryption uses deriveOversizeKey.
-var (
-	_ = deriveOversizeKey
-)

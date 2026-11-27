@@ -60,7 +60,7 @@ The database metadata file (`meta.db`) is a 36 KiB file allocated in full when a
 
 The fields contain the following values:
 - **Magic (4 bytes):** The constant `0x4D455441` (ASCII `"META"`).
-- **StoreFormatVersion (4 bytes):** The store format version recorded by the engine (`StoreFormatVersion`, currently `8`).
+- **StoreFormatVersion (4 bytes):** The store format version recorded by the engine (`StoreFormatVersion`, currently `9`).
 - **Database ID (16 bytes):** Unique 16-byte identifier for the database instance.
 - **Flags (8 bytes):** Store flags. Bit 0 indicates whether the store was created with an encryption cipher (`metaFlagEncrypted`). Bits 1 through 63 are reserved and must be zero.
 - **KeyCheckToken (32 bytes):** An HMAC-SHA256 of the database ID computed using a key derived from the master key with context `"diskstore/keycheck"`. In an unencrypted store, this field is zero.
@@ -523,7 +523,7 @@ Making `ByteString` a sequential stream keeps the stored format, threshold, and 
 
 Block encryption replaces per-value encryption and allows direct reads from any 4 KiB offset.
 
-`Get` today decrypts an oversize value with the per-value cipher before it decompresses. Until planned block-level encryption lands, a file-backed value cannot be served for a store that uses the per-value cipher without loading the full ciphertext into memory to decrypt it; such stores must fall back to memory-backed values. Under the planned block encryption, the engine encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak. The streaming `ByteString` reads 4 KiB units sequentially, decrypts each unit, and feeds the decrypted stream into the decompressor.
+In stores using block-level encryption, the engine encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak and a key derived per file. `Get` currently reads the full file, decrypts each 4 KiB unit, verifies the zero padding and SHA-256 checksum, and decompresses the result. Stores still using the legacy per-value cipher cannot serve a file-backed value without loading the full ciphertext into memory to decrypt it, so they must fall back to memory-backed values. When streaming `ByteString` reads land, block-encrypted stores will read 4 KiB units sequentially, decrypt each unit, and feed the decrypted stream into the decompressor.
 
 ### Callers
 
