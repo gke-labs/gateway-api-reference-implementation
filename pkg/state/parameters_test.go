@@ -144,6 +144,7 @@ func TestParseConfigMapParameters(t *testing.T) {
 				ParameterKeyNEGHTTPS:                  "neg-8443",
 				ParameterKeyNEGHTTP:                   "neg-8080",
 				ParameterKeyNEGPrefix:                 "gcpgw",
+				ParameterKeyBackendService:            "my-backend-service",
 			},
 		}
 		p, err := ParseConfigMapParameters(cm)

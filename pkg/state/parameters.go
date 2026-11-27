@@ -42,6 +42,7 @@ const (
 	ParameterKeyNEGHTTPS                  = "negHTTPS"
 	ParameterKeyNEGHTTP                   = "negHTTP"
 	ParameterKeyNEGPrefix                 = "negPrefix"
+	ParameterKeyBackendService            = "backendService"
 	ParameterKeyACMEChallenge             = "acmeChallenge"
 )
 
@@ -121,6 +122,7 @@ func ParseConfigMapParameters(cm *corev1.ConfigMap) (*Parameters, error) {
 			ParameterKeyNEGHTTPS,
 			ParameterKeyNEGHTTP,
 			ParameterKeyNEGPrefix,
+			ParameterKeyBackendService,
 			ParameterKeyACMEChallenge:
 		default:
 			return nil, fmt.Errorf("unknown key %q in ConfigMap", k)
