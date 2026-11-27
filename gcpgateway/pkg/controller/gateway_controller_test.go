@@ -2731,3 +2731,216 @@ func TestGateway_BackendServiceParameter(t *testing.T) {
 		}
 	})
 }
+
+func TestGateway_HTTPOnlyHealthPolling(t *testing.T) {
+	scheme := setupScheme()
+	ipAddressType := gatewayv1.IPAddressType
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
+	httpOnly := []gatewayv1.Listener{{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType}}
+
+	newFixture := func(t *testing.T, listeners []gatewayv1.Listener, parametersData map[string]string, extraObjects ...client.Object) (client.Client, *GatewayReconciler, *gcp.FakeComputeClient) {
+		t.Helper()
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-params"},
+			Data:       parametersData,
+		}
+		gateway := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         "default",
+				Name:              "my-gw",
+				CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "gcpgateway",
+				Addresses:        []gatewayv1.GatewaySpecAddress{{Type: &ipAddressType, Value: "34.120.254.10"}},
+				Infrastructure: &gatewayv1.GatewayInfrastructure{
+					ParametersRef: &gatewayv1.LocalParametersReference{Kind: "ConfigMap", Name: "gw-params"},
+				},
+				Listeners: listeners,
+			},
+		}
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+			Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+		}
+		objects := append([]client.Object{configMap, gateway, node}, extraObjects...)
+		kubeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+			WithObjects(objects...).
+			Build()
+		makeTestPod(t, kubeClient, gateway, "dp-pod-1", "node-1", "10.0.1.5", []corev1.PodCondition{
+			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+			{Type: corev1.PodConditionType(registrar.LoadBalancerReadyGate), Status: corev1.ConditionFalse},
+		})
+		fakeGCP := gcp.NewFakeComputeClient()
+		negRegistrar := registrar.NewRegistrar(kubeClient, fakeGCP, registrar.Config{
+			ClusterID: "cluster-1", NegPrefix: "gcpgw", Project: "my-project", Zones: []string{"us-central1-a"},
+		})
+		reconciler := NewGatewayReconciler(kubeClient, scheme, fakeGCP, negRegistrar, GatewayReconcilerConfig{
+			ClusterID: "cluster-1", NegPrefix: "gcpgw", Project: "my-project", Zones: []string{"us-central1-a"},
+		})
+		return kubeClient, reconciler, fakeGCP
+	}
+
+	addNEG := func(t *testing.T, fakeGCP *gcp.FakeComputeClient, name string, port int) {
+		t.Helper()
+		description, err := (&metadata.NegMetadata{
+			ClusterID: "cluster-1", Namespace: "default", GatewayName: "my-gw", Port: port,
+		}).Encode()
+		if err != nil {
+			t.Fatalf("encoding NEG metadata: %v", err)
+		}
+		fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+			Name: name, Zone: "us-central1-a", Description: description,
+		})
+	}
+
+	setHealth := func(fakeGCP *gcp.FakeComputeClient, backendService, negName string, port int64, healthState string) {
+		fakeGCP.SetBackendServiceHealth("my-project", backendService, negName, &compute.BackendServiceGroupHealth{
+			HealthStatus: []*compute.HealthStatus{{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: port, HealthState: healthState}},
+		})
+	}
+
+	readinessGateTrue := func(t *testing.T, kubeClient client.Client) bool {
+		t.Helper()
+		var pod corev1.Pod
+		if err := kubeClient.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "dp-pod-1"}, &pod); err != nil {
+			t.Fatalf("getting pod: %v", err)
+		}
+		return isPodReadinessGateTrue(&pod)
+	}
+
+	t.Run("derived HTTP NEG with backendService parameter", func(t *testing.T) {
+		const backendService = "operator-http-backend"
+		kubeClient, reconciler, fakeGCP := newFixture(t, httpOnly, map[string]string{
+			state.ParameterKeyBackendService: backendService,
+		})
+		httpNEG := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8080")
+		httpsNEG := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8443")
+		addNEG(t, fakeGCP, httpNEG, registrar.PortHTTP)
+
+		setHealth(fakeGCP, backendService, httpsNEG, registrar.PortHTTPS, "HEALTHY")
+		setHealth(fakeGCP, backendService, httpNEG, registrar.PortHTTP, "UNHEALTHY")
+		if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		endpoints, err := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", httpNEG)
+		if err != nil {
+			t.Fatalf("listing HTTP NEG endpoints: %v", err)
+		}
+		if len(endpoints) != 1 || endpoints[0].IpAddress != "10.0.1.5" || endpoints[0].Port != registrar.PortHTTP {
+			t.Fatalf("expected pod attached to HTTP NEG on port %d, got %+v", registrar.PortHTTP, endpoints)
+		}
+		if readinessGateTrue(t, kubeClient) {
+			t.Fatalf("expected readiness gate to remain False while HTTP NEG is UNHEALTHY")
+		}
+
+		setHealth(fakeGCP, backendService, httpNEG, registrar.PortHTTP, "HEALTHY")
+		if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if !readinessGateTrue(t, kubeClient) {
+			t.Fatalf("expected readiness gate to become True after HTTP NEG reports HEALTHY")
+		}
+		cached := reconciler.GetCachedStatus(request.NamespacedName)
+		if cached == nil || cached.ProgrammedStatus != metav1.ConditionTrue || cached.Reason != ReasonProgrammed {
+			t.Errorf("expected Programmed=True in cache, got %+v", cached)
+		}
+	})
+
+	t.Run("negHTTP override drives health poll and conflict detection", func(t *testing.T) {
+		const backendService = "operator-http-backend"
+		const customHTTPNEG = "gcpgw-custom-http"
+		newerGateway := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw-newer", CreationTimestamp: metav1.NewTime(time.Now())},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "gcpgateway",
+				Infrastructure: &gatewayv1.GatewayInfrastructure{
+					ParametersRef: &gatewayv1.LocalParametersReference{Kind: "ConfigMap", Name: "gw-params"},
+				},
+				Listeners: httpOnly,
+			},
+		}
+		kubeClient, reconciler, fakeGCP := newFixture(t, httpOnly, map[string]string{
+			state.ParameterKeyBackendService: backendService,
+			state.ParameterKeyNEGHTTP:        customHTTPNEG,
+		}, newerGateway)
+		addNEG(t, fakeGCP, customHTTPNEG, registrar.PortHTTP)
+		derivedHTTPNEG := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8080")
+		setHealth(fakeGCP, backendService, derivedHTTPNEG, registrar.PortHTTP, "UNHEALTHY")
+		setHealth(fakeGCP, backendService, customHTTPNEG, registrar.PortHTTP, "HEALTHY")
+
+		if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if !readinessGateTrue(t, kubeClient) {
+			t.Fatalf("expected readiness gate to become True from negHTTP health poll")
+		}
+		newerRequest := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw-newer"}}
+		if _, err := reconciler.Reconcile(t.Context(), newerRequest); err != nil {
+			t.Fatalf("Reconcile on newer Gateway failed: %v", err)
+		}
+		cached := reconciler.GetCachedStatus(newerRequest.NamespacedName)
+		if cached == nil || cached.AcceptedStatus != metav1.ConditionFalse || cached.Reason != ReasonConflictingParameters {
+			t.Errorf("expected newer Gateway to conflict on negHTTP, got %+v", cached)
+		}
+	})
+
+	t.Run("default backendService uses bs-80 for HTTP-only Gateway", func(t *testing.T) {
+		kubeClient, reconciler, fakeGCP := newFixture(t, httpOnly, nil)
+		httpNEG := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8080")
+		bs80 := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "bs-80")
+		bs443 := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "bs-443")
+		addNEG(t, fakeGCP, httpNEG, registrar.PortHTTP)
+
+		setHealth(fakeGCP, bs443, httpNEG, registrar.PortHTTP, "HEALTHY")
+		setHealth(fakeGCP, bs80, httpNEG, registrar.PortHTTP, "UNHEALTHY")
+		if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if readinessGateTrue(t, kubeClient) {
+			t.Fatalf("expected readiness gate to remain False while bs-80 is UNHEALTHY")
+		}
+
+		setHealth(fakeGCP, bs80, httpNEG, registrar.PortHTTP, "HEALTHY")
+		if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if !readinessGateTrue(t, kubeClient) {
+			t.Fatalf("expected readiness gate to become True after bs-80 reports HEALTHY")
+		}
+	})
+
+	t.Run("HTTP and HTTPS listeners keep polling HTTPS NEG", func(t *testing.T) {
+		const backendService = "operator-https-backend"
+		mixedListeners := []gatewayv1.Listener{
+			{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+		}
+		kubeClient, reconciler, fakeGCP := newFixture(t, mixedListeners, map[string]string{
+			state.ParameterKeyBackendService: backendService,
+		})
+		httpNEG := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8080")
+		httpsNEG := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8443")
+		addNEG(t, fakeGCP, httpNEG, registrar.PortHTTP)
+		addNEG(t, fakeGCP, httpsNEG, registrar.PortHTTPS)
+
+		setHealth(fakeGCP, backendService, httpNEG, registrar.PortHTTP, "HEALTHY")
+		setHealth(fakeGCP, backendService, httpsNEG, registrar.PortHTTPS, "UNHEALTHY")
+		if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if readinessGateTrue(t, kubeClient) {
+			t.Fatalf("expected readiness gate to remain False while HTTPS NEG is UNHEALTHY")
+		}
+
+		setHealth(fakeGCP, backendService, httpsNEG, registrar.PortHTTPS, "HEALTHY")
+		if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if !readinessGateTrue(t, kubeClient) {
+			t.Fatalf("expected readiness gate to become True after HTTPS NEG reports HEALTHY")
+		}
+	})
+}
