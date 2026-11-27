@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -234,37 +235,7 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&gatewayv1.Gateway{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.podToGateway)).
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.endpointSliceToGateway)).
-		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.configMapToGateway)).
 		Complete(r)
-}
-
-func (r *GatewayReconciler) configMapToGateway(ctx context.Context, object client.Object) []reconcile.Request {
-	configMap, ok := object.(*corev1.ConfigMap)
-	if !ok || configMap == nil {
-		return nil
-	}
-	var gatewayList gatewayv1.GatewayList
-	if err := r.Client.List(ctx, &gatewayList, client.InNamespace(configMap.Namespace)); err != nil {
-		klog.ErrorS(err, "listing gateways to map ConfigMap to gateway", "namespace", configMap.Namespace, "configMap", configMap.Name)
-		return nil
-	}
-	var requests []reconcile.Request
-	for i := range gatewayList.Items {
-		gateway := &gatewayList.Items[i]
-		if gateway.Spec.Infrastructure == nil || gateway.Spec.Infrastructure.ParametersRef == nil {
-			continue
-		}
-		parametersRef := gateway.Spec.Infrastructure.ParametersRef
-		if parametersRef.Group == "" && parametersRef.Kind == "ConfigMap" && string(parametersRef.Name) == configMap.Name {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: gateway.Namespace,
-					Name:      gateway.Name,
-				},
-			})
-		}
-	}
-	return requests
 }
 
 // gatewayRequestForLabel finds Gateways in the namespace matching the label value
@@ -391,7 +362,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		}
 	}
 
-	backendService, err := r.resolveBackendService(ctx, &gw)
+	parametersData, err := r.parametersConfigMapData(ctx, &gw)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	backendService, err := r.resolveBackendService(&gw, parametersData)
 	if err != nil {
 		var invalidParametersErr *invalidParametersError
 		if errors.As(err, &invalidParametersErr) {
@@ -407,10 +383,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	// 2. Resolve NEG conflicts deterministically across Gateways targeting identical NEGs
-	targetNEG, err := r.targetNEGKey(ctx, &gw)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
+	targetNEG := r.targetNEGKey(&gw, parametersData)
 	var allGateways gatewayv1.GatewayList
 	if err := r.List(ctx, &allGateways); err != nil {
 		return reconcile.Result{}, fmt.Errorf("listing gateways: %w", err)
@@ -423,11 +396,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			continue
 		}
 		if candidate.Spec.GatewayClassName == gw.Spec.GatewayClassName {
-			candKey, err := r.targetNEGKey(ctx, candidate)
-			if err != nil {
-				return reconcile.Result{}, err
+			candidateData := parametersData
+			if candidate.Namespace != gw.Namespace || candidate.Name != gw.Name {
+				candidateData, err = r.parametersConfigMapData(ctx, candidate)
+				if err != nil {
+					return reconcile.Result{}, err
+				}
 			}
-			if candKey == targetNEG {
+			if r.targetNEGKey(candidate, candidateData) == targetNEG {
 				conflicting = append(conflicting, candidate)
 			}
 		}
@@ -447,10 +423,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	// 3. Resolve external static IP
-	externalIP, err := r.resolveExternalIP(ctx, &gw)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
+	externalIP := r.resolveExternalIP(&gw, parametersData)
 
 	// 4. Reconcile endpoints with zonal NEGs via the registrar
 	reconcileRes, err := r.Registrar.ReconcileEndpoints(ctx, &gw)
@@ -736,33 +709,42 @@ func isPodReadinessGateTrue(pod *corev1.Pod) bool {
 	return false
 }
 
-func (r *GatewayReconciler) targetNEGKey(ctx context.Context, gw *gatewayv1.Gateway) (string, error) {
-	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
-		ref := gw.Spec.Infrastructure.ParametersRef
-		if ref.Kind == "ConfigMap" && ref.Name != "" {
-			var cm corev1.ConfigMap
-			err := r.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: string(ref.Name)}, &cm)
-			if err != nil {
-				if !apierrors.IsNotFound(err) {
-					return "", fmt.Errorf("getting parameters ConfigMap %s: %w", ref.Name, err)
-				}
-			} else {
-				if neg := cm.Data["negHTTPS"]; neg != "" {
-					return neg, nil
-				}
-				if targetGW := cm.Data["gatewayName"]; targetGW != "" {
-					ns := cm.Data["gatewayNamespace"]
-					if ns == "" {
-						ns = gw.Namespace
-					}
-					return metadata.ResourceName(r.NegPrefix, r.ClusterID, ns, targetGW, "8443"), nil
-				}
-			}
-		}
+// parametersConfigMapData returns the Data map from the ConfigMap named by
+// gateway.Spec.Infrastructure.ParametersRef. It returns nil when the Gateway
+// does not reference a core ConfigMap or when the ConfigMap does not exist.
+func (r *GatewayReconciler) parametersConfigMapData(ctx context.Context, gateway *gatewayv1.Gateway) (map[string]string, error) {
+	if gateway.Spec.Infrastructure == nil || gateway.Spec.Infrastructure.ParametersRef == nil {
+		return nil, nil
 	}
-	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gw.Namespace, gw.Name, "8443"), nil
+	parametersRef := gateway.Spec.Infrastructure.ParametersRef
+	if parametersRef.Group != "" || parametersRef.Kind != "ConfigMap" || parametersRef.Name == "" {
+		return nil, nil
+	}
+	var configMap corev1.ConfigMap
+	if err := r.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: string(parametersRef.Name)}, &configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("getting parameters ConfigMap %s: %w", parametersRef.Name, err)
+	}
+	return configMap.Data, nil
 }
 
+func (r *GatewayReconciler) targetNEGKey(gateway *gatewayv1.Gateway, parametersData map[string]string) string {
+	if neg := parametersData["negHTTPS"]; neg != "" {
+		return neg
+	}
+	if targetGateway := parametersData["gatewayName"]; targetGateway != "" {
+		namespace := parametersData["gatewayNamespace"]
+		if namespace == "" {
+			namespace = gateway.Namespace
+		}
+		return metadata.ResourceName(r.NegPrefix, r.ClusterID, namespace, targetGateway, "8443")
+	}
+	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gateway.Namespace, gateway.Name, "8443")
+}
+
+// invalidParametersError reports a rejected value in a Gateway's parameters ConfigMap.
 type invalidParametersError struct {
 	message string
 }
@@ -771,57 +753,37 @@ func (e *invalidParametersError) Error() string {
 	return e.message
 }
 
-func (r *GatewayReconciler) resolveBackendService(ctx context.Context, gateway *gatewayv1.Gateway) (string, error) {
-	if gateway.Spec.Infrastructure != nil && gateway.Spec.Infrastructure.ParametersRef != nil {
-		parametersRef := gateway.Spec.Infrastructure.ParametersRef
-		if parametersRef.Group == "" && parametersRef.Kind == "ConfigMap" && parametersRef.Name != "" {
-			var configMap corev1.ConfigMap
-			err := r.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: string(parametersRef.Name)}, &configMap)
-			if err != nil {
-				if !apierrors.IsNotFound(err) {
-					return "", fmt.Errorf("getting parameters ConfigMap %s: %w", parametersRef.Name, err)
-				}
-			} else if raw, ok := configMap.Data[state.ParameterKeyBackendService]; ok && raw != "" {
-				backendService := strings.TrimSpace(raw)
-				if err := state.ValidateComputeResourceName(backendService); err != nil {
-					return "", &invalidParametersError{
-						message: fmt.Sprintf("invalid %s %q: %v", state.ParameterKeyBackendService, raw, err),
-					}
-				}
-				return backendService, nil
+// resolveBackendService returns the Compute backend service name to poll for
+// gateway. When parametersData sets backendService, it validates the value as
+// an RFC 1035 Compute resource name and returns an invalidParametersError if
+// validation fails. When unset, it returns the derived backend service name.
+func (r *GatewayReconciler) resolveBackendService(gateway *gatewayv1.Gateway, parametersData map[string]string) (string, error) {
+	if raw, ok := parametersData[state.ParameterKeyBackendService]; ok && raw != "" {
+		backendService := strings.TrimSpace(raw)
+		if validationErrors := validation.IsDNS1035Label(backendService); len(validationErrors) > 0 {
+			return "", &invalidParametersError{
+				message: fmt.Sprintf("invalid %s %q: must be a valid Compute resource name: %s", state.ParameterKeyBackendService, raw, strings.Join(validationErrors, "; ")),
 			}
 		}
+		return backendService, nil
 	}
 	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gateway.Namespace, gateway.Name, "bs-443"), nil
 }
 
-func (r *GatewayReconciler) resolveExternalIP(ctx context.Context, gw *gatewayv1.Gateway) (string, error) {
-	for _, addr := range gw.Spec.Addresses {
+func (r *GatewayReconciler) resolveExternalIP(gateway *gatewayv1.Gateway, parametersData map[string]string) string {
+	for _, addr := range gateway.Spec.Addresses {
 		if addr.Type == nil || *addr.Type == gatewayv1.IPAddressType {
 			if strings.TrimSpace(addr.Value) != "" {
-				return strings.TrimSpace(addr.Value), nil
+				return strings.TrimSpace(addr.Value)
 			}
 		}
 	}
 
-	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
-		ref := gw.Spec.Infrastructure.ParametersRef
-		if ref.Kind == "ConfigMap" && ref.Name != "" {
-			var cm corev1.ConfigMap
-			err := r.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: string(ref.Name)}, &cm)
-			if err != nil {
-				if !apierrors.IsNotFound(err) {
-					return "", fmt.Errorf("getting parameters ConfigMap %s: %w", ref.Name, err)
-				}
-			} else {
-				if ip, ok := cm.Data["externalIP"]; ok && strings.TrimSpace(ip) != "" {
-					return strings.TrimSpace(ip), nil
-				}
-			}
-		}
+	if ip, ok := parametersData["externalIP"]; ok && strings.TrimSpace(ip) != "" {
+		return strings.TrimSpace(ip)
 	}
 
-	return "", nil
+	return ""
 }
 
 func (r *GatewayReconciler) updatePodReadinessGate(ctx context.Context, pod *corev1.Pod, status corev1.ConditionStatus, reason, message string) error {
