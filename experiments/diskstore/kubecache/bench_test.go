@@ -543,9 +543,17 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		}
 
 	case "bbolt":
-		cipherBbolt, err := bboltcache.NewEphemeralAESGCMCipher()
-		if err != nil {
-			t.Fatalf("cipher creation failed: %v", err)
+		encMode := os.Getenv("BENCHMARK_ENCRYPTION")
+		if encMode != "" && encMode != "on" && encMode != "off" {
+			t.Fatalf("invalid BENCHMARK_ENCRYPTION=%q (want 'on' or 'off')", encMode)
+		}
+		var cipherBbolt bboltcache.Cipher = bboltcache.NoopCipher{}
+		if encMode != "off" {
+			var err error
+			cipherBbolt, err = bboltcache.NewEphemeralAESGCMCipher()
+			if err != nil {
+				t.Fatalf("bbolt cipher creation failed: %v", err)
+			}
 		}
 
 		bboltDir := t.TempDir()
@@ -640,19 +648,31 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			poolBlocks = 16384 // 64 MiB block pool
 		}
 
-		cipherDisk, err := engine.NewEphemeralAESGCMCipher()
-		if err != nil {
-			t.Fatalf("cipher creation failed: %v", err)
+		encMode := os.Getenv("BENCHMARK_ENCRYPTION")
+		if encMode != "" && encMode != "on" && encMode != "off" {
+			t.Fatalf("invalid BENCHMARK_ENCRYPTION=%q (want 'on' or 'off')", encMode)
+		}
+
+		var encKey engine.EncryptionKey
+		if encMode != "off" {
+			var err error
+			encKey, err = engine.NewEncryptionKey()
+			if err != nil {
+				t.Fatalf("encryption key creation failed: %v", err)
+			}
 		}
 
 		diskDir := t.TempDir()
-		diskStore, err := engine.Open(
+		openOpts := []engine.Option{
 			engine.WithDir(diskDir),
-			engine.WithCipher(cipherDisk),
 			engine.WithNumPoolBlocks(poolBlocks),
 			engine.WithCompressionCodec(codec),
 			engine.WithCreate(),
-		)
+		}
+		if len(encKey) > 0 {
+			openOpts = append(openOpts, engine.WithEncryptionKey(encKey))
+		}
+		diskStore, err := engine.Open(openOpts...)
 		if err != nil {
 			t.Fatalf("diskstore creation failed: %v", err)
 		}
@@ -688,12 +708,15 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		heapMB, walMB, totalMB, _ := getDiskBreakdown(diskDir)
 
 		t0 = time.Now()
-		recoveredStore, err := engine.Open(
+		reopenOpts := []engine.Option{
 			engine.WithDir(diskDir),
-			engine.WithCipher(cipherDisk),
 			engine.WithNumPoolBlocks(poolBlocks),
 			engine.WithCompressionCodec(codec),
-		)
+		}
+		if len(encKey) > 0 {
+			reopenOpts = append(reopenOpts, engine.WithEncryptionKey(encKey))
+		}
+		recoveredStore, err := engine.Open(reopenOpts...)
 		if err != nil {
 			t.Fatalf("reopening store for recovery failed: %v", err)
 		}

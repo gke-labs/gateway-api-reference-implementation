@@ -674,3 +674,134 @@ func TestWatchLoop_EnvTest_RestartWithStoredResourceVersion(t *testing.T) {
 		t.Fatalf("expected at least 1 watch attempt, got %d", watches)
 	}
 }
+
+// TestWatchLoop_RestartWithDifferentKeyErasesAndRelists verifies that when a
+// kubecache process restarts and OpenEngine generates a new per-process key,
+// the previous store is erased and WatchLoop rebuilds the cache via LIST.
+func TestWatchLoop_RestartWithDifferentKeyErasesAndRelists(t *testing.T) {
+	memFS := engine.NewMemFS()
+	dir := "restart_diff_key_watch"
+
+	// Process 1: populate store and persist a resourceVersion via WatchLoop.
+	eng1, err := OpenEngine(engine.WithFS(memFS), engine.WithDir(dir))
+	if err != nil {
+		t.Fatalf("OpenEngine 1 failed: %v", err)
+	}
+	idx1, err := New(eng1, &corev1.ConfigMap{}, testOnFatal(t))
+	if err != nil {
+		t.Fatalf("New 1 failed: %v", err)
+	}
+
+	w1 := watch.NewFake()
+	lw1 := &toolscache.ListWatch{
+		ListFunc: func(o metav1.ListOptions) (k8sruntime.Object, error) {
+			return &corev1.ConfigMapList{
+				ListMeta: metav1.ListMeta{ResourceVersion: "10"},
+				Items: []corev1.ConfigMap{
+					{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-old", ResourceVersion: "10"}},
+				},
+			}, nil
+		},
+		WatchFunc: func(o metav1.ListOptions) (watch.Interface, error) {
+			return w1, nil
+		},
+	}
+
+	loop1 := NewWatchLoop(lw1, idx1, WithBackoff(testBackoff()))
+	ctx1, cancel1 := context.WithCancel(t.Context())
+	errCh1 := make(chan error, 1)
+	go func() { errCh1 <- loop1.Run(ctx1) }()
+
+	err = wait.PollUntilContextTimeout(t.Context(), 10*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		_, ok, getErr := idx1.GetByKey("default/cm-old")
+		return ok && idx1.LastStoreSyncResourceVersion() == "10", getErr
+	})
+	if err != nil {
+		t.Fatalf("process 1 initial sync failed: %v", err)
+	}
+	cancel1()
+	w1.Stop()
+	if loopErr := <-errCh1; loopErr != nil {
+		t.Fatalf("loop1 error: %v", loopErr)
+	}
+	if err := idx1.Close(); err != nil {
+		t.Fatalf("idx1.Close failed: %v", err)
+	}
+	if err := eng1.Close(); err != nil {
+		t.Fatalf("eng1.Close failed: %v", err)
+	}
+
+	// Process 2: OpenEngine generates a new per-process key -> store is wiped.
+	eng2, err := OpenEngine(engine.WithFS(memFS), engine.WithDir(dir))
+	if err != nil {
+		t.Fatalf("OpenEngine 2 failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := eng2.Close(); err != nil {
+			t.Errorf("eng2.Close failed: %v", err)
+		}
+	})
+	if !eng2.Wiped() {
+		t.Fatalf("expected store to be wiped when restarted with a different per-process key")
+	}
+
+	idx2, err := New(eng2, &corev1.ConfigMap{}, testOnFatal(t))
+	if err != nil {
+		t.Fatalf("New 2 failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := idx2.Close(); err != nil {
+			t.Errorf("idx2.Close failed: %v", err)
+		}
+	})
+	if rv := idx2.LastStoreSyncResourceVersion(); rv != "" {
+		t.Fatalf("expected empty stored resourceVersion after wipe, got %q", rv)
+	}
+
+	var listCount atomic.Int32
+	w2 := watch.NewFake()
+	lw2 := &toolscache.ListWatch{
+		ListFunc: func(o metav1.ListOptions) (k8sruntime.Object, error) {
+			listCount.Add(1)
+			return &corev1.ConfigMapList{
+				ListMeta: metav1.ListMeta{ResourceVersion: "20"},
+				Items: []corev1.ConfigMap{
+					{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-new", ResourceVersion: "20"}},
+				},
+			}, nil
+		},
+		WatchFunc: func(o metav1.ListOptions) (watch.Interface, error) {
+			return w2, nil
+		},
+	}
+
+	loop2 := NewWatchLoop(lw2, idx2, WithBackoff(testBackoff()))
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	errCh2 := make(chan error, 1)
+	go func() { errCh2 <- loop2.Run(ctx2) }()
+	t.Cleanup(func() {
+		cancel2()
+		w2.Stop()
+		if loopErr := <-errCh2; loopErr != nil {
+			t.Errorf("loop2 error: %v", loopErr)
+		}
+	})
+
+	err = wait.PollUntilContextTimeout(t.Context(), 10*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		_, okNew, errNew := idx2.GetByKey("default/cm-new")
+		if errNew != nil {
+			return false, errNew
+		}
+		_, okOld, errOld := idx2.GetByKey("default/cm-old")
+		if errOld != nil {
+			return false, errOld
+		}
+		return okNew && !okOld && idx2.LastStoreSyncResourceVersion() == "20", nil
+	})
+	if err != nil {
+		t.Fatalf("process 2 rebuild via LIST failed: %v", err)
+	}
+	if got := listCount.Load(); got != 1 {
+		t.Fatalf("expected 1 LIST call to rebuild wiped store, got %d", got)
+	}
+}

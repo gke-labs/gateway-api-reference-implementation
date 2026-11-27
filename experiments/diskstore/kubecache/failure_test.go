@@ -240,20 +240,21 @@ func TestAdapterFailure_DecodeFailure(t *testing.T) {
 	}
 }
 
-// TestAdapterFailure_DecryptFailure tests that a decrypt failure in the engine
-// calls OnFatal exactly once and List, ListKeys, and ByIndex never return partial results.
+// TestAdapterFailure_DecryptFailure tests that a corrupted encrypted heap block in the engine
+// calls OnFatal exactly once and List, ListKeys, and ByIndex never return partial results,
+// and that reopening with a different key fails closed with ErrInvalidKey.
 func TestAdapterFailure_DecryptFailure(t *testing.T) {
 	memFS := engine.NewMemFS()
-	cipher, err := engine.NewEphemeralAESGCMCipher()
+	encKey, err := engine.NewEncryptionKey()
 	if err != nil {
-		t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
+		t.Fatalf("NewEncryptionKey failed: %v", err)
 	}
 
-	eng, err := engine.Open(engine.WithFS(memFS), engine.WithCipher(cipher), engine.WithDir("fail_decrypt_err"), engine.WithCreate())
+	dir := "fail_decrypt_err"
+	eng, err := engine.Open(engine.WithFS(memFS), engine.WithEncryptionKey(encKey), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer eng.Close()
 
 	var fatalCount atomic.Int32
 	var fatalErr error
@@ -270,7 +271,6 @@ func TestAdapterFailure_DecryptFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
-	defer idx.Close()
 
 	// Pre-populate with valid secret
 	sec1 := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "sec-1"}}
@@ -278,32 +278,64 @@ func TestAdapterFailure_DecryptFailure(t *testing.T) {
 		t.Fatalf("Add sec1 failed: %v", err)
 	}
 
-	// Close engine and reopen with a different cipher key so that reading stored objects triggers decrypt failure
-	_ = idx.Close()
-	_ = eng.Close()
-
-	differentCipher, err := engine.NewEphemeralAESGCMCipher()
-	if err != nil {
-		t.Fatalf("NewEphemeralAESGCMCipher 2 failed: %v", err)
+	// Close engine cleanly to flush encrypted blocks to heap.db.
+	if err := idx.Close(); err != nil {
+		t.Fatalf("idx.Close failed: %v", err)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatalf("eng.Close failed: %v", err)
 	}
 
-	engWrongKey, err := engine.Open(engine.WithFS(memFS), engine.WithCipher(differentCipher), engine.WithDir("fail_decrypt_err"))
+	// Reopening with a different key without WithEraseOnError must fail closed at Open.
+	differentKey, err := engine.NewEncryptionKey()
 	if err != nil {
-		t.Fatalf("Open with different cipher failed: %v", err)
+		t.Fatalf("NewEncryptionKey 2 failed: %v", err)
 	}
-	defer engWrongKey.Close()
+	if _, err := engine.Open(engine.WithFS(memFS), engine.WithEncryptionKey(differentKey), engine.WithDir(dir)); !errors.Is(err, engine.ErrInvalidKey) {
+		t.Fatalf("expected ErrInvalidKey on Open with different key, got: %v", err)
+	}
 
-	// Reopen adapter with the wrong-key engine
+	// Reopen with the right key, then corrupt the encrypted heap block on disk so that
+	// reading stored objects decrypts to invalid block bytes and triggers engine failure.
+	engReopened, err := engine.Open(engine.WithFS(memFS), engine.WithEncryptionKey(encKey), engine.WithDir(dir))
+	if err != nil {
+		t.Fatalf("reopen with right key failed: %v", err)
+	}
+	defer engReopened.Close()
+
+	heapFile, err := memFS.OpenFile(dir+"/heap.db", os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatalf("OpenFile heap.db failed: %v", err)
+	}
+	sz, err := heapFile.Size()
+	if err != nil || sz == 0 {
+		t.Fatalf("unexpected heap.db size=%d err=%v", sz, err)
+	}
+	corruptByte := make([]byte, 1)
+	for off := int64(0); off < sz; off += int64(engine.BlockSize) {
+		if _, err := heapFile.ReadAt(corruptByte, off); err != nil {
+			t.Fatalf("ReadAt heap.db failed: %v", err)
+		}
+		corruptByte[0] ^= 0xff
+		if _, err := heapFile.WriteAt(corruptByte, off); err != nil {
+			t.Fatalf("WriteAt heap.db failed: %v", err)
+		}
+	}
+	if err := heapFile.Close(); err != nil {
+		t.Fatalf("Close heap.db failed: %v", err)
+	}
+
+	// Reopen adapter on the engine whose encrypted heap blocks are now corrupted on disk.
 	fatalCount.Store(0)
 	fatalErr = nil
-	idxWrongKey, err := New(engWrongKey, &corev1.Secret{}, onFatal,
+	idxCorrupt, err := New(engReopened, &corev1.Secret{}, onFatal,
 		WithIndexers(toolscache.Indexers{
 			"namespace": toolscache.MetaNamespaceIndexFunc,
 		}),
 	)
-	// New attempts to scan and rebuild secondary indexes, which hits decrypt failure!
+	// New attempts to scan and rebuild secondary indexes, which hits block decryption/CRC failure!
 	if err == nil {
-		t.Fatalf("expected New to fail on decrypt error during index rebuild")
+		t.Fatalf("expected New to fail on corrupt encrypted block during index rebuild")
 	}
 
 	if c := fatalCount.Load(); c != 1 {
@@ -313,14 +345,14 @@ func TestAdapterFailure_DecryptFailure(t *testing.T) {
 		t.Fatalf("expected non-nil fatalErr on decrypt failure")
 	}
 
-	if idxWrongKey != nil {
-		if len(idxWrongKey.List()) != 0 {
+	if idxCorrupt != nil {
+		if len(idxCorrupt.List()) != 0 {
 			t.Fatalf("expected empty List on decrypt failure")
 		}
-		if len(idxWrongKey.ListKeys()) != 0 {
+		if len(idxCorrupt.ListKeys()) != 0 {
 			t.Fatalf("expected empty ListKeys on decrypt failure")
 		}
-		items, bErr := idxWrongKey.ByIndex("namespace", "default")
+		items, bErr := idxCorrupt.ByIndex("namespace", "default")
 		if bErr == nil || len(items) != 0 {
 			t.Fatalf("expected error and empty ByIndex on decrypt failure")
 		}

@@ -154,7 +154,6 @@ type BlockPool struct {
 	wal      Log
 	buddy    *BuddyAllocator
 	directIO DirectIO
-	cipher   Cipher
 	// heapCipher is the AES-256-XTS cipher used for heap block encryption.
 	// A nil cipher means the store is not encrypted.
 	heapCipher *xts.Cipher
@@ -211,7 +210,6 @@ type BlockPool struct {
 // BlockPoolOptions configures the BlockPool.
 type BlockPoolOptions struct {
 	NumPoolBlocks int
-	Cipher        Cipher
 	// HeapCipher is the AES-256-XTS cipher used for encrypting and decrypting heap blocks.
 	// A nil cipher means the store is not encrypted.
 	HeapCipher *xts.Cipher
@@ -245,7 +243,6 @@ func NewBlockPool(file File, wal Log, buddy *BuddyAllocator, dbID [16]byte, opti
 		wal:                  wal,
 		buddy:                buddy,
 		directIO:             NewDirectIO(),
-		cipher:               options.Cipher,
 		heapCipher:           options.HeapCipher,
 		dbID:                 dbID,
 		numPoolBlocks:        numPoolBlocks,

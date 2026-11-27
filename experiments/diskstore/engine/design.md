@@ -523,7 +523,7 @@ Making `ByteString` a sequential stream keeps the stored format, threshold, and 
 
 Block encryption replaces per-value encryption and allows direct reads from any 4 KiB offset.
 
-In stores using block-level encryption, the engine encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak and a key derived per file. `Get` currently reads the full file, decrypts each 4 KiB unit, verifies the zero padding and SHA-256 checksum, and decompresses the result. Stores still using the legacy per-value cipher cannot serve a file-backed value without loading the full ciphertext into memory to decrypt it, so they must fall back to memory-backed values. When streaming `ByteString` reads land, block-encrypted stores will read 4 KiB units sequentially, decrypt each unit, and feed the decrypted stream into the decompressor.
+In stores using block-level encryption, the engine encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak and a key derived per file. `Get` currently reads the full file, decrypts each 4 KiB unit, verifies the zero padding and SHA-256 checksum, and decompresses the result. When streaming `ByteString` reads land, block-encrypted stores will read 4 KiB units sequentially, decrypt each unit, and feed the decrypted stream into the decompressor.
 
 ### Callers
 
@@ -557,7 +557,7 @@ Normal `Open` fails closed on several error conditions. A read-only engine toler
 - **A file that can't be quarantined:** Normal `Open` fails when an unreferenced oversize file or abandoned WAL segment cannot be moved to `lost+found`. Read-only opens anyway because it skips quarantine. `Get` returns normal data for referenced keys; unreferenced files do not affect lookups.
 - **A failure marker from an earlier run:** Normal `Open` fails with `ErrFailed` (or erases the store if `WithEraseOnError` is set). Read-only opens anyway and leaves the marker untouched on disk. `Get` returns valid data for healthy keys, and returns `ErrCorruptStore` for keys on damaged pages or corrupt oversize files that caused the prior failure.
 - **Corruption in a closed WAL segment:** Normal `Open` fails under Invariant 10. The maintainer must choose whether read-only opens anyway or fails. The recommendation is to open anyway by replaying records up to the corruption point and stopping with a logged warning. For keys updated in or after the corrupted record, `Get` returns the older durable heap value, or `ErrNotFound` if the key was created within the damaged log records.
-- **A damaged heap page:** Normal `Open` treats unreadable candidate blocks as torn, but steady-state reads of corrupt pages trigger the failed state. Read-only opens anyway. For keys stored on a damaged heap page, `Get` returns `ErrCorruptStore` (or `ErrDecrypt`) without writing a failure marker to disk, while keys on undamaged pages remain readable.
+- **A damaged heap page:** Normal `Open` treats unreadable candidate blocks as torn, but steady-state reads of corrupt pages trigger the failed state. Read-only opens anyway. For keys stored on a damaged heap page, `Get` returns `ErrCorruptStore` without writing a failure marker to disk, while keys on undamaged pages remain readable.
 
 ### Skipped Cleanup
 

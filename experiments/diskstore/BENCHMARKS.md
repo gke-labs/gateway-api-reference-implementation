@@ -169,3 +169,128 @@ What the comparison shows and what it doesn't: the WAL carries each payload once
 - **Durability Modes and Heap Flushes:** The workload without sync calls `Sync` only at checkpoints or close, so it makes nothing durable until a checkpoint or close. In that setting, with no checkpoint, 1,395 puts of 256 bytes wrote 20,480 bytes to the heap, because the resident pages were flushed once at close. Checkpointing every 1,000 operations flushes dirty pages at each checkpoint boundary, increasing heap write volume from 20,480 B to 32,768 B for 256 B values, and from 13,107,200 B to 19,922,944 B for 256 KiB values.
 - **Per-Operation Sync and WAL Block Padding:** In the "Sync after each op" mode, `Sync()` is called after each operation to make every modification immediately durable. Because WAL syncs pad unaligned trailing blocks with zeros up to the 4,096-byte boundary (`WALBlockSize`) before fsyncing, small 256 B puts write a full 4 KiB block per operation. This produces 7,409,664 bytes written to the WAL for 357,120 bytes of payload (a write ratio of 20.82 and 0.9105 syncs per operation). At 2 KiB values, block padding produces a 2.67 ratio. At 16 KiB and 256 KiB, values span multiple full blocks (4 and 64 blocks respectively), so trailing padding represents a much smaller fraction of total writes (ratios of 1.36 and 1.06).
 - **WAL Segment Rollover:** The default WAL segment size is 16 MiB (`DefaultMaxSegmentSize`). For 256 KiB values, accumulating ~370 MB of writes causes segment rollover every 16 MiB, which explains the 0.0210–0.0250 syncs per operation observed even without explicit per-operation syncs.
+
+---
+
+## 5. Block-Level Encryption Measurement (`TestDiskStore_Versus_BBolt_MeasurementSuite`)
+
+Recorded after removing the per-value AES-GCM cipher in favor of block-level AES-256-XTS encryption across heap blocks, WAL segments, and oversize files.
+
+### Environment & Commands
+
+- **Date:** 2026-11-27
+- **Machine:** AMD EPYC 9B14 (60 vCPUs, 235 GiB RAM, Linux 6.12.110+ x86_64)
+- **Go Version:** `go1.27.4 linux/amd64`
+- **Commands:**
+  ```bash
+  # Encryption ON (DiskStore: AES-256-XTS block encryption; BBolt: AES-256-GCM)
+  go test -v -count=1 -run=^TestDiskStore_Versus_BBolt_MeasurementSuite$ ./experiments/diskstore/kubecache
+
+  # Encryption OFF (DiskStore: unencrypted; BBolt: NoopCipher)
+  BENCHMARK_ENCRYPTION=off go test -v -count=1 -run=^TestDiskStore_Versus_BBolt_MeasurementSuite$ ./experiments/diskstore/kubecache
+  ```
+
+### Results: Encryption ON (AES-256-XTS Block Encryption)
+
+#### Storage, Memory & Write Performance
+
+| Corpus | Storage Engine | Heap In-Use | Process RSS | Heap File | WAL Size | Total Disk | Write Time | Write Throughput | Recovery |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Configuration Text (JSON)** (2,500 objs) | In-Memory Informer | 28.61 MB | 79.40 MB | - | - | 0 MB (RAM) | 0.31 s | 8,154 op/s | - |
+| | BBolt (mmap + NoSync) | 0.34 MB | 71.77 MB | 48.06 MB | 0.00 MB | 48.06 MB | 0.60 s | 4,149 op/s | 3.3 ms |
+| | DiskStore (None) | 15.66 MB | 68.52 MB | 39.81 MB | 8.77 MB | 48.58 MB | 0.52 s | 4,846 op/s | 475 ms |
+| | DiskStore (zstd) | 15.23 MB | 65.50 MB | 4.89 MB | 3.51 MB | 8.40 MB | 0.40 s | 6,189 op/s | 83 ms |
+| | DiskStore (None, 64 MB pool) | 75.19 MB | 152.29 MB | 39.08 MB | 8.77 MB | 47.85 MB | 0.49 s | 5,150 op/s | 460 ms |
+| **TLS Material (x509 PEM)** (2,500 objs) | In-Memory Informer | 30.08 MB | 82.07 MB | - | - | 0 MB (RAM) | 0.43 s | 5,763 op/s | - |
+| | BBolt (mmap + NoSync) | 0.27 MB | 72.37 MB | 48.08 MB | 0.00 MB | 48.08 MB | 0.74 s | 3,367 op/s | 3.4 ms |
+| | DiskStore (None) | 15.50 MB | 69.21 MB | 39.81 MB | 8.84 MB | 48.66 MB | 0.64 s | 3,898 op/s | 436 ms |
+| | DiskStore (zstd) | 15.70 MB | 71.11 MB | 9.77 MB | 6.29 MB | 16.05 MB | 0.57 s | 4,418 op/s | 154 ms |
+| | DiskStore (None, 64 MB pool) | 74.48 MB | 152.91 MB | 39.08 MB | 8.83 MB | 47.91 MB | 0.63 s | 3,952 op/s | 592 ms |
+| **Random Incompressible Bytes** (2,500 objs) | In-Memory Informer | 27.34 MB | 62.04 MB | - | - | 0 MB (RAM) | 0.06 s | 43,026 op/s | - |
+| | BBolt (mmap + NoSync) | 0.23 MB | 71.65 MB | 48.06 MB | 0.00 MB | 48.06 MB | 0.30 s | 8,464 op/s | 3.5 ms |
+| | DiskStore (None) | 14.49 MB | 68.59 MB | 39.81 MB | 8.79 MB | 48.60 MB | 0.30 s | 8,448 op/s | 501 ms |
+| | DiskStore (zstd) | 14.43 MB | 70.20 MB | 39.81 MB | 8.79 MB | 48.60 MB | 0.31 s | 7,942 op/s | 452 ms |
+| | DiskStore (None, 64 MB pool) | 70.88 MB | 149.66 MB | 39.08 MB | 8.77 MB | 47.85 MB | 0.28 s | 9,000 op/s | 458 ms |
+| **Mixed Realistic Corpus** (10,000 objs) | In-Memory Informer | 115.84 MB | 206.18 MB | - | - | 0 MB (RAM) | 1.08 s | 9,221 op/s | - |
+| | BBolt (mmap + NoSync) | 0.72 MB | 173.57 MB | 144.23 MB | 0.00 MB | 144.23 MB | 2.56 s | 3,900 op/s | 14 ms |
+| | DiskStore (None) | 19.69 MB | 77.86 MB | 157.81 MB | 3.20 MB | 161.01 MB | 2.17 s | 4,608 op/s | 1,638 ms |
+| | DiskStore (zstd) | 19.62 MB | 80.62 MB | 89.98 MB | 14.02 MB | 104.00 MB | 3.29 s | 3,044 op/s | 879 ms |
+| | DiskStore (None, 64 MB pool) | 78.46 MB | 185.88 MB | 159.08 MB | 3.15 MB | 162.23 MB | 2.52 s | 3,969 op/s | 1,562 ms |
+
+#### Recompute Read Latency (Encryption ON)
+
+| Corpus | Storage Engine | 0 refs (Cold / Warm) | 10 refs (Cold / Warm) | 1,000 refs (Cold / Warm) |
+| :--- | :--- | :---: | :---: | :---: |
+| **Configuration Text (JSON)** | In-Memory Informer | 0 µs | 13 µs | 353 µs |
+| | BBolt (mmap + NoSync) | 3 µs / 0 µs | 200 µs / 15 µs | 18 ms / 538 µs |
+| | DiskStore (None) | 0 µs / 0 µs | 3.0 ms / 88 µs | 333 ms / 336 ms |
+| | DiskStore (zstd) | 0 µs / 0 µs | 275 µs / 138 µs | 15 ms / 14 ms |
+| | DiskStore (None, 64 MB pool) | 0 µs / 0 µs | 128 µs / 128 µs | 7.1 ms / 9.0 ms |
+| **TLS Material (x509 PEM)** | In-Memory Informer | 0 µs | 10 µs | 276 µs |
+| | BBolt (mmap + NoSync) | 3 µs / 0 µs | 162 µs / 13 µs | 19 ms / 524 µs |
+| | DiskStore (None) | 0 µs / 0 µs | 3.0 ms / 73 µs | 319 ms / 336 ms |
+| | DiskStore (zstd) | 0 µs / 0 µs | 1.9 ms / 180 µs | 181 ms / 19 ms |
+| | DiskStore (None, 64 MB pool) | 0 µs / 0 µs | 175 µs / 74 µs | 6.7 ms / 7.4 ms |
+| **Random Incompressible Bytes** | In-Memory Informer | 0 µs | 11 µs | 307 µs |
+| | BBolt (mmap + NoSync) | 3 µs / 1 µs | 137 µs / 7 µs | 18 ms / 552 µs |
+| | DiskStore (None) | 0 µs / 0 µs | 3.2 ms / 76 µs | 321 ms / 336 ms |
+| | DiskStore (zstd) | 0 µs / 0 µs | 3.3 ms / 50 µs | 348 ms / 350 ms |
+| | DiskStore (None, 64 MB pool) | 0 µs / 0 µs | 133 µs / 67 µs | 5.9 ms / 5.8 ms |
+| **Mixed Realistic Corpus** | In-Memory Informer | 0 µs | 13 µs | 383 µs |
+| | BBolt (mmap + NoSync) | 3 µs / 0 µs | 145 µs / 11 µs | 20 ms / 640 µs |
+| | DiskStore (None) | 0 µs / 0 µs | 3.1 ms / 66 µs | 430 ms / 449 ms |
+| | DiskStore (zstd) | 0 µs / 0 µs | 2.9 ms / 127 µs | 483 ms / 13 ms |
+| | DiskStore (None, 64 MB pool) | 0 µs / 0 µs | 5.7 ms / 87 µs | 461 ms / 7.4 ms |
+
+### Results: Encryption OFF
+
+#### Storage, Memory & Write Performance
+
+| Corpus | Storage Engine | Heap In-Use | Process RSS | Heap File | WAL Size | Total Disk | Write Time | Write Throughput | Recovery |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Configuration Text (JSON)** (2,500 objs) | In-Memory Informer | 28.76 MB | 81.75 MB | - | - | 0 MB (RAM) | 0.44 s | 5,695 op/s | - |
+| | BBolt (mmap + NoSync) | 0.35 MB | 71.00 MB | 48.09 MB | 0.00 MB | 48.09 MB | 0.80 s | 3,109 op/s | 4.7 ms |
+| | DiskStore (None) | 14.62 MB | 65.37 MB | 39.81 MB | 8.77 MB | 48.58 MB | 0.58 s | 4,281 op/s | 191 ms |
+| | DiskStore (zstd) | 14.38 MB | 65.11 MB | 4.89 MB | 3.51 MB | 8.40 MB | 0.55 s | 4,567 op/s | 48 ms |
+| | DiskStore (None, 64 MB pool) | 74.09 MB | 149.00 MB | 39.08 MB | 8.77 MB | 47.85 MB | 0.43 s | 5,833 op/s | 167 ms |
+| **TLS Material (x509 PEM)** (2,500 objs) | In-Memory Informer | 30.09 MB | 79.59 MB | - | - | 0 MB (RAM) | 0.47 s | 5,297 op/s | - |
+| | BBolt (mmap + NoSync) | 0.30 MB | 73.12 MB | 48.09 MB | 0.00 MB | 48.09 MB | 1.04 s | 2,394 op/s | 5.8 ms |
+| | DiskStore (None) | 14.41 MB | 66.78 MB | 39.81 MB | 8.84 MB | 48.66 MB | 1.44 s | 1,734 op/s | 170 ms |
+| | DiskStore (zstd) | 14.60 MB | 69.21 MB | 9.77 MB | 6.30 MB | 16.07 MB | 0.59 s | 4,220 op/s | 51 ms |
+| | DiskStore (None, 64 MB pool) | 73.34 MB | 150.73 MB | 39.08 MB | 8.83 MB | 47.91 MB | 0.56 s | 4,466 op/s | 153 ms |
+| **Random Incompressible Bytes** (2,500 objs) | In-Memory Informer | 27.32 MB | 61.89 MB | - | - | 0 MB (RAM) | 0.06 s | 39,950 op/s | - |
+| | BBolt (mmap + NoSync) | 0.23 MB | 73.95 MB | 48.09 MB | 0.00 MB | 48.09 MB | 0.28 s | 9,079 op/s | 3.4 ms |
+| | DiskStore (None) | 13.53 MB | 65.66 MB | 39.81 MB | 8.79 MB | 48.60 MB | 0.17 s | 14,667 op/s | 165 ms |
+| | DiskStore (zstd) | 13.54 MB | 67.98 MB | 39.81 MB | 8.79 MB | 48.60 MB | 0.19 s | 13,283 op/s | 158 ms |
+| | DiskStore (None, 64 MB pool) | 69.84 MB | 148.01 MB | 39.08 MB | 8.77 MB | 47.85 MB | 0.16 s | 15,402 op/s | 184 ms |
+| **Mixed Realistic Corpus** (10,000 objs) | In-Memory Informer | 115.60 MB | 198.69 MB | - | - | 0 MB (RAM) | 1.14 s | 8,736 op/s | - |
+| | BBolt (mmap + NoSync) | 0.72 MB | 174.93 MB | 144.21 MB | 0.00 MB | 144.21 MB | 2.27 s | 4,413 op/s | 15 ms |
+| | DiskStore (None) | 18.38 MB | 76.50 MB | 157.81 MB | 3.20 MB | 161.01 MB | 1.66 s | 6,016 op/s | 518 ms |
+| | DiskStore (zstd) | 18.64 MB | 80.25 MB | 121.94 MB | 14.09 MB | 136.02 MB | 1.83 s | 5,479 op/s | 395 ms |
+| | DiskStore (None, 64 MB pool) | 77.45 MB | 183.09 MB | 159.08 MB | 3.15 MB | 162.23 MB | 2.07 s | 4,838 op/s | 567 ms |
+
+#### Recompute Read Latency (Encryption OFF)
+
+| Corpus | Storage Engine | 0 refs (Cold / Warm) | 10 refs (Cold / Warm) | 1,000 refs (Cold / Warm) |
+| :--- | :--- | :---: | :---: | :---: |
+| **Configuration Text (JSON)** | In-Memory Informer | 0 µs | 18 µs | 545 µs |
+| | BBolt (mmap + NoSync) | 4 µs / 1 µs | 116 µs / 11 µs | 14 ms / 931 µs |
+| | DiskStore (None) | 0 µs / 0 µs | 2.5 ms / 112 µs | 342 ms / 301 ms |
+| | DiskStore (zstd) | 0 µs / 0 µs | 335 µs / 233 µs | 26 ms / 24 ms |
+| | DiskStore (None, 64 MB pool) | 0 µs / 0 µs | 149 µs / 66 µs | 5.9 ms / 9.8 ms |
+| **TLS Material (x509 PEM)** | In-Memory Informer | 0 µs | 14 µs | 431 µs |
+| | BBolt (mmap + NoSync) | 7 µs / 1 µs | 169 µs / 11 µs | 16 ms / 632 µs |
+| | DiskStore (None) | 0 µs / 0 µs | 3.1 ms / 148 µs | 304 ms / 288 ms |
+| | DiskStore (zstd) | 0 µs / 0 µs | 1.5 ms / 250 µs | 172 ms / 21 ms |
+| | DiskStore (None, 64 MB pool) | 0 µs / 0 µs | 117 µs / 57 µs | 6.6 ms / 8.1 ms |
+| **Random Incompressible Bytes** | In-Memory Informer | 0 µs | 13 µs | 333 µs |
+| | BBolt (mmap + NoSync) | 7 µs / 0 µs | 148 µs / 10 µs | 20 ms / 598 µs |
+| | DiskStore (None) | 0 µs / 0 µs | 2.6 ms / 65 µs | 270 ms / 321 ms |
+| | DiskStore (zstd) | 0 µs / 0 µs | 2.6 ms / 161 µs | 283 ms / 292 ms |
+| | DiskStore (None, 64 MB pool) | 0 µs / 0 µs | 137 µs / 111 µs | 7.6 ms / 6.3 ms |
+| **Mixed Realistic Corpus** | In-Memory Informer | 0 µs | 20 µs | 616 µs |
+| | BBolt (mmap + NoSync) | 3 µs / 0 µs | 93 µs / 7 µs | 13 ms / 674 µs |
+| | DiskStore (None) | 0 µs / 0 µs | 2.7 ms / 59 µs | 386 ms / 368 ms |
+| | DiskStore (zstd) | 0 µs / 0 µs | 2.5 ms / 125 µs | 351 ms / 15 ms |
+| | DiskStore (None, 64 MB pool) | 0 µs / 0 µs | 4.8 ms / 78 µs | 426 ms / 7.8 ms |
+

@@ -498,87 +498,22 @@ func TestEngine_BlockEncryption_OpenKeyVerification(t *testing.T) {
 			}
 		}
 	})
+}
 
-	t.Run("Interaction_StoreWithKey_OpenedWithCipherOnly", func(t *testing.T) {
-		memFS := NewMemFS()
-		dir := "test_key_store_cipher_open"
+func TestNewEncryptionKey(t *testing.T) {
+	k1, err := NewEncryptionKey()
+	if err != nil {
+		t.Fatalf("NewEncryptionKey failed: %v", err)
+	}
+	if len(k1) != MasterKeySize {
+		t.Fatalf("key length = %d, want %d", len(k1), MasterKeySize)
+	}
 
-		store, err := Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(validKey[:]), WithCreate())
-		if err != nil {
-			t.Fatalf("Open with key failed: %v", err)
-		}
-		if err := store.Put("Table", "k", []byte("v")); err != nil {
-			t.Fatalf("Put failed: %v", err)
-		}
-		if err := store.Close(); err != nil {
-			t.Fatalf("Close failed: %v", err)
-		}
-
-		cipher, err := NewEphemeralAESGCMCipher()
-		if err != nil {
-			t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
-		}
-
-		// Reopen with only WithCipher: must return an error stating encryption key option is required,
-		// and NOT say "cipher option required".
-		_, err = Open(WithFS(memFS), WithDir(dir), WithCipher(cipher))
-		if err == nil {
-			t.Fatalf("expected Open with only cipher to fail on key-encrypted store")
-		}
-		expectedErr := "store is encrypted with a key: encryption key option required"
-		if !strings.Contains(err.Error(), expectedErr) {
-			t.Fatalf("expected error containing %q, got: %v", expectedErr, err)
-		}
-		if !errors.Is(err, ErrStoreEncrypted) {
-			t.Fatalf("expected error to wrap ErrStoreEncrypted, got: %v", err)
-		}
-		if strings.Contains(err.Error(), "cipher option required") {
-			t.Fatalf("error should not mention 'cipher option required', got: %v", err)
-		}
-	})
-
-	t.Run("Interaction_StoreWithCipher_OpenedWithKey", func(t *testing.T) {
-		memFS := NewMemFS()
-		dir := "test_cipher_store_key_open"
-
-		cipher, err := NewEphemeralAESGCMCipher()
-		if err != nil {
-			t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
-		}
-
-		store, err := Open(WithFS(memFS), WithDir(dir), WithCipher(cipher), WithCreate())
-		if err != nil {
-			t.Fatalf("Open with cipher failed: %v", err)
-		}
-		if err := store.Put("Table", "k", []byte("v")); err != nil {
-			t.Fatalf("Put failed: %v", err)
-		}
-		if err := store.Close(); err != nil {
-			t.Fatalf("Close failed: %v", err)
-		}
-
-		// Reopen with WithEncryptionKey without WithEraseOnError: must fail with ErrInvalidKey
-		_, err = Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(validKey[:]))
-		if err == nil {
-			t.Fatalf("expected Open with key to fail on cipher-only store")
-		}
-		if !errors.Is(err, ErrInvalidKey) {
-			t.Fatalf("expected ErrInvalidKey, got: %v", err)
-		}
-
-		// Reopen with WithEncryptionKey and WithEraseOnError: must erase and recreate store
-		store2, err := Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(validKey[:]), WithEraseOnError())
-		if err != nil {
-			t.Fatalf("Open with key and WithEraseOnError failed: %v", err)
-		}
-		defer store2.Close()
-
-		if !store2.Wiped() {
-			t.Fatalf("expected store to be wiped when opening cipher-only store with key and WithEraseOnError")
-		}
-		_, exists, err := store2.Get("Table", "k")
-		if err != nil || exists {
-			t.Fatalf("expected key to be wiped, exists=%v, err=%v", exists, err)
-		}
-	})
+	k2, err := NewEncryptionKey()
+	if err != nil {
+		t.Fatalf("second NewEncryptionKey failed: %v", err)
+	}
+	if bytes.Equal(k1, k2) {
+		t.Fatalf("two generated encryption keys should not be equal")
+	}
 }

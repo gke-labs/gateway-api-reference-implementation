@@ -237,8 +237,7 @@ func TestHeapEncryption_BlockCopiedToAnotherPositionFailsCRC32C(t *testing.T) {
 }
 
 // TestHeapEncryption_ErrorMessagesAndWrapping verifies that the encrypted and not-encrypted errors
-// match ErrStoreEncrypted and ErrStoreNotEncrypted, and that opening a key-encrypted store without
-// the key wraps ErrStoreEncrypted.
+// match ErrStoreEncrypted and ErrStoreNotEncrypted.
 func TestHeapEncryption_ErrorMessagesAndWrapping(t *testing.T) {
 	memFS := NewMemFS()
 	var key [32]byte
@@ -254,26 +253,13 @@ func TestHeapEncryption_ErrorMessagesAndWrapping(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
-	// Reopen with no key and no cipher: must fail with ErrStoreEncrypted
+	// Reopen without key: must fail with ErrStoreEncrypted
 	_, err = Open(WithFS(memFS), WithDir(keyDir))
 	if err == nil {
 		t.Fatalf("expected Open without key to fail")
 	}
 	if !errors.Is(err, ErrStoreEncrypted) {
 		t.Fatalf("expected ErrStoreEncrypted, got: %v", err)
-	}
-
-	// Reopen with cipher only: must wrap ErrStoreEncrypted
-	cipher, err := NewEphemeralAESGCMCipher()
-	if err != nil {
-		t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
-	}
-	_, err = Open(WithFS(memFS), WithDir(keyDir), WithCipher(cipher))
-	if err == nil {
-		t.Fatalf("expected Open with cipher only to fail on key store")
-	}
-	if !errors.Is(err, ErrStoreEncrypted) {
-		t.Fatalf("expected error to wrap ErrStoreEncrypted, got: %v", err)
 	}
 
 	// 2. Create unencrypted store
@@ -290,15 +276,6 @@ func TestHeapEncryption_ErrorMessagesAndWrapping(t *testing.T) {
 	_, err = Open(WithFS(memFS), WithDir(unencDir), WithEncryptionKey(key[:]))
 	if err == nil {
 		t.Fatalf("expected Open with key to fail on unencrypted store")
-	}
-	if !errors.Is(err, ErrStoreNotEncrypted) {
-		t.Fatalf("expected ErrStoreNotEncrypted, got: %v", err)
-	}
-
-	// Reopen unencrypted store with cipher: must fail with ErrStoreNotEncrypted
-	_, err = Open(WithFS(memFS), WithDir(unencDir), WithCipher(cipher))
-	if err == nil {
-		t.Fatalf("expected Open with cipher to fail on unencrypted store")
 	}
 	if !errors.Is(err, ErrStoreNotEncrypted) {
 		t.Fatalf("expected ErrStoreNotEncrypted, got: %v", err)

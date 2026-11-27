@@ -2073,18 +2073,18 @@ func TestRegression_OversizeValueFileFirst(t *testing.T) {
 }
 
 func TestEngine_EncryptionMismatchRejection(t *testing.T) {
-	cipher, err := NewEphemeralAESGCMCipher()
+	encKey, err := NewEncryptionKey()
 	if err != nil {
-		t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
+		t.Fatalf("NewEncryptionKey failed: %v", err)
 	}
 
-	t.Run("EncryptedStore_OpenedWithoutCipher", func(t *testing.T) {
+	t.Run("EncryptedStore_OpenedWithoutKey", func(t *testing.T) {
 		memFS := NewMemFS()
 		dir := "encrypted_store"
 
-		store, err := Open(WithFS(memFS), WithDir(dir), WithCipher(cipher), WithCreate())
+		store, err := Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(encKey), WithCreate())
 		if err != nil {
-			t.Fatalf("Open with cipher failed: %v", err)
+			t.Fatalf("Open with key failed: %v", err)
 		}
 		if err := store.Put("Secrets", "key1", []byte("secret-payload")); err != nil {
 			t.Fatalf("Put failed: %v", err)
@@ -2093,10 +2093,10 @@ func TestEngine_EncryptionMismatchRejection(t *testing.T) {
 			t.Fatalf("Close failed: %v", err)
 		}
 
-		// Reopen without cipher: must fail with ErrStoreEncrypted and error mentioning store is encrypted
+		// Reopen without key: must fail with ErrStoreEncrypted and error mentioning store is encrypted
 		_, err = Open(WithFS(memFS), WithDir(dir))
 		if err == nil {
-			t.Fatalf("expected Open without cipher to fail on encrypted store, but succeeded")
+			t.Fatalf("expected Open without key to fail on encrypted store, but succeeded")
 		}
 		if !errors.Is(err, ErrStoreEncrypted) {
 			t.Fatalf("expected ErrStoreEncrypted, got: %v", err)
@@ -2111,10 +2111,10 @@ func TestEngine_EncryptionMismatchRejection(t *testing.T) {
 			t.Fatalf("expected ErrStoreEncrypted with WithEraseOnError, got: %v", err)
 		}
 
-		// Reopen with cipher: must succeed and data must be intact
-		storeReopened, err := Open(WithFS(memFS), WithDir(dir), WithCipher(cipher))
+		// Reopen with key: must succeed and data must be intact
+		storeReopened, err := Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(encKey))
 		if err != nil {
-			t.Fatalf("reopening with cipher failed: %v", err)
+			t.Fatalf("reopening with key failed: %v", err)
 		}
 		defer storeReopened.Close()
 
@@ -2124,7 +2124,7 @@ func TestEngine_EncryptionMismatchRejection(t *testing.T) {
 		}
 	})
 
-	t.Run("UnencryptedStore_OpenedWithCipher", func(t *testing.T) {
+	t.Run("UnencryptedStore_OpenedWithKey", func(t *testing.T) {
 		memFS := NewMemFS()
 		dir := "unencrypted_store"
 
@@ -2139,25 +2139,25 @@ func TestEngine_EncryptionMismatchRejection(t *testing.T) {
 			t.Fatalf("Close failed: %v", err)
 		}
 
-		// Reopen with cipher: must fail with ErrStoreNotEncrypted
-		_, err = Open(WithFS(memFS), WithDir(dir), WithCipher(cipher))
+		// Reopen with key: must fail with ErrStoreNotEncrypted
+		_, err = Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(encKey))
 		if err == nil {
-			t.Fatalf("expected Open with cipher to fail on unencrypted store, but succeeded")
+			t.Fatalf("expected Open with key to fail on unencrypted store, but succeeded")
 		}
 		if !errors.Is(err, ErrStoreNotEncrypted) {
 			t.Fatalf("expected ErrStoreNotEncrypted, got: %v", err)
 		}
 
 		// Even with WithEraseOnError, it must not wipe and still reject
-		_, err = Open(WithFS(memFS), WithDir(dir), WithCipher(cipher), WithEraseOnError())
+		_, err = Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(encKey), WithEraseOnError())
 		if !errors.Is(err, ErrStoreNotEncrypted) {
 			t.Fatalf("expected ErrStoreNotEncrypted with WithEraseOnError, got: %v", err)
 		}
 
-		// Reopen without cipher: must succeed and data must be intact
+		// Reopen without key: must succeed and data must be intact
 		storeReopened, err := Open(WithFS(memFS), WithDir(dir))
 		if err != nil {
-			t.Fatalf("reopening without cipher failed: %v", err)
+			t.Fatalf("reopening without key failed: %v", err)
 		}
 		defer storeReopened.Close()
 

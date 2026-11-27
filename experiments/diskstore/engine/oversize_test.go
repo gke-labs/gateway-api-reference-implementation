@@ -653,39 +653,26 @@ func TestOversize_TruncatedFile_GetReturnsCorruptionError(t *testing.T) {
 	})
 }
 
-type magicPrefixCipher struct{}
-
-func (c *magicPrefixCipher) Encrypt(plaintext, additionalData []byte) ([]byte, error) {
-	// Prefix ciphertext with OversizePointerMagic (0x4F, 0x56, 0x53, 0x50 = "OVSP")
-	out := make([]byte, 4+len(plaintext))
-	binary.BigEndian.PutUint32(out[0:4], OversizePointerMagic)
-	copy(out[4:], plaintext)
-	return out, nil
-}
-
-func (c *magicPrefixCipher) Decrypt(ciphertext, additionalData []byte) ([]byte, error) {
-	if len(ciphertext) < 4 || binary.BigEndian.Uint32(ciphertext[0:4]) != OversizePointerMagic {
-		return nil, errors.New("bad magic prefix in ciphertext")
-	}
-	return append([]byte(nil), ciphertext[4:]...), nil
-}
-
-// Review Feedback Item 2:
-// A small record whose encrypted output starts with OversizePointerMagic must NOT be
+// A small record whose payload starts with OversizePointerMagic must NOT be
 // misidentified as an oversize pointer record, and must read back correctly after reopen.
-func TestOversize_CipherOutputStartingWithMagic_ReadsBackCorrectly(t *testing.T) {
+func TestOversize_PayloadStartingWithMagic_ReadsBackCorrectly(t *testing.T) {
 	memFS := NewMemFS()
-	dir := "test_oversize_magic_prefix_cipher"
-	cipher := &magicPrefixCipher{}
+	dir := "test_oversize_magic_prefix_payload"
+	encKey, err := NewEncryptionKey()
+	if err != nil {
+		t.Fatalf("NewEncryptionKey failed: %v", err)
+	}
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithCipher(cipher), WithCreate())
+	store, err := Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(encKey), WithCompressionCodec(CodecNone), WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
 
 	table := "TestTable"
 	key := "smallRecord"
-	plainVal := []byte("hello-this-is-a-small-regular-slotted-record")
+	plainVal := make([]byte, 4+len("hello-this-is-a-small-regular-slotted-record"))
+	binary.BigEndian.PutUint32(plainVal[0:4], OversizePointerMagic)
+	copy(plainVal[4:], "hello-this-is-a-small-regular-slotted-record")
 	if err := store.Put(table, key, plainVal); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
@@ -697,7 +684,7 @@ func TestOversize_CipherOutputStartingWithMagic_ReadsBackCorrectly(t *testing.T)
 	}
 
 	// Reopen store
-	store2, err := Open(WithFS(memFS), WithDir(dir), WithCipher(cipher))
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithEncryptionKey(encKey), WithCompressionCodec(CodecNone))
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}
@@ -712,7 +699,7 @@ func TestOversize_CipherOutputStartingWithMagic_ReadsBackCorrectly(t *testing.T)
 		t.Fatalf("expected key to exist in index")
 	}
 	if entry.IsOversize {
-		t.Fatalf("key was incorrectly identified as oversize due to ciphertext magic bytes")
+		t.Fatalf("key was incorrectly identified as oversize due to payload magic bytes")
 	}
 
 	got, exists, err := store2.Get(table, key)

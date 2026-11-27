@@ -209,9 +209,9 @@ func TestCompression_RoundTripAllCodecs(t *testing.T) {
 		2080000, 2100000,
 	}
 
-	cipher, err := NewEphemeralAESGCMCipher()
+	encKey, err := NewEncryptionKey()
 	if err != nil {
-		t.Fatalf("cipher creation failed: %v", err)
+		t.Fatalf("NewEncryptionKey failed: %v", err)
 	}
 
 	for _, tc := range codecs {
@@ -221,7 +221,7 @@ func TestCompression_RoundTripAllCodecs(t *testing.T) {
 				WithFS(memFS),
 				WithDir("test_roundtrip_"+tc.name),
 				WithCompressionCodec(tc.codec),
-				WithCipher(cipher),
+				WithEncryptionKey(encKey),
 				WithCreate(),
 			)
 			if err != nil {

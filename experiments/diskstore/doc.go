@@ -16,7 +16,7 @@
 // The implementation is divided into two packages:
 //   - engine: A core database engine with a WAL, self-describing 4 KiB block heap file,
 //     fixed-size direct I/O block pool, out-of-place buddy allocation, crash recovery,
-//     and payload encryption. See experiments/diskstore/engine/design.md for design details.
+//     and block-level encryption. See experiments/diskstore/engine/design.md for design details.
 //   - kubecache: A Kubernetes cache adapter that implements client-go's cache.Indexer
 //     on top of the engine with a fail-fast error policy.
 package diskstore
