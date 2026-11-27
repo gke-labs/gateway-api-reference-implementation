@@ -292,3 +292,80 @@ func TestWriteMeasurement(t *testing.T) {
 	}
 	fmt.Println()
 }
+
+func TestWALBytesWrittenMatchesMeasureFS(t *testing.T) {
+	runWorkload := func(t *testing.T, codec CompressionCodec) (walBytesWritten int64, measuredWALBytes int64, retainedWALBytes int64) {
+		t.Helper()
+
+		baseFS := NewMemFS()
+		measuredFS := newMeasureFS(baseFS)
+		dir := "/wal-bytes-written"
+
+		store, err := Open(
+			WithFS(measuredFS),
+			WithDir(dir),
+			WithCreate(),
+			WithCompressionCodec(codec),
+			WithWALMaxSegmentSize(64*1024),
+			WithNumPoolBlocks(512),
+		)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+
+		payload := []byte(strings.Repeat("gateway-api-config-payload-entry-", 300))
+		for i := 0; i < 60; i++ {
+			key := fmt.Sprintf("ns-00/cm-%05d", i)
+			if err := store.Put("ConfigMap", key, payload); err != nil {
+				t.Fatalf("Put(%s) failed: %v", key, err)
+			}
+			if (i+1)%20 == 0 {
+				if err := store.Checkpoint(); err != nil {
+					t.Fatalf("Checkpoint failed at %d: %v", i, err)
+				}
+			}
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		entries, err := baseFS.ReadDir(filepath.Join(dir, "wal"))
+		if err != nil {
+			t.Fatalf("ReadDir(wal) failed: %v", err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				t.Fatalf("entry.Info(%s) failed: %v", entry.Name(), err)
+			}
+			retainedWALBytes += info.Size()
+		}
+
+		return store.WALBytesWritten(), measuredFS.Stats(kindWAL).bytesWritten, retainedWALBytes
+	}
+
+	noneWritten, noneMeasured, noneRetained := runWorkload(t, CodecNone)
+	if noneWritten == 0 {
+		t.Fatalf("expected positive WALBytesWritten for uncompressed store")
+	}
+	if noneWritten != noneMeasured {
+		t.Fatalf("uncompressed WALBytesWritten = %d, want measureFS WAL bytes %d", noneWritten, noneMeasured)
+	}
+	if noneWritten <= noneRetained {
+		t.Fatalf("expected cumulative WALBytesWritten (%d) to exceed retained WAL size (%d) after segment rollovers and checkpoints", noneWritten, noneRetained)
+	}
+
+	zstdWritten, zstdMeasured, _ := runWorkload(t, CodecZstd)
+	if zstdWritten == 0 {
+		t.Fatalf("expected positive WALBytesWritten for zstd store")
+	}
+	if zstdWritten != zstdMeasured {
+		t.Fatalf("zstd WALBytesWritten = %d, want measureFS WAL bytes %d", zstdWritten, zstdMeasured)
+	}
+	if zstdWritten >= noneWritten {
+		t.Fatalf("expected zstd WALBytesWritten (%d) to be lower than uncompressed (%d) on compressible payloads", zstdWritten, noneWritten)
+	}
+}

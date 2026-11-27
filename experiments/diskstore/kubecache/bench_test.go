@@ -372,24 +372,23 @@ func readMemStats() MemorySnapshot {
 	return snap
 }
 
-func getDiskBreakdown(dir string) (heapMB float64, walMB float64, totalMB float64, err error) {
-	heapFi, err := os.Stat(filepath.Join(dir, "heap.db"))
+func getDiskBreakdown(dir string) (heapMB float64, retainedWALMB float64, err error) {
+	heapFileInfo, err := os.Stat(filepath.Join(dir, "heap.db"))
 	if err == nil {
-		heapMB = float64(heapFi.Size()) / (1024 * 1024)
+		heapMB = float64(heapFileInfo.Size()) / (1024 * 1024)
 	}
 	walEntries, _ := os.ReadDir(filepath.Join(dir, "wal"))
-	var walTotal int64
-	for _, e := range walEntries {
-		if !e.IsDir() {
-			fi, err := e.Info()
-			if err == nil {
-				walTotal += fi.Size()
+	var retainedWALBytes int64
+	for _, entry := range walEntries {
+		if !entry.IsDir() {
+			info, infoErr := entry.Info()
+			if infoErr == nil {
+				retainedWALBytes += info.Size()
 			}
 		}
 	}
-	walMB = float64(walTotal) / (1024 * 1024)
-	totalMB = heapMB + walMB
-	return heapMB, walMB, totalMB, nil
+	retainedWALMB = float64(retainedWALBytes) / (1024 * 1024)
+	return heapMB, retainedWALMB, nil
 }
 
 func measureRecomputeMem(t *testing.T, indexer toolscache.Indexer, corpus string, refs int) time.Duration {
@@ -475,8 +474,8 @@ type WorkerResult struct {
 	ProcessRSSMB     float64 `json:"process_rss_mb"`
 	DeltaRSSMB       float64 `json:"delta_rss_mb"`
 	HeapFileMB       float64 `json:"heap_file_mb"`
-	WalSizeMB        float64 `json:"wal_size_mb"`
-	TotalDiskMB      float64 `json:"total_disk_mb"`
+	WALWrittenMB     float64 `json:"wal_bytes_written_mb"`
+	RetainedWALMB    float64 `json:"retained_wal_mb"`
 	WriteDurationSec float64 `json:"write_duration_sec"`
 	Throughput       float64 `json:"throughput"`
 	RecoveryMs       float64 `json:"recovery_ms"`
@@ -542,8 +541,8 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			ProcessRSSMB:     memAfter.RSSMB,
 			DeltaRSSMB:       memAfter.RSSMB - baseMem.RSSMB,
 			HeapFileMB:       0,
-			WalSizeMB:        0,
-			TotalDiskMB:      0,
+			WALWrittenMB:     0,
+			RetainedWALMB:    0,
 			WriteDurationSec: writeDur.Seconds(),
 			Throughput:       float64(count) / writeDur.Seconds(),
 			RecoveryMs:       0,
@@ -627,8 +626,8 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			ProcessRSSMB:     memAfter.RSSMB,
 			DeltaRSSMB:       memAfter.RSSMB - baseMem.RSSMB,
 			HeapFileMB:       diskSizeMB,
-			WalSizeMB:        0,
-			TotalDiskMB:      diskSizeMB,
+			WALWrittenMB:     0,
+			RetainedWALMB:    0,
 			WriteDurationSec: writeDur.Seconds(),
 			Throughput:       float64(count) / writeDur.Seconds(),
 			RecoveryMs:       float64(recDur) / float64(time.Millisecond),
@@ -709,7 +708,8 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		_ = diskIndexer.Close()
 		_ = diskStore.Close()
 
-		heapMB, walMB, totalMB, _ := getDiskBreakdown(diskDir)
+		walBytesWrittenMB := float64(diskStore.WALBytesWritten()) / (1024 * 1024)
+		heapMB, retainedWALMB, _ := getDiskBreakdown(diskDir)
 
 		t0 = time.Now()
 		reopenOpts := []engine.Option{
@@ -733,8 +733,8 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			ProcessRSSMB:     memAfter.RSSMB,
 			DeltaRSSMB:       memAfter.RSSMB - baseMem.RSSMB,
 			HeapFileMB:       heapMB,
-			WalSizeMB:        walMB,
-			TotalDiskMB:      totalMB,
+			WALWrittenMB:     walBytesWrittenMB,
+			RetainedWALMB:    retainedWALMB,
 			WriteDurationSec: writeDur.Seconds(),
 			Throughput:       float64(count) / writeDur.Seconds(),
 			RecoveryMs:       float64(recDur) / float64(time.Millisecond),
@@ -824,29 +824,35 @@ func runCorpusBenchmark(t *testing.T, corpusName string, corpusID string, object
 	}
 
 	// Output Results Table for Corpus
-	fmt.Println("\n====================================================================================================================================================================")
+	fmt.Println("\n=======================================================================================================================================================")
 	fmt.Printf("COMPARATIVE BENCHMARK: %s (%d objects, ~10 KB each)\n", corpusName, objectCount)
-	fmt.Println("====================================================================================================================================================================")
-	fmt.Printf("%-28s | %-12s | %-12s | %-12s | %-10s | %-12s | %-12s | %-14s | %-10s\n",
-		"Storage Engine", "Heap In-Use", "Process RSS", "Heap File", "WAL Size", "Total Disk", "Write Time", "Write Thruput", "Recovery")
-	fmt.Println("--------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+	fmt.Println("=======================================================================================================================================================")
+	fmt.Printf("%-28s | %-13s | %-13s | %-12s | %-12s | %-12s | %-12s | %-15s | %-10s\n",
+		"Storage Engine", "Heap In-Use", "Process RSS", "Heap File", "WAL Written", "Retained WAL", "Write Time", "Write Thruput", "Recovery")
+	fmt.Println("-------------------------------------------------------------------------------------------------------------------------------------------------------")
 	for _, res := range results {
 		recStr := formatBenchMs(res.RecoveryMs)
 		if res.Name == "In-Memory Informer" {
 			recStr = "-"
 		}
 		heapFileStr := fmt.Sprintf("%.2f MB", res.HeapFileMB)
-		walStr := fmt.Sprintf("%.2f MB", res.WalSizeMB)
-		diskStr := fmt.Sprintf("%.2f MB", res.TotalDiskMB)
+		walWrittenStr := fmt.Sprintf("%.2f MB", res.WALWrittenMB)
+		retainedWALStr := fmt.Sprintf("%.2f MB", res.RetainedWALMB)
 		if res.Name == "In-Memory Informer" {
 			heapFileStr = "-"
-			walStr = "-"
-			diskStr = "0 MB (RAM)"
+			walWrittenStr = "-"
+			retainedWALStr = "-"
+		} else if res.Name == "BBolt (mmap + NoSync)" {
+			walWrittenStr = "-"
+			retainedWALStr = "-"
 		}
-		fmt.Printf("%-28s | %10.2f MB | %10.2f MB | %10s | %8s | %10s | %10.2f s | %10.0f op/s | %10s\n",
-			res.Name, res.HeapInUseMB, res.ProcessRSSMB, heapFileStr, walStr, diskStr, res.WriteDurationSec, res.Throughput, recStr)
+		fmt.Printf("%-28s | %10.2f MB | %10.2f MB | %12s | %12s | %12s | %10.2f s | %10.0f op/s | %10s\n",
+			res.Name, res.HeapInUseMB, res.ProcessRSSMB, heapFileStr, walWrittenStr, retainedWALStr, res.WriteDurationSec, res.Throughput, recStr)
 	}
-	fmt.Println("--------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+	fmt.Println("-------------------------------------------------------------------------------------------------------------------------------------------------------")
+	fmt.Println("Note: Heap File is the steady-state disk footprint. WAL Written is cumulative bytes written to WAL segments during the run.")
+	fmt.Println("      Retained WAL is the WAL size on disk at the end of the run, which rises and falls in a sawtooth up to the 16 MiB segment size as checkpoints delete finished segments.")
+	fmt.Println("-------------------------------------------------------------------------------------------------------------------------------------------------------")
 	fmt.Println("Recompute Latency Comparison:")
 	for _, res := range results {
 		if res.Name == "In-Memory Informer" {
@@ -859,7 +865,7 @@ func runCorpusBenchmark(t *testing.T, corpusName string, corpusID string, object
 				res.Name, formatBenchLatency(res.Lat0WarmUs), formatBenchLatency(res.Lat10WarmUs), formatBenchLatency(res.Lat1000WarmUs))
 		}
 	}
-	fmt.Println("====================================================================================================================================================================")
+	fmt.Println("=======================================================================================================================================================")
 }
 
 func TestDiskStore_Versus_BBolt_MeasurementSuite(t *testing.T) {

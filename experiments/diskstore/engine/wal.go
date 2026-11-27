@@ -119,6 +119,7 @@ type WAL struct {
 	lastAppendedLSN uint64 // Highest LSN successfully written to buffer
 	maxLSN          atomic.Uint64
 	fsyncedLSN      atomic.Uint64 // Highest LSN covered by fdatasync
+	bytesWritten    atomic.Int64  // Cumulative bytes written to WAL segment files
 	maxSegSize      int64
 	quarantine      QuarantineOptions
 	createdLSNs     map[uint64]bool // Asserts never reuse/recycle segment file names
@@ -449,7 +450,11 @@ func (w *WAL) flushQueueAndSync(isStop bool) {
 	var writeErr error
 	for _, ws := range slices {
 		dataToWrite := encryptWALSlices(syncCipher, w.encryptionBuffer, ws)
-		if _, err := syncFile.WriteAt(dataToWrite, ws.offset); err != nil {
+		bytesWritten, err := syncFile.WriteAt(dataToWrite, ws.offset)
+		if bytesWritten > 0 {
+			w.bytesWritten.Add(int64(bytesWritten))
+		}
+		if err != nil {
 			writeErr = fmt.Errorf("failed to write WAL block at offset %d: %w", ws.offset, err)
 			break
 		}
@@ -519,7 +524,11 @@ func (w *WAL) flushQueueAndSyncDirectLocked(doSync bool) error {
 	slices := w.collectWriteSlices(endOff)
 	for _, ws := range slices {
 		dataToWrite := encryptWALSlices(w.activeCipher, w.encryptionBuffer, ws)
-		if _, err := w.activeFile.WriteAt(dataToWrite, ws.offset); err != nil {
+		bytesWritten, err := w.activeFile.WriteAt(dataToWrite, ws.offset)
+		if bytesWritten > 0 {
+			w.bytesWritten.Add(int64(bytesWritten))
+		}
+		if err != nil {
 			w.setStickyErrLocked(fmt.Errorf("failed to write WAL block at offset %d: %w", ws.offset, err))
 			return w.stickyErr
 		}
@@ -644,6 +653,12 @@ func (w *WAL) FsyncedLSN() uint64 {
 // DurableLSN returns the maximum LSN confirmed durable by fdatasync.
 func (w *WAL) DurableLSN() uint64 {
 	return w.fsyncedLSN.Load()
+}
+
+// BytesWritten returns the cumulative bytes written to WAL segment files since OpenWAL.
+// The counter does not decrease when checkpoints delete older segments.
+func (w *WAL) BytesWritten() int64 {
+	return w.bytesWritten.Load()
 }
 
 // Append appends a record to the WAL.

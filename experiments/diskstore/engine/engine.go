@@ -1331,6 +1331,15 @@ func (s *Engine) DirectIOFallbackCount() int64 {
 	return GlobalMetrics.DirectIOFallbackCount.Load()
 }
 
+// WALBytesWritten returns the cumulative bytes written to WAL segment files since Open.
+// The counter does not decrease when checkpoints delete older segments.
+func (s *Engine) WALBytesWritten() int64 {
+	if s.wal == nil {
+		return 0
+	}
+	return s.wal.BytesWritten()
+}
+
 // CompressionCodec returns the engine's configured compression algorithm.
 func (s *Engine) CompressionCodec() CompressionCodec {
 	return s.compressionCodec

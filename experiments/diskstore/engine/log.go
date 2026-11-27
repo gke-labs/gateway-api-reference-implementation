@@ -52,6 +52,10 @@ type Log interface {
 	// where all records at or below the returned LSN have been synced.
 	DurableLSN() uint64
 
+	// BytesWritten reports the cumulative bytes written to log storage since open.
+	// The counter does not decrease when TruncateBefore removes older segments.
+	BytesWritten() int64
+
 	// NewIterator creates an iterator to read records forward in sequence starting
 	// from startLSN. The iterator yields records in increasing LSN order beginning
 	// at or after startLSN. Unacknowledged torn writes in the active log tail are
