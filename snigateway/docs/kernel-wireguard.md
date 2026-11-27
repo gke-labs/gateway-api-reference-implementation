@@ -1,5 +1,7 @@
 # Design: Kernel WireGuard Data Path for SNIGateway
 
+> **Status:** Implemented as the sole tunnel transport in `snigateway`. The TCP pool, userspace WireGuard, HTTP/2, and fallback modes discussed below have been removed; see [snigateway/README.md](../README.md) and [snigateway/BENCHMARKS.md](../BENCHMARKS.md) for current requirements and benchmark results.
+
 ## Context
 
 Benchmarks in [snigateway/BENCHMARKS.md](../BENCHMARKS.md) measured SNIGateway's userspace WireGuard transport (`wireguard-go` device with gVisor's `netstack`). On loopback, userspace WireGuard reached ~86 MB/s bulk throughput at ~116 CPU-s/GB—roughly a tenth of the throughput of the TCP pool and HTTP/2 transports at 14× their CPU per gigabyte. Profiling showed that ~35% of CPU was consumed by netstack's userspace TCP/IP state machine and ~20% by `wireguard-go`'s device queues and crypto.
@@ -47,8 +49,8 @@ Kernel WireGuard requires elevated privileges to create network links, assign ad
   - **In-cluster Controller**: Needs `CAP_NET_ADMIN` in the pod's network namespace to create `wg0`, configure IP addresses, and set kernel routing tables.
   - **Frontend**: Needs `CAP_NET_ADMIN` (or root) on the host or container network namespace to create `wg0` and manage peer routes via netlink.
 - **Kernel Requirements**: Linux kernel 5.6 or later (which includes in-tree WireGuard support), or earlier kernels with the out-of-tree `wireguard.ko` module loaded.
-- **Comparison with Existing Transports**:
-  - Today's TCP pool transport runs entirely in userspace with zero Linux capabilities. Controller pods run under the Kubernetes `restricted` Pod Security Standard as non-root (`runAsUser: 65532`).
+- **Comparison with Removed Transports**:
+  - The removed TCP pool transport ran entirely in userspace with zero Linux capabilities, allowing controller pods to run under the Kubernetes `restricted` Pod Security Standard as non-root (`runAsUser: 65532`).
 - **Pod Security Standards (PSS)**:
   - `CAP_NET_ADMIN` is disallowed by both the `restricted` and `baseline` PSS levels (baseline only permits default unprivileged capabilities plus `NET_BIND_SERVICE`). Running the controller pod with kernel WireGuard requires the namespace to be configured with the `privileged` PSS level, or granted an explicit namespace exemption.
 - **Scope of `CAP_NET_ADMIN`**:
