@@ -228,45 +228,6 @@ func TestParseConfigMapParameters(t *testing.T) {
 		}
 	})
 
-	t.Run("valid ACME challenge setting", func(t *testing.T) {
-		cm := &corev1.ConfigMap{
-			Data: map[string]string{
-				ParameterKeyACMEChallenge: "enabled",
-			},
-		}
-		p, err := ParseConfigMapParameters(cm)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if p.ACMEChallenge != "enabled" {
-			t.Errorf("unexpected ACMEChallenge: %s", p.ACMEChallenge)
-		}
-	})
-
-	t.Run("invalid ACME challenge setting", func(t *testing.T) {
-		cm := &corev1.ConfigMap{
-			Data: map[string]string{
-				ParameterKeyACMEChallenge: "invalid",
-			},
-		}
-		_, err := ParseConfigMapParameters(cm)
-		if err == nil {
-			t.Fatalf("expected error for invalid ACME challenge setting, got nil")
-		}
-	})
-
-	t.Run("rejected ACME challenge file path parameters", func(t *testing.T) {
-		cm := &corev1.ConfigMap{
-			Data: map[string]string{
-				"acmeChallengeTokenPath": "/var/run/secrets/token",
-			},
-		}
-		_, err := ParseConfigMapParameters(cm)
-		if err == nil {
-			t.Fatalf("expected error for acmeChallengeTokenPath in ConfigMap, got nil")
-		}
-	})
-
 	t.Run("unknown key in Data", func(t *testing.T) {
 		cm := &corev1.ConfigMap{
 			Data: map[string]string{
@@ -586,19 +547,6 @@ func TestMergeParameters(t *testing.T) {
 			t.Errorf("expected ClusterID cluster-gw, got %s", res.ClusterID)
 		}
 	})
-
-	t.Run("Gateway merges ACME challenge parameters", func(t *testing.T) {
-		gc := &Parameters{
-			ACMEChallenge: "enabled",
-		}
-		gw := &Parameters{
-			ACMEChallenge: "disabled",
-		}
-		res := MergeParameters(gc, gw)
-		if res.ACMEChallenge != "disabled" {
-			t.Errorf("expected gw ACMEChallenge 'disabled', got %s", res.ACMEChallenge)
-		}
-	})
 }
 
 func TestParametersEqual(t *testing.T) {
@@ -606,25 +554,16 @@ func TestParametersEqual(t *testing.T) {
 		ServiceType:           corev1.ServiceTypeLoadBalancer,
 		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
 		ServiceAnnotations:    map[string]string{"a": "1"},
-		ACMEChallenge:         "enabled",
 	}
 	p2 := &Parameters{
 		ServiceType:           corev1.ServiceTypeLoadBalancer,
 		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
 		ServiceAnnotations:    map[string]string{"a": "1"},
-		ACMEChallenge:         "enabled",
 	}
 	p3 := &Parameters{
 		ServiceType:           corev1.ServiceTypeClusterIP,
 		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
 		ServiceAnnotations:    map[string]string{"a": "1"},
-		ACMEChallenge:         "enabled",
-	}
-	p4 := &Parameters{
-		ServiceType:           corev1.ServiceTypeLoadBalancer,
-		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
-		ServiceAnnotations:    map[string]string{"a": "1"},
-		ACMEChallenge:         "disabled",
 	}
 
 	if !ParametersEqual(p1, p2) {
@@ -632,9 +571,6 @@ func TestParametersEqual(t *testing.T) {
 	}
 	if ParametersEqual(p1, p3) {
 		t.Errorf("expected p1 != p3")
-	}
-	if ParametersEqual(p1, p4) {
-		t.Errorf("expected p1 != p4 (differing ACME challenge setting)")
 	}
 	if !ParametersEqual(nil, nil) {
 		t.Errorf("expected nil == nil")

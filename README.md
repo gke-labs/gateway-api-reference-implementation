@@ -122,9 +122,6 @@ See [docs/singlepod-parameters.md](docs/singlepod-parameters.md) for details and
 | `--proxy-https-bind-address` | `:8443` | Address the proxy binds to for HTTPS. |
 | `--proxy-http3-bind-address` | `""` (disabled) | UDP address the proxy binds to for HTTP/3. |
 | `--proxy-http3-advertised-port` | `0` (inferred) | Port advertised in the `Alt-Svc` header for HTTP/3. |
-| `--acme-challenge-upstream-url` | `""` (disabled) | URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to. Challenge forwarding is enabled for Gateways whose parameters ConfigMap specifies `acmeChallenge: enabled`. |
-| `--acme-challenge-ca-bundle-path` | `""` | Path to the CA bundle PEM file to verify the upstream certificate server. |
-| `--acme-challenge-token-path` | `/var/run/secrets/tokens/certserver/token` | Path to the projected service-account token file for data-plane identity. |
 
 ### Partial Gateway API CRD Installation
 

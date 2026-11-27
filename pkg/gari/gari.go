@@ -283,15 +283,6 @@ type Options struct {
 	// and other core status fields.
 	GatewayStatusHook GatewayStatusHook
 
-	// ACMEChallengeUpstreamURL is the URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to.
-	ACMEChallengeUpstreamURL string
-
-	// ACMEChallengeCABundlePath is the path to the CA bundle PEM file to verify the upstream certificate server.
-	ACMEChallengeCABundlePath string
-
-	// ACMEChallengeTokenPath is the path to the projected service-account token file for data-plane identity.
-	ACMEChallengeTokenPath string
-
 	// InternalAPIBindAddress is the address the internal API server binds to.
 	// Defaults to "" (disabled). Ignored if InternalAPIListener is provided.
 	InternalAPIBindAddress string
@@ -560,13 +551,6 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.DebugErrorResponses {
 		p.SetDebugErrorResponses(true)
-	}
-	if opts.ACMEChallengeUpstreamURL != "" {
-		p.UpdateACMEChallenge(&proxy.ACMEChallengeConfig{
-			UpstreamURL:  opts.ACMEChallengeUpstreamURL,
-			CABundlePath: opts.ACMEChallengeCABundlePath,
-			TokenPath:    opts.ACMEChallengeTokenPath,
-		})
 	}
 
 	s := &Server{

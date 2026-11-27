@@ -66,8 +66,7 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 			Namespace: "test-ns",
 		},
 		Data: map[string]string{
-			state.ParameterKeyServiceType:   "LoadBalancer",
-			state.ParameterKeyACMEChallenge: "enabled",
+			state.ParameterKeyServiceType: "LoadBalancer",
 		},
 	}
 
@@ -132,9 +131,6 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 		singlepod.WithEnableH2C(true),
 		singlepod.WithForwardedForMode("append"),
 		singlepod.WithDebugErrorResponses(true),
-		singlepod.WithACMEChallengeUpstreamURL("https://certserver.example.internal:8443"),
-		singlepod.WithACMEChallengeCABundlePath("/etc/ssl/certs/certserver-ca.crt"),
-		singlepod.WithACMEChallengeTokenPath("/var/run/secrets/tokens/certserver/token"),
 	)
 
 	_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
@@ -177,15 +173,6 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	}
 	if !opts.DebugErrorResponses {
 		t.Errorf("expected DebugErrorResponses=true")
-	}
-	if opts.ACMEChallengeUpstreamURL != "https://certserver.example.internal:8443" {
-		t.Errorf("expected ACMEChallengeUpstreamURL='https://certserver.example.internal:8443', got %q", opts.ACMEChallengeUpstreamURL)
-	}
-	if opts.ACMEChallengeCABundlePath != "/etc/ssl/certs/certserver-ca.crt" {
-		t.Errorf("expected ACMEChallengeCABundlePath='/etc/ssl/certs/certserver-ca.crt', got %q", opts.ACMEChallengeCABundlePath)
-	}
-	if opts.ACMEChallengeTokenPath != "/var/run/secrets/tokens/certserver/token" {
-		t.Errorf("expected ACMEChallengeTokenPath='/var/run/secrets/tokens/certserver/token', got %q", opts.ACMEChallengeTokenPath)
 	}
 	expectedAddr := fmt.Sprintf("%s.default.svc.cluster.local:%d", spiffe.ControllerServiceName, push.InternalAPIPort)
 	if opts.InternalAPIAddress != expectedAddr {
@@ -295,9 +282,6 @@ func TestFlagsGolden(t *testing.T) {
 		Usage    string
 	}
 	golden := []flagInfo{
-		{Name: "acme-challenge-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify the upstream certificate server."},
-		{Name: "acme-challenge-token-path", DefValue: "", Usage: "Path to the projected service-account token file for data-plane identity."},
-		{Name: "acme-challenge-upstream-url", DefValue: "", Usage: "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to."},
 		{Name: "allowed-source-cidrs", DefValue: "", Usage: "Comma-separated list of CIDRs permitted to connect to HTTP/HTTPS listeners."},
 		{Name: "body-read-timeout", DefValue: "5m0s", Usage: "The maximum duration allowed between read progress while reading a request body; the proxy responds 408 Request Timeout and closes the connection (0 disables)."},
 		{Name: "certserver-address", DefValue: "", Usage: "Address of the certserver gRPC service"},
