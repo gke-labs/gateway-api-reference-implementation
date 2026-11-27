@@ -21,8 +21,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
 
 var (
@@ -43,13 +41,12 @@ type Requester struct {
 
 // Item represents an active ACME challenge in the store.
 type Item struct {
-	Token               string                    `json:"token"`
-	Identifier          string                    `json:"identifier"` // normalized host
-	KeyAuth             string                    `json:"key_auth"`
-	ExpiresAt           time.Time                 `json:"expires_at"`
-	Requester           Requester                 `json:"requester"`
-	CandidateRequesters []Requester               `json:"candidate_requesters,omitempty"`
-	AnsweringIdentities []registry.CallerIdentity `json:"answering_identities,omitempty"`
+	Token               string      `json:"token"`
+	Identifier          string      `json:"identifier"` // normalized host
+	KeyAuth             string      `json:"key_auth"`
+	ExpiresAt           time.Time   `json:"expires_at"`
+	Requester           Requester   `json:"requester"`
+	CandidateRequesters []Requester `json:"candidate_requesters,omitempty"`
 }
 
 // ChallengeResolver provides a lookup method for HTTP-01 challenge responses,
@@ -65,7 +62,6 @@ type Store interface {
 	PutWithCandidates(ctx context.Context, token string, identifier string, keyAuth string, expiresAt time.Time, req Requester, candidates []Requester) error
 	Get(ctx context.Context, token string) (*Item, error)
 	GetChallengesForRequester(ctx context.Context, req Requester) []*Item
-	RecordAnswer(ctx context.Context, token string, identity registry.CallerIdentity) error
 	Remove(ctx context.Context, token string) error
 }
 
@@ -125,10 +121,6 @@ func (s *MemoryStore) Get(ctx context.Context, token string) (*Item, error) {
 	}
 
 	cp := *item
-	if len(item.AnsweringIdentities) > 0 {
-		cp.AnsweringIdentities = make([]registry.CallerIdentity, len(item.AnsweringIdentities))
-		copy(cp.AnsweringIdentities, item.AnsweringIdentities)
-	}
 	if len(item.CandidateRequesters) > 0 {
 		cp.CandidateRequesters = make([]Requester, len(item.CandidateRequesters))
 		copy(cp.CandidateRequesters, item.CandidateRequesters)
@@ -166,18 +158,6 @@ func requesterMatches(item *Item, req Requester) bool {
 		}
 	}
 	return false
-}
-
-// RecordAnswer appends the answering caller identity to the challenge item.
-func (s *MemoryStore) RecordAnswer(ctx context.Context, token string, identity registry.CallerIdentity) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	item, ok := s.challenges[token]
-	if !ok {
-		return ErrNotFound
-	}
-	item.AnsweringIdentities = append(item.AnsweringIdentities, identity)
-	return nil
 }
 
 // Remove deletes a challenge by token.

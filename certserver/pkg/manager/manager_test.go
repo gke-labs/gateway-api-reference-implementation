@@ -38,7 +38,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
-	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/testserver"
 )
 
@@ -833,10 +832,6 @@ func (b *brokenChallengeStore) GetChallengesForRequester(ctx context.Context, re
 		return nil
 	}
 	return b.store.GetChallengesForRequester(ctx, req)
-}
-
-func (b *brokenChallengeStore) RecordAnswer(ctx context.Context, token string, identity registry.CallerIdentity) error {
-	return b.store.RecordAnswer(ctx, token, identity)
 }
 
 func (b *brokenChallengeStore) Remove(ctx context.Context, token string) error {

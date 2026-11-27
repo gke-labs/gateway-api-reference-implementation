@@ -55,9 +55,6 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 	if cfg.MaxPendingOrders != 50 {
 		t.Errorf("unexpected max pending orders: %d", cfg.MaxPendingOrders)
 	}
-	if cfg.ChallengeListenAddr != ":8080" {
-		t.Errorf("unexpected challenge listen addr: %s", cfg.ChallengeListenAddr)
-	}
 	if cfg.MetricsListenAddr != ":9090" {
 		t.Errorf("unexpected metrics listen addr: %s", cfg.MetricsListenAddr)
 	}
@@ -74,7 +71,6 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 		"--eab-kid=custom-kid",
 		"--eab-hmac-key-file=/tmp/custom-key-file",
 		"--cache-dir=/tmp/custom-cache",
-		"--challenge-listen-addr=:18080",
 		"--metrics-listen-addr=:19090",
 		"--grpc-listen-addr=:18443",
 		"--tls-cert-file=/tmp/tls.crt",
@@ -112,9 +108,6 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 	if cfg.CacheDir != "/tmp/custom-cache" {
 		t.Errorf("unexpected custom cache dir: %s", cfg.CacheDir)
 	}
-	if cfg.ChallengeListenAddr != ":18080" {
-		t.Errorf("unexpected custom challenge addr: %s", cfg.ChallengeListenAddr)
-	}
 	if cfg.MetricsListenAddr != ":19090" {
 		t.Errorf("unexpected custom metrics addr: %s", cfg.MetricsListenAddr)
 	}
@@ -145,6 +138,10 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 	if cfg.MaxPendingOrders != 10 {
 		t.Errorf("unexpected custom max pending orders: %d", cfg.MaxPendingOrders)
 	}
+
+	if _, err := parseFlags([]string{"--challenge-listen-addr=:8080"}); err == nil {
+		t.Errorf("expected --challenge-listen-addr flag to be rejected")
+	}
 }
 
 func waitForReady(t *testing.T, addr string) {
@@ -168,15 +165,6 @@ func TestRun_LifecycleWithPebble(t *testing.T) {
 	tempDir := t.TempDir()
 	cacheDir := filepath.Join(tempDir, "cache")
 
-	chalLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen for challenge addr failed: %v", err)
-	}
-	chalAddr := chalLn.Addr().String()
-	if err := chalLn.Close(); err != nil {
-		t.Fatalf("Close chalLn failed: %v", err)
-	}
-
 	metricsLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen for metrics addr failed: %v", err)
@@ -187,14 +175,13 @@ func TestRun_LifecycleWithPebble(t *testing.T) {
 	}
 
 	cfg := &Config{
-		DirectoryURL:        pebble.DirectoryURL,
-		HTTPClient:          pebble.HTTPClient,
-		CacheDir:            cacheDir,
-		ChallengeListenAddr: chalAddr,
-		MetricsListenAddr:   metricsAddr,
-		MaxHostnames:        100,
-		MaxPendingOrders:    50,
-		PrometheusRegistry:  prometheus.NewRegistry(),
+		DirectoryURL:       pebble.DirectoryURL,
+		HTTPClient:         pebble.HTTPClient,
+		CacheDir:           cacheDir,
+		MetricsListenAddr:  metricsAddr,
+		MaxHostnames:       100,
+		MaxPendingOrders:   50,
+		PrometheusRegistry: prometheus.NewRegistry(),
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -205,7 +192,6 @@ func TestRun_LifecycleWithPebble(t *testing.T) {
 	}()
 
 	// Wait for readiness instead of sleep
-	waitForReady(t, chalAddr)
 	waitForReady(t, metricsAddr)
 
 	// Trigger graceful shutdown
@@ -432,13 +418,6 @@ func TestRun_RegisterClusterLiveReloadIntegration(t *testing.T) {
 	cacheDir := filepath.Join(tempDir, "cache")
 	regDir := filepath.Join(tempDir, "clusters")
 
-	chalLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen for challenge addr failed: %v", err)
-	}
-	chalAddr := chalLn.Addr().String()
-	_ = chalLn.Close()
-
 	metricsLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen for metrics addr failed: %v", err)
@@ -450,7 +429,6 @@ func TestRun_RegisterClusterLiveReloadIntegration(t *testing.T) {
 		DirectoryURL:           pebble.DirectoryURL,
 		HTTPClient:             pebble.HTTPClient,
 		CacheDir:               cacheDir,
-		ChallengeListenAddr:    chalAddr,
 		MetricsListenAddr:      metricsAddr,
 		ClusterDir:             regDir,
 		ClusterDirPollInterval: 50 * time.Millisecond,
@@ -473,7 +451,6 @@ func TestRun_RegisterClusterLiveReloadIntegration(t *testing.T) {
 	default:
 	}
 
-	waitForReady(t, chalAddr)
 	waitForReady(t, metricsAddr)
 
 	// Register cluster dynamically while certserver is running

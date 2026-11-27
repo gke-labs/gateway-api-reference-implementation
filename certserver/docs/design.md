@@ -206,6 +206,7 @@ Under the "serve, don't forward" model, binding follows directly from who serves
 6. The self-check fails, and certserver does not request CA validation. Even if the certificate authority queried Gateway B, validation would fail with HTTP 404.
 7. Gateway A does not receive the certificate. A Gateway that wasn't given a challenge cannot serve it, and therefore cannot complete it.
 8. **Deactivating Pre-Validated Authorizations:** Certificate authorities may retain authorization state across orders for an ACME account. To prevent an unauthorized Gateway from capitalizing on an authorization previously validated by another Gateway, certserver deactivates pre-validated authorizations so that each issuance requires fresh HTTP-01 validation.
+9. **Recording Validated Bindings:** certserver records a validated binding for a Gateway only in the manager, after the certificate authority has validated that Gateway's own request (or, for cached certificate reuse, after the manager's local probe self-check validates that Gateway's own probe).
 
 This design removes the data plane's challenge forwarder, the data plane's service-account token for certserver, certserver's HTTP challenge endpoint, and forwarder-identity checks.
 
