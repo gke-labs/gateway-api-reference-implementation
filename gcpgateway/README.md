@@ -39,11 +39,11 @@
 
 The `gcpgateway` controller calls the Google Compute Engine API using Application Default Credentials (ADC). At start-up, the controller resolves credentials and fetches one access token unless `--fake-compute` is set. If credential resolution or token fetching fails, the controller exits with an error that lists the credential sources it tried. Data-plane pods do not call Google Cloud APIs and do not need Google Cloud credentials.
 
-ADC checks three sources in order and stops at the first one it finds:
+ADC checks credential sources in this order:
 
-1. The JSON file named by the `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
-2. The `gcloud` application default credentials file at `$HOME/.config/gcloud/application_default_credentials.json`.
-3. The Google Compute Engine metadata server at `169.254.169.254` (or `GCE_METADATA_HOST` when set).
+1. The JSON file named by the `GOOGLE_APPLICATION_CREDENTIALS` environment variable. If the variable is set, ADC uses that file and does not check the other sources.
+2. The `gcloud` application default credentials file at `$HOME/.config/gcloud/application_default_credentials.json`. If the file is readable, ADC uses it and does not check the metadata server.
+3. The Google Compute Engine metadata server at `169.254.169.254` (or `GCE_METADATA_HOST` when set). When neither file is used, ADC probes whether the pod is running on GCE and fetches tokens from the metadata server.
 
 ### Required IAM Permissions
 
@@ -89,7 +89,7 @@ On GKE clusters with Workload Identity enabled, GKE intercepts metadata server r
 
 #### 3. Workload Identity Federation with a Projected ServiceAccount Token
 
-On self-managed Kubernetes clusters running on GCE (such as kOps clusters where pods cannot reach the metadata server), you can authenticate the controller with Workload Identity Federation and a projected Kubernetes ServiceAccount token. The Go client reads the resulting `external_account` configuration automatically with no changes to the controller binary.
+On self-managed Kubernetes clusters running on GCE (such as kOps clusters where pods cannot reach the metadata server), you can authenticate the controller with Workload Identity Federation and a projected Kubernetes ServiceAccount token. The Go client reads the resulting `external_account` configuration with no changes to the controller binary.
 
 1. Create a Workload Identity Pool and an OIDC provider using the cluster's JSON Web Key Set (JWKS). Uploading the JWKS works even when the cluster's OIDC issuer is a private name that Google cannot fetch directly:
 
