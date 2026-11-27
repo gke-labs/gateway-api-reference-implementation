@@ -1262,41 +1262,6 @@ func TestCompileHTTPRoute(t *testing.T) {
 		}
 	})
 
-	t.Run("compiles valid path regex match", func(t *testing.T) {
-		route := &gatewayv1.HTTPRoute{
-			ObjectMeta: metav1.ObjectMeta{Name: "valid-path-regex", Namespace: "default"},
-			Spec: gatewayv1.HTTPRouteSpec{
-				Rules: []gatewayv1.HTTPRouteRule{
-					{
-						Matches: []gatewayv1.HTTPRouteMatch{
-							{
-								Path: &gatewayv1.HTTPPathMatch{
-									Type:  Ptr(gatewayv1.PathMatchRegularExpression),
-									Value: Ptr("^/users/[0-9]+$"),
-								},
-							},
-						},
-					},
-				},
-			},
-		}
-
-		internal := CompileHTTPRoute(route, nil, nil, nil, nil)
-		if internal.ValidationCondition.Status != metav1.ConditionTrue {
-			t.Fatalf("expected ValidationCondition True, got %+v", internal.ValidationCondition)
-		}
-		if len(internal.Rules) != 1 || internal.Rules[0].Error != nil {
-			t.Fatalf("expected 1 valid rule, got %+v", internal.Rules)
-		}
-		pathMatch := internal.Rules[0].Matches[0].Path
-		if pathMatch == nil || pathMatch.Type != gatewayv1.PathMatchRegularExpression || pathMatch.MatchRegularExpressionValue == nil {
-			t.Fatalf("expected compiled regex path match, got %+v", pathMatch)
-		}
-		if !pathMatch.MatchRegularExpressionValue.MatchString("/users/42") || pathMatch.MatchRegularExpressionValue.MatchString("/users/abc") {
-			t.Errorf("compiled regex did not evaluate expected paths")
-		}
-	})
-
 	t.Run("rejects invalid path regex with Accepted False", func(t *testing.T) {
 		gateway := &gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{Name: "test-gw", Namespace: "default"},

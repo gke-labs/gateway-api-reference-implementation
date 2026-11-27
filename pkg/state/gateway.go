@@ -826,8 +826,15 @@ func hasPathPrefix(path, prefix string) bool {
 }
 
 type InternalPathMatch struct {
-	Type                        gatewayv1.PathMatchType
-	Value                       string
+	// Type specifies how to compare the request path against Value.
+	Type gatewayv1.PathMatchType
+
+	// Value holds the path string or regular expression pattern to match.
+	Value string
+
+	// MatchRegularExpressionValue holds the compiled pattern. The compiler
+	// sets this field only when Type is RegularExpression and the pattern
+	// compiled without error.
 	MatchRegularExpressionValue *regexp.Regexp
 }
 

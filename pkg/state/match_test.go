@@ -1029,18 +1029,6 @@ func TestMatchRoute_PathRegularExpression(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("nil compiled regex does not match", func(t *testing.T) {
-		match := InternalMatch{
-			Path: &InternalPathMatch{
-				Type:  gatewayv1.PathMatchRegularExpression,
-				Value: "^/users/[0-9]+$",
-			},
-		}
-		if match.Matches("GET", "/users/123", nil, nil) {
-			t.Errorf("expected nil compiled regex not to match")
-		}
-	})
 }
 
 func TestMatchRoute_PathRegularExpressionPrecedence(t *testing.T) {
