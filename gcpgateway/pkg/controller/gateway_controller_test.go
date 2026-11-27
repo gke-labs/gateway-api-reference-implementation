@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2730,4 +2731,152 @@ func TestGateway_BackendServiceParameter(t *testing.T) {
 			t.Errorf("expected no NEG attach calls for invalid parameters, got %d", len(fakeGCP.AttachCalls))
 		}
 	})
+}
+
+func TestGateway_HTTPOnlyHealthPolling(t *testing.T) {
+	scheme := setupScheme()
+	ipAddressType := gatewayv1.IPAddressType
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
+	httpOnly := []gatewayv1.Listener{{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType}}
+	mixedListeners := []gatewayv1.Listener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+	}
+	httpNEG := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", strconv.Itoa(registrar.PortHTTP))
+	httpsNEG := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", strconv.Itoa(registrar.PortHTTPS))
+	bs80 := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", registrar.BackendServiceSuffixHTTP)
+	bs443 := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", registrar.BackendServiceSuffixHTTPS)
+
+	cases := []struct {
+		name                  string
+		listeners             []gatewayv1.Listener
+		parametersData        map[string]string
+		polledBackendService  string
+		ignoredBackendService string
+		polledNEG             string
+		ignoredNEG            string
+		polledPort            int
+		registerIgnoredNEG    bool
+	}{
+		{
+			name:                 "HTTP-only Gateway polls derived HTTP NEG",
+			listeners:            httpOnly,
+			parametersData:       map[string]string{state.ParameterKeyBackendService: "operator-http-backend"},
+			polledBackendService: "operator-http-backend",
+			polledNEG:            httpNEG,
+			ignoredNEG:           httpsNEG,
+			polledPort:           registrar.PortHTTP,
+		},
+		{
+			name:      "HTTP-only Gateway uses negHTTP parameter",
+			listeners: httpOnly,
+			parametersData: map[string]string{
+				state.ParameterKeyBackendService: "operator-http-backend",
+				state.ParameterKeyNEGHTTP:        "gcpgw-custom-http",
+			},
+			polledBackendService: "operator-http-backend",
+			polledNEG:            "gcpgw-custom-http",
+			ignoredNEG:           httpNEG,
+			polledPort:           registrar.PortHTTP,
+		},
+		{
+			name:                  "HTTP-only Gateway defaults backendService to bs-80",
+			listeners:             httpOnly,
+			polledBackendService:  bs80,
+			ignoredBackendService: bs443,
+			polledNEG:             httpNEG,
+			polledPort:            registrar.PortHTTP,
+		},
+		{
+			name:                 "HTTP and HTTPS listeners keep polling HTTPS NEG",
+			listeners:            mixedListeners,
+			parametersData:       map[string]string{state.ParameterKeyBackendService: "operator-https-backend"},
+			polledBackendService: "operator-https-backend",
+			polledNEG:            httpsNEG,
+			ignoredNEG:           httpNEG,
+			polledPort:           registrar.PortHTTPS,
+			registerIgnoredNEG:   true,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			gateway := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "gcpgateway",
+					Addresses:        []gatewayv1.GatewaySpecAddress{{Type: &ipAddressType, Value: "34.120.254.10"}},
+					Infrastructure: &gatewayv1.GatewayInfrastructure{
+						ParametersRef: &gatewayv1.LocalParametersReference{Kind: "ConfigMap", Name: "gw-params"},
+					},
+					Listeners: testCase.listeners,
+				},
+			}
+			kubeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+				WithObjects(
+					gateway,
+					&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-params"}, Data: testCase.parametersData},
+					&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}, Spec: corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"}},
+				).
+				Build()
+			makeTestPod(t, kubeClient, gateway, "dp-pod-1", "node-1", "10.0.1.5", []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+				{Type: corev1.PodConditionType(registrar.LoadBalancerReadyGate), Status: corev1.ConditionFalse},
+			})
+
+			fakeGCP := gcp.NewFakeComputeClient()
+			addNEG := func(name string, port int) {
+				description, err := (&metadata.NegMetadata{ClusterID: "cluster-1", Namespace: "default", GatewayName: "my-gw", Port: port}).Encode()
+				if err != nil {
+					t.Fatalf("encoding NEG metadata: %v", err)
+				}
+				fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{Name: name, Zone: "us-central1-a", Description: description})
+			}
+			addNEG(testCase.polledNEG, testCase.polledPort)
+			if testCase.registerIgnoredNEG {
+				addNEG(testCase.ignoredNEG, registrar.PortHTTP)
+			}
+
+			setHealth := func(backendService, negName string, healthState string) {
+				fakeGCP.SetBackendServiceHealth("my-project", backendService, negName, &compute.BackendServiceGroupHealth{
+					HealthStatus: []*compute.HealthStatus{{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: int64(testCase.polledPort), HealthState: healthState}},
+				})
+			}
+			if testCase.ignoredNEG != "" {
+				setHealth(testCase.polledBackendService, testCase.ignoredNEG, "HEALTHY")
+			}
+			if testCase.ignoredBackendService != "" {
+				setHealth(testCase.ignoredBackendService, testCase.polledNEG, "HEALTHY")
+			}
+			setHealth(testCase.polledBackendService, testCase.polledNEG, "UNHEALTHY")
+
+			negRegistrar := registrar.NewRegistrar(kubeClient, fakeGCP, registrar.Config{ClusterID: "cluster-1", NegPrefix: "gcpgw", Project: "my-project", Zones: []string{"us-central1-a"}})
+			reconciler := NewGatewayReconciler(kubeClient, scheme, fakeGCP, negRegistrar, GatewayReconcilerConfig{ClusterID: "cluster-1", NegPrefix: "gcpgw", Project: "my-project", Zones: []string{"us-central1-a"}})
+
+			if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			endpoints, err := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", testCase.polledNEG)
+			if err != nil || len(endpoints) != 1 || endpoints[0].IpAddress != "10.0.1.5" || endpoints[0].Port != int64(testCase.polledPort) {
+				t.Fatalf("expected pod attached to NEG %s on port %d, got endpoints=%+v err=%v", testCase.polledNEG, testCase.polledPort, endpoints, err)
+			}
+			var pod corev1.Pod
+			if err := kubeClient.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "dp-pod-1"}, &pod); err != nil || isPodReadinessGateTrue(&pod) {
+				t.Fatalf("expected readiness gate False while %s/%s is UNHEALTHY (err=%v)", testCase.polledBackendService, testCase.polledNEG, err)
+			}
+
+			setHealth(testCase.polledBackendService, testCase.polledNEG, "HEALTHY")
+			if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if err := kubeClient.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "dp-pod-1"}, &pod); err != nil || !isPodReadinessGateTrue(&pod) {
+				t.Fatalf("expected readiness gate True after %s/%s reports HEALTHY (err=%v)", testCase.polledBackendService, testCase.polledNEG, err)
+			}
+			if cached := reconciler.GetCachedStatus(request.NamespacedName); cached == nil || cached.ProgrammedStatus != metav1.ConditionTrue || cached.Reason != ReasonProgrammed {
+				t.Errorf("expected Programmed=True in cache, got %+v", cached)
+			}
+		})
+	}
 }

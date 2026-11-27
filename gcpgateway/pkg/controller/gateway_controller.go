@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -487,11 +488,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			continue
 		}
 
-		// Check health on backend service
-		negName := metadata.ResourceName(r.NegPrefix, r.ClusterID, gw.Namespace, gw.Name, "8443")
+		// Check health on backend service.
 		// backendServices.getHealth takes a resourceGroup reference, which must be the full NEG URL;
 		// a bare name is rejected with "Invalid value for field 'resourceGroup.group' ... malformed".
-		negURL := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s/networkEndpointGroups/%s", r.Project, nodeInfo.Zone, negName)
+		negURL := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s/networkEndpointGroups/%s", r.Project, nodeInfo.Zone, targetNEG)
 
 		health, err := r.GCPClient.GetBackendServiceHealth(ctx, r.Project, backendService, negURL)
 		if err != nil {
@@ -730,18 +730,36 @@ func (r *GatewayReconciler) parametersConfigMapData(ctx context.Context, gateway
 	return configMap.Data, nil
 }
 
+// usesHTTPHealthNEG reports whether gateway polls health on the HTTP NEG (8080)
+// instead of the HTTPS NEG (8443). It returns true when gateway targets
+// PortHTTP and does not target PortHTTPS.
+func usesHTTPHealthNEG(gateway *gatewayv1.Gateway) bool {
+	targetPorts := registrar.TargetPorts(gateway)
+	return targetPorts[registrar.PortHTTP] && !targetPorts[registrar.PortHTTPS]
+}
+
+// targetNEGKey returns the Compute NEG name for conflict detection and health
+// polling. When gateway uses the HTTP NEG, it prefers negHTTP and falls back to
+// the derived 8080 NEG name. Otherwise it prefers negHTTPS and falls back to
+// the derived 8443 NEG name.
 func (r *GatewayReconciler) targetNEGKey(gateway *gatewayv1.Gateway, parametersData map[string]string) string {
-	if neg := parametersData["negHTTPS"]; neg != "" {
+	negParameterKey := state.ParameterKeyNEGHTTPS
+	portSuffix := strconv.Itoa(registrar.PortHTTPS)
+	if usesHTTPHealthNEG(gateway) {
+		negParameterKey = state.ParameterKeyNEGHTTP
+		portSuffix = strconv.Itoa(registrar.PortHTTP)
+	}
+	if neg := parametersData[negParameterKey]; neg != "" {
 		return neg
 	}
-	if targetGateway := parametersData["gatewayName"]; targetGateway != "" {
-		namespace := parametersData["gatewayNamespace"]
+	if targetGateway := parametersData[state.ParameterKeyGatewayName]; targetGateway != "" {
+		namespace := parametersData[state.ParameterKeyGatewayNamespace]
 		if namespace == "" {
 			namespace = gateway.Namespace
 		}
-		return metadata.ResourceName(r.NegPrefix, r.ClusterID, namespace, targetGateway, "8443")
+		return metadata.ResourceName(r.NegPrefix, r.ClusterID, namespace, targetGateway, portSuffix)
 	}
-	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gateway.Namespace, gateway.Name, "8443")
+	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gateway.Namespace, gateway.Name, portSuffix)
 }
 
 // invalidParametersError reports a rejected value in a Gateway's parameters ConfigMap.
@@ -756,7 +774,8 @@ func (e *invalidParametersError) Error() string {
 // resolveBackendService returns the Compute backend service name to poll for
 // gateway. When parametersData sets backendService, it validates the value as
 // an RFC 1035 Compute resource name and returns an invalidParametersError if
-// validation fails. When unset, it returns the derived backend service name.
+// validation fails. When unset, it derives bs-80 for HTTP-only Gateways and
+// bs-443 otherwise.
 func (r *GatewayReconciler) resolveBackendService(gateway *gatewayv1.Gateway, parametersData map[string]string) (string, error) {
 	if raw, ok := parametersData[state.ParameterKeyBackendService]; ok && raw != "" {
 		backendService := strings.TrimSpace(raw)
@@ -767,7 +786,11 @@ func (r *GatewayReconciler) resolveBackendService(gateway *gatewayv1.Gateway, pa
 		}
 		return backendService, nil
 	}
-	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gateway.Namespace, gateway.Name, "bs-443"), nil
+	suffix := registrar.BackendServiceSuffixHTTPS
+	if usesHTTPHealthNEG(gateway) {
+		suffix = registrar.BackendServiceSuffixHTTP
+	}
+	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gateway.Namespace, gateway.Name, suffix), nil
 }
 
 func (r *GatewayReconciler) resolveExternalIP(gateway *gatewayv1.Gateway, parametersData map[string]string) string {
