@@ -15,6 +15,7 @@
 package state
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -224,6 +225,66 @@ func TestParseConfigMapParameters(t *testing.T) {
 		_, err := ParseConfigMapParameters(cm)
 		if err == nil {
 			t.Fatalf("expected error for non-string value in serviceAnnotations, got nil")
+		}
+	})
+
+	t.Run("valid backendService", func(t *testing.T) {
+		validNames := []string{
+			"my-backend-service",
+			"a",
+			"a" + strings.Repeat("b", 62),
+			"my-backend-1\n",
+		}
+		for _, name := range validNames {
+			configMap := &corev1.ConfigMap{
+				Data: map[string]string{
+					ParameterKeyBackendService: name,
+				},
+			}
+			parsed, err := ParseConfigMapParameters(configMap)
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", name, err)
+			}
+			if parsed.BackendService != strings.TrimSpace(name) {
+				t.Errorf("BackendService = %q, want %q", parsed.BackendService, strings.TrimSpace(name))
+			}
+		}
+
+		emptyConfigMap := &corev1.ConfigMap{
+			Data: map[string]string{
+				ParameterKeyBackendService: "",
+			},
+		}
+		parsed, err := ParseConfigMapParameters(emptyConfigMap)
+		if err != nil {
+			t.Fatalf("unexpected error for empty backendService: %v", err)
+		}
+		if parsed.BackendService != "" {
+			t.Errorf("expected empty BackendService, got %q", parsed.BackendService)
+		}
+	})
+
+	t.Run("invalid backendService", func(t *testing.T) {
+		invalidNames := []string{
+			"My-Backend",
+			"1-backend",
+			"-backend",
+			"backend-",
+			"my_backend",
+			"my.backend",
+			"projects/my-project/global/backendServices/my-bs",
+			"   ",
+			"a" + strings.Repeat("b", 63),
+		}
+		for _, name := range invalidNames {
+			configMap := &corev1.ConfigMap{
+				Data: map[string]string{
+					ParameterKeyBackendService: name,
+				},
+			}
+			if _, err := ParseConfigMapParameters(configMap); err == nil {
+				t.Errorf("expected error for invalid backendService %q, got nil", name)
+			}
 		}
 	})
 
@@ -588,14 +649,19 @@ func TestMergeParameters(t *testing.T) {
 
 	t.Run("Gateway merges ACME challenge parameters", func(t *testing.T) {
 		gc := &Parameters{
-			ACMEChallenge: "enabled",
+			ACMEChallenge:  "enabled",
+			BackendService: "class-backend",
 		}
 		gw := &Parameters{
-			ACMEChallenge: "disabled",
+			ACMEChallenge:  "disabled",
+			BackendService: "gateway-backend",
 		}
 		res := MergeParameters(gc, gw)
 		if res.ACMEChallenge != "disabled" {
 			t.Errorf("expected gw ACMEChallenge 'disabled', got %s", res.ACMEChallenge)
+		}
+		if res.BackendService != "gateway-backend" {
+			t.Errorf("expected gw BackendService 'gateway-backend', got %s", res.BackendService)
 		}
 	})
 }
@@ -605,25 +671,36 @@ func TestParametersEqual(t *testing.T) {
 		ServiceType:           corev1.ServiceTypeLoadBalancer,
 		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
 		ServiceAnnotations:    map[string]string{"a": "1"},
+		BackendService:        "backend-a",
 		ACMEChallenge:         "enabled",
 	}
 	p2 := &Parameters{
 		ServiceType:           corev1.ServiceTypeLoadBalancer,
 		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
 		ServiceAnnotations:    map[string]string{"a": "1"},
+		BackendService:        "backend-a",
 		ACMEChallenge:         "enabled",
 	}
 	p3 := &Parameters{
 		ServiceType:           corev1.ServiceTypeClusterIP,
 		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
 		ServiceAnnotations:    map[string]string{"a": "1"},
+		BackendService:        "backend-a",
 		ACMEChallenge:         "enabled",
 	}
 	p4 := &Parameters{
 		ServiceType:           corev1.ServiceTypeLoadBalancer,
 		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
 		ServiceAnnotations:    map[string]string{"a": "1"},
+		BackendService:        "backend-a",
 		ACMEChallenge:         "disabled",
+	}
+	p5 := &Parameters{
+		ServiceType:           corev1.ServiceTypeLoadBalancer,
+		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
+		ServiceAnnotations:    map[string]string{"a": "1"},
+		BackendService:        "backend-b",
+		ACMEChallenge:         "enabled",
 	}
 
 	if !ParametersEqual(p1, p2) {
@@ -634,6 +711,9 @@ func TestParametersEqual(t *testing.T) {
 	}
 	if ParametersEqual(p1, p4) {
 		t.Errorf("expected p1 != p4 (differing ACME challenge setting)")
+	}
+	if ParametersEqual(p1, p5) {
+		t.Errorf("expected p1 != p5 (differing BackendService)")
 	}
 	if !ParametersEqual(nil, nil) {
 		t.Errorf("expected nil == nil")

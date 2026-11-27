@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/yaml"
 )
@@ -42,6 +43,7 @@ const (
 	ParameterKeyNEGHTTPS                  = "negHTTPS"
 	ParameterKeyNEGHTTP                   = "negHTTP"
 	ParameterKeyNEGPrefix                 = "negPrefix"
+	ParameterKeyBackendService            = "backendService"
 	ParameterKeyACMEChallenge             = "acmeChallenge"
 )
 
@@ -60,6 +62,7 @@ type Parameters struct {
 	NEGHTTPS                  string
 	NEGHTTP                   string
 	NEGPrefix                 string
+	BackendService            string
 	ACMEChallenge             string
 }
 
@@ -89,6 +92,17 @@ func parseCIDRList(val, paramKey string) ([]string, error) {
 		result = append(result, trimmed)
 	}
 	return result, nil
+}
+
+// ValidateComputeResourceName checks that name is a valid Google Cloud Compute
+// Engine resource name. Compute Engine names are RFC 1035 labels of 1 to 63
+// lowercase letters, digits, or hyphens that start with a letter and end with
+// a letter or digit.
+func ValidateComputeResourceName(name string) error {
+	if validationErrors := validation.IsDNS1035Label(name); len(validationErrors) > 0 {
+		return fmt.Errorf("must be a valid Compute resource name: %s", strings.Join(validationErrors, "; "))
+	}
+	return nil
 }
 
 // ParseConfigMapParameters parses and validates parameters from a ConfigMap.
@@ -121,6 +135,7 @@ func ParseConfigMapParameters(cm *corev1.ConfigMap) (*Parameters, error) {
 			ParameterKeyNEGHTTPS,
 			ParameterKeyNEGHTTP,
 			ParameterKeyNEGPrefix,
+			ParameterKeyBackendService,
 			ParameterKeyACMEChallenge:
 		default:
 			return nil, fmt.Errorf("unknown key %q in ConfigMap", k)
@@ -226,6 +241,14 @@ func ParseConfigMapParameters(cm *corev1.ConfigMap) (*Parameters, error) {
 
 	if val, ok := cm.Data[ParameterKeyNEGPrefix]; ok {
 		p.NEGPrefix = strings.TrimSpace(val)
+	}
+
+	if value, ok := cm.Data[ParameterKeyBackendService]; ok && value != "" {
+		trimmed := strings.TrimSpace(value)
+		if err := ValidateComputeResourceName(trimmed); err != nil {
+			return nil, fmt.Errorf("invalid %s %q: %w", ParameterKeyBackendService, value, err)
+		}
+		p.BackendService = trimmed
 	}
 
 	if val, ok := cm.Data[ParameterKeyACMEChallenge]; ok && val != "" {
@@ -344,6 +367,9 @@ func MergeParameters(gcParams, gwParams *Parameters) *Parameters {
 		if gcParams.NEGPrefix != "" {
 			res.NEGPrefix = gcParams.NEGPrefix
 		}
+		if gcParams.BackendService != "" {
+			res.BackendService = gcParams.BackendService
+		}
 		if gcParams.ACMEChallenge != "" {
 			res.ACMEChallenge = gcParams.ACMEChallenge
 		}
@@ -388,6 +414,9 @@ func MergeParameters(gcParams, gwParams *Parameters) *Parameters {
 		}
 		if gwParams.NEGPrefix != "" {
 			res.NEGPrefix = gwParams.NEGPrefix
+		}
+		if gwParams.BackendService != "" {
+			res.BackendService = gwParams.BackendService
 		}
 		if gwParams.ACMEChallenge != "" {
 			res.ACMEChallenge = gwParams.ACMEChallenge
@@ -442,6 +471,9 @@ func ParametersEqual(a, b *Parameters) bool {
 		return false
 	}
 	if a.NEGPrefix != b.NEGPrefix {
+		return false
+	}
+	if a.BackendService != b.BackendService {
 		return false
 	}
 	return a.ACMEChallenge == b.ACMEChallenge
