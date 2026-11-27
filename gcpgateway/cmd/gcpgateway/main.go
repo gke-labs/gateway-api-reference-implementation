@@ -122,9 +122,6 @@ func BindDataplaneFlags(fs *flag.FlagSet, opts *gari.Options) {
 	// data-plane flag set must accept them (matching cmd/gateway-api-reference-implementation).
 	fs.StringVar(&opts.ProxyHTTP3Addr, "proxy-http3-bind-address", opts.ProxyHTTP3Addr, "The UDP address the proxy binds to for HTTP/3 (defaults to the HTTPS bind address)")
 	fs.IntVar(&opts.ProxyHTTP3AdvertisedPort, "proxy-http3-advertised-port", opts.ProxyHTTP3AdvertisedPort, "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address)")
-	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to")
-	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
-	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
 	gari.BindInternalAPIFlags(fs, opts)
 }
 
@@ -218,9 +215,6 @@ func BindControllerFlags(fs *flag.FlagSet, opts *gari.Options, cfg *ControllerCo
 	fs.BoolVar(&opts.LeaderElection, "leader-elect", opts.LeaderElection, "Enable leader election")
 	fs.BoolVar(&cfg.FakeCompute, "fake-compute", cfg.FakeCompute, "Use in-memory fake Compute client for testing/offline mode")
 	fs.BoolVar(&opts.DebugErrorResponses, "debug-error-responses", opts.DebugErrorResponses, "Include detailed error messages in unmatched responses")
-	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to")
-	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
-	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
 	certserversource.BindFlags(fs, &cfg.Certserver)
 	gari.BindInternalAPIFlags(fs, opts)
 }
@@ -298,9 +292,6 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		singlepod.WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{drainVol}, []*corev1ac.VolumeMountApplyConfiguration{drainMount}),
 		singlepod.WithTerminationGracePeriodSeconds(gracePeriodSeconds),
 		singlepod.WithDebugErrorResponses(opts.DebugErrorResponses),
-		singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
-		singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
-		singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
 	)
 
 	reconcilerCfg := controller.GatewayReconcilerConfig{
