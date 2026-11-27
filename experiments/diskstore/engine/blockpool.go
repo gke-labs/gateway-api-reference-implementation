@@ -363,22 +363,8 @@ func (bp *BlockPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 		// Re-check pageTable because acquirePoolBlocksLocked can release bp.mu
 		// while it flushes dirty pages. Another goroutine may reload, replace,
 		// or remove the page during that window.
-		desc, exists = bp.pageTable[logicalPage]
-		if !exists || desc == nil {
-			bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
-			return nil, ErrPageNotFound
-		}
-		if len(desc.PoolBlocks) > 0 {
-			bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
-			desc.PinCount.Add(1)
-			desc.LastAccess = time.Now()
-			return &PageHandle{pool: bp, Desc: desc}, nil
-		}
-		if desc.PhysicalBlock == NoBlock {
-			bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
-			return nil, ErrPageNotFound
-		}
-		if desc.NumBlocks != neededBlocks {
+		current := bp.pageTable[logicalPage]
+		if current != desc || len(current.PoolBlocks) > 0 || current.PhysicalBlock == NoBlock || current.NumBlocks != neededBlocks {
 			bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
 			continue
 		}
@@ -399,9 +385,7 @@ func (bp *BlockPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 	if err := bp.directIO.Readv(bp.file, int64(readBlock*BlockSize), iov); err != nil {
 		bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
 		desc.PoolBlocks = nil
-		if desc.PinCount.Add(-1) == 0 && bp.cond != nil {
-			bp.cond.Broadcast()
-		}
+		desc.PinCount.Add(-1)
 		return nil, fmt.Errorf("failed to read page %d from disk block %d: %w", logicalPage, readBlock, err)
 	}
 
@@ -413,9 +397,7 @@ func (bp *BlockPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 		if err != nil || hdr.LogicalPage != logicalPage || hdr.BlockIndex != uint32(i) {
 			bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
 			desc.PoolBlocks = nil
-			if desc.PinCount.Add(-1) == 0 && bp.cond != nil {
-				bp.cond.Broadcast()
-			}
+			desc.PinCount.Add(-1)
 			if err != nil {
 				return nil, fmt.Errorf("corrupt block in page %d: %w", logicalPage, err)
 			}
