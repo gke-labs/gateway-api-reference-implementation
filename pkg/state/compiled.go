@@ -3076,16 +3076,16 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 			}
 		}
 		var compiledGw *CompiledGateway
-		var parentGatewayStatus *gatewayv1.GatewayStatus
+		var parentProgrammed *metav1.Condition
 		if parentGW != nil {
 			parentKey := types.NamespacedName{Namespace: parentGW.Namespace, Name: parentGW.Name}
 			compiledGw = compiled.Gateways[parentKey]
 			if status, ok := outputs.GatewayStatuses[parentKey]; ok {
-				parentGatewayStatus = &status
+				parentProgrammed = FindCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 			}
 		}
 		if parentGW != nil && (inputs.ControllerName == "" || compiledGw != nil) {
-			outputs.ListenerSetStatuses[lsKey] = ComputeDesiredListenerSetStatus(ls, parentGW, inputs.Namespaces, compiledGw, parentGatewayStatus)
+			outputs.ListenerSetStatuses[lsKey] = ComputeDesiredListenerSetStatus(ls, parentGW, inputs.Namespaces, compiledGw, parentProgrammed)
 		}
 	}
 
@@ -3259,29 +3259,14 @@ func ComputeDesiredGatewayStatus(
 	}
 }
 
-// parentGatewayNotProgrammedMessage formats a condition message for an accepted ListenerSet
-// or listener when its parent Gateway is not programmed, naming the parent Gateway's reason.
-func parentGatewayNotProgrammedMessage(parentProgrammed metav1.Condition) string {
-	switch {
-	case parentProgrammed.Reason != "" && parentProgrammed.Message != "":
-		return fmt.Sprintf("Parent Gateway is not programmed (%s): %s", parentProgrammed.Reason, parentProgrammed.Message)
-	case parentProgrammed.Reason != "":
-		return fmt.Sprintf("Parent Gateway is not programmed (%s)", parentProgrammed.Reason)
-	case parentProgrammed.Message != "":
-		return fmt.Sprintf("Parent Gateway is not programmed: %s", parentProgrammed.Message)
-	default:
-		return "Parent Gateway is not programmed"
-	}
-}
-
 // ComputeDesiredListenerSetStatus computes the desired ListenerSetStatus from the compiled model
-// and the parent Gateway's computed status.
+// and the parent Gateway's computed Programmed condition.
 func ComputeDesiredListenerSetStatus(
 	ls *gatewayv1.ListenerSet,
 	parentGW *gatewayv1.Gateway,
 	namespaces map[string]*corev1.Namespace,
 	compiledGw *CompiledGateway,
-	parentGatewayStatus *gatewayv1.GatewayStatus,
+	parentProgrammed *metav1.Condition,
 ) gatewayv1.ListenerSetStatus {
 	var effectiveListeners []*EffectiveListener
 	if compiledGw != nil {
@@ -3290,16 +3275,12 @@ func ComputeDesiredListenerSetStatus(
 
 	acceptedCond, programmedCond := ComputeListenerSetConditions(ls, parentGW, namespaces, effectiveListeners)
 
-	var parentProgrammed *metav1.Condition
-	if parentGatewayStatus != nil {
-		parentProgrammed = FindCondition(parentGatewayStatus.Conditions, string(gatewayv1.GatewayConditionProgrammed))
-	}
 	parentNotProgrammed := acceptedCond.Status == metav1.ConditionTrue &&
 		parentProgrammed != nil &&
 		parentProgrammed.Status != metav1.ConditionTrue
 	var parentNotProgrammedMessage string
 	if parentNotProgrammed {
-		parentNotProgrammedMessage = parentGatewayNotProgrammedMessage(*parentProgrammed)
+		parentNotProgrammedMessage = fmt.Sprintf("Parent Gateway is not programmed (%s): %s", parentProgrammed.Reason, parentProgrammed.Message)
 		if programmedCond.Status == metav1.ConditionTrue {
 			programmedCond = NewCondition(
 				string(gatewayv1.ListenerSetConditionProgrammed),

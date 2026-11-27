@@ -1256,7 +1256,8 @@ func TestStatusComputation_PureFunctions(t *testing.T) {
 	}
 
 	// 2. ListenerSet Status
-	lsStatus := ComputeDesiredListenerSetStatus(ls, gw, nil, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], &gwStatus)
+	parentProgrammed := FindCondition(gwStatus.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	lsStatus := ComputeDesiredListenerSetStatus(ls, gw, nil, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], parentProgrammed)
 	if len(lsStatus.Conditions) != 2 {
 		t.Errorf("expected 2 ListenerSet conditions, got %d", len(lsStatus.Conditions))
 	}

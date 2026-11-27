@@ -3333,32 +3333,32 @@ func newGatewayAndListenerSetFixtures() (*gatewayv1.GatewayClass, *gatewayv1.Gat
 }
 
 func TestState_ListenerSetProgrammedFollowsParentGateway_PublishError(t *testing.T) {
-	stateEngine := NewState()
-	stateEngine.SetControllerName("example.net/gateway-controller")
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
 
 	publishError := errors.New("simulated publish failure")
 	mockPublisher := &mockDataplanePublisher{publishErr: publishError}
-	stateEngine.SetDataplanePublisher(mockPublisher)
+	st.SetDataplanePublisher(mockPublisher)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	startErrors := make(chan error, 1)
 	go func() {
-		startErrors <- stateEngine.Start(ctx)
+		startErrors <- st.Start(ctx)
 	}()
 
 	gatewayClass, gateway, listenerSet := newGatewayAndListenerSetFixtures()
 	gatewayKey := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
 	listenerSetKey := types.NamespacedName{Namespace: listenerSet.Namespace, Name: listenerSet.Name}
 
-	stateEngine.UpsertGatewayClass(gatewayClass)
-	stateEngine.UpsertGateway(gateway)
-	stateEngine.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	stateEngine.UpsertListenerSet(listenerSet)
+	st.UpsertGatewayClass(gatewayClass)
+	st.UpsertGateway(gateway)
+	st.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.UpsertListenerSet(listenerSet)
 
 	pollUntil(t, 2*time.Second, func() bool {
-		status, ok := stateEngine.GetDesiredListenerSetStatus(listenerSetKey)
+		status, ok := st.GetDesiredListenerSetStatus(listenerSetKey)
 		if !ok || len(status.Listeners) != 1 {
 			return false
 		}
@@ -3380,7 +3380,7 @@ func TestState_ListenerSetProgrammedFollowsParentGateway_PublishError(t *testing
 	mockPublisher.mu.Unlock()
 
 	pollUntil(t, 2*time.Second, func() bool {
-		status, ok := stateEngine.GetDesiredListenerSetStatus(listenerSetKey)
+		status, ok := st.GetDesiredListenerSetStatus(listenerSetKey)
 		if !ok || len(status.Listeners) != 1 {
 			return false
 		}
@@ -3399,19 +3399,19 @@ func TestState_ListenerSetProgrammedFollowsParentGateway_PublishError(t *testing
 }
 
 func TestState_ListenerSetProgrammedFollowsParentGateway_NoAddress(t *testing.T) {
-	stateEngine := NewState()
-	stateEngine.SetControllerName("example.net/gateway-controller")
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
 
 	gatewayClass, gateway, listenerSet := newGatewayAndListenerSetFixtures()
 	gatewayKey := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
 	listenerSetKey := types.NamespacedName{Namespace: listenerSet.Namespace, Name: listenerSet.Name}
 
-	stateEngine.UpsertGatewayClass(gatewayClass)
-	stateEngine.UpsertGateway(gateway)
-	stateEngine.UpsertListenerSet(listenerSet)
-	stateEngine.Recompute()
+	st.UpsertGatewayClass(gatewayClass)
+	st.UpsertGateway(gateway)
+	st.UpsertListenerSet(listenerSet)
+	st.Recompute()
 
-	status, ok := stateEngine.GetDesiredListenerSetStatus(listenerSetKey)
+	status, ok := st.GetDesiredListenerSetStatus(listenerSetKey)
 	if !ok {
 		t.Fatalf("expected desired status for ListenerSet")
 	}
@@ -3435,10 +3435,10 @@ func TestState_ListenerSetProgrammedFollowsParentGateway_NoAddress(t *testing.T)
 		t.Errorf("expected listener Programmed=False/Pending naming AddressNotAssigned, got %+v", listenerProgrammed)
 	}
 
-	stateEngine.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	stateEngine.Recompute()
+	st.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.Recompute()
 
-	status, ok = stateEngine.GetDesiredListenerSetStatus(listenerSetKey)
+	status, ok = st.GetDesiredListenerSetStatus(listenerSetKey)
 	if !ok {
 		t.Fatalf("expected desired status for ListenerSet after address assignment")
 	}
@@ -3453,8 +3453,8 @@ func TestState_ListenerSetProgrammedFollowsParentGateway_NoAddress(t *testing.T)
 }
 
 func TestState_ListenerSetProgrammedFollowsParentGateway_ReasonMappingAndUnaccepted(t *testing.T) {
-	stateEngine := NewState()
-	stateEngine.SetControllerName("example.net/gateway-controller")
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
 
 	gatewayClass, gateway, listenerSet := newGatewayAndListenerSetFixtures()
 	listenerSet.Spec.Listeners = append(listenerSet.Spec.Listeners, gatewayv1.ListenerEntry{
@@ -3479,19 +3479,19 @@ func TestState_ListenerSetProgrammedFollowsParentGateway_ReasonMappingAndUnaccep
 	listenerSetKey := types.NamespacedName{Namespace: listenerSet.Namespace, Name: listenerSet.Name}
 	disallowedKey := types.NamespacedName{Namespace: disallowedListenerSet.Namespace, Name: disallowedListenerSet.Name}
 
-	stateEngine.UpsertGatewayClass(gatewayClass)
-	stateEngine.UpsertGateway(gateway)
-	stateEngine.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	stateEngine.SetGatewayProvisioningErrors(gatewayKey, nil, &ConditionError{
+	st.UpsertGatewayClass(gatewayClass)
+	st.UpsertGateway(gateway)
+	st.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayProvisioningErrors(gatewayKey, nil, &ConditionError{
 		Type:    string(gatewayv1.GatewayConditionProgrammed),
 		Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
 		Message: "Requested address cannot be bound",
 	})
-	stateEngine.UpsertListenerSet(listenerSet)
-	stateEngine.UpsertListenerSet(disallowedListenerSet)
-	stateEngine.Recompute()
+	st.UpsertListenerSet(listenerSet)
+	st.UpsertListenerSet(disallowedListenerSet)
+	st.Recompute()
 
-	status, ok := stateEngine.GetDesiredListenerSetStatus(listenerSetKey)
+	status, ok := st.GetDesiredListenerSetStatus(listenerSetKey)
 	if !ok || len(status.Listeners) != 2 {
 		t.Fatalf("expected accepted ListenerSet status with 2 listeners, got ok=%v listeners=%d", ok, len(status.Listeners))
 	}
@@ -3515,7 +3515,7 @@ func TestState_ListenerSetProgrammedFollowsParentGateway_ReasonMappingAndUnaccep
 		t.Errorf("expected conflicting listener to keep HostnameConflict reason, got %+v", conflictingListenerProgrammed)
 	}
 
-	disallowedStatus, ok := stateEngine.GetDesiredListenerSetStatus(disallowedKey)
+	disallowedStatus, ok := st.GetDesiredListenerSetStatus(disallowedKey)
 	if !ok {
 		t.Fatalf("expected desired status for disallowed ListenerSet")
 	}
