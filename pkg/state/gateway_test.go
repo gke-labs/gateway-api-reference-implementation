@@ -2499,7 +2499,6 @@ func TestGateway_DisabledRouteKinds(t *testing.T) {
 		st.UpsertGatewayClass(gc)
 		st.UpsertGateway(gw)
 		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-		st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 		outputs := st.Recompute()
 
 		cg := outputs.CompiledGateways[gwKey]
@@ -2603,7 +2602,6 @@ func TestGateway_DisabledRouteKinds(t *testing.T) {
 		st.UpsertGatewayClass(gc)
 		st.UpsertGateway(gw)
 		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-		st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 		outputs := st.Recompute()
 
 		status, ok := outputs.GatewayStatuses[gwKey]

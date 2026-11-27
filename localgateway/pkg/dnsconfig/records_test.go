@@ -80,7 +80,11 @@ func upsertGateway(testState *state.State, gateway *gatewayv1.Gateway, addresses
 		statusAddresses = append(statusAddresses, gatewayv1.GatewayStatusAddress{Value: address})
 	}
 	testState.SetGatewayAddresses(key, statusAddresses)
-	testState.SetGatewayReadiness(key, state.GatewayReadiness{Ready: ready})
+	var notServing *state.ConditionError
+	if !ready {
+		notServing = &state.ConditionError{Type: string(gatewayv1.GatewayConditionProgrammed)}
+	}
+	testState.SetGatewayProvisioningErrors(key, nil, notServing)
 	testState.Recompute()
 }
 

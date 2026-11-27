@@ -688,7 +688,6 @@ func addTestGateway(stateEngine *state.State, gatewayKey types.NamespacedName, p
 	}
 	stateEngine.UpsertGateway(gateway)
 	stateEngine.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	stateEngine.SetGatewayReadiness(gatewayKey, state.GatewayReadiness{Ready: true})
 	return gateway
 }
 

@@ -759,10 +759,8 @@ type ModelInputs struct {
 	GatewayClasses []*gatewayv1.GatewayClass
 	// GatewayAddresses provides infrastructure-assigned status addresses keyed by Gateway.
 	GatewayAddresses map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
-	// GatewayReadiness provides data-plane readiness state keyed by Gateway.
-	GatewayReadiness map[types.NamespacedName]GatewayReadiness
 	// ProvisioningErrors maps Gateway names to errors from infrastructure provisioning.
-	ProvisioningErrors map[types.NamespacedName]error
+	ProvisioningErrors map[types.NamespacedName]gatewayProvisioningErrors
 	// SupportedAddressTypes lists address types supported by the controller implementation.
 	SupportedAddressTypes []gatewayv1.AddressType
 
@@ -1581,8 +1579,7 @@ func ComputeGatewayConditions(
 	gw *gatewayv1.Gateway,
 	effectiveListeners []*EffectiveListener,
 	hasAddress bool,
-	readiness GatewayReadiness,
-	provisioningError error,
+	provisioningErrors gatewayProvisioningErrors,
 	supportedAddressTypes []gatewayv1.AddressType,
 	resolvedRefsCondition metav1.Condition,
 	parametersError error,
@@ -1632,7 +1629,7 @@ func ComputeGatewayConditions(
 	if acceptedCond.Status == metav1.ConditionFalse {
 		addProgrammedError(string(gatewayv1.GatewayReasonInvalid), "Gateway is not accepted")
 	} else {
-		if provisioningError != nil {
+		if provisioningError := provisioningErrors.provisioningError(); provisioningError != nil {
 			reason := string(gatewayv1.GatewayReasonPending)
 			var conditionError *ConditionError
 			if errors.As(provisioningError, &conditionError) && conditionError.Type == programmedType && conditionError.Reason != "" {
@@ -1640,17 +1637,18 @@ func ComputeGatewayConditions(
 			}
 			addProgrammedError(reason, provisioningError.Error())
 		}
-		if !readiness.Ready && readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
-			addProgrammedError(string(gatewayv1.GatewayReasonAddressNotUsable), cmp.Or(readiness.Message, "Requested address cannot be used"))
+		notServing := provisioningErrors.notServing
+		if notServing != nil && notServing.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+			addProgrammedError(string(gatewayv1.GatewayReasonAddressNotUsable), cmp.Or(notServing.Message, "Requested address cannot be used"))
 		} else if !hasAddress {
 			message := "Waiting for address to be assigned to the Gateway"
-			if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotAssigned) && readiness.Message != "" {
-				message = readiness.Message
+			if notServing != nil && notServing.Reason == string(gatewayv1.GatewayReasonAddressNotAssigned) && notServing.Message != "" {
+				message = notServing.Message
 			}
 			addProgrammedError(string(gatewayv1.GatewayReasonAddressNotAssigned), message)
 		}
-		if !readiness.Ready && readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-			addProgrammedError(cmp.Or(readiness.Reason, string(gatewayv1.GatewayReasonPending)), cmp.Or(readiness.Message, "Waiting for data-plane deployment to become available"))
+		if notServing != nil && notServing.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+			addProgrammedError(cmp.Or(notServing.Reason, string(gatewayv1.GatewayReasonPending)), cmp.Or(notServing.Message, "Waiting for data-plane deployment to become available"))
 		}
 	}
 
@@ -2150,9 +2148,9 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		if inputs.GatewayAddresses != nil {
 			hasAddress = len(inputs.GatewayAddresses[gwKey]) > 0
 		}
-		var provisioningError error
+		var provisioningErrors gatewayProvisioningErrors
 		if inputs.ProvisioningErrors != nil {
-			provisioningError = inputs.ProvisioningErrors[gwKey]
+			provisioningErrors = inputs.ProvisioningErrors[gwKey]
 		}
 		var gcParams *Parameters
 		var parametersError error
@@ -2194,7 +2192,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		clientCert, resolvedRefsCond := resolveGatewayBackendClientCert(gw, inputs.Secrets, refValidator)
 		cg.BackendClientCert = clientCert
 		cg.ResolvedRefsCondition = resolvedRefsCond
-		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, GatewayReadiness{Ready: true}, provisioningError, inputs.SupportedAddressTypes, resolvedRefsCond, cg.ParametersRefError)
+		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, provisioningErrors, inputs.SupportedAddressTypes, resolvedRefsCond, cg.ParametersRefError)
 		cm.Gateways[gwKey] = cg
 	}
 
@@ -3056,17 +3054,11 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 			if inputs.GatewayAddresses != nil {
 				addrs = inputs.GatewayAddresses[gwKey]
 			}
-			readiness := GatewayReadiness{Ready: true}
-			if inputs.GatewayReadiness != nil {
-				if r, ok := inputs.GatewayReadiness[gwKey]; ok {
-					readiness = r
-				}
-			}
-			var provisioningError error
+			var provisioningErrors gatewayProvisioningErrors
 			if inputs.ProvisioningErrors != nil {
-				provisioningError = inputs.ProvisioningErrors[gwKey]
+				provisioningErrors = inputs.ProvisioningErrors[gwKey]
 			}
-			outputs.GatewayStatuses[gwKey] = ComputeDesiredGatewayStatus(gw, cg, addrs, readiness, provisioningError, inputs.SupportedAddressTypes)
+			outputs.GatewayStatuses[gwKey] = ComputeDesiredGatewayStatus(gw, cg, addrs, provisioningErrors, inputs.SupportedAddressTypes)
 		}
 	}
 
@@ -3195,8 +3187,7 @@ func ComputeDesiredGatewayStatus(
 	gw *gatewayv1.Gateway,
 	compiledGw *CompiledGateway,
 	providedAddresses []gatewayv1.GatewayStatusAddress,
-	readiness GatewayReadiness,
-	provisioningError error,
+	provisioningErrors gatewayProvisioningErrors,
 	supportedAddressTypes []gatewayv1.AddressType,
 ) gatewayv1.GatewayStatus {
 	desiredAddresses := computeDesiredAddresses(gw.Spec.Addresses, providedAddresses)
@@ -3214,7 +3205,7 @@ func ComputeDesiredGatewayStatus(
 		_, parametersError = ValidateGatewayParametersRef(gw.Spec.Infrastructure.ParametersRef, gw.Namespace, nil)
 	}
 
-	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, readiness, provisioningError, supportedAddressTypes, resolvedRefsCond, parametersError)
+	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, provisioningErrors, supportedAddressTypes, resolvedRefsCond, parametersError)
 
 	var desiredListenerStatuses []gatewayv1.ListenerStatus
 	for _, l := range gw.Spec.Listeners {

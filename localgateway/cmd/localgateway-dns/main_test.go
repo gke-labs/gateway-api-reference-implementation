@@ -258,7 +258,6 @@ func (f *testFixture) applyGateway(t *testing.T, ctx context.Context, name, host
 	gatewayKey := types.NamespacedName{Namespace: "default", Name: name}
 	f.controllerState.UpsertGateway(gateway)
 	f.controllerState.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: address}})
-	f.controllerState.SetGatewayReadiness(gatewayKey, state.GatewayReadiness{Ready: true})
 	f.controllerState.Recompute()
 
 	waitForConfigInClient(t, ctx, f.fakeClient, func(config *dnsconfig.Config) bool {
