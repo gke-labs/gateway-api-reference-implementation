@@ -407,6 +407,170 @@ The response confirms end-to-end traffic passing through the Google Cloud L4 Loa
 
 ---
 
+## Serving Behind an Operator-Built Front End
+
+If you already operate a Google Cloud front end—for example, a global external Application Load Balancer whose URL map routes traffic to an existing global HTTP backend service—you do not need `gcpgatewayctl frontend create`. Instead, create zonal NEGs for the Gateway, point the backend service's health check at the data-plane readiness endpoint, and configure the Gateway's parameters ConfigMap to target your backend service and HTTP NEG.
+
+This setup assumes a VPC-native cluster (`--enable-ip-alias`) where the `gcpgateway` controller is already deployed with the `gcpgatewayNegRegistrar` IAM role (including `compute.backendServices.get` on the existing backend service and NEG permissions on the NEGs). Because the controller calls the global `backendServices.getHealth` API in its configured `--project` (`PROJECT_ID`), the existing backend service must be a global Compute Engine backend service in that project.
+
+### 1. Create Zonal NEGs with Ownership Metadata
+
+Create one zonal `GCE_VM_IP_PORT` Network Endpoint Group (NEG) in every zone where cluster nodes run (and any zone configured on the controller via `--zones`):
+
+- **Name**: Use the same NEG name in every zone. The name must start with the controller's `--neg-prefix` (or `NEG_PREFIX`, default `gcpgw`), because the controller lists NEGs using a prefix filter (`name = <neg-prefix>*`).
+- **Network, subnetwork, and port**: Create each NEG in the cluster's VPC network and subnetwork with `--network-endpoint-type=gce-vm-ip-port` and `--default-port=8080`.
+- **Description**: Set the NEG `description` field to a JSON object identifying the controller's `--cluster-id` (or `CLUSTER_ID`, default `cluster-1`), the Gateway's `namespace` and `name`, and port `8080`:
+
+  ```json
+  {"cluster-id":"cluster-prod-1","namespace":"default","gateway-name":"app-gw","port":8080}
+  ```
+
+  Setting `"port": 8080` is required for HTTP NEGs: if `port` is omitted or `0`, the registrar defaults to attaching endpoints on port `8443`.
+
+The controller attaches and detaches endpoints **only** on NEGs whose name starts with its `--neg-prefix` and whose JSON `description` names its `cluster-id` and the Gateway (`namespace` and `gateway-name`) with a port served by the Gateway's listeners. NEGs with a missing, unparseable, or foreign description are ignored and never modified, so it is safe to attach NEGs for a Gateway alongside other backends on the same backend service.
+
+```bash
+export PROJECT_ID="my-gcp-project"
+export NETWORK="default"
+export SUBNET="default"
+export ZONES="us-central1-a us-central1-b us-central1-c"
+export CLUSTER_ID="cluster-prod-1"
+export GATEWAY_NAMESPACE="default"
+export GATEWAY_NAME="app-gw"
+export NEG_NAME="gcpgw-app-gw-8080"
+export BACKEND_SERVICE="my-http-backend-service"
+export HEALTH_CHECK_NAME="gcpgw-app-gw-hc"
+
+NEG_DESCRIPTION=$(printf '{"cluster-id":"%s","namespace":"%s","gateway-name":"%s","port":8080}' \
+  "${CLUSTER_ID}" "${GATEWAY_NAMESPACE}" "${GATEWAY_NAME}")
+
+for ZONE in ${ZONES}; do
+  gcloud compute network-endpoint-groups create "${NEG_NAME}" \
+    --project="${PROJECT_ID}" \
+    --zone="${ZONE}" \
+    --network-endpoint-type=gce-vm-ip-port \
+    --network="${NETWORK}" \
+    --subnet="${SUBNET}" \
+    --default-port=8080 \
+    --description="${NEG_DESCRIPTION}"
+done
+```
+
+### 2. Configure the Health Check, Backends, and Firewall
+
+Data-plane pods serve their readiness endpoint over HTTP on fixed port **`8999`** at path **`/_gari/readyz`**. It returns `200 OK` once the data plane has received its Gateway routing configuration, and immediately returns `503 Service Unavailable` during graceful shutdown when the `preStop` hook writes `/var/run/gcpgateway/draining`.
+
+1. Create an HTTP health check targeting port `8999` and path `/_gari/readyz`, update the existing global HTTP backend service to use it (with a connection draining timeout matching the controller's `--drain-seconds`, default `35`), and attach each zonal NEG as a backend:
+
+```bash
+gcloud compute health-checks create http "${HEALTH_CHECK_NAME}" \
+  --project="${PROJECT_ID}" \
+  --global \
+  --port=8999 \
+  --request-path="/_gari/readyz" \
+  --check-interval=5s \
+  --timeout=5s \
+  --healthy-threshold=2 \
+  --unhealthy-threshold=2
+
+gcloud compute backend-services update "${BACKEND_SERVICE}" \
+  --project="${PROJECT_ID}" \
+  --global \
+  --health-checks="${HEALTH_CHECK_NAME}" \
+  --connection-draining-timeout=35
+
+for ZONE in ${ZONES}; do
+  gcloud compute backend-services add-backend "${BACKEND_SERVICE}" \
+    --project="${PROJECT_ID}" \
+    --global \
+    --network-endpoint-group="${NEG_NAME}" \
+    --network-endpoint-group-zone="${ZONE}" \
+    --balancing-mode=RATE \
+    --max-rate-per-endpoint=100
+done
+```
+
+2. Ensure a VPC ingress firewall rule allows TCP traffic to data-plane pods on ports `8080` (HTTP traffic) and `8999` (health checks) from Google Front End and health check ranges (`35.191.0.0/16` and `130.211.0.0/22`):
+
+```bash
+gcloud compute firewall-rules create "${NEG_NAME}-allow-gfe" \
+  --project="${PROJECT_ID}" \
+  --network="${NETWORK}" \
+  --direction=INGRESS \
+  --action=ALLOW \
+  --rules=tcp:8080,tcp:8999 \
+  --source-ranges="35.191.0.0/16,130.211.0.0/22"
+```
+
+If your front end forwards HTTP traffic from another source range (such as a VPC proxy-only subnet), allow TCP `8080` from that range as well and include it in `allowedSourceCIDRs` below.
+
+### 3. Configure the Parameters ConfigMap and Gateway
+
+Create a `ConfigMap` in the Gateway's namespace and reference it from `Gateway.spec.infrastructure.parametersRef`:
+
+| Key | Value | Purpose |
+| --- | --- | --- |
+| `backendService` | `"<BACKEND_SERVICE>"` | Name of the existing global Compute Engine backend service to poll with `backendServices.getHealth`. Must be a valid Compute Engine resource name (RFC 1035 label: lowercase letters, digits, and hyphens, starting with a letter and ending with a letter or digit, up to 63 characters); invalid values cause `Accepted=False` with reason `InvalidParameters`. |
+| `negHTTP` | `"<NEG_NAME>"` | Name of the zonal HTTP NEG (without zone) polled on `backendService` and used for NEG conflict detection. |
+| `proxyProtocol` | `"disabled"` | Disables PROXY protocol header parsing on data-plane listeners, since an HTTP backend service forwards plain HTTP rather than TCP wrapped in a PROXY header. |
+| `serviceType` | `ClusterIP` | Prevents the single-pod provisioner from creating an extra Kubernetes `LoadBalancer` Service. |
+| `allowedSourceCIDRs` | `"35.191.0.0/16,130.211.0.0/22"` | Source CIDRs allowed to connect to data-plane port `8080` (adjust if your front end uses different proxy source CIDRs). |
+| `externalIP` | `"<FRONTEND_STATIC_IP>"` | External IP address of your front end. Provide it here and/or in `Gateway.spec.addresses` (`type: IPAddress`); if neither is set, the controller reports `Programmed=False` with reason `AddressNotAssigned` and does not poll backend health. |
+
+Declare an `HTTP` listener on the Gateway and no `HTTPS`, `TLS`, or `TCP` listener. When a Gateway has an `HTTP` listener and no `HTTPS`, `TLS`, or `TCP` listener, the controller polls health on `negHTTP` (port `8080`); if an `HTTPS`, `TLS`, or `TCP` listener is present, it polls `negHTTPS` (port `8443`) instead.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gcpgateway-params-app-gw
+  namespace: default
+data:
+  serviceType: ClusterIP
+  backendService: "my-http-backend-service"
+  negHTTP: "gcpgw-app-gw-8080"
+  proxyProtocol: "disabled"
+  allowedSourceCIDRs: "35.191.0.0/16,130.211.0.0/22"
+  externalIP: "<FRONTEND_STATIC_IP>"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: app-gw
+  namespace: default
+spec:
+  gatewayClassName: gcpgateway
+  addresses:
+  - type: IPAddress
+    value: "<FRONTEND_STATIC_IP>"
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: Same
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: gcpgateway-params-app-gw
+```
+
+### 4. Verify Readiness and Cleanup
+
+Attach an `HTTPRoute` to `app-gw` (as in [Step 5](#step-5-deploy-sample-application-tls-secret-and-route) above) and wait for the Gateway to become ready:
+
+```bash
+kubectl wait --for=condition=Programmed gateway/app-gw -n default --timeout=3m
+```
+
+Once data-plane pods pass container readiness, the controller attaches each pod IP on port `8080` to the matching zonal NEG, polls `backendServices.getHealth` on `backendService` for `negHTTP`, sets the pod's `gcpgateway.gke-labs.io/load-balancer-ready` readiness gate to `True` when the backend service reports the pod `HEALTHY`, and marks the Gateway `Programmed=True`.
+
+When you delete the Gateway (`kubectl delete gateway app-gw -n default`), the controller's `gcpgateway.gke-labs.io/cleanup` finalizer detaches its pod endpoints from the matching zonal NEGs while leaving your backend service, health check, firewall rule, and NEGs intact.
+
+---
+
 ## Automatic TLS Certificates via certserver
 
 `gcpgateway` integrates with `certserver` to automatically provision and renew TLS certificates for HTTPS listeners using GARI's pluggable certificate-source hook and certserver's authenticated `GetCertificate` gRPC API.
