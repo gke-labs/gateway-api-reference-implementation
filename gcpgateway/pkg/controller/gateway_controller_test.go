@@ -2614,3 +2614,228 @@ func TestGateway_LongName_Reconcile(t *testing.T) {
 		t.Fatalf("expected pod attached to NEG, got %+v", eps)
 	}
 }
+
+func TestGateway_BackendServiceParameter(t *testing.T) {
+	scheme := setupScheme()
+	ipAddrType := gatewayv1.IPAddressType
+
+	const customBackendService = "operator-http-backend"
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "gw-params",
+		},
+		Data: map[string]string{
+			state.ParameterKeyBackendService: customBackendService,
+		},
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "my-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "gw-params",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(configMap, gateway, node).
+		Build()
+
+	makeTestPod(t, kubeClient, gateway, "dp-pod-1", "node-1", "10.0.1.5", []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodConditionType(registrar.LoadBalancerReadyGate), Status: corev1.ConditionFalse},
+	})
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	negDesc, err := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "my-gw",
+		Port:        8443,
+	}).Encode()
+	if err != nil {
+		t.Fatalf("encoding NEG metadata: %v", err)
+	}
+
+	negName := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negName,
+		Zone:        "us-central1-a",
+		Description: negDesc,
+	})
+
+	derivedBackendService := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "bs-443")
+
+	reg := registrar.NewRegistrar(kubeClient, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+	reconciler := NewGatewayReconciler(kubeClient, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
+
+	// Derived backend service is healthy, but configured backendService is unhealthy.
+	fakeGCP.SetBackendServiceHealth("my-project", derivedBackendService, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "HEALTHY"},
+		},
+	})
+	fakeGCP.SetBackendServiceHealth("my-project", customBackendService, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "UNHEALTHY"},
+		},
+	})
+
+	if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	var pod corev1.Pod
+	if err := kubeClient.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "dp-pod-1"}, &pod); err != nil {
+		t.Fatalf("getting pod: %v", err)
+	}
+	if isPodReadinessGateTrue(&pod) {
+		t.Fatalf("expected readiness gate to remain False while configured backendService is UNHEALTHY")
+	}
+
+	// Configured backendService becomes healthy while derived backend service is unhealthy.
+	fakeGCP.SetBackendServiceHealth("my-project", derivedBackendService, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "UNHEALTHY"},
+		},
+	})
+	fakeGCP.SetBackendServiceHealth("my-project", customBackendService, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "HEALTHY"},
+		},
+	})
+
+	if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	if err := kubeClient.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "dp-pod-1"}, &pod); err != nil {
+		t.Fatalf("getting pod: %v", err)
+	}
+	if !isPodReadinessGateTrue(&pod) {
+		t.Fatalf("expected readiness gate to become True from configured backendService")
+	}
+	cached := reconciler.GetCachedStatus(request.NamespacedName)
+	if cached == nil || cached.ProgrammedStatus != metav1.ConditionTrue || cached.Reason != ReasonProgrammed {
+		t.Errorf("expected Programmed=True in cache, got %+v", cached)
+	}
+}
+
+func TestGateway_BackendServiceParameterInvalid(t *testing.T) {
+	scheme := setupScheme()
+	ipAddrType := gatewayv1.IPAddressType
+
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "bad-params",
+		},
+		Data: map[string]string{
+			state.ParameterKeyBackendService: "Invalid_Backend_Name",
+		},
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "my-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "bad-params",
+				},
+			},
+		},
+	}
+
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&gatewayv1.Gateway{}).
+		WithObjects(configMap, gateway).
+		Build()
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	reg := registrar.NewRegistrar(kubeClient, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+	})
+	reconciler := NewGatewayReconciler(kubeClient, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+	})
+
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
+	if _, err := reconciler.Reconcile(t.Context(), request); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	cached := reconciler.GetCachedStatus(request.NamespacedName)
+	if cached == nil || cached.AcceptedStatus != metav1.ConditionFalse || cached.ProgrammedStatus != metav1.ConditionFalse || cached.Reason != ReasonInvalidParameters {
+		t.Fatalf("expected Accepted=False and Programmed=False with InvalidParameters, got %+v", cached)
+	}
+
+	var gatewayStatus gatewayv1.GatewayStatus
+	if err := reconciler.GatewayStatusHook(t.Context(), gateway, &gatewayStatus); err != nil {
+		t.Fatalf("GatewayStatusHook failed: %v", err)
+	}
+	acceptedCondition := getConditionFromStatus(&gatewayStatus, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCondition == nil || acceptedCondition.Status != metav1.ConditionFalse || acceptedCondition.Reason != ReasonInvalidParameters {
+		t.Errorf("expected Accepted=False with Reason=%s, got %+v", ReasonInvalidParameters, acceptedCondition)
+	}
+	if len(fakeGCP.AttachCalls) != 0 {
+		t.Errorf("expected no NEG attach calls for invalid parameters, got %d", len(fakeGCP.AttachCalls))
+	}
+
+	mapped := reconciler.configMapToGateway(t.Context(), configMap)
+	if len(mapped) != 1 || mapped[0].NamespacedName != request.NamespacedName {
+		t.Errorf("configMapToGateway = %v, want [%v]", mapped, request.NamespacedName)
+	}
+	unrelated := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "other-params"}}
+	if got := reconciler.configMapToGateway(t.Context(), unrelated); len(got) != 0 {
+		t.Errorf("configMapToGateway for unrelated ConfigMap = %v, want empty", got)
+	}
+}
