@@ -24,6 +24,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/yaml"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/certserversource"
 )
 
 func TestControllerManifest_RBACCustomResourceDefinitions(t *testing.T) {
@@ -118,8 +120,8 @@ func TestControllerManifest_CertserverDeployment(t *testing.T) {
 				}
 				for _, src := range vol.Projected.Sources {
 					if src.ServiceAccountToken != nil {
-						if src.ServiceAccountToken.Audience != "certserver" {
-							t.Errorf("expected audience certserver, got %s", src.ServiceAccountToken.Audience)
+						if src.ServiceAccountToken.Audience != certserversource.TokenAudience {
+							t.Errorf("expected audience %s, got %s", certserversource.TokenAudience, src.ServiceAccountToken.Audience)
 						}
 						if src.ServiceAccountToken.Path != "token" {
 							t.Errorf("expected path token, got %s", src.ServiceAccountToken.Path)
@@ -150,18 +152,18 @@ func TestControllerManifest_CertserverDeployment(t *testing.T) {
 		}
 
 		// 3. Verify arguments
-		hasAddr := slices.Contains(c.Args, "--certserver-address=certserver.gateway-system.svc:8443")
-		hasCA := slices.Contains(c.Args, "--certserver-ca-bundle-path=/etc/ssl/certs/certserver-ca.crt")
-		hasToken := slices.Contains(c.Args, "--certserver-token-path=/var/run/secrets/tokens/certserver/token")
+		hasAddr := slices.Contains(c.Args, "--"+certserversource.FlagServerAddress+"=certserver.gateway-system.svc:8443")
+		hasCA := slices.Contains(c.Args, "--"+certserversource.FlagCABundlePath+"=/etc/ssl/certs/certserver-ca.crt")
+		hasToken := slices.Contains(c.Args, "--"+certserversource.FlagTokenPath+"=/var/run/secrets/tokens/certserver/token")
 
 		if !hasAddr {
-			t.Errorf("expected --certserver-address in args, got %v", c.Args)
+			t.Errorf("expected --%s in args, got %v", certserversource.FlagServerAddress, c.Args)
 		}
 		if !hasCA {
-			t.Errorf("expected --certserver-ca-bundle-path in args, got %v", c.Args)
+			t.Errorf("expected --%s in args, got %v", certserversource.FlagCABundlePath, c.Args)
 		}
 		if !hasToken {
-			t.Errorf("expected --certserver-token-path in args, got %v", c.Args)
+			t.Errorf("expected --%s in args, got %v", certserversource.FlagTokenPath, c.Args)
 		}
 	}
 
