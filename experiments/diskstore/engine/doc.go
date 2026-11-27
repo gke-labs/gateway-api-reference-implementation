@@ -15,7 +15,7 @@
 // Package engine implements the disk-store database engine.
 // It provides crash-consistent key-value storage using a write-ahead log,
 // a self-describing block heap file, a fixed-size block pool, out-of-place
-// buddy allocation, and payload compression and encryption.
+// buddy allocation, payload compression, and block-level encryption.
 //
 // See design.md for the engine design, terminology, on-disk formats, and invariants.
 package engine

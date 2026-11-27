@@ -207,14 +207,10 @@ func TestIndexer_SecondaryIndexing(t *testing.T) {
 
 func TestIndexer_WithEncryption(t *testing.T) {
 	memFS := engine.NewMemFS()
-	cipher, err := engine.NewEphemeralAESGCMCipher()
-	if err != nil {
-		t.Fatalf("NewEphemeralAESGCMCipher failed: %v", err)
-	}
 
-	store, err := engine.Open(engine.WithFS(memFS), engine.WithCipher(cipher), engine.WithDir("idx_crypto_store"), engine.WithCreate())
+	store, err := OpenEngine(engine.WithFS(memFS), engine.WithDir("idx_crypto_store"))
 	if err != nil {
-		t.Fatalf("Open failed: %v", err)
+		t.Fatalf("OpenEngine failed: %v", err)
 	}
 	defer store.Close()
 
@@ -236,7 +232,7 @@ func TestIndexer_WithEncryption(t *testing.T) {
 		t.Fatalf("Add failed: %v", err)
 	}
 
-	// Decrypt through indexer
+	// Read back through indexer
 	obj, exists, err := indexer.GetByKey("kube-system/sensitive-secret")
 	if err != nil || !exists {
 		t.Fatalf("GetByKey failed: %v", err)
@@ -250,11 +246,11 @@ func TestIndexer_WithEncryption(t *testing.T) {
 	_ = indexer.Close()
 	_ = store.Close()
 
-	// Verify reopening store without cipher fails with encryption error
-	storeNoCipher, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_crypto_store"))
+	// Verify reopening store without key fails with encryption error
+	storeNoKey, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_crypto_store"))
 	if err == nil {
-		storeNoCipher.Close()
-		t.Fatalf("expected Open without cipher to fail on encrypted store, but succeeded")
+		storeNoKey.Close()
+		t.Fatalf("expected Open without key to fail on encrypted store, but succeeded")
 	}
 	if !errors.Is(err, engine.ErrStoreEncrypted) {
 		t.Fatalf("expected ErrStoreEncrypted, got: %v", err)
@@ -263,8 +259,22 @@ func TestIndexer_WithEncryption(t *testing.T) {
 		t.Fatalf("expected error to mention that store is encrypted, got: %v", err)
 	}
 
-	// Verify on-disk files do not contain the plaintext token
-	for _, sub := range []string{"", "wal"} {
+	// Verify reopening with a different key without WithEraseOnError fails with ErrInvalidKey
+	wrongKey, err := engine.NewEncryptionKey()
+	if err != nil {
+		t.Fatalf("NewEncryptionKey failed: %v", err)
+	}
+	storeWrongKey, err := engine.Open(engine.WithFS(memFS), engine.WithEncryptionKey(wrongKey), engine.WithDir("idx_crypto_store"))
+	if err == nil {
+		storeWrongKey.Close()
+		t.Fatalf("expected Open with wrong key to fail on encrypted store, but succeeded")
+	}
+	if !errors.Is(err, engine.ErrInvalidKey) {
+		t.Fatalf("expected ErrInvalidKey, got: %v", err)
+	}
+
+	// Verify on-disk files do not contain the plaintext token or secret name
+	for _, sub := range []string{"", "wal", "oversize"} {
 		dir := filepath.Join("idx_crypto_store", sub)
 		entries, err := memFS.ReadDir(dir)
 		if err != nil {
@@ -284,6 +294,9 @@ func TestIndexer_WithEncryption(t *testing.T) {
 			_ = f.Close()
 			if bytes.Contains(buf, []byte("super-secret-token-12345")) {
 				t.Fatalf("secret token was found in plaintext in file %s!", filepath.Join(dir, e.Name()))
+			}
+			if bytes.Contains(buf, []byte("sensitive-secret")) {
+				t.Fatalf("secret name was found in plaintext in file %s!", filepath.Join(dir, e.Name()))
 			}
 		}
 	}

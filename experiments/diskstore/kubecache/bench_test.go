@@ -488,6 +488,19 @@ type WorkerResult struct {
 	Lat1000WarmUs    float64 `json:"lat_1000_warm_us"`
 }
 
+func benchmarkEncryptionEnabled(t *testing.T) bool {
+	t.Helper()
+	switch mode := os.Getenv("BENCHMARK_ENCRYPTION"); mode {
+	case "", "on":
+		return true
+	case "off":
+		return false
+	default:
+		t.Fatalf("invalid BENCHMARK_ENCRYPTION=%q (want 'on' or 'off')", mode)
+		return false
+	}
+}
+
 // TestDiskStore_Benchmark_Worker executes a single benchmark engine in an isolated OS process.
 func TestDiskStore_Benchmark_Worker(t *testing.T) {
 	if os.Getenv("BENCHMARK_WORKER") != "1" {
@@ -543,9 +556,13 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		}
 
 	case "bbolt":
-		cipherBbolt, err := bboltcache.NewEphemeralAESGCMCipher()
-		if err != nil {
-			t.Fatalf("cipher creation failed: %v", err)
+		var cipherBbolt bboltcache.Cipher = bboltcache.NoopCipher{}
+		if benchmarkEncryptionEnabled(t) {
+			var err error
+			cipherBbolt, err = bboltcache.NewEphemeralAESGCMCipher()
+			if err != nil {
+				t.Fatalf("bbolt cipher creation failed: %v", err)
+			}
 		}
 
 		bboltDir := t.TempDir()
@@ -640,19 +657,26 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			poolBlocks = 16384 // 64 MiB block pool
 		}
 
-		cipherDisk, err := engine.NewEphemeralAESGCMCipher()
-		if err != nil {
-			t.Fatalf("cipher creation failed: %v", err)
+		var encryptionKey engine.EncryptionKey
+		if benchmarkEncryptionEnabled(t) {
+			var err error
+			encryptionKey, err = engine.NewEncryptionKey()
+			if err != nil {
+				t.Fatalf("encryption key creation failed: %v", err)
+			}
 		}
 
 		diskDir := t.TempDir()
-		diskStore, err := engine.Open(
+		openOpts := []engine.Option{
 			engine.WithDir(diskDir),
-			engine.WithCipher(cipherDisk),
 			engine.WithNumPoolBlocks(poolBlocks),
 			engine.WithCompressionCodec(codec),
 			engine.WithCreate(),
-		)
+		}
+		if len(encryptionKey) > 0 {
+			openOpts = append(openOpts, engine.WithEncryptionKey(encryptionKey))
+		}
+		diskStore, err := engine.Open(openOpts...)
 		if err != nil {
 			t.Fatalf("diskstore creation failed: %v", err)
 		}
@@ -688,12 +712,15 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		heapMB, walMB, totalMB, _ := getDiskBreakdown(diskDir)
 
 		t0 = time.Now()
-		recoveredStore, err := engine.Open(
+		reopenOpts := []engine.Option{
 			engine.WithDir(diskDir),
-			engine.WithCipher(cipherDisk),
 			engine.WithNumPoolBlocks(poolBlocks),
 			engine.WithCompressionCodec(codec),
-		)
+		}
+		if len(encryptionKey) > 0 {
+			reopenOpts = append(reopenOpts, engine.WithEncryptionKey(encryptionKey))
+		}
+		recoveredStore, err := engine.Open(reopenOpts...)
 		if err != nil {
 			t.Fatalf("reopening store for recovery failed: %v", err)
 		}

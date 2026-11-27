@@ -53,9 +53,6 @@ var (
 	// ErrStopScan can be returned by a Scan callback to abort scanning early without error.
 	ErrStopScan = errors.New("stop scan")
 
-	// ErrDecrypt indicates a failure during payload decryption.
-	ErrDecrypt = errors.New("payload decryption failed")
-
 	// ErrCorruptStore indicates corruption in the store state or referenced files.
 	ErrCorruptStore = errors.New("store corruption")
 
@@ -87,7 +84,6 @@ func unqualifyKey(qualified string) (string, string) {
 type Options struct {
 	Dir           string
 	FS            FS
-	Cipher        Cipher
 	EncryptionKey EncryptionKey
 	NumPoolBlocks int
 	AutoDelete    bool
@@ -177,29 +173,11 @@ func WithFS(fs FS) Option {
 	}
 }
 
-// WithCipher sets the cipher for payload encryption.
-func WithCipher(cipher Cipher) Option {
-	return func(o *Options) {
-		o.Cipher = cipher
-	}
-}
-
 // WithEncryptionKey sets the 32-byte caller's key for block-level encryption.
 //
-// When configured, the block pool encrypts each 4 KiB heap block with AES-256-XTS
-// under the derived heap key when flushing to disk and decrypts it when reading,
-// and the WAL encrypts each 4 KiB log block under the derived segment key when
-// writing and decrypts it when recovery reads. Oversize files are not yet encrypted.
-//
-// Interaction with WithCipher:
-// During the transition before the per-value cipher is removed:
-//   - A store created with WithEncryptionKey records a non-zero key-check token.
-//     Opening such a store with only WithCipher returns an error stating that the
-//     store is encrypted with a key and requires the encryption key option.
-//   - A store created with only WithCipher records an empty (zero) key-check token.
-//     Opening such a store with WithEncryptionKey fails key verification and
-//     returns ErrInvalidKey, which will cause WithEraseOnError to erase and
-//     recreate the store.
+// When configured, the engine derives subkeys via HKDF-SHA256 using the database ID
+// as salt and encrypts 4 KiB heap blocks, WAL segment blocks, and oversize value files
+// with AES-256-XTS. Passing a nil or empty key disables encryption.
 func WithEncryptionKey(key EncryptionKey) Option {
 	return func(o *Options) {
 		o.EncryptionKey = key
@@ -282,7 +260,7 @@ func (t *emptyPageTracker) Pages() []uint64 {
 }
 
 // Engine coordinates the write-ahead log, heap file, block pool, buddy allocator,
-// in-memory index, payload encryption, and crash consistency mechanisms.
+// in-memory index, block-level encryption, and crash consistency mechanisms.
 type Engine struct {
 	fs         FS
 	dir        string
@@ -290,7 +268,6 @@ type Engine struct {
 	isTemp     bool
 	autoDelete bool
 
-	cipher           Cipher
 	encryptionKey    EncryptionKey
 	compressionCodec CompressionCodec
 	maxObjectSize    int
@@ -397,11 +374,11 @@ func wipeStoreFiles(fs FS, dir string) error {
 }
 
 var (
-	// ErrStoreEncrypted is returned when opening an encrypted store without a cipher or encryption key.
-	ErrStoreEncrypted = errors.New("store is encrypted: cipher or encryption key option required")
+	// ErrStoreEncrypted is returned when opening an encrypted store without an encryption key.
+	ErrStoreEncrypted = errors.New("store is encrypted: encryption key option required")
 
-	// ErrStoreNotEncrypted is returned when opening an unencrypted store with a cipher or encryption key.
-	ErrStoreNotEncrypted = errors.New("store is not encrypted: cipher or encryption key option provided")
+	// ErrStoreNotEncrypted is returned when opening an unencrypted store with an encryption key.
+	ErrStoreNotEncrypted = errors.New("store is not encrypted: encryption key option provided")
 
 	// ErrInvalidKey is returned when the encryption key fails verification against the key-check token.
 	ErrInvalidKey = errors.New("invalid encryption key")
@@ -409,7 +386,7 @@ var (
 
 const (
 	// StoreFileMode is the file mode used when creating store files (0600).
-	// Store files can hold Secret payloads, unencrypted when no cipher is configured,
+	// Store files can hold Secret payloads, unencrypted when no encryption key is configured,
 	// so other users on the node should not be able to read them.
 	StoreFileMode os.FileMode = 0600
 
@@ -419,14 +396,14 @@ const (
 	// metaMagic identifies valid meta.db files ("META").
 	metaMagic uint32 = 0x4D455441
 
-	// metaFlagEncrypted indicates that the store was created with an active encryption cipher.
+	// metaFlagEncrypted indicates that the store was created with encryption enabled.
 	metaFlagEncrypted uint64 = 1 << 0
 
 	// StoreFormatVersion is the format version recorded in meta.db.
 	// Version 1 did not record a version and stored uncompressed values without a codec byte.
 	// Version 2 records this version in meta.db and prefixes each stored value with a codec byte.
 	// Version 3 removes resourceVersion (token) handling from WAL records and the engine.
-	// Version 4 records whether the store was created with a cipher in meta.db.
+	// Version 4 records whether the store was created with an encryption key in meta.db.
 	// Version 5 makes meta.db a 4 KiB checksummed record with room for new fields.
 	// Version 6 stores oversize values in separate files and logs only pointers in the WAL.
 	// Version 7 adds the HMAC-SHA256 key check token for block-level encryption.
@@ -641,24 +618,10 @@ func decodeMetaRecord(buffer []byte) (metaRecord, error) {
 	return record, nil
 }
 
-// isEncrypted reports whether c represents an active encryption cipher.
-func isEncrypted(c Cipher) bool {
-	if c == nil {
-		return false
-	}
-	switch c.(type) {
-	case NoopCipher, *NoopCipher:
-		return false
-	default:
-		return true
-	}
-}
-
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (_ *Engine, err error) {
 	options := Options{
 		FS:               NewOSFS(),
-		Cipher:           NoopCipher{},
 		NumPoolBlocks:    DefaultBlockPoolBlocks,
 		AutoDelete:       false,
 		CompressionCodec: CodecZstd,
@@ -826,7 +789,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 				} else {
 					copy(dbID[:], record.dbID[:])
 					storeEncrypted := record.encrypted
-					callerEncrypted := len(options.EncryptionKey) > 0 || isEncrypted(options.Cipher)
+					callerEncrypted := len(options.EncryptionKey) > 0
 					if storeEncrypted && !callerEncrypted {
 						return nil, ErrStoreEncrypted
 					}
@@ -835,17 +798,13 @@ func Open(opts ...Option) (_ *Engine, err error) {
 					}
 
 					if storeEncrypted {
-						if len(options.EncryptionKey) > 0 {
-							if err := verifyKeyCheckToken(options.EncryptionKey, record.dbID, record.keyCheckToken); err != nil {
-								if !options.EraseOnError {
-									return nil, err
-								}
-								needsErase = true
-								eraseReason = "invalid encryption key"
-								isNewStore = true
+						if err := verifyKeyCheckToken(options.EncryptionKey, record.dbID, record.keyCheckToken); err != nil {
+							if !options.EraseOnError {
+								return nil, err
 							}
-						} else if record.keyCheckToken != [32]byte{} {
-							return nil, fmt.Errorf("%w: store is encrypted with a key: encryption key option required", ErrStoreEncrypted)
+							needsErase = true
+							eraseReason = "invalid encryption key"
+							isNewStore = true
 						}
 					}
 
@@ -928,7 +887,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		copy(metaBuffer[:metaBlockSize], encodeMetaRecord(metaRecord{
 			dbID:          dbID,
 			version:       StoreFormatVersion,
-			encrypted:     isEncrypted(options.Cipher) || len(options.EncryptionKey) > 0,
+			encrypted:     len(options.EncryptionKey) > 0,
 			keyCheckToken: keyCheckToken,
 		}))
 		initPage := encodeRecoveryPage(recoveryStartRecord{
@@ -992,7 +951,6 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		dbID:             dbID,
 		isTemp:           isTemp,
 		autoDelete:       options.AutoDelete,
-		cipher:           options.Cipher,
 		encryptionKey:    EncryptionKey(bytes.Clone(options.EncryptionKey)),
 		compressionCodec: options.CompressionCodec,
 		maxObjectSize:    options.MaxObjectSize,
@@ -1041,7 +999,6 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		s.buddy = NewBuddyAllocator(512)
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
-			Cipher:        options.Cipher,
 			HeapCipher:    heapCipher,
 		})
 		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile, 0, 1)
@@ -1098,7 +1055,6 @@ func Open(opts ...Option) (_ *Engine, err error) {
 
 		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
 			NumPoolBlocks: options.NumPoolBlocks,
-			Cipher:        options.Cipher,
 			HeapCipher:    heapCipher,
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
@@ -1365,11 +1321,6 @@ func (s *Engine) DBID() [16]byte {
 	return s.dbID
 }
 
-// Cipher returns the configured cipher.
-func (s *Engine) Cipher() Cipher {
-	return s.cipher
-}
-
 // Path returns the store directory.
 func (s *Engine) Path() string {
 	return s.dir
@@ -1627,7 +1578,7 @@ func (s *Engine) applyPutLocked(qKey string, payload []byte, lsn uint64, isOvers
 	return nil
 }
 
-// Put writes an object to the engine, encrypting if a cipher is configured.
+// Put writes an object to the engine.
 func (s *Engine) Put(tableName, key string, payload []byte) error {
 	if s.isFailed() {
 		return s.failErr()
@@ -1641,22 +1592,10 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 	}
 
 	// Compress payload
-	compressed, err := s.compress(payload)
+	toStore, err := s.compress(payload)
 	if err != nil {
 		s.setFailed(err)
 		return s.failErr()
-	}
-
-	// Encrypt payload if cipher is configured
-	toStore := compressed
-	if s.cipher != nil {
-		ad := AdditionalData(tableName, key)
-		encrypted, err := s.cipher.Encrypt(compressed, ad)
-		if err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
-		toStore = encrypted
 	}
 
 	pageBlocks := 1
@@ -1850,7 +1789,7 @@ func (s *Engine) clearLogicalPageLocked(logicalPage uint64, lsn uint64) error {
 	return nil
 }
 
-// Get retrieves an object by table and key, decrypting if a cipher is configured.
+// Get retrieves an object by table and key.
 func (s *Engine) Get(tableName, key string) ([]byte, bool, error) {
 	if s.isFailed() {
 		return nil, false, s.failErr()
@@ -1867,11 +1806,11 @@ func (s *Engine) Get(tableName, key string) ([]byte, bool, error) {
 			return nil, false, nil
 		}
 
-		val, matched, err := s.readIndexEntry(tableName, key, qKey, entry)
+		val, matched, err := s.readIndexEntry(key, qKey, entry)
 		if matched {
 			return val, true, nil
 		}
-		if err != nil && (errors.Is(err, ErrDecrypt) || s.isFailed()) {
+		if err != nil && s.isFailed() {
 			return nil, false, err
 		}
 
@@ -1913,9 +1852,9 @@ func (s *Engine) getLocked(tableName, key string) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 
-	val, matched, err := s.readIndexEntry(tableName, key, qKey, entry)
+	val, matched, err := s.readIndexEntry(key, qKey, entry)
 	if err != nil {
-		if errors.Is(err, ErrDecrypt) || errors.Is(err, ErrCorruptStore) {
+		if errors.Is(err, ErrCorruptStore) {
 			return nil, false, err
 		}
 		s.setFailed(err)
@@ -1930,10 +1869,10 @@ func (s *Engine) getLocked(tableName, key string) ([]byte, bool, error) {
 }
 
 // readIndexEntry reads the record corresponding to entry, verifies its key and LSN,
-// and decrypts/decompresses the payload. It returns matched=true when the record
+// and decompresses the payload. It returns matched=true when the record
 // was found and matched entry, or matched=false if the record did not match or could
 // not be read due to page conflict.
-func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry) ([]byte, bool, error) {
+func (s *Engine) readIndexEntry(key, qKey string, entry KeyIndexEntry) ([]byte, bool, error) {
 	if entry.IsOversize {
 		handle, err := s.bp.PinPage(entry.LogicalPage)
 		if err != nil {
@@ -2009,16 +1948,7 @@ func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry
 			return nil, false, fmt.Errorf("%w: corrupt oversize file %s (checksum mismatch)", ErrCorruptStore, fileName)
 		}
 
-		res := fileData
-		if s.cipher != nil {
-			ad := AdditionalData(tableName, key)
-			decrypted, err := s.cipher.Decrypt(res, ad)
-			if err != nil {
-				return nil, false, fmt.Errorf("%w: %v", ErrDecrypt, err)
-			}
-			res = decrypted
-		}
-		decompressed, err := s.decompress(res)
+		decompressed, err := s.decompress(fileData)
 		if err != nil {
 			s.setFailed(err)
 			return nil, false, s.failErr()
@@ -2059,15 +1989,6 @@ func (s *Engine) readIndexEntry(tableName, key, qKey string, entry KeyIndexEntry
 
 	if err != nil || recKey != qKey || recLSN != entry.LSN {
 		return nil, false, nil
-	}
-
-	if s.cipher != nil {
-		ad := AdditionalData(tableName, key)
-		decrypted, err := s.cipher.Decrypt(recPayload, ad)
-		if err != nil {
-			return nil, false, fmt.Errorf("%w: %v", ErrDecrypt, err)
-		}
-		recPayload = decrypted
 	}
 
 	decompressed, err := s.decompress(recPayload)

@@ -18,8 +18,10 @@ import (
 	"crypto/aes"
 	"crypto/hkdf"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 
@@ -48,6 +50,15 @@ type EncryptionKey []byte
 // String returns a fixed placeholder so that a stray %v or %s does not expose sensitive key material.
 func (EncryptionKey) String() string {
 	return "<redacted>"
+}
+
+// NewEncryptionKey generates a random 32-byte master key for block-level encryption.
+func NewEncryptionKey() (EncryptionKey, error) {
+	key := make(EncryptionKey, MasterKeySize)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, fmt.Errorf("failed to generate encryption key: %w", err)
+	}
+	return key, nil
 }
 
 // deriveHeapKey derives the 512-bit AES-XTS key for heap blocks from the caller's key.

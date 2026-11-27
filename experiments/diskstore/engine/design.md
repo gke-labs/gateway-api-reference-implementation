@@ -62,7 +62,7 @@ The fields contain the following values:
 - **Magic (4 bytes):** The constant `0x4D455441` (ASCII `"META"`).
 - **StoreFormatVersion (4 bytes):** The store format version recorded by the engine (`StoreFormatVersion`, currently `9`).
 - **Database ID (16 bytes):** Unique 16-byte identifier for the database instance.
-- **Flags (8 bytes):** Store flags. Bit 0 indicates whether the store was created with an encryption cipher (`metaFlagEncrypted`). Bits 1 through 63 are reserved and must be zero.
+- **Flags (8 bytes):** Store flags. Bit 0 indicates whether the store was created with an encryption key (`metaFlagEncrypted`). Bits 1 through 63 are reserved and must be zero.
 - **KeyCheckToken (32 bytes):** An HMAC-SHA256 of the database ID computed using a key derived from the master key with context `"diskstore/keycheck"`. In an unencrypted store, this field is zero.
 - **Reserved (4028 bytes):** Reserved space written as zeroes. New fields take reserved bytes and bump `StoreFormatVersion`. Reserved bytes that aren't zero under the current version are rejected as an error.
 - **CRC32C (4 bytes):** Castagnoli CRC32C checksum computed over the full 4096-byte block with the CRC field zeroed.
@@ -243,7 +243,7 @@ The record fields contain:
 
 A copy of the store's files reveals no keys, values, or table names without the encryption key. The design protects data at rest against offline exposure, such as copied backups and disk snapshots. File modes (0600 for files and 0700 for directories) remain the first protection on the host, and encryption covers copies that file modes do not reach. The design does not detect deliberate modification of the files by an attacker with write access to storage.
 
-The engine executes encryption and decryption at the block I/O boundary in the block pool. The pool encrypts each full 4 KiB block with AES-256-XTS when flushing it to disk, and decrypts the full 4 KiB block when reading it into the pool. Because AES-XTS transforms fixed-size blocks without ciphertext expansion, encrypted stores use the exact same block layout as unencrypted stores (`BlockUsableSize = 4064`). Nothing in a block stays in plaintext. The cipher transforms all 4096 bytes, including the page header, logical page number, LSN, and CRC32C. Layers above the block pool—such as slotted pages, multi-block pages, the key index, `Get`, and `Put`—operate on plaintext in memory and do not manage ciphers or keys. This block-level scheme replaces the previous per-value cipher, per-value nonces, and per-record associated data.
+The engine executes encryption and decryption at the block I/O boundary in the block pool. The pool encrypts each full 4 KiB block with AES-256-XTS when flushing it to disk, and decrypts the full 4 KiB block when reading it into the pool. Because AES-XTS transforms fixed-size blocks without ciphertext expansion, encrypted stores use the exact same block layout as unencrypted stores (`BlockUsableSize = 4064`). Nothing in a block stays in plaintext. The cipher transforms all 4096 bytes, including the page header, logical page number, LSN, and CRC32C. Layers above the block pool—such as slotted pages, multi-block pages, the key index, `Get`, and `Put`—operate on plaintext in memory and do not manage ciphers or keys.
 
 ### Key Derivation
 
@@ -273,7 +273,7 @@ The crypto transform runs at the direct I/O boundary:
 
 ### Startup and Key Verification
 
-`meta.db` records whether the creator encrypted the store. If a caller provides a cipher for a store written without one, `Open` fails closed and returns `ErrStoreNotEncrypted`. If a caller opens an encrypted store without providing a cipher, `Open` fails closed and returns `ErrStoreEncrypted`. For an encrypted store, `meta.db` stores an HMAC-SHA256 token of the database ID under the key-check key. `Open` computes the expected HMAC-SHA256 token and verifies it before recovery reads any block from disk. If key verification fails, `Open` returns `ErrInvalidKey`. The caller's `WithEraseOnError` option decides the next action. For kubecache, which generates an ephemeral key per process, a key mismatch is the normal condition across restarts, triggering store erasure and cache reconstruction from the API server.
+`meta.db` records whether the creator encrypted the store. If a caller provides an encryption key for a store written without one, `Open` fails closed and returns `ErrStoreNotEncrypted`. If a caller opens an encrypted store without providing an encryption key, `Open` fails closed and returns `ErrStoreEncrypted`. For an encrypted store, `meta.db` stores an HMAC-SHA256 token of the database ID under the key-check key. `Open` computes the expected HMAC-SHA256 token and verifies it before recovery reads any block from disk. If key verification fails, `Open` returns `ErrInvalidKey`. The caller's `WithEraseOnError` option decides the next action. For kubecache, which generates an ephemeral key per process, a key mismatch is the normal condition across restarts, triggering store erasure and cache reconstruction from the API server.
 
 ### Integrity
 
@@ -281,7 +281,7 @@ The Castagnoli CRC32C checksum in the plaintext page header provides the sole in
 
 ### Recovery
 
-Recovery scans physical heap blocks sequentially and decrypts each block using its physical block number as the tweak before inspecting its header. Callers must provide the cipher key to `Open` before recovery starts. The engine verifies the key against the token in `meta.db` before recovery begins, ensuring that a wrong key fails `Open` immediately rather than causing recovery to misinterpret corrupted blocks as torn writes, open an empty store, and overwrite older durable data. Once the key is verified, recovery treats any block that fails CRC32C verification as a torn write and discards it. The heap file grows by extending file size, so it can contain unwritten blocks of zeros. In an encrypted store, decrypting a block of zeros produces pseudorandom bytes that fail the magic, version, and CRC32C checks; recovery treats never-written zero blocks like torn blocks and discards them. The torn-write and newest-copy-wins rules then operate on decrypted candidate blocks with valid checksums. For WAL blocks, an invalid record checksum in the active segment ends the log as a torn tail, whereas an invalid checksum in a closed segment indicates corruption. Any trailing zero padding at the end of an extended WAL segment similarly decrypts to invalid record bytes that end the log under the torn-tail rule.
+Recovery scans physical heap blocks sequentially and decrypts each block using its physical block number as the tweak before inspecting its header. Callers must provide the encryption key to `Open` before recovery starts. The engine verifies the key against the token in `meta.db` before recovery begins, ensuring that a wrong key fails `Open` immediately rather than causing recovery to misinterpret corrupted blocks as torn writes, open an empty store, and overwrite older durable data. Once the key is verified, recovery treats any block that fails CRC32C verification as a torn write and discards it. The heap file grows by extending file size, so it can contain unwritten blocks of zeros. In an encrypted store, decrypting a block of zeros produces pseudorandom bytes that fail the magic, version, and CRC32C checks; recovery treats never-written zero blocks like torn blocks and discards them. The torn-write and newest-copy-wins rules then operate on decrypted candidate blocks with valid checksums. For WAL blocks, an invalid record checksum in the active segment ends the log as a torn tail, whereas an invalid checksum in a closed segment indicates corruption. Any trailing zero padding at the end of an extended WAL segment similarly decrypts to invalid record bytes that end the log under the torn-tail rule.
 
 ### Memory Residency
 
@@ -425,9 +425,9 @@ When the block pool flushes a heap block, it encrypts the block using the physic
 
 ### 10. The Fail-Closed Rule
 
-The engine refuses to open a store if the configured cipher conflicts with the store's recorded encryption state or fails key verification, and treats corrupted blocks as torn.
+The engine refuses to open a store if the encryption key configuration conflicts with the store's recorded encryption state or fails key verification, and treats corrupted blocks as torn.
 
-During `Open`, the engine reads the encryption flag recorded in `meta.db`. If a caller provides a cipher for an unencrypted store, `Open` returns `ErrStoreNotEncrypted`. If a caller opens an encrypted store without providing a cipher, `Open` returns `ErrStoreEncrypted`. For an encrypted store, `meta.db` stores an HMAC-SHA256 key-check token. `Open` computes and verifies this token under the derived key-check key before recovery reads any block. If verification fails, `Open` returns `ErrInvalidKey`. This prevents a wrong key from causing recovery to treat all encrypted blocks as torn and opening an empty store that overwrites existing data. The configured `WithEraseOnError` option determines whether the caller receives `ErrInvalidKey` or erases the store (the expected restart behavior for kubecache's ephemeral per-process keys). During recovery with a verified key, a checksum failure in a closed WAL segment represents corruption, and `Open` fails as well. The engine treats invalid heap blocks and active WAL segment tail blocks as torn writes and discards them. During steady-state reads, any block that fails CRC32C verification returns an error and transitions the engine into its sticky failed state. The CRC32C check detects storage corruption, accidental block displacement, and torn writes with an error detection probability of roughly $1 - 2^{-32}$.
+During `Open`, the engine reads the encryption flag recorded in `meta.db`. If a caller provides an encryption key for an unencrypted store, `Open` returns `ErrStoreNotEncrypted`. If a caller opens an encrypted store without providing an encryption key, `Open` returns `ErrStoreEncrypted`. For an encrypted store, `meta.db` stores an HMAC-SHA256 key-check token. `Open` computes and verifies this token under the derived key-check key before recovery reads any block. If verification fails, `Open` returns `ErrInvalidKey`. This prevents a wrong key from causing recovery to treat all encrypted blocks as torn and opening an empty store that overwrites existing data. The configured `WithEraseOnError` option determines whether the caller receives `ErrInvalidKey` or erases the store (the expected restart behavior for kubecache's ephemeral per-process keys). During recovery with a verified key, a checksum failure in a closed WAL segment represents corruption, and `Open` fails as well. The engine treats invalid heap blocks and active WAL segment tail blocks as torn writes and discards them. During steady-state reads, any block that fails CRC32C verification returns an error and transitions the engine into its sticky failed state. The CRC32C check detects storage corruption, accidental block displacement, and torn writes with an error detection probability of roughly $1 - 2^{-32}$.
 
 ## Recovery
 
@@ -449,7 +449,7 @@ Recovery relies on the core invariants to guarantee consistency:
 - **Retention of logical page numbers** ensures that empty page records supersede older on-disk copies and prevent deleted records from resurrecting.
 - The **old-version rule**, **in-flight protection**, and **heap pointer storage** ensure that valid oversize value files remain intact across crashes, checkpoints, and background sweeps.
 - The **block-binding rule** (Invariant 9) ensures that blocks moved to different physical positions decrypt to pseudorandom bytes and fail checksum verification.
-- The **fail-closed rule** (Invariant 10) ensures that mismatched cipher configurations, key verification failures, and checksum failures in closed WAL segments abort startup.
+- The **fail-closed rule** (Invariant 10) ensures that mismatched encryption key configurations, key verification failures, and checksum failures in closed WAL segments abort startup.
 
 ## Concurrency
 
@@ -521,9 +521,9 @@ Making `ByteString` a sequential stream keeps the stored format, threshold, and 
 
 ### Encryption
 
-Block encryption replaces per-value encryption and allows direct reads from any 4 KiB offset.
+Block encryption allows direct reads from any 4 KiB offset.
 
-In stores using block-level encryption, the engine encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak and a key derived per file. `Get` currently reads the full file, decrypts each 4 KiB unit, verifies the zero padding and SHA-256 checksum, and decompresses the result. Stores still using the legacy per-value cipher cannot serve a file-backed value without loading the full ciphertext into memory to decrypt it, so they must fall back to memory-backed values. When streaming `ByteString` reads land, block-encrypted stores will read 4 KiB units sequentially, decrypt each unit, and feed the decrypted stream into the decompressor.
+In stores using block-level encryption, the engine encrypts oversize files in 4 KiB units using AES-256-XTS with the unit index as the tweak and a key derived per file. `Get` currently reads the full file, decrypts each 4 KiB unit, verifies the zero padding and SHA-256 checksum, and decompresses the result. When streaming `ByteString` reads land, block-encrypted stores will read 4 KiB units sequentially, decrypt each unit, and feed the decrypted stream into the decompressor.
 
 ### Callers
 
@@ -557,7 +557,7 @@ Normal `Open` fails closed on several error conditions. A read-only engine toler
 - **A file that can't be quarantined:** Normal `Open` fails when an unreferenced oversize file or abandoned WAL segment cannot be moved to `lost+found`. Read-only opens anyway because it skips quarantine. `Get` returns normal data for referenced keys; unreferenced files do not affect lookups.
 - **A failure marker from an earlier run:** Normal `Open` fails with `ErrFailed` (or erases the store if `WithEraseOnError` is set). Read-only opens anyway and leaves the marker untouched on disk. `Get` returns valid data for healthy keys, and returns `ErrCorruptStore` for keys on damaged pages or corrupt oversize files that caused the prior failure.
 - **Corruption in a closed WAL segment:** Normal `Open` fails under Invariant 10. The maintainer must choose whether read-only opens anyway or fails. The recommendation is to open anyway by replaying records up to the corruption point and stopping with a logged warning. For keys updated in or after the corrupted record, `Get` returns the older durable heap value, or `ErrNotFound` if the key was created within the damaged log records.
-- **A damaged heap page:** Normal `Open` treats unreadable candidate blocks as torn, but steady-state reads of corrupt pages trigger the failed state. Read-only opens anyway. For keys stored on a damaged heap page, `Get` returns `ErrCorruptStore` (or `ErrDecrypt`) without writing a failure marker to disk, while keys on undamaged pages remain readable.
+- **A damaged heap page:** Normal `Open` treats unreadable candidate blocks as torn, but steady-state reads of corrupt pages trigger the failed state. Read-only opens anyway. For keys stored on a damaged heap page, `Get` returns `ErrCorruptStore` without writing a failure marker to disk, while keys on undamaged pages remain readable.
 
 ### Skipped Cleanup
 
@@ -574,7 +574,7 @@ If a read-only engine opens an active store directory anyway, it sees a point-in
 
 ### Encryption and Key Check
 
-The HMAC-SHA256 key check still applies in read-only mode. `Open` computes and verifies the key-check token against `meta.db` before recovery reads any block. If verification fails or the cipher configuration mismatches, `Open` returns `ErrInvalidKey`, `ErrStoreEncrypted`, or `ErrStoreNotEncrypted`.
+The HMAC-SHA256 key check still applies in read-only mode. `Open` computes and verifies the key-check token against `meta.db` before recovery reads any block. If verification fails or the encryption key configuration mismatches, `Open` returns `ErrInvalidKey`, `ErrStoreEncrypted`, or `ErrStoreNotEncrypted`.
 
 A wrong key never erases a store in read-only mode, whatever the erase option (`WithEraseOnError`) says. The zero-writes rule is unconditional.
 
@@ -606,18 +606,18 @@ The engine classifies every call to `setFailed` and every `onFailure` path acros
 | Engine (`Put`, `Delete`) | Oversize file unlink error (`removeOversizeFileByName`) or write/fsync failure | Disk | Erase or error | Yes: filesystem metadata or oversize file contents on disk inconsistent with WAL. |
 | Engine (`Put`, `Delete`) | Target page missing in page table during mutation (`applyPutLocked`, `applyDeleteLocked`) | Disk | Erase or error | Can't tell: WAL record was already appended before `applyPutLocked`; failing heap mutation leaves WAL and heap desynchronized. |
 | Engine (`Get`) | Decompression failure or record key/LSN mismatch against index entry | Disk | Erase or error | Can't tell whether corruption originated from disk bit-rot or memory; safe side chooses disk fault. |
-| Engine (`Put`) | Payload compression (`compress`) or cipher encryption (`cipher.Encrypt`) failure | In-memory | Normal recovery | No: error occurs on input parameters before taking `writerMu`, appending to WAL, or allocating heap blocks; zero disk writes occurred. |
+| Engine (`Put`) | Payload compression (`compress`) failure | In-memory | Normal recovery | No: error occurs on input parameters before taking `writerMu`, appending to WAL, or allocating heap blocks; zero disk writes occurred. |
 
 ### The Rule for an In-Memory Fault
 
 When an in-memory fault occurs, the engine stops accepting operations, records the sticky error, and closes the `Failed()` channel. It writes no `FAILED` marker to disk. The next `Open` runs ordinary crash recovery.
 
 This rule is safe because:
-- **No state changed before detection:** The remaining in-memory faults (compression or cipher failures in `Put`) occur during input preparation, before acquiring `writerMu`, appending a record to the WAL, or allocating heap blocks. No corrupted data or invalid block references reach memory structures or the disk.
+- **No state changed before detection:** The remaining in-memory faults (compression failures in `Put`) occur during input preparation, before acquiring `writerMu`, appending a record to the WAL, or allocating heap blocks. No corrupted data or invalid block references reach memory structures or the disk.
 - **Durable data remains intact:** Because the engine writes pages out-of-place and enforces write-ahead logging, disk blocks reflect only modifications that were fully fsynced before the failed call. Reopening after an in-memory fault allows crash recovery to scan the self-describing heap and replay any uncheckpointed WAL records, restoring the database to its last durable state without data loss.
 
 **Why the engine fails instead of returning an error:**
-When compression or encryption fails in `Put`, the engine transitions to the failed state rather than returning the error to the caller and remaining usable. A failure in the compression codec or encryption cipher indicates that the codec or crypto subsystem in process memory is compromised or in an indeterminate state. If the engine remained usable, subsequent writes might silently produce unreadable records or leak plaintext. Failing stops further writes immediately to protect store integrity.
+When compression fails in `Put`, the engine transitions to the failed state rather than returning the error to the caller and remaining usable. A failure in the compression codec indicates that the codec in process memory is compromised or in an indeterminate state. If the engine remained usable, subsequent writes might silently produce unreadable records. Failing stops further writes immediately to protect store integrity.
 
 ### The Rule for a Disk Fault
 
@@ -638,7 +638,7 @@ Callers distinguish the two failure kinds:
 ### Maintainer Decisions
 
 - **Marker on in-memory fault:** The recommendation is to write no marker. This gives up post-mortem identification of in-memory faults from disk files alone, relying on process logs.
-- **Failing `Put` vs. returning an error on codec/crypto failure:** An open choice is whether `Put` should fail the engine or simply return the error to the caller when compression or cipher encryption fails before any state changes. The recommendation is to fail the engine because a codec or cipher failure indicates compromised process state. Returning the error would keep the engine usable for subsequent operations, but risks executing further writes with an unreliable codec or cipher.
+- **Failing `Put` vs. returning an error on codec failure:** An open choice is whether `Put` should fail the engine or simply return the error to the caller when compression fails before any state changes. The recommendation is to fail the engine because a codec failure indicates compromised process state. Returning the error would keep the engine usable for subsequent operations, but risks executing further writes with an unreliable codec.
 - **Ambiguous read and metadata faults:** The recommendation is to classify decompression errors, key/LSN mismatches, and allocator double-frees as disk faults. A double-free could have permitted concurrent flushes to overwrite durable blocks before the double-free was reported, and a decompression error during `Get` could stem from disk corruption. This gives up restart survival if the fault was caused by harmless transient RAM anomalies, but prevents opening a store whose on-disk blocks may be corrupt.
 - **Reopen recovery path:** The recommendation is to run standard read-write recovery by default, leaving read-only mode as an explicit caller option if recovery fails.
 
@@ -648,7 +648,7 @@ Callers distinguish the two failure kinds:
 2. **Split failure paths:** Update `setFailed` to accept fault classification; write the `FAILED` marker only for disk faults.
 3. **Classify subsystem callbacks:** Pass fault classifications from WAL, block pool, and engine failure sites.
 4. **Verify recovery on in-memory faults:** Ensure `Open` cleanly recovers stores after in-memory faults without requiring erasure.
-5. **Add tests:** Verify that simulated compression/cipher failures in `Put` allow restart and clean crash recovery, while disk I/O, checksum, and allocator double-free faults write `FAILED` and require erasure.
+5. **Add tests:** Verify that simulated compression failures in `Put` allow restart and clean crash recovery, while disk I/O, checksum, and allocator double-free faults write `FAILED` and require erasure.
 
 ### Future Work
 
