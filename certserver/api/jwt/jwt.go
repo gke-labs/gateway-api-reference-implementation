@@ -34,6 +34,9 @@ const (
 	// DefaultAudience is the default audience required in ServiceAccount tokens.
 	DefaultAudience = "snigateway"
 
+	// CertServerAudience is the required audience for ServiceAccount tokens presented to certserver.
+	CertServerAudience = "certserver"
+
 	// TimeSkew is the allowed clock skew when evaluating exp and nbf claims.
 	TimeSkew = 60 * time.Second
 
