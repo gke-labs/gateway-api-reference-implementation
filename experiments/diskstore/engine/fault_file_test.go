@@ -18,11 +18,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
-	"strings"
 	"testing"
 )
 
@@ -146,29 +144,32 @@ func TestFaultFile_WriteAheadRuleAssertion(t *testing.T) {
 	faultFS := NewFaultFS(memFS)
 	faultFS.SetMaxFsyncedLSN(50) // WAL only synced up to 50
 
-	file, _ := faultFS.Create("heap.db")
+	file, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
 	defer file.Close()
 
-	// Write block with LSN 60 (exceeds 50) -> should panic with write-ahead rule violation
+	// Block LSN 60 exceeds maxFsyncedLSN 50, so WriteAt returns a write-ahead rule violation and writes no data.
 	b0 := makeTestBlock(1, 60, 0, 1)
-
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatalf("expected panic on write-ahead rule violation")
-		}
-		errMsg := ""
-		if err, ok := r.(error); ok {
-			errMsg = err.Error()
-		} else if s, ok := r.(string); ok {
-			errMsg = s
-		}
-		if !strings.Contains(errMsg, "write-ahead rule violation") {
-			t.Fatalf("unexpected panic message: %v", r)
-		}
-	}()
-
-	_, _ = file.WriteAt(b0, 0)
+	written, err := file.WriteAt(b0, 0)
+	if !errors.Is(err, ErrWriteAheadRuleViolation) {
+		t.Fatalf("expected ErrWriteAheadRuleViolation, got %v", err)
+	}
+	if written != 0 {
+		t.Fatalf("expected 0 bytes written on violation, got %d", written)
+	}
+	size, err := file.Size()
+	if err != nil {
+		t.Fatalf("Size failed: %v", err)
+	}
+	if size != 0 {
+		t.Fatalf("expected file size 0 after rejected write, got %d", size)
+	}
+	violations := faultFS.Violations()
+	if len(violations) != 1 || !errors.Is(violations[0], ErrWriteAheadRuleViolation) {
+		t.Fatalf("expected one recorded ErrWriteAheadRuleViolation, got %v", violations)
+	}
 }
 
 func TestFaultFile_ReuseRuleAssertion(t *testing.T) {
@@ -176,34 +177,41 @@ func TestFaultFile_ReuseRuleAssertion(t *testing.T) {
 	faultFS := NewFaultFS(memFS)
 	faultFS.SetMaxFsyncedLSN(200)
 
-	file, _ := faultFS.Create("heap.db")
+	file, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
 	defer file.Close()
 
-	// Write block 5 as page 10, LSN 100, and Sync it so it becomes durable
+	// Write block 5 as page 10, LSN 100, and Sync it so it becomes durable.
 	b5 := makeTestBlock(10, 100, 0, 1)
-	_, _ = file.WriteAt(b5, 5*DefaultBlockSize)
-	_ = file.Sync()
+	if _, err := file.WriteAt(b5, 5*DefaultBlockSize); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
 
-	// Now try to overwrite block 5 while it is the newest durable copy of page 10
+	// Attempt to overwrite block 5 while it holds the newest durable copy of page 10.
 	b5New := makeTestBlock(20, 110, 0, 1)
-
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatalf("expected panic on reuse rule violation")
-		}
-		errMsg := ""
-		if err, ok := r.(error); ok {
-			errMsg = err.Error()
-		} else if s, ok := r.(string); ok {
-			errMsg = s
-		}
-		if !strings.Contains(errMsg, "reuse rule violation") {
-			t.Fatalf("unexpected panic message: %v", r)
-		}
-	}()
-
-	_, _ = file.WriteAt(b5New, 5*DefaultBlockSize)
+	written, err := file.WriteAt(b5New, 5*DefaultBlockSize)
+	if !errors.Is(err, ErrReuseRuleViolation) {
+		t.Fatalf("expected ErrReuseRuleViolation, got %v", err)
+	}
+	if written != 0 {
+		t.Fatalf("expected 0 bytes written on violation, got %d", written)
+	}
+	readBuffer := make([]byte, DefaultBlockSize)
+	if _, err := file.ReadAt(readBuffer, 5*DefaultBlockSize); err != nil {
+		t.Fatalf("ReadAt failed: %v", err)
+	}
+	if !bytes.Equal(readBuffer, b5) {
+		t.Fatalf("durable block was overwritten after rejected write")
+	}
+	violations := faultFS.Violations()
+	if len(violations) != 1 || !errors.Is(violations[0], ErrReuseRuleViolation) {
+		t.Fatalf("expected one recorded ErrReuseRuleViolation, got %v", violations)
+	}
 }
 
 func TestFaultFile_InjectedErrors(t *testing.T) {
@@ -404,48 +412,22 @@ func TestFaultFile_EncryptedStoreWriteAheadRuleViolation(t *testing.T) {
 	encryptedBlock := make([]byte, DefaultBlockSize)
 	encryptHeapBlock(encryptedBlock, plainBlock, 0, cipher)
 
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatalf("expected panic on write-ahead rule violation for encrypted block")
-		}
-		errMsg := fmt.Sprintf("%v", r)
-		if !strings.Contains(errMsg, "write-ahead rule violation") {
-			t.Fatalf("unexpected panic message: %v", r)
-		}
-	}()
-
-	if _, err := file.WriteAt(encryptedBlock, 0); err != nil {
-		t.Fatalf("WriteAt returned unexpected error: %v", err)
+	written, err := file.WriteAt(encryptedBlock, 0)
+	if !errors.Is(err, ErrWriteAheadRuleViolation) {
+		t.Fatalf("expected ErrWriteAheadRuleViolation, got %v", err)
 	}
-}
-
-func TestFaultFile_ViolationHandler(t *testing.T) {
-	memFS := NewMemFS()
-	faultFS := NewFaultFS(memFS)
-	faultFS.SetMaxFsyncedLSN(50)
-
-	var recordedErr error
-	faultFS.SetViolationHandler(func(err error) {
-		recordedErr = err
-	})
-
-	file, err := faultFS.Create("heap.db")
+	if written != 0 {
+		t.Fatalf("expected 0 bytes written on violation, got %d", written)
+	}
+	size, err := file.Size()
 	if err != nil {
-		t.Fatalf("Create failed: %v", err)
+		t.Fatalf("Size failed: %v", err)
 	}
-	defer file.Close()
-
-	// Write block with LSN 60 > maxFsyncedLSN 50: must return error without panic
-	b0 := makeTestBlock(1, 60, 0, 1)
-	_, writeErr := file.WriteAt(b0, 0)
-	if writeErr == nil {
-		t.Fatalf("expected write error from violation handler, got nil")
+	if size != 0 {
+		t.Fatalf("expected file size 0 after rejected write, got %d", size)
 	}
-	if !errors.Is(writeErr, ErrWriteAheadRuleViolation) {
-		t.Fatalf("expected ErrWriteAheadRuleViolation, got %v", writeErr)
-	}
-	if recordedErr == nil || !errors.Is(recordedErr, ErrWriteAheadRuleViolation) {
-		t.Fatalf("expected recorded violation error, got %v", recordedErr)
+	violations := faultFS.Violations()
+	if len(violations) != 1 || !errors.Is(violations[0], ErrWriteAheadRuleViolation) {
+		t.Fatalf("expected one recorded ErrWriteAheadRuleViolation, got %v", violations)
 	}
 }

@@ -16,6 +16,7 @@ package engine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/crypto/xts"
@@ -331,7 +333,7 @@ func copyModel(original map[string][]byte) map[string][]byte {
 	return copied
 }
 
-func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *tortureWorkloadResult {
+func runTortureWorkload(t testing.TB, config tortureConfig, seed int64) *tortureWorkloadResult {
 	t.Helper()
 	var stats tortureWorkloadResult
 	random := rand.New(rand.NewSource(seed))
@@ -375,20 +377,6 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *torture
 		}
 		return options
 	}
-
-	var violationMutex sync.Mutex
-	var firstViolation error
-
-	setViolationHandler := func(targetFS *FaultFS) {
-		targetFS.SetViolationHandler(func(err error) {
-			violationMutex.Lock()
-			defer violationMutex.Unlock()
-			if firstViolation == nil {
-				firstViolation = err
-			}
-		})
-	}
-	setViolationHandler(faultFS)
 
 	var ioCount int
 	var ioMutex sync.Mutex
@@ -451,10 +439,18 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *torture
 
 	var failed bool
 	defer func() {
-		if !failed && currentStore != nil {
+		if currentStore == nil {
+			return
+		}
+		if failed {
+			TestHookFail(currentStore, errors.New("torture test failed"))
 			if closeErr := currentStore.Close(); closeErr != nil {
-				t.Errorf("torture cleanup: Close failed: %v", closeErr)
+				// Close errors during failed teardown are expected.
 			}
+			return
+		}
+		if closeErr := currentStore.Close(); closeErr != nil {
+			t.Errorf("torture cleanup: Close failed: %v", closeErr)
 		}
 	}()
 
@@ -495,22 +491,10 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *torture
 			config.name, seed, operationNumber, cycle, stage, cause, rerunCmd)
 	}
 
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			failed = true
-			stopSweepFn()
-			t.Fatalf("torture panic: config=%s seed=%d op=%d: %v\nRerun with:\n  %s",
-				config.name, seed, operationNumber, recovered, rerunCmd)
-		}
-	}()
-
 	checkViolation := func(cycle int, stage string) {
 		t.Helper()
-		violationMutex.Lock()
-		violation := firstViolation
-		violationMutex.Unlock()
-		if violation != nil {
-			fail(cycle, stage, violation)
+		if violations := faultFS.Violations(); len(violations) > 0 {
+			fail(cycle, stage, violations[0])
 		}
 	}
 
@@ -704,13 +688,14 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *torture
 			lastSyncOp = len(history) - 1
 
 			if err := currentStore.Close(); err != nil {
+				checkViolation(cycle, "close")
 				fail(cycle, "close", err)
 			}
 			currentStore = nil
 		}
+		checkViolation(cycle, "cycle_end")
 
 		faultFS = NewFaultFS(baseFS)
-		setViolationHandler(faultFS)
 		if heapCipher != nil {
 			faultFS.SetHeapCipher(heapCipher)
 			faultFS.SetEncryptionKey(encryptionKey[:])
@@ -724,8 +709,10 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *torture
 			if config.stopOnCrash && isCrashed() {
 				break
 			}
+			checkViolation(cycle, "reopen")
 			fail(cycle, "reopen", err)
 		}
+		checkViolation(cycle, "reopen")
 		history = append(history, copyModel(model))
 		lastCompletedOp = len(history) - 1
 		lastSyncOp = len(history) - 1
@@ -766,12 +753,14 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *torture
 				if config.stopOnCrash && isCrashed() {
 					// Injected crash occurred during Close's checkpoint flush.
 				} else {
+					checkViolation(config.numCycles-1, "final_close")
 					fail(config.numCycles-1, "final_close", closeErr)
 				}
 			}
 		}
 		currentStore = nil
 	}
+	checkViolation(config.numCycles-1, "final_close")
 
 	return &tortureWorkloadResult{
 		payloadBytesPut: stats.payloadBytesPut,
@@ -789,6 +778,68 @@ func runTortureWorkload(t *testing.T, config tortureConfig, seed int64) *torture
 		dbID:            storeDBID,
 		encryptionKey:   encryptionKey,
 		crashed:         isCrashed(),
+	}
+}
+
+type recordingTB struct {
+	testing.TB
+	failed  bool
+	message string
+}
+
+func (r *recordingTB) Helper() {}
+
+func (r *recordingTB) Fatalf(format string, args ...any) {
+	r.failed = true
+	r.message = fmt.Sprintf(format, args...)
+	runtime.Goexit()
+}
+
+func TestTortureWorkload_RecordedViolationFailsRun(t *testing.T) {
+	var triggered atomic.Bool
+	config := tortureConfig{
+		name:               "violation_self_check",
+		poolBlocks:         16,
+		maxValueBlocks:     2,
+		numKeys:            4,
+		operationsPerCycle: 5,
+		numCycles:          1,
+		cycleEnd:           cycleEndClean,
+		onIO: func(targetFS *FaultFS, path string, isSync bool) {
+			if !triggered.CompareAndSwap(false, true) {
+				return
+			}
+			file, err := targetFS.Create("violation_check.heap")
+			if err != nil {
+				t.Errorf("Create failed: %v", err)
+				return
+			}
+			defer func() {
+				if closeErr := file.Close(); closeErr != nil {
+					t.Errorf("Close failed: %v", closeErr)
+				}
+			}()
+			badBlock := makeTestBlock(1, targetFS.MaxFsyncedLSN()+1, 0, 1)
+			if _, writeErr := file.WriteAt(badBlock, 0); !errors.Is(writeErr, ErrWriteAheadRuleViolation) {
+				t.Errorf("expected ErrWriteAheadRuleViolation, got %v", writeErr)
+			}
+		},
+	}
+
+	recorder := &recordingTB{TB: t}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runTortureWorkload(recorder, config, 0)
+	}()
+	wg.Wait()
+
+	if !recorder.failed {
+		t.Fatalf("expected torture workload to fail when FaultFS records a violation")
+	}
+	if !strings.Contains(recorder.message, ErrWriteAheadRuleViolation.Error()) {
+		t.Fatalf("expected failure message to contain %q, got: %s", ErrWriteAheadRuleViolation.Error(), recorder.message)
 	}
 }
 
