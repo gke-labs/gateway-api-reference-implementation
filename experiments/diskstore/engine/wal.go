@@ -1057,14 +1057,14 @@ func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64, options W
 
 // openSegmentAt opens the segment at segmentIndex and positions the iterator at startOffset
 // without re-reading the segment header, which an earlier scan already validated.
-func (iterator *WALIterator) openSegmentAt(segmentIndex int, startOffset int64) error {
-	iterator.currSegIdx = segmentIndex
-	segment := iterator.segments[segmentIndex]
-	file, err := iterator.fs.Open(segment.path)
+func (it *WALIterator) openSegmentAt(segmentIndex int, startOffset int64) error {
+	it.currSegIdx = segmentIndex
+	segment := it.segments[segmentIndex]
+	file, err := it.fs.Open(segment.path)
 	if err != nil {
 		return err
 	}
-	return iterator.attachSegment(file, segment, startOffset)
+	return it.attachSegment(file, segment, startOffset)
 }
 
 func (it *WALIterator) nextSegment() error {
@@ -1134,27 +1134,27 @@ func (it *WALIterator) nextSegment() error {
 }
 
 // attachSegment initializes segment size, cipher, cache state, and offset for an opened segment file.
-func (iterator *WALIterator) attachSegment(file File, segment segmentMeta, startOffset int64) error {
+func (it *WALIterator) attachSegment(file File, segment segmentMeta, startOffset int64) error {
 	size, sizeErr := file.Size()
 	if sizeErr != nil {
 		closeErr := file.Close()
-		iterator.done = true
+		it.done = true
 		return errors.Join(fmt.Errorf("read error getting segment size in %s: %w", segment.name, sizeErr), closeErr)
 	}
 
-	segmentCipher, err := newWALSegmentCipher(iterator.encryptionKey, iterator.dbID, segment.startLSN)
+	segmentCipher, err := newWALSegmentCipher(it.encryptionKey, it.dbID, segment.startLSN)
 	if err != nil {
 		closeErr := file.Close()
-		iterator.done = true
+		it.done = true
 		return errors.Join(fmt.Errorf("failed to create WAL cipher for segment %s: %w", segment.name, err), closeErr)
 	}
 
-	iterator.currFile = file
-	iterator.currCipher = segmentCipher
-	iterator.cachedBlockIndex = -1
-	iterator.cachedBlockLen = 0
-	iterator.currOffset = startOffset
-	iterator.currSegSize = size
+	it.currFile = file
+	it.currCipher = segmentCipher
+	it.cachedBlockIndex = -1
+	it.cachedBlockLen = 0
+	it.currOffset = startOffset
+	it.currSegSize = size
 	return nil
 }
 
@@ -1176,25 +1176,25 @@ func (it *WALIterator) loadBlock(blockIndex int64) error {
 
 // cacheLoadedBlock zero-pads any trailing bytes in rawBlock, decrypts blockIndex into cachedBlock
 // (preserving the plaintext header in block 0), and marks that block cached.
-func (iterator *WALIterator) cacheLoadedBlock(blockIndex int64, n int) {
+func (it *WALIterator) cacheLoadedBlock(blockIndex int64, n int) {
 	for i := n; i < WALBlockSize; i++ {
-		iterator.rawBlock[i] = 0
+		it.rawBlock[i] = 0
 	}
 
-	if iterator.currCipher != nil {
-		iterator.currCipher.Decrypt(iterator.cachedBlock, iterator.rawBlock, uint64(blockIndex))
+	if it.currCipher != nil {
+		it.currCipher.Decrypt(it.cachedBlock, it.rawBlock, uint64(blockIndex))
 		if blockIndex == 0 {
 			// SegmentHeaderSize (32 bytes) is a multiple of the 16-byte AES block size,
 			// so the plaintext header on disk decrypts into scrambled bytes that we overwrite
 			// with the plaintext header while the remaining 16-byte blocks decrypt properly.
-			copy(iterator.cachedBlock[:SegmentHeaderSize], iterator.rawBlock[:SegmentHeaderSize])
+			copy(it.cachedBlock[:SegmentHeaderSize], it.rawBlock[:SegmentHeaderSize])
 		}
 	} else {
-		copy(iterator.cachedBlock[:n], iterator.rawBlock[:n])
+		copy(it.cachedBlock[:n], it.rawBlock[:n])
 	}
 
-	iterator.cachedBlockIndex = blockIndex
-	iterator.cachedBlockLen = n
+	it.cachedBlockIndex = blockIndex
+	it.cachedBlockLen = n
 }
 
 // readAt reads len(p) decrypted bytes starting at logical offset off within the current segment.
