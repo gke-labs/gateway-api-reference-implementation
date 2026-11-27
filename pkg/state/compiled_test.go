@@ -1256,7 +1256,7 @@ func TestStatusComputation_PureFunctions(t *testing.T) {
 	}
 
 	// 2. ListenerSet Status
-	lsStatus := ComputeDesiredListenerSetStatus(ls, gw, nil, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}])
+	lsStatus := ComputeDesiredListenerSetStatus(ls, gw, nil, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], &gwStatus)
 	if len(lsStatus.Conditions) != 2 {
 		t.Errorf("expected 2 ListenerSet conditions, got %d", len(lsStatus.Conditions))
 	}
@@ -1632,7 +1632,7 @@ func TestCompileModel_PrecedenceAndConflicts(t *testing.T) {
 
 			// Check ListenerSet desired status
 			for _, ls := range tc.listenerSets {
-				lsStatus := ComputeDesiredListenerSetStatus(ls, tc.gateway, map[string]*corev1.Namespace{"default": {ObjectMeta: metav1.ObjectMeta{Name: "default"}}}, cg)
+				lsStatus := ComputeDesiredListenerSetStatus(ls, tc.gateway, map[string]*corev1.Namespace{"default": {ObjectMeta: metav1.ObjectMeta{Name: "default"}}}, cg, nil)
 				expectedStatus, ok := tc.expectedLSStatus[ls.Name]
 				if ok {
 					var accCond *metav1.Condition
@@ -1749,7 +1749,7 @@ func TestCompileModel_ListenerSetReferenceGrant(t *testing.T) {
 			t.Errorf("expected AttachedListenerSets = 0 without grant, got %d", cg.AttachedListenerSets)
 		}
 
-		lsStatus := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg)
+		lsStatus := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg, nil)
 		var accCond, progCond *metav1.Condition
 		for i := range lsStatus.Conditions {
 			if lsStatus.Conditions[i].Type == string(gatewayv1.ListenerSetConditionAccepted) {
@@ -1797,7 +1797,7 @@ func TestCompileModel_ListenerSetReferenceGrant(t *testing.T) {
 			t.Errorf("expected AttachedListenerSets = 1 with grant, got %d", cg.AttachedListenerSets)
 		}
 
-		lsStatus := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg)
+		lsStatus := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg, nil)
 		var accCond, progCond *metav1.Condition
 		for i := range lsStatus.Conditions {
 			if lsStatus.Conditions[i].Type == string(gatewayv1.ListenerSetConditionAccepted) {

@@ -2448,6 +2448,13 @@ func TestListenerSetReconciler(t *testing.T) {
 		},
 		Spec: gatewayv1.GatewaySpec{
 			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "gw-http",
+					Port:     8080,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
 			AllowedListeners: &gatewayv1.AllowedListeners{
 				Namespaces: &gatewayv1.ListenerNamespaces{
 					From: &sameFrom,
@@ -2501,6 +2508,7 @@ func TestListenerSetReconciler(t *testing.T) {
 	st.SetControllerName(DefaultControllerName)
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(types.NamespacedName{Namespace: "default", Name: "test-gw"}, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
 	st.UpsertListenerSet(lsAllowed)
 	st.UpsertListenerSet(lsDisallowed)
 	st.Recompute()

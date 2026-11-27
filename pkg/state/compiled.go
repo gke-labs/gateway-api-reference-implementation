@@ -3076,12 +3076,16 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 			}
 		}
 		var compiledGw *CompiledGateway
+		var parentGatewayStatus *gatewayv1.GatewayStatus
 		if parentGW != nil {
 			parentKey := types.NamespacedName{Namespace: parentGW.Namespace, Name: parentGW.Name}
 			compiledGw = compiled.Gateways[parentKey]
+			if status, ok := outputs.GatewayStatuses[parentKey]; ok {
+				parentGatewayStatus = &status
+			}
 		}
 		if parentGW != nil && (inputs.ControllerName == "" || compiledGw != nil) {
-			outputs.ListenerSetStatuses[lsKey] = ComputeDesiredListenerSetStatus(ls, parentGW, inputs.Namespaces, compiledGw)
+			outputs.ListenerSetStatuses[lsKey] = ComputeDesiredListenerSetStatus(ls, parentGW, inputs.Namespaces, compiledGw, parentGatewayStatus)
 		}
 	}
 
@@ -3255,12 +3259,29 @@ func ComputeDesiredGatewayStatus(
 	}
 }
 
-// ComputeDesiredListenerSetStatus computes the desired ListenerSetStatus from the compiled model.
+// parentGatewayNotProgrammedMessage formats a condition message for an accepted ListenerSet
+// or listener when its parent Gateway is not programmed, naming the parent Gateway's reason.
+func parentGatewayNotProgrammedMessage(parentProgrammed metav1.Condition) string {
+	switch {
+	case parentProgrammed.Reason != "" && parentProgrammed.Message != "":
+		return fmt.Sprintf("Parent Gateway is not programmed (%s): %s", parentProgrammed.Reason, parentProgrammed.Message)
+	case parentProgrammed.Reason != "":
+		return fmt.Sprintf("Parent Gateway is not programmed (%s)", parentProgrammed.Reason)
+	case parentProgrammed.Message != "":
+		return fmt.Sprintf("Parent Gateway is not programmed: %s", parentProgrammed.Message)
+	default:
+		return "Parent Gateway is not programmed"
+	}
+}
+
+// ComputeDesiredListenerSetStatus computes the desired ListenerSetStatus from the compiled model
+// and the parent Gateway's computed status.
 func ComputeDesiredListenerSetStatus(
 	ls *gatewayv1.ListenerSet,
 	parentGW *gatewayv1.Gateway,
 	namespaces map[string]*corev1.Namespace,
 	compiledGw *CompiledGateway,
+	parentGatewayStatus *gatewayv1.GatewayStatus,
 ) gatewayv1.ListenerSetStatus {
 	var effectiveListeners []*EffectiveListener
 	if compiledGw != nil {
@@ -3268,6 +3289,27 @@ func ComputeDesiredListenerSetStatus(
 	}
 
 	acceptedCond, programmedCond := ComputeListenerSetConditions(ls, parentGW, namespaces, effectiveListeners)
+
+	var parentProgrammed *metav1.Condition
+	if parentGatewayStatus != nil {
+		parentProgrammed = FindCondition(parentGatewayStatus.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	}
+	parentNotProgrammed := acceptedCond.Status == metav1.ConditionTrue &&
+		parentProgrammed != nil &&
+		parentProgrammed.Status != metav1.ConditionTrue
+	var parentNotProgrammedMessage string
+	if parentNotProgrammed {
+		parentNotProgrammedMessage = parentGatewayNotProgrammedMessage(*parentProgrammed)
+		if programmedCond.Status == metav1.ConditionTrue {
+			programmedCond = NewCondition(
+				string(gatewayv1.ListenerSetConditionProgrammed),
+				parentProgrammed.Status,
+				string(gatewayv1.ListenerSetReasonPending),
+				parentNotProgrammedMessage,
+				ls.Generation,
+			)
+		}
+	}
 	desiredConditions := []metav1.Condition{programmedCond, acceptedCond}
 
 	var desiredListeners []gatewayv1.ListenerEntryStatus
@@ -3291,6 +3333,18 @@ func ComputeDesiredListenerSetStatus(
 			attachedRoutes := matchedEl.AttachedRoutes
 			conds := make([]metav1.Condition, len(matchedEl.ListenerInfo.Conditions))
 			copy(conds, matchedEl.ListenerInfo.Conditions)
+
+			if parentNotProgrammed {
+				if listenerProgrammed := FindCondition(conds, string(gatewayv1.ListenerEntryConditionProgrammed)); listenerProgrammed != nil && listenerProgrammed.Status == metav1.ConditionTrue {
+					SetCondition(&conds, NewCondition(
+						string(gatewayv1.ListenerEntryConditionProgrammed),
+						parentProgrammed.Status,
+						string(gatewayv1.ListenerEntryReasonPending),
+						parentNotProgrammedMessage,
+						ls.Generation,
+					))
+				}
+			}
 
 			desiredListeners = append(desiredListeners, gatewayv1.ListenerEntryStatus{
 				Name:           l.Name,
