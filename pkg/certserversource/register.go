@@ -22,11 +22,24 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/client"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 )
 
-// CertificateSourceName is the identifier used to register the certserver CertificateSource in GARI.
-const CertificateSourceName = "certserver"
+const (
+	// CertificateSourceName is the identifier used to register the certserver CertificateSource in GARI.
+	CertificateSourceName = "certserver"
+
+	// FlagServerAddress is the CLI flag name for the certserver gRPC service address.
+	FlagServerAddress = "certserver-address"
+	// FlagCABundlePath is the CLI flag name for the CA bundle PEM file verifying certserver TLS.
+	FlagCABundlePath = "certserver-ca-bundle-path"
+	// FlagTokenPath is the CLI flag name for the projected ServiceAccount token file.
+	FlagTokenPath = "certserver-token-path"
+
+	// TokenAudience is the required audience for projected ServiceAccount tokens presented to certserver.
+	TokenAudience = jwt.CertServerAudience
+)
 
 // Config configures the certserver CertificateSource.
 type Config struct {
@@ -51,9 +64,9 @@ func DefaultConfig() Config {
 
 // BindFlags binds certserver CLI flags directly to cfg.
 func BindFlags(fs *flag.FlagSet, cfg *Config) {
-	fs.StringVar(&cfg.ServerAddress, "certserver-address", cfg.ServerAddress, "Address of the certserver gRPC service")
-	fs.StringVar(&cfg.CABundlePath, "certserver-ca-bundle-path", cfg.CABundlePath, "Path to the CA bundle PEM file to verify certserver TLS")
-	fs.StringVar(&cfg.TokenPath, "certserver-token-path", cfg.TokenPath, "Path to the projected service-account token file for controller identity")
+	fs.StringVar(&cfg.ServerAddress, FlagServerAddress, cfg.ServerAddress, "Address of the certserver gRPC service")
+	fs.StringVar(&cfg.CABundlePath, FlagCABundlePath, cfg.CABundlePath, "Path to the CA bundle PEM file to verify certserver TLS")
+	fs.StringVar(&cfg.TokenPath, FlagTokenPath, cfg.TokenPath, "Path to the projected service-account token file for controller identity")
 }
 
 // Register validates cfg, initializes a certserver client when an address is configured,
@@ -63,10 +76,10 @@ func Register(opts *gari.Options, cfg Config) error {
 		return nil
 	}
 	if cfg.ServerAddress == "" {
-		return fmt.Errorf("--certserver-address is required when certserver flags are set")
+		return fmt.Errorf("--%s is required when certserver flags are set", FlagServerAddress)
 	}
 	if cfg.TokenPath == "" {
-		return fmt.Errorf("--certserver-token-path is required when certserver flags are set")
+		return fmt.Errorf("--%s is required when certserver flags are set", FlagTokenPath)
 	}
 
 	cli, err := client.New(client.Config{

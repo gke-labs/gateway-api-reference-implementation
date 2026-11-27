@@ -25,6 +25,9 @@ export RUN_E2E=1
 echo "Running basic E2E tests..."
 go test -v -timeout "${TIMEOUT}" ./tests/e2e/... -run TestGatewayAPI
 
+echo "Running certserver E2E tests..."
+go test -v -timeout "${TIMEOUT}" ./tests/e2e/... -run '^TestCertServer'
+
 echo "Running SNIGateway E2E tests..."
 (cd snigateway && go test -v -timeout "${TIMEOUT}" ./tests/e2e/... -run TestSNIGateway)
 

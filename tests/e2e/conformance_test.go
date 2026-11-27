@@ -108,7 +108,7 @@ func TestConformance(t *testing.T) {
 			UsableNetworkAddresses: []gatewayv1.GatewaySpecAddress{
 				{
 					Type:  state.Ptr(gatewayv1.IPAddressType),
-					Value: "172.18.255.240",
+					Value: StaticAddressPoolIP,
 				},
 			},
 			UnusableNetworkAddresses: []gatewayv1.GatewaySpecAddress{

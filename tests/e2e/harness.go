@@ -630,8 +630,12 @@ spec:
 `
 }
 
+// StaticAddressPoolIP is the static IP in MetallbConfigManifest's static-address-pool
+// for tests that request a known Gateway address.
+const StaticAddressPoolIP = "172.18.255.240"
+
 func (h *Harness) MetallbConfigManifest() string {
-	return `
+	return fmt.Sprintf(`
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
@@ -649,7 +653,7 @@ metadata:
   namespace: metallb-system
 spec:
   addresses:
-  - 172.18.255.240-172.18.255.240
+  - %s-%s
   autoAssign: false
 ---
 apiVersion: metallb.io/v1beta1
@@ -657,7 +661,7 @@ kind: L2Advertisement
 metadata:
   name: empty
   namespace: metallb-system
-`
+`, StaticAddressPoolIP, StaticAddressPoolIP)
 }
 
 func (h *Harness) ExampleGatewayManifest() string {
