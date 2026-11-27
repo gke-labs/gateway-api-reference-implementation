@@ -75,8 +75,11 @@ type FaultFS struct {
 	beforeWriteAt func(path string, p []byte, off int64)
 	beforeSync    func(path string)
 
+	// violationsMu guards violations.
 	violationsMu sync.Mutex
-	violations   []error
+
+	// violations holds the write-ahead and reuse rule violations that FaultFile.WriteAt records.
+	violations []error
 
 	// heapCipher is the AES-256-XTS cipher used for decrypting heap blocks.
 	// A nil cipher means the store is not encrypted.
