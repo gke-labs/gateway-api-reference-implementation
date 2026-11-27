@@ -108,7 +108,6 @@ type InternalListener struct {
 	TCPBackends      []InternalTCPBackend
 	UDPBackends      []InternalUDPBackend
 	ClientValidation *InternalClientValidation `json:"clientValidation,omitempty"`
-	ACMEChallenge    bool                      `json:"acmeChallenge,omitempty"`
 }
 
 // hostWithoutPort returns s with the port stripped if present, or s unchanged if not.

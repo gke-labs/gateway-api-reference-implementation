@@ -21,16 +21,8 @@ The `ConfigMap.data` can contain the following keys:
 | `serviceType` | `LoadBalancer`, `ClusterIP` | `LoadBalancer` | The Kubernetes `Service.spec.type`. |
 | `externalTrafficPolicy` | `Cluster`, `Local` | `Cluster` | The `Service.spec.externalTrafficPolicy`. Only meaningful when `serviceType` is `LoadBalancer`. |
 | `serviceAnnotations` | YAML or JSON map | (none) | Key-value annotations applied to the generated Service only (in addition to `spec.infrastructure.annotations`). |
-| `acmeChallenge` | `enabled`, `disabled` | (disabled) | Enables ACME HTTP-01 challenge forwarding to certserver. Forwarding is active when the controller has an upstream configured (via `--acme-challenge-upstream-url`) and `acmeChallenge: enabled` is set on the Gateway or GatewayClass parameters ConfigMap. |
 
 Unknown keys or invalid values will cause the GatewayClass or Gateway to be rejected with condition `Accepted=False` and reason `InvalidParameters`.
-
-### ACME Challenge Forwarding
-
-When data-plane pods forward ACME HTTP-01 challenge requests to an upstream `certserver` using their own identity:
-- **How it is turned on**: Challenge forwarding is active for a Gateway when the controller has an upstream certificate server URL configured (via `--acme-challenge-upstream-url`) **and** the Gateway's parameters ConfigMap (`parametersRef`) has `acmeChallenge: enabled`.
-- **What is provisioned**: When enabled, the singlepod provisioner adds a projected service-account token volume (`certserver-token`, audience `certserver`, 10-minute expiry) for the Gateway's own data-plane service account, mounts it at `/var/run/secrets/tokens/certserver`, and passes the challenge-forwarding flags (`--acme-challenge-upstream-url`, `--acme-challenge-token-path`, and optionally `--acme-challenge-ca-bundle-path`) to the data-plane Deployment.
-- **Turning off**: Setting `acmeChallenge: disabled` or omitting it from the ConfigMap removes the projected volume, volume mount, and flags from the Deployment.
 
 ### ClusterIP Address Rule
 

@@ -93,18 +93,6 @@ const (
 	// DataPlaneHealthProbePort is the container port for health probes and metrics.
 	DataPlaneHealthProbePort = state.DataPlaneHealthProbePort
 
-	// DefaultACMEChallengeAudience is the token audience expected by certserver for ACME HTTP-01 challenge forwarding.
-	DefaultACMEChallengeAudience = "certserver"
-
-	// DefaultACMEChallengeTokenExpirationSeconds is the duration requested for projected service-account tokens (10 minutes, the minimum valid Kubernetes token expiry).
-	DefaultACMEChallengeTokenExpirationSeconds int64 = 600
-
-	// DefaultACMEChallengeVolumeName is the name of the projected service-account token volume.
-	DefaultACMEChallengeVolumeName = "certserver-token"
-
-	// DefaultACMEChallengeTokenPath is the full file path to the projected service-account token.
-	DefaultACMEChallengeTokenPath = "/var/run/secrets/tokens/certserver/token"
-
 	// internalAPIBundleVolumeName is the name of the ConfigMap volume mounting the trust bundle.
 	internalAPIBundleVolumeName = "internal-api-bundle"
 
@@ -237,49 +225,9 @@ type AddressProvider struct {
 	extraVolumes                  []*corev1ac.VolumeApplyConfiguration
 	extraVolumeMounts             []*corev1ac.VolumeMountApplyConfiguration
 	terminationGracePeriodSeconds *int64
-	acmeChallengeUpstreamURL      string
-	acmeChallengeCABundlePath     string
-	acmeChallengeTokenPath        string
-	acmeChallengeAudience         string
-	acmeChallengeTokenExpiration  int64
 
 	// controllerNamespace is the namespace where the controller runs, used to locate the trust bundle and address the internal API.
 	controllerNamespace string
-}
-
-// WithACMEChallengeUpstreamURL configures the upstream certificate server URL for forwarding ACME HTTP-01 challenges.
-func WithACMEChallengeUpstreamURL(url string) Option {
-	return func(p *AddressProvider) {
-		p.acmeChallengeUpstreamURL = url
-	}
-}
-
-// WithACMEChallengeCABundlePath configures the CA bundle PEM file path to verify the upstream certificate server.
-func WithACMEChallengeCABundlePath(path string) Option {
-	return func(p *AddressProvider) {
-		p.acmeChallengeCABundlePath = path
-	}
-}
-
-// WithACMEChallengeTokenPath configures a custom path for the projected service-account token.
-func WithACMEChallengeTokenPath(path string) Option {
-	return func(p *AddressProvider) {
-		p.acmeChallengeTokenPath = path
-	}
-}
-
-// WithACMEChallengeAudience configures the audience for the projected service-account token.
-func WithACMEChallengeAudience(audience string) Option {
-	return func(p *AddressProvider) {
-		p.acmeChallengeAudience = audience
-	}
-}
-
-// WithACMEChallengeTokenExpiration configures the validity duration in seconds for the projected service-account token.
-func WithACMEChallengeTokenExpiration(seconds int64) Option {
-	return func(p *AddressProvider) {
-		p.acmeChallengeTokenExpiration = seconds
-	}
 }
 
 // WithExtraReadinessGates configures additional readiness gate condition types for the data-plane pods.
@@ -321,22 +269,6 @@ func WithState(s *state.State) Option {
 // SetState sets the State reference for the AddressProvider.
 func (p *AddressProvider) SetState(s *state.State) {
 	p.state = s
-}
-
-// isACMEChallengeEnabled reports whether ACME HTTP-01 challenge forwarding is active for the given Gateway parameters.
-// Forwarding is on when the controller has an upstream configured and the Gateway's parameters say "enabled".
-func (p *AddressProvider) isACMEChallengeEnabled(params *state.Parameters) bool {
-	if p.acmeChallengeUpstreamURL == "" {
-		return false
-	}
-	return params != nil && strings.EqualFold(params.ACMEChallenge, "enabled")
-}
-
-func (p *AddressProvider) acmeTokenPath() string {
-	if p.acmeChallengeTokenPath != "" {
-		return p.acmeChallengeTokenPath
-	}
-	return DefaultACMEChallengeTokenPath
 }
 
 // NewAddressProvider creates a new singlepod AddressProvider.
@@ -559,15 +491,6 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	if p.debugErrorResponses {
 		args = append(args, "--debug-error-responses")
 	}
-	challengeEnabled := p.isACMEChallengeEnabled(params)
-	if challengeEnabled {
-		tokenPath := p.acmeTokenPath()
-		args = append(args, fmt.Sprintf("--acme-challenge-upstream-url=%s", p.acmeChallengeUpstreamURL))
-		args = append(args, fmt.Sprintf("--acme-challenge-token-path=%s", tokenPath))
-		if p.acmeChallengeCABundlePath != "" {
-			args = append(args, fmt.Sprintf("--acme-challenge-ca-bundle-path=%s", p.acmeChallengeCABundlePath))
-		}
-	}
 	host, err := spiffe.ServiceClusterDNSName(spiffe.ControllerServiceName, p.controllerNamespace)
 	if err != nil {
 		return nil, state.GatewayReadiness{}, fmt.Errorf("building internal API address: %w", err)
@@ -780,40 +703,6 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	var volumes []*corev1ac.VolumeApplyConfiguration
 	if len(p.extraVolumes) > 0 {
 		volumes = append(volumes, p.extraVolumes...)
-	}
-
-	if challengeEnabled {
-		tokenPath := p.acmeTokenPath()
-		mountDir := filepath.Dir(tokenPath)
-		subPath := filepath.Base(tokenPath)
-
-		aud := p.acmeChallengeAudience
-		if aud == "" {
-			aud = DefaultACMEChallengeAudience
-		}
-		exp := p.acmeChallengeTokenExpiration
-		if exp <= 0 {
-			exp = DefaultACMEChallengeTokenExpirationSeconds
-		}
-
-		volumeMounts = append(volumeMounts, corev1ac.VolumeMount().
-			WithName(DefaultACMEChallengeVolumeName).
-			WithMountPath(mountDir).
-			WithReadOnly(true),
-		)
-
-		volumes = append(volumes, corev1ac.Volume().
-			WithName(DefaultACMEChallengeVolumeName).
-			WithProjected(corev1ac.ProjectedVolumeSource().
-				WithSources(corev1ac.VolumeProjection().
-					WithServiceAccountToken(corev1ac.ServiceAccountTokenProjection().
-						WithAudience(aud).
-						WithExpirationSeconds(exp).
-						WithPath(subPath),
-					),
-				),
-			),
-		)
 	}
 
 	volumeMounts = append(volumeMounts,

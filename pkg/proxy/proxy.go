@@ -78,6 +78,9 @@ const (
 	// DefaultBodyReadTimeout is the default duration allowed between read progress while reading a request body (5 minutes).
 	DefaultBodyReadTimeout = 5 * time.Minute
 
+	// ACMEChallengePrefix is the standard URI path prefix for ACME HTTP-01 challenges.
+	ACMEChallengePrefix = "/.well-known/acme-challenge/"
+
 	// MaxBufferedBodySize is the maximum request body size buffered in memory for mirroring or retry replay.
 	MaxBufferedBodySize = 8 * 1024 * 1024
 )
@@ -117,16 +120,6 @@ type Proxy struct {
 
 	transportsMu sync.Mutex
 	transports   map[string]http.RoundTripper
-
-	// acmeMu serializes updates to acmeConfig, acmeTokenSource, and acmeTimeout,
-	// and coordinates rebuilding the immutable acmeForwarder.
-	acmeMu sync.Mutex
-
-	acmeForwarder         atomic.Pointer[acmeForwarder]
-	acmeConfig            *ACMEChallengeConfig
-	acmeTokenSource       TokenSource
-	acmeTimeout           time.Duration
-	logForwarderErrorOnce sync.Once
 
 	// challenges holds active ACME HTTP-01 challenges mapped by (hostname, token)
 	// to key authorization. Readers load the pointer atomically without acquiring mu.
@@ -301,61 +294,6 @@ func (p *Proxy) getForwardedForMode() ForwardedForMode {
 		return *m
 	}
 	return ForwardedForModeAppend
-}
-
-// UpdateACMEChallenge updates the proxy's ACME HTTP-01 challenge forwarder configuration.
-// If cfg is nil or UpstreamURL is empty, challenge forwarding is disabled.
-func (p *Proxy) UpdateACMEChallenge(cfg *ACMEChallengeConfig) {
-	p.acmeMu.Lock()
-	defer p.acmeMu.Unlock()
-	p.acmeConfig = cfg
-	p.logForwarderErrorOnce = sync.Once{}
-	p.rebuildACMEForwarderLocked()
-}
-
-// SetACMETokenSource sets a custom TokenSource for ACME challenge forwarding.
-func (p *Proxy) SetACMETokenSource(ts TokenSource) {
-	p.acmeMu.Lock()
-	defer p.acmeMu.Unlock()
-	p.acmeTokenSource = ts
-	p.rebuildACMEForwarderLocked()
-}
-
-// SetACMETimeout configures the timeout for ACME challenge upstream requests.
-func (p *Proxy) SetACMETimeout(d time.Duration) {
-	p.acmeMu.Lock()
-	defer p.acmeMu.Unlock()
-	p.acmeTimeout = d
-	p.rebuildACMEForwarderLocked()
-}
-
-func (p *Proxy) rebuildACMEForwarderLocked() {
-	oldForwarder := p.acmeForwarder.Swap(nil)
-	if oldForwarder != nil && oldForwarder.httpClient != nil {
-		if tr, ok := oldForwarder.httpClient.Transport.(*http.Transport); ok {
-			tr.CloseIdleConnections()
-		}
-	}
-
-	cfg := p.acmeConfig
-	if cfg == nil || cfg.UpstreamURL == "" {
-		return
-	}
-
-	forwarderCfg := *cfg
-	if p.acmeTimeout > 0 {
-		forwarderCfg.Timeout = p.acmeTimeout
-	}
-	ts := p.acmeTokenSource
-
-	h, err := NewACMEChallengeForwarder(forwarderCfg, ts)
-	if err != nil {
-		p.logForwarderErrorOnce.Do(func() {
-			klog.Errorf("failed to configure ACME challenge forwarder: %v", err)
-		})
-		return
-	}
-	p.acmeForwarder.Store(h.(*acmeForwarder))
 }
 
 // SetDebugErrorResponses configures whether detailed error messages are included in unmatched responses.
@@ -974,39 +912,6 @@ func (p *Proxy) maybeServeACMEChallenge(w http.ResponseWriter, r *http.Request, 
 	return true
 }
 
-// maybeForwardACMEChallenge checks if a plain-HTTP request matches the ACME HTTP-01 challenge prefix,
-// and if forwarding is enabled on the matching listener and the upstream returns 200, relays the response and returns true.
-// For HTTPS requests, listeners without forwarding enabled, malformed tokens, 404, upstream errors, or timeouts,
-// it returns false to fall through to normal routing.
-func (p *Proxy) maybeForwardACMEChallenge(w http.ResponseWriter, r *http.Request, listeners []state.InternalListener) bool {
-	if r.TLS != nil {
-		return false
-	}
-	f := p.acmeForwarder.Load()
-	if f == nil {
-		return false
-	}
-
-	if len(listeners) > 0 {
-		matchedListeners, hasPortListeners := matchHTTPListeners(listeners, r.Host)
-		if !hasPortListeners || len(matchedListeners) == 0 {
-			return false
-		}
-		hasEnabledListener := false
-		for _, l := range matchedListeners {
-			if l.ACMEChallenge {
-				hasEnabledListener = true
-				break
-			}
-		}
-		if !hasEnabledListener {
-			return false
-		}
-	}
-
-	return f.tryForward(w, r)
-}
-
 // isUnreserved reports whether byteValue is an unreserved character per RFC 3986 §2.3:
 // unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"
 func isUnreserved(byteValue byte) bool {
@@ -1214,10 +1119,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.RUnlock()
 
 	if p.maybeServeACMEChallenge(w, r, listeners) {
-		return
-	}
-
-	if p.maybeForwardACMEChallenge(w, r, listeners) {
 		return
 	}
 

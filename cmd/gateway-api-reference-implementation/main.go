@@ -79,9 +79,6 @@ func BindFlags(fs *flag.FlagSet, opts *gari.Options, cfg *Config) {
 	fs.IntVar(&opts.TCPMaxConnections, "tcp-max-connections", opts.TCPMaxConnections, "The maximum number of concurrent TCP connections per listener.")
 	fs.StringVar((*string)(&opts.ForwardedForMode), "forwarded-for-mode", string(opts.ForwardedForMode), "How to handle X-Forwarded-For: append (default) or replace.")
 	fs.BoolVar(&opts.DebugErrorResponses, "debug-error-responses", opts.DebugErrorResponses, "Include detailed error messages in unmatched responses.")
-	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to.")
-	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server.")
-	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity.")
 	fs.BoolVar(&opts.LeaderElection, "leader-elect", opts.LeaderElection,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -143,9 +140,6 @@ func Setup(args []string) (gari.Options, error) {
 		singlepod.WithEnableH2C(opts.EnableH2C),
 		singlepod.WithForwardedForMode(string(opts.ForwardedForMode)),
 		singlepod.WithDebugErrorResponses(opts.DebugErrorResponses),
-		singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
-		singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
-		singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
 	}
 
 	controllerNamespace, err := gari.ProvisioningControllerNamespace(opts)
