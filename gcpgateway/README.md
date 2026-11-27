@@ -409,7 +409,7 @@ The response confirms end-to-end traffic passing through the Google Cloud L4 Loa
 
 ## Serving Behind an Operator-Built Front End
 
-If you already operate a Google Cloud front end—for example, a global external Application Load Balancer whose URL map routes traffic to an existing global HTTP backend service—you do not need `gcpgatewayctl frontend create`. Instead, create zonal NEGs for the Gateway, point the backend service's health check at the data-plane readiness endpoint, and configure the Gateway's parameters ConfigMap to target your backend service and HTTP NEG.
+If you already operate a Google Cloud front end, you do not need `gcpgatewayctl frontend create`. For example, you might already have a global external Application Load Balancer whose URL map routes traffic to an existing global HTTP backend service. Instead, create zonal NEGs for the Gateway, point the backend service's health check at the data-plane readiness endpoint, and configure the Gateway's parameters ConfigMap to target your backend service and HTTP NEG.
 
 This setup assumes a VPC-native cluster (`--enable-ip-alias`) where the `gcpgateway` controller is already deployed with the `gcpgatewayNegRegistrar` IAM role (including `compute.backendServices.get` on the existing backend service and NEG permissions on the NEGs). Because the controller calls the global `backendServices.getHealth` API in its configured `--project` (`PROJECT_ID`), the existing backend service must be a global Compute Engine backend service in that project.
 
@@ -458,7 +458,7 @@ done
 
 ### 2. Configure the Health Check, Backends, and Firewall
 
-Data-plane pods serve their readiness endpoint over HTTP on fixed port **`8999`** at path **`/_gari/readyz`**. It returns `200 OK` once the data plane has received its Gateway routing configuration, and immediately returns `503 Service Unavailable` during graceful shutdown when the `preStop` hook writes `/var/run/gcpgateway/draining`.
+Data-plane pods serve their readiness endpoint over HTTP on fixed port **`8999`** at path **`/_gari/readyz`**. The handler returns `200 OK` once the data plane has received and applied its Gateway routing configuration, and returns `503 Service Unavailable` during graceful shutdown once the `preStop` hook writes `/var/run/gcpgateway/draining`.
 
 1. Create an HTTP health check targeting port `8999` and path `/_gari/readyz`, update the existing global HTTP backend service to use it (with a connection draining timeout matching the controller's `--drain-seconds`, default `35`), and attach each zonal NEG as a backend:
 
@@ -490,7 +490,7 @@ for ZONE in ${ZONES}; do
 done
 ```
 
-2. Ensure a VPC ingress firewall rule allows TCP traffic to data-plane pods on ports `8080` (HTTP traffic) and `8999` (health checks) from Google Front End and health check ranges (`35.191.0.0/16` and `130.211.0.0/22`):
+2. Create a VPC ingress firewall rule allowing TCP traffic to data-plane pods on ports `8080` (HTTP traffic) and `8999` (health checks) from Google Front End and health check ranges (`35.191.0.0/16` and `130.211.0.0/22`):
 
 ```bash
 gcloud compute firewall-rules create "${NEG_NAME}-allow-gfe" \
@@ -502,7 +502,7 @@ gcloud compute firewall-rules create "${NEG_NAME}-allow-gfe" \
   --source-ranges="35.191.0.0/16,130.211.0.0/22"
 ```
 
-If your front end forwards HTTP traffic from another source range (such as a VPC proxy-only subnet), allow TCP `8080` from that range as well and include it in `allowedSourceCIDRs` below.
+Without `--target-tags`, this rule applies to every instance on the network. If your front end forwards HTTP traffic from another source range (such as a VPC proxy-only subnet), allow TCP `8080` from that range as well and include it in `allowedSourceCIDRs` below.
 
 ### 3. Configure the Parameters ConfigMap and Gateway
 
