@@ -33,28 +33,7 @@ const (
 
 	// maxTokenLength bounds the maximum length accepted for ACME challenge tokens.
 	maxTokenLength = 128
-
-	// DefaultValidatedBindingTTL is the default validity duration for recorded Gateway bindings.
-	DefaultValidatedBindingTTL = 24 * time.Hour
 )
-
-// RecordValidatedBinding records a validated binding in the binding store for the requester with the specified TTL.
-//
-// Invariant: a Gateway holds a validated binding for a set of hostnames only after that Gateway
-// itself proved that it serves them. Callers must only pass requesters whose domain
-// control has been verified.
-func RecordValidatedBinding(bindingStore registry.BindingStore, requester Requester, now time.Time, ttl time.Duration) {
-	if bindingStore == nil || requester.ClusterID == "" || requester.HostnamesKey == "" {
-		return
-	}
-	bindingStore.RecordValidatedBinding(registry.ValidatedBinding{
-		ClusterID:    requester.ClusterID,
-		Gateway:      requester.Gateway,
-		HostnamesKey: requester.HostnamesKey,
-		ValidatedAt:  now,
-		ExpiresAt:    now.Add(ttl),
-	})
-}
 
 // isValidToken reports whether token is non-empty, within length bounds, and composed
 // exclusively of base64url characters (RFC 8555 Section 8.3).

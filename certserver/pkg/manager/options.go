@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
 
@@ -63,7 +62,7 @@ func DefaultOptions() Options {
 		MaxRetryBackoff:      1 * time.Hour,
 		RenewalCheckInterval: 1 * time.Minute,
 		Clock:                realClock{},
-		ValidatedBindingTTL:  challenge.DefaultValidatedBindingTTL,
+		ValidatedBindingTTL:  DefaultValidatedBindingTTL,
 		// SelfCheckTimeout is 15 seconds, comfortably longer than the GARI certificate source's
 		// 1-second pending polling interval so that the controller has ample time to program
 		// the data plane before self-check times out.

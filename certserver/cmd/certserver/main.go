@@ -92,7 +92,7 @@ func parseFlags(args []string) (*Config, error) {
 	fs.IntVar(&cfg.RateLimitBurst, "rate-limit-burst", 20, "Per-identity rate limit burst size")
 	fs.IntVar(&cfg.MaxHostnames, "max-hostnames", 100, "Maximum number of hostnames permitted per certificate set")
 	fs.Int64Var(&cfg.MaxPendingOrders, "max-pending-orders", 50, "Maximum number of concurrent pending ACME orders")
-	fs.DurationVar(&cfg.ValidatedBindingTTL, "validated-binding-ttl", challenge.DefaultValidatedBindingTTL, "Validity duration for recorded Gateway binding validations")
+	fs.DurationVar(&cfg.ValidatedBindingTTL, "validated-binding-ttl", manager.DefaultValidatedBindingTTL, "Validity duration for recorded Gateway binding validations")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
