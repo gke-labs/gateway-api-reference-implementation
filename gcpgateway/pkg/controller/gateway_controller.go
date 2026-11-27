@@ -731,19 +731,11 @@ func (r *GatewayReconciler) parametersConfigMapData(ctx context.Context, gateway
 }
 
 // usesHTTPHealthNEG reports whether gateway polls health on the HTTP NEG (8080)
-// instead of the HTTPS NEG (8443). A Gateway uses the HTTP NEG when it declares
-// at least one HTTP listener and no listener that targets the HTTPS NEG.
+// instead of the HTTPS NEG (8443). It returns true when gateway targets
+// PortHTTP and does not target PortHTTPS.
 func usesHTTPHealthNEG(gateway *gatewayv1.Gateway) bool {
-	hasHTTP := false
-	for _, listener := range gateway.Spec.Listeners {
-		switch listener.Protocol {
-		case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType, gatewayv1.TCPProtocolType:
-			return false
-		case gatewayv1.HTTPProtocolType:
-			hasHTTP = true
-		}
-	}
-	return hasHTTP
+	targetPorts := registrar.TargetPorts(gateway)
+	return targetPorts[registrar.PortHTTP] && !targetPorts[registrar.PortHTTPS]
 }
 
 // targetNEGKey returns the Compute NEG name for conflict detection and health
@@ -757,11 +749,11 @@ func (r *GatewayReconciler) targetNEGKey(gateway *gatewayv1.Gateway, parametersD
 		negParameterKey = state.ParameterKeyNEGHTTP
 		portSuffix = strconv.Itoa(registrar.PortHTTP)
 	}
-	if neg := strings.TrimSpace(parametersData[negParameterKey]); neg != "" {
+	if neg := parametersData[negParameterKey]; neg != "" {
 		return neg
 	}
-	if targetGateway := strings.TrimSpace(parametersData[state.ParameterKeyGatewayName]); targetGateway != "" {
-		namespace := strings.TrimSpace(parametersData[state.ParameterKeyGatewayNamespace])
+	if targetGateway := parametersData[state.ParameterKeyGatewayName]; targetGateway != "" {
+		namespace := parametersData[state.ParameterKeyGatewayNamespace]
 		if namespace == "" {
 			namespace = gateway.Namespace
 		}
@@ -794,9 +786,9 @@ func (r *GatewayReconciler) resolveBackendService(gateway *gatewayv1.Gateway, pa
 		}
 		return backendService, nil
 	}
-	suffix := "bs-443"
+	suffix := registrar.BackendServiceSuffixHTTPS
 	if usesHTTPHealthNEG(gateway) {
-		suffix = "bs-80"
+		suffix = registrar.BackendServiceSuffixHTTP
 	}
 	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gateway.Namespace, gateway.Name, suffix), nil
 }

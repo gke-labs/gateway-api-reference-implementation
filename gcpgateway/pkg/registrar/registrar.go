@@ -43,6 +43,12 @@ const (
 	// PortHTTP is the container target port for HTTP traffic.
 	PortHTTP = 8080
 
+	// BackendServiceSuffixHTTPS is the resource name suffix for the derived HTTPS backend service.
+	BackendServiceSuffixHTTPS = "bs-443"
+
+	// BackendServiceSuffixHTTP is the resource name suffix for the derived HTTP backend service.
+	BackendServiceSuffixHTTP = "bs-80"
+
 	// LoadBalancerReadyGate is the readiness gate condition type added to data plane pods.
 	LoadBalancerReadyGate = "gcpgateway.gke-labs.io/load-balancer-ready"
 
@@ -272,6 +278,27 @@ func (r *Registrar) DetachAll(ctx context.Context, gw *gatewayv1.Gateway) (*Reco
 	return result, nil
 }
 
+// TargetPorts returns the set of data-plane container ports targeted by
+// gateway's listeners. When gateway declares no listeners, it defaults to
+// PortHTTPS.
+func TargetPorts(gateway *gatewayv1.Gateway) map[int]bool {
+	targetPorts := make(map[int]bool)
+	for _, listener := range gateway.Spec.Listeners {
+		switch listener.Protocol {
+		case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType, gatewayv1.TCPProtocolType:
+			targetPorts[PortHTTPS] = true
+		case gatewayv1.HTTPProtocolType:
+			targetPorts[PortHTTP] = true
+		default:
+			targetPorts[int(listener.Port)] = true
+		}
+	}
+	if len(targetPorts) == 0 {
+		targetPorts[PortHTTPS] = true
+	}
+	return targetPorts
+}
+
 // ReconcileEndpoints synchronizes data plane pods with the matched zonal NEGs for a Gateway.
 func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gateway) (*ReconcileResult, error) {
 	if gw.DeletionTimestamp != nil {
@@ -284,20 +311,7 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 	result := &ReconcileResult{}
 
 	// 1. Determine target ports from Gateway listeners
-	targetPorts := make(map[int]bool)
-	for _, l := range gw.Spec.Listeners {
-		switch l.Protocol {
-		case gatewayv1.HTTPSProtocolType, gatewayv1.TLSProtocolType, gatewayv1.TCPProtocolType:
-			targetPorts[PortHTTPS] = true
-		case gatewayv1.HTTPProtocolType:
-			targetPorts[PortHTTP] = true
-		default:
-			targetPorts[int(l.Port)] = true
-		}
-	}
-	if len(targetPorts) == 0 {
-		targetPorts[PortHTTPS] = true
-	}
+	targetPorts := TargetPorts(gw)
 
 	// 2. Discover zones from configured zones and active cluster nodes
 	zones, nodesByName, err := r.discoverZones(ctx)
