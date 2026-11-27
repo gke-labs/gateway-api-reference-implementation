@@ -15,7 +15,9 @@
 package gari
 
 import (
+	"errors"
 	"flag"
+	"os"
 	"strings"
 )
 
@@ -75,4 +77,19 @@ func BindInternalAPIFlags(fs *flag.FlagSet, opts *Options) {
 	fs.StringVar(&opts.InternalAPITLSCertFile, "internal-api-tls-cert-file", opts.InternalAPITLSCertFile, "Path to TLS server certificate file for internal API endpoint. The listener stays off until a certificate that data planes can verify is provided, and how it is provided is not settled.")
 	fs.StringVar(&opts.InternalAPITLSKeyFile, "internal-api-tls-key-file", opts.InternalAPITLSKeyFile, "Path to TLS server private key file for internal API endpoint.")
 	fs.StringVar(&opts.InternalAPITokenFile, "internal-api-token-file", opts.InternalAPITokenFile, "A projected ServiceAccount token with the audience the server expects.")
+}
+
+// ProvisioningControllerNamespace returns the namespace of a controller that
+// provisions data planes. It reads the POD_NAMESPACE environment variable and
+// checks that options includes the internal API server bind address, TLS
+// certificate file, and TLS key file.
+func ProvisioningControllerNamespace(options Options) (string, error) {
+	controllerNamespace := os.Getenv("POD_NAMESPACE")
+	if controllerNamespace == "" {
+		return "", errors.New("POD_NAMESPACE environment variable is required")
+	}
+	if options.InternalAPIBindAddress == "" || options.InternalAPITLSCertFile == "" || options.InternalAPITLSKeyFile == "" {
+		return "", errors.New("--internal-api-bind-address, --internal-api-tls-cert-file, and --internal-api-tls-key-file are required")
+	}
+	return controllerNamespace, nil
 }

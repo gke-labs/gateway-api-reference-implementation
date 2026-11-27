@@ -168,3 +168,83 @@ func TestOptionsComplete_InternalAPIFlags(t *testing.T) {
 		t.Fatalf("unexpected error for valid options: %v", err)
 	}
 }
+
+func TestProvisioningControllerNamespace(t *testing.T) {
+	t.Run("missing POD_NAMESPACE", func(t *testing.T) {
+		t.Setenv("POD_NAMESPACE", "")
+		options := DefaultOptions()
+		options.InternalAPIBindAddress = ":8443"
+		options.InternalAPITLSCertFile = "/etc/cert.pem"
+		options.InternalAPITLSKeyFile = "/etc/key.pem"
+
+		_, err := ProvisioningControllerNamespace(options)
+		if err == nil {
+			t.Fatalf("expected error when POD_NAMESPACE is empty, got nil")
+		}
+		if !strings.Contains(err.Error(), "POD_NAMESPACE") {
+			t.Errorf("expected error to name POD_NAMESPACE, got %v", err)
+		}
+	})
+
+	missingFlagCases := []struct {
+		name    string
+		options Options
+	}{
+		{
+			name:    "missing all internal API flags",
+			options: DefaultOptions(),
+		},
+		{
+			name: "missing bind address",
+			options: Options{
+				InternalAPITLSCertFile: "/etc/cert.pem",
+				InternalAPITLSKeyFile:  "/etc/key.pem",
+			},
+		},
+		{
+			name: "missing tls cert file",
+			options: Options{
+				InternalAPIBindAddress: ":8443",
+				InternalAPITLSKeyFile:  "/etc/key.pem",
+			},
+		},
+		{
+			name: "missing tls key file",
+			options: Options{
+				InternalAPIBindAddress: ":8443",
+				InternalAPITLSCertFile: "/etc/cert.pem",
+			},
+		},
+	}
+
+	for _, testCase := range missingFlagCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("POD_NAMESPACE", "gateway-system")
+			_, err := ProvisioningControllerNamespace(testCase.options)
+			if err == nil {
+				t.Fatalf("expected error when internal API flags are missing, got nil")
+			}
+			for _, flagName := range []string{"--internal-api-bind-address", "--internal-api-tls-cert-file", "--internal-api-tls-key-file"} {
+				if !strings.Contains(err.Error(), flagName) {
+					t.Errorf("expected error to name %s, got %v", flagName, err)
+				}
+			}
+		})
+	}
+
+	t.Run("valid configuration", func(t *testing.T) {
+		t.Setenv("POD_NAMESPACE", "gateway-system")
+		options := DefaultOptions()
+		options.InternalAPIBindAddress = ":8443"
+		options.InternalAPITLSCertFile = "/etc/cert.pem"
+		options.InternalAPITLSKeyFile = "/etc/key.pem"
+
+		namespace, err := ProvisioningControllerNamespace(options)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if namespace != "gateway-system" {
+			t.Errorf("namespace = %q, want %q", namespace, "gateway-system")
+		}
+	})
+}
