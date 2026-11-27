@@ -4,10 +4,10 @@ This guide explains how to deploy `snigateway-frontend` on a standalone Linux VM
 
 ## Prerequisites
 
-- A Linux VM with a public IPv4 or IPv6 address.
+- A Linux VM running kernel 5.6 or later (in-tree WireGuard support) with a public IPv4 or IPv6 address.
 - Root or `sudo` access on the VM.
 - Go toolchain (if building from source) or Docker (if running as a container).
-- Firewall permissions allowing inbound TCP traffic on port 443.
+- Firewall permissions allowing inbound TCP on port `443` and inbound UDP on the WireGuard port (default `51820/udp`). Kernel WireGuard is the only tunnel transport and there is no fallback; networks that block UDP to this port cannot use `snigateway`.
 
 ---
 
@@ -110,7 +110,12 @@ Copy the systemd service file to `/etc/systemd/system/`:
 cp snigateway-frontend.service /etc/systemd/system/snigateway-frontend.service
 ```
 
-The systemd service utilizes `AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN` to allow the unprivileged `snigateway` user to bind directly to privileged port `443` and configure the kernel WireGuard interface.
+The systemd service grants `AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN` and `CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN` so the unprivileged `snigateway` user can bind port `443` and create and configure the kernel WireGuard interface (`wg0`). Without `CAP_NET_ADMIN`, `snigateway-frontend` fails to start.
+
+Two WireGuard flags can be added to `ExecStart` if the defaults do not fit your environment:
+
+- `--wireguard-listen-port` (default `51820`): UDP port for the kernel WireGuard interface. Setting `0` is refused because WireGuard is the only tunnel transport.
+- `--wireguard-prefix` (optional): IPv6 `/64` prefix for tunnel addresses (the frontend uses `<prefix>::1` and allocates addresses inside the prefix to connected controllers). If omitted, an RFC 4193 ULA `/64` prefix is generated at startup. A new prefix on restart is fine because controllers re-exchange keys when they reconnect.
 
 Reload systemd, enable, and start the service:
 
@@ -128,24 +133,47 @@ journalctl -u snigateway-frontend -f
 
 ---
 
-### 4. Open Port 443 on Firewall
+### 4. Open Ports 443/TCP and 51820/UDP on Firewall
 
-Ensure port 443 is open for inbound TCP connections on your VM and cloud provider firewall:
+Ensure inbound TCP port `443` and inbound UDP port `51820` (or the port set by `--wireguard-listen-port`) are open on your VM and cloud provider firewall:
 
 - **UFW (Ubuntu/Debian)**:
   ```bash
   ufw allow 443/tcp
+  ufw allow 51820/udp
   ```
 - **Firewalld (RHEL/CentOS/Fedora)**:
   ```bash
   firewall-cmd --permanent --add-port=443/tcp
+  firewall-cmd --permanent --add-port=51820/udp
   firewall-cmd --reload
   ```
-- **Cloud Firewall**: In your cloud console (GCP / AWS / Azure), add an ingress firewall rule permitting TCP port 443 from `0.0.0.0/0`.
+- **Cloud Firewall**: In your cloud console (GCP / AWS / Azure), add ingress firewall rules permitting `443/tcp` and `51820/udp` from `0.0.0.0/0` (or restrict `51820/udp` to your cluster's egress IPs).
 
 ---
 
-### 5. Point DNS to the VM
+### 5. Verify the WireGuard Tunnel
+
+Check that the `wg0` interface exists:
+
+```bash
+ip link show wg0
+```
+
+Once an in-cluster `snigateway` controller connects, inspect the interface with `wg` (from `wireguard-tools`):
+
+```bash
+sudo wg show wg0
+```
+
+Confirm three things in the output:
+- The `wg0` interface is present and listening on your configured UDP port (default `51820`).
+- A `peer:` entry appears for each connected controller with its allocated `/128` IPv6 address under `allowed ips`.
+- `latest handshake` appears and updates (the controller sends a persistent keepalive every 25 seconds), confirming bidirectional UDP traffic through the firewall.
+
+---
+
+### 6. Point DNS to the VM
 
 Create DNS `A` (and/or `AAAA`) records for your domains pointing to the public IP address of your frontend VM:
 

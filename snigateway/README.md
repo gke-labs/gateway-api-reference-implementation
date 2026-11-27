@@ -18,6 +18,14 @@ The `snigateway` architecture consists of two main components:
    - Uses GARI's `OnGatewaysUpdate` hook to dynamically register SNI hostnames for its HTTPS/TLS listeners.
    - Feeds reverse-tunnelled connections to GARI's HTTPS proxy server via a custom tunnel `net.Listener`, parsing PROXY v2 headers to expose real client IPs.
 
+### WireGuard Tunnel & Requirements
+
+The tunnel between `snigateway-frontend` and `snigateway` is kernel WireGuard over UDP (default port `51820/udp`). Inside an IPv6 ULA `/64` prefix, the frontend dials TCP port `51821` on the controller's tunnel address and sends a PROXY protocol v2 header (client IP and SNI/Host metadata) followed by the client's raw TLS or plaintext HTTP stream. Client TLS traffic is already encrypted end-to-end between the client and the cluster; WireGuard is the encapsulation layer carrying those streams and their PROXY v2 metadata, not an extra encryption layer for client traffic. Kernel WireGuard replaced the previous pre-dialed TCP pool to avoid pool exhaustion stalls under WAN connection bursts, keep CPU per gigabyte in the same range by running framing and TCP in the kernel (see [BENCHMARKS.md](BENCHMARKS.md)), and share one tunnel transport with `tunnelgateway`.
+
+- **Kernel**: Linux 5.6 or later is required at both ends (frontend and cluster nodes).
+- **No fallback transport**: Kernel WireGuard is the only tunnel transport. A network that blocks outbound UDP from the cluster to the frontend's WireGuard port (default `51820/udp`) cannot use `snigateway`.
+- **Capabilities & Pod Security**: Both ends need `CAP_NET_ADMIN` to create and configure the `wg0` interface. In Kubernetes, the controller pod in `snigateway/k8s/controller.yaml` sets `capabilities: {drop: [ALL], add: [NET_ADMIN]}` with `runAsNonRoot: true` and `allowPrivilegeEscalation: true` (required so the binary's `cap_net_admin+ep` file capability applies on exec). The target namespace must allow `CAP_NET_ADMIN`, which the `restricted` (and `baseline`) Pod Security Standard does not.
+
 ---
 
 ## Building Container Images
@@ -71,8 +79,11 @@ Choose one of the following deployment methods depending on your environment. Us
 
 #### Option A: Local Development (`go run`)
 
+Running `snigateway-frontend` directly requires Linux 5.6+ and `CAP_NET_ADMIN` (for example via `sudo` or building a binary with `setcap cap_net_admin+ep`):
+
 ```bash
-go run ./cmd/snigateway-frontend \
+go build -o /tmp/snigateway-frontend ./cmd/snigateway-frontend
+sudo /tmp/snigateway-frontend \
   --listen ":8443" \
   --client-ca certs/ca.crt=*.example.com \
   --server-cert certs/server.crt \
@@ -190,11 +201,19 @@ spec:
       serviceAccountName: snigateway-controller
       containers:
       - name: snigateway
-        image: gari-controller:latest
+        image: snigateway:latest
         args:
         - --frontend=frontend.example.com:443
         - --ca-cert=/etc/snigateway/ca.crt
         - --token-file=/var/run/secrets/tokens/snigateway-token
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_ADMIN
         volumeMounts:
         - name: ca-cert
           mountPath: /etc/snigateway
@@ -223,12 +242,13 @@ When `--token-file` is specified, `--client-cert` and `--client-key` are optiona
 
 Before deploying the controller, complete these prerequisites:
 
-1. Install the Gateway API CRDs. For example, run:
+1. Verify that cluster nodes run Linux 5.6 or later and that the cluster allows outbound UDP traffic to the frontend's WireGuard port (default `51820/udp`).
+2. Install the Gateway API CRDs. For example, run:
    ```bash
    kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
    ```
-2. Create the target namespace if it does not already exist, and create the `snigateway-client-cert` Secret in that namespace as shown in Step 3.
-3. Set the `--frontend` argument in `snigateway/k8s/controller.yaml` to the address (`<host-or-ip>:443`) of your `snigateway-frontend` instance. `controller.yaml` ships with `--frontend=snigateway-frontend.example.com:443`. Deployment tools apply the manifest as written.
+3. Create the target namespace if it does not already exist, ensure its Pod Security Standard allows `CAP_NET_ADMIN` and `allowPrivilegeEscalation: true` (the `restricted` level does not), and create the `snigateway-client-cert` Secret in that namespace as shown in Step 3.
+4. Set the `--frontend` argument in `snigateway/k8s/controller.yaml` to the address (`<host-or-ip>:443`) of your `snigateway-frontend` instance. `controller.yaml` ships with `--frontend=snigateway-frontend.example.com:443`. Deployment tools apply the manifest as written.
 
 #### Using `ap deploy`
 

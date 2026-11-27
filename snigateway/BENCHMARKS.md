@@ -1,49 +1,51 @@
-# SNIGateway Tunnel Overhead Benchmarks: TCP Pool vs QUIC vs HTTP/2 CONNECT vs WireGuard
+# SNIGateway Tunnel Overhead Benchmarks
 
-This document records the benchmarking methodology, empirical measurements, CPU profile analysis, optimizations, and architectural recommendations for SNIGateway's reverse tunnel transports (TCP Pool, QUIC, HTTP/2 CONNECT, and WireGuard), addressing [Issue #621](https://github.com/gke-labs/gateway-api-reference-implementation/issues/621), [Issue #689](https://github.com/gke-labs/gateway-api-reference-implementation/issues/689), and [Issue #1079](https://github.com/gke-labs/gateway-api-reference-implementation/issues/1079).
+This document records the benchmarking methodology, empirical measurements, CPU profile analysis, and architectural history for SNIGateway's reverse tunnel transports, addressing [Issue #621](https://github.com/gke-labs/gateway-api-reference-implementation/issues/621), [Issue #689](https://github.com/gke-labs/gateway-api-reference-implementation/issues/689), [Issue #1079](https://github.com/gke-labs/gateway-api-reference-implementation/issues/1079), and [Issue #1563](https://github.com/gke-labs/gateway-api-reference-implementation/issues/1563).
+
+**Current status:** Kernel WireGuard is the only tunnel transport in `snigateway`. The four earlier transports recorded below for comparison—TCP Pool, QUIC, HTTP/2 CONNECT, and userspace WireGuard (`wireguard-go` + `netstack`)—have all been removed.
 
 ---
 
-## 1. Executive Summary & Transport Recommendations
+## 1. Executive Summary
 
-### Architectural Comparison: Four Transports
-1. **QUIC (`--tunnel-transport=quic`)**:
+### Architectural Comparison: Historical Transports vs Kernel WireGuard
+1. **QUIC (removed)**:
    - 0-RTT/1-RTT stream multiplexing without pre-dialed pool.
    - Survives NAT rebindings and uses a single UDP 4-tuple.
    - Trade-off: Higher userspace CPU cost (2.5x–3.5x higher CPU per byte than TCP pool) due to userspace packet encryption, ACK generation, and single-threaded connection event loop.
-2. **TCP Pool (`--tunnel-transport=tcp`)**:
+2. **TCP Pool (removed)**:
    - Lowest CPU per byte on loopback and line-rate interfaces (~4.1 CPU-s/GB).
    - Kernel handles TCP segmentation, retransmission, and flow control.
    - Trade-off: Vulnerable to connection burst starvation when new requests exceed the pre-dialed pool size under WAN latency (2–3 RTT connection dial penalty).
-3. **HTTP/2 CONNECT (`--tunnel-transport=h2`)**:
+3. **HTTP/2 CONNECT (removed)**:
    - Multiplexes client streams as HTTP/2 CONNECT streams over a small pool of long-lived mTLS TCP connections (default 4).
    - Combines the burst-latency advantage of stream multiplexing (p50 TTFB comparable to QUIC under WAN delay) with the CPU efficiency of TCP-backed framing (~20% within TCP pool on bulk transfer, more than 2x lower CPU per byte than QUIC).
    - Uses standard HTTP/2 flow control, PING liveness, GOAWAY graceful drain, and error handling.
-4. **WireGuard (`--tunnel-transport=wireguard`)**:
-   - Multiplexes client connections inside an end-to-end WireGuard tunnel using userspace `wireguard-go` and `netstack` on both frontend and backend.
-   - Survives NAT rebinding and operates over a single UDP socket.
-   - Avoids TCP pool burst starvation under WAN latency (achieving ~66 ms p50 TTFB at 20 ms RTT and ~157 ms at 50 ms RTT, though paying 1 RTT for establishing a netstack TCP connection through the tunnel).
-   - Trade-off: Significantly higher CPU consumption (~116 CPU-s/GB) and lower single-stream bulk throughput (~86 MB/s on loopback) due to userspace netstack TCP/IP processing and ChaCha20-Poly1305 framing.
-
-### Architectural Decision: `auto` Mode
-- `auto` remains QUIC-first in this phase; evaluating switching default to HTTP/2 is planned once comprehensive cluster data is gathered.
-- `--tunnel-transport=h2` is now fully supported as an explicit transport option.
+4. **Userspace WireGuard (`wireguard-go` + `netstack`, removed)**:
+   - Multiplexed client connections inside a WireGuard tunnel using userspace `wireguard-go` and `netstack` on both frontend and backend.
+   - Avoided TCP pool burst starvation under WAN latency (~66 ms p50 TTFB at 20 ms RTT and ~157 ms at 50 ms RTT, paying 1 RTT for establishing a netstack TCP connection through the tunnel).
+   - Trade-off: Very high CPU consumption (~116 CPU-s/GB) and low single-stream bulk throughput (~86 MB/s on loopback) due to userspace netstack TCP/IP processing and ChaCha20-Poly1305 framing.
+5. **Kernel WireGuard (current, sole transport)**:
+   - Uses native Linux kernel `wireguard` interfaces (`wg0`) and the kernel TCP stack at both ends.
+   - Cuts total separate-process CPU from **115.51 CPU-s/GB** (userspace WireGuard) to **9.58 CPU-s/GB** at 50 MB (**7.96 CPU-s/GB** at 500 MB), placing it in the same CPU range as the removed TCP Pool (7.52 CPU-s/GB) and HTTP/2 CONNECT (8.41 CPU-s/GB) while keeping allocations at **10.4 allocs/MB** and **1,036 allocs/conn**.
+   - Avoids TCP pool burst starvation under WAN latency (**65.9 ms p50** at 20 ms RTT, **154.6 ms p50** at 50 ms RTT), and shares one tunnel transport with `tunnelgateway`.
+   - Trade-off: Requires Linux 5.6+ and `CAP_NET_ADMIN` at both ends, and outbound UDP to the frontend (no fallback transport).
 
 ### Key Empirical Findings
-1. **Connection Burst Latency (WAN Impairment)**: Under a burst of 32 concurrent requests against a pool size of 8:
-   - At **20 ms RTT**: HTTP/2 CONNECT p50 is **42.5 ms** and QUIC p50 is **48.0 ms** (both stream multiplexed without new connection dials). WireGuard achieves **65.6 ms** p50 (incurring a 1-RTT netstack TCP handshake over the tunnel), whereas TCP Pool degrades to **155.2 ms** p50 / **250.3 ms** p99 (~3.2x higher latency) due to pool exhaustion stalls on new dials.
-   - At **50 ms RTT**: HTTP/2 CONNECT p50 is **102.8 ms**, QUIC p50 is **114.2 ms**, and WireGuard p50 is **156.5 ms**, whereas TCP Pool degrades to **404.0 ms** p50 / **609.3 ms** p99 (~2.6x–3.9x higher latency).
-2. **Loopback TTFB with Warm Pool**: On loopback with a warm pre-dialed pool, TCP Pool achieves a faster TTFB (**1.03 ms**), HTTP/2 CONNECT achieves **1.13 ms**, QUIC achieves **1.20 ms**, and WireGuard achieves **1.48 ms**. This is expected because loopback hides connection-dialing penalties, and the pre-dialed TCP connection is already waiting in memory.
-3. **Frontend CPU per Byte at Saturation**: Under sustained bulk transfer saturation on loopback, the frontend process uses **~3.40 CPU-seconds per GB** with **HTTP/2 CONNECT**, **~3.95 CPU-seconds per GB** with **TCP Pool**, **~13.35 CPU-seconds per GB** with **QUIC**, and **~39.56 CPU-seconds per GB** with **WireGuard** (total process CPU across frontend and backend: ~8.41 s/GB for H2, ~7.52 s/GB for TCP Pool, ~19.78 s/GB for QUIC, and ~115.51 s/GB for WireGuard).
-4. **Connection Setup Allocations**: QUIC and HTTP/2 achieve **~1,138–1,144 allocs/conn**, WireGuard achieves **~1,522 allocs/conn**, and TCP Pool uses **~2,061 allocs/conn**.
+1. **Connection Burst Latency (WAN Impairment)**: Under a burst of 32 concurrent requests:
+   - At **20 ms RTT**: Kernel WireGuard achieves **65.9 ms** p50 / **68.3 ms** p99 (1-RTT inner TCP handshake over the tunnel), ~2.4x faster at p50 and ~3.7x faster at p99 than the removed TCP Pool (**155.2 ms** p50 / **250.3 ms** p99).
+   - At **50 ms RTT**: Kernel WireGuard achieves **154.6 ms** p50 / **159.1 ms** p99, ~2.6x faster at p50 and ~3.8x faster at p99 than the removed TCP Pool (**404.0 ms** p50 / **609.3 ms** p99).
+2. **Low-RTT TTFB**: With a new connection per request (`DisableKeepAlives: true`), kernel WireGuard over a two-namespace `veth` pair achieves **1.84 ms** p50 (**4.01 ms** p99), compared to loopback warm-pool TCP Pool (**1.03 ms**), HTTP/2 (**1.13 ms**), QUIC (**1.20 ms**), and userspace WireGuard (**1.48 ms**).
+3. **Process CPU per Byte at Saturation**: In separate processes (50 MB across 4 streams), kernel WireGuard uses **7.43 CPU-s/GB** on the frontend (including kernel WireGuard + `veth` sys time and client TLS in parent) and **2.15 CPU-s/GB** on the backend (**1.01 CPU-s/GB** over 500 MB once process startup amortizes), for **9.58 CPU-s/GB** total (**7.96 CPU-s/GB** over 500 MB)—a 12x–14.5x reduction from userspace WireGuard (**115.51 CPU-s/GB**).
+4. **Connection Setup Allocations**: Kernel WireGuard achieves **1,036 allocs/conn**, the lowest of all tested transports (compared to 1,138–1,144 for QUIC/H2, 1,522 for userspace WireGuard, and 2,061 for TCP Pool).
 
 ---
 
 ## 2. Benchmark Methodology
 
 ### Symmetrical Test Conditions
-Previous benchmarks compared a hand-rolled raw QUIC loop against an `http.Server` TCP pool backend. The harness in `snigateway/pkg/frontend/benchmark_test.go` evaluates both transports under **identical conditions**:
-- A real `http.Server` behind `tls.NewListener` attached to `tunnel.NewManager(c, tunnel.WithTransport(...))` for both QUIC and TCP Pool.
+The benchmark harness (originally in `snigateway/pkg/frontend/benchmark_test.go`, removed with the TCP pool in #1395 and adapted for kernel WireGuard over a two-namespace `veth` pair for #1563) evaluated each transport under **identical conditions**:
+- A real `http.Server` behind `tls.NewListener` attached to `tunnel.NewManager`.
 - The same mTLS certificate validation, session registration, PROXY protocol v2 header parsing, and client TLS handshakes.
 
 ### Measured Metrics
@@ -59,44 +61,48 @@ Previous benchmarks compared a hand-rolled raw QUIC loop against an `http.Server
 
 ## 3. Benchmark Results
 
-Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27.3, commit 90a731b plus this change):
+Historical loopback runs (QUIC, TCP Pool, HTTP/2 CONNECT, and Userspace WireGuard) ran on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27.3, commit `90a731b`). All four of those transports—Userspace WireGuard, QUIC, HTTP/2 CONNECT, and TCP Pool—were removed after those measurements were recorded.
 
-The WireGuard transport was removed after these measurements were recorded. The QUIC transport was removed after these measurements were recorded. The HTTP/2 transport was removed after these measurements were recorded.
+**Kernel WireGuard runs** were measured on Linux `6.12.110+` `amd64` (AMD EPYC 9B14 60-core processor, Go `1.27.4`, default `rmem_max`/`wmem_max` = 208 KiB, commit `d281f79`) using the same HTTP/TLS-over-SNIGateway harness (`BenchmarkLatency_*`, `BenchmarkThroughput_*`, `BenchmarkThroughput_Concurrent_*`, `BenchmarkLatency_Burst_*`, `BenchmarkMatrix_*`, and `TestBenchmark_SeparateProcessCPU`) across two Linux network namespaces (`unshare -Urn`) linked by a `veth` pair (`10.100.0.1/24` ↔ `10.100.0.2/24`, MTU 1500, `wg0` MTU 1420), with real kernel `wg0` interfaces on both ends and Linux `netem` qdiscs on both `veth` ends for RTT/loss runs. Because `veth` uses standard 1500-byte frames (1420 inside `wg0`) rather than loopback's 65536-byte MTU, kernel WireGuard throughput reflects realistic Ethernet-sized WireGuard packets rather than 64 KiB loopback frames.
 
-### 3.1 Loopback Saturation Baseline (Comparable Transport Data)
+### 3.1 Saturation Baseline (Comparable Transport Data)
 
-Measured using standalone harness benchmarks: `BenchmarkLatency_*` for TTFB and connection setup allocations, `BenchmarkThroughput_*` for single-stream throughput and allocations, `BenchmarkThroughput_Concurrent_*` for 8-stream aggregate throughput, and `TestBenchmark_SeparateProcessCPU` for frontend and backend process CPU at saturation in separate processes:
+Measured using standalone harness benchmarks: `BenchmarkLatency_*` for TTFB and connection setup allocations, `BenchmarkThroughput_*` for single-stream throughput and allocations, `BenchmarkThroughput_Concurrent_*` for 8-stream aggregate throughput, and `TestBenchmark_SeparateProcessCPU` for frontend and backend process CPU at saturation in separate processes (50 MB across 4 streams; kernel WireGuard medians of 3 runs, with 500 MB separate-process medians in parentheses):
 
-| Metric | QUIC | TCP Pool | HTTP/2 CONNECT | WireGuard | Analysis |
-|---|---|---|---|---|---|
-| **TTFB (p50, warm pool)** | 1.20 ms | 1.03 ms | 1.13 ms | 1.48 ms | TCP pool & H2 fastest; WireGuard incurs userspace netstack processing |
-| **TTFB (p99, warm pool)** | 1.59 ms | 2.11 ms | 1.48 ms | 2.18 ms | All four transports around ~1.5–2.2 ms on loopback |
-| **Connection Setup Allocations** | 1,138 allocs/conn | 2,061 allocs/conn | 1,144 allocs/conn | 1,522 allocs/conn | H2 & QUIC lowest allocations; WireGuard allocates userspace TCP endpoints |
-| **Single-Stream Throughput** | 435 MB/s | 742 MB/s | **791 MB/s** | 86 MB/s | WireGuard throughput constrained by userspace netstack and framing |
-| **8-Stream Aggregate Throughput** | 333 MB/s | **3,210 MB/s** | 2,327 MB/s | 72 MB/s | TCP pool & H2 scale across cores; WireGuard event processing bounds stream rate |
-| **Throughput Memory Allocations** | 3,322 allocs/MB | **10.5 allocs/MB** | 57.6 allocs/MB | 18,368 allocs/MB | WireGuard buffer/view churn in userspace packet pipelines |
-| **Frontend Process CPU (separate proc)** | 13.35 CPU-s/GB | 3.95 CPU-s/GB | **3.40 CPU-s/GB** | 39.56 CPU-s/GB | High userspace netstack and WireGuard framing overhead |
-| **Backend Process CPU (separate proc)** | 6.43 CPU-s/GB | **3.57 CPU-s/GB** | 5.01 CPU-s/GB | 75.95 CPU-s/GB | Netstack listener + device encryption/decryption overhead |
-| **Total Process CPU (separate proc)** | 19.78 CPU-s/GB | **7.52 CPU-s/GB** | 8.41 CPU-s/GB | 115.51 CPU-s/GB | WireGuard consumes substantially higher CPU per GB than other transports |
+| Metric | QUIC (removed) | TCP Pool (removed) | HTTP/2 CONNECT (removed) | Userspace WireGuard (removed) | **Kernel WireGuard (current)** | Analysis |
+|---|---|---|---|---|---|---|
+| **TTFB (p50)** | 1.20 ms | 1.03 ms | 1.13 ms | 1.48 ms | **1.84 ms** | Kernel WG dials a fresh inner TCP connection across `wg0` + `veth` |
+| **TTFB (p99)** | 1.59 ms | 2.11 ms | 1.48 ms | 2.18 ms | **4.01 ms** | Two-namespace `veth` + kernel `wg0` handshake/scheduling tail |
+| **Connection Setup Allocations** | 1,138 allocs/conn | 2,061 allocs/conn | 1,144 allocs/conn | 1,522 allocs/conn | **1,036 allocs/conn** | Lowest of all tested transports; no userspace netstack or pool state |
+| **Single-Stream Throughput** | 435 MB/s | 742 MB/s | 791 MB/s | 86 MB/s | **181 MB/s** | 2.1x faster than userspace WG; realistic 1420 B `wg0` MTU over `veth` |
+| **8-Stream Aggregate Throughput** | 333 MB/s | 3,210 MB/s | 2,327 MB/s | 72 MB/s | **194 MB/s** | 2.7x faster than userspace WG; single-peer `wg0` MTU 1420 `veth` ceiling |
+| **Throughput Memory Allocations** | 3,322 allocs/MB | 10.5 allocs/MB | 57.6 allocs/MB | 18,368 allocs/MB | **10.4 allocs/MB** | Matches TCP Pool; ~1,760x fewer allocs/MB than userspace WG |
+| **Frontend Process CPU (separate proc)** | 13.35 CPU-s/GB | 3.95 CPU-s/GB | 3.40 CPU-s/GB | 39.56 CPU-s/GB | **7.43 CPU-s/GB** (6.96 at 500 MB) | 5.3x lower than userspace WG; includes kernel `wg0`/`veth` sys time + client TLS |
+| **Backend Process CPU (separate proc)** | 6.43 CPU-s/GB | 3.57 CPU-s/GB | 5.01 CPU-s/GB | 75.95 CPU-s/GB | **2.15 CPU-s/GB** (1.01 at 500 MB) | 35x–75x lower than userspace WG; kernel handles WireGuard + TCP |
+| **Total Process CPU (separate proc)** | 19.78 CPU-s/GB | 7.52 CPU-s/GB | 8.41 CPU-s/GB | 115.51 CPU-s/GB | **9.58 CPU-s/GB** (7.96 at 500 MB) | 12x–14.5x lower than userspace WG; comparable to removed TCP Pool & H2 |
 
-### 3.2 Connection Burst Latency (Burst = 32, Pool Size = 4–8)
+### 3.2 Connection Burst Latency (Burst = 32)
 
-Measured using `BenchmarkLatency_Burst`. When traffic bursts exceed the warm pool capacity under network RTT, QUIC and HTTP/2 stream multiplexing avoid connection-dialing round trips entirely, while WireGuard incurs 1 RTT for establishing a netstack TCP connection through the tunnel:
+Measured using `BenchmarkLatency_Burst` (32 concurrent new connections; historical rows used userspace RTT simulation against pool size 4–8, while Kernel WireGuard used Linux `netem` delay on both ends of the `veth` pair):
 
 | Network RTT | Transport | TTFB p50 | TTFB p99 | Comparison |
 |---|---|---|---|---|
-| **20 ms RTT** | **HTTP/2 CONNECT** | **42.5 ms** | **83.1 ms** | Zero new dial penalty |
-| | **QUIC** | **48.0 ms** | **67.9 ms** | Fast multiplexing |
-| | **WireGuard** | **65.6 ms** | **70.6 ms** | 1-RTT dial penalty (netstack TCP handshake over tunnel), ~2.4x faster than TCP pool |
-| | TCP Pool | 155.2 ms | 250.3 ms | Pool exhaustion stalls on new dials across RTT |
-| **50 ms RTT** | **HTTP/2 CONNECT** | **102.8 ms** | **202.2 ms** | Zero new dial penalty |
-| | **QUIC** | **114.2 ms** | **173.5 ms** | Fast multiplexing |
-| | **WireGuard** | **156.5 ms** | **158.9 ms** | 1-RTT dial penalty (netstack TCP handshake over tunnel), ~2.6x faster than TCP pool |
-| | TCP Pool | 404.0 ms | 609.3 ms | Multi-RTT handshake penalties compound |
+| **20 ms RTT** | **Kernel WireGuard (current)** | **65.9 ms** | **68.3 ms** | 1-RTT inner TCP handshake over kernel `wg0`; ~2.4x faster p50 / ~3.7x faster p99 than TCP Pool |
+| | HTTP/2 CONNECT (removed) | 42.5 ms | 83.1 ms | Zero new dial penalty |
+| | QUIC (removed) | 48.0 ms | 67.9 ms | Fast multiplexing |
+| | Userspace WireGuard (removed) | 65.6 ms | 70.6 ms | 1-RTT netstack TCP handshake over tunnel |
+| | TCP Pool (removed) | 155.2 ms | 250.3 ms | Pool exhaustion stalls on new dials across RTT |
+| **50 ms RTT** | **Kernel WireGuard (current)** | **154.6 ms** | **159.1 ms** | 1-RTT inner TCP handshake over kernel `wg0`; ~2.6x faster p50 / ~3.8x faster p99 than TCP Pool |
+| | HTTP/2 CONNECT (removed) | 102.8 ms | 202.2 ms | Zero new dial penalty |
+| | QUIC (removed) | 114.2 ms | 173.5 ms | Fast multiplexing |
+| | Userspace WireGuard (removed) | 156.5 ms | 158.9 ms | 1-RTT netstack TCP handshake over tunnel |
+| | TCP Pool (removed) | 404.0 ms | 609.3 ms | Multi-RTT handshake penalties compound |
 
-### 3.3 Synthetic In-Process Impairment (Sensitivity Analysis)
+### 3.3 Impaired-Network Single-Stream Throughput
 
-Measured using `BenchmarkMatrix` with a 10 MB single-stream transfer per scenario and in-process CPU metrics:
+For Kernel WireGuard, single-stream 10 MB transfers were also measured under real Linux `netem` qdisc impairment on both ends of the `veth` pair (0.5% loss per direction for ~1% round-trip loss, default 208 KiB socket buffers): **195 MB/s** at 0 ms / 0% loss (`6.55 CPU-s/GB`), **33.1 MB/s** at 20 ms / 0% loss (`4.70 CPU-s/GB`), **13.4 MB/s** at 50 ms / 0% loss (`4.65 CPU-s/GB`), **1.33 MB/s** at 20 ms / 1% loss (`10.8 CPU-s/GB`), and **0.47 MB/s** at 50 ms / 1% loss (`15.4 CPU-s/GB`). The loss rows reflect real kernel TCP congestion control at 1420-byte MTU rather than the userspace delay-only `simulatedConn` model below.
+
+Historical synthetic in-process impairment (sensitivity analysis for the removed transports, 10 MB single-stream transfer per scenario):
 
 > **Methodological Note on In-Process Impairment**:
 > The in-process `simulatedPacketConn` wrapper intercepts packets in user space by wrapping `net.PacketConn`. Because the wrapper hides the underlying `*net.UDPConn`, **quic-go automatically disables Generic Segmentation Offload (GSO), Generic Receive Offload (GRO), and batch read/write syscalls (`recvmmsg`/`WriteMsgUDP`)**.
@@ -267,18 +273,18 @@ sudo sysctl -w net.core.wmem_max=7500000
 
 ---
 
-## 7. Open Architectural Discussion: TLS Redundancy vs Metadata Security
+## 7. Historical Architectural Discussion: TLS Redundancy vs Metadata Security
 
 ### The Redundancy Question
-In SNIGateway, client traffic is already end-to-end TLS between the client and the backend pod. Tunneling this traffic over mTLS (either TCP pool TLS or QUIC TLS) means the payload is encrypted twice in userspace.
+In SNIGateway, client traffic is already end-to-end TLS between the client and the backend pod. Tunneling this traffic over an encrypted tunnel (previously mTLS TCP pool / QUIC, now kernel WireGuard) means the payload is encrypted twice—once end-to-end by the client/backend TLS session, and once by the tunnel.
 
 ### Security Trade-Offs
-1. **Authentication & Authorization**: The reverse tunnel connection must be mutually authenticated (mTLS) so the frontend can verify client identity (cluster/backend identity and CA allowlist).
+1. **Authentication & Authorization**: The control session and tunnel peers must be mutually authenticated so the frontend can verify cluster/backend identity and CA/subject allowlists.
 2. **Metadata Confidentiality**: The PROXY protocol v2 header carries sensitive connection metadata:
    - Client source IP and port.
    - Target SNI hostname and cluster authority TLVs.
    If the tunnel were unencrypted (integrity-only), this metadata would transit the network in plaintext.
-3. **Transport Security Standards**: TLS 1.3 does not define null-cipher authentication modes. Standard TLS ciphers (`TLS_AES_128_GCM_SHA256`) utilize hardware AES-NI instructions and provide guaranteed end-to-end security without custom cryptographic protocols.
+3. **Transport Security Standards**: Offloading tunnel framing to kernel WireGuard authenticates peers and protects PROXY v2 metadata without custom cryptographic protocols or double userspace TLS encryption.
 
 ### Conclusion
-Maintain standard mTLS encryption for both TCP pool and QUIC tunnels. Tunnel overhead should be mitigated through userspace buffer pooling and transport selection rather than compromising metadata confidentiality.
+Keep the tunnel authenticated and encrypted for PROXY v2 metadata confidentiality; running WireGuard in the Linux kernel avoids the userspace double-encryption CPU cost of the earlier transports.
