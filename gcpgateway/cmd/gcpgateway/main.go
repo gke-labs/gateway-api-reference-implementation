@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/auth/credentials"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
@@ -30,6 +31,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	compute "google.golang.org/api/compute/v1"
+	"google.golang.org/api/option"
 	corev1 "k8s.io/api/core/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/klog/v2"
@@ -220,9 +222,10 @@ func BindControllerFlags(fs *flag.FlagSet, opts *gari.Options, cfg *ControllerCo
 }
 
 // SetupController parses args and builds the gari.Options for controller mode.
-// If computeClient is nil:
-//   - if --fake-compute is set, gcp.NewFakeComputeClient() is used.
-//   - otherwise compute.NewService(ctx) is called, returning an error on failure.
+// When computeClient is nil and --fake-compute is set, SetupController uses
+// gcp.NewFakeComputeClient without looking for Google Cloud credentials.
+// Otherwise, SetupController resolves Application Default Credentials, fetches
+// one access token to verify them, and initializes the Compute API client.
 func SetupController(ctx context.Context, args []string, computeClient gcp.ComputeClient) (gari.Options, error) {
 	cfg := DefaultControllerConfig()
 
@@ -256,11 +259,10 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		if cfg.FakeCompute {
 			gcpClient = gcp.NewFakeComputeClient()
 		} else {
-			computeSvc, err := compute.NewService(ctx)
+			gcpClient, err = newComputeClient(ctx)
 			if err != nil {
-				return gari.Options{}, fmt.Errorf("initializing Google Cloud Compute API client: %w", err)
+				return gari.Options{}, err
 			}
-			gcpClient = gcp.NewGCEComputeClient(computeSvc)
 		}
 	}
 
@@ -345,6 +347,39 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 	}
 
 	return opts, nil
+}
+
+// credentialCheckTimeout bounds the start-up token fetch so the controller
+// fails fast when the metadata server or token endpoint is unreachable.
+const credentialCheckTimeout = 15 * time.Second
+
+// newComputeClient resolves Application Default Credentials, fetches one
+// access token to verify them, and returns a Compute API client.
+func newComputeClient(ctx context.Context) (*gcp.GCEComputeClient, error) {
+	sources := fmt.Sprintf(
+		"tried GOOGLE_APPLICATION_CREDENTIALS=%q, gcloud application default credentials, and GCE/GKE metadata server (GCE_METADATA_HOST=%q)",
+		os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+		os.Getenv("GCE_METADATA_HOST"),
+	)
+
+	defaultCredentials, err := credentials.DetectDefault(&credentials.DetectOptions{
+		Scopes: []string{compute.CloudPlatformScope, compute.ComputeScope},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolving Google Cloud credentials (%s): %w", sources, err)
+	}
+
+	tokenCtx, cancel := context.WithTimeout(ctx, credentialCheckTimeout)
+	defer cancel()
+	if _, err := defaultCredentials.Token(tokenCtx); err != nil {
+		return nil, fmt.Errorf("fetching Google Cloud access token (%s): %w", sources, err)
+	}
+
+	computeService, err := compute.NewService(ctx, option.WithAuthCredentials(defaultCredentials))
+	if err != nil {
+		return nil, fmt.Errorf("initializing Google Cloud Compute API client: %w", err)
+	}
+	return gcp.NewGCEComputeClient(computeService), nil
 }
 
 func runController(ctx context.Context, args []string) error {
