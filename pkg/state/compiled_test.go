@@ -1153,7 +1153,7 @@ func TestCompileModel_AttachedRoutes_TableDriven(t *testing.T) {
 			}
 
 			// Verify GatewayStatus
-			gwStatus := ComputeDesiredGatewayStatus(tc.gateway, cg, nil, GatewayReadiness{Ready: false}, nil, nil)
+			gwStatus := ComputeDesiredGatewayStatus(tc.gateway, cg, nil, gatewayProvisioningErrors{}, nil)
 			for _, ls := range gwStatus.Listeners {
 				if expectedCount, ok := tc.expectedAttachedRoutes[ls.Name]; ok {
 					if ls.AttachedRoutes != expectedCount {
@@ -1241,7 +1241,7 @@ func TestStatusComputation_PureFunctions(t *testing.T) {
 
 	// 1. Gateway Status
 	addresses := []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}}
-	gwStatus := ComputeDesiredGatewayStatus(gw, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], addresses, GatewayReadiness{Ready: true}, nil, nil)
+	gwStatus := ComputeDesiredGatewayStatus(gw, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], addresses, gatewayProvisioningErrors{}, nil)
 	if len(gwStatus.Conditions) != 3 {
 		t.Errorf("expected 3 Gateway conditions, got %d", len(gwStatus.Conditions))
 	}
@@ -5776,7 +5776,6 @@ func TestGatewayCondition_InsecureFrontendValidationMode(t *testing.T) {
 		st.UpsertGateway(gw)
 		st.UpsertConfigMap(configMaps[types.NamespacedName{Namespace: "default", Name: "ca"}])
 		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "10.0.0.1"}})
-		st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 		st.Recompute()
 
 		status, ok := st.GetDesiredGatewayStatus(gwKey)

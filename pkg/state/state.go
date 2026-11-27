@@ -126,11 +126,16 @@ type gatewayDataplaneState struct {
 // gatewayProvisioningErrors holds per-Gateway provisioning errors from different sources.
 type gatewayProvisioningErrors struct {
 	// addressProvider holds the provisioning error reported by the address provider
-	// or Gateway reconciler, set by SetGatewayProvisioningError.
+	// or Gateway reconciler, set by SetGatewayProvisioningErrors.
 	addressProvider error
+
 	// publish holds the error from the most recent data-plane publish attempt,
 	// set by recordPublishError.
 	publish error
+
+	// notServing holds the not-serving error reported by the address provider,
+	// set by SetGatewayProvisioningErrors.
+	notServing *ConditionError
 }
 
 // provisioningError returns the error for the Gateway's Programmed condition.
@@ -181,8 +186,8 @@ type State struct {
 	// It remains a map on State rather than a field on GatewayState because it must
 	// outlive Gateway deletion: when a Gateway is deleted from State, the background
 	// worker needs the acceptedConfig to publish deletion to data planes and handle retries.
-	// In contrast, addresses, readiness, and provisioningErrors live on GatewayState,
-	// and UpsertGateway carries those three fields over on a spec update.
+	// In contrast, addresses and provisioningErrors live on GatewayState,
+	// and UpsertGateway carries those two fields over on a spec update.
 	dataplaneState map[types.NamespacedName]gatewayDataplaneState
 
 	previousOutputs *Outputs
@@ -732,6 +737,13 @@ func (s *State) clearPublishErrorLocked(gwKey types.NamespacedName) {
 	}
 }
 
+func conditionErrorsEqual(first, second *ConditionError) bool {
+	if first == nil || second == nil {
+		return first == second
+	}
+	return *first == *second
+}
+
 // provisioningErrorsEqual reports whether two provisioning errors are equivalent.
 // If both errors wrap RejectedError, their rejections are compared rather than their error messages.
 // If both errors wrap ConditionError, their fields are compared.
@@ -753,10 +765,7 @@ func provisioningErrorsEqual(firstError, secondError error) bool {
 	}
 	var firstCondition, secondCondition *ConditionError
 	if errors.As(firstError, &firstCondition) && errors.As(secondError, &secondCondition) {
-		if firstCondition == nil || secondCondition == nil {
-			return firstCondition == secondCondition
-		}
-		return *firstCondition == *secondCondition
+		return conditionErrorsEqual(firstCondition, secondCondition)
 	}
 	if errors.As(firstError, &firstCondition) || errors.As(secondError, &secondCondition) {
 		return false
@@ -837,18 +846,14 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 	})
 
 	gwAddrs := make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress)
-	gwReady := make(map[types.NamespacedName]GatewayReadiness)
-	gwProvErrs := make(map[types.NamespacedName]error)
+	gwProvErrs := make(map[types.NamespacedName]gatewayProvisioningErrors)
 	for k, gwState := range s.gateways {
 		if gwState != nil {
 			if len(gwState.addresses) > 0 {
 				gwAddrs[k] = slices.Clone(gwState.addresses)
 			}
-			if gwState.readiness != nil {
-				gwReady[k] = *gwState.readiness
-			}
-			if err := gwState.provisioningErrors.provisioningError(); err != nil {
-				gwProvErrs[k] = err
+			if gwState.provisioningErrors.provisioningError() != nil || gwState.provisioningErrors.notServing != nil {
+				gwProvErrs[k] = gwState.provisioningErrors
 			}
 		}
 	}
@@ -1042,7 +1047,6 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		Gateways:                gws,
 		GatewayClasses:          gcs,
 		GatewayAddresses:        gwAddrs,
-		GatewayReadiness:        gwReady,
 		ProvisioningErrors:      gwProvErrs,
 		SupportedAddressTypes:   suppAddrs,
 		ListenerSets:            listenerSets,
@@ -1576,22 +1580,8 @@ func (s *State) GetGatewayAddresses() map[types.NamespacedName][]gatewayv1.Gatew
 	return gwAddrs
 }
 
-func (s *State) SetGatewayReadiness(key types.NamespacedName, readiness GatewayReadiness) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	gw, ok := s.gateways[key]
-	if !ok || (gw.readiness != nil && *gw.readiness == readiness) {
-		return
-	}
-
-	gw.readiness = &readiness
-	s.revision++
-	s.markDirtyLocked()
-}
-
-// SetGatewayProvisioningError sets the address provider provisioning error only for a Gateway.
-func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provisioningError error) {
+// SetGatewayProvisioningErrors sets the address provider's failure and not-serving error for a Gateway.
+func (s *State) SetGatewayProvisioningErrors(key types.NamespacedName, addressProviderError error, notServingError *ConditionError) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1601,11 +1591,12 @@ func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provisioni
 	}
 
 	errs := gw.provisioningErrors
-	if provisioningErrorsEqual(errs.addressProvider, provisioningError) {
+	if provisioningErrorsEqual(errs.addressProvider, addressProviderError) && conditionErrorsEqual(errs.notServing, notServingError) {
 		return
 	}
 
-	errs.addressProvider = provisioningError
+	errs.addressProvider = addressProviderError
+	errs.notServing = notServingError
 	gw.provisioningErrors = errs
 	s.revision++
 	s.markDirtyLocked()

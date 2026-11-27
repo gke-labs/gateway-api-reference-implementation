@@ -658,8 +658,8 @@ func TestState_GatewayReadinessGating(t *testing.T) {
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
 
-	// 1. Initial recompute with ready=false -> Programmed=False, Reason=Pending
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: false})
+	// 1. Initial recompute with not-serving error -> Programmed=False, Reason=Pending
+	st.SetGatewayProvisioningErrors(gwKey, nil, &ConditionError{Type: string(gatewayv1.GatewayConditionProgrammed)})
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -677,11 +677,11 @@ func TestState_GatewayReadinessGating(t *testing.T) {
 		t.Fatalf("expected Programmed condition")
 	}
 	if progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonPending) {
-		t.Errorf("expected Programmed=False Reason=Pending when ready=false, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+		t.Errorf("expected Programmed=False Reason=Pending when not serving, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
 	}
 
-	// 2. Set ready=true -> Programmed=True, Reason=Programmed
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+	// 2. Clear not-serving error -> Programmed=True, Reason=Programmed
+	st.SetGatewayProvisioningErrors(gwKey, nil, nil)
 	st.Recompute()
 
 	status, ok = st.GetDesiredGatewayStatus(gwKey)
@@ -695,11 +695,15 @@ func TestState_GatewayReadinessGating(t *testing.T) {
 		}
 	}
 	if progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Errorf("expected Programmed=True Reason=Programmed when ready=true, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+		t.Errorf("expected Programmed=True Reason=Programmed when serving, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
 	}
 
-	// 3. Custom readiness reason and message
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: false, Reason: "Pending", Message: "Waiting for tunnel connection to frontend"})
+	// 3. Custom not-serving reason and message
+	st.SetGatewayProvisioningErrors(gwKey, nil, &ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
+		Reason:  "Pending",
+		Message: "Waiting for tunnel connection to frontend",
+	})
 	st.Recompute()
 
 	status, ok = st.GetDesiredGatewayStatus(gwKey)
@@ -715,6 +719,27 @@ func TestState_GatewayReadinessGating(t *testing.T) {
 	}
 	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != "Pending" || progCond.Message != "Waiting for tunnel connection to frontend" {
 		t.Errorf("expected Programmed=False Reason=Pending Message='Waiting for tunnel connection to frontend', got %+v", progCond)
+	}
+
+	// 4. Same message with a different reason counts as a change and recomputes
+	prevRevision := st.Recompute().Revision
+	st.SetGatewayProvisioningErrors(gwKey, nil, &ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
+		Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
+		Message: "Waiting for tunnel connection to frontend",
+	})
+	outputs := st.Recompute()
+	if outputs.Revision == prevRevision {
+		t.Errorf("expected revision to advance when ConditionError reason changes with same message")
+	}
+
+	status, ok = st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	progCond = findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) || progCond.Message != "Waiting for tunnel connection to frontend" {
+		t.Errorf("expected Programmed=False Reason=AddressNotUsable Message='Waiting for tunnel connection to frontend', got %+v", progCond)
 	}
 }
 
@@ -740,11 +765,10 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. With provisioning error -> Programmed=False, Message=error
 	provisioningError := errors.New("conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw")
-	st.SetGatewayProvisioningError(gwKey, provisioningError)
+	st.SetGatewayProvisioningErrors(gwKey, provisioningError, nil)
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -765,8 +789,8 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 		t.Errorf("expected Programmed=False Message=%q when provisioning error present, got Status=%s Message=%q", provisioningError.Error(), progCond.Status, progCond.Message)
 	}
 
-	// 2. Clear provisioning error -> Programmed=True restored (given address and readiness)
-	st.SetGatewayProvisioningError(gwKey, nil)
+	// 2. Clear provisioning error -> Programmed=True restored (given address and serving)
+	st.SetGatewayProvisioningErrors(gwKey, nil, nil)
 	st.Recompute()
 
 	status, ok = st.GetDesiredGatewayStatus(gwKey)
@@ -809,11 +833,10 @@ func TestState_GatewayProvisioningError_NoAddress_ReportsFirstReasonAndBothMessa
 
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// Gateway has a provisioning error and no address assigned.
 	provisioningErrorMessage := "conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw"
-	st.SetGatewayProvisioningError(gwKey, errors.New(provisioningErrorMessage))
+	st.SetGatewayProvisioningErrors(gwKey, errors.New(provisioningErrorMessage), nil)
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -842,7 +865,7 @@ func TestState_GatewayProvisioningError_NoAddress_ReportsFirstReasonAndBothMessa
 		Reason:  customReason,
 		Message: provisioningErrorMessage,
 	}
-	st.SetGatewayProvisioningError(gwKey, customCondErr)
+	st.SetGatewayProvisioningErrors(gwKey, customCondErr, nil)
 	st.Recompute()
 
 	status, ok = st.GetDesiredGatewayStatus(gwKey)
@@ -869,7 +892,7 @@ func TestState_GatewayProvisioningError_NoAddress_ReportsFirstReasonAndBothMessa
 		Reason:  "OtherReason",
 		Message: provisioningErrorMessage,
 	}
-	st.SetGatewayProvisioningError(gwKey, otherTypeCondErr)
+	st.SetGatewayProvisioningErrors(gwKey, otherTypeCondErr, nil)
 	st.Recompute()
 
 	status, ok = st.GetDesiredGatewayStatus(gwKey)
@@ -1022,7 +1045,6 @@ func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. Initial recompute publishes config and encounters OwnershipConflictError,
 	// which records the provisioning error. Wait for the condition to update.
@@ -1089,7 +1111,6 @@ func TestState_PublishDataplaneConfig_PlainError(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. Initial publish fails with a plain error, which records the provisioning error.
 	// Wait for the Gateway condition to show Programmed=False with the error message.
@@ -1595,7 +1616,6 @@ func TestState_PublishAndProvisioningErrors_DoNotOverwriteOrClearEachOther(t *te
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. Initial publish fails with pubErr. Gateway status shows Programmed=False with publish error.
 	pollUntil(t, 2*time.Second, func() bool {
@@ -1610,7 +1630,7 @@ func TestState_PublishAndProvisioningErrors_DoNotOverwriteOrClearEachOther(t *te
 	// 2. Report a provisioning error from an address provider.
 	// Address provider's error is shown first in Gateway status.
 	addrErr := errors.New("conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw")
-	st.SetGatewayProvisioningError(gwKey, addrErr)
+	st.SetGatewayProvisioningErrors(gwKey, addrErr, nil)
 
 	pollUntil(t, 2*time.Second, func() bool {
 		status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -1654,7 +1674,7 @@ func TestState_PublishAndProvisioningErrors_DoNotOverwriteOrClearEachOther(t *te
 	})
 
 	// 5. Clear the address provider provisioning error (address provider succeeds).
-	st.SetGatewayProvisioningError(gwKey, nil)
+	st.SetGatewayProvisioningErrors(gwKey, nil, nil)
 
 	// Verify that clearing addressProvider error reveals the still-failing publish error
 	// (not Programmed=True), proving publish error was not overwritten or cleared.
@@ -1687,6 +1707,71 @@ func TestState_PublishAndProvisioningErrors_DoNotOverwriteOrClearEachOther(t *te
 	pollUntil(t, 2*time.Second, func() bool {
 		_, ok := st.GetDesiredGatewayStatus(gwKey)
 		return !ok
+	})
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestState_PublishErrorAndNotServingAddressNotAssigned_ReportsPublishReasonAndBothMessages(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	publishErr := &ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
+		Reason:  "PublishFailed",
+		Message: "simulated publish failure",
+	}
+	mockPub := &mockDataplanePublisher{
+		publishErr: publishErr,
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	notServingMsg := "Waiting for LoadBalancer IP to be assigned"
+	st.SetGatewayProvisioningErrors(gwKey, nil, &ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
+		Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+		Message: notServingMsg,
+	})
+
+	expectedMsg := publishErr.Error() + "; " + notServingMsg
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			return false
+		}
+		progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+		return progCond != nil &&
+			progCond.Status == metav1.ConditionFalse &&
+			progCond.Reason == publishErr.Reason &&
+			progCond.Message == expectedMsg
 	})
 
 	cancel()
@@ -1731,7 +1816,6 @@ func TestState_PublishError_ClearedOnGatewayDeleteAndRecreate(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. Initial publish fails with pubErr. Wait for Programmed=False with pubErr.
 	pollUntil(t, 2*time.Second, func() bool {
@@ -1766,7 +1850,6 @@ func TestState_PublishError_ClearedOnGatewayDeleteAndRecreate(t *testing.T) {
 	}
 	st.UpsertGateway(recreatedGW)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 4. Assert that its status never shows the old publish error, and reaches Programmed=True.
 	pollUntil(t, 2*time.Second, func() bool {
@@ -1923,7 +2006,6 @@ func TestState_PublishDataplaneConfig_NotAnswered_PublicEntryPoints(t *testing.T
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. Wait for Gateway condition to show Programmed=False with reason Pending and count.
 	pollUntil(t, 2*time.Second, func() bool {
@@ -2116,7 +2198,6 @@ func TestState_PublishDataplaneConfig_RetryOnFailure(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// Wait for retry to publish without any other event.
 	pollUntil(t, 2*time.Second, func() bool {
@@ -2175,7 +2256,6 @@ func TestState_PublishDataplaneConfig_RepeatedFailuresBackoff(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// Wait for at least 4 publish attempts without any other events.
 	pollUntil(t, 2*time.Second, func() bool {
@@ -2245,7 +2325,6 @@ func TestState_PublishDataplaneConfig_UnrelatedChangesDoNotRetryFailingKey(t *te
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gwA)
 	st.SetGatewayAddresses(gwKeyA, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKeyA, GatewayReadiness{Ready: true})
 
 	// Wait until gw-a has made about six attempts, so that its next retry is
 	// more than 150 milliseconds away (5ms -> 10ms -> 20ms -> 40ms -> 80ms -> 160ms).
@@ -2326,7 +2405,6 @@ func TestState_SetDataplanePublisher_EnqueuesExistingConfigs(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// Wait for the state to perform the initial recompute with the Gateway config.
 	pollUntil(t, 2*time.Second, func() bool {
@@ -2391,7 +2469,6 @@ func TestState_PublishDataplaneConfig_RetryCancelledOnGatewayDelete(t *testing.T
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// Wait for first failure
 	pollUntil(t, 2*time.Second, func() bool {
@@ -2461,7 +2538,6 @@ func TestState_PublishDataplaneConfig_FailedDeletionRetried(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// Wait for successful initial publish
 	pollUntil(t, 2*time.Second, func() bool {
@@ -2742,11 +2818,11 @@ func TestState_GatewayAddresses_AddressNotUsable(t *testing.T) {
 	}
 	st.UpsertGateway(gw)
 
-	// Provider reports AddressNotUsable readiness
+	// Provider reports AddressNotUsable not-serving error
 	notUsableMsg := "Requested address 192.0.2.1 could not be bound to Service"
 	st.SetGatewayAddresses(gwKey, nil)
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{
-		Ready:   false,
+	st.SetGatewayProvisioningErrors(gwKey, nil, &ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
 		Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
 		Message: notUsableMsg,
 	})
@@ -2795,12 +2871,11 @@ func TestState_GatewayAddresses_BoundProgrammed(t *testing.T) {
 	}
 	st.UpsertGateway(gw)
 
-	// Provider reports bound address and Ready=true, also includes another unrelated address to test filtering
+	// Provider reports bound address, also includes another unrelated address to test filtering
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{
 		{Type: Ptr(gatewayv1.IPAddressType), Value: "192.0.2.1"},
 		{Type: Ptr(gatewayv1.IPAddressType), Value: "10.0.0.99"},
 	})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -2854,7 +2929,6 @@ func TestState_GatewayAddresses_EmptyValueNormalAllocation(t *testing.T) {
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{
 		{Type: Ptr(gatewayv1.IPAddressType), Value: "10.0.0.5"},
 	})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -2899,7 +2973,6 @@ func TestState_GatewayAddresses_NoSpecAddresses(t *testing.T) {
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{
 		{Type: Ptr(gatewayv1.IPAddressType), Value: "10.0.0.1"},
 	})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -3007,10 +3080,13 @@ func TestState_GatewayState_AddressesReadinessErrorsLifecycle(t *testing.T) {
 
 	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
 
-	// 1. Setting addresses, readiness, and errors for a non-existent Gateway is safely ignored.
+	// 1. Setting addresses and errors for a non-existent Gateway is safely ignored.
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
-	st.SetGatewayProvisioningError(gwKey, errors.New("some-err"))
+	st.SetGatewayProvisioningErrors(gwKey, errors.New("some-err"), &ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
+		Reason:  string(gatewayv1.GatewayReasonPending),
+		Message: "not serving",
+	})
 
 	st.mu.RLock()
 	_, exists := st.gateways[gwKey]
@@ -3022,7 +3098,7 @@ func TestState_GatewayState_AddressesReadinessErrorsLifecycle(t *testing.T) {
 		t.Fatalf("expected no addresses for non-existent Gateway, got: %v", addrs)
 	}
 
-	// 2. Upsert Gateway and populate addresses, readiness, and provisioning error.
+	// 2. Upsert Gateway and populate addresses and provisioning errors.
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
 		Spec: gatewayv1.GatewaySpec{
@@ -3032,10 +3108,14 @@ func TestState_GatewayState_AddressesReadinessErrorsLifecycle(t *testing.T) {
 			},
 		},
 	}
+	notServingErr := &ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
+		Reason:  string(gatewayv1.GatewayReasonPending),
+		Message: "waiting for deployment",
+	}
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
-	st.SetGatewayProvisioningError(gwKey, errors.New("test provisioning error"))
+	st.SetGatewayProvisioningErrors(gwKey, errors.New("test provisioning error"), notServingErr)
 
 	st.mu.RLock()
 	gwState := st.gateways[gwKey]
@@ -3046,15 +3126,15 @@ func TestState_GatewayState_AddressesReadinessErrorsLifecycle(t *testing.T) {
 	if len(gwState.addresses) != 1 || gwState.addresses[0].Value != "192.0.2.1" {
 		t.Errorf("expected addresses to be stored on GatewayState, got: %+v", gwState.addresses)
 	}
-	if gwState.readiness == nil || !gwState.readiness.Ready {
-		t.Errorf("expected readiness to be stored on GatewayState, got: %+v", gwState.readiness)
+	if gwState.provisioningErrors.notServing == nil || *gwState.provisioningErrors.notServing != *notServingErr {
+		t.Errorf("expected notServing error to be stored on GatewayState, got: %+v", gwState.provisioningErrors.notServing)
 	}
 	if gwState.provisioningErrors.addressProvider == nil || gwState.provisioningErrors.addressProvider.Error() != "test provisioning error" {
 		t.Errorf("expected provisioning error to be stored on GatewayState, got: %+v", gwState.provisioningErrors)
 	}
 	st.mu.RUnlock()
 
-	// 3. Updating Gateway spec preserves addresses, readiness, and provisioning errors.
+	// 3. Updating Gateway spec preserves addresses and provisioning errors.
 	gwUpdated := gw.DeepCopy()
 	gwUpdated.Spec.Listeners[0].Port = 8080
 	st.UpsertGateway(gwUpdated)
@@ -3068,8 +3148,8 @@ func TestState_GatewayState_AddressesReadinessErrorsLifecycle(t *testing.T) {
 	if len(gwStateUpdated.addresses) != 1 || gwStateUpdated.addresses[0].Value != "192.0.2.1" {
 		t.Errorf("expected addresses to be preserved after spec update, got: %+v", gwStateUpdated.addresses)
 	}
-	if gwStateUpdated.readiness == nil || !gwStateUpdated.readiness.Ready {
-		t.Errorf("expected readiness to be preserved after spec update, got: %+v", gwStateUpdated.readiness)
+	if gwStateUpdated.provisioningErrors.notServing == nil || *gwStateUpdated.provisioningErrors.notServing != *notServingErr {
+		t.Errorf("expected notServing error to be preserved after spec update, got: %+v", gwStateUpdated.provisioningErrors.notServing)
 	}
 	if gwStateUpdated.provisioningErrors.addressProvider == nil || gwStateUpdated.provisioningErrors.addressProvider.Error() != "test provisioning error" {
 		t.Errorf("expected provisioning error to be preserved after spec update, got: %+v", gwStateUpdated.provisioningErrors)

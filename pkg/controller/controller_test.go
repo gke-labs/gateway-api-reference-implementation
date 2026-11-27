@@ -2008,6 +2008,26 @@ func TestGatewayReconciler_AddressReadiness(t *testing.T) {
 	}
 }
 
+func TestReadinessToConditionError(t *testing.T) {
+	if got := readinessToConditionError(state.GatewayReadiness{Ready: true, Reason: "Ignored", Message: "ignored"}); got != nil {
+		t.Fatalf("expected nil for ready GatewayReadiness, got %+v", got)
+	}
+
+	got := readinessToConditionError(state.GatewayReadiness{
+		Ready:   false,
+		Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+		Message: "Waiting for IP",
+	})
+	want := &state.ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
+		Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+		Message: "Waiting for IP",
+	}
+	if got == nil || *got != *want {
+		t.Fatalf("readinessToConditionError() = %+v, want %+v", got, want)
+	}
+}
+
 func TestGatewayReconciler_GatewayStatusHook(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -2773,7 +2793,6 @@ func TestGatewayReconciler_PartialCRDInstallation_ReconcilesGatewayAndHTTPRoute(
 	st.UpsertGateway(gw)
 	st.UpsertHTTPRoute(route)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
 	st.Recompute()
 
 	client := fake.NewClientBuilder().
