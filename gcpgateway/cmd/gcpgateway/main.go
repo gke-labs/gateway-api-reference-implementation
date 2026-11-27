@@ -16,13 +16,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
+	"cloud.google.com/go/auth/credentials"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
@@ -30,6 +34,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	compute "google.golang.org/api/compute/v1"
+	"google.golang.org/api/option"
 	corev1 "k8s.io/api/core/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/klog/v2"
@@ -220,9 +225,10 @@ func BindControllerFlags(fs *flag.FlagSet, opts *gari.Options, cfg *ControllerCo
 }
 
 // SetupController parses args and builds the gari.Options for controller mode.
-// If computeClient is nil:
-//   - if --fake-compute is set, gcp.NewFakeComputeClient() is used.
-//   - otherwise compute.NewService(ctx) is called, returning an error on failure.
+// When computeClient is nil and --fake-compute is set, SetupController uses
+// gcp.NewFakeComputeClient without looking for Google Cloud credentials.
+// Otherwise, SetupController resolves Application Default Credentials, fetches
+// one access token to verify them, and initializes the Compute API client.
 func SetupController(ctx context.Context, args []string, computeClient gcp.ComputeClient) (gari.Options, error) {
 	cfg := DefaultControllerConfig()
 
@@ -256,11 +262,10 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		if cfg.FakeCompute {
 			gcpClient = gcp.NewFakeComputeClient()
 		} else {
-			computeSvc, err := compute.NewService(ctx)
+			gcpClient, err = newComputeClient(ctx)
 			if err != nil {
-				return gari.Options{}, fmt.Errorf("initializing Google Cloud Compute API client: %w", err)
+				return gari.Options{}, err
 			}
-			gcpClient = gcp.NewGCEComputeClient(computeSvc)
 		}
 	}
 
@@ -345,6 +350,80 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 	}
 
 	return opts, nil
+}
+
+const credentialCheckTimeout = 15 * time.Second
+
+func newComputeClient(ctx context.Context) (*gcp.GCEComputeClient, error) {
+	defaultCredentials, err := credentials.DetectDefault(&credentials.DetectOptions{
+		Scopes: []string{compute.CloudPlatformScope, compute.ComputeScope},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolving Google Cloud credentials (tried: %s): %w",
+			strings.Join(triedCredentialSources(), "; "), err)
+	}
+
+	tokenCtx, cancel := context.WithTimeout(ctx, credentialCheckTimeout)
+	defer cancel()
+	if _, err := defaultCredentials.Token(tokenCtx); err != nil {
+		return nil, fmt.Errorf("fetching Google Cloud access token (tried: %s): %w",
+			strings.Join(triedCredentialSources(), "; "), err)
+	}
+
+	computeService, err := compute.NewService(ctx, option.WithAuthCredentials(defaultCredentials))
+	if err != nil {
+		return nil, fmt.Errorf("initializing Google Cloud Compute API client: %w", err)
+	}
+	return gcp.NewGCEComputeClient(computeService), nil
+}
+
+func triedCredentialSources() []string {
+	if path := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); path != "" {
+		return []string{fmt.Sprintf("GOOGLE_APPLICATION_CREDENTIALS (%s)", path)}
+	}
+
+	sources := []string{"GOOGLE_APPLICATION_CREDENTIALS (unset)"}
+
+	gcloudPath, err := gcloudCredentialsPath()
+	if err != nil {
+		sources = append(sources, fmt.Sprintf("gcloud application default credentials (home directory unavailable: %v)", err))
+	} else if gcloudPath == "" {
+		sources = append(sources, "gcloud application default credentials (HOME unset)")
+	} else if _, err := os.ReadFile(gcloudPath); err == nil {
+		return append(sources, fmt.Sprintf("gcloud application default credentials (%s)", gcloudPath))
+	} else if errors.Is(err, os.ErrNotExist) {
+		sources = append(sources, fmt.Sprintf("gcloud application default credentials (%s, not found)", gcloudPath))
+	} else {
+		sources = append(sources, fmt.Sprintf("gcloud application default credentials (%s, unreadable: %v)", gcloudPath, err))
+	}
+
+	metadataHost := os.Getenv("GCE_METADATA_HOST")
+	if metadataHost == "" {
+		metadataHost = "169.254.169.254"
+	}
+	return append(sources, fmt.Sprintf("GCE/GKE metadata server (%s)", metadataHost))
+}
+
+func gcloudCredentialsPath() (string, error) {
+	if runtime.GOOS == "windows" {
+		appData := os.Getenv("APPDATA")
+		if appData == "" {
+			return "", nil
+		}
+		return filepath.Join(appData, "gcloud", "application_default_credentials.json"), nil
+	}
+	home := os.Getenv("HOME")
+	if home == "" {
+		currentUser, err := user.Current()
+		if err != nil {
+			return "", err
+		}
+		home = currentUser.HomeDir
+	}
+	if home == "" {
+		return "", nil
+	}
+	return filepath.Join(home, ".config", "gcloud", "application_default_credentials.json"), nil
 }
 
 func runController(ctx context.Context, args []string) error {

@@ -19,11 +19,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -345,6 +349,159 @@ func TestSetupController_FakeComputeFlag(t *testing.T) {
 	if opts.SetupWithManager == nil {
 		t.Errorf("expected SetupWithManager to be set")
 	}
+}
+
+func TestRun_StartupCredentialCheck(t *testing.T) {
+	controllerArgs := []string{
+		"--cluster-id=c1",
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
+	}
+
+	t.Run("missing GOOGLE_APPLICATION_CREDENTIALS file", func(t *testing.T) {
+		missingPath := filepath.Join(t.TempDir(), "missing-credentials.json")
+		t.Setenv("POD_NAMESPACE", "default")
+		t.Setenv("HOME", t.TempDir())
+		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", missingPath)
+
+		err := Run(t.Context(), controllerArgs)
+		if err == nil {
+			t.Fatalf("expected error from Run when GOOGLE_APPLICATION_CREDENTIALS points to missing file, got nil")
+		}
+		for _, want := range []string{"GOOGLE_APPLICATION_CREDENTIALS", missingPath} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("expected error to contain %q, got: %v", want, err)
+			}
+		}
+	})
+
+	t.Run("metadata server unreachable", func(t *testing.T) {
+		// Subprocess gives cloud.google.com/go/compute/metadata a fresh OnGCE sync.Once.
+		if os.Getenv("TEST_CREDENTIAL_SUBPROCESS") == "unreachable" {
+			err := Run(t.Context(), controllerArgs)
+			if err == nil {
+				t.Fatalf("expected error from Run when no credentials are available, got nil")
+			}
+			metadataHost := os.Getenv("GCE_METADATA_HOST")
+			for _, want := range []string{
+				"GOOGLE_APPLICATION_CREDENTIALS",
+				"gcloud application default credentials",
+				"GCE/GKE metadata server",
+				metadataHost,
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("expected error to contain %q, got: %v", want, err)
+				}
+			}
+			return
+		}
+
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to allocate local port: %v", err)
+		}
+		closedAddr := listener.Addr().String()
+		if err := listener.Close(); err != nil {
+			t.Fatalf("failed to close local listener: %v", err)
+		}
+
+		cmd := exec.Command(os.Args[0], "-test.run=^TestRun_StartupCredentialCheck/metadata_server_unreachable$", "-test.v")
+		cmd.Env = append(
+			withoutEnvVars(os.Environ(), "GOOGLE_APPLICATION_CREDENTIALS", "HOME", "POD_NAMESPACE", "GCE_METADATA_HOST"),
+			"TEST_CREDENTIAL_SUBPROCESS=unreachable",
+			"POD_NAMESPACE=default",
+			"HOME="+t.TempDir(),
+			"GCE_METADATA_HOST="+closedAddr,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("subprocess failed: %v\nOutput:\n%s", err, string(out))
+		}
+	})
+
+	t.Run("fetches one token at startup", func(t *testing.T) {
+		if os.Getenv("TEST_CREDENTIAL_SUBPROCESS") == "token" {
+			if _, err := SetupController(t.Context(), controllerArgs, nil); err != nil {
+				t.Fatalf("SetupController failed with working metadata server: %v", err)
+			}
+			return
+		}
+
+		var tokenRequests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Metadata-Flavor", "Google")
+			if strings.HasPrefix(r.URL.Path, "/computeMetadata/v1/instance/service-accounts/default/token") {
+				tokenRequests.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				if _, err := fmt.Fprint(w, `{"access_token":"test-token","expires_in":3600,"token_type":"Bearer"}`); err != nil {
+					t.Errorf("writing fake token response: %v", err)
+				}
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		metadataHost := strings.TrimPrefix(server.URL, "http://")
+		cmd := exec.Command(os.Args[0], "-test.run=^TestRun_StartupCredentialCheck/fetches_one_token_at_startup$", "-test.v")
+		cmd.Env = append(
+			withoutEnvVars(os.Environ(), "GOOGLE_APPLICATION_CREDENTIALS", "HOME", "POD_NAMESPACE", "GCE_METADATA_HOST"),
+			"TEST_CREDENTIAL_SUBPROCESS=token",
+			"POD_NAMESPACE=default",
+			"HOME="+t.TempDir(),
+			"GCE_METADATA_HOST="+metadataHost,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("subprocess failed: %v\nOutput:\n%s", err, string(out))
+		}
+		if got := tokenRequests.Load(); got != 1 {
+			t.Errorf("expected 1 startup token fetch from metadata server, got %d", got)
+		}
+	})
+}
+
+func TestSetupController_FakeComputeSkipsCredentials(t *testing.T) {
+	var metadataRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metadataRequests.Add(1)
+		http.Error(w, "metadata server must not be contacted", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	t.Setenv("POD_NAMESPACE", "default")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "does-not-exist.json"))
+	t.Setenv("GCE_METADATA_HOST", strings.TrimPrefix(server.URL, "http://"))
+
+	opts, err := SetupController(t.Context(), []string{
+		"--cluster-id=c1",
+		"--fake-compute",
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/cert.pem",
+		"--internal-api-tls-key-file=/etc/key.pem",
+	}, nil)
+	if err != nil {
+		t.Fatalf("SetupController failed with --fake-compute: %v", err)
+	}
+	if opts.SetupWithManager == nil {
+		t.Errorf("expected SetupWithManager to be set")
+	}
+	if got := metadataRequests.Load(); got != 0 {
+		t.Errorf("expected --fake-compute not to contact metadata server, got %d requests", got)
+	}
+}
+
+func withoutEnvVars(env []string, keys ...string) []string {
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		if !slices.Contains(keys, name) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 func TestSetupController_DebugErrorResponsesFlag(t *testing.T) {

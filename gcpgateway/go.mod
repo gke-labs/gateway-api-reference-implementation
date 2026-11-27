@@ -3,6 +3,7 @@ module github.com/gke-labs/gateway-api-reference-implementation/gcpgateway
 go 1.27.2
 
 require (
+	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a
 	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261024134123-7373c0c33da0
 	github.com/gke-labs/gateway-api-reference-implementation/certserver/api v0.0.0
 	google.golang.org/api v0.316.0
@@ -17,7 +18,6 @@ require (
 )
 
 require (
-	cloud.google.com/go/auth v0.24.1-0.20261001053825-dbc26066f70a // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.3.1 // indirect
 	cloud.google.com/go/compute/metadata v0.10.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect

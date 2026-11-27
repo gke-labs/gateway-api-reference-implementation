@@ -35,27 +35,143 @@
 
 ---
 
-## Google Cloud IAM Roles & Workload Identity
+## Google Cloud Credentials and IAM Roles
 
-To uphold least privilege, `gcpgateway` uses two distinct IAM roles:
+The `gcpgateway` controller calls the Google Compute Engine API using Application Default Credentials (ADC). At start-up, the controller resolves credentials and fetches one access token unless `--fake-compute` is set. If credential resolution or token fetching fails, the controller exits with an error that lists the credential sources it tried. Data-plane pods do not call Google Cloud APIs and do not need Google Cloud credentials.
+
+ADC checks three sources in order and stops at the first one it finds:
+
+1. The JSON file named by the `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
+2. The `gcloud` application default credentials file at `$HOME/.config/gcloud/application_default_credentials.json`.
+3. The Google Compute Engine metadata server at `169.254.169.254` (or `GCE_METADATA_HOST` when set).
+
+### Required IAM Permissions
+
+`gcpgateway` separates runtime permissions from provisioning permissions using two IAM roles:
 
 1. **`gcpgatewayNegRegistrar` (Runtime Controller Role)**:
-   Used by the controller in the cluster. It can **only** inspect NEGs and backend services, attach/detach endpoints, and query health. It cannot create or destroy infrastructure.
+   The controller uses this role inside the cluster. It can inspect NEGs and backend services, attach and detach endpoints, and query backend health. It cannot create or delete load-balancing infrastructure.
    - Permissions:
      - `compute.networkEndpointGroups.get`
      - `compute.networkEndpointGroups.list`
      - `compute.networkEndpointGroups.use`
      - `compute.networkEndpointGroups.attachNetworkEndpoints`
      - `compute.networkEndpointGroups.detachNetworkEndpoints`
-     - `compute.instances.use` (attachNetworkEndpoints references the pod's VM)
+     - `compute.instances.use` (required because `attachNetworkEndpoints` references the pod's VM)
      - `compute.backendServices.get` (also authorizes `getHealth`)
      - `compute.zoneOperations.get`
 2. **`gcpgatewayOperatorHelper` (Provisioning Helper Role)**:
-   Used by operators or CI/CD pipelines executing `gcpgatewayctl frontend create` and `gcpgatewayctl frontend delete`.
-   - Permissions across addresses, health checks, NEGs, backend services, target TCP proxies, forwarding rules, and firewall rules.
+   Operators or CI/CD pipelines use this role when running `gcpgatewayctl frontend create` and `gcpgatewayctl frontend delete`.
+   - Permissions cover addresses, health checks, NEGs, backend services, target TCP proxies, forwarding rules, and firewall rules.
 
 > **Note on IAM Conditions and Multi-Cluster Isolation**:
-> Because resource names use `<prefix>-<8-char-hash>-<suffix>` without readable cluster names, a name-based IAM Condition (e.g. `resource.name.startsWith(...)`) **cannot** separate multiple clusters sharing the same GCP project unless each cluster is configured with a unique prefix (e.g., `--neg-prefix=gcpgw-cluster1-`). If multiple clusters share a project, configure distinct prefixes per cluster to achieve IAM resource separation.
+> Resource names use `<prefix>-<8-char-hash>-<suffix>` without readable cluster names. A name-based IAM Condition such as `resource.name.startsWith(...)` cannot separate multiple clusters sharing the same GCP project unless each cluster uses a unique prefix such as `--neg-prefix=gcpgw-cluster1-`. Configure distinct prefixes per cluster if multiple clusters share a project.
+
+### Supplying an Identity to the Controller
+
+You can supply a Google Cloud identity to the `gcpgateway` controller in three ways.
+
+#### 1. Node Service Account via the Metadata Server
+
+When `GOOGLE_APPLICATION_CREDENTIALS` is unset and no `gcloud` credentials file exists in the container, ADC falls back to the Compute Engine metadata server. The controller then authenticates as the service account attached to the node VM.
+
+This option requires three conditions:
+
+- The controller pod can reach the metadata server at `169.254.169.254`.
+- The node VM grants the `compute` or `cloud-platform` OAuth scope.
+- The node's service account holds the `gcpgatewayNegRegistrar` role.
+
+Granting `gcpgatewayNegRegistrar` to the node service account exposes those permissions to any pod on that node that can reach the metadata server. On clusters that block pod access to the metadata server, this option fails and the controller exits at start-up.
+
+#### 2. Workload Identity on GKE
+
+On GKE clusters with Workload Identity enabled, GKE intercepts metadata server requests from the controller pod and issues tokens for a bound Google Service Account (GSA). The controller pod still uses ADC through the metadata server endpoint, but it receives the GSA's identity instead of the node's service account. See [Step 1](#step-1-create-iam-roles--bind-workload-identity) and [Step 2](#step-2-deploy-the-controller) below for the GKE setup commands.
+
+#### 3. Workload Identity Federation with a Projected ServiceAccount Token
+
+On self-managed Kubernetes clusters running on GCE (such as kOps clusters where pods cannot reach the metadata server), you can authenticate the controller with Workload Identity Federation and a projected Kubernetes ServiceAccount token. The Go client reads the resulting `external_account` configuration automatically with no changes to the controller binary.
+
+1. Create a Workload Identity Pool and an OIDC provider using the cluster's JSON Web Key Set (JWKS). Uploading the JWKS works even when the cluster's OIDC issuer is a private name that Google cannot fetch directly:
+
+```bash
+export PROJECT_ID="my-gcp-project"
+export PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')
+export POOL="my-cluster-pool"
+
+kubectl get --raw /openid/v1/jwks > jwks.json
+ISSUER=$(kubectl get --raw /.well-known/openid-configuration | jq -r .issuer)
+
+gcloud iam workload-identity-pools create "${POOL}" \
+  --project="${PROJECT_ID}" \
+  --location="global"
+
+gcloud iam workload-identity-pools providers create-oidc kubernetes \
+  --project="${PROJECT_ID}" \
+  --location="global" \
+  --workload-identity-pool="${POOL}" \
+  --issuer-uri="${ISSUER}" \
+  --jwk-json-path="jwks.json" \
+  --allowed-audiences="//iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL}/providers/kubernetes" \
+  --attribute-mapping="google.subject=assertion.sub"
+```
+
+2. Grant `gcpgatewayNegRegistrar` directly to the federated Kubernetes ServiceAccount (KSA) principal. Compute Engine accepts federated principals directly, so you do not need a Google Service Account:
+
+```bash
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --role="projects/${PROJECT_ID}/roles/gcpgatewayNegRegistrar" \
+  --member="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL}/subject/system:serviceaccount:default:gcpgateway-controller"
+```
+
+3. Generate an `external_account` credential configuration file and store it in a ConfigMap:
+
+```bash
+gcloud iam workload-identity-pools create-cred-config \
+  "projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL}/providers/kubernetes" \
+  --credential-source-file="/var/run/secrets/gcp-token/token" \
+  --credential-source-type="text" \
+  --output-file="gcp-wif-credentials.json"
+
+kubectl create configmap gcpgateway-gcp-credentials \
+  --namespace="default" \
+  --from-file=credentials.json=gcp-wif-credentials.json
+```
+
+4. Mount the credential configuration ConfigMap and a projected `serviceAccountToken` volume into the `gcpgateway-controller` Deployment, and point `GOOGLE_APPLICATION_CREDENTIALS` at the mounted file:
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+      - name: controller
+        env:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /var/run/secrets/gcp-credentials/credentials.json
+        volumeMounts:
+        - name: gcp-credentials
+          mountPath: /var/run/secrets/gcp-credentials
+          readOnly: true
+        - name: gcp-token
+          mountPath: /var/run/secrets/gcp-token
+          readOnly: true
+      volumes:
+      - name: gcp-credentials
+        configMap:
+          name: gcpgateway-gcp-credentials
+      - name: gcp-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: //iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/kubernetes
+              expirationSeconds: 3600
+              path: token
+```
+
+Once the controller runs with this configuration, Cloud Audit Logs record Compute API calls under `principalSubject: .../workloadIdentityPools/<POOL>/subject/system:serviceaccount:default:gcpgateway-controller`, and you can remove `gcpgatewayNegRegistrar` from the node service account.
+
+> **Key Rotation Caveat**:
+> When you configure the OIDC provider with an uploaded JWKS file, rotating the cluster's service-account signing key requires exporting the updated JWKS and re-running `gcloud iam workload-identity-pools providers update-oidc kubernetes --location="global" --workload-identity-pool="${POOL}" --jwk-json-path="jwks.json"`.
 
 ---
 
