@@ -53,6 +53,8 @@ Engines evaluated:
 
 ### Storage, Memory & Write Performance
 
+In this table, the "WAL Size" column reports the WAL size retained at the end of the run rather than cumulative WAL bytes written.
+
 | Corpus | Storage Engine | Heap In-Use | Process RSS | Heap File | WAL Size | Total Disk | Write Throughput | Recovery |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Config Text (2.5k)** | In-Memory Informer | 28.64 MB | 80.77 MB | - | - | 0 MB (RAM) | 8,529 op/s | - |
@@ -193,6 +195,8 @@ Measures DiskStore with block-level AES-256-XTS encryption enabled (across heap 
 
 ### Results: Encryption ON (AES-256-XTS Block Encryption, Median of 3 Runs)
 
+In the Section 5 storage tables below, the "WAL Size" column reports the WAL size retained at the end of the run rather than cumulative WAL bytes written.
+
 #### Storage, Memory & Write Performance
 
 | Corpus | Storage Engine | Heap In-Use | Process RSS | Heap File | WAL Size | Total Disk | Write Time | Write Throughput | Recovery |
@@ -300,3 +304,51 @@ Measures DiskStore with block-level AES-256-XTS encryption enabled (across heap 
 - **Run-to-run spread (3 runs per mode):** Across the 3 runs, DiskStore write throughput was stable within ~2–5% for most rows (for example, Mixed Realistic Corpus `DiskStore (None)`: 4,608–4,638 op/s encrypted vs 6,016–6,145 op/s unencrypted; Random Incompressible Bytes `DiskStore (None)`: 8,448–8,560 op/s encrypted vs 14,667–15,205 op/s unencrypted). Individual runs occasionally experienced shared-host I/O stalls (e.g., one encryption-off TLS `DiskStore (None)` run dipped to 1,734 op/s versus 4,651 and 4,685 op/s on the other two runs, and one encryption-on Mixed `DiskStore (zstd)` run dipped to 3,044 op/s versus 4,925 and 4,957 op/s). Recovery times stayed consistent across all 3 runs, scaling roughly 2.5–3x with AES-256-XTS enabled because startup scans and decrypts every 4 KiB heap block.
 - **Mixed-corpus `DiskStore (zstd)` heap file size:** AES-256-XTS transforms 4 KiB blocks in place with zero ciphertext expansion, so block and record sizes do not differ between encrypted and unencrypted stores. Across the 6 runs (3 encrypted, 3 unencrypted), Mixed Realistic Corpus `DiskStore (zstd)` reached `121.94–121.96 MB` in 5 runs and `89.98 MB` in 1 encrypted run. The difference comes from non-deterministic out-of-place flush ordering (`BlockPool` scans its `pageTable` map in randomized order during eviction and runs a wall-clock background cleaner) interacting with `BuddyAllocator`'s power-of-two growth and deferred frees between checkpoints; because `heap.db` is never shrunk, differing fragmentation shifts its high-water mark independently of encryption.
 
+---
+
+## 6. Cumulative WAL Bytes Written and Steady-State Heap File Size (`TestDiskStore_Versus_BBolt_MeasurementSuite`)
+
+This run measures cumulative WAL bytes written alongside the steady-state heap file size (`heap.db`). It replaces the earlier combined `Total Disk` column so the table does not add a sawtooth WAL size to a steady-state file size.
+
+- **Date:** 2026-11-27
+- **Machine:** AMD EPYC 9B14 (60 vCPUs, 235 GiB RAM, Linux 6.12.110+ x86_64)
+- **Go Version:** `go1.27.4 linux/amd64`
+- **Runs:** 1 run (each number in the table below comes from a single run).
+- **Command:**
+  ```bash
+  GOTOOLCHAIN=auto go test -v -count=1 -run=^TestDiskStore_Versus_BBolt_MeasurementSuite$ ./experiments/diskstore/kubecache
+  ```
+
+### Storage, Memory & Write Performance
+
+`Heap File` is the steady-state size of `heap.db` for DiskStore, or the database file for BBolt. `WAL Bytes Written` is the cumulative byte volume written to WAL segment files during the run. `Retained WAL (End of Run)` is the WAL size left on disk when the run ends. Because checkpoints delete only whole 16 MiB segments behind the checkpoint, the retained WAL size rises and falls in a sawtooth up to 16 MiB plus any uncheckpointed writes.
+
+| Corpus | Storage Engine | Heap In-Use | Process RSS | Heap File | WAL Bytes Written | Retained WAL (End of Run) | Write Time | Write Throughput | Recovery |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Configuration Text (JSON)** (2,500 objs) | In-Memory Informer | 28.59 MB | 79.62 MB | - | - | - | 0.28 s | 8,966 op/s | - |
+| | BBolt (mmap + NoSync) | 0.33 MB | 71.03 MB | 48.09 MB | - | - | 0.60 s | 4,134 op/s | 3.9 ms |
+| | DiskStore (None) | 15.59 MB | 69.08 MB | 39.81 MB | 24.77 MB | 8.77 MB | 0.50 s | 5,006 op/s | 434 ms |
+| | DiskStore (zstd) | 15.33 MB | 67.10 MB | 4.89 MB | 3.51 MB | 3.51 MB | 0.38 s | 6,568 op/s | 80 ms |
+| | DiskStore (None, 64 MB pool) | 75.15 MB | 151.58 MB | 39.08 MB | 24.76 MB | 8.77 MB | 0.49 s | 5,135 op/s | 432 ms |
+| **TLS Material (x509 PEM)** (2,500 objs) | In-Memory Informer | 30.45 MB | 81.78 MB | - | - | - | 0.43 s | 5,819 op/s | - |
+| | BBolt (mmap + NoSync) | 0.30 MB | 72.88 MB | 48.07 MB | - | - | 0.74 s | 3,394 op/s | 3.4 ms |
+| | DiskStore (None) | 15.53 MB | 69.04 MB | 39.81 MB | 24.84 MB | 8.84 MB | 0.70 s | 3,554 op/s | 433 ms |
+| | DiskStore (zstd) | 15.70 MB | 71.00 MB | 9.77 MB | 6.27 MB | 6.27 MB | 0.57 s | 4,405 op/s | 148 ms |
+| | DiskStore (None, 64 MB pool) | 74.43 MB | 151.68 MB | 39.08 MB | 24.83 MB | 8.83 MB | 0.63 s | 3,947 op/s | 434 ms |
+| **Random Incompressible Bytes** (2,500 objs) | In-Memory Informer | 27.37 MB | 61.47 MB | - | - | - | 0.06 s | 44,131 op/s | - |
+| | BBolt (mmap + NoSync) | 0.23 MB | 71.05 MB | 48.08 MB | - | - | 0.29 s | 8,577 op/s | 3.2 ms |
+| | DiskStore (None) | 14.49 MB | 68.17 MB | 39.81 MB | 24.79 MB | 8.79 MB | 0.29 s | 8,668 op/s | 639 ms |
+| | DiskStore (zstd) | 14.60 MB | 67.21 MB | 39.81 MB | 24.79 MB | 8.79 MB | 0.42 s | 5,934 op/s | 553 ms |
+| | DiskStore (None, 64 MB pool) | 70.82 MB | 150.73 MB | 39.08 MB | 24.77 MB | 8.77 MB | 0.29 s | 8,589 op/s | 461 ms |
+| **Mixed Realistic Corpus** (10,000 objs) | In-Memory Informer | 116.46 MB | 203.57 MB | - | - | - | 1.05 s | 9,545 op/s | - |
+| | BBolt (mmap + NoSync) | 0.68 MB | 174.30 MB | 144.23 MB | - | - | 2.35 s | 4,260 op/s | 14 ms |
+| | DiskStore (None) | 19.75 MB | 77.27 MB | 157.81 MB | 99.18 MB | 3.20 MB | 2.15 s | 4,659 op/s | 1,497 ms |
+| | DiskStore (zstd) | 19.48 MB | 81.24 MB | 121.96 MB | 46.11 MB | 14.12 MB | 2.05 s | 4,868 op/s | 1,010 ms |
+| | DiskStore (None, 64 MB pool) | 78.33 MB | 185.43 MB | 159.08 MB | 99.14 MB | 3.15 MB | 2.49 s | 4,018 op/s | 1,462 ms |
+
+### Key Observations
+
+- **Configuration Text (JSON):** `zstd` writes 3.51 MB to the WAL against 24.77 MB uncompressed, an 85.8% reduction in WAL volume. The heap file drops from 39.81 MB to 4.89 MB.
+- **TLS Material (x509 PEM):** `zstd` writes 6.27 MB to the WAL against 24.84 MB uncompressed, a 74.8% reduction. The heap file drops from 39.81 MB to 9.77 MB.
+- **Random Incompressible Bytes:** The 10% savings threshold stores incompressible values raw, so `zstd` and uncompressed match on both WAL bytes written (24.79 MB) and heap file size (39.81 MB).
+- **Mixed Realistic Corpus:** `zstd` writes 46.11 MB to the WAL against 99.18 MB uncompressed, a 53.5% reduction. The uncompressed run truncates six completed 16 MiB segments and leaves 3.20 MB in the active segment, whereas `zstd` truncates two segments and leaves 14.12 MB in the active segment.

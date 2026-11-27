@@ -18,26 +18,26 @@ The new `DiskStore` architecture introduces:
 
 ### Key Empirical Results (Mixed Realistic Corpus: 10,000 Objects, 10 KB Payloads)
 
-*Measured on Linux 6.6 amd64 with direct I/O enabled and an 8 MiB (2,048-block) block pool in isolated benchmark processes.*
+*Measured in a single run (`-count=1`) on an AMD EPYC 9B14 (60 vCPUs, 235 GiB RAM, Linux 6.12.110+ x86_64) with `go1.27.4 linux/amd64`, AES-256-XTS block encryption enabled, direct I/O enabled, and an 8 MiB (2,048-block) block pool in isolated benchmark processes via `GOTOOLCHAIN=auto go test -v -count=1 -run=^TestDiskStore_Versus_BBolt_MeasurementSuite$ ./experiments/diskstore/kubecache`.*
 
-| Architecture | Heap In-Use | Process RSS | Heap File | WAL Size | Total Disk | Write Throughput | Recovery Time | Warm Recompute (10 refs) |
+| Architecture | Heap In-Use | Process RSS | Heap File | WAL Written | Retained WAL (End of Run) | Write Throughput | Recovery Time | Warm Recompute (10 refs) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **In-Memory Informer** (Status Quo) | 115.70 MB | 176.91 MB | - | - | 0 MB (RAM) | 9,646 op/s | N/A | 11 µs |
-| **BBolt Store** (`mmap` + `NoSync`) | 0.65 MB | 154.30 MB | 144.25 MB | 0.00 MB | 144.25 MB | 3,651 op/s | 12.0 ms | 12 µs |
-| **DiskStore (Uncompressed)** | 13.54 MB | 45.77 MB | 156.25 MB | 3.65 MB | 159.90 MB | 2,177 op/s | 565.0 ms | 146 µs |
-| **DiskStore (zstd)** | **13.73 MB** | **48.11 MB** | **78.12 MB** | 14.50 MB | **92.62 MB** | **2,318 op/s** | **340.0 ms** | **152 µs** |
+| **In-Memory Informer** (Status Quo) | 116.46 MB | 203.57 MB | - | - | - | 9,545 op/s | N/A | 12 µs |
+| **BBolt Store** (`mmap` + `NoSync`) | 0.68 MB | 174.30 MB | 144.23 MB | - | - | 4,260 op/s | 14 ms | 7 µs |
+| **DiskStore (Uncompressed)** | 19.75 MB | 77.27 MB | 157.81 MB | 99.18 MB | 3.20 MB | 4,659 op/s | 1,497 ms | 83 µs |
+| **DiskStore (zstd)** | **19.48 MB** | **81.24 MB** | **121.96 MB** | **46.11 MB** | 14.12 MB | **4,868 op/s** | **1,010 ms** | **169 µs** |
 
-- **In-Memory Informer Baseline:** The standard in-memory cache retains all objects in RAM, consuming **115.70 MB Go heap** and **176.91 MB Process RSS** for 10,000 objects (~100 MB data).
-- **RSS Reduction:** `DiskStore (zstd)` consumes **48.11 MB Process RSS**, achieving a **72.8% reduction compared to In-Memory** (176.91 MB) and a **68.8% reduction compared to BBolt** (154.30 MB) by avoiding kernel page-cache amplification from `mmap`.
-- **Heap Footprint:** `DiskStore` holds only index structures and block pool pointers in heap, consuming **13.73 MB Go heap**, an **88.1% reduction** compared to In-Memory.
-- **Disk Footprint Reduction by Data Type:**
-  - **Configuration text (JSON):** `zstd` reduces on-disk storage by **82.3%** (8.51 MB vs. 47.95 MB uncompressed; Heap file: 4.88 MB vs. 39.06 MB) and doubles write throughput (4,974 op/s vs. 2,549 op/s).
-  - **TLS material (x509 PEM):** `zstd` reduces on-disk storage by **66.4%** (16.14 MB vs. 48.01 MB uncompressed; Heap file: 9.77 MB vs. 39.06 MB).
-  - **Random bytes:** Incompressible data triggers the 10% threshold rule and stores raw without compression expansion (47.96 MB across all codecs).
-  - **Mixed realistic corpus:** `zstd` reduces the physical heap file by **50.0%** (78.12 MB vs. 156.25 MB).
-- **Heap File vs. WAL Size Dynamics:** On the mixed corpus, the physical heap file size drops by half with zstd (78.12 MB vs. 156.25 MB uncompressed). The 14.50 MB WAL file reflects the unrolled active segment under the 16 MiB rollover threshold after 3 finished segments (48 MB) were truncated at checkpoint.
-- **Zero Mmap Overhead:** Because direct I/O bypasses the operating system page cache and block pool memory is bounded to a fixed arena, container memory accounting remains flat and predictable under load.
-- **Fast Startup & Recovery:** The sequential scan in physical block order reconstructs the store state across the mixed corpus in **340 ms**.
+- **In-Memory Informer Baseline:** The standard in-memory cache retains all objects in RAM. It uses 116.46 MB of Go heap and 203.57 MB of Process RSS for 10,000 objects (~97.7 MB raw data).
+- **RSS Reduction:** `DiskStore (zstd)` uses 81.24 MB of Process RSS. That is a 60.1% reduction compared to In-Memory (203.57 MB) and a 53.4% reduction compared to BBolt (174.30 MB), because direct I/O avoids kernel page-cache amplification from `mmap`.
+- **Heap Footprint:** `DiskStore` keeps only index structures and block pool descriptors in Go heap. It uses 19.48 MB of Go heap, an 83.3% reduction compared to In-Memory.
+- **Steady-State Heap File and Cumulative WAL Volume by Data Type:**
+  - **Configuration text (JSON):** `zstd` reduces the steady-state heap file by 87.7% (4.89 MB vs. 39.81 MB uncompressed) and reduces cumulative WAL bytes written by 85.8% (3.51 MB vs. 24.77 MB). Write throughput rises from 5,006 op/s to 6,568 op/s.
+  - **TLS material (x509 PEM):** `zstd` reduces the heap file by 75.5% (9.77 MB vs. 39.81 MB uncompressed) and reduces cumulative WAL bytes written by 74.8% (6.27 MB vs. 24.84 MB).
+  - **Random bytes:** Incompressible payloads fall back to raw storage under the 10% savings rule. Both `DiskStore (zstd)` and `DiskStore (None)` produce a 39.81 MB heap file and write 24.79 MB to the WAL.
+  - **Mixed realistic corpus:** `zstd` reduces the heap file by 22.7% (121.96 MB vs. 157.81 MB) and reduces cumulative WAL bytes written by 53.5% (46.11 MB vs. 99.18 MB).
+- **Retained WAL Sawtooth vs. Cumulative WAL Volume:** Checkpoints delete only whole 16 MiB WAL segments that are fully behind the checkpoint. As a result, the retained WAL size on disk rises and falls in a sawtooth up to 16 MiB plus uncheckpointed writes. On the mixed corpus, the uncompressed run writes 99.18 MB across six truncated segments and leaves 3.20 MB in the active segment. The `zstd` run writes 46.11 MB across two truncated segments and leaves 14.12 MB in the active segment. The benchmark reports `Heap File` as the steady-state disk footprint and `WAL Written` as the cumulative log volume, without adding the sawtooth retained WAL size to the heap file size.
+- **End-of-Run Process RSS:** Direct I/O bypasses the operating system page cache, and the engine allocates the block pool as a single fixed-size arena. At the end of the 10,000-object mixed workload, Process RSS measured 77.27 MB uncompressed and 81.24 MB with `zstd`, compared to 174.30 MB for BBolt and 203.57 MB for the in-memory informer.
+- **Startup Recovery:** Sequential heap scans rebuild the store state across the mixed corpus in 1,010 ms with AES-256-XTS encryption enabled, or 389 ms without encryption. See `experiments/diskstore/BENCHMARKS.md` for the unencrypted measurements.
 
 ---
 
@@ -330,102 +330,126 @@ Recovery never trusts bytes that object payloads control:
 
 ### Detailed Benchmark Results Across Realistic Workloads
 
-*Measured on Linux 6.6 amd64 with direct I/O enabled and an 8 MiB (2,048-block) block pool in isolated benchmark processes.*
+*Measured in a single run (`-count=1`) on an AMD EPYC 9B14 (60 vCPUs, 235 GiB RAM, Linux 6.12.110+ x86_64) with `go1.27.4 linux/amd64`, AES-256-XTS block encryption enabled, direct I/O enabled, and an 8 MiB (2,048-block) block pool in isolated benchmark processes, alongside a 64 MiB uncompressed pool configuration.*
 
 #### 1. Configuration Text (JSON) (2,500 objects, ~10 KB each)
 
 ```
-====================================================================================================================================================================
+=======================================================================================================================================================
 COMPARATIVE BENCHMARK: Configuration Text (JSON) (2500 objects, ~10 KB each)
-====================================================================================================================================================================
-Storage Engine           | Heap In-Use  | Process RSS  | Heap File    | WAL Size   | Total Disk   | Write Time   | Write Thruput  | Recovery  
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
-In-Memory Informer       |      28.52 MB |      61.07 MB |          - |        - | 0 MB (RAM) |       0.28 s |       8788 op/s |          -
-BBolt (mmap + NoSync)    |       0.23 MB |      51.80 MB |   48.09 MB |  0.00 MB |   48.09 MB |       0.65 s |       3830 op/s |   12.00 ms
-DiskStore (None)         |      10.02 MB |      37.29 MB |   39.06 MB |  8.88 MB |   47.95 MB |       0.98 s |       2549 op/s |  138.00 ms
-DiskStore (zstd)         |       9.82 MB |      33.60 MB |    4.88 MB |  3.62 MB |    8.51 MB |       0.50 s |       4974 op/s |   40.00 ms
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+=======================================================================================================================================================
+Storage Engine               | Heap In-Use   | Process RSS   | Heap File    | WAL Written  | Retained WAL | Write Time   | Write Thruput   | Recovery  
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+In-Memory Informer           |      28.59 MB |      79.62 MB |            - |            - |            - |       0.28 s |       8966 op/s |          -
+BBolt (mmap + NoSync)        |       0.33 MB |      71.03 MB |     48.09 MB |            - |            - |       0.60 s |       4134 op/s |     3.9 ms
+DiskStore (None)             |      15.59 MB |      69.08 MB |     39.81 MB |     24.77 MB |      8.77 MB |       0.50 s |       5006 op/s |     434 ms
+DiskStore (zstd)             |      15.33 MB |      67.10 MB |      4.89 MB |      3.51 MB |      3.51 MB |       0.38 s |       6568 op/s |      80 ms
+DiskStore (None, 64 MB pool) |      75.15 MB |     151.58 MB |     39.08 MB |     24.76 MB |      8.77 MB |       0.49 s |       5135 op/s |     432 ms
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+Note: Heap File is the steady-state disk footprint. WAL Written is cumulative bytes written to WAL segments during the run.
+      Retained WAL is the WAL size on disk at the end of the run, which rises and falls in a sawtooth up to the 16 MiB segment size as checkpoints delete finished segments.
+-------------------------------------------------------------------------------------------------------------------------------------------------------
 Recompute Latency Comparison:
-  In-Memory Informer     :         0 refs =   0.00 µs |   10 refs =   7.00 µs | 1000 refs =   253.00 µs
-  BBolt (mmap + NoSync)   (Cold): 0 refs =   8.00 µs |   10 refs = 171.00 µs | 1000 refs = 19007.00 µs
-  BBolt (mmap + NoSync)   (Warm): 0 refs =   0.00 µs |   10 refs =   7.00 µs | 1000 refs =   540.00 µs
-  DiskStore (None)        (Cold): 0 refs =   0.00 µs |   10 refs = 2708.00 µs | 1000 refs = 273908.00 µs
-  DiskStore (None)        (Warm): 0 refs =   0.00 µs |   10 refs =  86.00 µs | 1000 refs = 262657.00 µs
-  DiskStore (zstd)        (Cold): 0 refs =   0.00 µs |   10 refs =  261.00 µs | 1000 refs = 15659.00 µs
-  DiskStore (zstd)        (Warm): 0 refs =   0.00 µs |   10 refs =  151.00 µs | 1000 refs = 14490.00 µs
-====================================================================================================================================================================
+  In-Memory Informer          :         0 refs =     0 µs |   10 refs =    11 µs | 1000 refs =   343 µs
+  BBolt (mmap + NoSync)        (Cold): 0 refs =     3 µs |   10 refs =   126 µs | 1000 refs =    19 ms
+  BBolt (mmap + NoSync)        (Warm): 0 refs =     0 µs |   10 refs =     7 µs | 1000 refs =   560 µs
+  DiskStore (None)             (Cold): 0 refs =     0 µs |   10 refs =   2.7 ms | 1000 refs =   276 ms
+  DiskStore (None)             (Warm): 0 refs =     0 µs |   10 refs =   133 µs | 1000 refs =   274 ms
+  DiskStore (zstd)             (Cold): 0 refs =     0 µs |   10 refs =   229 µs | 1000 refs =    14 ms
+  DiskStore (zstd)             (Warm): 0 refs =     0 µs |   10 refs =   119 µs | 1000 refs =    13 ms
+  DiskStore (None, 64 MB pool) (Cold): 0 refs =     0 µs |   10 refs =   101 µs | 1000 refs =   5.8 ms
+  DiskStore (None, 64 MB pool) (Warm): 0 refs =     0 µs |   10 refs =    75 µs | 1000 refs =   9.4 ms
+=======================================================================================================================================================
 ```
 
 #### 2. TLS Material (x509 PEM) (2,500 objects, ~10 KB each)
 
 ```
-====================================================================================================================================================================
+=======================================================================================================================================================
 COMPARATIVE BENCHMARK: TLS Material (x509 PEM) (2500 objects, ~10 KB each)
-====================================================================================================================================================================
-Storage Engine           | Heap In-Use  | Process RSS  | Heap File    | WAL Size   | Total Disk   | Write Time   | Write Thruput  | Recovery  
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
-In-Memory Informer       |      30.02 MB |      60.59 MB |          - |        - | 0 MB (RAM) |       0.43 s |       5848 op/s |          -
-BBolt (mmap + NoSync)    |       0.30 MB |      52.27 MB |   48.05 MB |  0.00 MB |   48.05 MB |       0.76 s |       3304 op/s |   12.00 ms
-DiskStore (None)         |       9.90 MB |      37.63 MB |   39.06 MB |  8.95 MB |   48.01 MB |       1.11 s |       2252 op/s |  145.00 ms
-DiskStore (zstd)         |      10.09 MB |      39.78 MB |    9.77 MB |  6.38 MB |   16.14 MB |       0.81 s |       3087 op/s |   55.00 ms
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+=======================================================================================================================================================
+Storage Engine               | Heap In-Use   | Process RSS   | Heap File    | WAL Written  | Retained WAL | Write Time   | Write Thruput   | Recovery  
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+In-Memory Informer           |      30.45 MB |      81.78 MB |            - |            - |            - |       0.43 s |       5819 op/s |          -
+BBolt (mmap + NoSync)        |       0.30 MB |      72.88 MB |     48.07 MB |            - |            - |       0.74 s |       3394 op/s |     3.4 ms
+DiskStore (None)             |      15.53 MB |      69.04 MB |     39.81 MB |     24.84 MB |      8.84 MB |       0.70 s |       3554 op/s |     433 ms
+DiskStore (zstd)             |      15.70 MB |      71.00 MB |      9.77 MB |      6.27 MB |      6.27 MB |       0.57 s |       4405 op/s |     148 ms
+DiskStore (None, 64 MB pool) |      74.43 MB |     151.68 MB |     39.08 MB |     24.83 MB |      8.83 MB |       0.63 s |       3947 op/s |     434 ms
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+Note: Heap File is the steady-state disk footprint. WAL Written is cumulative bytes written to WAL segments during the run.
+      Retained WAL is the WAL size on disk at the end of the run, which rises and falls in a sawtooth up to the 16 MiB segment size as checkpoints delete finished segments.
+-------------------------------------------------------------------------------------------------------------------------------------------------------
 Recompute Latency Comparison:
-  In-Memory Informer     :         0 refs =   0.00 µs |   10 refs =  11.00 µs | 1000 refs =   259.00 µs
-  BBolt (mmap + NoSync)   (Cold): 0 refs =   7.00 µs |   10 refs = 162.00 µs | 1000 refs = 20114.00 µs
-  BBolt (mmap + NoSync)   (Warm): 0 refs =   0.00 µs |   10 refs =   7.00 µs | 1000 refs =   618.00 µs
-  DiskStore (None)        (Cold): 0 refs =   0.00 µs |   10 refs = 2790.00 µs | 1000 refs = 265489.00 µs
-  DiskStore (None)        (Warm): 0 refs =   0.00 µs |   10 refs = 118.00 µs | 1000 refs = 264233.00 µs
-  DiskStore (zstd)        (Cold): 0 refs =   0.00 µs |   10 refs = 2153.00 µs | 1000 refs = 156466.00 µs
-  DiskStore (zstd)        (Warm): 0 refs =   0.00 µs |   10 refs =  206.00 µs | 1000 refs =  23203.00 µs
-====================================================================================================================================================================
+  In-Memory Informer          :         0 refs =     0 µs |   10 refs =    12 µs | 1000 refs =   331 µs
+  BBolt (mmap + NoSync)        (Cold): 0 refs =     3 µs |   10 refs =   120 µs | 1000 refs =    19 ms
+  BBolt (mmap + NoSync)        (Warm): 0 refs =     0 µs |   10 refs =     6 µs | 1000 refs =   600 µs
+  DiskStore (None)             (Cold): 0 refs =     0 µs |   10 refs =   6.3 ms | 1000 refs =   291 ms
+  DiskStore (None)             (Warm): 0 refs =     0 µs |   10 refs =    60 µs | 1000 refs =   295 ms
+  DiskStore (zstd)             (Cold): 0 refs =     0 µs |   10 refs =   2.1 ms | 1000 refs =   176 ms
+  DiskStore (zstd)             (Warm): 0 refs =     0 µs |   10 refs =   183 µs | 1000 refs =    18 ms
+  DiskStore (None, 64 MB pool) (Cold): 0 refs =     0 µs |   10 refs =   107 µs | 1000 refs =   6.2 ms
+  DiskStore (None, 64 MB pool) (Warm): 0 refs =     0 µs |   10 refs =    69 µs | 1000 refs =   8.5 ms
+=======================================================================================================================================================
 ```
 
 #### 3. Random Incompressible Bytes (2,500 objects, ~10 KB each)
 
 ```
-====================================================================================================================================================================
+=======================================================================================================================================================
 COMPARATIVE BENCHMARK: Random Incompressible Bytes (2500 objects, ~10 KB each)
-====================================================================================================================================================================
-Storage Engine           | Heap In-Use  | Process RSS  | Heap File    | WAL Size   | Total Disk   | Write Time   | Write Thruput  | Recovery  
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
-In-Memory Informer       |      27.43 MB |      43.07 MB |          - |        - | 0 MB (RAM) |       0.06 s |      42401 op/s |          -
-BBolt (mmap + NoSync)    |       0.22 MB |      51.82 MB |   48.06 MB |  0.00 MB |   48.06 MB |       0.36 s |       7034 op/s |   12.00 ms
-DiskStore (None)         |       9.47 MB |      37.33 MB |   39.06 MB |  8.90 MB |   47.96 MB |       0.66 s |       3785 op/s |  145.00 ms
-DiskStore (zstd)         |       9.48 MB |      40.71 MB |   39.06 MB |  8.90 MB |   47.96 MB |       0.69 s |       3634 op/s |  162.00 ms
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+=======================================================================================================================================================
+Storage Engine               | Heap In-Use   | Process RSS   | Heap File    | WAL Written  | Retained WAL | Write Time   | Write Thruput   | Recovery  
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+In-Memory Informer           |      27.37 MB |      61.47 MB |            - |            - |            - |       0.06 s |      44131 op/s |          -
+BBolt (mmap + NoSync)        |       0.23 MB |      71.05 MB |     48.08 MB |            - |            - |       0.29 s |       8577 op/s |     3.2 ms
+DiskStore (None)             |      14.49 MB |      68.17 MB |     39.81 MB |     24.79 MB |      8.79 MB |       0.29 s |       8668 op/s |     639 ms
+DiskStore (zstd)             |      14.60 MB |      67.21 MB |     39.81 MB |     24.79 MB |      8.79 MB |       0.42 s |       5934 op/s |     553 ms
+DiskStore (None, 64 MB pool) |      70.82 MB |     150.73 MB |     39.08 MB |     24.77 MB |      8.77 MB |       0.29 s |       8589 op/s |     461 ms
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+Note: Heap File is the steady-state disk footprint. WAL Written is cumulative bytes written to WAL segments during the run.
+      Retained WAL is the WAL size on disk at the end of the run, which rises and falls in a sawtooth up to the 16 MiB segment size as checkpoints delete finished segments.
+-------------------------------------------------------------------------------------------------------------------------------------------------------
 Recompute Latency Comparison:
-  In-Memory Informer     :         0 refs =   0.00 µs |   10 refs =  10.00 µs | 1000 refs =   234.00 µs
-  BBolt (mmap + NoSync)   (Cold): 0 refs =   8.00 µs |   10 refs = 301.00 µs | 1000 refs = 19433.00 µs
-  BBolt (mmap + NoSync)   (Warm): 0 refs =   0.00 µs |   10 refs =   6.00 µs | 1000 refs =   548.00 µs
-  DiskStore (None)        (Cold): 0 refs =   0.00 µs |   10 refs = 2803.00 µs | 1000 refs = 269474.00 µs
-  DiskStore (None)        (Warm): 0 refs =   0.00 µs |   10 refs = 132.00 µs | 1000 refs = 264048.00 µs
-  DiskStore (zstd)        (Cold): 0 refs =   0.00 µs |   10 refs = 2636.00 µs | 1000 refs = 340338.00 µs
-  DiskStore (zstd)        (Warm): 0 refs =   0.00 µs |   10 refs =   81.00 µs | 1000 refs = 301167.00 µs
-====================================================================================================================================================================
+  In-Memory Informer          :         0 refs =     0 µs |   10 refs =    13 µs | 1000 refs =   281 µs
+  BBolt (mmap + NoSync)        (Cold): 0 refs =     3 µs |   10 refs =   119 µs | 1000 refs =    19 ms
+  BBolt (mmap + NoSync)        (Warm): 0 refs =     0 µs |   10 refs =     7 µs | 1000 refs =   610 µs
+  DiskStore (None)             (Cold): 0 refs =     0 µs |   10 refs =   3.5 ms | 1000 refs =   315 ms
+  DiskStore (None)             (Warm): 0 refs =     0 µs |   10 refs =    71 µs | 1000 refs =   332 ms
+  DiskStore (zstd)             (Cold): 0 refs =     0 µs |   10 refs =   3.7 ms | 1000 refs =   378 ms
+  DiskStore (zstd)             (Warm): 0 refs =     0 µs |   10 refs =   103 µs | 1000 refs =   379 ms
+  DiskStore (None, 64 MB pool) (Cold): 0 refs =     0 µs |   10 refs =   141 µs | 1000 refs =   5.9 ms
+  DiskStore (None, 64 MB pool) (Warm): 0 refs =     0 µs |   10 refs =    72 µs | 1000 refs =   6.0 ms
+=======================================================================================================================================================
 ```
 
-#### 4. Mixed Realistic Corpus (10,000 objects, ~100 MB data)
+#### 4. Mixed Realistic Corpus (10,000 objects, ~97.7 MB data)
 
 ```
-====================================================================================================================================================================
+=======================================================================================================================================================
 COMPARATIVE BENCHMARK: Mixed Realistic Corpus (10000 objects, ~10 KB each)
-====================================================================================================================================================================
-Storage Engine           | Heap In-Use  | Process RSS  | Heap File    | WAL Size   | Total Disk   | Write Time   | Write Thruput  | Recovery  
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
-In-Memory Informer       |     115.70 MB |     176.91 MB |          - |        - | 0 MB (RAM) |       1.04 s |       9646 op/s |          -
-BBolt (mmap + NoSync)    |       0.65 MB |     154.30 MB |  144.25 MB |  0.00 MB |  144.25 MB |       2.74 s |       3651 op/s |   12.00 ms
-DiskStore (None)         |      13.54 MB |      45.77 MB |  156.25 MB |  3.65 MB |  159.90 MB |       4.59 s |       2177 op/s |  565.00 ms
-DiskStore (zstd)         |      13.73 MB |      48.11 MB |   78.12 MB | 14.50 MB |   92.62 MB |       4.31 s |       2318 op/s |  340.00 ms
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+=======================================================================================================================================================
+Storage Engine               | Heap In-Use   | Process RSS   | Heap File    | WAL Written  | Retained WAL | Write Time   | Write Thruput   | Recovery  
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+In-Memory Informer           |     116.46 MB |     203.57 MB |            - |            - |            - |       1.05 s |       9545 op/s |          -
+BBolt (mmap + NoSync)        |       0.68 MB |     174.30 MB |    144.23 MB |            - |            - |       2.35 s |       4260 op/s |      14 ms
+DiskStore (None)             |      19.75 MB |      77.27 MB |    157.81 MB |     99.18 MB |      3.20 MB |       2.15 s |       4659 op/s |    1497 ms
+DiskStore (zstd)             |      19.48 MB |      81.24 MB |    121.96 MB |     46.11 MB |     14.12 MB |       2.05 s |       4868 op/s |    1010 ms
+DiskStore (None, 64 MB pool) |      78.33 MB |     185.43 MB |    159.08 MB |     99.14 MB |      3.15 MB |       2.49 s |       4018 op/s |    1462 ms
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+Note: Heap File is the steady-state disk footprint. WAL Written is cumulative bytes written to WAL segments during the run.
+      Retained WAL is the WAL size on disk at the end of the run, which rises and falls in a sawtooth up to the 16 MiB segment size as checkpoints delete finished segments.
+-------------------------------------------------------------------------------------------------------------------------------------------------------
 Recompute Latency Comparison:
-  In-Memory Informer     :         0 refs =   0.00 µs |   10 refs =  11.00 µs | 1000 refs =   306.00 µs
-  BBolt (mmap + NoSync)   (Cold): 0 refs =   3.00 µs |   10 refs = 216.00 µs | 1000 refs = 19329.00 µs
-  BBolt (mmap + NoSync)   (Warm): 0 refs =   0.00 µs |   10 refs =  12.00 µs | 1000 refs =   590.00 µs
-  DiskStore (None)        (Cold): 0 refs =   0.00 µs |   10 refs = 5149.00 µs | 1000 refs = 410326.00 µs
-  DiskStore (None)        (Warm): 0 refs =   0.00 µs |   10 refs = 146.00 µs | 1000 refs = 396606.00 µs
-  DiskStore (zstd)        (Cold): 0 refs =   0.00 µs |   10 refs = 3477.00 µs | 1000 refs = 354856.00 µs
-  DiskStore (zstd)        (Warm): 0 refs =   0.00 µs |   10 refs = 152.00 µs | 1000 refs =  18088.00 µs
-====================================================================================================================================================================
+  In-Memory Informer          :         0 refs =     0 µs |   10 refs =    12 µs | 1000 refs =   430 µs
+  BBolt (mmap + NoSync)        (Cold): 0 refs =     3 µs |   10 refs =   143 µs | 1000 refs =    19 ms
+  BBolt (mmap + NoSync)        (Warm): 0 refs =     0 µs |   10 refs =     7 µs | 1000 refs =   598 µs
+  DiskStore (None)             (Cold): 0 refs =     0 µs |   10 refs =   3.0 ms | 1000 refs =   403 ms
+  DiskStore (None)             (Warm): 0 refs =     0 µs |   10 refs =    83 µs | 1000 refs =   407 ms
+  DiskStore (zstd)             (Cold): 0 refs =     0 µs |   10 refs =   2.8 ms | 1000 refs =   358 ms
+  DiskStore (zstd)             (Warm): 0 refs =     0 µs |   10 refs =   169 µs | 1000 refs =    15 ms
+  DiskStore (None, 64 MB pool) (Cold): 0 refs =     0 µs |   10 refs =   5.4 ms | 1000 refs =   451 ms
+  DiskStore (None, 64 MB pool) (Warm): 0 refs =     0 µs |   10 refs =    86 µs | 1000 refs =   7.0 ms
+=======================================================================================================================================================
 ```
 
 ### Analysis of Trade-offs
@@ -433,30 +457,31 @@ Recompute Latency Comparison:
 1. **Why Compression Accelerates Write Throughput:**
    - Uncompressed storage writes 4 physical blocks for every 10 KB object. For 10,000 objects, that totals 40,000 blocks written through an 8 MiB (2,048-block) block pool. The block pool experiences continuous pool block eviction and dirty page writeback.
    - The engine issues one write call per WAL block, and one write call per page during flushes.
-   - When values compress, objects fit within single-block slotted pages or smaller multi-block allocations (e.g. 1 or 2 blocks). The reduced working set fits within the block pool without continuous eviction churn. Fewer pages and fewer blocks reduce the number of write system calls, which accelerates write throughput.
+   - When values compress, objects fit within single-block slotted pages or smaller multi-block allocations (for example, 1 or 2 blocks). The smaller working set fits within the block pool with less eviction churn. Fewer pages and fewer blocks reduce write system calls, which increases write throughput.
    - Batched writes would raise the uncompressed baseline; that architectural enhancement is tracked separately.
 
 2. **Heap Usage and Memory Isolation:**
-   - When measured in isolated processes, the In-Memory Informer retains the full dataset in RAM, consuming **115.70 MB Go heap** and **176.91 MB Process RSS** for 10,000 objects.
-   - `DiskStore` holds only index keys and block pool descriptors in RAM, keeping Go heap at **13.73 MB** (an 88.1% reduction) and Process RSS at **48.11 MB** (a 72.8% reduction compared to In-Memory, and a 68.8% reduction compared to BBolt's 154.30 MB).
+   - In isolated processes, the In-Memory Informer retains the full dataset in RAM. It uses 116.46 MB of Go heap and 203.57 MB of Process RSS for 10,000 objects.
+   - `DiskStore (zstd)` holds only index keys and block pool descriptors in RAM. It keeps Go heap at 19.48 MB (an 83.3% reduction) and Process RSS at 81.24 MB (a 60.1% reduction compared to In-Memory, and a 53.4% reduction compared to BBolt's 174.30 MB).
    - Closing the engine signals its `Closed()` channel, which terminates the adapter's failure-watch goroutine. This releases references to the engine and its block-pool arena, preventing memory retention across engine lifecycles.
 
-3. **Codec Selection: zstd as Default vs. Evaluation of S2 and Snappy:**
-   - **Configuration Text (JSON):** `zstd` produces the smallest disk footprint (**8.51 MB**, an 82.3% reduction; Heap file: **4.88 MB** vs. **39.06 MB**). S2 (**16.23 MB**) and Snappy (**15.62 MB**) required almost double the storage. Because the WAL records exact compressed payloads, zstd log stream volume was **3.62 MB**, compared to **6.46 MB** for S2 and **5.85 MB** for Snappy.
-   - **TLS Material (x509 PEM):** `zstd` achieved the highest compression ratio (**16.14 MB**, a 66.4% reduction; Heap file: **9.77 MB** vs. **39.06 MB**), outperforming S2 (**17.83 MB**) and Snappy (**18.35 MB**).
-   - **Incompressible Random Bytes:** When compressed output fails the 10% savings threshold, the engine falls back to raw storage (`CodecNone`), consuming identical disk space (**47.96 MB**) with identical write throughput (~3,600–3,700 op/s).
-   - **Rationale for Dropping S2 and Snappy:** Because zstd achieved superior compression ratios on all data types with fast execution speeds, S2 and Snappy added unnecessary code surface and format variants without operational benefit. Only zstd is supported for compression.
+3. **Codec Selection: zstd as Default vs. Earlier Evaluation of S2 and Snappy:**
+   - **Configuration Text (JSON):** `zstd` produces a 4.89 MB heap file versus 39.81 MB uncompressed (an 87.7% reduction) and writes 3.51 MB to the WAL versus 24.77 MB uncompressed (an 85.8% reduction). Earlier comparisons with S2 and Snappy required nearly double the storage and log volume.
+   - **TLS Material (x509 PEM):** `zstd` reduces the heap file to 9.77 MB versus 39.81 MB uncompressed (a 75.5% reduction) and reduces cumulative WAL writes to 6.27 MB versus 24.84 MB uncompressed (a 74.8% reduction).
+   - **Incompressible Random Bytes:** When compressed output fails the 10% savings threshold, the engine falls back to raw storage (`CodecNone`). Both configurations produce a 39.81 MB heap file and write 24.79 MB to the WAL. Attempting compression before falling back reduces write throughput on incompressible inputs (5,934 op/s vs. 8,668 op/s uncompressed).
+   - **Rationale for Dropping S2 and Snappy:** Because `zstd` achieved higher compression ratios across the tested corpora, S2 and Snappy added code surface and format variants without operational benefit. Only `zstd` is supported for compression.
 
-4. **Heap File vs. WAL Size Dynamics:**
-   - Across the 10,000 mixed corpus, physical heap file storage drops by half with zstd (**78.12 MB**, down from **156.25 MB** uncompressed).
-   - The total directory size on disk includes both the heap file and remaining WAL segments. The WAL file size of **14.50 MB** reflects the active segment under the 16 MiB rollover threshold after earlier finished segments were deleted upon checkpointing.
+4. **Heap File Size, Cumulative WAL Volume, and the Retained WAL Sawtooth:**
+   - On the 10,000-object mixed corpus, `zstd` reduces the steady-state heap file from 157.81 MB to 121.96 MB and reduces cumulative WAL bytes written from 99.18 MB to 46.11 MB (-53.5%).
+   - The WAL rotates immutable 16 MiB segment files, and checkpoints delete only whole segments that lie completely behind the checkpoint. Therefore, the WAL size retained on disk at the end of a run follows a sawtooth between near zero and 16 MiB plus uncheckpointed data.
+   - On the mixed corpus, the uncompressed run truncates six completed 16 MiB segments and leaves 3.20 MB retained at the end of the run. The `zstd` run truncates two completed segments and leaves 14.12 MB retained. Adding retained WAL size to the heap file size would conflate a sawtooth snapshot with a steady-state footprint, so the tables report `Heap File`, `WAL Written`, and `Retained WAL` separately.
 
 5. **Process RSS & Container Memory Limits:**
-   - `BBolt` resident set size reaches **154.30 MB** on the 10,000 mixed object workload because operating system page caching retains mmap pages in the container cgroup.
-   - `DiskStore` caps Process RSS at **48.11 MB** by using direct I/O and a fixed 8 MiB block pool arena, avoiding kernel page-cache amplification.
+   - `BBolt` Process RSS reaches 174.30 MB on the 10,000-object mixed workload because the operating system page cache retains `mmap` pages in the container cgroup.
+   - `DiskStore (zstd)` keeps Process RSS at 81.24 MB by using direct I/O and a fixed 8 MiB block pool arena, avoiding kernel page-cache amplification.
 
 6. **Crash Recovery Time:**
-   - On compressible configuration text, `DiskStore (zstd)` recovers in **40 ms**, compared to **138 ms** uncompressed. On the 10,000 mixed corpus, recovery completes in **340 ms**, compared to **565 ms** uncompressed. Replaying WAL redo records copies compressed bytes directly into pages without decompression, minimizing recovery latency.
+   - On compressible configuration text with AES-256-XTS encryption enabled, `DiskStore (zstd)` recovers in 80 ms, compared to 434 ms uncompressed. On the 10,000-object mixed corpus, recovery completes in 1,010 ms with `zstd`, compared to 1,497 ms uncompressed. Replaying WAL redo records copies compressed bytes directly into pages without decompression, reducing recovery work.
 
 7. **Broad Read Isolation and Locking Trade-offs (`List` vs Concurrent Writers):**
    - **Point-in-Time Consistency:** `DiskStore.List(tableName)` acquires `s.writerMu.RLock()` for the duration of the broad table read and object decoding. This provides point-in-time consistency across the table: concurrent writes (`Put`) or deletions (`Delete`) cannot mutate page contents, renumber slots during compaction, or modify the key index while objects are being retrieved and decoded.
@@ -505,13 +530,12 @@ Recompute Latency Comparison:
      | **Size: 4 KB Compressible** | 5,455 ns/op (6 allocs/op) | 5,436 ns/op (6 allocs/op) | -0.3% latency (already compressed under old threshold) |
      | **Size: 4 KB Incompressible** | 8,946 ns/op (15 allocs/op) | 9,195 ns/op (15 allocs/op) | +2.8% latency (already attempted under old threshold) |
 
-   - **Realistic Corpus Heap-File and Disk Footprint (10,000 objects, 18.22 MB raw JSON):**
+   - **Realistic Corpus Heap-File and WAL Volume (10,000 objects, 18.22 MB raw JSON):**
 
      | Metric | Before (Threshold = 4000 B) | After (Universal Compression) | Change |
      | :--- | :--- | :--- | :--- |
-     | **Heap File (`heap.db`)** | 21.91 MB (22,978,560 B) | 10.46 MB (10,973,184 B) | **-52.2%** (-12.01 MB) |
-     | **WAL Total Size** | 18.78 MB | 9.56 MB | **-49.1%** (-9.22 MB) |
-     | **Total On-Disk Footprint** | 40.69 MB | 20.02 MB | **-50.8%** (-20.67 MB) |
+     | **Heap File (`heap.db`)** | 21.91 MB (22,978,560 B) | 10.46 MB (10,973,184 B) | **-52.2%** (-11.45 MB) |
+     | **WAL Size Retained at End of Run** | 18.78 MB | 9.56 MB | **-49.1%** (-9.22 MB) |
      | **Write Stream Duration** | 50.2 ms (199,200 op/s) | 112.5 ms (88,900 op/s) | +62.3 ms (+124% CPU time, ~6.2 µs/write) |
      | **Slotted Pages Allocated** | 5,610 pages | 2,679 pages | **-52.2%** (-2,931 pages) |
      | **Average Slotted Page Density** | 1.78 records/page | 3.73 records/page | **+110%** (+1.95 records/page) |
@@ -526,11 +550,10 @@ Recompute Latency Comparison:
 
 ## Conclusion
 
-The `DiskStore` prototype proves that a write-ahead log combined with a self-describing 4 KiB block heap file, value compression, and fixed-size direct I/O block pool successfully resolves the `mmap` and durability flaws of `bbolt`. It provides:
-- **82.3% lower disk usage** on configuration text (JSON) and **66.4% lower disk usage** on TLS material with zstd value compression.
-- **72.8% lower memory footprint (RSS)** than In-Memory Informer and **68.8% lower RSS** than BBolt on mixed realistic workloads.
-- **2x higher write throughput** on configuration text through reduced block pool eviction churn.
-- **Strict crash consistency** with out-of-place writes and the Reuse Rule.
-- **Automatic detection and wipe of legacy unversioned stores** via `meta.db` store format versioning.
-- **Resilience against untrusted payload forgery and corrupt decompression inputs**.
-- **Full `cache.Indexer` conformance**.
+The `DiskStore` prototype combines a write-ahead log, a 4 KiB block heap file, value compression, and a fixed-size direct I/O block pool to avoid the `mmap` page-cache growth and durability trade-offs observed with `bbolt`. On the single-run benchmarks with AES-256-XTS encryption enabled, it measured:
+- **87.7% smaller heap file and 85.8% fewer WAL bytes written** on configuration text (JSON), and **75.5% smaller heap file and 74.8% fewer WAL bytes written** on TLS material with `zstd` compression.
+- **53.5% fewer WAL bytes written** and **22.7% smaller heap file** on the 10,000-object mixed corpus with `zstd` compression.
+- **60.1% lower Process RSS** than In-Memory Informer and **53.4% lower Process RSS** than BBolt at the end of the 10,000-object mixed corpus.
+- **Higher write throughput** on compressible configuration text (6,568 op/s vs. 5,006 op/s uncompressed) through reduced block pool eviction churn.
+
+The design aims for crash consistency through out-of-place writes, the Write-Ahead Rule, and the Reuse Rule, and the torture tests check those invariants. The store also detects and wipes legacy unversioned stores via `meta.db` format versioning, defends against untrusted payload forgery and corrupt decompression inputs, and implements `cache.Indexer`.
