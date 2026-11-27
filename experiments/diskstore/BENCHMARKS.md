@@ -352,3 +352,50 @@ This run measures cumulative WAL bytes written alongside the steady-state heap f
 - **TLS Material (x509 PEM):** `zstd` writes 6.27 MB to the WAL against 24.84 MB uncompressed, a 74.8% reduction. The heap file drops from 39.81 MB to 9.77 MB.
 - **Random Incompressible Bytes:** The 10% savings threshold stores incompressible values raw, so `zstd` and uncompressed match on both WAL bytes written (24.79 MB) and heap file size (39.81 MB).
 - **Mixed Realistic Corpus:** `zstd` writes 46.11 MB to the WAL against 99.18 MB uncompressed, a 53.5% reduction. The uncompressed run truncates six completed 16 MiB segments and leaves 3.20 MB in the active segment, whereas `zstd` truncates two segments and leaves 14.12 MB in the active segment.
+
+---
+
+## 7. Single-Pass Heap Recovery (`TestDiskStore_Benchmark_Worker`)
+
+Measures DiskStore `Open` recovery duration before (commit `56c1146`, where `Recover` reads and decrypts `heap.db` in both Step 1 and Step 3) and after changing `Recover` to extract key index metadata and empty-page status during Step 1 so `Open` reads each heap block once.
+
+### Environment & Methodology
+
+- **Date:** 2026-11-27
+- **Machine:** AMD EPYC 9B14 (60 vCPUs, 235 GiB RAM, Linux 6.12.110+ x86_64)
+- **Go Version:** `go1.27.4 linux/amd64`
+- **Runs:** 3 runs per configuration; tables report the median recovery time across the 3 runs.
+- **Worker Invocation:** Isolated `TestDiskStore_Benchmark_Worker` subprocesses for `config-text` (2,500 objects) and `mixed` (10,000 objects) with `BENCHMARK_ENCRYPTION=on` (AES-256-XTS) and `BENCHMARK_ENCRYPTION=off`, matching `TestDiskStore_Versus_BBolt_MeasurementSuite`:
+  ```bash
+  BENCHMARK_WORKER=1 BENCHMARK_ENCRYPTION=on|off \
+    BENCHMARK_CORPUS=config-text|mixed BENCHMARK_OBJECT_COUNT=2500|10000 \
+    BENCHMARK_ENGINE=disk-none|disk-zstd|disk-none-largepool \
+    GOTOOLCHAIN=auto go test -v -count=1 -run=^TestDiskStore_Benchmark_Worker$ ./experiments/diskstore/kubecache
+  ```
+
+### Recovery Time: Encryption ON (AES-256-XTS, Median of 3 Runs)
+
+| Corpus | Storage Engine | Heap File | Before (Median) | After (Median) | Delta |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Configuration Text (JSON)** (2,500 objs) | DiskStore (None) | 39.81 MB | 408 ms | 227 ms | -44% |
+| | DiskStore (zstd) | 4.89 MB | 68 ms | 49 ms | -28% |
+| | DiskStore (None, 64 MB pool) | 39.08 MB | 409 ms | 234 ms | -43% |
+| **Mixed Realistic Corpus** (10,000 objs) | DiskStore (None) | 157.81 MB | 1,476 ms | 720 ms | -51% |
+| | DiskStore (zstd) | 121.94 MB | 908 ms | 509 ms | -44% |
+| | DiskStore (None, 64 MB pool) | 159.08 MB | 1,519 ms | 762 ms | -50% |
+
+### Recovery Time: Encryption OFF (Median of 3 Runs)
+
+| Corpus | Storage Engine | Heap File | Before (Median) | After (Median) | Delta |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Configuration Text (JSON)** (2,500 objs) | DiskStore (None) | 39.81 MB | 145 ms | 73 ms | -50% |
+| | DiskStore (zstd) | 4.89 MB | 22 ms | 14 ms | -37% |
+| | DiskStore (None, 64 MB pool) | 39.08 MB | 171 ms | 116 ms | -32% |
+| **Mixed Realistic Corpus** (10,000 objs) | DiskStore (None) | 157.81 MB | 518 ms | 242 ms | -53% |
+| | DiskStore (zstd) | 121.95 MB | 346 ms | 205 ms | -41% |
+| | DiskStore (None, 64 MB pool) | 159.08 MB | 546 ms | 248 ms | -55% |
+
+### Observations
+
+- Eliminating the second heap pass cuts `Open` recovery time by 43%–55% on the uncompressed configurations, where heap scanning and decryption dominate recovery.
+- On `DiskStore (zstd)` (especially the 4.89 MB JSON heap file) and the unencrypted 64 MB pool JSON run, WAL scanning and block-pool arena allocation represent a larger share of `Open`, so removing the second heap pass reduces total recovery time by 28%–44%.

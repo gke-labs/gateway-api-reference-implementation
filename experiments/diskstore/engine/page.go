@@ -449,21 +449,28 @@ func NewMultiBlockPage(logicalPage, lsn uint64, key string, payload []byte) (*Mu
 	return &MultiBlockPage{Blocks: blocks}, nil
 }
 
+// decodeMultiBlockRecordHeader parses the record header at the start of block 0
+// of a multi-block page without reading the record payload.
+func decodeMultiBlockRecordHeader(block0 []byte) (keyLen uint16, payloadLen uint32, lsn uint64, err error) {
+	if len(block0) < BlockHeaderSize+PageRecordHeaderSize {
+		return 0, 0, 0, errors.New("block 0 too short")
+	}
+	keyLen = binary.BigEndian.Uint16(block0[BlockHeaderSize : BlockHeaderSize+2])
+	payloadLen = binary.BigEndian.Uint32(block0[BlockHeaderSize+2 : BlockHeaderSize+6])
+	lsn = binary.BigEndian.Uint64(block0[BlockHeaderSize+6 : BlockHeaderSize+14])
+	return keyLen, payloadLen, lsn, nil
+}
+
 // DecodeMultiBlockPage extracts the single record from blocks.
 func DecodeMultiBlockPage(blocks [][]byte) (key string, payload []byte, lsn uint64, err error) {
 	if len(blocks) == 0 {
 		return "", nil, 0, errors.New("empty multi-block page")
 	}
 
-	// Read metadata from block 0
-	b0 := blocks[0]
-	if len(b0) < BlockHeaderSize+14 {
-		return "", nil, 0, errors.New("block 0 too short")
+	keyLen, payloadLen, lsn, err := decodeMultiBlockRecordHeader(blocks[0])
+	if err != nil {
+		return "", nil, 0, err
 	}
-
-	keyLen := binary.BigEndian.Uint16(b0[BlockHeaderSize : BlockHeaderSize+2])
-	payloadLen := binary.BigEndian.Uint32(b0[BlockHeaderSize+2 : BlockHeaderSize+6])
-	lsn = binary.BigEndian.Uint64(b0[BlockHeaderSize+6 : BlockHeaderSize+14])
 
 	totalMetaLen := 14 + int(keyLen)
 	metaBuf := make([]byte, totalMetaLen)
