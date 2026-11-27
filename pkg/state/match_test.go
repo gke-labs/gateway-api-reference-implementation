@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -976,6 +977,195 @@ func TestMatchRoute_MatchingAcrossRoutes(t *testing.T) {
 			}
 			if len(rule.Backends) == 0 || rule.Backends[0].Host != tc.wantBackend {
 				t.Errorf("got backend %v, want %s", rule.Backends, tc.wantBackend)
+			}
+		})
+	}
+}
+
+func TestMatchRoute_PathRegularExpression(t *testing.T) {
+	route := &gatewayv1.HTTPRoute{
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  Ptr(gatewayv1.PathMatchRegularExpression),
+								Value: Ptr("^/users/[0-9]+$"),
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "users-svc"}}},
+					},
+				},
+			},
+		},
+	}
+	compiled := CompileHTTPRoute(route, nil, nil, nil, nil)
+	routes := []InternalRoute{{Rules: compiled.Rules}}
+
+	tests := []struct {
+		name        string
+		path        string
+		expectMatch bool
+	}{
+		{name: "matching numeric id", path: "/users/123", expectMatch: true},
+		{name: "non-matching alpha id", path: "/users/alice", expectMatch: false},
+		{name: "non-matching trailing segment", path: "/users/123/profile", expectMatch: false},
+		{name: "case sensitive mismatch", path: "/Users/123", expectMatch: false},
+		{name: "unrelated path", path: "/healthz", expectMatch: false},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest("GET", "http://example.com"+testCase.path, nil)
+			rule, _ := MatchRoute(routes, request)
+			if testCase.expectMatch && rule == nil {
+				t.Fatalf("expected match for %q, got nil", testCase.path)
+			}
+			if !testCase.expectMatch && rule != nil {
+				t.Fatalf("expected no match for %q, got backend %v", testCase.path, rule.Backends)
+			}
+		})
+	}
+}
+
+func TestMatchRoute_PathRegularExpressionPrecedence(t *testing.T) {
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "regex-precedence", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					// Declared first to prove catch-all prefix does not shadow regex rules.
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  Ptr(gatewayv1.PathMatchPathPrefix),
+								Value: Ptr("/"),
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "prefix-fallback"}}},
+					},
+				},
+				{
+					// Shorter regex declared first must beat the longer fallback regex below on /foo/.
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  Ptr(gatewayv1.PathMatchRegularExpression),
+								Value: Ptr("^/([^/]*)/?$"),
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "narrow-regex"}}},
+					},
+				},
+				{
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  Ptr(gatewayv1.PathMatchRegularExpression),
+								Value: Ptr("^/([^/]*)/(.*)$"),
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "broad-regex"}}},
+					},
+				},
+				{
+					// Same regex tie broken by header match count.
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  Ptr(gatewayv1.PathMatchRegularExpression),
+								Value: Ptr("^/([^/]*)/?$"),
+							},
+							Headers: []gatewayv1.HTTPHeaderMatch{
+								{Name: "X-Canary", Value: "true"},
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "regex-with-header"}}},
+					},
+				},
+				{
+					// Exact match beats regex matches.
+					Matches: []gatewayv1.HTTPRouteMatch{
+						{
+							Path: &gatewayv1.HTTPPathMatch{
+								Type:  Ptr(gatewayv1.PathMatchExact),
+								Value: Ptr("/exact"),
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "exact-backend"}}},
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileHTTPRoute(route, nil, nil, nil, nil)
+	if compiled.ValidationCondition.Status != metav1.ConditionTrue {
+		t.Fatalf("expected valid route, got %+v", compiled.ValidationCondition)
+	}
+	routes := []InternalRoute{{Rules: compiled.Rules}}
+
+	tests := []struct {
+		name        string
+		path        string
+		headerName  string
+		headerValue string
+		wantHost    string
+	}{
+		{
+			name:     "earlier shorter regex beats later longer fallback regex",
+			path:     "/foo/",
+			wantHost: "narrow-regex.default.svc.cluster.local",
+		},
+		{
+			name:     "longer fallback regex matches deeper path",
+			path:     "/foo/bar",
+			wantHost: "broad-regex.default.svc.cluster.local",
+		},
+		{
+			name:        "overlapping regex ties break by header match count",
+			path:        "/foo/",
+			headerName:  "X-Canary",
+			headerValue: "true",
+			wantHost:    "regex-with-header.default.svc.cluster.local",
+		},
+		{
+			name:     "exact path beats regex",
+			path:     "/exact",
+			wantHost: "exact-backend.default.svc.cluster.local",
+		},
+		{
+			name:     "regex beats catch-all prefix",
+			path:     "/single",
+			wantHost: "narrow-regex.default.svc.cluster.local",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest("GET", "http://example.com"+testCase.path, nil)
+			if testCase.headerName != "" {
+				request.Header.Set(testCase.headerName, testCase.headerValue)
+			}
+			rule, _ := MatchRoute(routes, request)
+			if rule == nil || len(rule.Backends) == 0 {
+				t.Fatalf("expected matching backend, got %+v", rule)
+			}
+			if rule.Backends[0].Host != testCase.wantHost {
+				t.Errorf("got backend %q, want %q", rule.Backends[0].Host, testCase.wantHost)
 			}
 		})
 	}

@@ -752,10 +752,16 @@ func (im *InternalMatch) Matches(method, path string, query url.Values, header h
 			if path != im.Path.Value {
 				return false
 			}
-		case gatewayv1.PathMatchPathPrefix:
+		case gatewayv1.PathMatchPathPrefix, "":
 			if !hasPathPrefix(path, im.Path.Value) {
 				return false
 			}
+		case gatewayv1.PathMatchRegularExpression:
+			if im.Path.MatchRegularExpressionValue == nil || !im.Path.MatchRegularExpressionValue.MatchString(path) {
+				return false
+			}
+		default:
+			return false
 		}
 	}
 
@@ -820,8 +826,16 @@ func hasPathPrefix(path, prefix string) bool {
 }
 
 type InternalPathMatch struct {
-	Type  gatewayv1.PathMatchType
+	// Type specifies how to compare the request path against Value.
+	Type gatewayv1.PathMatchType
+
+	// Value holds the path string or regular expression pattern to match.
 	Value string
+
+	// MatchRegularExpressionValue holds the compiled pattern. The compiler
+	// sets this field only when Type is RegularExpression and the pattern
+	// compiled without error.
+	MatchRegularExpressionValue *regexp.Regexp
 }
 
 type InternalHeaderMatch struct {
@@ -915,7 +929,17 @@ func isBetterCandidate(current, best *routeMatchCandidate) bool {
 		return current.hostnameLen > best.hostnameLen
 	}
 
-	// 3. Path match type priority: Exact > PathPrefix > None
+	// Beyond the Gateway API specification: the specification leaves the
+	// precedence of RegularExpression path matches implementation-specific.
+	// This implementation ranks Exact first, RegularExpression second, and
+	// PathPrefix third. Ranking RegularExpression ahead of PathPrefix keeps
+	// a catch-all PathPrefix "/" rule from shadowing regex rules. When two
+	// RegularExpression matches both apply, this implementation skips the
+	// path-length check because pattern string length does not reflect
+	// specificity. Those ties fall through to method, header, and query
+	// parameter match counts, and then to route and rule declaration order.
+
+	// 3. Path match type priority: Exact > RegularExpression > PathPrefix
 	currentType := getPathMatchType(current.match)
 	bestType := getPathMatchType(best.match)
 
@@ -923,11 +947,13 @@ func isBetterCandidate(current, best *routeMatchCandidate) bool {
 		return getPathMatchTypeWeight(currentType) > getPathMatchTypeWeight(bestType)
 	}
 
-	// 4. Longest path match wins
-	currentPathLen := getPathLen(current.match)
-	bestPathLen := getPathLen(best.match)
-	if currentPathLen != bestPathLen {
-		return currentPathLen > bestPathLen
+	// 4. Longest path prefix match wins
+	if currentType == gatewayv1.PathMatchPathPrefix {
+		currentPathLen := getPathLen(current.match)
+		bestPathLen := getPathLen(best.match)
+		if currentPathLen != bestPathLen {
+			return currentPathLen > bestPathLen
+		}
 	}
 
 	// 5. Method match wins over no method match
@@ -959,9 +985,9 @@ func getPathMatchTypeWeight(t gatewayv1.PathMatchType) int {
 	switch t {
 	case gatewayv1.PathMatchExact:
 		return 3
-	case gatewayv1.PathMatchPathPrefix:
+	case gatewayv1.PathMatchRegularExpression:
 		return 2
-	case "":
+	case gatewayv1.PathMatchPathPrefix:
 		return 1
 	default:
 		return 0
