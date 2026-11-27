@@ -16,10 +16,12 @@ package engine
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1449,4 +1451,137 @@ func TestBlockPool_DeferredFrees_NoRunDeferredOrFreedTwice(t *testing.T) {
 		t.Fatalf("heapSyncSucceeded freeing loc1 and loc2 failed: %v", err)
 	}
 	assertNoDuplicates()
+}
+
+// TestBlockPool_ConcurrentPinPageDuringEvictionFlush checks that concurrent PinPage
+// reloads of evicted pages stay race-free and consistent while eviction flushes
+// release bp.mu and one goroutine replaces pages with AllocateNewPage.
+func TestBlockPool_ConcurrentPinPageDuringEvictionFlush(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], "bp-pin-race-0001")
+	wal, err := OpenWAL(memFS, "wal_dir", dbID, 0, WALOptions{})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+	heapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	const (
+		numPages         = 12
+		numReaders       = 4
+		poolBlocks       = numReaders + 2
+		writerIterations = 150
+		payloadBytes     = 64
+	)
+	bp := NewBlockPool(heapFile, wal, NewBuddyAllocator(1024), dbID, BlockPoolOptions{NumPoolBlocks: poolBlocks})
+	defer bp.Close()
+
+	var zeroPayload [payloadBytes]byte
+	buildPayload := func(pageID, lsn uint64) [payloadBytes]byte {
+		var payload [payloadBytes]byte
+		binary.BigEndian.PutUint64(payload[0:8], pageID)
+		binary.BigEndian.PutUint64(payload[8:16], lsn)
+		fill := byte(pageID ^ lsn)
+		for i := 16; i < payloadBytes; i++ {
+			payload[i] = fill + byte(i)
+		}
+		return payload
+	}
+
+	var nextLSN uint64
+	allocateAndWrite := func(pageID uint64) error {
+		nextLSN++
+		lsn := nextLSN
+		if err := wal.Append(Record{Type: RecordTypePut, LSN: lsn, Key: fmt.Sprintf("p%d", pageID), Payload: []byte("v")}); err != nil {
+			return fmt.Errorf("wal.Append(%d, %d): %w", pageID, lsn, err)
+		}
+		handle, err := bp.AllocateNewPage(pageID, 1, lsn)
+		if err != nil {
+			return fmt.Errorf("AllocateNewPage(%d, %d): %w", pageID, lsn, err)
+		}
+		payload := buildPayload(pageID, lsn)
+		handle.Desc.Mu.Lock()
+		copy(handle.Block(0)[BlockHeaderSize:BlockHeaderSize+payloadBytes], payload[:])
+		handle.Desc.Mu.Unlock()
+		handle.Unpin()
+		return nil
+	}
+
+	// Populate all pages so earlier pages flush and evict before the concurrent phase starts.
+	for pageID := uint64(1); pageID <= numPages; pageID++ {
+		if err := allocateAndWrite(pageID); err != nil {
+			t.Fatalf("initial setup failed: %v", err)
+		}
+	}
+
+	var writerDone atomic.Bool
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer writerDone.Store(true)
+		for i := 0; i < writerIterations; i++ {
+			if err := allocateAndWrite(uint64((i % numPages) + 1)); err != nil {
+				t.Errorf("writer iteration %d failed: %v", i, err)
+				return
+			}
+		}
+	}()
+
+	for readerID := 0; readerID < numReaders; readerID++ {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+			for i := 0; !writerDone.Load() || i < numPages*2; i++ {
+				pageID := uint64((i % numPages) + 1)
+				handle, err := bp.PinPage(pageID)
+				if err != nil {
+					t.Errorf("reader %d: PinPage(%d) failed: %v", readerID, pageID, err)
+					return
+				}
+				handle.Desc.Mu.RLock()
+				blocks := handle.Blocks()
+				descriptorLSN := handle.Desc.PageLSN.Load()
+				if len(blocks) != 1 {
+					t.Errorf("reader %d: PinPage(%d) returned %d blocks, want 1", readerID, pageID, len(blocks))
+				} else {
+					block := blocks[0]
+					headerPageID := binary.BigEndian.Uint64(block[8:16])
+					headerLSN := binary.BigEndian.Uint64(block[16:24])
+					payload := block[BlockHeaderSize : BlockHeaderSize+payloadBytes]
+					expected := buildPayload(pageID, headerLSN)
+					if headerPageID != pageID || headerLSN != descriptorLSN {
+						t.Errorf("reader %d: page %d header mismatch: page=%d lsn=%d descriptorLSN=%d",
+							readerID, pageID, headerPageID, headerLSN, descriptorLSN)
+					} else if !bytes.Equal(payload, expected[:]) && !bytes.Equal(payload, zeroPayload[:]) {
+						// AllocateNewPage publishes cleared blocks before the writer locks Desc.Mu.
+						t.Errorf("reader %d: page %d lsn %d payload mismatch", readerID, pageID, headerLSN)
+					}
+				}
+				handle.Desc.Mu.RUnlock()
+				handle.Unpin()
+			}
+		}(readerID)
+	}
+
+	wg.Wait()
+
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	totalAccounted := len(bp.freePoolBlocks)
+	for pageID, descriptor := range bp.pageTable {
+		if pins := descriptor.PinCount.Load(); pins != 0 {
+			t.Fatalf("page %d has PinCount=%d after all handles unpinned, want 0", pageID, pins)
+		}
+		totalAccounted += len(descriptor.PoolBlocks)
+	}
+	if totalAccounted != poolBlocks {
+		t.Fatalf("pool block accounting mismatch: free+inMemory=%d, want %d", totalAccounted, poolBlocks)
+	}
 }

@@ -331,34 +331,49 @@ func (bp *BlockPool) sweepIdleDirtyPages() {
 // PinPage pins an existing page in the block pool, loading it from disk if necessary.
 func (bp *BlockPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 	bp.mu.Lock()
-	desc, exists := bp.pageTable[logicalPage]
-	if !exists {
-		bp.mu.Unlock()
-		return nil, ErrPageNotFound
+	defer bp.mu.Unlock()
+
+	var desc *PageDesc
+	var poolBlocks []int
+	for {
+		var exists bool
+		desc, exists = bp.pageTable[logicalPage]
+		if !exists || desc == nil {
+			return nil, ErrPageNotFound
+		}
+
+		if len(desc.PoolBlocks) > 0 {
+			desc.PinCount.Add(1)
+			desc.LastAccess = time.Now()
+			return &PageHandle{pool: bp, Desc: desc}, nil
+		}
+
+		// The pool evicted this page from memory, so reload it from disk.
+		if desc.PhysicalBlock == NoBlock {
+			return nil, ErrPageNotFound
+		}
+
+		neededBlocks := desc.NumBlocks
+		var err error
+		poolBlocks, err = bp.acquirePoolBlocksLocked(neededBlocks)
+		if err != nil {
+			return nil, err
+		}
+
+		// Re-check pageTable because acquirePoolBlocksLocked can release bp.mu
+		// while it flushes dirty pages. Another goroutine may reload, replace,
+		// or remove the page during that window.
+		current := bp.pageTable[logicalPage]
+		if current != desc || len(current.PoolBlocks) > 0 || current.PhysicalBlock == NoBlock || current.NumBlocks != neededBlocks {
+			bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
+			continue
+		}
+		break
 	}
 
-	if len(desc.PoolBlocks) > 0 {
-		desc.PinCount.Add(1)
-		desc.LastAccess = time.Now()
-		bp.mu.Unlock()
-		return &PageHandle{pool: bp, Desc: desc}, nil
-	}
-
-	// Page was evicted from memory pool blocks; reload from disk
 	readBlock := desc.PhysicalBlock
-	if readBlock == NoBlock {
-		bp.mu.Unlock()
-		return nil, ErrPageNotFound
-	}
-
-	poolBlocks, err := bp.acquirePoolBlocksLocked(desc.NumBlocks)
-	if err != nil {
-		bp.mu.Unlock()
-		return nil, err
-	}
-
 	desc.PoolBlocks = poolBlocks
-	desc.PinCount.Store(1)
+	desc.PinCount.Add(1)
 	desc.LastAccess = time.Now()
 
 	iov := make([][]byte, desc.NumBlocks)
@@ -370,29 +385,28 @@ func (bp *BlockPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 	if err := bp.directIO.Readv(bp.file, int64(readBlock*BlockSize), iov); err != nil {
 		bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
 		desc.PoolBlocks = nil
-		desc.PinCount.Store(0)
-		bp.mu.Unlock()
+		desc.PinCount.Add(-1)
 		return nil, fmt.Errorf("failed to read page %d from disk block %d: %w", logicalPage, readBlock, err)
 	}
 
 	// Verify block headers
+	var pageLSN uint64
 	for i := 0; i < desc.NumBlocks; i++ {
 		decryptHeapBlock(iov[i], iov[i], readBlock+uint64(i), bp.heapCipher)
 		hdr, err := DecodeBlockHeader(iov[i])
 		if err != nil || hdr.LogicalPage != logicalPage || hdr.BlockIndex != uint32(i) {
 			bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
 			desc.PoolBlocks = nil
-			desc.PinCount.Store(0)
-			bp.mu.Unlock()
+			desc.PinCount.Add(-1)
 			if err != nil {
 				return nil, fmt.Errorf("corrupt block in page %d: %w", logicalPage, err)
 			}
 			return nil, fmt.Errorf("corrupt block in page %d: logical page or block index mismatch", logicalPage)
 		}
-		desc.PageLSN.Store(hdr.LSN)
+		pageLSN = hdr.LSN
 	}
+	desc.PageLSN.Store(pageLSN)
 
-	bp.mu.Unlock()
 	return &PageHandle{pool: bp, Desc: desc}, nil
 }
 
