@@ -247,7 +247,6 @@ func TestPublisher_PublishesUpdatesAndDeletesConfig(t *testing.T) {
 	gateway := makePublisherTestGateway("my-gw", "app.local", time.Now())
 	controllerState.UpsertGateway(gateway)
 	controllerState.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
-	controllerState.SetGatewayReadiness(gatewayKey, state.GatewayReadiness{Ready: true})
 	controllerState.SetSynced(true)
 	controllerState.Recompute()
 
@@ -271,7 +270,7 @@ func TestPublisher_PublishesUpdatesAndDeletesConfig(t *testing.T) {
 	}
 
 	// 3. Gateway loses Programmed -> Secret is deleted
-	controllerState.SetGatewayReadiness(gatewayKey, state.GatewayReadiness{Ready: false})
+	controllerState.SetGatewayProvisioningErrors(gatewayKey, nil, &state.ConditionError{Type: string(gatewayv1.GatewayConditionProgrammed)})
 	controllerState.Recompute()
 
 	waitForConfig(t, ctx, fakeClient, func(config *Config) bool {
@@ -319,7 +318,6 @@ func TestPublisher_RefusesConflictingOwner(t *testing.T) {
 	gateway := makePublisherTestGateway("my-gw", "app.local", time.Now())
 	controllerState.UpsertGateway(gateway)
 	controllerState.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
-	controllerState.SetGatewayReadiness(gatewayKey, state.GatewayReadiness{Ready: true})
 	controllerState.SetSynced(true)
 	controllerState.Recompute()
 

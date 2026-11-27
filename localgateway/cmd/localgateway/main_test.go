@@ -501,7 +501,6 @@ func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
 	}
 	server.State().UpsertGateway(gateway)
 	server.State().SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
-	server.State().SetGatewayReadiness(gatewayKey, state.GatewayReadiness{Ready: true})
 	server.State().SetSynced(true)
 	server.State().Recompute()
 
