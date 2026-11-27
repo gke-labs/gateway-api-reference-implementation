@@ -20,10 +20,12 @@ import (
 	"os"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/tunnel"
 	"golang.org/x/sync/errgroup"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2/textlogger"
 	ctrl "sigs.k8s.io/controller-runtime"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -167,8 +169,24 @@ func main() {
 	gariOpts.HTTPSListener = tunnelMgr.HTTPSListener()
 	gariOpts.HTTPListener = tunnelMgr.HTTPListener()
 	gariOpts.AddressProvider = addrProvider
+	var gariState *state.State
+	gariOpts.SetupWithManager = func(_ ctrl.Manager, server *gari.Server) error {
+		gariState = server.State()
+		return nil
+	}
 	gariOpts.OnGatewaysUpdate = func(gateways []*gatewayv1.Gateway) {
-		tunnelMgr.UpdateGateways(gateways)
+		if gariState == nil {
+			return
+		}
+		var listeners []*state.EffectiveListener
+		for _, gateway := range gateways {
+			if gateway == nil {
+				continue
+			}
+			key := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
+			listeners = append(listeners, gariState.GetEffectiveListeners(key)...)
+		}
+		tunnelMgr.UpdateListeners(listeners)
 	}
 
 	ctx := ctrl.SetupSignalHandler()

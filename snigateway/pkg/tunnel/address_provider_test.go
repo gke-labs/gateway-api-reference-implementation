@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -87,6 +88,17 @@ func (f *fakeTunnelState) setRegistered(hostnames ...string) {
 	}
 }
 
+func compileGatewayListeners(gw *gatewayv1.Gateway) []*state.EffectiveListener {
+	compiled := state.CompileModel(state.ModelInputs{
+		Gateways: []*gatewayv1.Gateway{gw},
+	})
+	compiledGateway := compiled.Gateways[types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}]
+	if compiledGateway == nil {
+		return nil
+	}
+	return compiledGateway.EffectiveListeners
+}
+
 func TestAddressProvider_ReadinessLogic(t *testing.T) {
 	fakeState := &fakeTunnelState{
 		connected:           false,
@@ -113,11 +125,12 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 			},
 		},
 	}
+	effectiveListeners := compileGatewayListeners(gw)
 
 	ctx := t.Context()
 
 	// 1. Initially disconnected: returns addresses, ready=false, tunnel-specific unready message
-	addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
+	addrs, readiness, err := provider.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
@@ -133,7 +146,7 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 2. Tunnel connects, but hostnames not registered yet: ready=false
 	fakeState.setConnected(true)
-	addrs, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
+	addrs, readiness, err = provider.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
@@ -149,7 +162,7 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 3. Register a different hostname: still ready=false for this Gateway
 	fakeState.setRegistered("other.example.com")
-	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
+	_, readiness, err = provider.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
@@ -159,7 +172,7 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 4. Register this Gateway's hostname: ready=true
 	fakeState.setRegistered("echo.example.com")
-	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
+	_, readiness, err = provider.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
@@ -172,7 +185,7 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 5. Kill session (disconnect): flips back to ready=false
 	fakeState.setConnected(false)
-	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
+	_, readiness, err = provider.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
@@ -185,7 +198,7 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	// 6. Restore session: flips back to ready=true
 	fakeState.setConnected(true)
-	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
+	_, readiness, err = provider.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected GatewayAddresses error: %v", err)
 	}
@@ -213,19 +226,20 @@ func TestAddressProvider_MultipleListeners(t *testing.T) {
 			},
 		},
 	}
+	effectiveListeners := compileGatewayListeners(gw)
 
 	ctx := t.Context()
 
 	// Only h1 registered
 	fakeState.setRegistered("echo1.example.com")
-	_, readiness, _ := provider.GatewayAddresses(ctx, gw, nil)
+	_, readiness, _ := provider.GatewayAddresses(ctx, gw, effectiveListeners)
 	if readiness.Ready {
 		t.Fatalf("expected ready=false when only 1 of 2 listener hostnames is registered")
 	}
 
 	// Register h2 as well
 	fakeState.setRegistered("echo2.example.com")
-	_, readiness, _ = provider.GatewayAddresses(ctx, gw, nil)
+	_, readiness, _ = provider.GatewayAddresses(ctx, gw, effectiveListeners)
 	if !readiness.Ready {
 		t.Fatalf("expected ready=true when all listener hostnames are registered")
 	}
@@ -250,7 +264,7 @@ func TestAddressProvider_NoHostnamesGateway(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	_, readiness, _ := provider.GatewayAddresses(ctx, gw, nil)
+	_, readiness, _ := provider.GatewayAddresses(ctx, gw, compileGatewayListeners(gw))
 	if !readiness.Ready {
 		t.Fatalf("expected ready=true for Gateway with no SNI hostnames when tunnel is connected")
 	}

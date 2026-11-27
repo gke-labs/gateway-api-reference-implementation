@@ -27,10 +27,10 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
-	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 const (
@@ -153,9 +153,10 @@ func (m *Manager) SessionID() string {
 	return m.sessionID
 }
 
-// UpdateGateways extracts SNI hostnames from the provided Gateways and updates the manager.
-func (m *Manager) UpdateGateways(gateways []*gatewayv1.Gateway) {
-	hostnames := ExtractHostnames(gateways)
+// UpdateListeners extracts SNI hostnames from the accepted, non-conflicted effective
+// listeners and updates the manager.
+func (m *Manager) UpdateListeners(listeners []*state.EffectiveListener) {
+	hostnames := ExtractHostnames(listeners)
 	m.UpdateHostnames(hostnames)
 }
 
