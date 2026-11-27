@@ -889,14 +889,17 @@ func (bp *BlockPool) recordFlushedPageLocked(logicalPage uint64, firstChangedSin
 	}
 }
 
-// FlushAllDirty flushes all dirty pages currently in the block pool.
+// FlushAllDirty flushes every unpinned dirty page currently in the block pool.
+// It skips pinned pages so a flush does not write a page between AllocateNewPage
+// and the writer's MarkDirty and Unpin. A skipped page keeps its RedoLSN, so the
+// checkpointer holds back its redo start to cover that page.
 func (bp *BlockPool) FlushAllDirty() error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
 	var toFlush []*PageDesc
 	for _, desc := range bp.pageTable {
-		if desc.Dirty && len(desc.PoolBlocks) > 0 && !desc.InFlight {
+		if desc.Dirty && desc.PinCount.Load() == 0 && len(desc.PoolBlocks) > 0 && !desc.InFlight {
 			toFlush = append(toFlush, desc)
 		}
 	}

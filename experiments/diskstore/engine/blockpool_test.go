@@ -1585,3 +1585,202 @@ func TestBlockPool_ConcurrentPinPageDuringEvictionFlush(t *testing.T) {
 		t.Fatalf("pool block accounting mismatch: free+inMemory=%d, want %d", totalAccounted, poolBlocks)
 	}
 }
+
+func TestBlockPool_FlushAllDirtySkipsPinnedNewPageAndKeepsRedoLSN(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], "bp-skip-pin-0001")
+
+	wal, err := OpenWAL(memFS, "wal_dir", dbID, 0, WALOptions{})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	heapFile, err := memFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	bp := NewBlockPool(heapFile, wal, NewBuddyAllocator(512), dbID, BlockPoolOptions{NumPoolBlocks: 8})
+	defer bp.Close()
+
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k1", Payload: []byte("v1")}); err != nil {
+		t.Fatalf("wal.Append failed: %v", err)
+	}
+
+	// Allocate page 1 and keep it pinned before filling it or calling MarkDirty.
+	handle, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	if err := bp.FlushAllDirty(); err != nil {
+		t.Fatalf("FlushAllDirty while pinned failed: %v", err)
+	}
+
+	sizeBeforeMarkDirty, err := heapFile.Size()
+	if err != nil {
+		t.Fatalf("heapFile.Size failed: %v", err)
+	}
+	if sizeBeforeMarkDirty != 0 {
+		t.Fatalf("FlushAllDirty wrote %d bytes to heap.db while newly allocated page was pinned", sizeBeforeMarkDirty)
+	}
+	dirtyPageTable, _ := bp.DirtyPageTableAndLSN()
+	if dirtyPageTable[1] != 10 {
+		t.Fatalf("DirtyPageTable[1] = %d, want 10 so checkpoint holds back redo start", dirtyPageTable[1])
+	}
+
+	// Fill the page, call MarkDirty with the same LSN, unpin, and flush.
+	payload := []byte("filled-record")
+	handle.Desc.Mu.Lock()
+	copy(handle.Block(0)[BlockHeaderSize:], payload)
+	handle.Desc.Mu.Unlock()
+	bp.MarkDirty(1, 10)
+	handle.Unpin()
+
+	if err := bp.FlushAllDirty(); err != nil {
+		t.Fatalf("FlushAllDirty after unpin failed: %v", err)
+	}
+	sizeAfterFlush, err := heapFile.Size()
+	if err != nil {
+		t.Fatalf("heapFile.Size failed: %v", err)
+	}
+	if sizeAfterFlush != BlockSize {
+		t.Fatalf("heap.db size after first flush = %d, want %d", sizeAfterFlush, BlockSize)
+	}
+
+	blockBytes := make([]byte, BlockSize)
+	if _, err := heapFile.ReadAt(blockBytes, 0); err != nil {
+		t.Fatalf("heapFile.ReadAt failed: %v", err)
+	}
+	header, err := DecodeBlockHeader(blockBytes)
+	if err != nil {
+		t.Fatalf("DecodeBlockHeader failed: %v", err)
+	}
+	if header.LogicalPage != 1 || header.LSN != 10 {
+		t.Fatalf("flushed header = (page %d, LSN %d), want (page 1, LSN 10)", header.LogicalPage, header.LSN)
+	}
+	if !bytes.HasPrefix(blockBytes[BlockHeaderSize:], payload) {
+		t.Fatalf("flushed block does not contain written payload")
+	}
+
+	if err := bp.FlushAllDirty(); err != nil {
+		t.Fatalf("second FlushAllDirty failed: %v", err)
+	}
+	sizeAfterSecondFlush, err := heapFile.Size()
+	if err != nil {
+		t.Fatalf("heapFile.Size failed: %v", err)
+	}
+	if sizeAfterSecondFlush != sizeAfterFlush {
+		t.Fatalf("second FlushAllDirty wrote extra bytes: size=%d, want %d", sizeAfterSecondFlush, sizeAfterFlush)
+	}
+}
+
+func TestBlockPool_ConcurrentAllocateAndFlushAllDirty(t *testing.T) {
+	memFS := NewMemFS()
+	storeDir := "concurrent_alloc_flush"
+
+	store, err := Open(
+		WithFS(memFS),
+		WithDir(storeDir),
+		WithCreate(),
+		WithCompressionCodec(CodecNone),
+	)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	type testRecord struct {
+		key     string
+		payload []byte
+	}
+	const numRecords = 2000
+	records := make([]testRecord, numRecords)
+	for i := 0; i < numRecords; i++ {
+		payloadSize := 5000
+		if i%4 == 0 {
+			payloadSize = 2000
+		}
+		records[i] = testRecord{
+			key:     fmt.Sprintf("key-%04d", i),
+			payload: bytes.Repeat([]byte{byte('a' + (i % 26))}, payloadSize),
+		}
+	}
+
+	var writerDone atomic.Bool
+	var flusherErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !writerDone.Load() {
+			if err := store.bp.FlushAllDirty(); err != nil {
+				flusherErr = err
+				return
+			}
+		}
+	}()
+
+	for _, record := range records {
+		if err := store.Put("table", record.key, record.payload); err != nil {
+			writerDone.Store(true)
+			wg.Wait()
+			t.Fatalf("Put %s failed: %v", record.key, err)
+		}
+	}
+	writerDone.Store(true)
+	wg.Wait()
+	if flusherErr != nil {
+		t.Fatalf("FlushAllDirty failed: %v", flusherErr)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Scan the durable heap file to confirm no two durable copies share a (LogicalPage, LSN).
+	heapFile, err := memFS.Open(filepath.Join(storeDir, "heap.db"))
+	if err != nil {
+		t.Fatalf("Open heap.db failed: %v", err)
+	}
+	defer heapFile.Close()
+	heapSize, err := heapFile.Size()
+	if err != nil {
+		t.Fatalf("Size heap.db failed: %v", err)
+	}
+	heapBytes := make([]byte, heapSize)
+	if _, err := heapFile.ReadAt(heapBytes, 0); err != nil {
+		t.Fatalf("ReadAt heap.db failed: %v", err)
+	}
+	type pageLSNKey struct {
+		logicalPage uint64
+		lsn         uint64
+	}
+	durableCopies := make(map[pageLSNKey]uint64)
+	for blockIndex := uint64(0); int((blockIndex+1)*BlockSize) <= len(heapBytes); blockIndex++ {
+		start := int(blockIndex) * BlockSize
+		header, decodeErr := DecodeBlockHeader(heapBytes[start : start+BlockSize])
+		if decodeErr != nil || header.BlockIndex != 0 {
+			continue
+		}
+		key := pageLSNKey{logicalPage: header.LogicalPage, lsn: header.LSN}
+		if previousBlock, exists := durableCopies[key]; exists {
+			t.Fatalf("durable heap holds two copies of page %d at LSN %d: blocks %d and %d",
+				header.LogicalPage, header.LSN, previousBlock, blockIndex)
+		}
+		durableCopies[key] = blockIndex
+	}
+
+	reopened, err := Open(WithFS(memFS), WithDir(storeDir))
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+	for _, record := range records {
+		got, found, err := reopened.Get("table", record.key)
+		if err != nil || !found || !bytes.Equal(got, record.payload) {
+			t.Fatalf("Get %s after reopen: found=%v len=%d wantLen=%d err=%v",
+				record.key, found, len(got), len(record.payload), err)
+		}
+	}
+}
