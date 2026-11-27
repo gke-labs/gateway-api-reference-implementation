@@ -34,7 +34,7 @@ import (
 
 const (
 	// CertServerAudience is the required audience for ServiceAccount tokens presented to certserver.
-	CertServerAudience = "certserver"
+	CertServerAudience = jwt.CertServerAudience
 )
 
 type dirClusterState struct {
