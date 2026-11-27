@@ -403,7 +403,7 @@ const (
 	// Version 1 did not record a version and stored uncompressed values without a codec byte.
 	// Version 2 records this version in meta.db and prefixes each stored value with a codec byte.
 	// Version 3 removes resourceVersion (token) handling from WAL records and the engine.
-	// Version 4 records whether the store was created with a cipher in meta.db.
+	// Version 4 records whether the store was created with an encryption key in meta.db.
 	// Version 5 makes meta.db a 4 KiB checksummed record with room for new fields.
 	// Version 6 stores oversize values in separate files and logs only pointers in the WAL.
 	// Version 7 adds the HMAC-SHA256 key check token for block-level encryption.

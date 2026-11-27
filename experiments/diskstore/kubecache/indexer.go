@@ -44,23 +44,24 @@ func DefaultOnFatal(err error) {
 }
 
 // OpenEngine opens an engine configured for kubecache using a fresh per-process
-// block encryption key. WithCreate and WithEraseOnError are enabled by default
-// so that across process restarts, when the ephemeral key differs, the engine
-// erases and recreates the store so the cache can rebuild from the API server.
-// Caller-supplied options are applied after the defaults and may override them.
+// block encryption key, with WithCreate and WithEraseOnError enabled so that
+// across process restarts, when the ephemeral key differs, the engine erases
+// and recreates the store so the cache can rebuild from the API server.
+// OpenEngine owns the encryption key; callers that need to manage their own key
+// should call engine.Open directly.
 func OpenEngine(opts ...engine.Option) (*engine.Engine, error) {
 	key, err := engine.NewEncryptionKey()
 	if err != nil {
 		return nil, err
 	}
-	allOpts := make([]engine.Option, 0, len(opts)+3)
-	allOpts = append(allOpts,
-		engine.WithEncryptionKey(key),
+	engineOpts := make([]engine.Option, 0, len(opts)+3)
+	engineOpts = append(engineOpts,
 		engine.WithCreate(),
 		engine.WithEraseOnError(),
 	)
-	allOpts = append(allOpts, opts...)
-	return engine.Open(allOpts...)
+	engineOpts = append(engineOpts, opts...)
+	engineOpts = append(engineOpts, engine.WithEncryptionKey(key))
+	return engine.Open(engineOpts...)
 }
 
 // IndexerOptions configures an Indexer instance.

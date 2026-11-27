@@ -240,18 +240,18 @@ func TestAdapterFailure_DecodeFailure(t *testing.T) {
 	}
 }
 
-// TestAdapterFailure_DecryptFailure tests that a corrupted encrypted heap block in the engine
+// TestAdapterFailure_CorruptEncryptedHeapBlock tests that a corrupted encrypted heap block
 // calls OnFatal exactly once and List, ListKeys, and ByIndex never return partial results,
 // and that reopening with a different key fails closed with ErrInvalidKey.
-func TestAdapterFailure_DecryptFailure(t *testing.T) {
+func TestAdapterFailure_CorruptEncryptedHeapBlock(t *testing.T) {
 	memFS := engine.NewMemFS()
-	encKey, err := engine.NewEncryptionKey()
+	key, err := engine.NewEncryptionKey()
 	if err != nil {
 		t.Fatalf("NewEncryptionKey failed: %v", err)
 	}
 
-	dir := "fail_decrypt_err"
-	eng, err := engine.Open(engine.WithFS(memFS), engine.WithEncryptionKey(encKey), engine.WithDir(dir), engine.WithCreate())
+	dir := "fail_corrupt_encrypted_heap"
+	eng, err := engine.Open(engine.WithFS(memFS), engine.WithEncryptionKey(key), engine.WithDir(dir), engine.WithCreate())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestAdapterFailure_DecryptFailure(t *testing.T) {
 
 	// Reopen with the right key, then corrupt the encrypted heap block on disk so that
 	// reading stored objects decrypts to invalid block bytes and triggers engine failure.
-	engReopened, err := engine.Open(engine.WithFS(memFS), engine.WithEncryptionKey(encKey), engine.WithDir(dir))
+	engReopened, err := engine.Open(engine.WithFS(memFS), engine.WithEncryptionKey(key), engine.WithDir(dir))
 	if err != nil {
 		t.Fatalf("reopen with right key failed: %v", err)
 	}
@@ -333,28 +333,28 @@ func TestAdapterFailure_DecryptFailure(t *testing.T) {
 			"namespace": toolscache.MetaNamespaceIndexFunc,
 		}),
 	)
-	// New attempts to scan and rebuild secondary indexes, which hits block decryption/CRC failure!
+	// New attempts to scan and rebuild secondary indexes, which hits block CRC failure.
 	if err == nil {
 		t.Fatalf("expected New to fail on corrupt encrypted block during index rebuild")
 	}
 
 	if c := fatalCount.Load(); c != 1 {
-		t.Fatalf("expected OnFatal called exactly once on decrypt failure, got %d", c)
+		t.Fatalf("expected OnFatal called exactly once on corrupt encrypted block, got %d", c)
 	}
 	if fatalErr == nil {
-		t.Fatalf("expected non-nil fatalErr on decrypt failure")
+		t.Fatalf("expected non-nil fatalErr on corrupt encrypted block")
 	}
 
 	if idxCorrupt != nil {
 		if len(idxCorrupt.List()) != 0 {
-			t.Fatalf("expected empty List on decrypt failure")
+			t.Fatalf("expected empty List on corrupt encrypted block")
 		}
 		if len(idxCorrupt.ListKeys()) != 0 {
-			t.Fatalf("expected empty ListKeys on decrypt failure")
+			t.Fatalf("expected empty ListKeys on corrupt encrypted block")
 		}
 		items, bErr := idxCorrupt.ByIndex("namespace", "default")
 		if bErr == nil || len(items) != 0 {
-			t.Fatalf("expected error and empty ByIndex on decrypt failure")
+			t.Fatalf("expected error and empty ByIndex on corrupt encrypted block")
 		}
 	}
 }

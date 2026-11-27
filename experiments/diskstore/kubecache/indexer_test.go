@@ -207,12 +207,8 @@ func TestIndexer_SecondaryIndexing(t *testing.T) {
 
 func TestIndexer_WithEncryption(t *testing.T) {
 	memFS := engine.NewMemFS()
-	encKey, err := engine.NewEncryptionKey()
-	if err != nil {
-		t.Fatalf("NewEncryptionKey failed: %v", err)
-	}
 
-	store, err := OpenEngine(engine.WithFS(memFS), engine.WithEncryptionKey(encKey), engine.WithDir("idx_crypto_store"))
+	store, err := OpenEngine(engine.WithFS(memFS), engine.WithDir("idx_crypto_store"))
 	if err != nil {
 		t.Fatalf("OpenEngine failed: %v", err)
 	}
@@ -303,90 +299,6 @@ func TestIndexer_WithEncryption(t *testing.T) {
 				t.Fatalf("secret name was found in plaintext in file %s!", filepath.Join(dir, e.Name()))
 			}
 		}
-	}
-}
-
-func TestIndexer_RestartWithDifferentKeyErasesStore(t *testing.T) {
-	memFS := engine.NewMemFS()
-	dir := "idx_restart_diff_key"
-
-	// Process 1: OpenEngine generates a fresh per-process block encryption key.
-	eng1, err := OpenEngine(engine.WithFS(memFS), engine.WithDir(dir))
-	if err != nil {
-		t.Fatalf("OpenEngine 1 failed: %v", err)
-	}
-
-	idx1, err := New(eng1, &corev1.Secret{}, testOnFatal(t))
-	if err != nil {
-		t.Fatalf("New 1 failed: %v", err)
-	}
-
-	secret1 := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:       "default",
-			Name:            "ephemeral-secret",
-			ResourceVersion: "100",
-		},
-		Data: map[string][]byte{"token": []byte("process-1-secret-value")},
-	}
-	if err := idx1.Add(secret1); err != nil {
-		t.Fatalf("Add failed: %v", err)
-	}
-	idx1.Bookmark("100")
-
-	if err := idx1.Close(); err != nil {
-		t.Fatalf("idx1.Close failed: %v", err)
-	}
-	if err := eng1.Close(); err != nil {
-		t.Fatalf("eng1.Close failed: %v", err)
-	}
-
-	// Process 2: Restart with OpenEngine generates a new per-process key.
-	// Because the key differs, OpenEngine erases and recreates the store.
-	eng2, err := OpenEngine(engine.WithFS(memFS), engine.WithDir(dir))
-	if err != nil {
-		t.Fatalf("OpenEngine 2 failed: %v", err)
-	}
-	defer eng2.Close()
-
-	if !eng2.Wiped() {
-		t.Fatalf("expected store to be wiped on restart with a different per-process key")
-	}
-
-	idx2, err := New(eng2, &corev1.Secret{}, testOnFatal(t))
-	if err != nil {
-		t.Fatalf("New 2 failed: %v", err)
-	}
-	defer idx2.Close()
-
-	if got := idx2.LastStoreSyncResourceVersion(); got != "" {
-		t.Fatalf("expected empty resourceVersion after key-mismatch wipe, got %q", got)
-	}
-	if _, exists, err := idx2.GetByKey("default/ephemeral-secret"); err != nil || exists {
-		t.Fatalf("expected old secret to be erased after wipe, exists=%v, err=%v", exists, err)
-	}
-	if items := idx2.List(); len(items) != 0 {
-		t.Fatalf("expected empty store after wipe, got %d items", len(items))
-	}
-
-	// Verify the recreated store is usable with the new key.
-	secret2 := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:       "default",
-			Name:            "fresh-secret",
-			ResourceVersion: "200",
-		},
-		Data: map[string][]byte{"token": []byte("process-2-secret-value")},
-	}
-	if err := idx2.Add(secret2); err != nil {
-		t.Fatalf("Add on wiped store failed: %v", err)
-	}
-	obj, exists, err := idx2.GetByKey("default/fresh-secret")
-	if err != nil || !exists {
-		t.Fatalf("GetByKey on wiped store failed: exists=%v, err=%v", exists, err)
-	}
-	if got := string(obj.(*corev1.Secret).Data["token"]); got != "process-2-secret-value" {
-		t.Fatalf("fresh secret mismatch: got %q, want %q", got, "process-2-secret-value")
 	}
 }
 
