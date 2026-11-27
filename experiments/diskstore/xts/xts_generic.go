@@ -35,6 +35,8 @@ func encryptBlocksGeneric(c *Cipher, dst, src []byte, sectorNum uint64) {
 	tweakLow, tweakHigh := initTweak(c, dst, sectorNum)
 
 	for {
+		// Bounds-check hint so the compiler eliminates checks on the slice
+		// accesses below.
 		_ = dst[15]
 		binary.LittleEndian.PutUint64(dst[0:8], blockLow^tweakLow)
 		binary.LittleEndian.PutUint64(dst[8:16], blockHigh^tweakHigh)

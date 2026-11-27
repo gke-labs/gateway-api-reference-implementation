@@ -45,12 +45,12 @@ type Cipher struct {
 	tweakCipher cipher.Block
 }
 
-// NewCipher creates an AES-XTS Cipher from key. The key length must be 32, 48,
-// or 64 bytes for AES-128-XTS, AES-192-XTS, or AES-256-XTS. NewCipher uses the
-// first half of key for data blocks and the second half for tweaks.
+// NewCipher creates an AES-XTS Cipher from key. IEEE 1619 defines AES-XTS for
+// 128-bit and 256-bit AES keys only, so key must be 32 or 64 bytes. NewCipher
+// uses the first half of key for data blocks and the second half for tweaks.
 func NewCipher(key []byte) (*Cipher, error) {
 	switch len(key) {
-	case 32, 48, 64:
+	case 32, 64:
 	default:
 		return nil, fmt.Errorf("xts: invalid key size %d", len(key))
 	}
@@ -107,7 +107,9 @@ func validateBuffers(dst, src []byte) {
 }
 
 // inexactOverlap reports whether non-empty slices x and y share memory at any
-// non-corresponding index.
+// non-corresponding index. It uses unsafe.Pointer to match
+// golang.org/x/crypto/xts's overlap panic because the standard library's
+// alias.InexactOverlap helper is internal.
 func inexactOverlap(x, y []byte) bool {
 	if &x[0] == &y[0] {
 		return false
