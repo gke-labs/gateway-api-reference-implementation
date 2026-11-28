@@ -16,6 +16,7 @@ package hostport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -79,10 +80,11 @@ func New(client client.Client, reader client.Reader, controllerNamespace string,
 }
 
 // GatewayAddresses reconciles the Gateway's data-plane infrastructure and returns
-// addresses and readiness status based on the nodes running the Gateway's data-plane pods.
-func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+// addresses and a *state.ConditionError when not ready to serve, based on the nodes
+// running the Gateway's data-plane pods.
+func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, error) {
 	if provider.reader == nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("reader is required for HostPortAddressProvider")
+		return nil, fmt.Errorf("reader is required for HostPortAddressProvider")
 	}
 
 	// 0. Validate that listeners do not exceed one HTTP port and one HTTPS/TLS port.
@@ -100,25 +102,25 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 		}
 	}
 	if len(httpPorts) > 1 || len(httpsPorts) > 1 {
-		return nil, state.GatewayReadiness{
-			Ready:   false,
+		return nil, &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
 			Message: "host ports allow one HTTP and one HTTPS port",
-		}, nil
+		}
 	}
 
 	// 1. Reconcile the Deployment via the wrapped singlepod provisioner.
-	// With WithNoService(), singlepod can return not-ready results such as
+	// With WithNoService(), singlepod can return not-ready ConditionErrors such as
 	// GatewayReasonPending (waiting for state to compute gateway parameters) or
 	// GatewayReasonInvalidParameters (problem with the Gateway's parameters).
-	// If singlepod reports any not-ready condition other than AddressNotAssigned
+	// If singlepod reports any error or any ConditionError other than AddressNotAssigned
 	// ("no address yet"), return it immediately without discovering pods.
-	_, readiness, err := provider.wrapped.GatewayAddresses(ctx, gateway, effectiveListeners)
+	_, err := provider.wrapped.GatewayAddresses(ctx, gateway, effectiveListeners)
 	if err != nil {
-		return nil, readiness, err
-	}
-	if !readiness.Ready && readiness.Reason != "" && readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		return nil, readiness, nil
+		var conditionErr *state.ConditionError
+		if !errors.As(err, &conditionErr) || (conditionErr.Reason != "" && conditionErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned)) {
+			return nil, err
+		}
 	}
 
 	deploymentName := state.ResourceNameForGateway(gateway.Name)
@@ -126,13 +128,13 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 	var deployment appsv1.Deployment
 	if err := provider.reader.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: deploymentName}, &deployment); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 				Message: "Waiting for data-plane deployment to become available",
-			}, nil
+			}
 		}
-		return nil, state.GatewayReadiness{}, fmt.Errorf("getting Deployment %s/%s for Gateway %s: %w", gateway.Namespace, deploymentName, gateway.Name, err)
+		return nil, fmt.Errorf("getting Deployment %s/%s for Gateway %s: %w", gateway.Namespace, deploymentName, gateway.Name, err)
 	}
 
 	deploymentAvailable := deployment.Status.AvailableReplicas > 0 || deployment.Status.ReadyReplicas > 0
@@ -140,7 +142,7 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 	// 2. Find all data-plane pods owned by the Deployment.
 	pods, err := provider.dataplanePods(ctx, gateway, &deployment)
 	if err != nil {
-		return nil, state.GatewayReadiness{}, err
+		return nil, err
 	}
 
 	// With no such pod, the Gateway has no address and reason AddressNotAssigned.
@@ -149,11 +151,11 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 		if deploymentAvailable {
 			message = "Waiting for node address to be assigned to host-port Gateway"
 		}
-		return nil, state.GatewayReadiness{
-			Ready:   false,
+		return nil, &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 			Message: message,
-		}, nil
+		}
 	}
 
 	// 3. Collect unique node names to read each node once.
@@ -174,7 +176,7 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Node %s for Gateway %s/%s: %w", nodeName, gateway.Namespace, gateway.Name, err)
+			return nil, fmt.Errorf("getting Node %s for Gateway %s/%s: %w", nodeName, gateway.Namespace, gateway.Name, err)
 		}
 
 		for index := range node.Status.Addresses {
@@ -183,7 +185,7 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 				trimmed := strings.TrimSpace(nodeAddress.Address)
 				ip, err := netip.ParseAddr(trimmed)
 				if err != nil {
-					return nil, state.GatewayReadiness{}, fmt.Errorf("parsing NodeInternalIP %q on node %s: %w", trimmed, nodeName, err)
+					return nil, fmt.Errorf("parsing NodeInternalIP %q on node %s: %w", trimmed, nodeName, err)
 				}
 				parsedIPs = append(parsedIPs, ip)
 			}
@@ -195,11 +197,11 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 		if deploymentAvailable {
 			message = "Waiting for node address to be assigned to host-port Gateway"
 		}
-		return nil, state.GatewayReadiness{
-			Ready:   false,
+		return nil, &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 			Message: message,
-		}, nil
+		}
 	}
 
 	// Sort parsed IP addresses (IPv4 before IPv6, then numerically) and deduplicate.
@@ -218,18 +220,14 @@ func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, g
 
 	// Readiness: ready when the Deployment is available.
 	if !deploymentAvailable {
-		return addresses, state.GatewayReadiness{
-			Ready:   false,
+		return addresses, &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonPending),
 			Message: "Waiting for data-plane deployment to become available",
-		}, nil
+		}
 	}
 
-	return addresses, state.GatewayReadiness{
-		Ready:   true,
-		Reason:  string(gatewayv1.GatewayReasonProgrammed),
-		Message: "Gateway programmed by reference implementation",
-	}, nil
+	return addresses, nil
 }
 
 // dataplanePods finds all data-plane pods owned by the Gateway's Deployment that have an assigned node,
