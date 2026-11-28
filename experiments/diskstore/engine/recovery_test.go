@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2433,9 +2434,9 @@ func TestRecovery_TornReplaceDeletedKeyStayDeleted(t *testing.T) {
 	})
 }
 
-type walBlockKey struct {
-	segment string
-	block   int64
+type fileBlockKey struct {
+	name  string
+	block int64
 }
 
 type walSegmentBlocks struct {
@@ -2444,68 +2445,85 @@ type walSegmentBlocks struct {
 	numBlocks int64
 }
 
-type walBlockCountingFS struct {
+type blockCountingFS struct {
 	FS
-	mu     sync.Mutex
-	counts map[walBlockKey]int
+	match     func(name string) bool
+	blockSize int64
+	mu        sync.Mutex
+	counts    map[fileBlockKey]int
 }
 
-func newWALBlockCountingFS(base FS) *walBlockCountingFS {
-	return &walBlockCountingFS{
-		FS:     base,
-		counts: make(map[walBlockKey]int),
+func newBlockCountingFS(base FS, blockSize int64, match func(name string) bool) *blockCountingFS {
+	return &blockCountingFS{
+		FS:        base,
+		match:     match,
+		blockSize: blockSize,
+		counts:    make(map[fileBlockKey]int),
 	}
 }
 
-func (c *walBlockCountingFS) recordRead(name string, off int64, n int) {
-	if n <= 0 || !strings.HasSuffix(name, ".wal") {
+func newWALBlockCountingFS(base FS) *blockCountingFS {
+	return newBlockCountingFS(base, WALBlockSize, func(name string) bool {
+		return strings.HasSuffix(name, ".wal")
+	})
+}
+
+func newHeapBlockCountingFS(base FS) *blockCountingFS {
+	return newBlockCountingFS(base, BlockSize, func(name string) bool {
+		return filepath.Base(name) == "heap.db"
+	})
+}
+
+func (c *blockCountingFS) recordRead(name string, off int64, n int) {
+	if n <= 0 || !c.match(name) {
 		return
 	}
-	segment := filepath.Base(name)
-	firstBlock := off / WALBlockSize
-	lastBlock := (off + int64(n) - 1) / WALBlockSize
+	baseName := filepath.Base(name)
+	firstBlock := off / c.blockSize
+	lastBlock := (off + int64(n) - 1) / c.blockSize
 	c.mu.Lock()
 	for block := firstBlock; block <= lastBlock; block++ {
-		c.counts[walBlockKey{segment: segment, block: block}]++
+		c.counts[fileBlockKey{name: baseName, block: block}]++
 	}
 	c.mu.Unlock()
 }
 
-func (c *walBlockCountingFS) Open(name string) (File, error) {
+func (c *blockCountingFS) wrapFile(name string, file File) File {
+	if c.match(name) {
+		return &blockCountingFile{File: file, name: name, fs: c}
+	}
+	return file
+}
+
+func (c *blockCountingFS) Open(name string) (File, error) {
 	file, err := c.FS.Open(name)
 	if err != nil {
 		return nil, err
 	}
-	if strings.HasSuffix(name, ".wal") {
-		return &walBlockCountingFile{File: file, name: name, fs: c}, nil
-	}
-	return file, nil
+	return c.wrapFile(name, file), nil
 }
 
-func (c *walBlockCountingFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+func (c *blockCountingFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 	file, err := c.FS.OpenFile(name, flag, perm)
 	if err != nil {
 		return nil, err
 	}
-	if strings.HasSuffix(name, ".wal") {
-		return &walBlockCountingFile{File: file, name: name, fs: c}, nil
-	}
-	return file, nil
+	return c.wrapFile(name, file), nil
 }
 
-func (c *walBlockCountingFS) blockCount(segment string, block int64) int {
+func (c *blockCountingFS) blockCount(name string, block int64) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.counts[walBlockKey{segment: segment, block: block}]
+	return c.counts[fileBlockKey{name: name, block: block}]
 }
 
-type walBlockCountingFile struct {
+type blockCountingFile struct {
 	File
 	name string
-	fs   *walBlockCountingFS
+	fs   *blockCountingFS
 }
 
-func (f *walBlockCountingFile) ReadAt(p []byte, off int64) (int, error) {
+func (f *blockCountingFile) ReadAt(p []byte, off int64) (int, error) {
 	n, err := f.File.ReadAt(p, off)
 	f.fs.recordRead(f.name, off, n)
 	return n, err
@@ -2786,5 +2804,283 @@ func TestRecovery_OpenReadsWALOnce(t *testing.T) {
 		}
 
 		verifyRange(t, reopened, 0, 50, 'y')
+	})
+}
+
+func heapFileBlockCount(t *testing.T, fs FS, heapPath string) int64 {
+	t.Helper()
+	file, err := fs.Open(heapPath)
+	if err != nil {
+		t.Fatalf("Open %s failed: %v", heapPath, err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			t.Fatalf("Close %s failed: %v", heapPath, closeErr)
+		}
+	}()
+	size, err := file.Size()
+	if err != nil {
+		t.Fatalf("Size %s failed: %v", heapPath, err)
+	}
+	return size / BlockSize
+}
+
+// TestRecovery_OpenReadsHeapOnce counts heap block reads performed by Open through
+// the filesystem it is opened with and verifies Open reads every heap block once
+// and recovers empty pages in a deterministic order across opens.
+func TestRecovery_OpenReadsHeapOnce(t *testing.T) {
+	runMixedWorkload := func(t *testing.T, encrypted bool) {
+		t.Helper()
+		memFS := NewMemFS()
+		dir := "heap_once"
+		var encKey EncryptionKey
+		if encrypted {
+			var err error
+			encKey, err = NewEncryptionKey()
+			if err != nil {
+				t.Fatalf("NewEncryptionKey failed: %v", err)
+			}
+		}
+
+		openOpts := func(fs FS, create bool) []Option {
+			opts := []Option{
+				WithFS(fs),
+				WithDir(dir),
+				WithCompressionCodec(CodecNone),
+			}
+			if create {
+				opts = append(opts, WithCreate())
+			}
+			if len(encKey) > 0 {
+				opts = append(opts, WithEncryptionKey(encKey))
+			}
+			return opts
+		}
+
+		store, err := Open(openOpts(memFS, true)...)
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+
+		expected := make(map[string][]byte)
+		// Slotted records across multiple pages, plus updates and deletes to leave several empty and losing copies.
+		for i := 0; i < 80; i++ {
+			key := fmt.Sprintf("small-%03d", i)
+			val := bytes.Repeat([]byte{byte('a' + i%26)}, 400)
+			if err := store.Put("Table", key, val); err != nil {
+				t.Fatalf("Put %s failed: %v", key, err)
+			}
+			expected[key] = val
+		}
+		// Multi-block records (4 blocks each).
+		for i := 0; i < 8; i++ {
+			key := fmt.Sprintf("medium-%02d", i)
+			val := bytes.Repeat([]byte{byte('A' + i)}, 10*1024)
+			if err := store.Put("Table", key, val); err != nil {
+				t.Fatalf("Put %s failed: %v", key, err)
+			}
+			expected[key] = val
+		}
+		// Large multi-block record spanning 128 blocks (> 256 KiB chunk size).
+		largeValV1 := bytes.Repeat([]byte("L1"), 150*1024)
+		if err := store.Put("Table", "large-chunk-span", largeValV1); err != nil {
+			t.Fatalf("Put large-chunk-span v1 failed: %v", err)
+		}
+		// Multi-block record whose key spans across block 0 and block 1 (> 4050 bytes).
+		longKey := "long-key-" + strings.Repeat("k", 5000)
+		longKeyVal := bytes.Repeat([]byte("K"), 8192)
+		if err := store.Put("Table", longKey, longKeyVal); err != nil {
+			t.Fatalf("Put longKey failed: %v", err)
+		}
+		expected[longKey] = longKeyVal
+		// Oversize record (> 2 MiB) stored as an oversize pointer in a slotted page.
+		oversizeVal := bytes.Repeat([]byte("O"), MaxPayloadCapacity+4096)
+		if err := store.Put("Table", "oversize-key", oversizeVal); err != nil {
+			t.Fatalf("Put oversize-key failed: %v", err)
+		}
+		expected["oversize-key"] = oversizeVal
+
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 1 failed: %v", err)
+		}
+
+		// Overwrite and delete keys so the heap file holds losing page copies and multiple empty pages.
+		for i := 0; i < 60; i++ {
+			key := fmt.Sprintf("small-%03d", i)
+			if err := store.Delete("Table", key); err != nil {
+				t.Fatalf("Delete %s failed: %v", key, err)
+			}
+			delete(expected, key)
+		}
+		for i := 0; i < 2; i++ {
+			key := fmt.Sprintf("medium-%02d", i)
+			if err := store.Delete("Table", key); err != nil {
+				t.Fatalf("Delete %s failed: %v", key, err)
+			}
+			delete(expected, key)
+		}
+		for i := 60; i < 70; i++ {
+			key := fmt.Sprintf("small-%03d", i)
+			val := bytes.Repeat([]byte{byte('0' + i%10)}, 400)
+			if err := store.Put("Table", key, val); err != nil {
+				t.Fatalf("Put updated %s failed: %v", key, err)
+			}
+			expected[key] = val
+		}
+		largeValV2 := bytes.Repeat([]byte("L2"), 150*1024)
+		if err := store.Put("Table", "large-chunk-span", largeValV2); err != nil {
+			t.Fatalf("Put large-chunk-span v2 failed: %v", err)
+		}
+		expected["large-chunk-span"] = largeValV2
+
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 2 failed: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		totalBlocks := heapFileBlockCount(t, memFS, filepath.Join(dir, "heap.db"))
+		if totalBlocks <= 128 {
+			t.Fatalf("expected heap file > 128 blocks to exercise multi-chunk scan, got %d", totalBlocks)
+		}
+
+		reopenAndVerify := func() []uint64 {
+			countingFS := newHeapBlockCountingFS(memFS)
+			reopened, err := Open(openOpts(countingFS, false)...)
+			if err != nil {
+				t.Fatalf("reopen failed: %v", err)
+			}
+			defer func() {
+				if closeErr := reopened.Close(); closeErr != nil {
+					t.Fatalf("reopened.Close failed: %v", closeErr)
+				}
+			}()
+
+			for block := int64(0); block < totalBlocks; block++ {
+				if got := countingFS.blockCount("heap.db", block); got != 1 {
+					t.Fatalf("heap block %d (of %d) read %d times, want 1", block, totalBlocks, got)
+				}
+			}
+
+			for key, want := range expected {
+				got, exists, err := reopened.Get("Table", key)
+				if err != nil || !exists || !bytes.Equal(got, want) {
+					t.Fatalf("Get %q failed: exists=%v len=%d wantLen=%d err=%v", key, exists, len(got), len(want), err)
+				}
+			}
+			for i := 0; i < 60; i++ {
+				key := fmt.Sprintf("small-%03d", i)
+				if _, exists, err := reopened.Get("Table", key); err != nil || exists {
+					t.Fatalf("deleted key %s still exists=%v err=%v", key, exists, err)
+				}
+			}
+			return slices.Clone(reopened.emptyPages.pages)
+		}
+
+		firstEmptyPages := reopenAndVerify()
+		if len(firstEmptyPages) < 4 {
+			t.Fatalf("expected at least 4 empty pages to test deterministic ordering, got %v", firstEmptyPages)
+		}
+		secondEmptyPages := reopenAndVerify()
+		if !slices.Equal(firstEmptyPages, secondEmptyPages) {
+			t.Fatalf("empty page order differed across opens: first=%v second=%v", firstEmptyPages, secondEmptyPages)
+		}
+	}
+
+	t.Run("Unencrypted", func(t *testing.T) {
+		runMixedWorkload(t, false)
+	})
+
+	t.Run("Encrypted", func(t *testing.T) {
+		runMixedWorkload(t, true)
+	})
+
+	t.Run("TornMultiBlockAcrossChunkBoundary", func(t *testing.T) {
+		memFS := NewMemFS()
+		dir := "heap_once_torn_chunk"
+		store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+
+		valV1 := bytes.Repeat([]byte("A"), 300*1024) // 128 blocks
+		if err := store.Put("Table", "chunk-spanning", valV1); err != nil {
+			t.Fatalf("Put v1 failed: %v", err)
+		}
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 1 failed: %v", err)
+		}
+
+		valV2 := bytes.Repeat([]byte("B"), 300*1024) // 128 blocks at a new out-of-place run
+		if err := store.Put("Table", "chunk-spanning", valV2); err != nil {
+			t.Fatalf("Put v2 failed: %v", err)
+		}
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 2 failed: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+
+		// Simulate an unclean crash and tear block 70 (past the 64-block chunk boundary) of the newer 128-block copy.
+		if err := memFS.Remove(filepath.Join(dir, cleanMarkerFilename)); err != nil {
+			t.Fatalf("Remove clean marker failed: %v", err)
+		}
+		heapPath := filepath.Join(dir, "heap.db")
+		totalBlocks := heapFileBlockCount(t, memFS, heapPath)
+		heapFile, err := memFS.OpenFile(heapPath, os.O_RDWR, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile heap.db failed: %v", err)
+		}
+		var newestStart int64 = -1
+		var newestLSN uint64
+		blockBuffer := make([]byte, BlockSize)
+		for block := int64(0); block < totalBlocks; block++ {
+			if _, err := heapFile.ReadAt(blockBuffer, block*BlockSize); err != nil {
+				t.Fatalf("ReadAt block %d failed: %v", block, err)
+			}
+			header, err := DecodeBlockHeader(blockBuffer)
+			if err == nil && header.BlockIndex == 0 && header.NumBlocks == 128 && header.LSN > newestLSN {
+				newestLSN = header.LSN
+				newestStart = block
+			}
+		}
+		if newestStart < 0 {
+			t.Fatalf("failed to locate 128-block page run in heap.db")
+		}
+		tornBlock := newestStart + 70
+		if _, err := heapFile.ReadAt(blockBuffer, tornBlock*BlockSize); err != nil {
+			t.Fatalf("ReadAt torn target block %d failed: %v", tornBlock, err)
+		}
+		blockBuffer[BlockHeaderSize] ^= 0xff
+		if _, err := heapFile.WriteAt(blockBuffer, tornBlock*BlockSize); err != nil {
+			t.Fatalf("WriteAt torn block %d failed: %v", tornBlock, err)
+		}
+		if err := heapFile.Close(); err != nil {
+			t.Fatalf("Close heap.db failed: %v", err)
+		}
+
+		countingFS := newHeapBlockCountingFS(memFS)
+		reopened, err := Open(WithFS(countingFS), WithDir(dir), WithCompressionCodec(CodecNone))
+		if err != nil {
+			t.Fatalf("reopen after torn chunk-spanning page failed: %v", err)
+		}
+		defer func() {
+			if closeErr := reopened.Close(); closeErr != nil {
+				t.Fatalf("reopened.Close failed: %v", closeErr)
+			}
+		}()
+
+		for block := int64(0); block < totalBlocks; block++ {
+			if got := countingFS.blockCount("heap.db", block); got != 1 {
+				t.Fatalf("torn recovery: heap block %d (of %d) read %d times, want 1", block, totalBlocks, got)
+			}
+		}
+
+		got, exists, err := reopened.Get("Table", "chunk-spanning")
+		if err != nil || !exists || !bytes.Equal(got, valV2) {
+			t.Fatalf("Get chunk-spanning failed: exists=%v len=%d wantLen=%d err=%v", exists, len(got), len(valV2), err)
+		}
 	})
 }

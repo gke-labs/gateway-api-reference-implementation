@@ -68,11 +68,77 @@ type RecoveryResult struct {
 	RedoStartPosition *LogPosition
 }
 
+// candidateRecord holds the key index metadata extracted from one active record
+// during the Step 1 heap scan without retaining the record payload.
+type candidateRecord struct {
+	// key is the qualified table/key string stored in the record.
+	key string
+	// oversizeFileName is the backing .obj file name when isOversize is true.
+	oversizeFileName string
+	// lsn is the WAL log sequence number recorded inside the record.
+	lsn uint64
+	// slot is the slotted-page slot index, or 0 for multi-block records.
+	slot uint32
+	// isOversize reports whether the record stores an oversize pointer instead of inline bytes.
+	isOversize bool
+}
+
+// candidatePageCopy tracks the highest-LSN valid on-disk copy of a logical page
+// found during the Step 1 heap scan together with the metadata Step 3 needs.
 type candidatePageCopy struct {
+	// logicalPage identifies the logical page recovered from the block headers.
 	logicalPage uint64
-	lsn         uint64
-	startBlock  uint64
-	numBlocks   int
+	// lsn is the highest page LSN observed in the block headers of this copy.
+	lsn uint64
+	// startBlock is the starting 4 KiB physical block index of this copy in heap.db.
+	startBlock uint64
+	// records holds the active records extracted from this copy during Step 1.
+	records []candidateRecord
+	// decodeErr stores any record-decoding error encountered while extracting this copy,
+	// deferred until Step 3 so a losing copy's error does not fail recovery.
+	decodeErr error
+	// numBlocks is the power-of-two block count of this copy (1 for slotted, 2..512 for multi-block).
+	numBlocks int
+	// empty reports whether this copy holds zero active records and belongs in EmptyLogicalPages.
+	empty bool
+}
+
+// extractSlottedPageRecords reads only the key index metadata from a 1-block slotted page
+// without retaining the page buffer or record payloads.
+func extractSlottedPageRecords(blockBuffer []byte, logicalPage uint64) ([]candidateRecord, bool, error) {
+	slotted, err := WrapSlottedPage(blockBuffer)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to wrap recovered slotted page %d: %w", logicalPage, err)
+	}
+	activeCount := slotted.ActiveSlotsCount()
+	if activeCount == 0 {
+		return nil, true, nil
+	}
+	records := make([]candidateRecord, 0, activeCount)
+	for slot := uint32(0); slot < uint32(slotted.NumSlots()); slot++ {
+		key, value, recordLSN, isOversize, err := slotted.GetWithFlag(slot)
+		if err != nil {
+			if errors.Is(err, ErrSlotNotFound) {
+				continue
+			}
+			return nil, false, fmt.Errorf("failed to get slot %d from page %d: %w", slot, logicalPage, err)
+		}
+		record := candidateRecord{
+			key:        key,
+			slot:       slot,
+			lsn:        recordLSN,
+			isOversize: isOversize,
+		}
+		if isOversize {
+			_, _, fileName, decodeErr := DecodeOversizePointer(value)
+			if decodeErr != nil {
+				return nil, false, fmt.Errorf("failed to decode oversize pointer in page %d slot %d: %w", logicalPage, slot, decodeErr)
+			}
+			record.oversizeFileName = fileName
+		}
+		records = append(records, record)
+	}
+	return records, false, nil
 }
 
 type chunkBlockReader struct {
@@ -216,8 +282,9 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		tornBlocks = append(tornBlocks, blockNumber)
 	}
 
+	totalHeapBlocks := uint64(size / BlockSize)
 	b := uint64(0)
-	for b < uint64(size/BlockSize) {
+	for b < totalHeapBlocks {
 		blockBuf, err := reader.ReadBlock(b)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -250,18 +317,67 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		}
 
 		numBlocks := int(hdr.NumBlocks)
-		if b%uint64(numBlocks) != 0 || b+uint64(numBlocks) > uint64(size/BlockSize) {
+		if b%uint64(numBlocks) != 0 || b+uint64(numBlocks) > totalHeapBlocks {
 			b++
 			continue
 		}
 
-		// Verify candidate page run
+		existing, exists := bestCandidates[hdr.LogicalPage]
+		isNewer := !exists || hdr.LSN > existing.lsn
+
+		if numBlocks == 1 {
+			if isNewer {
+				records, empty, decodeErr := extractSlottedPageRecords(blockBuf, hdr.LogicalPage)
+				bestCandidates[hdr.LogicalPage] = candidatePageCopy{
+					logicalPage: hdr.LogicalPage,
+					lsn:         hdr.LSN,
+					startBlock:  b,
+					numBlocks:   1,
+					records:     records,
+					empty:       empty,
+					decodeErr:   decodeErr,
+				}
+			}
+			b++
+			continue
+		}
+
+		// Multi-block candidate: capture the record header and key bytes from block 0
+		// while validating the remaining blocks in a single forward pass.
+		var multiBlockKey []byte
+		var keyCopied int
+		var multiBlockLSN uint64
+		var multiBlockDecodeErr error
+		if isNewer {
+			keyLen, payloadLen, recordLSN, headerErr := decodeMultiBlockRecordHeader(blockBuf)
+			if headerErr != nil {
+				multiBlockDecodeErr = fmt.Errorf("failed to decode recovered multi-block page %d: %w", hdr.LogicalPage, headerErr)
+			} else if int64(PageRecordHeaderSize)+int64(keyLen)+int64(payloadLen) > int64(numBlocks)*BlockUsableSize {
+				multiBlockDecodeErr = fmt.Errorf("failed to decode recovered multi-block page %d: truncated multi-block page", hdr.LogicalPage)
+			} else {
+				multiBlockLSN = recordLSN
+				if keyLen > 0 {
+					multiBlockKey = make([]byte, keyLen)
+					keyCopied = copy(multiBlockKey, blockBuf[BlockHeaderSize+PageRecordHeaderSize:BlockSize])
+				}
+			}
+		}
+
+		// Verify the remaining blocks of the candidate page run.
+		// Invariants:
+		//  1. Every validated block k >= 1 has a valid CRC and BlockIndex == k (never 0),
+		//     so no validated block in [b+1, b+k-1] can start another valid page or be torn.
+		//  2. On failure at block b+k, the scan advances directly to b+k (or b+k+1 when
+		//     b+k itself failed header decoding). Because block b+k is still in the chunk
+		//     reader buffer, the scan moves strictly forward and reads every heap block once.
 		valid := true
-		for k := 0; k < numBlocks; k++ {
+		nextBlock := b + uint64(numBlocks)
+		for k := 1; k < numBlocks; k++ {
 			kbBuf, err := reader.ReadBlock(b + uint64(k))
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					valid = false
+					nextBlock = b + uint64(k)
 					break
 				}
 				return nil, fmt.Errorf("read error reading block %d: %w", b+uint64(k), err)
@@ -270,32 +386,51 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 			kHdr, err := DecodeBlockHeader(kbBuf)
 			if err != nil || kHdr.LogicalPage != hdr.LogicalPage || kHdr.LSN != hdr.LSN ||
 				kHdr.BlockIndex != uint32(k) || kHdr.NumBlocks != hdr.NumBlocks {
-				if options.ClosedCleanly && err != nil && !isZeroBlock(kbBuf) {
-					return nil, fmt.Errorf("%w %d: %w", ErrDamagedBlock, b+uint64(k), err)
-				}
-				if err != nil && !isZeroBlock(kbBuf) {
-					addTornBlock(b + uint64(k))
+				if err != nil {
+					if !isZeroBlock(kbBuf) {
+						if options.ClosedCleanly {
+							return nil, fmt.Errorf("%w %d: %w", ErrDamagedBlock, b+uint64(k), err)
+						}
+						if !errors.Is(err, ErrInvalidBlockMagic) && !errors.Is(err, ErrInvalidBlockVersion) && !errors.Is(err, ErrBlockCRCMismatch) {
+							return nil, fmt.Errorf("corrupt block decode error at block %d: %w", b+uint64(k), err)
+						}
+						addTornBlock(b + uint64(k))
+					}
+					nextBlock = b + uint64(k) + 1
+				} else {
+					nextBlock = b + uint64(k)
 				}
 				valid = false
 				break
 			}
+
+			if keyCopied < len(multiBlockKey) {
+				keyCopied += copy(multiBlockKey[keyCopied:], kbBuf[BlockHeaderSize:BlockSize])
+			}
 		}
 
-		if valid {
+		if valid && isNewer {
 			cand := candidatePageCopy{
 				logicalPage: hdr.LogicalPage,
 				lsn:         hdr.LSN,
 				startBlock:  b,
 				numBlocks:   numBlocks,
+				decodeErr:   multiBlockDecodeErr,
 			}
-			existing, exists := bestCandidates[hdr.LogicalPage]
-			if !exists || cand.lsn > existing.lsn {
-				bestCandidates[hdr.LogicalPage] = cand
+			if multiBlockDecodeErr == nil {
+				if len(multiBlockKey) > 0 {
+					cand.records = []candidateRecord{{
+						key:  string(multiBlockKey),
+						slot: 0,
+						lsn:  multiBlockLSN,
+					}}
+				} else {
+					cand.empty = true
+				}
 			}
-			b += uint64(numBlocks)
-		} else {
-			b++
+			bestCandidates[hdr.LogicalPage] = cand
 		}
+		b = nextBlock
 	}
 
 	// Zero blocks rejected as torn so invalid blocks do not linger in free space across a subsequent clean close.
@@ -342,107 +477,56 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		}
 	}
 
-	// Step 3: Scan recovered pages to rebuild key index and empty page list
+	// Step 3: Build the key index and empty-page list from winning candidates in
+	// start-block order so EmptyLogicalPages, SupersededPages, and any decode error
+	// are deterministic across runs. Step 1 already extracted each candidate's key
+	// metadata during the heap scan, so Step 3 reads no heap blocks.
 	// Item 4: Always keep the copy with the highest LSN when a key appears multiple times.
 	// Older copies on other pages are tracked as superseded so that WAL redo can clear
 	// them even if the key's current page is already up to date.
-	// Sort winning candidates by physical block so chunkBlockReader scans disk sequentially.
 	keyIndex := make(map[string]KeyIndexEntry)
 	supersededPages := make(map[string][]KeyIndexEntry)
 	var emptyPages []uint64
 
-	var sortedCandidates []candidatePageCopy
+	sortedCandidates := make([]candidatePageCopy, 0, len(bestCandidates))
 	for _, cand := range bestCandidates {
 		sortedCandidates = append(sortedCandidates, cand)
 	}
+	bestCandidates = nil
 	sort.Slice(sortedCandidates, func(i, j int) bool {
 		return sortedCandidates[i].startBlock < sortedCandidates[j].startBlock
 	})
 
 	for _, cand := range sortedCandidates {
 		logicalPage := cand.logicalPage
-		blocks := make([][]byte, cand.numBlocks)
-		for i := 0; i < cand.numBlocks; i++ {
-			bBytes, err := reader.ReadBlock(cand.startBlock + uint64(i))
-			if err != nil {
-				return nil, fmt.Errorf("failed to read block %d for page %d: %w", cand.startBlock+uint64(i), logicalPage, err)
-			}
-			blocks[i] = make([]byte, BlockSize)
-			copy(blocks[i], bBytes)
+		if cand.decodeErr != nil {
+			return nil, cand.decodeErr
 		}
-
-		if cand.numBlocks == 1 {
-			slotted, err := WrapSlottedPage(blocks[0])
-			if err != nil {
-				return nil, fmt.Errorf("failed to wrap recovered slotted page %d: %w", logicalPage, err)
+		if cand.empty {
+			emptyPages = append(emptyPages, logicalPage)
+			continue
+		}
+		for _, record := range cand.records {
+			entry := KeyIndexEntry{
+				LogicalPage:      logicalPage,
+				Slot:             record.slot,
+				LSN:              record.lsn,
+				NumBlocks:        cand.numBlocks,
+				IsOversize:       record.isOversize,
+				OversizeFileName: record.oversizeFileName,
 			}
-			if slotted.ActiveSlotsCount() == 0 {
-				emptyPages = append(emptyPages, logicalPage)
+			existing, exists := keyIndex[record.key]
+			if !exists {
+				keyIndex[record.key] = entry
+			} else if existing.LogicalPage == logicalPage {
+				if record.lsn > existing.LSN {
+					keyIndex[record.key] = entry
+				}
+			} else if record.lsn > existing.LSN {
+				supersededPages[record.key] = append(supersededPages[record.key], existing)
+				keyIndex[record.key] = entry
 			} else {
-				for s := uint32(0); s < uint32(slotted.NumSlots()); s++ {
-					k, val, recLSN, isOversize, err := slotted.GetWithFlag(s)
-					if err != nil {
-						if errors.Is(err, ErrSlotNotFound) {
-							continue
-						}
-						return nil, fmt.Errorf("failed to get slot %d from page %d: %w", s, logicalPage, err)
-					}
-					entry := KeyIndexEntry{
-						LogicalPage: logicalPage,
-						Slot:        s,
-						LSN:         recLSN,
-						NumBlocks:   1,
-						IsOversize:  isOversize,
-					}
-					if isOversize {
-						_, _, fileName, decodeErr := DecodeOversizePointer(val)
-						if decodeErr != nil {
-							return nil, fmt.Errorf("failed to decode oversize pointer in page %d slot %d: %w", logicalPage, s, decodeErr)
-						}
-						entry.OversizeFileName = fileName
-					}
-					existing, exists := keyIndex[k]
-					if !exists {
-						keyIndex[k] = entry
-					} else if existing.LogicalPage == logicalPage {
-						if recLSN > existing.LSN {
-							keyIndex[k] = entry
-						}
-					} else if recLSN > existing.LSN {
-						supersededPages[k] = append(supersededPages[k], existing)
-						keyIndex[k] = entry
-					} else {
-						supersededPages[k] = append(supersededPages[k], entry)
-					}
-				}
-			}
-		} else {
-			k, _, recLSN, err := DecodeMultiBlockPage(blocks)
-			if err != nil {
-				return nil, fmt.Errorf("failed to decode recovered multi-block page %d: %w", logicalPage, err)
-			}
-			if k != "" { // Active record (not tombstone)
-				entry := KeyIndexEntry{
-					LogicalPage: logicalPage,
-					Slot:        0,
-					LSN:         recLSN,
-					NumBlocks:   cand.numBlocks,
-				}
-				existing, exists := keyIndex[k]
-				if !exists {
-					keyIndex[k] = entry
-				} else if existing.LogicalPage == logicalPage {
-					if recLSN > existing.LSN {
-						keyIndex[k] = entry
-					}
-				} else if recLSN > existing.LSN {
-					supersededPages[k] = append(supersededPages[k], existing)
-					keyIndex[k] = entry
-				} else {
-					supersededPages[k] = append(supersededPages[k], entry)
-				}
-			} else {
-				emptyPages = append(emptyPages, logicalPage)
+				supersededPages[record.key] = append(supersededPages[record.key], entry)
 			}
 		}
 	}
