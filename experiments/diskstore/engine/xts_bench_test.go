@@ -19,6 +19,7 @@ import (
 	"crypto/cipher"
 	"testing"
 
+	diskstorexts "github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/xts"
 	"golang.org/x/crypto/xts"
 )
 
@@ -33,6 +34,10 @@ func BenchmarkBlockCipher4KiB(b *testing.B) {
 	xtsCipher, err := xts.NewCipher(aes.NewCipher, key64)
 	if err != nil {
 		b.Fatalf("xts.NewCipher: %v", err)
+	}
+	diskstoreXTSCipher, err := diskstorexts.NewCipher(key64)
+	if err != nil {
+		b.Fatalf("diskstorexts.NewCipher: %v", err)
 	}
 	aesBlock, err := aes.NewCipher(key64[:MasterKeySize])
 	if err != nil {
@@ -54,6 +59,20 @@ func BenchmarkBlockCipher4KiB(b *testing.B) {
 		b.SetBytes(BlockSize)
 		for i := 0; i < b.N; i++ {
 			xtsCipher.Decrypt(dst, src, uint64(i))
+		}
+	})
+
+	b.Run("DiskstoreXTS_Encrypt", func(b *testing.B) {
+		b.SetBytes(BlockSize)
+		for i := 0; i < b.N; i++ {
+			diskstoreXTSCipher.Encrypt(dst, src, uint64(i))
+		}
+	})
+
+	b.Run("DiskstoreXTS_Decrypt", func(b *testing.B) {
+		b.SetBytes(BlockSize)
+		for i := 0; i < b.N; i++ {
+			diskstoreXTSCipher.Decrypt(dst, src, uint64(i))
 		}
 	})
 
