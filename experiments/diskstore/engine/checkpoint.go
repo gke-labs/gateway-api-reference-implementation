@@ -143,11 +143,11 @@ func (c *Checkpointer) Checkpoint() error {
 		return fmt.Errorf("checkpoint failed to flush dirty pages: %w", err)
 	}
 
-	// In external-log mode, confirm redoStartLSN is durable in the external log before
-	// advancing meta.db so recovery never skips unconfirmed tail positions.
-	if c.wal == nil && c.bp.waitDurable != nil && redoStartLSN > 0 {
-		if err := c.bp.waitDurable(redoStartLSN); err != nil {
-			return fmt.Errorf("checkpoint failed waiting for external log durability: %w", err)
+	// Confirm redoStartLSN is durable in the log before advancing meta.db so recovery
+	// never skips unconfirmed tail positions when no dirty pages were flushed.
+	if c.wal != nil && redoStartLSN > 0 {
+		if err := c.wal.SyncThrough(redoStartLSN); err != nil {
+			return fmt.Errorf("checkpoint failed to confirm log durability through LSN %d: %w", redoStartLSN, err)
 		}
 	}
 
@@ -165,16 +165,14 @@ func (c *Checkpointer) Checkpoint() error {
 		return fmt.Errorf("checkpoint failed to write recovery start page to meta.db: %w", err)
 	}
 
-	if c.wal != nil {
-		// 5. Fsync WAL
-		if err := c.wal.Sync(); err != nil {
-			return fmt.Errorf("checkpoint failed to fsync WAL: %w", err)
-		}
+	// 5. Fsync WAL
+	if err := c.wal.Sync(); err != nil {
+		return fmt.Errorf("checkpoint failed to fsync WAL: %w", err)
+	}
 
-		// 6. Truncate finished WAL segments prior to redoStartLSN
-		if err := c.wal.TruncateBefore(redoStartLSN); err != nil {
-			return fmt.Errorf("checkpoint failed to truncate WAL: %w", err)
-		}
+	// 6. Truncate finished WAL segments prior to redoStartLSN
+	if err := c.wal.TruncateBefore(redoStartLSN); err != nil {
+		return fmt.Errorf("checkpoint failed to truncate WAL: %w", err)
 	}
 
 	return nil

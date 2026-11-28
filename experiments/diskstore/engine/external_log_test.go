@@ -17,111 +17,33 @@ package engine
 import (
 	"bytes"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 )
 
-// memExternalStream simulates an authoritative external redo stream in memory.
-type memExternalStream struct {
-	mu               sync.Mutex
-	records          []ExternalRecord
-	durableLSN       atomic.Uint64
-	replayStartLSNs  []uint64
-	waitDurableCalls []uint64
-	faultFS          *FaultFS
-}
-
-func (stream *memExternalStream) appendPut(table, key string, payload []byte, lsn uint64) {
-	stream.mu.Lock()
-	defer stream.mu.Unlock()
-	stream.records = append(stream.records, ExternalRecord{
-		Type:    RecordTypePut,
-		LSN:     lsn,
-		Table:   table,
-		Key:     key,
-		Payload: bytes.Clone(payload),
-	})
-}
-
-func (stream *memExternalStream) appendDelete(table, key string, lsn uint64) {
-	stream.mu.Lock()
-	defer stream.mu.Unlock()
-	stream.records = append(stream.records, ExternalRecord{
-		Type:  RecordTypeDelete,
-		LSN:   lsn,
-		Table: table,
-		Key:   key,
-	})
-}
-
-func (stream *memExternalStream) setDurable(lsn uint64) {
-	stream.durableLSN.Store(lsn)
-	if stream.faultFS != nil {
-		stream.faultFS.SetMaxFsyncedLSN(lsn)
+func openExternalStore(t *testing.T, fs FS, dir string, config ExternalLogConfig, extraOptions ...Option) *Engine {
+	t.Helper()
+	options := make([]Option, 0, 4+len(extraOptions))
+	if fs != nil {
+		options = append(options, WithFS(fs))
 	}
-}
-
-func (stream *memExternalStream) durable() uint64 {
-	return stream.durableLSN.Load()
-}
-
-func (stream *memExternalStream) waitDurable(lsn uint64) error {
-	stream.mu.Lock()
-	stream.waitDurableCalls = append(stream.waitDurableCalls, lsn)
-	stream.mu.Unlock()
-	if durable := stream.durableLSN.Load(); lsn > durable {
-		return ErrNotDurable
+	options = append(options, WithDir(dir), WithExternalLog(config))
+	options = append(options, extraOptions...)
+	store, err := Open(options...)
+	if err != nil {
+		t.Fatalf("Open(%s) failed: %v", dir, err)
 	}
-	return nil
+	return store
 }
 
-func (stream *memExternalStream) openReplay(startLSN uint64) (ExternalLogIterator, error) {
-	stream.mu.Lock()
-	defer stream.mu.Unlock()
-	stream.replayStartLSNs = append(stream.replayStartLSNs, startLSN)
-	var tail []ExternalRecord
-	for _, rec := range stream.records {
-		if rec.LSN >= startLSN {
-			tail = append(tail, rec)
-		}
+func closeStore(t *testing.T, store *Engine) {
+	t.Helper()
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
 	}
-	return &memExternalIterator{records: tail}, nil
-}
-
-func (stream *memExternalStream) config() ExternalLogConfig {
-	return ExternalLogConfig{
-		WaitDurable: stream.waitDurable,
-		DurableLSN:  stream.durable,
-		OpenReplay:  stream.openReplay,
-	}
-}
-
-type memExternalIterator struct {
-	records []ExternalRecord
-	idx     int
-	closed  bool
-}
-
-func (it *memExternalIterator) Next() (ExternalRecord, error) {
-	if it.closed {
-		return ExternalRecord{}, io.ErrClosedPipe
-	}
-	if it.idx >= len(it.records) {
-		return ExternalRecord{}, io.EOF
-	}
-	rec := it.records[it.idx]
-	it.idx++
-	return rec, nil
-}
-
-func (it *memExternalIterator) Close() error {
-	it.closed = true
-	return nil
 }
 
 func assertNoWALFilesMemFS(t *testing.T, memFS *MemFS, dir string) {
@@ -140,23 +62,36 @@ func assertNoWALFilesMemFS(t *testing.T, memFS *MemFS, dir string) {
 	}
 }
 
+func makeIncompressiblePayload(size int) []byte {
+	payload := make([]byte, size)
+	state := uint64(0x9e3779b97f4a7c15)
+	for index := range payload {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		payload[index] = byte(state)
+	}
+	return payload
+}
+
 func TestExternalLog_ModeEnforcement(t *testing.T) {
-	t.Run("requires WaitDurable or DurableLSN", func(t *testing.T) {
+	t.Run("requires DurableLSN", func(t *testing.T) {
 		memFS := NewMemFS()
-		_, err := Open(WithFS(memFS), WithDir("bad_cfg"), WithCreate(), WithExternalLog(ExternalLogConfig{}))
-		if err == nil {
-			t.Fatalf("expected Open to fail when neither WaitDurable nor DurableLSN is set")
+		if _, err := Open(WithFS(memFS), WithDir("missing_durable"), WithCreate(), WithExternalLog(ExternalLogConfig{})); err == nil {
+			t.Fatalf("expected Open to fail when DurableLSN is nil")
+		}
+		if _, err := Open(WithFS(memFS), WithDir("wait_only"), WithCreate(), WithExternalLog(ExternalLogConfig{
+			WaitDurable: func(uint64) error { return nil },
+		})); err == nil {
+			t.Fatalf("expected Open to fail when DurableLSN is nil even if WaitDurable is set")
 		}
 	})
 
-	t.Run("external-log mode rejects Put, Delete, Sync", func(t *testing.T) {
+	t.Run("external-log mode rejects Put, Delete, and Sync", func(t *testing.T) {
 		memFS := NewMemFS()
-		stream := &memExternalStream{}
-		store, err := Open(WithFS(memFS), WithDir("ext_mode"), WithCreate(), WithExternalLog(stream.config()))
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
-		defer store.Close()
+		var watermark atomic.Uint64
+		store := openExternalStore(t, memFS, "ext_mode", ExternalLogConfig{DurableLSN: watermark.Load}, WithCreate())
+		defer closeStore(t, store)
 
 		if err := store.Put("t", "k1", []byte("v1")); !errors.Is(err, ErrExternalLogMode) {
 			t.Fatalf("expected ErrExternalLogMode from Put, got: %v", err)
@@ -179,7 +114,7 @@ func TestExternalLog_ModeEnforcement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open failed: %v", err)
 		}
-		defer store.Close()
+		defer closeStore(t, store)
 
 		if err := store.ApplyPut("t", "k1", []byte("v1"), 1); !errors.Is(err, ErrLocalWALMode) {
 			t.Fatalf("expected ErrLocalWALMode from ApplyPut, got: %v", err)
@@ -192,22 +127,20 @@ func TestExternalLog_ModeEnforcement(t *testing.T) {
 
 func TestExternalLog_MonotonicPositionsAndMutations(t *testing.T) {
 	memFS := NewMemFS()
-	stream := &memExternalStream{}
-	stream.setDurable(100)
+	var watermark atomic.Uint64
+	watermark.Store(100)
 
-	store, err := Open(
-		WithFS(memFS),
-		WithDir("ext_mono"),
+	store := openExternalStore(
+		t,
+		memFS,
+		"ext_mono",
+		ExternalLogConfig{DurableLSN: watermark.Load},
 		WithCreate(),
 		WithCompressionCodec(CodecNone),
-		WithExternalLog(stream.config()),
 	)
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer store.Close()
+	defer closeStore(t, store)
 
-	// LSN 0 is rejected.
+	// Reject LSN 0 without advancing Position.
 	if err := store.ApplyPut("t", "k1", []byte("zero"), 0); !errors.Is(err, ErrNonMonotonicLSN) {
 		t.Fatalf("expected ErrNonMonotonicLSN for LSN 0, got: %v", err)
 	}
@@ -215,7 +148,6 @@ func TestExternalLog_MonotonicPositionsAndMutations(t *testing.T) {
 		t.Fatalf("expected Position 0 after rejected put, got %d", store.Position())
 	}
 
-	// Apply initial puts at LSN 5 and LSN 10.
 	if err := store.ApplyPut("t", "k1", []byte("v1"), 5); err != nil {
 		t.Fatalf("ApplyPut LSN 5 failed: %v", err)
 	}
@@ -223,7 +155,7 @@ func TestExternalLog_MonotonicPositionsAndMutations(t *testing.T) {
 		t.Fatalf("expected Position 5, got %d", store.Position())
 	}
 
-	// Duplicate and regressing positions are rejected without failing the engine.
+	// Reject duplicate and regressing positions without failing the engine.
 	if err := store.ApplyPut("t", "k1", []byte("dup"), 5); !errors.Is(err, ErrNonMonotonicLSN) {
 		t.Fatalf("expected ErrNonMonotonicLSN for duplicate LSN 5, got: %v", err)
 	}
@@ -234,13 +166,12 @@ func TestExternalLog_MonotonicPositionsAndMutations(t *testing.T) {
 		t.Fatalf("expected ErrNonMonotonicLSN for delete at LSN 5, got: %v", err)
 	}
 
-	// Verify k1 still holds "v1" and engine is healthy.
-	val, exists, err := store.Get("t", "k1")
-	if err != nil || !exists || string(val) != "v1" {
-		t.Fatalf("unexpected Get(k1): val=%q exists=%v err=%v", val, exists, err)
+	value, exists, err := store.Get("t", "k1")
+	if err != nil || !exists || string(value) != "v1" {
+		t.Fatalf("unexpected Get(k1): value=%q exists=%v err=%v", value, exists, err)
 	}
 
-	// ApplyDelete of a non-existent key advances Position.
+	// Deleting a nonexistent key still advances Position.
 	if err := store.ApplyDelete("t", "nonexistent", 7); err != nil {
 		t.Fatalf("ApplyDelete nonexistent at LSN 7 failed: %v", err)
 	}
@@ -251,12 +182,11 @@ func TestExternalLog_MonotonicPositionsAndMutations(t *testing.T) {
 		t.Fatalf("expected ErrNonMonotonicLSN at LSN 7, got: %v", err)
 	}
 
-	// Overwrite k1, add multi-block k2, then delete k1.
-	multiVal := bytes.Repeat([]byte("multi-block-ext-"), 400)
+	multiBlockValue := bytes.Repeat([]byte("multi-block-ext-"), 400)
 	if err := store.ApplyPut("t", "k1", []byte("v1-updated"), 10); err != nil {
 		t.Fatalf("ApplyPut overwrite k1 failed: %v", err)
 	}
-	if err := store.ApplyPut("t", "k2", multiVal, 11); err != nil {
+	if err := store.ApplyPut("t", "k2", multiBlockValue, 11); err != nil {
 		t.Fatalf("ApplyPut multi-block k2 failed: %v", err)
 	}
 	if err := store.ApplyDelete("t", "k1", 12); err != nil {
@@ -266,8 +196,8 @@ func TestExternalLog_MonotonicPositionsAndMutations(t *testing.T) {
 	if _, exists, err := store.Get("t", "k1"); err != nil || exists {
 		t.Fatalf("expected k1 deleted, got exists=%v err=%v", exists, err)
 	}
-	gotMulti, exists, err := store.Get("t", "k2")
-	if err != nil || !exists || !bytes.Equal(gotMulti, multiVal) {
+	gotMultiBlock, exists, err := store.Get("t", "k2")
+	if err != nil || !exists || !bytes.Equal(gotMultiBlock, multiBlockValue) {
 		t.Fatalf("multi-block Get(k2) mismatch: exists=%v err=%v", exists, err)
 	}
 
@@ -275,517 +205,376 @@ func TestExternalLog_MonotonicPositionsAndMutations(t *testing.T) {
 }
 
 func TestExternalLog_WriteAheadRule(t *testing.T) {
-	t.Run("flush refuses when page LSN exceeds durable watermark", func(t *testing.T) {
+	t.Run("ErrNotDurable is transient and Checkpoint succeeds once watermark advances", func(t *testing.T) {
 		memFS := NewMemFS()
 		faultFS := NewFaultFS(memFS)
 		var watermark atomic.Uint64
 		watermark.Store(5)
 		faultFS.SetMaxFsyncedLSN(5)
 
-		store, err := Open(
-			WithFS(faultFS),
-			WithDir("wal_rule_refuse"),
+		store := openExternalStore(
+			t,
+			faultFS,
+			"wal_rule_transient",
+			ExternalLogConfig{DurableLSN: watermark.Load},
 			WithCreate(),
 			WithCompressionCodec(CodecNone),
-			WithExternalLog(ExternalLogConfig{
-				DurableLSN: watermark.Load,
-			}),
 		)
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
-		defer store.Close()
+		defer closeStore(t, store)
 
 		if err := store.ApplyPut("t", "k1", []byte("v1"), 10); err != nil {
 			t.Fatalf("ApplyPut failed: %v", err)
 		}
 
-		// Checkpoint tries to flush page with LSN 10 while durable watermark is 5.
-		err = store.Checkpoint()
-		if !errors.Is(err, ErrNotDurable) {
+		// Checkpoint fails with ErrNotDurable while watermark (5) lags page LSN (10).
+		if err := store.Checkpoint(); !errors.Is(err, ErrNotDurable) {
 			t.Fatalf("expected ErrNotDurable on Checkpoint when watermark < page LSN, got: %v", err)
 		}
-
-		// FaultFS must report no write-ahead rule violation because the write was blocked before touching heap.db.
 		if violations := faultFS.Violations(); len(violations) > 0 {
 			t.Fatalf("unexpected FaultFS rule violations: %v", violations)
 		}
-		// heap.db must remain empty because the dirty page was never written.
 		memFS.mu.RLock()
-		heapLen := len(memFS.files[filepath.Join("wal_rule_refuse", "heap.db")])
+		heapLen := len(memFS.files[filepath.Join("wal_rule_transient", "heap.db")])
 		memFS.mu.RUnlock()
 		if heapLen != 0 {
 			t.Fatalf("expected heap.db to remain empty when flush blocked by watermark, got %d bytes", heapLen)
 		}
+
+		// The store must remain healthy and accept reads and further writes.
+		value, exists, err := store.Get("t", "k1")
+		if err != nil || !exists || string(value) != "v1" {
+			t.Fatalf("store became unusable after transient ErrNotDurable: value=%q exists=%v err=%v", value, exists, err)
+		}
+		if err := store.ApplyPut("t", "k2", []byte("v2"), 12); err != nil {
+			t.Fatalf("ApplyPut after transient ErrNotDurable failed: %v", err)
+		}
+
+		// Advancing the watermark allows Checkpoint to flush and advance meta.db.
+		watermark.Store(12)
+		faultFS.SetMaxFsyncedLSN(12)
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 1 failed after advancing watermark: %v", err)
+		}
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 2 failed after advancing watermark: %v", err)
+		}
+		if store.RecoveryPosition() != 12 {
+			t.Fatalf("expected RecoveryPosition 12, got %d", store.RecoveryPosition())
+		}
+		if violations := faultFS.Violations(); len(violations) > 0 {
+			t.Fatalf("unexpected FaultFS rule violations after checkpoint: %v", violations)
+		}
 	})
 
-	t.Run("checkpoint with no dirty pages still checks durable watermark", func(t *testing.T) {
+	t.Run("metadata-only checkpoint checks watermark and succeeds once watermark advances", func(t *testing.T) {
 		memFS := NewMemFS()
 		var watermark atomic.Uint64
 		watermark.Store(5)
 
-		store, err := Open(
-			WithFS(memFS),
-			WithDir("wal_rule_nodirty"),
+		store := openExternalStore(
+			t,
+			memFS,
+			"wal_rule_nodirty",
+			ExternalLogConfig{DurableLSN: watermark.Load},
 			WithCreate(),
-			WithExternalLog(ExternalLogConfig{
-				DurableLSN: watermark.Load,
-			}),
 		)
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
-		defer store.Close()
+		defer closeStore(t, store)
 
-		// Deleting a non-existent key advances Position without dirtying any page.
 		if err := store.ApplyDelete("t", "missing", 10); err != nil {
 			t.Fatalf("ApplyDelete failed: %v", err)
 		}
-		err = store.Checkpoint()
-		if !errors.Is(err, ErrNotDurable) {
+		if err := store.Checkpoint(); !errors.Is(err, ErrNotDurable) {
 			t.Fatalf("expected ErrNotDurable when advancing meta.db past watermark, got: %v", err)
 		}
 		if store.RecoveryPosition() != 0 {
 			t.Fatalf("expected RecoveryPosition to stay 0, got %d", store.RecoveryPosition())
 		}
+
+		watermark.Store(10)
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint failed after watermark advanced: %v", err)
+		}
+		if store.RecoveryPosition() != 10 {
+			t.Fatalf("expected RecoveryPosition 10, got %d", store.RecoveryPosition())
+		}
 	})
 
-	t.Run("blocking WaitDurable waits before heap writes under eviction pressure", func(t *testing.T) {
+	t.Run("blocking WaitDurable waits before heap writes", func(t *testing.T) {
 		memFS := NewMemFS()
 		faultFS := NewFaultFS(memFS)
-		stream := &memExternalStream{faultFS: faultFS}
-
+		var watermark atomic.Uint64
 		waitStarted := make(chan struct{})
 		releaseWait := make(chan struct{})
 		var waitedLSN atomic.Uint64
 
-		store, err := Open(
-			WithFS(faultFS),
-			WithDir("wal_rule_wait"),
-			WithCreate(),
-			WithNumPoolBlocks(16),
-			WithCompressionCodec(CodecNone),
-			WithExternalLog(ExternalLogConfig{
+		store := openExternalStore(
+			t,
+			faultFS,
+			"wal_rule_wait",
+			ExternalLogConfig{
+				DurableLSN: watermark.Load,
 				WaitDurable: func(lsn uint64) error {
-					if lsn > stream.durable() {
+					if lsn > watermark.Load() {
 						waitedLSN.Store(lsn)
 						close(waitStarted)
 						<-releaseWait
 					}
-					return stream.waitDurable(lsn)
+					if lsn > watermark.Load() {
+						return ErrNotDurable
+					}
+					return nil
 				},
-				DurableLSN: stream.durable,
-				OpenReplay: stream.openReplay,
-			}),
+			},
+			WithCreate(),
+			WithNumPoolBlocks(16),
+			WithCompressionCodec(CodecNone),
 		)
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
 
-		// Apply a put whose LSN is not yet durable.
-		stream.appendPut("t", "k1", []byte("v1"), 10)
 		if err := store.ApplyPut("t", "k1", []byte("v1"), 10); err != nil {
 			t.Fatalf("ApplyPut failed: %v", err)
 		}
 
-		// Start Checkpoint in a goroutine; it must block in WaitDurable until we advance durability.
-		cpDone := make(chan error, 1)
+		checkpointDone := make(chan error, 1)
 		go func() {
-			cpDone <- store.Checkpoint()
+			checkpointDone <- store.Checkpoint()
 		}()
 
-		// Wait until WaitDurable is entered for LSN 10.
 		<-waitStarted
 		if got := waitedLSN.Load(); got != 10 {
 			t.Fatalf("expected WaitDurable(10), got WaitDurable(%d)", got)
 		}
 
-		// Advance durability and release the wait.
-		stream.setDurable(10)
+		watermark.Store(10)
+		faultFS.SetMaxFsyncedLSN(10)
 		close(releaseWait)
 
-		if err := <-cpDone; err != nil {
+		if err := <-checkpointDone; err != nil {
 			t.Fatalf("Checkpoint failed after durability released: %v", err)
 		}
 		if violations := faultFS.Violations(); len(violations) > 0 {
 			t.Fatalf("FaultFS detected rule violations: %v", violations)
 		}
-		if err := store.Close(); err != nil {
-			t.Fatalf("Close failed: %v", err)
-		}
+		closeStore(t, store)
 		assertNoWALFilesMemFS(t, memFS, "wal_rule_wait")
+	})
+
+	t.Run("oversize replacement does not block on WaitDurable when watermark lags", func(t *testing.T) {
+		memFS := NewMemFS()
+		var watermark atomic.Uint64
+		watermark.Store(1)
+		var waitCalled atomic.Bool
+
+		store := openExternalStore(
+			t,
+			memFS,
+			"wal_rule_oversize",
+			ExternalLogConfig{
+				DurableLSN: watermark.Load,
+				WaitDurable: func(lsn uint64) error {
+					waitCalled.Store(true)
+					if lsn > watermark.Load() {
+						return ErrNotDurable
+					}
+					return nil
+				},
+			},
+			WithCreate(),
+			WithCompressionCodec(CodecNone),
+			WithQuarantine(QuarantineOptions{SweepInterval: -1}),
+		)
+
+		oversizeValue := makeIncompressiblePayload((MaxBatchBlocks + 8) * BlockSize)
+		if err := store.ApplyPut("blobs", "b1", oversizeValue, 1); err != nil {
+			t.Fatalf("ApplyPut oversize LSN 1 failed: %v", err)
+		}
+		store.keyMu.RLock()
+		firstFile := store.keyIndex[qualifyKey("blobs", "b1")].OversizeFileName
+		store.keyMu.RUnlock()
+
+		// Overwrite at LSN 2 while DurableLSN is still 1: must not call WaitDurable
+		// and must leave firstFile intact on disk.
+		if err := store.ApplyPut("blobs", "b1", []byte("small"), 2); err != nil {
+			t.Fatalf("ApplyPut overwrite LSN 2 failed: %v", err)
+		}
+		if waitCalled.Load() {
+			t.Fatalf("ApplyPut must not invoke blocking WaitDurable under writerMu")
+		}
+		openedFirst, err := memFS.Open(filepath.Join("wal_rule_oversize", "oversize", firstFile))
+		if err != nil {
+			t.Fatalf("expected superseded oversize file to remain when watermark lags: %v", err)
+		}
+		if err := openedFirst.Close(); err != nil {
+			t.Fatalf("failed to close oversize file: %v", err)
+		}
+
+		// Overwrite another oversize value at LSN 4 when DurableLSN >= 4: unlinks immediately.
+		watermark.Store(4)
+		if err := store.ApplyPut("blobs", "b2", oversizeValue, 3); err != nil {
+			t.Fatalf("ApplyPut oversize LSN 3 failed: %v", err)
+		}
+		store.keyMu.RLock()
+		secondFile := store.keyIndex[qualifyKey("blobs", "b2")].OversizeFileName
+		store.keyMu.RUnlock()
+		if err := store.ApplyDelete("blobs", "b2", 4); err != nil {
+			t.Fatalf("ApplyDelete oversize LSN 4 failed: %v", err)
+		}
+		if _, err := memFS.Open(filepath.Join("wal_rule_oversize", "oversize", secondFile)); !os.IsNotExist(err) {
+			t.Fatalf("expected superseded oversize file to be unlinked when durable, got err=%v", err)
+		}
+
+		closeStore(t, store)
 	})
 }
 
-func TestExternalLog_CrashAndRecovery(t *testing.T) {
-	t.Run("unflushed writes recover from external stream", func(t *testing.T) {
-		memFS := NewMemFS()
-		dir := "ext_crash_unflushed"
-		stream := &memExternalStream{}
-
-		store, err := Open(
-			WithFS(memFS),
-			WithDir(dir),
-			WithCreate(),
-			WithCompressionCodec(CodecNone),
-			WithExternalLog(stream.config()),
-		)
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
-
-		applyPut := func(lsn uint64, table, key string, val []byte) {
-			t.Helper()
-			stream.appendPut(table, key, val, lsn)
-			stream.setDurable(lsn)
-			if err := store.ApplyPut(table, key, val, lsn); err != nil {
-				t.Fatalf("ApplyPut(%s, %d) failed: %v", key, lsn, err)
-			}
-		}
-		applyDelete := func(lsn uint64, table, key string) {
-			t.Helper()
-			stream.appendDelete(table, key, lsn)
-			stream.setDurable(lsn)
-			if err := store.ApplyDelete(table, key, lsn); err != nil {
-				t.Fatalf("ApplyDelete(%s, %d) failed: %v", key, lsn, err)
-			}
-		}
-
-		multiVal := bytes.Repeat([]byte("multi-recover-"), 500)
-		applyPut(1, "pods", "p1", []byte("v1"))
-		applyPut(2, "pods", "p2", []byte("v2"))
-		applyPut(3, "pods", "p-multi", multiVal)
-		applyPut(4, "pods", "p1", []byte("v1-v2"))
-		applyDelete(5, "pods", "p2")
-
-		// Simulate crash by cloning the filesystem without calling Close.
-		crashedFS := cloneMemFS(memFS)
-		_ = store.Close()
-
-		reopened, err := Open(
-			WithFS(crashedFS),
-			WithDir(dir),
-			WithCompressionCodec(CodecNone),
-			WithExternalLog(stream.config()),
-		)
-		if err != nil {
-			t.Fatalf("reopen failed: %v", err)
-		}
-		defer reopened.Close()
-
-		if len(stream.replayStartLSNs) != 1 || stream.replayStartLSNs[0] != 1 {
-			t.Fatalf("expected OpenReplay to start at 1, got %v", stream.replayStartLSNs)
-		}
-		if reopened.Position() != 5 {
-			t.Fatalf("expected Position 5 after recovery, got %d", reopened.Position())
-		}
-
-		v1, exists, err := reopened.Get("pods", "p1")
-		if err != nil || !exists || string(v1) != "v1-v2" {
-			t.Fatalf("Get(p1): got %q exists=%v err=%v", v1, exists, err)
-		}
-		if _, exists, err := reopened.Get("pods", "p2"); err != nil || exists {
-			t.Fatalf("expected p2 deleted after recovery, got exists=%v err=%v", exists, err)
-		}
-		vMulti, exists, err := reopened.Get("pods", "p-multi")
-		if err != nil || !exists || !bytes.Equal(vMulti, multiVal) {
-			t.Fatalf("Get(p-multi) mismatch: exists=%v err=%v", exists, err)
-		}
-
-		// Monotonic enforcement continues from recovered position 5.
-		if err := reopened.ApplyPut("pods", "p3", []byte("bad"), 5); !errors.Is(err, ErrNonMonotonicLSN) {
-			t.Fatalf("expected ErrNonMonotonicLSN at LSN 5, got: %v", err)
-		}
-		if err := reopened.ApplyPut("pods", "p3", []byte("ok"), 6); err != nil {
-			t.Fatalf("ApplyPut at LSN 6 failed: %v", err)
-		}
-
-		assertNoWALFilesMemFS(t, crashedFS, dir)
-	})
-
-	t.Run("resumes replay from durable meta.db recovery position after checkpoints and evictions", func(t *testing.T) {
+func TestExternalLog_ReopenAndCheckpoints(t *testing.T) {
+	t.Run("clean close and reopen preserves data, position, and meta.db recovery position", func(t *testing.T) {
 		memFS := NewMemFS()
 		faultFS := NewFaultFS(memFS)
-		dir := "ext_crash_checkpoint"
-		stream := &memExternalStream{faultFS: faultFS}
+		dir := "ext_reopen_clean"
+		var watermark atomic.Uint64
 
-		store, err := Open(
-			WithFS(faultFS),
-			WithDir(dir),
+		store := openExternalStore(
+			t,
+			faultFS,
+			dir,
+			ExternalLogConfig{DurableLSN: watermark.Load},
 			WithCreate(),
 			WithNumPoolBlocks(16),
 			WithCompressionCodec(CodecNone),
-			WithExternalLog(stream.config()),
 		)
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
 
 		expected := make(map[string][]byte)
 		lsn := uint64(0)
-		applyPut := func(key string, val []byte) {
+		applyPut := func(key string, value []byte) {
 			t.Helper()
 			lsn++
-			stream.appendPut("items", key, val, lsn)
-			stream.setDurable(lsn)
-			if err := store.ApplyPut("items", key, val, lsn); err != nil {
+			watermark.Store(lsn)
+			faultFS.SetMaxFsyncedLSN(lsn)
+			if err := store.ApplyPut("items", key, value, lsn); err != nil {
 				t.Fatalf("ApplyPut(%s, %d) failed: %v", key, lsn, err)
 			}
-			expected[key] = bytes.Clone(val)
-		}
-		applyDelete := func(key string) {
-			t.Helper()
-			lsn++
-			stream.appendDelete("items", key, lsn)
-			stream.setDurable(lsn)
-			if err := store.ApplyDelete("items", key, lsn); err != nil {
-				t.Fatalf("ApplyDelete(%s, %d) failed: %v", key, lsn, err)
-			}
-			delete(expected, key)
+			expected[key] = bytes.Clone(value)
 		}
 
-		// Write enough records to trigger pool evictions and flushes.
-		for i := 0; i < 30; i++ {
-			val := bytes.Repeat([]byte{byte('a' + (i % 26))}, 1500)
-			applyPut("k-"+string(rune('a'+(i%26)))+"-"+string(rune('0'+(i/26))), val)
+		for index := 0; index < 30; index++ {
+			key := "k-" + string(rune('a'+(index%26))) + "-" + string(rune('0'+(index/26)))
+			value := bytes.Repeat([]byte{byte('a' + (index % 26))}, 1500)
+			applyPut(key, value)
 		}
 
-		// Two checkpoints: first flushes dirty pages and clears RedoLSN; second advances
-		// meta.db's recovery position to the current max applied LSN (30).
+		// Two checkpoints flush dirty pages and advance meta.db to lsn.
 		if err := store.Checkpoint(); err != nil {
 			t.Fatalf("Checkpoint 1 failed: %v", err)
 		}
 		if err := store.Checkpoint(); err != nil {
 			t.Fatalf("Checkpoint 2 failed: %v", err)
 		}
-		checkpointPos := store.RecoveryPosition()
-		if checkpointPos != lsn {
-			t.Fatalf("expected RecoveryPosition %d after second checkpoint, got %d", lsn, checkpointPos)
+		checkpointPosition := store.RecoveryPosition()
+		if checkpointPosition != lsn {
+			t.Fatalf("expected RecoveryPosition %d after second checkpoint, got %d", lsn, checkpointPosition)
 		}
-
-		// Apply additional mutations after the checkpoint (overwrites, deletes, new keys, multi-block).
-		applyPut("k-a-0", []byte("overwritten-after-cp"))
-		applyDelete("k-b-0")
-		applyPut("k-new-multi", bytes.Repeat([]byte("tail-multi-"), 600))
-		for i := 0; i < 10; i++ {
-			applyPut("k-tail-"+string(rune('0'+i)), bytes.Repeat([]byte("tail-"), 300))
-		}
-
 		if violations := faultFS.Violations(); len(violations) > 0 {
-			t.Fatalf("FaultFS detected rule violations before crash: %v", violations)
+			t.Fatalf("FaultFS detected rule violations: %v", violations)
 		}
+		closeStore(t, store)
+		assertNoWALFilesMemFS(t, memFS, dir)
 
-		// Simulate crash without Close.
-		crashedFS := cloneMemFS(memFS)
-		_ = store.Close()
-
-		reopened, err := Open(
-			WithFS(crashedFS),
-			WithDir(dir),
+		reopened := openExternalStore(
+			t,
+			memFS,
+			dir,
+			ExternalLogConfig{DurableLSN: watermark.Load},
 			WithNumPoolBlocks(16),
 			WithCompressionCodec(CodecNone),
-			WithExternalLog(stream.config()),
 		)
-		if err != nil {
-			t.Fatalf("reopen after crash failed: %v", err)
-		}
-		defer reopened.Close()
+		defer closeStore(t, reopened)
 
-		if len(stream.replayStartLSNs) != 1 || stream.replayStartLSNs[0] != checkpointPos {
-			t.Fatalf("expected OpenReplay to resume at meta.db position %d, got %v", checkpointPos, stream.replayStartLSNs)
-		}
 		if reopened.Position() != lsn {
-			t.Fatalf("expected Position %d after recovery, got %d", lsn, reopened.Position())
+			t.Fatalf("expected Position %d after reopen, got %d", lsn, reopened.Position())
 		}
-
-		for k, want := range expected {
-			got, exists, err := reopened.Get("items", k)
+		if reopened.RecoveryPosition() != checkpointPosition {
+			t.Fatalf("expected RecoveryPosition %d after reopen, got %d", checkpointPosition, reopened.RecoveryPosition())
+		}
+		for key, want := range expected {
+			got, exists, err := reopened.Get("items", key)
 			if err != nil || !exists || !bytes.Equal(got, want) {
-				t.Fatalf("key %s mismatch after recovery: exists=%v err=%v", k, exists, err)
+				t.Fatalf("key %s mismatch after reopen: exists=%v err=%v", key, exists, err)
 			}
 		}
-		if _, exists, err := reopened.Get("items", "k-b-0"); err != nil || exists {
-			t.Fatalf("expected deleted key k-b-0 to stay absent, got exists=%v err=%v", exists, err)
+
+		// Monotonic position enforcement continues from recovered position.
+		if err := reopened.ApplyPut("items", "next", []byte("bad"), lsn); !errors.Is(err, ErrNonMonotonicLSN) {
+			t.Fatalf("expected ErrNonMonotonicLSN at LSN %d, got: %v", lsn, err)
 		}
-		assertNoWALFilesMemFS(t, crashedFS, dir)
+		lsn++
+		watermark.Store(lsn)
+		if err := reopened.ApplyPut("items", "next", []byte("ok"), lsn); err != nil {
+			t.Fatalf("ApplyPut at LSN %d failed: %v", lsn, err)
+		}
+		assertNoWALFilesMemFS(t, memFS, dir)
 	})
 
-	t.Run("superseded page copy cleared during external-log replay", func(t *testing.T) {
+	t.Run("unclean reopen returns an error", func(t *testing.T) {
 		memFS := NewMemFS()
-		dir := "ext_superseded"
-		stream := &memExternalStream{}
+		dir := "ext_unclean"
+		var watermark atomic.Uint64
+		watermark.Store(5)
 
-		store, err := Open(
-			WithFS(memFS),
-			WithDir(dir),
-			WithCreate(),
-			WithCompressionCodec(CodecNone),
-			WithExternalLog(stream.config()),
-		)
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
-
-		// LSN 1: Put small k1 on slotted page 1, then flush and sync page 1.
-		stream.appendPut("t", "k1", []byte("small-v1"), 1)
-		stream.setDurable(1)
-		if err := store.ApplyPut("t", "k1", []byte("small-v1"), 1); err != nil {
-			t.Fatalf("ApplyPut LSN 1 failed: %v", err)
-		}
-		if err := store.cp.FlushPages(); err != nil {
-			t.Fatalf("FlushPages after LSN 1 failed: %v", err)
-		}
-
-		// LSN 2: Replace k1 with a multi-block value on page 2.
-		// Flush ONLY page 2 so page 1 on disk still carries the old copy of k1 (superseded copy).
-		bigVal := bytes.Repeat([]byte("big-v2-"), 1000)
-		stream.appendPut("t", "k1", bigVal, 2)
-		stream.setDurable(2)
-		if err := store.ApplyPut("t", "k1", bigVal, 2); err != nil {
-			t.Fatalf("ApplyPut LSN 2 failed: %v", err)
-		}
-		store.keyMu.RLock()
-		page2 := store.keyIndex[qualifyKey("t", "k1")].LogicalPage
-		store.keyMu.RUnlock()
-		if err := store.bp.FlushPage(page2); err != nil {
-			t.Fatalf("FlushPage(page2) failed: %v", err)
-		}
-		if err := store.heapFile.Sync(); err != nil {
-			t.Fatalf("heapFile.Sync failed: %v", err)
-		}
-
-		// Crash with page 1 still holding old LSN 1 copy and page 2 holding LSN 2 copy.
-		crashedFS := cloneMemFS(memFS)
-		_ = store.Close()
-
-		reopened, err := Open(
-			WithFS(crashedFS),
-			WithDir(dir),
-			WithCompressionCodec(CodecNone),
-			WithExternalLog(stream.config()),
-		)
-		if err != nil {
-			t.Fatalf("reopen failed: %v", err)
-		}
-
-		got, exists, err := reopened.Get("t", "k1")
-		if err != nil || !exists || !bytes.Equal(got, bigVal) {
-			t.Fatalf("expected big-v2 after recovery, got exists=%v err=%v", exists, err)
-		}
-
-		// Delete k1 at LSN 3, close cleanly, and reopen: the old copy on page 1 must have been cleared.
-		stream.appendDelete("t", "k1", 3)
-		stream.setDurable(3)
-		if err := reopened.ApplyDelete("t", "k1", 3); err != nil {
-			t.Fatalf("ApplyDelete LSN 3 failed: %v", err)
-		}
-		if err := reopened.Close(); err != nil {
-			t.Fatalf("Close failed: %v", err)
-		}
-
-		reopened2, err := Open(
-			WithFS(crashedFS),
-			WithDir(dir),
-			WithCompressionCodec(CodecNone),
-			WithExternalLog(stream.config()),
-		)
-		if err != nil {
-			t.Fatalf("reopen2 failed: %v", err)
-		}
-		defer reopened2.Close()
-
-		if _, exists, err := reopened2.Get("t", "k1"); err != nil || exists {
-			t.Fatalf("superseded copy resurrected after delete: exists=%v err=%v", exists, err)
-		}
-	})
-
-	t.Run("lost tail detection fails recovery when external log lags heap", func(t *testing.T) {
-		memFS := NewMemFS()
-		dir := "ext_lost_tail"
-		stream := &memExternalStream{}
-
-		store, err := Open(
-			WithFS(memFS),
-			WithDir(dir),
-			WithCreate(),
-			WithExternalLog(stream.config()),
-		)
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
-
-		stream.appendPut("t", "k1", []byte("v1"), 20)
-		stream.setDurable(20)
-		if err := store.ApplyPut("t", "k1", []byte("v1"), 20); err != nil {
-			t.Fatalf("ApplyPut failed: %v", err)
-		}
-		if err := store.Checkpoint(); err != nil {
-			t.Fatalf("Checkpoint failed: %v", err)
-		}
-		crashedFS := cloneMemFS(memFS)
-		_ = store.Close()
-
-		// Case 1: DurableLSN reports 10 < maxHeapLSN (20).
-		stream.setDurable(10)
-		if _, err := Open(WithFS(crashedFS), WithDir(dir), WithExternalLog(stream.config())); !errors.Is(err, ErrCorruptStore) {
-			t.Fatalf("expected ErrCorruptStore when DurableLSN < maxHeapLSN, got: %v", err)
-		}
-
-		// Case 2: DurableLSN is nil, and OpenReplay ends below maxHeapLSN (20).
-		truncatedStream := &memExternalStream{}
-		truncatedStream.appendPut("t", "k1", []byte("stale"), 10)
-		truncatedStream.setDurable(10)
-		_, err = Open(
-			WithFS(crashedFS),
-			WithDir(dir),
-			WithExternalLog(ExternalLogConfig{
-				WaitDurable: truncatedStream.waitDurable,
-				OpenReplay:  truncatedStream.openReplay,
-			}),
-		)
-		if !errors.Is(err, ErrCorruptStore) {
-			t.Fatalf("expected ErrCorruptStore when replay ends below maxHeapLSN, got: %v", err)
-		}
-	})
-
-	t.Run("unclean crash without OpenReplay fails recovery, clean close without OpenReplay succeeds", func(t *testing.T) {
-		memFS := NewMemFS()
-		dir := "ext_no_replay"
-		stream := &memExternalStream{}
-
-		store, err := Open(WithFS(memFS), WithDir(dir), WithCreate(), WithExternalLog(stream.config()))
-		if err != nil {
-			t.Fatalf("Open failed: %v", err)
-		}
-		stream.appendPut("t", "k1", []byte("v1"), 5)
-		stream.setDurable(5)
+		store := openExternalStore(t, memFS, dir, ExternalLogConfig{DurableLSN: watermark.Load}, WithCreate())
 		if err := store.ApplyPut("t", "k1", []byte("v1"), 5); err != nil {
 			t.Fatalf("ApplyPut failed: %v", err)
 		}
-
-		// Unclean crash without OpenReplay must fail.
 		crashedFS := cloneMemFS(memFS)
+		closeStore(t, store)
+
 		if _, err := Open(WithFS(crashedFS), WithDir(dir), WithExternalLog(ExternalLogConfig{
-			DurableLSN: stream.durable,
+			DurableLSN: watermark.Load,
 		})); err == nil {
-			t.Fatalf("expected error opening uncleanly closed store without OpenReplay")
+			t.Fatalf("expected error reopening uncleanly closed external-log store")
+		}
+	})
+
+	t.Run("reopen fails when DurableLSN lags MaxHeapLSN or metadata-only recoveryStartLSN", func(t *testing.T) {
+		memFS := NewMemFS()
+		dir := "ext_lagging_watermark"
+		var watermark atomic.Uint64
+		watermark.Store(30)
+
+		store := openExternalStore(t, memFS, dir, ExternalLogConfig{DurableLSN: watermark.Load}, WithCreate())
+		if err := store.ApplyPut("t", "k1", []byte("v1"), 10); err != nil {
+			t.Fatalf("ApplyPut LSN 10 failed: %v", err)
+		}
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint 1 failed: %v", err)
+		}
+		// Advance Position to 30 via a metadata-only delete so recoveryStartLSN (30) > MaxHeapLSN (10).
+		if err := store.ApplyDelete("t", "nonexistent", 30); err != nil {
+			t.Fatalf("ApplyDelete LSN 30 failed: %v", err)
+		}
+		closeStore(t, store)
+
+		// Watermark 5 < MaxHeapLSN (10): must fail.
+		watermark.Store(5)
+		if _, err := Open(WithFS(memFS), WithDir(dir), WithExternalLog(ExternalLogConfig{
+			DurableLSN: watermark.Load,
+		})); !errors.Is(err, ErrCorruptStore) {
+			t.Fatalf("expected ErrCorruptStore when DurableLSN < MaxHeapLSN, got: %v", err)
 		}
 
-		// Clean close without OpenReplay succeeds.
-		if err := store.Close(); err != nil {
-			t.Fatalf("Close failed: %v", err)
+		// Watermark 20 >= MaxHeapLSN (10) but < recoveryStartLSN (30): must fail.
+		watermark.Store(20)
+		if _, err := Open(WithFS(memFS), WithDir(dir), WithExternalLog(ExternalLogConfig{
+			DurableLSN: watermark.Load,
+		})); !errors.Is(err, ErrCorruptStore) {
+			t.Fatalf("expected ErrCorruptStore when DurableLSN < recoveryStartLSN, got: %v", err)
 		}
-		reopened, err := Open(WithFS(memFS), WithDir(dir), WithExternalLog(ExternalLogConfig{
-			DurableLSN: stream.durable,
-		}))
-		if err != nil {
-			t.Fatalf("reopen after clean close failed: %v", err)
-		}
-		defer reopened.Close()
 
-		val, exists, err := reopened.Get("t", "k1")
-		if err != nil || !exists || string(val) != "v1" {
-			t.Fatalf("unexpected Get(k1): val=%q exists=%v err=%v", val, exists, err)
+		// Watermark 30 covers both MaxHeapLSN and recoveryStartLSN: succeeds.
+		watermark.Store(30)
+		reopened := openExternalStore(t, memFS, dir, ExternalLogConfig{DurableLSN: watermark.Load})
+		defer closeStore(t, reopened)
+		if reopened.Position() != 30 {
+			t.Fatalf("expected Position 30, got %d", reopened.Position())
 		}
 	})
 }
@@ -796,45 +585,29 @@ func TestExternalLog_EncryptedOversizeAndOSFSNoWAL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEncryptionKey failed: %v", err)
 	}
-	stream := &memExternalStream{}
+	var watermark atomic.Uint64
+	watermark.Store(2)
 
-	store, err := Open(
-		WithDir(dir),
+	store := openExternalStore(
+		t,
+		nil,
+		dir,
+		ExternalLogConfig{DurableLSN: watermark.Load},
 		WithCreate(),
 		WithEncryptionKey(key),
 		WithCompressionCodec(CodecZstd),
-		WithExternalLog(stream.config()),
 	)
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
 
-	// Build an incompressible payload > 2 MiB to trigger oversize file storage even under zstd.
-	oversizeVal := make([]byte, (MaxBatchBlocks+32)*BlockSize)
-	state := uint64(0x9e3779b97f4a7c15)
-	for i := range oversizeVal {
-		state ^= state << 13
-		state ^= state >> 7
-		state ^= state << 17
-		oversizeVal[i] = byte(state)
-	}
-
-	stream.appendPut("blobs", "b1", oversizeVal, 1)
-	stream.setDurable(1)
-	if err := store.ApplyPut("blobs", "b1", oversizeVal, 1); err != nil {
+	oversizeValue := makeIncompressiblePayload((MaxBatchBlocks + 32) * BlockSize)
+	if err := store.ApplyPut("blobs", "b1", oversizeValue, 1); err != nil {
 		t.Fatalf("ApplyPut oversize failed: %v", err)
 	}
-	stream.appendPut("blobs", "small", []byte("hello encrypted external log"), 2)
-	stream.setDurable(2)
 	if err := store.ApplyPut("blobs", "small", []byte("hello encrypted external log"), 2); err != nil {
 		t.Fatalf("ApplyPut small failed: %v", err)
 	}
+	closeStore(t, store)
 
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	// Verify zero .wal files and no wal/ directory exist on real OS filesystem.
+	// Verify no wal/ directory or .wal files exist on the real OS filesystem.
 	if _, err := os.Stat(filepath.Join(dir, "wal")); !os.IsNotExist(err) {
 		t.Fatalf("expected no wal directory on OSFS, got err=%v", err)
 	}
@@ -850,33 +623,22 @@ func TestExternalLog_EncryptedOversizeAndOSFSNoWAL(t *testing.T) {
 		t.Fatalf("Walk failed: %v", err)
 	}
 
-	// Simulate an additional tail oversize record not yet applied before reopen.
-	oversizeVal2 := bytes.Clone(oversizeVal)
-	oversizeVal2[0] ^= 0xff
-	stream.appendPut("blobs", "b2", oversizeVal2, 3)
-	stream.setDurable(3)
-
-	reopened, err := Open(
-		WithDir(dir),
+	reopened := openExternalStore(
+		t,
+		nil,
+		dir,
+		ExternalLogConfig{DurableLSN: watermark.Load},
 		WithEncryptionKey(key),
 		WithCompressionCodec(CodecZstd),
-		WithExternalLog(stream.config()),
 	)
-	if err != nil {
-		t.Fatalf("reopen encrypted external-log store failed: %v", err)
-	}
-	defer reopened.Close()
+	defer closeStore(t, reopened)
 
-	got1, exists, err := reopened.Get("blobs", "b1")
-	if err != nil || !exists || !bytes.Equal(got1, oversizeVal) {
+	gotOversize, exists, err := reopened.Get("blobs", "b1")
+	if err != nil || !exists || !bytes.Equal(gotOversize, oversizeValue) {
 		t.Fatalf("Get(b1) mismatch: exists=%v err=%v", exists, err)
-	}
-	got2, exists, err := reopened.Get("blobs", "b2")
-	if err != nil || !exists || !bytes.Equal(got2, oversizeVal2) {
-		t.Fatalf("Get(b2) replayed oversize mismatch: exists=%v err=%v", exists, err)
 	}
 	gotSmall, exists, err := reopened.Get("blobs", "small")
 	if err != nil || !exists || string(gotSmall) != "hello encrypted external log" {
-		t.Fatalf("Get(small) mismatch: val=%q exists=%v err=%v", gotSmall, exists, err)
+		t.Fatalf("Get(small) mismatch: value=%q exists=%v err=%v", gotSmall, exists, err)
 	}
 }

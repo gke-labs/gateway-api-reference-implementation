@@ -76,23 +76,60 @@ var (
 )
 
 // ExternalLogConfig configures external-log mode, where the caller owns the authoritative
-// redo log and supplies log positions via ApplyPut and ApplyDelete.
-// At least one of WaitDurable or DurableLSN must be provided.
+// redo log and supplies strictly increasing log positions via ApplyPut and ApplyDelete.
+//
+// External-log invariants:
+//   - The engine writes a dirty heap page with LSN P to heap.db only after the external
+//     log confirms durability through P.
+//   - Checkpoints advance the durable recovery position in meta.db to LSN P only after the
+//     external log confirms durability through P and heap.db is fsynced.
+//   - ApplyPut and ApplyDelete accept only strictly increasing log positions across all calls.
+//   - Open verifies that DurableLSN covers both the highest heap page LSN on disk and the
+//     recovery position stored in meta.db.
 type ExternalLogConfig struct {
-	// WaitDurable blocks until the external log confirms durability through lsn, or returns
-	// an error. The engine calls WaitDurable before flushing dirty heap pages with LSN up to
-	// lsn to enforce the write-ahead rule. When nil, the engine checks lsn <= DurableLSN().
-	WaitDurable func(lsn uint64) error
-
 	// DurableLSN returns the highest log position confirmed durable in the external log.
-	// During recovery of an existing store, Open verifies that DurableLSN is at least the
-	// highest LSN on disk in heap.db.
+	// Required in external-log mode. The engine uses DurableLSN to enforce the write-ahead
+	// rule when WaitDurable is nil, to decide whether superseded oversize files can be
+	// unlinked immediately, and to verify the external log covers the store on reopen.
 	DurableLSN func() uint64
 
-	// OpenReplay opens an iterator over external log records starting at or after startLSN
-	// during recovery of an existing store.
-	OpenReplay func(startLSN uint64) (ExternalLogIterator, error)
+	// WaitDurable optionally blocks until the external log confirms durability through lsn,
+	// or returns an error. When nil, dirty page flushes and checkpoints check lsn <= DurableLSN()
+	// and return ErrNotDurable without failing the engine if the watermark lags.
+	WaitDurable func(lsn uint64) error
 }
+
+// externalLog adapts ExternalLogConfig to Log so BlockPool and Checkpointer enforce
+// the external-log write-ahead invariants without creating local .wal files.
+type externalLog struct {
+	config         *ExternalLogConfig
+	lastAppliedLSN *atomic.Uint64
+}
+
+func (l *externalLog) AppendRecord(*Record) (uint64, error) { return 0, ErrExternalLogMode }
+
+func (l *externalLog) SyncThrough(lsn uint64) error {
+	if lsn == 0 {
+		return nil
+	}
+	if l.config.WaitDurable != nil {
+		return l.config.WaitDurable(lsn)
+	}
+	if durable := l.config.DurableLSN(); lsn > durable {
+		return fmt.Errorf("%w: position %d exceeds durable watermark %d", ErrNotDurable, lsn, durable)
+	}
+	return nil
+}
+
+func (l *externalLog) Sync() error         { return nil }
+func (l *externalLog) MaxLSN() uint64      { return l.lastAppliedLSN.Load() }
+func (l *externalLog) DurableLSN() uint64  { return l.config.DurableLSN() }
+func (l *externalLog) BytesWritten() int64 { return 0 }
+func (l *externalLog) NewIterator(uint64, *LogPosition) (LogIterator, error) {
+	return nil, ErrExternalLogMode
+}
+func (l *externalLog) TruncateBefore(uint64) error { return nil }
+func (l *externalLog) Close() error                { return nil }
 
 // TestHookFail is an internal hook used by tests to trigger the failed state without exposing a method on Engine.
 var TestHookFail = func(e *Engine, err error) {
@@ -324,9 +361,8 @@ type Engine struct {
 	bp       *BlockPool
 	cp       *Checkpointer
 
-	externalLog       bool
-	externalLogConfig ExternalLogConfig
-	lastAppliedLSN    atomic.Uint64
+	externalLog    *ExternalLogConfig
+	lastAppliedLSN atomic.Uint64
 
 	writerMu sync.RWMutex // Single writer: serializes Put, Delete; RLock for point-in-time Scan/List
 
@@ -704,8 +740,8 @@ func Open(opts ...Option) (_ *Engine, err error) {
 	if options.WALMaxSegmentSize > 0 && options.WALMaxSegmentSize < int64(WALBlockSize) {
 		return nil, fmt.Errorf("%w: max segment size must be at least %d bytes, got %d", ErrWALSegmentSizeTooSmall, WALBlockSize, options.WALMaxSegmentSize)
 	}
-	if options.ExternalLog != nil && options.ExternalLog.WaitDurable == nil && options.ExternalLog.DurableLSN == nil {
-		return nil, errors.New("external-log mode requires WaitDurable or DurableLSN")
+	if options.ExternalLog != nil && options.ExternalLog.DurableLSN == nil {
+		return nil, errors.New("external-log mode requires DurableLSN")
 	}
 
 	dir := options.Dir
@@ -1007,7 +1043,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		quarantine:       options.Quarantine,
 		metaFile:         sMetaFile,
 		heapFile:         heapFile,
-		externalLog:      options.ExternalLog != nil,
+		externalLog:      options.ExternalLog,
 		keyIndex:         make(map[string]KeyIndexEntry),
 		inFlightOversize: make(map[string]int),
 		emptyPages:       newEmptyPageTracker(nil),
@@ -1015,26 +1051,6 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		closedCh:         make(chan struct{}),
 		wiped:            wiped,
 		nextLogicalPage:  1,
-	}
-	if options.ExternalLog != nil {
-		s.externalLogConfig = *options.ExternalLog
-	}
-
-	closeOnOpenError := func() error {
-		var errs []error
-		if s.bp != nil {
-			errs = append(errs, s.bp.Close())
-		}
-		if s.wal != nil {
-			errs = append(errs, s.wal.Close())
-		}
-		if heapFile != nil {
-			errs = append(errs, heapFile.Close())
-		}
-		if s.metaFile != nil {
-			errs = append(errs, s.metaFile.Close())
-		}
-		return errors.Join(errs...)
 	}
 
 	walQuarantine := s.quarantine
@@ -1048,75 +1064,81 @@ func Open(opts ...Option) (_ *Engine, err error) {
 	if len(options.EncryptionKey) > 0 {
 		cipher, err := newHeapCipher(options.EncryptionKey, dbID)
 		if err != nil {
-			return nil, errors.Join(fmt.Errorf("failed to create heap cipher: %w", err), closeOnOpenError())
+			closeErr := heapFile.Close()
+			return nil, errors.Join(fmt.Errorf("failed to create heap cipher: %w", err), closeErr)
 		}
 		heapCipher = cipher
 	}
 
-	bpOptions := BlockPoolOptions{
-		NumPoolBlocks: options.NumPoolBlocks,
-		HeapCipher:    heapCipher,
-	}
-	if s.externalLog {
-		bpOptions.WaitDurable = s.waitLogDurable
-		bpOptions.MaxLSN = s.Position
+	openLog := func(initialLSN uint64) (Log, error) {
+		if s.externalLog != nil {
+			return &externalLog{config: s.externalLog, lastAppliedLSN: &s.lastAppliedLSN}, nil
+		}
+		return OpenWAL(options.FS, walDir, dbID, initialLSN, WALOptions{
+			MaxSegmentSize: options.WALMaxSegmentSize,
+			OnFailure:      s.setFailed,
+			Clock:          options.Clock,
+			Quarantine:     walQuarantine,
+			EncryptionKey:  options.EncryptionKey,
+		})
 	}
 
 	if isNewStore {
-		if !s.externalLog {
-			wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{
-				MaxSegmentSize: options.WALMaxSegmentSize,
-				OnFailure:      s.setFailed,
-				Clock:          options.Clock,
-				Quarantine:     walQuarantine,
-				EncryptionKey:  options.EncryptionKey,
-			})
-			if err != nil {
-				return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeOnOpenError())
-			}
-			s.wal = wal
+		wal, err := openLog(0)
+		if err != nil {
+			closeErr := heapFile.Close()
+			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)
 		}
+		s.wal = wal
 		s.buddy = NewBuddyAllocator(512)
-		s.bp = NewBlockPool(heapFile, s.wal, s.buddy, dbID, bpOptions)
-		s.cp = NewCheckpointer(s.bp, heapFile, s.wal, s.metaFile, 0, 1)
+		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
+			NumPoolBlocks: options.NumPoolBlocks,
+			HeapCipher:    heapCipher,
+		})
+		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile, 0, 1)
 	} else {
-		// Existing store: perform crash recovery scan and redo replay.
+		// Existing store: perform crash recovery scan and WAL redo replay
 		recoveryRes, err := Recover(options.FS, heapFile, dir, walDir, dbID, RecoveryOptions{
 			Quarantine:       options.Quarantine,
 			HeapCipher:       heapCipher,
 			ClosedCleanly:    closedCleanly,
 			EncryptionKey:    options.EncryptionKey,
 			RecoveryStartLSN: recoveryStartLSN,
-			ExternalLog:      s.externalLog,
+			ExternalLog:      s.externalLog != nil,
 		})
 		if err != nil {
-			return nil, errors.Join(fmt.Errorf("recovery failed: %w", err), closeOnOpenError())
+			closeErr := heapFile.Close()
+			return nil, errors.Join(fmt.Errorf("recovery failed: %w", err), closeErr)
 		}
 
-		if s.externalLog {
-			if s.externalLogConfig.DurableLSN != nil {
-				if durableLSN := s.externalLogConfig.DurableLSN(); durableLSN < recoveryRes.MaxHeapLSN {
-					return nil, errors.Join(
-						fmt.Errorf("%w: external log durable LSN %d is below highest heap page LSN %d", ErrCorruptStore, durableLSN, recoveryRes.MaxHeapLSN),
-						closeOnOpenError(),
-					)
-				}
+		if s.externalLog != nil {
+			if !closedCleanly {
+				closeErr := heapFile.Close()
+				return nil, errors.Join(errors.New("external-log crash recovery is not supported yet"), closeErr)
 			}
-			if !closedCleanly && s.externalLogConfig.OpenReplay == nil {
-				return nil, errors.Join(errors.New("external-log mode requires OpenReplay to recover an uncleanly closed store"), closeOnOpenError())
+			requiredLSN := max(recoveryRes.MaxHeapLSN, recoveryStartLSN)
+			if durableLSN := s.externalLog.DurableLSN(); durableLSN < requiredLSN {
+				closeErr := heapFile.Close()
+				return nil, errors.Join(
+					fmt.Errorf("%w: external log durable LSN %d is below required store LSN %d", ErrCorruptStore, durableLSN, requiredLSN),
+					closeErr,
+				)
 			}
+			s.lastAppliedLSN.Store(requiredLSN)
 		}
 
 		if closedCleanly {
 			// Remove the clean shutdown marker and sync the directory after the heap scan has
 			// verified block integrity without finding damage, and before Open writes anything
-			// to the heap or replays the log, so that a crash during Open cannot leave the marker
+			// to the heap or replays the WAL, so that a crash during Open cannot leave the marker
 			// alongside a block that Open itself tore.
 			if err := options.FS.Remove(cleanMarkerPath); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
-				return nil, errors.Join(fmt.Errorf("failed to remove clean shutdown marker: %w", err), closeOnOpenError())
+				closeErr := heapFile.Close()
+				return nil, errors.Join(fmt.Errorf("failed to remove clean shutdown marker: %w", err), closeErr)
 			}
 			if err := options.FS.SyncDir(dir); err != nil {
-				return nil, errors.Join(fmt.Errorf("failed to sync directory after removing clean shutdown marker: %w", err), closeOnOpenError())
+				closeErr := heapFile.Close()
+				return nil, errors.Join(fmt.Errorf("failed to sync directory after removing clean shutdown marker: %w", err), closeErr)
 			}
 		}
 
@@ -1128,55 +1150,31 @@ func Open(opts ...Option) (_ *Engine, err error) {
 			s.nextLogicalPage = 1
 		}
 
-		if !s.externalLog {
-			// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
-			wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{
-				MaxSegmentSize: options.WALMaxSegmentSize,
-				OnFailure:      s.setFailed,
-				Clock:          options.Clock,
-				Quarantine:     walQuarantine,
-				EncryptionKey:  options.EncryptionKey,
-			})
-			if err != nil {
-				return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeOnOpenError())
-			}
-			s.wal = wal
+		// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
+		wal, err := openLog(recoveryRes.MaxLSN)
+		if err != nil {
+			closeErr := heapFile.Close()
+			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)
 		}
+		s.wal = wal
 
-		s.bp = NewBlockPool(heapFile, s.wal, s.buddy, dbID, bpOptions)
+		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
+			NumPoolBlocks: options.NumPoolBlocks,
+			HeapCipher:    heapCipher,
+		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
-		s.cp = NewCheckpointer(s.bp, heapFile, s.wal, s.metaFile, activePageIndex, pageCounter)
+		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile, activePageIndex, pageCounter)
 		s.cp.recoveryStartLSN.Store(recoveryStartLSN)
 
-		// Replay log records from redo start LSN through write path apply functions.
-		if !s.externalLog {
-			if recoveryRes.RedoStartLSN <= recoveryRes.MaxLSN {
-				if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.RedoStartPosition, recoveryRes.SupersededPages); err != nil {
-					return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeOnOpenError())
-				}
+		// Replay WAL records from redo start LSN through write path apply functions.
+		if s.externalLog == nil && recoveryRes.RedoStartLSN <= recoveryRes.MaxLSN {
+			if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.RedoStartPosition, recoveryRes.SupersededPages); err != nil {
+				closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+				return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeErr)
 			}
-		} else {
-			var replayedMaxLSN uint64
-			if s.externalLogConfig.OpenReplay != nil {
-				replayIterator, err := s.externalLogConfig.OpenReplay(recoveryRes.RedoStartLSN)
-				if err != nil {
-					return nil, errors.Join(fmt.Errorf("external log replay open failed: %w", err), closeOnOpenError())
-				}
-				replayedMaxLSN, err = s.replayExternal(replayIterator, recoveryRes.SupersededPages)
-				if err != nil {
-					return nil, errors.Join(fmt.Errorf("external log replay failed: %w", err), closeOnOpenError())
-				}
-			}
-			if s.externalLogConfig.DurableLSN == nil && recoveryRes.MaxHeapLSN > 0 && replayedMaxLSN < recoveryRes.MaxHeapLSN {
-				return nil, errors.Join(
-					fmt.Errorf("%w: external log replay ended at LSN %d below highest heap page LSN %d", ErrCorruptStore, replayedMaxLSN, recoveryRes.MaxHeapLSN),
-					closeOnOpenError(),
-				)
-			}
-			s.lastAppliedLSN.Store(max(recoveryRes.MaxHeapLSN, replayedMaxLSN, recoveryStartLSN))
 		}
 
-		// Track empty logical pages recovered from disk only after log replay completes,
+		// Track empty logical pages recovered from disk only after WAL replay completes,
 		// so replayed historical mutations never reuse an empty page whose durable copy
 		// carries a newer LSN and regress its LSN under small block pool eviction.
 		for _, pageID := range recoveryRes.EmptyLogicalPages {
@@ -1186,7 +1184,8 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		// After replay, the engine flushes the changed pages as it does for a checkpoint,
 		// before it accepts writes.
 		if err := s.cp.FlushPages(); err != nil {
-			return nil, errors.Join(fmt.Errorf("failed to flush pages after replay: %w", err), closeOnOpenError())
+			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+			return nil, errors.Join(fmt.Errorf("failed to flush pages after replay: %w", err), closeErr)
 		}
 
 		// Quarantine unreferenced oversize files now that keyIndex holds all recovered pointers.
@@ -1202,7 +1201,8 @@ func Open(opts ...Option) (_ *Engine, err error) {
 			return referenced
 		}
 		if _, err := quarantineUnreferencedOversizeFiles(context.Background(), options.FS, dir, getReferenced, options.Quarantine, 0); err != nil {
-			return nil, errors.Join(fmt.Errorf("failed to quarantine unreferenced oversize files: %w", err), closeOnOpenError())
+			closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
+			return nil, errors.Join(fmt.Errorf("failed to quarantine unreferenced oversize files: %w", err), closeErr)
 		}
 	}
 
@@ -1450,9 +1450,6 @@ func (s *Engine) WALBytesWritten() int64 {
 
 // Position returns the highest log position applied to the engine in memory.
 func (s *Engine) Position() uint64 {
-	if s.externalLog {
-		return s.lastAppliedLSN.Load()
-	}
 	if s.wal == nil {
 		return 0
 	}
@@ -1467,37 +1464,6 @@ func (s *Engine) RecoveryPosition() uint64 {
 	return s.cp.recoveryStartLSN.Load()
 }
 
-func (s *Engine) waitLogDurable(lsn uint64) error {
-	if s.externalLogConfig.WaitDurable != nil {
-		return s.externalLogConfig.WaitDurable(lsn)
-	}
-	if s.externalLogConfig.DurableLSN != nil {
-		if durable := s.externalLogConfig.DurableLSN(); lsn > durable {
-			return fmt.Errorf("%w: position %d exceeds durable watermark %d", ErrNotDurable, lsn, durable)
-		}
-		return nil
-	}
-	return ErrNotDurable
-}
-
-func (s *Engine) writeOversizePointer(qualifiedKey string, stored []byte) ([]byte, string, error) {
-	var fileName string
-	if len(s.encryptionKey) > 0 {
-		var err error
-		fileName, err = randomOversizeFileName()
-		if err != nil {
-			return nil, "", err
-		}
-	} else {
-		fileName = OversizeFileName(qualifiedKey, stored)
-	}
-	if err := s.writeOversizeValueFile(fileName, stored); err != nil {
-		return nil, "", err
-	}
-	checksum := sha256.Sum256(stored)
-	return EncodeOversizePointer(uint64(len(stored)), checksum, fileName), fileName, nil
-}
-
 func (s *Engine) validateExternalLSN(lsn uint64) error {
 	if last := s.lastAppliedLSN.Load(); lsn == 0 || lsn <= last {
 		return fmt.Errorf("%w: got %d, last applied %d", ErrNonMonotonicLSN, lsn, last)
@@ -1509,8 +1475,10 @@ func (s *Engine) removeSupersededOversizeLocked(fileName string, lsn uint64) err
 	if fileName == "" || s.isInFlight(fileName) {
 		return nil
 	}
-	if s.externalLog {
-		if s.waitLogDurable(lsn) != nil {
+	if s.externalLog != nil {
+		// Unlink immediately only when the non-blocking watermark already confirms
+		// durability through lsn; otherwise leave the file for quarantine.
+		if s.externalLog.DurableLSN() < lsn {
 			return nil
 		}
 	} else if err := s.wal.SyncThrough(lsn); err != nil {
@@ -1776,7 +1744,7 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if s.externalLog {
+	if s.externalLog != nil {
 		return fmt.Errorf("%w: Put cannot be called in external-log mode; use ApplyPut", ErrExternalLogMode)
 	}
 	return s.put(tableName, key, payload, 0)
@@ -1788,7 +1756,7 @@ func (s *Engine) ApplyPut(tableName, key string, payload []byte, lsn uint64) err
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if !s.externalLog {
+	if s.externalLog == nil {
 		return fmt.Errorf("%w: ApplyPut requires external-log mode; use Put", ErrLocalWALMode)
 	}
 	if err := s.validateExternalLSN(lsn); err != nil {
@@ -1869,7 +1837,7 @@ func (s *Engine) put(tableName, key string, payload []byte, lsn uint64) error {
 		if s.isFailed() {
 			return s.failErr()
 		}
-		if s.externalLog {
+		if s.externalLog != nil {
 			if err := s.validateExternalLSN(lsn); err != nil {
 				return err
 			}
@@ -1905,7 +1873,7 @@ func (s *Engine) put(tableName, key string, payload []byte, lsn uint64) error {
 		if s.isFailed() {
 			return s.failErr()
 		}
-		if s.externalLog {
+		if s.externalLog != nil {
 			if err := s.validateExternalLSN(lsn); err != nil {
 				return err
 			}
@@ -1926,7 +1894,7 @@ func (s *Engine) put(tableName, key string, payload []byte, lsn uint64) error {
 		}
 	}
 
-	if !s.externalLog {
+	if s.externalLog == nil {
 		var appendErr error
 		lsn, appendErr = s.wal.AppendRecord(&rec)
 		if appendErr != nil {
@@ -1942,7 +1910,7 @@ func (s *Engine) put(tableName, key string, payload []byte, lsn uint64) error {
 		s.setFailed(err)
 		return s.failErr()
 	}
-	if s.externalLog {
+	if s.externalLog != nil {
 		s.lastAppliedLSN.Store(lsn)
 	}
 
@@ -2272,7 +2240,7 @@ func (s *Engine) Delete(tableName, key string) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if s.externalLog {
+	if s.externalLog != nil {
 		return fmt.Errorf("%w: Delete cannot be called in external-log mode; use ApplyDelete", ErrExternalLogMode)
 	}
 	return s.deleteKey(tableName, key, 0)
@@ -2284,7 +2252,7 @@ func (s *Engine) ApplyDelete(tableName, key string, lsn uint64) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if !s.externalLog {
+	if s.externalLog == nil {
 		return fmt.Errorf("%w: ApplyDelete requires external-log mode; use Delete", ErrLocalWALMode)
 	}
 	return s.deleteKey(tableName, key, lsn)
@@ -2297,7 +2265,7 @@ func (s *Engine) deleteKey(tableName, key string, lsn uint64) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if s.externalLog {
+	if s.externalLog != nil {
 		if err := s.validateExternalLSN(lsn); err != nil {
 			return err
 		}
@@ -2309,13 +2277,13 @@ func (s *Engine) deleteKey(tableName, key string, lsn uint64) error {
 	entry, exists := s.keyIndex[qKey]
 	s.keyMu.RUnlock()
 	if !exists {
-		if s.externalLog {
+		if s.externalLog != nil {
 			s.lastAppliedLSN.Store(lsn)
 		}
 		return nil
 	}
 
-	if !s.externalLog {
+	if s.externalLog == nil {
 		rec := Record{
 			Type: RecordTypeDelete,
 			Key:  qKey,
@@ -2332,7 +2300,7 @@ func (s *Engine) deleteKey(tableName, key string, lsn uint64) error {
 		s.setFailed(err)
 		return s.failErr()
 	}
-	if s.externalLog {
+	if s.externalLog != nil {
 		s.lastAppliedLSN.Store(lsn)
 	}
 
@@ -2434,7 +2402,7 @@ func (s *Engine) Sync() error {
 	if s.isFailed() {
 		return s.failErr()
 	}
-	if s.externalLog {
+	if s.externalLog != nil {
 		return fmt.Errorf("%w: Sync cannot be called in external-log mode", ErrExternalLogMode)
 	}
 	if err := s.wal.Sync(); err != nil {
@@ -2451,6 +2419,9 @@ func (s *Engine) Checkpoint() error {
 	}
 
 	if err := s.cp.Checkpoint(); err != nil {
+		if errors.Is(err, ErrNotDurable) {
+			return err
+		}
 		s.setFailed(err)
 		return s.failErr()
 	}
