@@ -85,7 +85,13 @@ func makeTestNode(name, zone, instance string) *corev1.Node {
 }
 
 func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nodeName, ip string, containersReady, overallReady bool, isTerminating bool) *corev1.Pod {
-	if err := spiffe.EnsureCredentials(t.Context(), c, "default"); err != nil {
+	if err := spiffe.EnsureCredentials(t.Context(), c, spiffe.Options{
+		AuthorityNamespace: "default",
+		Identities: []spiffe.Identity{{
+			Namespace:      "default",
+			ServiceAccount: spiffe.ControllerServiceAccountName,
+		}},
+	}); err != nil {
 		t.Fatalf("ensuring credentials: %v", err)
 	}
 
