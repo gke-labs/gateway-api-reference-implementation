@@ -48,7 +48,7 @@ It provides readable in-process scripts whose type, null-handling, and pattern-s
 4. **Bound CPU, stack, and memory per request.**
    The evaluator enforces explicit step, recursion, loop, and allocation limits with no ambient I/O.
 5. **Stay pure Go and small enough to audit.**
-   The language core targets roughly 1,200 non-test lines across small, self-contained files using only the Go standard library.
+   The language core uses only the Go standard library and breaks down into small PRs matching the repository's 200-line budget (including tests).
 
 ### Non-Goals
 
@@ -96,8 +96,8 @@ filterlang defines a small, indentation-delimited subset of Python syntax.
 
 ### Lexical Rules
 
-- **Indentation:** Blocks open after `:` and indent with spaces.
-  The lexer emits `INDENT`, `DEDENT`, and `NEWLINE` tokens using an explicit indentation stack.
+- **Indentation:** Blocks open after `:` and use space-only indentation.
+  Increasing indentation opens a nested block, and decreasing indentation closes one or more blocks back to a previously active column.
   The lexer rejects tab characters in leading indentation to prevent mixed-indentation ambiguity.
 - **Comments:** `#` starts a line comment extending to the end of the line.
 - **Line continuation:** The lexer ignores embedded newlines and indentation inside `(...)`, `[...]`, or `{...}`.
@@ -228,9 +228,11 @@ The type checker enforces five invariants:
 The type checker combines Hindley-Milner unification with bidirectional local inference and flat optional joins:
 
 1. **Fresh type variables:** The checker assigns fresh type variables (`?a`, `?b`) to unannotated function parameters, local variables initialized from polymorphic calls, and empty container literals (`[]`, `{}`).
-2. **Unification with occurs check:** The unifier solves equality constraints recursively across composite types.
+2. **Unification with occurs check and flat nullability:** The unifier solves equality constraints recursively across composite types.
    An occurs check rejects infinite recursive types such as `?a = list[?a]`.
+   When unifying `?a` with a nullable type `?t | None`, the unifier constrains `?t` to non-nullable types (and flattens nested nullability on substitution) so substitution never produces `(T | None) | None` or `None | None`.
 3. **Flat optional `join` at merge points:** When branches of an `if`/`elif`/`else`, multiple `return` statements in a function, or elements of a list literal produce types `A` and `B`, the checker computes `join(A, B)`:
+   - `join(None, None) = None`
    - `join(T, T) = T`
    - `join(T, None) = T | None` and `join(None, T) = T | None`
    - `join(T, T | None) = T | None` and `join(T | None, T) = T | None`
@@ -239,10 +241,15 @@ The type checker combines Hindley-Milner unification with bidirectional local in
 4. **Directed assignability at calls and annotations:** When passing `src` to a parameter or annotated target `dst`:
    - If `dst` is `T | None`, the checker accepts `None`, `T`, or `T | None`.
    - If `dst` is non-nullable `T`, the checker rejects `None` and `T | None`, and unifies `src` with `T`.
-5. **Let-polymorphism for top-level helpers:** The checker computes strongly connected components (SCCs) of the function call graph and checks them in topological order.
+5. **Attribute resolution and deferred overload constraints:** Built-in attributes and methods belong to a closed set of host and primitive types.
+   - When an expression accesses an attribute or method unique to one built-in type (for example, `request.path` or `request.query` on `Request`, or `.strip_prefix` on `str`), the checker unifies an unresolved receiver type variable with that type immediately.
+   - Overloaded operations with more than one valid operand type (`len`, `+`, ordering comparisons, `in`/`not in`, slicing, `.get`, and `.match`) record a deferred constraint when their operand or receiver is still a type variable (for example, `len(raw_query)` before `f"?{raw_query}"` constrains `raw_query` to `str`).
+   - The checker solves deferred constraints as unification progresses within an SCC.
+     filterlang has no typeclass polymorphism: every deferred overload constraint must resolve to a single concrete type before generalization, or compilation fails and requests a type annotation.
+6. **Let-polymorphism for top-level helpers:** The checker computes strongly connected components (SCCs) of the function call graph and checks them in topological order.
    Functions within one recursive SCC share monomorphic type variables while the checker inspects their bodies.
-   After checking an SCC, the checker generalizes free type variables into polymorphic schemes so helper functions such as `def unwrap_or(value, fallback)` work on both `str | None` and `int | None`.
-6. **No unresolved ambiguity:** After checking `handle(request)` against `(Request) -> Action`, the checker reports a compile-time error for any remaining unconstrained type variable (such as an unused `items = []`) and asks for an explicit annotation.
+   After checking an SCC and solving its deferred overload constraints, the checker generalizes remaining unconstrained type variables into polymorphic schemes so helper functions such as `def unwrap_or(value, fallback)` work on both `str | None` and `int | None`.
+7. **No unresolved ambiguity:** After checking `handle(request)` against `(Request) -> Action`, the checker reports a compile-time error for any remaining unconstrained type variable (such as an unused `items = []`) and asks for an explicit annotation.
 
 ### Flow-Sensitive Narrowing
 
@@ -266,9 +273,10 @@ The checker supports four narrowing forms:
    repo = match.named("repo")
    ```
 3. **Compound `and` and `or` expressions:**
-   - In `A and B`, positive narrowings from `A` apply while checking `B` and inside the `then` branch.
+   - In `A and B`, positive narrowings from `A` (facts that hold when `A` is true) apply while checking `B` and inside the `then` branch.
      This enables `if go_get is not None and go_get == "1":`.
-   - In `if a is None or b is None: return next()`, the fall-through path knows both `a` and `b` are non-null, so the checker narrows both variables after the guard.
+   - In `A or B`, negative narrowings from `A` (facts that hold when `A` is false) apply while checking `B`, and the combined negative narrowings from `A` and `B` apply in the `else` branch and after an early-exit guard.
+     This enables both `if go_get is None or go_get != "1":` (where `go_get` narrows to `str` before `!= "1"`) and `if a is None or b is None: return next()` (where both `a` and `b` narrow after the guard).
 4. **Rebinding invalidation:**
    When a statement reassigns `x = expr`, the checker checks `expr` against `x`'s slot type (widening an unannotated slot via `join`) and resets `x`'s narrowed type to the type of `expr`.
 
@@ -279,27 +287,24 @@ This trade-off avoids purity analysis over arbitrary expressions, keeps the narr
 
 ### Compile-Time Diagnostics
 
-Every token and AST node carries a `Span` recording 1-based `StartLine`, `StartCol`, `EndLine`, and `EndCol`.
-The compiler formats diagnostics with the script identifier, line and column, offending source line, caret underline, and a hint when applicable.
+The compiler tracks a 1-based start and end line and column span for every source construct.
+Diagnostics display the script identifier, line and column, offending source line, caret underline, and a corrective hint when applicable.
 
-Consider a script that forgets to narrow `user` before escaping it:
+Consider a script that forgets to narrow a query parameter before escaping it:
 
 ```python
-def handle_go(request):
-    match = OWNERS_TEMPLATE.match(request.path)
-    if match is None:
-        return next()
-    user = match.named("user")
-    return redirect(302, f"https://cs.k8s.io/?q={url_query_escape(user)}")
+def handle(request):
+    target = request.query.get("target")
+    return redirect(302, f"https://cs.k8s.io/?q={url_query_escape(target)}")
 ```
 
 The compiler rejects this script during reconciliation:
 
 ```text
-HTTPRoute/default/go-k8s-io:6:67: type error: cannot pass 'str | None' to parameter 'value' of type 'str'
-  6 |     return redirect(302, f"https://cs.k8s.io/?q={url_query_escape(user)}")
-    |                                                                   ^^^^
-  hint: narrow 'user' first with 'if user is not None:'
+HTTPRoute/default/go-k8s-io:3:67: type error: cannot pass 'str | None' to parameter 'value' of type 'str'
+  3 |     return redirect(302, f"https://cs.k8s.io/?q={url_query_escape(target)}")
+    |                                                                   ^^^^^^
+  hint: narrow 'target' first with 'if target is not None:'
 ```
 
 When a future PR integrates filterlang into GARI, the controller will report this message on the route or filter `Accepted=False` status condition and refuse to push the invalid script to the data plane.
@@ -313,16 +318,17 @@ A buggy or adversarial script must not hang a request goroutine, exhaust pod mem
 
 1. **No ambient authority:** The evaluator exposes no filesystem, network, clock, randomness, environment variable, or concurrency APIs.
    Evaluating the same compiled `Program` on the same `Request` produces the same `Action`.
-2. **Step budget:** Every statement, expression node, loop iteration, and function call decrements a per-request integer `stepsRemaining` counter.
-   When `stepsRemaining` reaches zero, the evaluator aborts immediately with `ErrStepBudgetExceeded`.
-3. **Call-depth bound:** Every function call increments `callDepth` and checks it against `MaxCallDepth`.
-   Exceeding `MaxCallDepth` aborts immediately with `ErrCallDepthExceeded`.
-4. **Loop bound:** Because `while` does not exist, every `for` loop iterates over a finite collection or `range(n)` capped at `MaxRangeLen`, and each iteration charges the step budget.
-5. **Memory and size bounds:** Every string allocation (concatenation, f-string formatting, escaping, slicing, split), list allocation, and dict allocation checks single-string and single-collection caps and charges bytes against `allocBytesRemaining` before allocating.
-   Exceeding any cap aborts immediately with `ErrMemoryBudgetExceeded`.
+2. **Step budget:** Every statement, expression evaluation, loop iteration, and function call consumes from a per-request step budget.
+   Pattern matching (`.match(text)`) and linear string scans (substring `in` and `.split`) charge steps proportional to input length (1 step per 64 bytes scanned, minimum 1 step) so a bounded loop cannot scan megabytes of text for a handful of steps.
+   Exhausting the step budget aborts evaluation immediately.
+3. **Call-depth bound:** Every function call counts against a per-request maximum call depth.
+   Exceeding the call-depth bound aborts evaluation immediately.
+4. **Loop bound:** Because `while` does not exist, every `for` loop iterates over a finite collection or bounded `range`, and each iteration consumes the step budget.
+5. **Memory and size bounds:** Every string allocation (concatenation, f-string formatting, escaping, slicing, split), list allocation, and dict allocation checks single-value size caps and charges a per-request cumulative allocation budget before allocating.
+   Exceeding any cap aborts evaluation immediately.
 6. **Linear-time pattern matching:** The compiler compiles regular expressions with Go's standard `regexp` package (RE2), which matches in time linear in the input length without backtracking blowups.
    Path templates use linear-time segment matching.
-7. **Compile-time bounds:** `Compile` caps source byte length, AST node count, compiled pattern count, and top-level constant initialization steps and allocations so malformed scripts cannot stall the controller during reconciliation.
+7. **Compile-time bounds:** Compilation caps source byte length, AST node count, compiled pattern count, and top-level constant initialization steps and allocations so malformed scripts cannot stall the controller during reconciliation.
 
 ### Default Resource Limits
 
@@ -331,16 +337,17 @@ A buggy or adversarial script must not hang a request goroutine, exhaust pod mem
 | `MaxSourceBytes` | Compile | 64 KiB | Bounds lexer and parser input size. |
 | `MaxASTNodes` | Compile | 4,096 | Prevents deeply nested parser DoS payloads. |
 | `MaxCompiledPatterns` | Compile | 256 | Caps RE2 and path-template memory per script. |
-| `MaxInitSteps` | Compile | 50,000 | Bounds top-level constant initialization. |
+| `MaxInitSteps` | Compile | 50,000 | Bounds top-level constant initialization CPU work. |
+| `MaxInitAllocBytes` | Compile | 256 KiB | Caps cumulative allocations during top-level constant initialization. |
 | `MaxSteps` | Request | 10,000 | Bounds per-request CPU time. |
 | `MaxCallDepth` | Request | 32 | Prevents stack overflow from recursion. |
 | `MaxRangeLen` | Request | 1,024 | Caps `range(n)` length. |
-| `MaxCollectionLen` | Request | 1,024 | Caps single list or dict element count. |
-| `MaxStringBytes` | Request | 16 KiB | Caps any single string value, including response bodies. |
+| `MaxCollectionLen` | Compile & Request | 1,024 | Caps single list or dict element count. |
+| `MaxStringBytes` | Compile & Request | 16 KiB | Caps any single string value, including response bodies. |
 | `MaxAllocBytes` | Request | 64 KiB | Caps cumulative allocations per request evaluation. |
 
 Callers can override limits through `CompileOptions` and `EvalLimits`.
-These defaults are conservative starting values to tune after Issue 7 benchmarks realistic filter scripts.
+These defaults are conservative starting values to tune after Issue 9 benchmarks realistic filter scripts.
 
 ### Runtime Failure and HTTP Output Safety
 
@@ -356,13 +363,13 @@ The `redirect` and `respond` constructors also enforce HTTP safety invariants at
    `respond` validates header names as RFC 9110 tokens and rejects header values containing CR, LF, or NUL.
 2. **Status code validation:** `redirect` accepts only `{301, 302, 303, 307, 308}`.
    `respond` accepts only status codes in `200..599`.
-3. **Redirect scheme and host policy:** `redirect` accepts only a relative path starting with `/` (rejecting `//`, which browsers treat as a protocol-relative host redirect) or an explicit `http://` or `https://` URL.
+3. **Redirect scheme and host policy:** `redirect` accepts only a relative path starting with `/` (rejecting both `//` and `/\`, which browsers normalize to protocol-relative host redirects) or an explicit `http://` or `https://` URL.
    `EvalLimits` accepts an optional `AllowedRedirectHosts []string` allowlist.
    When configured, `redirect` rejects absolute URLs whose host is not in the allowlist.
 
 **Trade-off (open-redirect defense):** Declarative path templates (#1637) keep redirect schemes and hostnames static by schema structure.
 Because filterlang constructs `location` strings dynamically, the type checker cannot prove the target hostname is static in all scripts.
-The host layer mitigates this with CR/LF rejection, `//` rejection, and optional `AllowedRedirectHosts` checks at runtime.
+The host layer mitigates this with CR/LF rejection, `//` and `/\` rejection, and optional `AllowedRedirectHosts` checks at runtime.
 
 ## HTTP Filter Host API
 
@@ -410,7 +417,7 @@ Built-in functions:
 - `html_escape(value: str) -> str` escapes HTML metacharacters (`html.EscapeString`) for safe inline HTML generation.
 - `len(x) -> int` returns the rune count for `str` or the element count for `list[T]` and `dict[K, V]`.
 - `str(n: int) -> str` converts an `int` to its base-10 string representation.
-- `range(stop: int) -> list[int]` returns `[0, ..., stop-1]` when `0 <= stop <= MaxRangeLen`.
+- `range(stop: int) -> list[int]` returns `[]` when `stop <= 0`, returns `[0, ..., stop-1]` when `0 < stop <= MaxRangeLen`, and aborts with a budget error when `stop > MaxRangeLen`.
 
 Built-in methods:
 
@@ -434,12 +441,10 @@ Built-in methods:
 
 ## Concrete Examples: `k8s.io` Vanity Redirector
 
-The script below implements the `k8s.io` vanity redirector cases from issue #1601 in filterlang.
-The script contains no manual type annotations.
-The type checker infers every parameter, local variable, and return type and verifies every `T | None` narrowing step during compilation.
+The script below implements the `k8s.io` vanity redirector cases from issue #1601 in filterlang with no manual type annotations.
+Each handler exercises a distinct capability: ordered regex rules and `?go-get=1` pass-through (`git.k8s.io`), table lookup and query escaping (`go.k8s.io`), prefix narrowing and fragment ordering (`rel.k8s.io`), optional regex groups with a polymorphic helper (`sbom.k8s.io`), and in-process `?go-get=1` HTML responses (`k8s.io`).
 
 ```python
-# Compile-time validated patterns and immutable constant tables.
 GIT_REPO_PATTERN = re_compile(r"^/(?P<repo>[^/]+)/?$")
 GIT_FILE_PATTERN = re_compile(r"^/(?P<repo>[^/]+)/(?P<path>.+)$")
 OWNERS_TEMPLATE = path_template("/owners/{user}")
@@ -451,6 +456,18 @@ GO_SHORT_LINKS = [
     ("/b", "https://github.com/kubernetes/kubernetes/issues"),
     ("/pr", "https://github.com/kubernetes/kubernetes/pulls"),
 ]
+
+
+def unwrap_or(value, fallback):
+    if value is not None:
+        return value
+    return fallback
+
+
+def capture(match, name):
+    if match is None:
+        return None
+    return match.named(name)
 
 
 def append_query_and_fragment(base_url, raw_query, fragment):
@@ -467,24 +484,21 @@ def handle_git(request):
         return next()
 
     # Ordered rule 1: git.k8s.io/<repo> or git.k8s.io/<repo>/
-    match = GIT_REPO_PATTERN.match(request.path)
-    if match is not None:
-        repo = match.named("repo")
-        if repo is not None:
-            return redirect(302, f"https://github.com/kubernetes/{url_path_escape(repo)}")
+    repo = capture(GIT_REPO_PATTERN.match(request.path), "repo")
+    if repo is not None:
+        return redirect(302, f"https://github.com/kubernetes/{url_path_escape(repo)}")
 
     # Ordered rule 2: git.k8s.io/<repo>/<path>
-    match = GIT_FILE_PATTERN.match(request.path)
-    if match is not None:
-        repo = match.named("repo")
-        file_path = match.named("path")
-        if repo is not None and file_path is not None:
-            escaped_repo = url_path_escape(repo)
-            escaped_path = url_segments_escape(file_path)
-            return redirect(
-                302,
-                f"https://github.com/kubernetes/{escaped_repo}/blob/master/{escaped_path}",
-            )
+    file_match = GIT_FILE_PATTERN.match(request.path)
+    repo = capture(file_match, "repo")
+    file_path = capture(file_match, "path")
+    if repo is not None and file_path is not None:
+        escaped_repo = url_path_escape(repo)
+        escaped_path = url_segments_escape(file_path)
+        return redirect(
+            302,
+            f"https://github.com/kubernetes/{escaped_repo}/blob/master/{escaped_path}",
+        )
 
     return redirect(302, "https://github.com/kubernetes")
 
@@ -496,15 +510,13 @@ def handle_go(request):
             return redirect(302, target)
 
     # go.k8s.io/owners/<user>: escape capture while keeping literal %2F intact.
-    match = OWNERS_TEMPLATE.match(request.path)
-    if match is not None:
-        user = match.named("user")
-        if user is not None:
-            escaped = url_query_escape(user)
-            return redirect(
-                302,
-                f"https://cs.k8s.io/?q={escaped}&i=fosho&files=OWNERS&excludeFiles=vendor%2F&repos=",
-            )
+    user = capture(OWNERS_TEMPLATE.match(request.path), "user")
+    if user is not None:
+        escaped = url_query_escape(user)
+        return redirect(
+            302,
+            f"https://cs.k8s.io/?q={escaped}&i=fosho&files=OWNERS&excludeFiles=vendor%2F&repos=",
+        )
 
     return next()
 
@@ -512,11 +524,8 @@ def handle_go(request):
 def handle_rel(request):
     # rel.k8s.io/v1.32/retro -> .../releases/release-1.32/links.md#retro
     match = RELEASE_LINK_TEMPLATE.match(request.path)
-    if match is None:
-        return next()
-
-    raw_version = match.named("version")
-    section = match.named("section")
+    raw_version = capture(match, "version")
+    section = capture(match, "section")
     if raw_version is None or section is None:
         return next()
 
@@ -534,20 +543,13 @@ def handle_rel(request):
 
 
 def handle_sbom(request):
-    # sbom.k8s.io/<ver>/release[.sig|.cert] -> optional capture group narrowing.
+    # sbom.k8s.io/<ver>/release[.sig|.cert] -> optional capture via polymorphic helper.
     match = SBOM_PATTERN.match(request.path)
-    if match is None:
-        return next()
-
-    version = match.named("version")
+    version = capture(match, "version")
     if version is None:
         return next()
 
-    suffix = ""
-    extension = match.named("extension")
-    if extension is not None:
-        suffix = extension
-
+    suffix = unwrap_or(capture(match, "extension"), "")
     return redirect(
         302,
         f"https://dl.k8s.io/release/{url_path_escape(version)}/kubernetes-release.spdx{suffix}",
@@ -560,11 +562,7 @@ def maybe_go_get_response(request):
     if go_get is None or go_get != "1":
         return None
 
-    match = GO_GET_PATTERN.match(request.path)
-    if match is None:
-        return None
-
-    repo = match.named("repo")
+    repo = capture(GO_GET_PATTERN.match(request.path), "repo")
     if repo is None:
         return None
 
@@ -579,10 +577,7 @@ def maybe_go_get_response(request):
 
 def handle(request):
     if request.host == "k8s.io":
-        go_get_action = maybe_go_get_response(request)
-        if go_get_action is not None:
-            return go_get_action
-        return next()
+        return unwrap_or(maybe_go_get_response(request), next())
     if request.host == "git.k8s.io":
         return handle_git(request)
     if request.host == "go.k8s.io":
@@ -597,15 +592,16 @@ def handle(request):
 ### Ergonomics Notes from the Examples
 
 - **Uniform null safety across all types:** `request.query.get("go-get")` (`str | None`), `GIT_REPO_PATTERN.match(...)` (`Match | None`), `match.named("extension")` (`str | None`), `raw_version.strip_prefix("v")` (`str | None`), and `maybe_go_get_response(request)` (`Action | None`) all use the same `T | None` narrowing rules.
-- **Extra guard on required captures:** Because `match.named(...)` returns `str | None` even for required capture groups, `handle_git` and `handle_sbom` check `if repo is not None:`.
-  This check adds one guard line per required capture in exchange for keeping the type checker independent of regex AST analysis.
-  A later enhancement can inspect compiled pattern metadata to type required groups as `str` directly if scripts find the extra guard noisy.
+- **Let-polymorphism reduces boilerplate:** The 4-line `unwrap_or` helper infers `(T | None, T) -> T` and works cleanly on both `str | None` (in `handle_sbom`) and `Action | None` (in `handle`), while `capture(match, name)` collapses chained `Match | None` and `str | None` checks into one `str | None` check.
+- **Trade-off on required captures:** Because `match.named(...)` returns `str | None` even for required capture groups, scripts still check or unwrap required captures.
+  This keeps the type checker independent of regex AST analysis.
+  A later enhancement can inspect compiled pattern metadata to type required groups as `str` directly if scripts find the check noisy.
 
 ## Key Architectural Trade-Offs
 
 1. **Tree-walking evaluator vs. bytecode VM:**
    The initial implementation walks the type-checked AST directly.
-   A tree walker takes roughly 200 lines of Go and maps runtime errors directly to AST spans.
+   A tree walker stays compact and maps runtime errors directly to source spans.
    The trade-off is higher per-step CPU overhead than a stack-based bytecode VM.
    Because the public Go API exposes only `Compile` and `Program.Eval`, replacing the internal evaluator with a bytecode compiler later requires no language or caller changes.
 2. **Immutable composite values vs. local mutation:**
@@ -620,29 +616,26 @@ def handle(request):
 
 ## Implementation Breakdown
 
-Following the repository scope guidelines, implementation splits into seven small, ordered follow-up issues of roughly 200 non-test lines each.
+Following `AGENTS.md`, each follow-up issue targets at most 200 lines **including tests**, with explicit split points noted where an indivisible core plus unit tests may approach that ceiling.
 No production code lands in this design PR.
 
-1. **Issue 1 — `experiments/filterlang`: tokens, source spans, AST, and indentation lexer (~200 non-test lines)**
-   - Define `Span`, `Token`, AST statement/expression/type-annotation nodes, and the indentation-tracking lexer (including raw strings and f-string interpolation tokens, rejecting leading tabs).
-   - Unit tests cover indentation and dedentation edge cases, multiline grouping, f-string tokenization, and lexical error spans.
-2. **Issue 2 — `experiments/filterlang`: recursive-descent and Pratt parser (~200 non-test lines)**
-   - Parse top-level constants and `def` declarations, optional type annotations (`T | None`, `list[T]`, `dict[K, V]`, `tuple[...]`), control flow (`if`/`elif`/`else`, `for`, `return`, `break`, `continue`), and expressions with operator precedence.
-   - Enforce `MaxSourceBytes` and `MaxASTNodes`.
-   - Unit tests cover valid syntax, operator precedence, and syntax errors with exact `line:col` spans.
-3. **Issue 3 — `experiments/filterlang`: type representation, unifier, and core type checker (~200 non-test lines)**
-   - Implement types, type variables, unification with occurs check, flat `T | None` join and directed assignability, call-graph SCC let-polymorphism, exhaustive return checking, and `handle(request)` entry-point signature validation.
-   - Unit tests cover type inference, explicit annotations, nullability rejection, and missing returns.
-4. **Issue 4 — `experiments/filterlang`: flow-sensitive `T | None` narrowing and formatted diagnostics (~180 non-test lines)**
-   - Add branch narrowing (`is None`, `is not None`), early-return guard narrowing, `and`/`or` narrowing, rebinding invalidation, and caret-formatted `line:col` diagnostic rendering with hints.
-   - Unit tests cover nested guards, compound conditions, rebinding invalidation, and diagnostic formatting.
-5. **Issue 5 — `experiments/filterlang`: bounded tree-walking evaluator and immutable runtime values (~200 non-test lines)**
-   - Implement immutable runtime values, top-level constant initialization, deterministic evaluation of statements and expressions, and enforcement of `MaxSteps`, `MaxCallDepth`, `MaxRangeLen`, `MaxCollectionLen`, `MaxStringBytes`, and `MaxAllocBytes`.
-   - Unit tests cover evaluation semantics, division-by-zero errors, and every resource-budget limit.
-6. **Issue 6 — `experiments/filterlang`: HTTP filter host API, pattern compilation, and output safety (~200 non-test lines)**
-   - Add `Request`, `Regex` (RE2), `PathTemplate` (reusing `pkg/pathtemplate` from #1637 if merged, or a minimal self-contained matcher), `Match`, `Action` (`redirect`, `respond`, `next`), escaping and string helpers, HTTP header and `Location` validation, optional `AllowedRedirectHosts`, and the top-level `Compile` and `Program.Eval` Go API.
-   - Unit tests cover compile-time regex and template validation, escaping, header-injection rejection, and concurrent `Program.Eval` execution under `-race`.
-7. **Issue 7 — `experiments/filterlang`: `k8s.io` vanity redirector corpus tests, fuzz tests, and benchmarks (tests and benchmarks only)**
-   - Execute the full `k8s.io` script from this design against unit test matrices (`git.k8s.io`, `go.k8s.io/owners`, `rel.k8s.io`, `sbom.k8s.io`, `?go-get=1` via both `next()` and `respond(...)`, and negative compile-time error cases).
-   - Add Go fuzz targets for the lexer, parser, type checker, and bounded evaluator to verify bounded execution without panics on arbitrary inputs.
-   - Add `BenchmarkEval` measuring `ns/op` and `allocs/op` against an equivalent handwritten Go `http.Handler` to evaluate whether the experiment warrants GARI `ExtensionRef` integration in a subsequent phase.
+1. **Issue 1 — `experiments/filterlang`: source spans, token definitions, and AST (~160 lines including tests)**
+   - Define 1-based source spans, token kinds, and AST nodes for declarations, statements, expressions, and type annotations, with basic span/formatting tests.
+2. **Issue 2 — `experiments/filterlang`: indentation-tracking lexer (~200 lines including tests)**
+   - Implement space-only indentation block scanning (rejecting leading tabs), multiline delimiter grouping, raw strings, and f-string tokenization, with unit tests for edge cases and lexical error spans.
+3. **Issue 3 — `experiments/filterlang`: expression and statement parser (~200 lines including tests)**
+   - Parse top-level declarations, optional type annotations, statements, and operator-precedence expressions while enforcing compile-time source-size and AST-node caps.
+   - If unit tests push this slice over 200 total lines, split into expression parsing (3a) followed by statement/declaration parsing (3b).
+4. **Issue 4 — `experiments/filterlang`: type model, unifier, and flat nullability (~180 lines including tests)**
+   - Implement type representations, type variables, unification with occurs check, flat `T | None` normalization and `join`, directed assignability, and unit tests.
+5. **Issue 5 — `experiments/filterlang`: core type checker and SCC inference (~200 lines including tests)**
+   - Implement call-graph SCC topological checking, attribute and deferred overload resolution, let-polymorphism, exhaustive return checking, and `handle` entry-point signature verification.
+6. **Issue 6 — `experiments/filterlang`: flow-sensitive narrowing and diagnostics (~200 lines including tests)**
+   - Add `is None` / `is not None` branch and early-exit guard narrowing, `and`/`or` short-circuit narrowing, rebinding invalidation, and caret-formatted `line:col` diagnostics with hints.
+7. **Issue 7 — `experiments/filterlang`: immutable runtime values and bounded evaluator (~200 lines including tests)**
+   - Implement top-level constant initialization, deterministic AST evaluation, and enforcement of the compile-time and per-request step, call-depth, loop, and allocation budgets.
+8. **Issue 8 — `experiments/filterlang`: HTTP host API, pattern compilation, and output safety (~200 lines including tests)**
+   - Implement read-only request bindings, compile-time RE2 and path-template compilation (reusing `pkg/pathtemplate` from #1637 if merged), escaping/string helpers, HTTP output safety validation, and the concurrent `Compile` / `Program.Eval` entry points.
+   - If tests push this slice over 200 total lines, split pattern matchers and escaping helpers (8a) from HTTP request/action bindings and safety checks (8b).
+9. **Issue 9 — `experiments/filterlang`: `k8s.io` corpus tests, fuzz targets, and benchmarks (~200 lines, tests and benchmarks only)**
+   - Run the full `k8s.io` script and negative compile-time cases end to end, add fuzz targets verifying panic-free bounded execution on arbitrary input, and benchmark `Program.Eval` against a handwritten Go `http.Handler` to inform future GARI `ExtensionRef` integration.
