@@ -52,6 +52,9 @@ var (
 // Addresses: The Gateway's addresses are the internal addresses of every node that runs
 // a data-plane pod owned by the Gateway's Deployment, sorted and deduplicated.
 type HostPortAddressProvider struct {
+	// reader is used for uncached reads of Pods, ReplicaSets, and Nodes.
+	// When nil at construction, SetupWatches populates it once during manager
+	// registration before GatewayAddresses runs concurrently.
 	reader  client.Reader
 	wrapped *singlepod.AddressProvider
 }
