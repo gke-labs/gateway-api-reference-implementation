@@ -15,6 +15,7 @@
 package tunnel
 
 import (
+	"errors"
 	"flag"
 	"slices"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -116,81 +118,67 @@ func TestAddressProvider_ReadinessLogic(t *testing.T) {
 
 	ctx := t.Context()
 
-	// 1. Initially disconnected: returns addresses, ready=false, tunnel-specific unready message
-	addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected GatewayAddresses error: %v", err)
-	}
+	// 1. Initially disconnected: returns addresses and a Pending ConditionError with tunnel-specific message
+	addrs, err := provider.GatewayAddresses(ctx, gw, nil)
 	if len(addrs) != 2 {
 		t.Fatalf("expected 2 addresses, got %d", len(addrs))
 	}
-	if readiness.Ready {
-		t.Fatalf("expected ready=false when tunnel is disconnected")
+	var condErr *state.ConditionError
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected *state.ConditionError when tunnel is disconnected, got %v", err)
 	}
-	if readiness.Reason != "Pending" || !strings.Contains(readiness.Message, "not connected") {
-		t.Errorf("expected reason=Pending, msg containing 'not connected', got reason=%s, msg=%s", readiness.Reason, readiness.Message)
+	if condErr.Type != string(gatewayv1.GatewayConditionProgrammed) {
+		t.Errorf("expected type=Programmed, got %s", condErr.Type)
+	}
+	if condErr.Reason != "Pending" || !strings.Contains(condErr.Message, "not connected") {
+		t.Errorf("expected reason=Pending, msg containing 'not connected', got reason=%s, msg=%s", condErr.Reason, condErr.Message)
 	}
 
-	// 2. Tunnel connects, but hostnames not registered yet: ready=false
+	// 2. Tunnel connects, but hostnames not registered yet: Pending ConditionError
 	fakeState.setConnected(true)
-	addrs, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected GatewayAddresses error: %v", err)
-	}
+	addrs, err = provider.GatewayAddresses(ctx, gw, nil)
 	if len(addrs) != 2 {
 		t.Fatalf("expected 2 addresses, got %d", len(addrs))
 	}
-	if readiness.Ready {
-		t.Fatalf("expected ready=false when hostnames not yet registered")
+	condErr = nil
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected *state.ConditionError when hostnames not yet registered, got %v", err)
 	}
-	if readiness.Reason != "Pending" || !strings.Contains(readiness.Message, "registration") {
-		t.Errorf("expected reason=Pending, msg containing 'registration', got reason=%s, msg=%s", readiness.Reason, readiness.Message)
+	if condErr.Reason != "Pending" || !strings.Contains(condErr.Message, "registration") {
+		t.Errorf("expected reason=Pending, msg containing 'registration', got reason=%s, msg=%s", condErr.Reason, condErr.Message)
 	}
 
-	// 3. Register a different hostname: still ready=false for this Gateway
+	// 3. Register a different hostname: still Pending ConditionError for this Gateway
 	fakeState.setRegistered("other.example.com")
-	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected GatewayAddresses error: %v", err)
-	}
-	if readiness.Ready {
-		t.Fatalf("expected ready=false when this Gateway's hostname is not registered")
+	_, err = provider.GatewayAddresses(ctx, gw, nil)
+	condErr = nil
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected *state.ConditionError when this Gateway's hostname is not registered, got %v", err)
 	}
 
-	// 4. Register this Gateway's hostname: ready=true
+	// 4. Register this Gateway's hostname: nil error (ready)
 	fakeState.setRegistered("echo.example.com")
-	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
+	_, err = provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected GatewayAddresses error: %v", err)
-	}
-	if !readiness.Ready {
-		t.Fatalf("expected ready=true when tunnel is connected and hostnames are registered")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Errorf("expected reason=Programmed when ready, got %s", readiness.Reason)
+		t.Fatalf("expected nil error when tunnel is connected and hostnames are registered, got: %v", err)
 	}
 
-	// 5. Kill session (disconnect): flips back to ready=false
+	// 5. Kill session (disconnect): flips back to Pending ConditionError
 	fakeState.setConnected(false)
-	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected GatewayAddresses error: %v", err)
+	_, err = provider.GatewayAddresses(ctx, gw, nil)
+	condErr = nil
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected *state.ConditionError after killing tunnel session, got %v", err)
 	}
-	if readiness.Ready {
-		t.Fatalf("expected ready=false after killing tunnel session")
-	}
-	if readiness.Reason != "Pending" || !strings.Contains(readiness.Message, "not connected") {
-		t.Errorf("expected reason=Pending, msg containing 'not connected' after kill, got reason=%s, msg=%s", readiness.Reason, readiness.Message)
+	if condErr.Reason != "Pending" || !strings.Contains(condErr.Message, "not connected") {
+		t.Errorf("expected reason=Pending, msg containing 'not connected' after kill, got reason=%s, msg=%s", condErr.Reason, condErr.Message)
 	}
 
-	// 6. Restore session: flips back to ready=true
+	// 6. Restore session: flips back to nil error (ready)
 	fakeState.setConnected(true)
-	_, readiness, err = provider.GatewayAddresses(ctx, gw, nil)
+	_, err = provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected GatewayAddresses error: %v", err)
-	}
-	if !readiness.Ready {
-		t.Fatalf("expected ready=true after restoring tunnel session")
+		t.Fatalf("expected nil error after restoring tunnel session, got: %v", err)
 	}
 }
 
@@ -218,16 +206,17 @@ func TestAddressProvider_MultipleListeners(t *testing.T) {
 
 	// Only h1 registered
 	fakeState.setRegistered("echo1.example.com")
-	_, readiness, _ := provider.GatewayAddresses(ctx, gw, nil)
-	if readiness.Ready {
-		t.Fatalf("expected ready=false when only 1 of 2 listener hostnames is registered")
+	_, err := provider.GatewayAddresses(ctx, gw, nil)
+	var condErr *state.ConditionError
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected *state.ConditionError when only 1 of 2 listener hostnames is registered, got %v", err)
 	}
 
 	// Register h2 as well
 	fakeState.setRegistered("echo2.example.com")
-	_, readiness, _ = provider.GatewayAddresses(ctx, gw, nil)
-	if !readiness.Ready {
-		t.Fatalf("expected ready=true when all listener hostnames are registered")
+	_, err = provider.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("expected nil error when all listener hostnames are registered, got %v", err)
 	}
 }
 
@@ -250,9 +239,9 @@ func TestAddressProvider_NoHostnamesGateway(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	_, readiness, _ := provider.GatewayAddresses(ctx, gw, nil)
-	if !readiness.Ready {
-		t.Fatalf("expected ready=true for Gateway with no SNI hostnames when tunnel is connected")
+	_, err := provider.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("expected nil error for Gateway with no SNI hostnames when tunnel is connected, got %v", err)
 	}
 }
 

@@ -133,8 +133,9 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 		singlepod.WithDebugErrorResponses(true),
 	)
 
-	_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
-	if err != nil {
+	_, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
+	var condErr *state.ConditionError
+	if err != nil && !errors.As(err, &condErr) {
 		t.Fatalf("GatewayAddresses failed: %v", err)
 	}
 

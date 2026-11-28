@@ -19,6 +19,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -49,12 +50,9 @@ func TestAddressProvider_ConfiguredInterface(t *testing.T) {
 		})
 
 		gw := &gatewayv1.Gateway{}
-		addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
+		addrs, err := provider.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
-		}
-		if !readiness.Ready {
-			t.Errorf("expected ready=true")
 		}
 
 		if len(addrs) != 2 {
@@ -81,12 +79,13 @@ func TestAddressProvider_ConfiguredInterface(t *testing.T) {
 		})
 
 		gw := &gatewayv1.Gateway{}
-		addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		addrs, err := provider.GatewayAddresses(ctx, gw, nil)
+		var condErr *state.ConditionError
+		if !errors.As(err, &condErr) {
+			t.Fatalf("expected *state.ConditionError, got %v", err)
 		}
-		if readiness.Ready {
-			t.Errorf("expected ready=false on error")
+		if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+			t.Errorf("expected reason=%s, got %s", gatewayv1.GatewayReasonAddressNotAssigned, condErr.Reason)
 		}
 		if len(addrs) != 0 {
 			t.Errorf("expected 0 addresses, got %d", len(addrs))
@@ -121,12 +120,9 @@ func TestAddressProvider_NodeFallback(t *testing.T) {
 	})
 
 	gw := &gatewayv1.Gateway{}
-	addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
+	addrs, err := provider.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if !readiness.Ready {
-		t.Errorf("expected ready=true")
 	}
 
 	if len(addrs) != 2 {
@@ -145,12 +141,13 @@ func TestAddressProvider_Unconfigured(t *testing.T) {
 	ctx := t.Context()
 	provider := NewAddressProvider(Options{})
 	gw := &gatewayv1.Gateway{}
-	addrs, readiness, err := provider.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	addrs, err := provider.GatewayAddresses(ctx, gw, nil)
+	var condErr *state.ConditionError
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected *state.ConditionError when unconfigured, got %v", err)
 	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false when unconfigured")
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected reason=%s, got %s", gatewayv1.GatewayReasonAddressNotAssigned, condErr.Reason)
 	}
 	if len(addrs) != 0 {
 		t.Errorf("expected 0 addresses, got %d", len(addrs))

@@ -131,29 +131,28 @@ func ParseGatewayAddresses(addrs []string) []gatewayv1.GatewayStatusAddress {
 	return result
 }
 
-// GatewayAddresses returns the configured addresses and whether the Gateway is ready.
-func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+// GatewayAddresses returns the configured addresses and a *state.ConditionError if the Gateway is not ready to serve.
+func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, error) {
 	if gw != nil {
 		p.mu.Lock()
 		p.knownGateways[types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}] = struct{}{}
 		p.mu.Unlock()
 	}
 
-	readiness := p.readinessForGateway(gw)
-	return slices.Clone(p.addresses), readiness, nil
+	return slices.Clone(p.addresses), p.readinessErrorForGateway(gw)
 }
 
-func (p *AddressProvider) readinessForGateway(gw *gatewayv1.Gateway) state.GatewayReadiness {
+func (p *AddressProvider) readinessErrorForGateway(gw *gatewayv1.Gateway) error {
 	if p.tunnelState == nil {
-		return state.GatewayReadiness{
-			Ready:   false,
+		return &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonPending),
 			Message: "Tunnel state is unavailable",
 		}
 	}
 	if !p.tunnelState.IsConnected() {
-		return state.GatewayReadiness{
-			Ready:   false,
+		return &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonPending),
 			Message: "Tunnel session to frontend is not connected",
 		}
@@ -164,18 +163,14 @@ func (p *AddressProvider) readinessForGateway(gw *gatewayv1.Gateway) state.Gatew
 		hostnames = ExtractHostnames([]*gatewayv1.Gateway{gw})
 	}
 	if !p.tunnelState.HasRegisteredHostnames(hostnames) {
-		return state.GatewayReadiness{
-			Ready:   false,
+		return &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonPending),
 			Message: "Waiting for tunnel hostname registration to complete",
 		}
 	}
 
-	return state.GatewayReadiness{
-		Ready:   true,
-		Reason:  string(gatewayv1.GatewayReasonProgrammed),
-		Message: "Gateway programmed by reference implementation",
-	}
+	return nil
 }
 
 // SetupWatches registers a watch on tunnel state changes with the Gateway controller.

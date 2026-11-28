@@ -741,13 +741,6 @@ func (cm *CompiledModel) ResolvedGateways() []*gatewayv1.Gateway {
 	return res
 }
 
-// GatewayReadiness represents the data-plane readiness state of a Gateway.
-type GatewayReadiness struct {
-	Ready   bool
-	Reason  string
-	Message string
-}
-
 // ModelInputs contains all inputs required to build a CompiledModel and ComputeOutputs.
 type ModelInputs struct {
 	// Revision is the monotonically increasing snapshot revision number for state computation.

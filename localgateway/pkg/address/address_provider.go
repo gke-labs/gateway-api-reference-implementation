@@ -114,8 +114,8 @@ func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
 	return nil
 }
 
-// GatewayAddresses returns the node's LAN IP addresses and detailed readiness for the Gateway.
-func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+// GatewayAddresses returns the node's LAN IP addresses and a *state.ConditionError when not ready.
+func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, error) {
 	p.mu.RLock()
 	ifaceName := p.interfaceName
 	nodeName := p.nodeName
@@ -130,48 +130,48 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		addrs, err := ifaceAddrsFn(ifaceName)
 		if err != nil {
 			klog.Errorf("localgateway: failed to get addresses for interface %q: %v", ifaceName, err)
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 				Message: fmt.Sprintf("failed to get addresses for interface %q: %v", ifaceName, err),
-			}, nil
+			}
 		}
 		ips = extractLANIPs(addrs)
 		if len(ips) == 0 {
 			klog.Errorf("localgateway: interface %q has no valid LAN IP addresses", ifaceName)
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 				Message: fmt.Sprintf("interface %q has no valid LAN IP addresses", ifaceName),
-			}, nil
+			}
 		}
 	} else if nodeName != "" && cl != nil {
 		// 2. Node lookup from Kubernetes API: require node's InternalIP
 		node := &corev1.Node{}
 		if err := cl.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
 			klog.Errorf("localgateway: failed to get node %q: %v", nodeName, err)
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 				Message: fmt.Sprintf("failed to get node %q: %v", nodeName, err),
-			}, nil
+			}
 		}
 		ips = extractNodeInternalIPs(node)
 		if len(ips) == 0 {
 			klog.Errorf("localgateway: node %q has no NodeInternalIP addresses in status.addresses", nodeName)
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 				Message: fmt.Sprintf("no NodeInternalIP addresses found on node %q", nodeName),
-			}, nil
+			}
 		}
 	} else {
 		// Neither interface nor node is available
-		return nil, state.GatewayReadiness{
-			Ready:   false,
+		return nil, &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 			Message: "either --interface or --node-name must be specified for localgateway address provider",
-		}, nil
+		}
 	}
 
 	// Deduplicate and sort deterministically: IPv4 first, then IPv6
@@ -185,11 +185,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		})
 	}
 
-	return statusAddrs, state.GatewayReadiness{
-		Ready:   true,
-		Reason:  string(gatewayv1.GatewayReasonProgrammed),
-		Message: "Node LAN addresses assigned",
-	}, nil
+	return statusAddrs, nil
 }
 
 // extractLANIPs extracts valid IPv4 and IPv6 LAN IPs from a slice of net.Addr.

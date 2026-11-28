@@ -16,6 +16,7 @@ package hostport
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -64,6 +65,26 @@ func setupTestClient(t *testing.T) client.Client {
 		WithObjects(bundleCM).
 		WithReturnManagedFields().
 		Build()
+}
+
+func requireConditionError(t *testing.T, err error) *state.ConditionError {
+	t.Helper()
+	var condErr *state.ConditionError
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected *state.ConditionError, got: %v", err)
+	}
+	if condErr.Type != string(gatewayv1.GatewayConditionProgrammed) {
+		t.Errorf("expected ConditionError.Type=%q, got %q", gatewayv1.GatewayConditionProgrammed, condErr.Type)
+	}
+	return condErr
+}
+
+func assertNoUnexpectedError(t *testing.T, err error) {
+	t.Helper()
+	var condErr *state.ConditionError
+	if err != nil && !errors.As(err, &condErr) {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 type hostPortSignature struct {
@@ -117,10 +138,8 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 	// 1. Expected: run existing singlepod provider with WithHostPorts()
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, "default", singlepod.WithHostPorts())
-	expectedAddresses, expectedReadiness, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
-	}
+	expectedAddresses, expectedErr := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
+	expectedCondErr := requireConditionError(t, expectedErr)
 
 	var expectedDeployment appsv1.Deployment
 	if err := expectedClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &expectedDeployment); err != nil {
@@ -133,10 +152,8 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	actualAddresses, actualReadiness, err := hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
-	}
+	actualAddresses, actualErr := hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	actualCondErr := requireConditionError(t, actualErr)
 
 	var actualDeployment appsv1.Deployment
 	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
@@ -179,18 +196,15 @@ func TestHostPortAddressProvider_MatchesSinglePodWithHostPorts(t *testing.T) {
 		t.Errorf("expected no Service to be created, got err: %v", err)
 	}
 
-	// 6. Verify address and readiness stub
-	if actualReadiness.Ready {
-		t.Errorf("expected ready=false in this step")
-	}
+	// 6. Verify address and not-ready ConditionError
 	if len(actualAddresses) > 0 {
 		t.Errorf("expected 0 addresses in this step, got %+v", actualAddresses)
 	}
 	if !reflect.DeepEqual(actualAddresses, expectedAddresses) {
 		t.Errorf("addresses mismatch: got %+v, want %+v", actualAddresses, expectedAddresses)
 	}
-	if actualReadiness.Ready != expectedReadiness.Ready {
-		t.Errorf("readiness.Ready mismatch: got %v, want %v", actualReadiness.Ready, expectedReadiness.Ready)
+	if actualCondErr.Reason != expectedCondErr.Reason {
+		t.Errorf("ConditionError.Reason mismatch: got %q, want %q", actualCondErr.Reason, expectedCondErr.Reason)
 	}
 }
 
@@ -224,10 +238,8 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, "default", singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
-	}
+	_, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 	var expectedDeployment appsv1.Deployment
 	if err := expectedClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &expectedDeployment); err != nil {
 		t.Fatalf("failed to get expected Deployment: %v", err)
@@ -238,10 +250,8 @@ func TestHostPortAddressProvider_ReservedPortsSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	_, _, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
-	}
+	_, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 	var actualDeployment appsv1.Deployment
 	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
 		t.Fatalf("failed to get actual Deployment: %v", err)
@@ -294,10 +304,8 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, "default", singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
-	}
+	_, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 	var expectedDeployment appsv1.Deployment
 	if err := expectedClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &expectedDeployment); err != nil {
 		t.Fatalf("failed to get expected Deployment: %v", err)
@@ -308,10 +316,8 @@ func TestHostPortAddressProvider_NonDefaultPorts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	_, _, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
-	}
+	_, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 	var actualDeployment appsv1.Deployment
 	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
 		t.Fatalf("failed to get actual Deployment: %v", err)
@@ -444,10 +450,8 @@ func TestHostPortAddressProvider_ListenerSetListener(t *testing.T) {
 
 	expectedClient := setupTestClient(t)
 	singlePodHP := singlepod.NewAddressProvider(expectedClient, "default", singlepod.WithHostPorts())
-	_, _, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("singlepod WithHostPorts reconcile failed: %v", err)
-	}
+	_, err := singlePodHP.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 	var expectedDeployment appsv1.Deployment
 	if err := expectedClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &expectedDeployment); err != nil {
 		t.Fatalf("failed to get expected Deployment: %v", err)
@@ -458,10 +462,8 @@ func TestHostPortAddressProvider_ListenerSetListener(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	_, _, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
-	}
+	_, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 	var actualDeployment appsv1.Deployment
 	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
 		t.Fatalf("failed to get actual Deployment: %v", err)
@@ -533,10 +535,8 @@ func TestHostPortAddressProvider_ConflictedListenerSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create HostPortAddressProvider: %v", err)
 	}
-	_, _, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("HostPortAddressProvider reconcile failed: %v", err)
-	}
+	_, err = hostPortProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 	var actualDeployment appsv1.Deployment
 	if err := actualClient.Get(ctx, types.NamespacedName{Namespace: gateway.Namespace, Name: resourceName}, &actualDeployment); err != nil {
 		t.Fatalf("failed to get actual Deployment: %v", err)
@@ -691,13 +691,8 @@ func TestHostPortAddressProvider_GatewayAddresses(t *testing.T) {
 		},
 	}
 
-	addresses, readiness, err := provider.GatewayAddresses(t.Context(), gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false")
-	}
+	addresses, err := provider.GatewayAddresses(t.Context(), gateway, nil)
+	requireConditionError(t, err)
 	if len(addresses) != 0 {
 		t.Errorf("expected 0 addresses, got %+v", addresses)
 	}
@@ -741,9 +736,13 @@ func TestHostPortAddressProvider_NilReaderFailsWithoutSetupWatches(t *testing.T)
 			UID:       types.UID("test-uid"),
 		},
 	}
-	_, _, err = provider.GatewayAddresses(t.Context(), gateway, nil)
+	_, err = provider.GatewayAddresses(t.Context(), gateway, nil)
 	if err == nil {
 		t.Fatalf("expected error from GatewayAddresses when reader is nil, got nil")
+	}
+	var condErr *state.ConditionError
+	if errors.As(err, &condErr) {
+		t.Fatalf("expected non-ConditionError when reader is nil, got ConditionError: %v", err)
 	}
 	if !strings.Contains(err.Error(), "reader is required") {
 		t.Fatalf("expected error mentioning missing reader, got: %v", err)
@@ -782,13 +781,8 @@ func TestHostPortAddressProvider_SetupWatchesPopulatesReader(t *testing.T) {
 			},
 		},
 	}
-	_, readiness, err := provider.GatewayAddresses(t.Context(), gateway, nil)
-	if err != nil {
-		t.Fatalf("GatewayAddresses failed after SetupWatches populated reader: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected readiness.Ready=false before data-plane pod is scheduled")
-	}
+	_, err = provider.GatewayAddresses(t.Context(), gateway, nil)
+	requireConditionError(t, err)
 
 	var deployment appsv1.Deployment
 	deploymentKey := types.NamespacedName{
@@ -848,13 +842,11 @@ func TestHostPortAddressProvider_WrappedReadinessPropagated(t *testing.T) {
 
 	// With state set on provider but no parameters computed in state,
 	// singlepod returns GatewayReasonPending ("Waiting for state to compute gateway parameters").
-	// HostPortAddressProvider must return that readiness without discovering pods.
-	addresses, readiness, err := provider.GatewayAddresses(t.Context(), gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonPending) {
-		t.Errorf("expected Pending readiness from wrapped provider, got addresses=%+v readiness=%+v", addresses, readiness)
+	// HostPortAddressProvider must return that ConditionError without discovering pods.
+	addresses, err := provider.GatewayAddresses(t.Context(), gateway, nil)
+	condErr := requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Errorf("expected Pending ConditionError from wrapped provider, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 }
 
@@ -920,9 +912,8 @@ func setupHostPortsFixture(t *testing.T) (*hostPortsFixture, context.Context) {
 	}
 
 	// Run provider to build the Deployment
-	if _, _, err := provider.GatewayAddresses(ctx, gateway, nil); err != nil {
-		t.Fatalf("initial reconciliation failed: %v", err)
-	}
+	_, err = provider.GatewayAddresses(ctx, gateway, nil)
+	assertNoUnexpectedError(t, err)
 
 	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var deployment appsv1.Deployment
@@ -1023,22 +1014,18 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 	fixture, ctx := setupHostPortsFixture(t)
 
 	// 1. Initial reconcile: no pod exists yet -> no address and not programmed
-	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected 0 addresses and AddressNotAssigned before pod exists, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr := requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected 0 addresses and AddressNotAssigned before pod exists, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 
 	// 2. Pod exists but has no node assigned (Spec.NodeName = "") -> no address and not programmed
 	pod := fixture.createPod(t, ctx, "gw-hp-pod", "", true)
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected 0 addresses and AddressNotAssigned when pod has no node, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected 0 addresses and AddressNotAssigned when pod has no node, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 
 	// 3. Pod is scheduled onto node-1 and deployment is available:
@@ -1049,12 +1036,9 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 	}
 	fixture.setDeploymentReady(t, ctx, true)
 
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if !readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Errorf("expected ready=true and Reason=Programmed, got readiness=%+v", readiness)
 	}
 	// Verify addresses: only InternalIPs, sorted (IPv4 before IPv6), duplicate removed
 	if len(addresses) != 2 || addresses[0].Value != "10.0.0.5" || addresses[1].Value != "2001:db8::5" {
@@ -1065,9 +1049,9 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 	}
 
 	// Also verify through GatewayAddresses public API
-	gwAddresses, gwReadiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil || !gwReadiness.Ready || len(gwAddresses) != 2 || gwAddresses[0].Value != "10.0.0.5" || gwAddresses[1].Value != "2001:db8::5" {
-		t.Errorf("unexpected addresses from GatewayAddresses: ready=%v addrs=%+v err=%v", gwReadiness.Ready, gwAddresses, err)
+	gwAddresses, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	if err != nil || len(gwAddresses) != 2 || gwAddresses[0].Value != "10.0.0.5" || gwAddresses[1].Value != "2001:db8::5" {
+		t.Errorf("unexpected addresses from GatewayAddresses: addrs=%+v err=%v", gwAddresses, err)
 	}
 
 	// 4. Pod is rescheduled to node-2: addresses follow to node-2's internal address
@@ -1076,12 +1060,12 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 		t.Fatalf("failed to reschedule pod to node-2: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error after reschedule: %v", err)
 	}
-	if !readiness.Ready || len(addresses) != 1 || addresses[0].Value != "192.168.1.20" {
-		t.Fatalf("expected ready=true with 192.168.1.20 after reschedule, got ready=%v addresses=%+v", readiness.Ready, addresses)
+	if len(addresses) != 1 || addresses[0].Value != "192.168.1.20" {
+		t.Fatalf("expected 192.168.1.20 after reschedule, got addresses=%+v", addresses)
 	}
 
 	// 5. Pod moves back to unscheduled: address is cleared and not programmed
@@ -1090,12 +1074,10 @@ func TestHostPortAddressProvider_AddressFollowsNode(t *testing.T) {
 		t.Fatalf("failed to update pod: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error when unscheduled: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected 0 addresses and AddressNotAssigned when unscheduled, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected 0 addresses and AddressNotAssigned when unscheduled, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 }
 
@@ -1106,12 +1088,10 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 	// 1. Unowned pod that matches labels but lacks owner references -> ignored
 	unownedPod := fixture.createPod(t, ctx, "spoofed-pod", "node-1", false)
 
-	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected unowned pod copying labels to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr := requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected unowned pod copying labels to be ignored, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 	if err := fixture.client.Delete(ctx, unownedPod); err != nil {
 		t.Fatalf("failed to delete unowned pod: %v", err)
@@ -1144,12 +1124,10 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 		t.Fatalf("failed to update foreign pod owner reference: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected pod owned by foreign ReplicaSet to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected pod owned by foreign ReplicaSet to be ignored, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 	if err := fixture.client.Delete(ctx, foreignPod); err != nil {
 		t.Fatalf("failed to delete foreign pod: %v", err)
@@ -1170,12 +1148,10 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 	if err := fixture.client.Update(ctx, noUIDPod); err != nil {
 		t.Fatalf("failed to update no-uid pod: %v", err)
 	}
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected pod with empty ownerRef UID to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected pod with empty ownerRef UID to be ignored, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 	if err := fixture.client.Delete(ctx, noUIDPod); err != nil {
 		t.Fatalf("failed to delete no-uid pod: %v", err)
@@ -1216,12 +1192,10 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 	if err := fixture.client.Update(ctx, mismatchedPod); err != nil {
 		t.Fatalf("failed to update mismatched pod: %v", err)
 	}
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected pod with mismatched Deployment UID to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected pod with mismatched Deployment UID to be ignored, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 	if err := fixture.client.Delete(ctx, mismatchedPod); err != nil {
 		t.Fatalf("failed to delete mismatched pod: %v", err)
@@ -1229,12 +1203,12 @@ func TestHostPortAddressProvider_OwnerReferenceRequired(t *testing.T) {
 
 	// 5. Pod owned by the Deployment's ReplicaSet with strictly matching UIDs -> accepted
 	_ = fixture.createPod(t, ctx, "valid-rs-pod", "node-1", true)
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !readiness.Ready || len(addresses) != 2 {
-		t.Errorf("expected owned pod to be accepted, got ready=%v addresses=%+v", readiness.Ready, addresses)
+	if len(addresses) != 2 {
+		t.Errorf("expected owned pod to be accepted, got addresses=%+v", addresses)
 	}
 }
 
@@ -1306,12 +1280,9 @@ func TestHostPortAddressProvider_MultiplePodsOnMultipleNodesAndShrink(t *testing
 
 	// Two owned pods on two nodes give both nodes' addresses:
 	// node-1 (10.0.0.5, 2001:db8::5) and node-2 (192.168.1.20)
-	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	addresses, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error during rollout: %v", err)
-	}
-	if !readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Errorf("expected ready=true and Reason=Programmed, got %+v", readiness)
 	}
 	if len(addresses) != 3 || addresses[0].Value != "10.0.0.5" || addresses[1].Value != "192.168.1.20" || addresses[2].Value != "2001:db8::5" {
 		t.Fatalf("expected both nodes' addresses [10.0.0.5, 192.168.1.20, 2001:db8::5], got %+v", addresses)
@@ -1326,7 +1297,7 @@ func TestHostPortAddressProvider_MultiplePodsOnMultipleNodesAndShrink(t *testing
 		t.Fatalf("failed to remove finalizer: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1344,12 +1315,9 @@ func TestHostPortAddressProvider_MultiplePodsOnSameNode(t *testing.T) {
 	_ = fixture.createPod(t, ctx, "pod-b", "node-1", true)
 
 	// Two pods on one node give that node once (node-1 read once, deduplicated addresses)
-	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	addresses, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if !readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Errorf("expected ready=true and Reason=Programmed, got %+v", readiness)
 	}
 	if len(addresses) != 2 || addresses[0].Value != "10.0.0.5" || addresses[1].Value != "2001:db8::5" {
 		t.Fatalf("expected node-1 addresses once [10.0.0.5, 2001:db8::5], got %+v", addresses)
@@ -1361,12 +1329,10 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 
 	// 1. Pod on node that does not exist -> AddressNotAssigned
 	pod := fixture.createPod(t, ctx, "edge-pod", "non-existent-node", true)
-	addresses, readiness, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected 0 addresses for missing node, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err := fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr := requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected 0 addresses for missing node, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 
 	// 2. Pod on node without NodeInternalIP -> AddressNotAssigned
@@ -1385,12 +1351,10 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 	if err := fixture.client.Update(ctx, pod); err != nil {
 		t.Fatalf("failed to update pod: %v", err)
 	}
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected 0 addresses for node without internal IP, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected 0 addresses for node without internal IP, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 
 	// 3. Pod on node with unparseable NodeInternalIP -> returns error naming the node
@@ -1409,27 +1373,29 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 	if err := fixture.client.Update(ctx, pod); err != nil {
 		t.Fatalf("failed to update pod: %v", err)
 	}
-	_, _, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	_, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
 	if err == nil {
 		t.Fatalf("expected error for unparseable NodeInternalIP, got nil")
+	}
+	var condErrCheck *state.ConditionError
+	if errors.As(err, &condErrCheck) {
+		t.Fatalf("expected non-ConditionError for unparseable NodeInternalIP, got ConditionError: %v", err)
 	}
 	if !strings.Contains(err.Error(), "node-bad-ip") {
 		t.Errorf("expected error to name the node node-bad-ip, got %v", err)
 	}
 
-	// 4. Pod on valid node, but deployment is NOT available -> returns addresses, but Ready=false / Pending
+	// 4. Pod on valid node, but deployment is NOT available -> returns addresses, with Pending ConditionError
 	pod.Spec.NodeName = "node-1"
 	if err := fixture.client.Update(ctx, pod); err != nil {
 		t.Fatalf("failed to update pod: %v", err)
 	}
 	fixture.setDeploymentReady(t, ctx, false)
 
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 2 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonPending) {
-		t.Errorf("expected 2 addresses and Pending when deployment not ready, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 2 || condErr.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Errorf("expected 2 addresses and Pending when deployment not ready, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 
 	// 5. Pod in Failed phase (e.g. evicted) with a node assigned -> ignored
@@ -1439,12 +1405,10 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Fatalf("failed to update pod status: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected Failed pod to be skipped, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected Failed pod to be skipped, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 
 	// 6. Pod in Succeeded phase -> ignored
@@ -1453,12 +1417,10 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Fatalf("failed to update pod status: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected Succeeded pod to be skipped, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected Succeeded pod to be skipped, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 
 	// 7. Pod with empty NodeName -> ignored
@@ -1468,12 +1430,10 @@ func TestHostPortAddressProvider_EdgeCases(t *testing.T) {
 		t.Fatalf("failed to update pod: %v", err)
 	}
 
-	addresses, readiness, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(addresses) != 0 || readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected pod with empty NodeName to be ignored, got addresses=%+v readiness=%+v", addresses, readiness)
+	addresses, err = fixture.provider.GatewayAddresses(ctx, fixture.gateway, nil)
+	condErr = requireConditionError(t, err)
+	if len(addresses) != 0 || condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected pod with empty NodeName to be ignored, got addresses=%+v condErr=%+v", addresses, condErr)
 	}
 }
 
@@ -1723,19 +1683,14 @@ func TestHostPortAddressProvider_MultipleHTTPListeners_AddressNotUsable(t *testi
 		{Name: "http-8080", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
 	}
 
-	addresses, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false for two HTTP listeners on different ports")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	addresses, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", condErr.Reason)
 	}
 	expectedMsg := "host ports allow one HTTP and one HTTPS port"
-	if readiness.Message != expectedMsg {
-		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	if condErr.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, condErr.Message)
 	}
 	if len(addresses) > 0 {
 		t.Errorf("expected no addresses, got %+v", addresses)
@@ -1776,19 +1731,14 @@ func TestHostPortAddressProvider_MultipleHTTPSListeners_AddressNotUsable(t *test
 		{Name: "https-8443", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
 	}
 
-	addresses, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false for two HTTPS listeners on different ports")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	addresses, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", condErr.Reason)
 	}
 	expectedMsg := "host ports allow one HTTP and one HTTPS port"
-	if readiness.Message != expectedMsg {
-		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	if condErr.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, condErr.Message)
 	}
 	if len(addresses) > 0 {
 		t.Errorf("expected no addresses, got %+v", addresses)
@@ -1829,19 +1779,14 @@ func TestHostPortAddressProvider_HTTPSAndTLSListenersDifferentPorts_AddressNotUs
 		{Name: "tls-8443", Port: 8443, Protocol: gatewayv1.TLSProtocolType},
 	}
 
-	addresses, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false for one HTTPS port and one differing TLS port")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	addresses, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", condErr.Reason)
 	}
 	expectedMsg := "host ports allow one HTTP and one HTTPS port"
-	if readiness.Message != expectedMsg {
-		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	if condErr.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, condErr.Message)
 	}
 	if len(addresses) > 0 {
 		t.Errorf("expected no addresses, got %+v", addresses)
@@ -1882,11 +1827,10 @@ func TestHostPortAddressProvider_HTTPSAndTLSListenersSamePort_Provisioned(t *tes
 		{Name: "tls-443", Port: 443, Protocol: gatewayv1.TLSProtocolType},
 	}
 
-	_, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+	_, err = provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
+	var condErr *state.ConditionError
+	if errors.As(err, &condErr) && condErr.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
 		t.Errorf("expected not rejected with AddressNotUsable for HTTPS and TLS on same port")
 	}
 
@@ -1933,11 +1877,10 @@ func TestHostPortAddressProvider_OneHTTPOneHTTPSSeveralTCPUDP_Provisioned(t *tes
 		{Name: "udp-5354", Port: 5354, Protocol: gatewayv1.UDPProtocolType},
 	}
 
-	_, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+	_, err = provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
+	var condErr *state.ConditionError
+	if errors.As(err, &condErr) && condErr.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
 		t.Errorf("mixed listener configuration with 1 HTTP and 1 HTTPS should be provisioned, got AddressNotUsable")
 	}
 
@@ -1992,11 +1935,10 @@ func TestHostPortAddressProvider_TwoHTTPListenersSamePortDifferentHostnames(t *t
 		{Name: "http-bar", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: &h2},
 	}
 
-	_, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+	_, err = provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
+	var condErr *state.ConditionError
+	if errors.As(err, &condErr) && condErr.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
 		t.Errorf("two HTTP listeners on same port with different hostnames must count as one port, got AddressNotUsable")
 	}
 
@@ -2055,11 +1997,10 @@ func TestHostPortAddressProvider_ConflictedListenerSkippedInPortCount(t *testing
 		},
 	}
 
-	_, readiness, err := provider.GatewayAddresses(ctx, gateway, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+	_, err = provider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	assertNoUnexpectedError(t, err)
+	var condErr *state.ConditionError
+	if errors.As(err, &condErr) && condErr.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
 		t.Errorf("conflicted listener should be excluded from port count, got AddressNotUsable")
 	}
 
@@ -2104,10 +2045,8 @@ func TestHostPortAddressProvider_ExistingDeploymentUnchangedWhenPortLimitExceede
 	}
 
 	// 1. Initial valid reconcile provisions Deployment
-	_, _, err = provider.GatewayAddresses(ctx, gateway, validListeners)
-	if err != nil {
-		t.Fatalf("initial reconcile failed: %v", err)
-	}
+	_, err = provider.GatewayAddresses(ctx, gateway, validListeners)
+	assertNoUnexpectedError(t, err)
 
 	deploymentName := state.ResourceNameForGateway(gateway.Name)
 	var initialDeployment appsv1.Deployment
@@ -2124,12 +2063,10 @@ func TestHostPortAddressProvider_ExistingDeploymentUnchangedWhenPortLimitExceede
 		Name: "http-8080", Port: 8080, Protocol: gatewayv1.HTTPProtocolType,
 	})
 
-	addresses, readiness, err := provider.GatewayAddresses(ctx, gateway, invalidListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready || readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Errorf("expected AddressNotUsable, got readiness: %+v", readiness)
+	addresses, err := provider.GatewayAddresses(ctx, gateway, invalidListeners)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected AddressNotUsable, got condErr: %+v", condErr)
 	}
 	if len(addresses) > 0 {
 		t.Errorf("expected no addresses, got %+v", addresses)

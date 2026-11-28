@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"slices"
 	"strconv"
@@ -400,12 +401,10 @@ func TestLocalGateway_WiredControllerSetup(t *testing.T) {
 
 	t.Run("host-port Deployment provisioned with internal API and no Service", func(t *testing.T) {
 		ctx := t.Context()
-		_, readiness, err := fixture.options.AddressProvider.GatewayAddresses(ctx, gateway, compiledGateway.EffectiveListeners)
-		if err != nil {
-			t.Fatalf("GatewayAddresses failed: %v", err)
-		}
-		if readiness.Ready {
-			t.Errorf("expected readiness.Ready=false before data-plane pod is scheduled")
+		_, err := fixture.options.AddressProvider.GatewayAddresses(ctx, gateway, compiledGateway.EffectiveListeners)
+		var condErr *state.ConditionError
+		if !errors.As(err, &condErr) {
+			t.Fatalf("expected *state.ConditionError before data-plane pod is scheduled, got %v", err)
 		}
 
 		resourceKey := types.NamespacedName{

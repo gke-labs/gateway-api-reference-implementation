@@ -114,12 +114,16 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // AddressProvider returns the addresses to report in Gateway.status.addresses and whether the Gateway infrastructure is ready.
 // An empty result means the address is not assigned yet.
 //
-// GatewayReadiness.Ready indicates whether the data path from the reported addresses to this Gateway's
+// A nil error indicates that the data path from the reported addresses to this Gateway's
 // listeners is serving the Gateway's current configuration, as far as the provider can tell.
 // Concrete providers approximate this readiness contract using available infrastructure signals,
 // but fall short of confirming that the latest configuration revision is actively being served.
+//
+// A non-nil *state.ConditionError indicates a non-serving readiness state and may be returned
+// alongside non-empty addresses (for example, when addresses are known while the Gateway is
+// still not ready to serve). Any other non-nil error indicates a provisioning failure.
 type AddressProvider interface {
-	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error)
+	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, error)
 }
 
 // AddressWatcher is an optional interface that an AddressProvider can implement
@@ -222,9 +226,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				r.State.SetGatewayAddresses(req.NamespacedName, nil)
 			} else {
 				effectiveListeners := r.State.GetEffectiveListeners(req.NamespacedName)
-				providedAddresses, readiness, err := r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
+				providedAddresses, err := r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
 				if err != nil {
 					var conflictErr *OwnershipConflictError
+					var conditionErr *state.ConditionError
 					if errors.As(err, &conflictErr) {
 						l.Error(err, "ownership conflict provisioning gateway")
 						r.State.SetGatewayProvisioningErrors(req.NamespacedName, conflictErr, nil)
@@ -235,12 +240,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 						if requeueAfter == 0 || delay < requeueAfter {
 							requeueAfter = delay
 						}
+					} else if errors.As(err, &conditionErr) {
+						r.State.SetGatewayProvisioningErrors(req.NamespacedName, nil, conditionErr)
+						r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
 					} else {
 						l.Error(err, "unable to provision or fetch gateway addresses from address provider")
 						return ctrl.Result{}, err
 					}
 				} else {
-					r.State.SetGatewayProvisioningErrors(req.NamespacedName, nil, readinessToConditionError(readiness))
+					r.State.SetGatewayProvisioningErrors(req.NamespacedName, nil, nil)
 					r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
 				}
 			}
@@ -286,19 +294,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
-}
-
-// readinessToConditionError turns a non-ready GatewayReadiness into a Programmed ConditionError.
-// A ready result returns nil.
-func readinessToConditionError(readiness state.GatewayReadiness) *state.ConditionError {
-	if readiness.Ready {
-		return nil
-	}
-	return &state.ConditionError{
-		Type:    string(gatewayv1.GatewayConditionProgrammed),
-		Reason:  readiness.Reason,
-		Message: readiness.Message,
-	}
 }
 
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {

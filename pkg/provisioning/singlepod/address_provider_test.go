@@ -137,6 +137,26 @@ func testBundleConfigMap() *corev1.ConfigMap {
 	}
 }
 
+func requireConditionError(t *testing.T, err error) *state.ConditionError {
+	t.Helper()
+	var condErr *state.ConditionError
+	if !errors.As(err, &condErr) {
+		t.Fatalf("expected *state.ConditionError, got: %v", err)
+	}
+	if condErr.Type != string(gatewayv1.GatewayConditionProgrammed) {
+		t.Errorf("expected ConditionError.Type=%q, got %q", gatewayv1.GatewayConditionProgrammed, condErr.Type)
+	}
+	return condErr
+}
+
+func assertNoUnexpectedError(t *testing.T, err error) {
+	t.Helper()
+	var condErr *state.ConditionError
+	if err != nil && !errors.As(err, &condErr) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -207,15 +227,10 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	p := NewAddressProvider(client, "default", WithEnableH2C(true))
 
 	// 1. Initial reconcile creates SA, adds to CRB, creates Deployment and Service in my-ns, but no Ingress and replicas not ready yet
-	addrs, readiness, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	addrs, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
+	requireConditionError(t, err)
 	if len(addrs) != 0 {
 		t.Fatalf("expected 0 addresses before LB ingress is assigned, got %d", len(addrs))
-	}
-	if readiness.Ready {
-		t.Fatalf("expected ready=false before deployment replicas become available")
 	}
 
 	// Verify Service was created in my-ns with all effective listener ports (including ListenerSet port 8080)
@@ -306,13 +321,10 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 		t.Fatalf("failed to update deploy status: %v", err)
 	}
 
-	// Reconcile again -> should return the assigned LB address and ready=true
-	addrs, readiness, err = p.GatewayAddresses(ctx, gw, effectiveListeners)
+	// Reconcile again -> should return the assigned LB address and nil error (ready)
+	addrs, err = p.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !readiness.Ready {
-		t.Fatalf("expected ready=true after replicas available")
+		t.Fatalf("expected ready (nil error) after replicas available, got: %v", err)
 	}
 	if len(addrs) != 1 || addrs[0].Value != "172.18.255.201" || state.ValueOf(addrs[0].Type) != gatewayv1.IPAddressType {
 		t.Fatalf("expected IP 172.18.255.201, got %+v", addrs)
@@ -320,7 +332,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 
 	// 3. Update Gateway infrastructure labels -> should update template hash and pod template
 	gw.Spec.Infrastructure.Labels["updated-label"] = "updated-val"
-	_, _, err = p.GatewayAddresses(ctx, gw, effectiveListeners)
+	_, err = p.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("failed to update gateway with new infrastructure label: %v", err)
 	}
@@ -361,11 +373,11 @@ func TestSinglePodAddressProvider_NamespacedConfigMaps(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _, _ = p.GatewayAddresses(ctx, gw1, nil)
+		_, _ = p.GatewayAddresses(ctx, gw1, nil)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _, _ = p.GatewayAddresses(ctx, gw2, nil)
+		_, _ = p.GatewayAddresses(ctx, gw2, nil)
 	}()
 	wg.Wait()
 
@@ -576,7 +588,7 @@ func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
 			p := NewAddressProvider(cl, "default")
 			ctx := t.Context()
 
-			_, _, err := p.GatewayAddresses(ctx, gw, nil)
+			_, err := p.GatewayAddresses(ctx, gw, nil)
 			if err == nil {
 				t.Fatalf("expected ownership conflict error, got nil")
 			}
@@ -785,10 +797,8 @@ func TestSinglePodAddressProvider_InfrastructureLabelsAndAnnotationsLandOnAllFou
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	resName := state.ResourceNameForGateway("test-gw")
 
@@ -863,10 +873,8 @@ func TestSinglePodAddressProvider_InfrastructureValueUpdate(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on initial reconcile: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	resName := state.ResourceNameForGateway("test-gw")
 
@@ -874,10 +882,8 @@ func TestSinglePodAddressProvider_InfrastructureValueUpdate(t *testing.T) {
 	gw.Spec.Infrastructure.Labels["tier"] = "frontend-v2"
 	gw.Spec.Infrastructure.Annotations["cost-center"] = "2000"
 
-	_, _, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on update reconcile: %v", err)
-	}
+	_, err = p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	// 1. ServiceAccount
 	var sa corev1.ServiceAccount
@@ -952,10 +958,8 @@ func TestSinglePodAddressProvider_InfrastructureKeyRemoval(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on initial reconcile: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	resName := state.ResourceNameForGateway("test-gw")
 
@@ -963,10 +967,8 @@ func TestSinglePodAddressProvider_InfrastructureKeyRemoval(t *testing.T) {
 	delete(gw.Spec.Infrastructure.Labels, "remove-me")
 	delete(gw.Spec.Infrastructure.Annotations, "remove-me")
 
-	_, _, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on removal reconcile: %v", err)
-	}
+	_, err = p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	// 1. ServiceAccount
 	var sa corev1.ServiceAccount
@@ -1065,10 +1067,8 @@ func TestSinglePodAddressProvider_InfrastructureUserKeysCannotOverrideReservedLa
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	resName := state.ResourceNameForGateway("test-gw")
 
@@ -1160,10 +1160,8 @@ func TestSinglePodAddressProvider_PreservesForeignLabelsAndAnnotations(t *testin
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on initial reconcile: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	resName := state.ResourceNameForGateway("test-gw")
 
@@ -1206,10 +1204,8 @@ func TestSinglePodAddressProvider_PreservesForeignLabelsAndAnnotations(t *testin
 	gw.Spec.Infrastructure.Annotations["cost-center"] = "2000"
 	delete(gw.Spec.Infrastructure.Annotations, "remove-anno")
 
-	_, _, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on second reconcile: %v", err)
-	}
+	_, err = p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	// Verify ServiceAccount preserves foreign labels/annotations and updates/removes infra keys
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
@@ -1316,10 +1312,8 @@ func TestSinglePodAddressProvider_NoChangesIssuesNoWrite(t *testing.T) {
 	resName := state.ResourceNameForGateway("test-gw")
 
 	// 1. Initial reconcile creates resources
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on initial reconcile: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	var sa corev1.ServiceAccount
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
@@ -1340,10 +1334,8 @@ func TestSinglePodAddressProvider_NoChangesIssuesNoWrite(t *testing.T) {
 	svcRV := svc.ResourceVersion
 
 	// 2. Second reconcile with identical configuration: no writes issued, resourceVersion unchanged
-	_, _, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on no-op reconcile: %v", err)
-	}
+	_, err = p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
 		t.Fatalf("failed to get ServiceAccount: %v", err)
@@ -1368,10 +1360,8 @@ func TestSinglePodAddressProvider_NoChangesIssuesNoWrite(t *testing.T) {
 
 	// 3. Third reconcile with changed infrastructure metadata: resourceVersion must change
 	gw.Spec.Infrastructure.Labels["tier"] = "frontend-v2"
-	_, _, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on update reconcile: %v", err)
-	}
+	_, err = p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
 		t.Fatalf("failed to get ServiceAccount: %v", err)
@@ -1419,19 +1409,14 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 		},
 	}
 
-	// 1. Initial reconcile with requested IP: Service pins loadBalancerIP, readiness is AddressNotUsable
-	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// 1. Initial reconcile with requested IP: Service pins loadBalancerIP, returns AddressNotUsable ConditionError
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", condErr.Reason)
 	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false when requested address not in ingress")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
-	}
-	if !strings.Contains(readiness.Message, "192.0.2.1") {
-		t.Errorf("expected message mentioning 192.0.2.1, got %s", readiness.Message)
+	if !strings.Contains(condErr.Message, "192.0.2.1") {
+		t.Errorf("expected message mentioning 192.0.2.1, got %s", condErr.Message)
 	}
 
 	resName := state.ResourceNameForGateway("test-gw")
@@ -1460,12 +1445,9 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 		t.Fatalf("failed to update Service status: %v", err)
 	}
 
-	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
+	addrs, err := p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected error on second reconcile: %v", err)
-	}
-	if !readiness.Ready {
-		t.Errorf("expected ready=true when requested address is bound in ingress")
+		t.Fatalf("expected ready (nil error) when requested address is bound in ingress, got: %v", err)
 	}
 	if len(addrs) != 1 || addrs[0].Value != "192.0.2.1" {
 		t.Errorf("expected 1 address 192.0.2.1, got %+v", addrs)
@@ -1474,12 +1456,9 @@ func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
 	// 3. Removing requested address from spec.addresses releases it:
 	// Service no longer pins it and status updates on next reconcile without restart.
 	gw.Spec.Addresses = nil
-	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
+	addrs, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected error on remove reconcile: %v", err)
-	}
-	if !readiness.Ready {
-		t.Errorf("expected ready=true after releasing static address")
+		t.Fatalf("expected ready (nil error) after releasing static address, got: %v", err)
 	}
 	if len(addrs) != 1 || addrs[0].Value != "192.0.2.1" {
 		t.Errorf("expected reported address to still report ingress address 192.0.2.1, got %+v", addrs)
@@ -1530,10 +1509,8 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 	}
 
 	// Reconcile gw1 and mark bound
-	_, _, err := p.GatewayAddresses(ctx, gw1, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on gw1: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw1, nil)
+	assertNoUnexpectedError(t, err)
 	svc1Name := state.ResourceNameForGateway("gw-1")
 	var svc1 corev1.Service
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: svc1Name}, &svc1); err != nil {
@@ -1546,24 +1523,18 @@ func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
 	deploy1.Status.ReadyReplicas = 1
 	_ = c.Status().Update(ctx, &deploy1)
 
-	_, readiness1, _ := p.GatewayAddresses(ctx, gw1, nil)
-	if !readiness1.Ready {
-		t.Fatalf("expected gw1 to be ready")
+	if _, err := p.GatewayAddresses(ctx, gw1, nil); err != nil {
+		t.Fatalf("expected gw1 to be ready (nil error), got: %v", err)
 	}
 
 	// Reconcile gw2 requesting the same IP: its service does NOT have the ingress IP bound
-	_, readiness2, err := p.GatewayAddresses(ctx, gw2, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on gw2: %v", err)
+	_, err = p.GatewayAddresses(ctx, gw2, nil)
+	condErr2 := requireConditionError(t, err)
+	if condErr2.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected gw2 reason=AddressNotUsable, got %s", condErr2.Reason)
 	}
-	if readiness2.Ready {
-		t.Errorf("expected gw2 ready=false when requesting already bound IP")
-	}
-	if readiness2.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Errorf("expected gw2 reason=AddressNotUsable, got %s", readiness2.Reason)
-	}
-	if !strings.Contains(readiness2.Message, "192.0.2.50") {
-		t.Errorf("expected message mentioning 192.0.2.50, got %s", readiness2.Message)
+	if !strings.Contains(condErr2.Message, "192.0.2.50") {
+		t.Errorf("expected message mentioning 192.0.2.50, got %s", condErr2.Message)
 	}
 }
 
@@ -1589,10 +1560,8 @@ func TestSinglePodAddressProvider_MultipleRequestedIPs(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	// Mock the first IP bound in service ingress
 	resName := state.ResourceNameForGateway("gw-multi")
@@ -1601,19 +1570,14 @@ func TestSinglePodAddressProvider_MultipleRequestedIPs(t *testing.T) {
 	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "192.0.2.10"}}
 	_ = c.Status().Update(ctx, &svc)
 
-	_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false when second requested IP cannot be bound")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	_, err = p.GatewayAddresses(ctx, gw, nil)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", condErr.Reason)
 	}
 	expectedMsgSub := "singlepod binds at most one requested IP"
-	if !strings.Contains(readiness.Message, expectedMsgSub) {
-		t.Errorf("expected message to contain %q, got %q", expectedMsgSub, readiness.Message)
+	if !strings.Contains(condErr.Message, expectedMsgSub) {
+		t.Errorf("expected message to contain %q, got %q", expectedMsgSub, condErr.Message)
 	}
 }
 
@@ -1696,10 +1660,8 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 
 	resName := state.ResourceNameForGateway("gw-tcp")
 
@@ -1871,10 +1833,8 @@ func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testin
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 
 	resName := state.ResourceNameForGateway("gw-udp")
 
@@ -1986,10 +1946,8 @@ func TestSinglePodAddressProvider_ForwardedForModeArg(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	name := state.ResourceNameForGateway("test-gw")
 	var deploy appsv1.Deployment
@@ -2082,21 +2040,16 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 	}
 
 	// Verify at the provider level: Service has an LB IP but Deployment has 0 ready replicas
-	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error from GatewayAddresses: %v", err)
-	}
+	addrs, err := p.GatewayAddresses(ctx, gw, nil)
+	condErr := requireConditionError(t, err)
 	if len(addrs) != 0 {
 		t.Fatalf("expected no addresses when data plane is not ready, got %d", len(addrs))
 	}
-	if readiness.Ready {
-		t.Fatalf("expected readiness.Ready=false when deployment has no ready replicas")
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Fatalf("expected ConditionError.Reason=AddressNotAssigned, got %s", condErr.Reason)
 	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Fatalf("expected readiness.Reason=AddressNotAssigned, got %s", readiness.Reason)
-	}
-	if readiness.Message != "Waiting for data-plane deployment to become available" {
-		t.Fatalf("expected readiness.Message='Waiting for data-plane deployment to become available', got %q", readiness.Message)
+	if condErr.Message != "Waiting for data-plane deployment to become available" {
+		t.Fatalf("expected ConditionError.Message='Waiting for data-plane deployment to become available', got %q", condErr.Message)
 	}
 
 	// Reconcile through GatewayReconciler and verify status:
@@ -2143,21 +2096,16 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 	}
 
 	// Provider level check
-	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error from GatewayAddresses: %v", err)
-	}
+	addrs, err = p.GatewayAddresses(ctx, gw, nil)
+	condErr = requireConditionError(t, err)
 	if len(addrs) != 0 {
 		t.Fatalf("expected 0 addresses before LB ingress is assigned, got %d", len(addrs))
 	}
-	if readiness.Ready {
-		t.Fatalf("expected readiness.Ready=false before LB ingress is assigned")
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Fatalf("expected ConditionError.Reason=AddressNotAssigned, got %s", condErr.Reason)
 	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Fatalf("expected readiness.Reason=AddressNotAssigned, got %s", readiness.Reason)
-	}
-	if readiness.Message != "Waiting for address to be assigned to the Gateway" {
-		t.Fatalf("expected readiness.Message='Waiting for address to be assigned to the Gateway', got %q", readiness.Message)
+	if condErr.Message != "Waiting for address to be assigned to the Gateway" {
+		t.Fatalf("expected ConditionError.Message='Waiting for address to be assigned to the Gateway', got %q", condErr.Message)
 	}
 
 	// Controller reconcile check
@@ -2192,18 +2140,12 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 	}
 
 	// Provider level check
-	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
+	addrs, err = p.GatewayAddresses(ctx, gw, nil)
 	if err != nil {
-		t.Fatalf("unexpected error from GatewayAddresses: %v", err)
+		t.Fatalf("expected ready (nil error) when deployment is ready and LB IP is bound, got: %v", err)
 	}
 	if len(addrs) != 1 || addrs[0].Value != "192.0.2.100" {
 		t.Fatalf("expected 1 address 192.0.2.100, got %+v", addrs)
-	}
-	if !readiness.Ready {
-		t.Fatalf("expected readiness.Ready=true when deployment is ready and LB IP is bound")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-		t.Fatalf("expected readiness.Reason=Programmed, got %s", readiness.Reason)
 	}
 
 	// Controller reconcile check
@@ -2241,15 +2183,10 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 	st.UpsertGateway(&reconciledGW)
 	st.Recompute()
 
-	addrs, readiness, err = p.GatewayAddresses(ctx, &reconciledGW, nil)
-	if err != nil {
-		t.Fatalf("unexpected error from GatewayAddresses: %v", err)
-	}
-	if readiness.Ready {
-		t.Fatalf("expected readiness.Ready=false when requested IP is not bound")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Fatalf("expected readiness.Reason=AddressNotUsable, got %s", readiness.Reason)
+	_, err = p.GatewayAddresses(ctx, &reconciledGW, nil)
+	condErr = requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Fatalf("expected ConditionError.Reason=AddressNotUsable, got %s", condErr.Reason)
 	}
 
 	_, err = r.Reconcile(ctx, req)
@@ -2345,10 +2282,8 @@ func TestSinglePodAddressProvider_ParametersRef_MergeOrder(t *testing.T) {
 	st.Recompute()
 
 	p := NewAddressProvider(c, "default", WithState(st))
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	var svc corev1.Service
 	resName := state.ResourceNameForGateway("test-gw")
@@ -2441,10 +2376,8 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, "default", WithState(st))
-		_, _, err := p.GatewayAddresses(ctx, gw, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		_, err := p.GatewayAddresses(ctx, gw, nil)
+		assertNoUnexpectedError(t, err)
 
 		var svc corev1.Service
 		resName := state.ResourceNameForGateway("gw-clusterip")
@@ -2510,10 +2443,8 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, "default", WithState(st))
-		_, _, err := p.GatewayAddresses(ctx, gw, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		_, err := p.GatewayAddresses(ctx, gw, nil)
+		assertNoUnexpectedError(t, err)
 
 		var svc corev1.Service
 		resName := state.ResourceNameForGateway("gw-local")
@@ -2603,18 +2534,13 @@ func TestSinglePodAddressProvider_ParametersRef_InvalidValues(t *testing.T) {
 			st.Recompute()
 
 			p := NewAddressProvider(c, "default", WithState(st))
-			addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-			if err != nil {
-				t.Fatalf("expected nil error (reported via readiness), got: %v", err)
-			}
+			addrs, err := p.GatewayAddresses(ctx, gw, nil)
+			condErr := requireConditionError(t, err)
 			if len(addrs) != 0 {
 				t.Fatalf("expected 0 addresses, got %d", len(addrs))
 			}
-			if readiness.Ready {
-				t.Errorf("expected readiness.Ready=false")
-			}
-			if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
-				t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+			if condErr.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+				t.Errorf("expected ConditionError.Reason=InvalidParameters, got %s", condErr.Reason)
 			}
 
 			// Verify no Service was created
@@ -2673,15 +2599,10 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, "default", WithState(st))
-		_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-		if err != nil {
-			t.Fatalf("expected nil error, got: %v", err)
-		}
-		if readiness.Ready {
-			t.Errorf("expected readiness.Ready=false")
-		}
-		if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
-			t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+		_, err := p.GatewayAddresses(ctx, gw, nil)
+		condErr := requireConditionError(t, err)
+		if condErr.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected ConditionError.Reason=InvalidParameters, got %s", condErr.Reason)
 		}
 	})
 
@@ -2728,15 +2649,10 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, "default", WithState(st))
-		_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-		if err != nil {
-			t.Fatalf("expected nil error, got: %v", err)
-		}
-		if readiness.Ready {
-			t.Errorf("expected readiness.Ready=false")
-		}
-		if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
-			t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+		_, err := p.GatewayAddresses(ctx, gw, nil)
+		condErr := requireConditionError(t, err)
+		if condErr.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected ConditionError.Reason=InvalidParameters, got %s", condErr.Reason)
 		}
 
 		// Verify Gateway status has Accepted=False/InvalidParameters
@@ -2800,15 +2716,10 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, "default", WithState(st))
-		_, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-		if err != nil {
-			t.Fatalf("expected nil error, got: %v", err)
-		}
-		if readiness.Ready {
-			t.Errorf("expected readiness.Ready=false")
-		}
-		if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
-			t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+		_, err := p.GatewayAddresses(ctx, gw, nil)
+		condErr := requireConditionError(t, err)
+		if condErr.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected ConditionError.Reason=InvalidParameters, got %s", condErr.Reason)
 		}
 
 		// Verify Gateway status has Accepted=False/InvalidParameters
@@ -2863,18 +2774,13 @@ func TestSinglePodAddressProvider_ParametersRef_NotComputedYet(t *testing.T) {
 	// State has not computed outputs for gw yet
 
 	p := NewAddressProvider(c, "default", WithState(st))
-	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("expected nil error, got: %v", err)
-	}
+	addrs, err := p.GatewayAddresses(ctx, gw, nil)
+	condErr := requireConditionError(t, err)
 	if len(addrs) != 0 {
 		t.Errorf("expected 0 addresses before state computes parameters, got %d", len(addrs))
 	}
-	if readiness.Ready {
-		t.Errorf("expected readiness.Ready=false")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonPending) {
-		t.Errorf("expected readiness.Reason=Pending, got %s", readiness.Reason)
+	if condErr.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Errorf("expected ConditionError.Reason=Pending, got %s", condErr.Reason)
 	}
 
 	// Verify no Service was created
@@ -2939,21 +2845,16 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		st.Recompute()
 
 		p := NewAddressProvider(c, "default", WithState(st))
-		addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		addrs, err := p.GatewayAddresses(ctx, gw, nil)
+		condErr := requireConditionError(t, err)
 		if len(addrs) != 0 {
 			t.Fatalf("expected 0 addresses, got %d", len(addrs))
 		}
-		if readiness.Ready {
-			t.Errorf("expected readiness.Ready=false")
+		if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+			t.Errorf("expected AddressNotAssigned, got %s", condErr.Reason)
 		}
-		if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-			t.Errorf("expected AddressNotAssigned, got %s", readiness.Reason)
-		}
-		if !strings.Contains(readiness.Message, "static address") {
-			t.Errorf("expected message explaining static address needed, got %q", readiness.Message)
+		if !strings.Contains(condErr.Message, "static address") {
+			t.Errorf("expected message explaining static address needed, got %q", condErr.Message)
 		}
 	})
 
@@ -3010,18 +2911,13 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		p := NewAddressProvider(c, "default", WithState(st))
 
 		// 1. Initial reconcile: Deployment has 0 available replicas -> addresses withheld
-		addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		addrs, err := p.GatewayAddresses(ctx, gw, nil)
+		condErr := requireConditionError(t, err)
 		if len(addrs) != 0 {
 			t.Fatalf("expected 0 addresses while deployment not ready, got %d", len(addrs))
 		}
-		if readiness.Ready {
-			t.Errorf("expected readiness.Ready=false")
-		}
-		if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-			t.Errorf("expected AddressNotAssigned, got %s", readiness.Reason)
+		if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+			t.Errorf("expected AddressNotAssigned, got %s", condErr.Reason)
 		}
 
 		// 2. Simulate Deployment becoming available
@@ -3037,15 +2933,9 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 		}
 
 		// 3. Reconcile again: data plane is ready -> addresses are reported
-		addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
+		addrs, err = p.GatewayAddresses(ctx, gw, nil)
 		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !readiness.Ready {
-			t.Errorf("expected readiness.Ready=true")
-		}
-		if readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
-			t.Errorf("expected Programmed, got %s", readiness.Reason)
+			t.Fatalf("expected ready (nil error), got: %v", err)
 		}
 		if len(addrs) != 2 {
 			t.Fatalf("expected 2 addresses (IP and Hostname), got %d: %+v", len(addrs), addrs)
@@ -3308,10 +3198,8 @@ func TestSinglePodAddressProvider_UpgradeUpdatesServiceAndDeploymentInPlace(t *t
 	}
 
 	// 3. Reconcile with updated provider
-	_, _, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
-	if err != nil {
-		t.Fatalf("unexpected error during reconcile: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 
 	// 4. Verify Service updated in place to named target ports
 	var updatedSvc corev1.Service
@@ -3400,10 +3288,8 @@ func TestAddressProvider_GcpGatewayHooks(t *testing.T) {
 		WithTerminationGracePeriodSeconds(60),
 	)
 
-	_, _, err := p.GatewayAddresses(t.Context(), gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(t.Context(), gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	resName := state.ResourceNameForGateway("my-gw")
 	var deploy appsv1.Deployment
@@ -3491,10 +3377,8 @@ func TestAddressProvider_DebugErrorResponses(t *testing.T) {
 	{
 		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, testBundleConfigMap()).Build()
 		p := NewAddressProvider(client, "default", WithDebugErrorResponses(true))
-		_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		_, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
+		assertNoUnexpectedError(t, err)
 
 		name := state.ResourceNameForGateway("test-gw")
 		var deploy appsv1.Deployment
@@ -3511,10 +3395,8 @@ func TestAddressProvider_DebugErrorResponses(t *testing.T) {
 	{
 		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, testBundleConfigMap()).Build()
 		p := NewAddressProvider(client, "default")
-		_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		_, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
+		assertNoUnexpectedError(t, err)
 
 		name := state.ResourceNameForGateway("test-gw")
 		var deploy appsv1.Deployment
@@ -3581,10 +3463,8 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 	}
 
 	// 1. Reconcile Gateway resources
-	_, readiness, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
-	if err != nil {
-		t.Fatalf("GatewayAddresses failed for max length gateway: %v", err)
-	}
+	_, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
+	assertNoUnexpectedError(t, err)
 
 	expectedName := state.ResourceNameForGateway(gwName)
 	expectedLabelGwName := LabelValueForGateway(gwName)
@@ -3652,7 +3532,7 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 		t.Errorf("Service selector LabelGatewayName = %q, want %q", svc.Spec.Selector[LabelGatewayName], expectedLabelGwName)
 	}
 
-	// 6. Verify readiness becomes Programmed once Deployment is ready and Service has LB ingress
+	// 6. Verify Gateway becomes ready once Deployment is ready and Service has LB ingress
 	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "1.2.3.4"}}
 	if err := c.Status().Update(t.Context(), &svc); err != nil {
 		t.Fatalf("failed to update Service status: %v", err)
@@ -3662,12 +3542,9 @@ func TestSinglePodAddressProvider_MaximumLengthGatewayName(t *testing.T) {
 		t.Fatalf("failed to update Deployment status: %v", err)
 	}
 
-	finalAddrs, readiness, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
+	finalAddrs, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
 	if err != nil {
-		t.Fatalf("GatewayAddresses failed: %v", err)
-	}
-	if !readiness.Ready {
-		t.Errorf("expected readiness.Ready = true, got false (reason=%s message=%s)", readiness.Reason, readiness.Message)
+		t.Fatalf("expected ready (nil error), got: %v", err)
 	}
 	if len(finalAddrs) == 0 || finalAddrs[0].Value != "1.2.3.4" {
 		t.Errorf("expected address 1.2.3.4, got %v", finalAddrs)
@@ -3755,9 +3632,8 @@ func TestSinglePodAddressProvider_GatewayNameWithDots(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, testBundleConfigMap()).Build()
 	p := NewAddressProvider(c, "default")
 	listeners := []*state.EffectiveListener{{Port: 80, Protocol: gatewayv1.HTTPProtocolType}}
-	if _, _, err := p.GatewayAddresses(t.Context(), gw, listeners); err != nil {
-		t.Fatalf("GatewayAddresses failed: %v", err)
-	}
+	_, err := p.GatewayAddresses(t.Context(), gw, listeners)
+	assertNoUnexpectedError(t, err)
 
 	expectedName := state.ResourceNameForGateway("my.gateway")
 	var svc corev1.Service
@@ -3795,13 +3671,8 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 	}
 
 	// 1. Initial reconciliation creates Deployment with host ports, but no Service
-	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false before pod is running")
-	}
+	addrs, err := p.GatewayAddresses(ctx, gw, nil)
+	requireConditionError(t, err)
 	if len(addrs) > 0 {
 		t.Errorf("expected no addresses set by this step, got %+v", addrs)
 	}
@@ -3879,15 +3750,10 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 	if err := c.Status().Update(ctx, &deploy); err != nil {
 		t.Fatalf("failed to update deployment status: %v", err)
 	}
-	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error when deployment is ready: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false until address follows the node, got ready=true")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected reason=AddressNotAssigned, got %s", readiness.Reason)
+	addrs, err = p.GatewayAddresses(ctx, gw, nil)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected reason=AddressNotAssigned, got %s", condErr.Reason)
 	}
 	if len(addrs) > 0 {
 		t.Errorf("expected no addresses set by this step, got %+v", addrs)
@@ -3895,19 +3761,15 @@ func TestSinglePodAddressProvider_HostPorts_DeploymentAndNoService(t *testing.T)
 
 	// 2. Switching from Service mode to host-port mode deletes existing owned Service
 	pDefault := NewAddressProvider(c, "default")
-	_, _, err = pDefault.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error creating Service with default provider: %v", err)
-	}
+	_, err = pDefault.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
 		t.Fatalf("expected Service to exist after default provider reconcile: %v", err)
 	}
 
 	// Reconcile with host-port provider again
-	_, _, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error with host-port provider: %v", err)
-	}
+	_, err = p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
 		t.Errorf("expected existing Service to be deleted when host ports are enabled, got err: %v", err)
 	}
@@ -3946,19 +3808,14 @@ func TestSinglePodAddressProvider_HostPorts_MultipleHTTPListenersConflict(t *tes
 		},
 	}
 
-	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false for two HTTP listeners on different ports")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	addrs, err := p.GatewayAddresses(ctx, gw, nil)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", condErr.Reason)
 	}
 	expectedMsg := "host ports allow one HTTP and one HTTPS port"
-	if readiness.Message != expectedMsg {
-		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	if condErr.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, condErr.Message)
 	}
 	if len(addrs) > 0 {
 		t.Errorf("expected no addresses, got %+v", addrs)
@@ -3991,19 +3848,14 @@ func TestSinglePodAddressProvider_HostPorts_MultipleHTTPSListenersConflict(t *te
 		},
 	}
 
-	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false for two HTTPS listeners on different ports")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
-		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	addrs, err := p.GatewayAddresses(ctx, gw, nil)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", condErr.Reason)
 	}
 	expectedMsg := "host ports allow one HTTP and one HTTPS port"
-	if readiness.Message != expectedMsg {
-		t.Errorf("expected message %q, got %q", expectedMsg, readiness.Message)
+	if condErr.Message != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, condErr.Message)
 	}
 	if len(addrs) > 0 {
 		t.Errorf("expected no addresses, got %+v", addrs)
@@ -4031,10 +3883,8 @@ func TestSinglePodAddressProvider_HostPorts_ReservedPortsSkipped(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	var deploy appsv1.Deployment
 	resName := state.ResourceNameForGateway("gw-reserved")
@@ -4072,15 +3922,10 @@ func TestSinglePodAddressProvider_WithNoService(t *testing.T) {
 	}
 
 	// 1. Initial reconcile creates Deployment and no Service.
-	addrs, readiness, err := p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false when deployment has no ready replicas")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected reason=AddressNotAssigned, got %s", readiness.Reason)
+	addrs, err := p.GatewayAddresses(ctx, gw, nil)
+	condErr := requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected reason=AddressNotAssigned, got %s", condErr.Reason)
 	}
 	if len(addrs) > 0 {
 		t.Errorf("expected no addresses, got %+v", addrs)
@@ -4103,18 +3948,13 @@ func TestSinglePodAddressProvider_WithNoService(t *testing.T) {
 	if err := c.Status().Update(ctx, &deploy); err != nil {
 		t.Fatalf("failed to update deployment status: %v", err)
 	}
-	addrs, readiness, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error when deployment ready: %v", err)
+	addrs, err = p.GatewayAddresses(ctx, gw, nil)
+	condErr = requireConditionError(t, err)
+	if condErr.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected reason=AddressNotAssigned, got %s", condErr.Reason)
 	}
-	if readiness.Ready {
-		t.Errorf("expected ready=false because no Service exists to supply addresses")
-	}
-	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
-		t.Errorf("expected reason=AddressNotAssigned, got %s", readiness.Reason)
-	}
-	if readiness.Message != "Waiting for address to be assigned to the Gateway" {
-		t.Errorf("expected message 'Waiting for address to be assigned to the Gateway', got %q", readiness.Message)
+	if condErr.Message != "Waiting for address to be assigned to the Gateway" {
+		t.Errorf("expected message 'Waiting for address to be assigned to the Gateway', got %q", condErr.Message)
 	}
 	if len(addrs) > 0 {
 		t.Errorf("expected no addresses, got %+v", addrs)
@@ -4146,10 +3986,8 @@ func TestSinglePodAddressProvider_WithNoService(t *testing.T) {
 	}
 
 	// Reconcile with WithNoService() provider again
-	_, _, err = p.GatewayAddresses(ctx, gw, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err = p.GatewayAddresses(ctx, gw, nil)
+	assertNoUnexpectedError(t, err)
 
 	// Verify existing Service is STILL present (not deleted)
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
@@ -4211,10 +4049,8 @@ func TestSinglePodAddressProvider_WithDeploymentMutator(t *testing.T) {
 		},
 	}
 
-	_, _, err := p.GatewayAddresses(ctx, gw, listeners)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	_, err := p.GatewayAddresses(ctx, gw, listeners)
+	assertNoUnexpectedError(t, err)
 
 	if !mutatorCalled {
 		t.Fatalf("expected mutator to be called")
@@ -4290,7 +4126,7 @@ func TestSinglePodAddressProvider_WithDeploymentMutator_Error(t *testing.T) {
 	}
 
 	// Reconcile via GatewayAddresses
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
+	_, err := p.GatewayAddresses(ctx, gw, nil)
 	if err == nil {
 		t.Fatalf("expected error from mutator, got nil")
 	}
@@ -4496,19 +4332,21 @@ func TestSinglePodAddressProvider_DataplaneConfigFromInternalAPI(t *testing.T) {
 
 			p := NewAddressProvider(c, tc.controllerNamespace)
 
-			_, _, err := p.GatewayAddresses(ctx, gw, nil)
+			_, err := p.GatewayAddresses(ctx, gw, nil)
 			if tc.wantErrSubstring != "" {
 				if err == nil {
 					t.Fatalf("expected error containing %q, got nil", tc.wantErrSubstring)
+				}
+				var condErr *state.ConditionError
+				if errors.As(err, &condErr) {
+					t.Fatalf("expected non-ConditionError containing %q, got ConditionError: %v", tc.wantErrSubstring, err)
 				}
 				if !strings.Contains(err.Error(), tc.wantErrSubstring) {
 					t.Fatalf("expected error containing %q, got %v", tc.wantErrSubstring, err)
 				}
 				return
 			}
-			if err != nil {
-				t.Fatalf("GatewayAddresses failed unexpectedly: %v", err)
-			}
+			assertNoUnexpectedError(t, err)
 			if tc.verify != nil {
 				tc.verify(t, c, p, gw, state.ResourceNameForGateway(gw.Name))
 			}
