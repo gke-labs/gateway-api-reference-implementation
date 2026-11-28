@@ -139,11 +139,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		p.mu.Unlock()
 	}
 
-	readiness := p.readinessForGateway(gw)
+	readiness := p.readinessForGateway(effectiveListeners)
 	return slices.Clone(p.addresses), readiness, nil
 }
 
-func (p *AddressProvider) readinessForGateway(gw *gatewayv1.Gateway) state.GatewayReadiness {
+func (p *AddressProvider) readinessForGateway(effectiveListeners []*state.EffectiveListener) state.GatewayReadiness {
 	if p.tunnelState == nil {
 		return state.GatewayReadiness{
 			Ready:   false,
@@ -159,10 +159,7 @@ func (p *AddressProvider) readinessForGateway(gw *gatewayv1.Gateway) state.Gatew
 		}
 	}
 
-	var hostnames []string
-	if gw != nil {
-		hostnames = ExtractHostnames([]*gatewayv1.Gateway{gw})
-	}
+	hostnames := ExtractHostnames(effectiveListeners)
 	if !p.tunnelState.HasRegisteredHostnames(hostnames) {
 		return state.GatewayReadiness{
 			Ready:   false,

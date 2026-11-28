@@ -18,38 +18,39 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-// ExtractHostnames extracts the set of unique SNI hostnames from all HTTPS and TLS listeners
-// across the provided Gateways. Listeners without hostnames cannot be routed by SNI and are skipped.
-func ExtractHostnames(gateways []*gatewayv1.Gateway) []string {
+// ExtractHostnames extracts the sorted set of unique SNI hostnames from all accepted,
+// non-conflicted HTTPS and TLS effective listeners, covering both Gateway listeners and
+// listeners attached through allowed ListenerSets. Listeners without hostnames cannot
+// be routed by SNI and are skipped.
+func ExtractHostnames(listeners []*state.EffectiveListener) []string {
 	seen := make(map[string]bool)
 	var hostnames []string
 
-	for _, gw := range gateways {
-		if gw == nil {
+	for _, listener := range listeners {
+		if listener == nil || !listener.IsAccepted() || listener.IsConflicted() {
 			continue
 		}
-		for _, l := range gw.Spec.Listeners {
-			proto := string(l.Protocol)
-			if !strings.EqualFold(proto, string(gatewayv1.HTTPSProtocolType)) &&
-				!strings.EqualFold(proto, string(gatewayv1.TLSProtocolType)) {
-				continue
-			}
+		protocol := string(listener.Protocol)
+		if !strings.EqualFold(protocol, string(gatewayv1.HTTPSProtocolType)) &&
+			!strings.EqualFold(protocol, string(gatewayv1.TLSProtocolType)) {
+			continue
+		}
 
-			if l.Hostname == nil || strings.TrimSpace(string(*l.Hostname)) == "" {
-				klog.Infof("Skipping listener %q on Gateway %s/%s: HTTPS/TLS listener has no hostname and cannot be routed by SNI",
-					l.Name, gw.Namespace, gw.Name)
-				continue
-			}
+		if listener.Hostname == nil || strings.TrimSpace(string(*listener.Hostname)) == "" {
+			klog.Infof("Skipping listener %q on %s %s/%s: HTTPS/TLS listener has no hostname and cannot be routed by SNI",
+				listener.Name, listener.Owner.Kind, listener.Owner.Namespace, listener.Owner.Name)
+			continue
+		}
 
-			h := strings.ToLower(strings.TrimSpace(string(*l.Hostname)))
-			if !seen[h] {
-				seen[h] = true
-				hostnames = append(hostnames, h)
-			}
+		hostname := strings.ToLower(strings.TrimSpace(string(*listener.Hostname)))
+		if !seen[hostname] {
+			seen[hostname] = true
+			hostnames = append(hostnames, hostname)
 		}
 	}
 

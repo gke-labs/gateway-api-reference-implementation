@@ -33,10 +33,14 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/wireguard"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 func newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM []byte) (*tls.Config, error) {
@@ -695,5 +699,199 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 	}
 	if mgr.HasRegisteredHostnames([]string{"echo.example.com"}) {
 		t.Fatalf("expected HasRegisteredHostnames=false after cancel")
+	}
+}
+
+func TestManager_UpdateListeners_ListenerSet(t *testing.T) {
+	ctx := t.Context()
+
+	tempDir := t.TempDir()
+	if err := certs.GenerateAndWriteCertificates(tempDir, "snigateway.internal", "listenerset-client"); err != nil {
+		t.Fatalf("GenerateAndWriteCertificates: %v", err)
+	}
+
+	caCertPEM, err := os.ReadFile(filepath.Join(tempDir, "ca.crt"))
+	if err != nil {
+		t.Fatalf("reading ca.crt: %v", err)
+	}
+	serverCertPEM, err := os.ReadFile(filepath.Join(tempDir, "server.crt"))
+	if err != nil {
+		t.Fatalf("reading server.crt: %v", err)
+	}
+	serverKeyPEM, err := os.ReadFile(filepath.Join(tempDir, "server.key"))
+	if err != nil {
+		t.Fatalf("reading server.key: %v", err)
+	}
+	clientCertPEM, err := os.ReadFile(filepath.Join(tempDir, "client.crt"))
+	if err != nil {
+		t.Fatalf("reading client.crt: %v", err)
+	}
+	clientKeyPEM, err := os.ReadFile(filepath.Join(tempDir, "client.key"))
+	if err != nil {
+		t.Fatalf("reading client.key: %v", err)
+	}
+
+	serverTLS, err := newServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("newServerTLSConfig: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	serverAddr := listener.Addr().String()
+
+	applyWireGuard, wireGuardOptions := setupTestWireGuardPair(t)
+	frontendConfig := frontend.ServerConfig{
+		ServerTLSConfig:  serverTLS,
+		InternalHostname: "snigateway.internal",
+		ConnectTimeout:   5 * time.Second,
+		ReadSNITimeout:   2 * time.Second,
+	}
+	applyWireGuard(&frontendConfig)
+	frontendServer, err := frontend.NewServer(frontendConfig)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- frontendServer.ServeWithHTTP([]net.Listener{listener}, nil)
+	}()
+	t.Cleanup(func() {
+		if closeErr := frontendServer.Close(); closeErr != nil {
+			t.Errorf("frontendServer.Close: %v", closeErr)
+		}
+		if serveErr := <-serveErrCh; serveErr != nil {
+			t.Errorf("frontendServer.ServeWithHTTP: %v", serveErr)
+		}
+	})
+
+	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig: %v", err)
+	}
+
+	tunnelClient := client.NewClient(serverAddr, clientTLS)
+	manager := NewManager(tunnelClient, append(wireGuardOptions, WithBackoff(50*time.Millisecond, 100*time.Millisecond))...)
+	addressProvider := NewAddressProvider(manager, "frontend.example.com")
+
+	notifyCh := make(chan struct{}, 10)
+	manager.AddStateChangeListener(func() {
+		select {
+		case notifyCh <- struct{}{}:
+		default:
+		}
+	})
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	managerDone := make(chan error, 1)
+	go func() {
+		managerDone <- manager.Run(runCtx)
+	}()
+
+	sameNamespaces := gatewayv1.NamespacesFromSame
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{
+					From: &sameNamespaces,
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "default", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	listenerSet := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-ls", Namespace: "default"},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{Name: "shared-gw"},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: state.Ptr(gatewayv1.Hostname("app.snigateway.test")),
+				},
+				{
+					Name:     "conflicted",
+					Port:     80,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: state.Ptr(gatewayv1.Hostname("conflict.snigateway.test")),
+				},
+			},
+		},
+	}
+	namespaces := map[string]*corev1.Namespace{
+		"default": {ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+	}
+
+	compiled := state.CompileModel(state.ModelInputs{
+		Gateways:     []*gatewayv1.Gateway{gateway},
+		ListenerSets: []*gatewayv1.ListenerSet{listenerSet},
+		Namespaces:   namespaces,
+	})
+	effectiveListeners := compiled.GatewaysList()[0].EffectiveListeners
+
+	// Before the ListenerSet hostname is registered, AddressProvider reports not ready.
+	_, readiness, err := addressProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("GatewayAddresses before registration: %v", err)
+	}
+	if readiness.Ready {
+		t.Fatalf("expected ready=false before ListenerSet hostname is registered")
+	}
+
+	manager.UpdateListeners(effectiveListeners)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !manager.HasRegisteredHostnames([]string{"app.snigateway.test"}) && time.Now().Before(deadline) {
+		select {
+		case <-notifyCh:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !manager.HasRegisteredHostnames([]string{"app.snigateway.test"}) {
+		t.Fatalf("expected ListenerSet hostname app.snigateway.test to be registered with frontend")
+	}
+	if manager.HasRegisteredHostnames([]string{"conflict.snigateway.test"}) {
+		t.Fatalf("expected conflicted ListenerSet hostname not to be registered with frontend")
+	}
+
+	// Once registered, AddressProvider reports ready even though the conflicted listener is unregistered.
+	_, readiness, err = addressProvider.GatewayAddresses(ctx, gateway, effectiveListeners)
+	if err != nil {
+		t.Fatalf("GatewayAddresses after registration: %v", err)
+	}
+	if !readiness.Ready {
+		t.Fatalf("expected ready=true once accepted ListenerSet hostname is registered, got %+v", readiness)
+	}
+
+	// Removing the ListenerSet unregisters its hostname from the frontend.
+	compiledWithoutListenerSet := state.CompileModel(state.ModelInputs{
+		Gateways:   []*gatewayv1.Gateway{gateway},
+		Namespaces: namespaces,
+	})
+	manager.UpdateListeners(compiledWithoutListenerSet.GatewaysList()[0].EffectiveListeners)
+
+	deadline = time.Now().Add(5 * time.Second)
+	for manager.HasRegisteredHostnames([]string{"app.snigateway.test"}) && time.Now().Before(deadline) {
+		select {
+		case <-notifyCh:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if manager.HasRegisteredHostnames([]string{"app.snigateway.test"}) {
+		t.Fatalf("expected ListenerSet hostname app.snigateway.test to be unregistered after deletion")
+	}
+
+	runCancel()
+	if runErr := <-managerDone; runErr != nil && !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("manager.Run returned unexpected error: %v", runErr)
 	}
 }

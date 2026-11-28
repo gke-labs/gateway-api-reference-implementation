@@ -540,6 +540,24 @@ func (s *State) Recompute() *Outputs {
 
 	prev := s.previousOutputs
 	gatewaysChanged := prev == nil || !reflectGatewaysEqual(outputs.ResolvedGateways, prev.ResolvedGateways)
+	if !gatewaysChanged {
+		gatewaysChanged = len(outputs.CompiledGateways) != len(prev.CompiledGateways)
+	}
+	if !gatewaysChanged {
+		for key, compiledGateway := range outputs.CompiledGateways {
+			var currentListeners, previousListeners []*EffectiveListener
+			if compiledGateway != nil {
+				currentListeners = compiledGateway.EffectiveListeners
+			}
+			if previousGateway := prev.CompiledGateways[key]; previousGateway != nil {
+				previousListeners = previousGateway.EffectiveListeners
+			}
+			if !effectiveListenersEqual(currentListeners, previousListeners) {
+				gatewaysChanged = true
+				break
+			}
+		}
+	}
 
 	onGatewaysUpdate := s.onGatewaysUpdate
 
@@ -1103,7 +1121,17 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		}
 		errChanged := (curErr == nil) != (oldErr == nil) || (curErr != nil && oldErr != nil && curErr.Error() != oldErr.Error())
 		paramsChanged := !ParametersEqual(curP, oldP) || errChanged
-		if curOk != oldOk || (curOk && !GatewayStatusesEqual(cur, old)) || paramsChanged {
+		var currentListeners, previousListeners []*EffectiveListener
+		if compiledGateway := outputs.CompiledGateways[k]; compiledGateway != nil {
+			currentListeners = compiledGateway.EffectiveListeners
+		}
+		if prev != nil && prev.CompiledGateways != nil {
+			if compiledGateway := prev.CompiledGateways[k]; compiledGateway != nil {
+				previousListeners = compiledGateway.EffectiveListeners
+			}
+		}
+		listenersChanged := !effectiveListenersEqual(currentListeners, previousListeners)
+		if curOk != oldOk || (curOk && !GatewayStatusesEqual(cur, old)) || paramsChanged || listenersChanged {
 			s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
@@ -1291,6 +1319,36 @@ func reflectGatewaysEqual(a, b []*gatewayv1.Gateway) bool {
 	}
 	for i := range a {
 		if a[i].Namespace != b[i].Namespace || a[i].Name != b[i].Name || a[i].Generation != b[i].Generation {
+			return false
+		}
+	}
+	return true
+}
+
+// effectiveListenersEqual reports whether two effective listener slices have the
+// same length and matching owner, name, port, protocol, hostname, and Accepted,
+// Conflicted, and Programmed condition statuses at each position.
+func effectiveListenersEqual(a, b []*EffectiveListener) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		listenerA := a[i]
+		listenerB := b[i]
+		if (listenerA == nil) != (listenerB == nil) {
+			return false
+		}
+		if listenerA == nil {
+			continue
+		}
+		if listenerA.Owner != listenerB.Owner ||
+			listenerA.Name != listenerB.Name ||
+			listenerA.Port != listenerB.Port ||
+			listenerA.Protocol != listenerB.Protocol ||
+			ValueOf(listenerA.Hostname) != ValueOf(listenerB.Hostname) ||
+			listenerA.IsAccepted() != listenerB.IsAccepted() ||
+			listenerA.IsConflicted() != listenerB.IsConflicted() ||
+			listenerA.IsProgrammed() != listenerB.IsProgrammed() {
 			return false
 		}
 	}

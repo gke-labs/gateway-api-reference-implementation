@@ -421,3 +421,100 @@ func TestListenerSet_AllowedRoutesSupportedKinds_TLSInvalidKinds(t *testing.T) {
 		t.Errorf("expected ResolvedRefs reason InvalidRouteKinds, got %s", resolvedRefsCond.Reason)
 	}
 }
+
+func TestState_OnGatewaysUpdate_ListenerSetLifecycle(t *testing.T) {
+	controllerState := NewState()
+	controllerState.SetControllerName("example.net/gateway-controller")
+
+	gatewayKey := types.NamespacedName{Namespace: "default", Name: "shared-gw"}
+	var listenerSnapshots [][]*EffectiveListener
+	controllerState.SetOnGatewaysUpdate(func(gateways []*gatewayv1.Gateway) {
+		var listeners []*EffectiveListener
+		for _, gateway := range gateways {
+			key := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
+			listeners = append(listeners, controllerState.GetEffectiveListeners(key)...)
+		}
+		listenerSnapshots = append(listenerSnapshots, listeners)
+	})
+
+	gatewayClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "shared-gw",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{
+					From: Ptr(gatewayv1.NamespacesFromSame),
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "default", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	controllerState.UpsertGatewayClass(gatewayClass)
+	controllerState.UpsertGateway(gateway)
+	controllerState.Recompute()
+	if len(listenerSnapshots) != 1 || len(listenerSnapshots[0]) != 1 {
+		t.Fatalf("expected 1 callback with 1 listener after Gateway upsert, got %d callbacks", len(listenerSnapshots))
+	}
+
+	// Add ListenerSet without changing the Gateway: callback must fire.
+	listenerSet := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "app-ls",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{Name: "shared-gw"},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("v1.example.com")),
+				},
+			},
+		},
+	}
+	controllerState.UpsertListenerSet(listenerSet)
+	controllerState.Recompute()
+	if len(listenerSnapshots) != 2 || len(listenerSnapshots[1]) != 2 {
+		t.Fatalf("expected 2 callbacks with 2 effective listeners after ListenerSet add, got %d callbacks", len(listenerSnapshots))
+	}
+
+	// Update ListenerSet hostname without changing AttachedListenerSets: callback must fire.
+	updatedListenerSet := listenerSet.DeepCopy()
+	updatedListenerSet.Generation = 2
+	updatedListenerSet.Spec.Listeners[0].Hostname = Ptr(gatewayv1.Hostname("v2.example.com"))
+	controllerState.UpsertListenerSet(updatedListenerSet)
+	controllerState.Recompute()
+	if len(listenerSnapshots) != 3 {
+		t.Fatalf("expected 3 callbacks after ListenerSet hostname edit, got %d", len(listenerSnapshots))
+	}
+	if got := ValueOf(controllerState.GetEffectiveListeners(gatewayKey)[1].Hostname); got != "v2.example.com" {
+		t.Fatalf("expected updated effective listener hostname v2.example.com, got %q", got)
+	}
+
+	// Recompute with no changes must not fire the callback again.
+	controllerState.Recompute()
+	if len(listenerSnapshots) != 3 {
+		t.Fatalf("expected no extra callback when nothing changed, got %d", len(listenerSnapshots))
+	}
+
+	// Delete ListenerSet: callback must fire with only the Gateway's own listener remaining.
+	controllerState.DeleteListenerSet(types.NamespacedName{Namespace: "default", Name: "app-ls"})
+	controllerState.Recompute()
+	if len(listenerSnapshots) != 4 || len(listenerSnapshots[3]) != 1 {
+		t.Fatalf("expected 4 callbacks with 1 effective listener after ListenerSet delete, got %d callbacks", len(listenerSnapshots))
+	}
+}
