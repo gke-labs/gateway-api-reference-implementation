@@ -66,8 +66,8 @@ For example:
 
 The only exceptions are conventional Go:
 - `i`, `j` and `k` as integer loop indices.
-- A one- or two-letter method receiver, such as `p *Proxy`.
-- The ecosystem idioms `ctx`, `err`, `ok`, `wg`, `mu` and `tx`. `context` and `error` are also package and type names.
+- A one- or two-letter method receiver, such as `p *Proxy`. Every method of a type uses the same receiver name.
+- The ecosystem idioms `ctx`, `err`, `ok`, `wg`, `mu`, `tx` and `it`. Use `it` for an iterator. `context` and `error` are also package and type names.
 - Protocol or on-disk field names that are themselves abbreviations, such as `fd` or `sha256`.
 
 **Names must match signatures.** For example, a function that returns `[]byte` is `build...`, not `write...`. A `write...` function takes an `io.Writer` or a destination slice.
