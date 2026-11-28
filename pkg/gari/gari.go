@@ -94,9 +94,6 @@ type TriggerableCertificateSource = controller.TriggerableCertificateSource
 // SecretsCertificateSource resolves certificates from Secret references specified in listener.TLS.CertificateRefs.
 type SecretsCertificateSource = controller.SecretsCertificateSource
 
-// GatewayReadiness represents the data-plane readiness state of a Gateway.
-type GatewayReadiness = state.GatewayReadiness
-
 // DefaultScheme creates a new runtime.Scheme initialized with client-go and Gateway API schemes.
 func DefaultScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()

@@ -357,28 +357,28 @@ func requestedHostnameAddresses(gw *gatewayv1.Gateway) []string {
 }
 
 // GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and Service,
-// and returns the Service's ingress addresses and detailed readiness state.
-func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+// and returns the Service's ingress addresses and a *state.ConditionError if not ready to serve.
+func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, error) {
 	if p.client == nil {
-		return nil, state.GatewayReadiness{}, nil
+		return nil, nil
 	}
 
 	var params *state.Parameters
 	if p.state != nil && gw != nil {
 		prms, found, err := p.state.GetGatewayParameters(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
 		if !found {
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonPending),
 				Message: "Waiting for state to compute gateway parameters",
-			}, nil
+			}
 		}
 		if err != nil {
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonInvalidParameters),
 				Message: err.Error(),
-			}, nil
+			}
 		}
 		params = prms
 	} else if p.state == nil {
@@ -404,12 +404,12 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSA)
 	if err == nil {
 		if !isOwnedByGateway(&existingSA, gw) {
-			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
+			return nil, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing ServiceAccount %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return nil, state.GatewayReadiness{}, err
+		return nil, err
 	}
 
 	saApply := corev1ac.ServiceAccount(name, gwNamespace).
@@ -419,29 +419,29 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		saApply.WithAnnotations(annotations)
 	}
 	if err := p.client.Apply(ctx, saApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		return nil, fmt.Errorf("failed to apply ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 2. Reconcile per-Gateway trust bundle ConfigMap in Gateway namespace
 	var sourceConfigMap corev1.ConfigMap
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: p.controllerNamespace, Name: spiffe.BundleConfigMapName}, &sourceConfigMap); err != nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("reading bundle configmap %s/%s: %w", p.controllerNamespace, spiffe.BundleConfigMapName, err)
+		return nil, fmt.Errorf("reading bundle configmap %s/%s: %w", p.controllerNamespace, spiffe.BundleConfigMapName, err)
 	}
 	bundleData, ok := sourceConfigMap.Data[spiffe.BundleDataKey]
 	if !ok || bundleData == "" {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("bundle configmap %s/%s missing key %s", p.controllerNamespace, spiffe.BundleConfigMapName, spiffe.BundleDataKey)
+		return nil, fmt.Errorf("bundle configmap %s/%s missing key %s", p.controllerNamespace, spiffe.BundleConfigMapName, spiffe.BundleDataKey)
 	}
 
 	var existingConfigMap corev1.ConfigMap
 	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingConfigMap)
 	if err == nil {
 		if !isOwnedByGateway(&existingConfigMap, gw) {
-			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
+			return nil, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing ConfigMap %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return nil, state.GatewayReadiness{}, err
+		return nil, err
 	}
 
 	configMapApply := corev1ac.ConfigMap(name, gwNamespace).
@@ -454,7 +454,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		configMapApply.WithAnnotations(annotations)
 	}
 	if err := p.client.Apply(ctx, configMapApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply ConfigMap for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		return nil, fmt.Errorf("failed to apply ConfigMap for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 3. Reconcile per-Gateway Deployment in Gateway namespace
@@ -462,12 +462,12 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy)
 	if err == nil {
 		if !isOwnedByGateway(&existingDeploy, gw) {
-			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
+			return nil, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing Deployment %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return nil, state.GatewayReadiness{}, err
+		return nil, err
 	}
 
 	args := []string{
@@ -493,7 +493,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 	host, err := spiffe.ServiceClusterDNSName(spiffe.ControllerServiceName, p.controllerNamespace)
 	if err != nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("building internal API address: %w", err)
+		return nil, fmt.Errorf("building internal API address: %w", err)
 	}
 	internalAPIAddress := net.JoinHostPort(host, strconv.Itoa(push.InternalAPIPort))
 	args = append(args,
@@ -590,11 +590,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			}
 		}
 		if httpPorts > 1 || httpsPorts > 1 {
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
 				Message: "host ports allow one HTTP and one HTTPS port",
-			}, nil
+			}
 		}
 	}
 
@@ -796,11 +796,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 	if p.deploymentMutator != nil {
 		if err := p.deploymentMutator(deployApply, gw, effectiveListeners); err != nil {
-			return nil, state.GatewayReadiness{}, err
+			return nil, err
 		}
 	}
 	if err := p.client.Apply(ctx, deployApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Deployment for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		return nil, fmt.Errorf("failed to apply Deployment for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	requestedIPs := requestedIPAddresses(gw)
@@ -812,17 +812,17 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc)
 		if err == nil {
 			if !isOwnedByGateway(&existingSvc, gw) {
-				return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
+				return nil, &controller.OwnershipConflictError{
 					Message: fmt.Sprintf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 				}
 			}
 			if p.useHostPorts {
 				if deleteErr := p.client.Delete(ctx, &existingSvc); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
-					return nil, state.GatewayReadiness{}, fmt.Errorf("failed to delete Service for Gateway %s/%s: %w", gwNamespace, gw.Name, deleteErr)
+					return nil, fmt.Errorf("failed to delete Service for Gateway %s/%s: %w", gwNamespace, gw.Name, deleteErr)
 				}
 			}
 		} else if !apierrors.IsNotFound(err) {
-			return nil, state.GatewayReadiness{}, err
+			return nil, err
 		}
 
 		var svcPorts []*corev1ac.ServicePortApplyConfiguration
@@ -911,7 +911,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 				svcApply.WithAnnotations(svcAnnos)
 			}
 			if err := p.client.Apply(ctx, svcApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-				return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+				return nil, fmt.Errorf("failed to apply Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 			}
 		}
 	}
@@ -920,7 +920,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	deployReady := false
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy); err != nil {
 		if !apierrors.IsNotFound(err) {
-			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Deployment %s/%s for readiness check: %w", gwNamespace, name, err)
+			return nil, fmt.Errorf("getting Deployment %s/%s for readiness check: %w", gwNamespace, name, err)
 		}
 	} else {
 		if existingDeploy.Status.AvailableReplicas > 0 || existingDeploy.Status.ReadyReplicas > 0 {
@@ -933,11 +933,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		if deployReady {
 			message = "Waiting for node address to be assigned to host-port Gateway"
 		}
-		return nil, state.GatewayReadiness{
-			Ready:   false,
+		return nil, &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 			Message: message,
-		}, nil
+		}
 	}
 
 	if p.noService {
@@ -945,11 +945,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		if deployReady {
 			message = "Waiting for address to be assigned to the Gateway"
 		}
-		return nil, state.GatewayReadiness{
-			Ready:   false,
+		return nil, &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 			Message: message,
-		}, nil
+		}
 	}
 
 	if params.ServiceType == corev1.ServiceTypeClusterIP {
@@ -968,26 +968,22 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		}
 
 		if len(addresses) == 0 {
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 				Message: "ClusterIP Gateway requires a static address in spec.addresses",
-			}, nil
+			}
 		}
 
 		if !deployReady {
-			return nil, state.GatewayReadiness{
-				Ready:   false,
+			return nil, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 				Message: "Waiting for data-plane deployment to become available",
-			}, nil
+			}
 		}
 
-		return addresses, state.GatewayReadiness{
-			Ready:   true,
-			Reason:  string(gatewayv1.GatewayReasonProgrammed),
-			Message: "Gateway programmed by reference implementation",
-		}, nil
+		return addresses, nil
 	}
 
 	var addresses []gatewayv1.GatewayStatusAddress
@@ -995,7 +991,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	var ingressHostnames []string
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc); err != nil {
 		if !apierrors.IsNotFound(err) {
-			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Service %s/%s for address check: %w", gwNamespace, name, err)
+			return nil, fmt.Errorf("getting Service %s/%s for address check: %w", gwNamespace, name, err)
 		}
 	} else {
 		for _, ingress := range existingSvc.Status.LoadBalancer.Ingress {
@@ -1029,11 +1025,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			if i > 0 {
 				msg = fmt.Sprintf("Requested address %s could not be bound to Service: singlepod binds at most one requested IP", reqIP)
 			}
-			return addresses, state.GatewayReadiness{
-				Ready:   false,
+			return addresses, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
 				Message: msg,
-			}, nil
+			}
 		}
 	}
 
@@ -1046,11 +1042,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			}
 		}
 		if !bound {
-			return addresses, state.GatewayReadiness{
-				Ready:   false,
+			return addresses, &state.ConditionError{
+				Type:    string(gatewayv1.GatewayConditionProgrammed),
 				Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
 				Message: fmt.Sprintf("Requested address %s could not be bound to Service", reqHost),
-			}, nil
+			}
 		}
 	}
 
@@ -1059,26 +1055,22 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		// If an address is published before the data plane is ready, traffic may reach an IP
 		// that does not yet route to this Gateway's data plane (e.g. after IP reuse, kube-proxy
 		// can still route to another Gateway's data plane until kube-proxy converges).
-		return nil, state.GatewayReadiness{
-			Ready:   false,
+		return nil, &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 			Message: "Waiting for data-plane deployment to become available",
-		}, nil
+		}
 	}
 
 	if len(addresses) == 0 {
-		return nil, state.GatewayReadiness{
-			Ready:   false,
+		return nil, &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
 			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 			Message: "Waiting for address to be assigned to the Gateway",
-		}, nil
+		}
 	}
 
-	return addresses, state.GatewayReadiness{
-		Ready:   true,
-		Reason:  string(gatewayv1.GatewayReasonProgrammed),
-		Message: "Gateway programmed by reference implementation",
-	}, nil
+	return addresses, nil
 }
 
 // SupportedAddressTypes returns the address types supported by singlepod.

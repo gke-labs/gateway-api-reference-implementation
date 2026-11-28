@@ -178,9 +178,9 @@ type trackingAddressProvider struct {
 	called bool
 }
 
-func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, error) {
 	p.called = true
-	return nil, state.GatewayReadiness{}, nil
+	return nil, nil
 }
 
 func TestGatewayReconciler_DeletingGateway_Skipped(t *testing.T) {
@@ -1621,20 +1621,11 @@ func findCondition(conditions []metav1.Condition, condType string) *metav1.Condi
 
 type fakeAddressProvider struct {
 	addresses []gatewayv1.GatewayStatusAddress
-	readiness state.GatewayReadiness
-	ready     bool
 	err       error
 }
 
-func (f *fakeAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
-	readiness := f.readiness
-	if f.ready {
-		readiness.Ready = true
-	}
-	if !readiness.Ready && readiness.Reason == "" && readiness.Message == "" && f.err == nil && len(f.addresses) > 0 {
-		readiness.Ready = true
-	}
-	return f.addresses, readiness, f.err
+func (f *fakeAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, error) {
+	return f.addresses, f.err
 }
 
 type fakeAddressWatcherProvider struct {
@@ -1969,9 +1960,9 @@ func TestGatewayReconciler_AddressReadiness(t *testing.T) {
 
 	readinessProvider := &fakeAddressProvider{
 		addresses: []gatewayv1.GatewayStatusAddress{{Value: "1.2.3.4"}},
-		readiness: state.GatewayReadiness{
-			Ready:   false,
-			Reason:  "Pending",
+		err: &state.ConditionError{
+			Type:    string(gatewayv1.GatewayConditionProgrammed),
+			Reason:  string(gatewayv1.GatewayReasonPending),
 			Message: "Tunnel session to frontend is not connected",
 		},
 	}
@@ -2002,29 +1993,13 @@ func TestGatewayReconciler_AddressReadiness(t *testing.T) {
 		t.Fatalf("failed to get gateway: %v", err)
 	}
 
+	if len(reconciledGW.Status.Addresses) != 1 || reconciledGW.Status.Addresses[0].Value != "1.2.3.4" {
+		t.Fatalf("expected status address 1.2.3.4 alongside ConditionError, got: %+v", reconciledGW.Status.Addresses)
+	}
+
 	progCond := findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != "Pending" || progCond.Message != "Tunnel session to frontend is not connected" {
 		t.Fatalf("expected Programmed=False Reason=Pending Message='Tunnel session to frontend is not connected', got: %+v", progCond)
-	}
-}
-
-func TestReadinessToConditionError(t *testing.T) {
-	if got := readinessToConditionError(state.GatewayReadiness{Ready: true, Reason: "Ignored", Message: "ignored"}); got != nil {
-		t.Fatalf("expected nil for ready GatewayReadiness, got %+v", got)
-	}
-
-	got := readinessToConditionError(state.GatewayReadiness{
-		Ready:   false,
-		Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
-		Message: "Waiting for IP",
-	})
-	want := &state.ConditionError{
-		Type:    string(gatewayv1.GatewayConditionProgrammed),
-		Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
-		Message: "Waiting for IP",
-	}
-	if got == nil || *got != *want {
-		t.Fatalf("readinessToConditionError() = %+v, want %+v", got, want)
 	}
 }
 
@@ -2207,7 +2182,7 @@ func (f *fakeAddressTypeProvider) SupportedAddressTypes() []gatewayv1.AddressTyp
 	return f.supportedTypes
 }
 
-func (f *fakeAddressTypeProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+func (f *fakeAddressTypeProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, error) {
 	f.called = true
 	return f.fakeAddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
 }
@@ -2816,7 +2791,6 @@ func TestGatewayReconciler_PartialCRDInstallation_ReconcilesGatewayAndHTTPRoute(
 		ControllerName: "test-controller",
 		AddressProvider: &fakeAddressProvider{
 			addresses: []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}},
-			ready:     true,
 		},
 	}
 
