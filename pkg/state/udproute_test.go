@@ -1032,6 +1032,9 @@ func TestUDPPort8443Conflict(t *testing.T) {
 	inputs := ModelInputs{
 		Gateways:       []*gatewayv1.Gateway{gw},
 		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		GatewayAddresses: map[types.NamespacedName][]gatewayv1.GatewayStatusAddress{
+			{Namespace: "default", Name: gw.Name}: {{Value: "192.0.2.1"}},
+		},
 		ControllerName: "test-controller",
 	}
 
@@ -1144,12 +1147,18 @@ func TestUDPListener_AllInOneModeConflict(t *testing.T) {
 		},
 	}
 
+	gatewayAddresses := map[types.NamespacedName][]gatewayv1.GatewayStatusAddress{
+		{Namespace: "default", Name: gw1.Name}: {{Value: "192.0.2.1"}},
+		{Namespace: "default", Name: gw2.Name}: {{Value: "192.0.2.2"}},
+	}
+
 	// 1. With AllInOneMode: true
 	inputsAllInOne := ModelInputs{
-		Gateways:       []*gatewayv1.Gateway{gw2, gw1},
-		GatewayClasses: []*gatewayv1.GatewayClass{gc},
-		ControllerName: "test-controller",
-		AllInOneMode:   true,
+		Gateways:         []*gatewayv1.Gateway{gw2, gw1},
+		GatewayClasses:   []*gatewayv1.GatewayClass{gc},
+		GatewayAddresses: gatewayAddresses,
+		ControllerName:   "test-controller",
+		AllInOneMode:     true,
 	}
 
 	outputsAllInOne := ComputeOutputs(inputsAllInOne)
@@ -1187,10 +1196,11 @@ func TestUDPListener_AllInOneModeConflict(t *testing.T) {
 
 	// 2. With AllInOneMode: false (singlepod mode)
 	inputsSinglePod := ModelInputs{
-		Gateways:       []*gatewayv1.Gateway{gw1, gw2},
-		GatewayClasses: []*gatewayv1.GatewayClass{gc},
-		ControllerName: "test-controller",
-		AllInOneMode:   false,
+		Gateways:         []*gatewayv1.Gateway{gw1, gw2},
+		GatewayClasses:   []*gatewayv1.GatewayClass{gc},
+		GatewayAddresses: gatewayAddresses,
+		ControllerName:   "test-controller",
+		AllInOneMode:     false,
 	}
 
 	outputsSinglePod := ComputeOutputs(inputsSinglePod)

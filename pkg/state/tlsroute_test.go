@@ -1093,6 +1093,9 @@ func TestTLSRoute_TerminateListener_SupportedKinds(t *testing.T) {
 	inputs := ModelInputs{
 		Gateways:       []*gatewayv1.Gateway{gw},
 		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		GatewayAddresses: map[types.NamespacedName][]gatewayv1.GatewayStatusAddress{
+			{Namespace: "default", Name: gw.Name}: {{Value: "192.0.2.1"}},
+		},
 		Secrets:        secrets,
 		ControllerName: "example.net/gateway-controller",
 	}
