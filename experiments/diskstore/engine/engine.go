@@ -61,7 +61,75 @@ var (
 
 	// ErrWALSegmentSizeTooSmall indicates that the configured WAL segment size is less than WALBlockSize.
 	ErrWALSegmentSizeTooSmall = errors.New("WAL segment size is too small")
+
+	// ErrExternalLogMode indicates that a local-WAL method was called on an engine opened in external-log mode.
+	ErrExternalLogMode = errors.New("operation not allowed in external-log mode")
+
+	// ErrLocalWALMode indicates that an external-log method was called on an engine opened in local-WAL mode.
+	ErrLocalWALMode = errors.New("operation requires external-log mode")
+
+	// ErrNonMonotonicLSN indicates that a caller-supplied log position did not strictly increase.
+	ErrNonMonotonicLSN = errors.New("log position must be strictly greater than last applied position")
+
+	// ErrNotDurable indicates that a log position exceeds the external log's durable watermark.
+	ErrNotDurable = errors.New("log position exceeds external log durable watermark")
 )
+
+// ExternalLogConfig configures external-log mode, where the caller owns the authoritative
+// redo log and supplies strictly increasing log positions via ApplyPut and ApplyDelete.
+//
+// External-log invariants:
+//   - The engine writes a dirty heap page with LSN P to heap.db only after the external
+//     log confirms durability through P.
+//   - Checkpoints advance the durable recovery position in meta.db to LSN P only after the
+//     external log confirms durability through P and heap.db is fsynced.
+//   - ApplyPut and ApplyDelete accept only strictly increasing log positions across all calls.
+//   - Open verifies that DurableLSN covers both the highest heap page LSN on disk and the
+//     recovery position stored in meta.db.
+type ExternalLogConfig struct {
+	// DurableLSN returns the highest log position confirmed durable in the external log.
+	// Required in external-log mode. The engine uses DurableLSN to enforce the write-ahead
+	// rule when WaitDurable is nil, to decide whether superseded oversize files can be
+	// unlinked immediately, and to verify the external log covers the store on reopen.
+	DurableLSN func() uint64
+
+	// WaitDurable optionally blocks until the external log confirms durability through lsn,
+	// or returns an error. When nil, dirty page flushes and checkpoints check lsn <= DurableLSN()
+	// and return ErrNotDurable without failing the engine if the watermark lags.
+	WaitDurable func(lsn uint64) error
+}
+
+// externalLog adapts ExternalLogConfig to Log so BlockPool and Checkpointer enforce
+// the external-log write-ahead invariants without creating local .wal files.
+type externalLog struct {
+	config         *ExternalLogConfig
+	lastAppliedLSN *atomic.Uint64
+}
+
+func (l *externalLog) AppendRecord(*Record) (uint64, error) { return 0, ErrExternalLogMode }
+
+func (l *externalLog) SyncThrough(lsn uint64) error {
+	if lsn == 0 {
+		return nil
+	}
+	if l.config.WaitDurable != nil {
+		return l.config.WaitDurable(lsn)
+	}
+	if durable := l.config.DurableLSN(); lsn > durable {
+		return fmt.Errorf("%w: position %d exceeds durable watermark %d", ErrNotDurable, lsn, durable)
+	}
+	return nil
+}
+
+func (l *externalLog) Sync() error         { return nil }
+func (l *externalLog) MaxLSN() uint64      { return l.lastAppliedLSN.Load() }
+func (l *externalLog) DurableLSN() uint64  { return l.config.DurableLSN() }
+func (l *externalLog) BytesWritten() int64 { return 0 }
+func (l *externalLog) NewIterator(uint64, *LogPosition) (LogIterator, error) {
+	return nil, ErrExternalLogMode
+}
+func (l *externalLog) TruncateBefore(uint64) error { return nil }
+func (l *externalLog) Close() error                { return nil }
 
 // TestHookFail is an internal hook used by tests to trigger the failed state without exposing a method on Engine.
 var TestHookFail = func(e *Engine, err error) {
@@ -103,10 +171,22 @@ type Options struct {
 	// Must be at least WALBlockSize (4096 bytes) if set.
 	// Defaults to DefaultMaxSegmentSize (16 MiB) if unset or 0.
 	WALMaxSegmentSize int64
+
+	// ExternalLog enables external-log mode when non-nil, disabling local .wal files.
+	ExternalLog *ExternalLogConfig
 }
 
 // Option is a functional option for configuring an Engine.
 type Option func(*Options)
+
+// WithExternalLog opens the engine in external-log mode without creating or reading local .wal files.
+// Callers apply mutations with ApplyPut and ApplyDelete at strictly increasing log positions.
+func WithExternalLog(config ExternalLogConfig) Option {
+	return func(options *Options) {
+		copied := config
+		options.ExternalLog = &copied
+	}
+}
 
 // WithWALMaxSegmentSize configures the maximum size in bytes of a WAL segment file before rotating.
 // The segment size must be at least WALBlockSize (4096 bytes).
@@ -280,6 +360,9 @@ type Engine struct {
 	buddy    *BuddyAllocator
 	bp       *BlockPool
 	cp       *Checkpointer
+
+	externalLog    *ExternalLogConfig
+	lastAppliedLSN atomic.Uint64
 
 	writerMu sync.RWMutex // Single writer: serializes Put, Delete; RLock for point-in-time Scan/List
 
@@ -657,6 +740,9 @@ func Open(opts ...Option) (_ *Engine, err error) {
 	if options.WALMaxSegmentSize > 0 && options.WALMaxSegmentSize < int64(WALBlockSize) {
 		return nil, fmt.Errorf("%w: max segment size must be at least %d bytes, got %d", ErrWALSegmentSizeTooSmall, WALBlockSize, options.WALMaxSegmentSize)
 	}
+	if options.ExternalLog != nil && options.ExternalLog.DurableLSN == nil {
+		return nil, errors.New("external-log mode requires DurableLSN")
+	}
 
 	dir := options.Dir
 	isTemp := false
@@ -957,6 +1043,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		quarantine:       options.Quarantine,
 		metaFile:         sMetaFile,
 		heapFile:         heapFile,
+		externalLog:      options.ExternalLog,
 		keyIndex:         make(map[string]KeyIndexEntry),
 		inFlightOversize: make(map[string]int),
 		emptyPages:       newEmptyPageTracker(nil),
@@ -983,14 +1070,21 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		heapCipher = cipher
 	}
 
-	if isNewStore {
-		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{
+	openLog := func(initialLSN uint64) (Log, error) {
+		if s.externalLog != nil {
+			return &externalLog{config: s.externalLog, lastAppliedLSN: &s.lastAppliedLSN}, nil
+		}
+		return OpenWAL(options.FS, walDir, dbID, initialLSN, WALOptions{
 			MaxSegmentSize: options.WALMaxSegmentSize,
 			OnFailure:      s.setFailed,
 			Clock:          options.Clock,
 			Quarantine:     walQuarantine,
 			EncryptionKey:  options.EncryptionKey,
 		})
+	}
+
+	if isNewStore {
+		wal, err := openLog(0)
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)
@@ -1010,10 +1104,27 @@ func Open(opts ...Option) (_ *Engine, err error) {
 			ClosedCleanly:    closedCleanly,
 			EncryptionKey:    options.EncryptionKey,
 			RecoveryStartLSN: recoveryStartLSN,
+			ExternalLog:      s.externalLog != nil,
 		})
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("recovery failed: %w", err), closeErr)
+		}
+
+		if s.externalLog != nil {
+			if !closedCleanly {
+				closeErr := heapFile.Close()
+				return nil, errors.Join(errors.New("external-log crash recovery is not supported yet"), closeErr)
+			}
+			requiredLSN := max(recoveryRes.MaxHeapLSN, recoveryStartLSN)
+			if durableLSN := s.externalLog.DurableLSN(); durableLSN < requiredLSN {
+				closeErr := heapFile.Close()
+				return nil, errors.Join(
+					fmt.Errorf("%w: external log durable LSN %d is below required store LSN %d", ErrCorruptStore, durableLSN, requiredLSN),
+					closeErr,
+				)
+			}
+			s.lastAppliedLSN.Store(requiredLSN)
 		}
 
 		if closedCleanly {
@@ -1040,13 +1151,7 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		}
 
 		// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
-		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{
-			MaxSegmentSize: options.WALMaxSegmentSize,
-			OnFailure:      s.setFailed,
-			Clock:          options.Clock,
-			Quarantine:     walQuarantine,
-			EncryptionKey:  options.EncryptionKey,
-		})
+		wal, err := openLog(recoveryRes.MaxLSN)
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)
@@ -1059,9 +1164,10 @@ func Open(opts ...Option) (_ *Engine, err error) {
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal, s.metaFile, activePageIndex, pageCounter)
+		s.cp.recoveryStartLSN.Store(recoveryStartLSN)
 
 		// Replay WAL records from redo start LSN through write path apply functions.
-		if recoveryRes.RedoStartLSN <= recoveryRes.MaxLSN {
+		if s.externalLog == nil && recoveryRes.RedoStartLSN <= recoveryRes.MaxLSN {
 			if err := s.replayWAL(recoveryRes.RedoStartLSN, recoveryRes.RedoStartPosition, recoveryRes.SupersededPages); err != nil {
 				closeErr := errors.Join(s.bp.Close(), s.wal.Close(), heapFile.Close())
 				return nil, errors.Join(fmt.Errorf("WAL replay failed: %w", err), closeErr)
@@ -1342,6 +1448,50 @@ func (s *Engine) WALBytesWritten() int64 {
 	return s.wal.BytesWritten()
 }
 
+// Position returns the highest log position applied to the engine in memory.
+func (s *Engine) Position() uint64 {
+	if s.wal == nil {
+		return 0
+	}
+	return s.wal.MaxLSN()
+}
+
+// RecoveryPosition returns the durable recovery start position recorded in meta.db.
+func (s *Engine) RecoveryPosition() uint64 {
+	if s.cp == nil {
+		return 0
+	}
+	return s.cp.recoveryStartLSN.Load()
+}
+
+func (s *Engine) validateExternalLSN(lsn uint64) error {
+	if last := s.lastAppliedLSN.Load(); lsn == 0 || lsn <= last {
+		return fmt.Errorf("%w: got %d, last applied %d", ErrNonMonotonicLSN, lsn, last)
+	}
+	return nil
+}
+
+func (s *Engine) removeSupersededOversizeLocked(fileName string, lsn uint64) error {
+	if fileName == "" || s.isInFlight(fileName) {
+		return nil
+	}
+	if s.externalLog != nil {
+		// Unlink immediately only when the non-blocking watermark already confirms
+		// durability through lsn; otherwise leave the file for quarantine.
+		if s.externalLog.DurableLSN() < lsn {
+			return nil
+		}
+	} else if err := s.wal.SyncThrough(lsn); err != nil {
+		s.setFailed(err)
+		return s.failErr()
+	}
+	if err := s.removeOversizeFileByName(fileName); err != nil {
+		s.setFailed(err)
+		return s.failErr()
+	}
+	return nil
+}
+
 // CompressionCodec returns the engine's configured compression algorithm.
 func (s *Engine) CompressionCodec() CompressionCodec {
 	return s.compressionCodec
@@ -1589,12 +1739,33 @@ func (s *Engine) applyPutLocked(qKey string, payload []byte, lsn uint64, isOvers
 	return nil
 }
 
-// Put writes an object to the engine.
+// Put writes an object to the engine using its local WAL.
 func (s *Engine) Put(tableName, key string, payload []byte) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
+	if s.externalLog != nil {
+		return fmt.Errorf("%w: Put cannot be called in external-log mode; use ApplyPut", ErrExternalLogMode)
+	}
+	return s.put(tableName, key, payload, 0)
+}
 
+// ApplyPut writes an object at caller-supplied log position lsn in external-log mode.
+// Positions must strictly increase across all ApplyPut and ApplyDelete calls.
+func (s *Engine) ApplyPut(tableName, key string, payload []byte, lsn uint64) error {
+	if s.isFailed() {
+		return s.failErr()
+	}
+	if s.externalLog == nil {
+		return fmt.Errorf("%w: ApplyPut requires external-log mode; use Put", ErrLocalWALMode)
+	}
+	if err := s.validateExternalLSN(lsn); err != nil {
+		return err
+	}
+	return s.put(tableName, key, payload, lsn)
+}
+
+func (s *Engine) put(tableName, key string, payload []byte, lsn uint64) error {
 	qKey := qualifyKey(tableName, key)
 
 	// Validate key length: a key over 65535 bytes cannot fit in the 16-bit key length field.
@@ -1666,6 +1837,11 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		if s.isFailed() {
 			return s.failErr()
 		}
+		if s.externalLog != nil {
+			if err := s.validateExternalLSN(lsn); err != nil {
+				return err
+			}
+		}
 
 		s.keyMu.RLock()
 		existing, inIndex := s.keyIndex[qKey]
@@ -1697,6 +1873,11 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		if s.isFailed() {
 			return s.failErr()
 		}
+		if s.externalLog != nil {
+			if err := s.validateExternalLSN(lsn); err != nil {
+				return err
+			}
+		}
 
 		s.keyMu.RLock()
 		existing, inIndex := s.keyIndex[qKey]
@@ -1713,10 +1894,13 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		}
 	}
 
-	lsn, err := s.wal.AppendRecord(&rec)
-	if err != nil {
-		s.setFailed(err)
-		return s.failErr()
+	if s.externalLog == nil {
+		var appendErr error
+		lsn, appendErr = s.wal.AppendRecord(&rec)
+		if appendErr != nil {
+			s.setFailed(appendErr)
+			return s.failErr()
+		}
 	}
 
 	if err := s.applyPutLocked(qKey, rec.Payload, lsn, isOversize); err != nil {
@@ -1726,20 +1910,12 @@ func (s *Engine) Put(tableName, key string, payload []byte) error {
 		s.setFailed(err)
 		return s.failErr()
 	}
-
-	// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
-	if oldOversizeFile != "" && !s.isInFlight(oldOversizeFile) {
-		if err := s.wal.SyncThrough(lsn); err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
-		if err := s.removeOversizeFileByName(oldOversizeFile); err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
+	if s.externalLog != nil {
+		s.lastAppliedLSN.Store(lsn)
 	}
 
-	return nil
+	// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
+	return s.removeSupersededOversizeLocked(oldOversizeFile, lsn)
 }
 
 func (s *Engine) deleteSlotFromPageLocked(pageID uint64, slotIdx uint32, lsn uint64) error {
@@ -1821,7 +1997,7 @@ func (s *Engine) Get(tableName, key string) ([]byte, bool, error) {
 		if matched {
 			return val, true, nil
 		}
-		if err != nil && s.isFailed() {
+		if err != nil && (s.isFailed() || errors.Is(err, ErrNotDurable)) {
 			return nil, false, err
 		}
 
@@ -1865,7 +2041,7 @@ func (s *Engine) getLocked(tableName, key string) ([]byte, bool, error) {
 
 	val, matched, err := s.readIndexEntry(key, qKey, entry)
 	if err != nil {
-		if errors.Is(err, ErrCorruptStore) {
+		if errors.Is(err, ErrCorruptStore) || errors.Is(err, ErrNotDurable) {
 			return nil, false, err
 		}
 		s.setFailed(err)
@@ -2059,14 +2235,41 @@ func (s *Engine) applyDeleteLocked(qKey string, lsn uint64) error {
 	return nil
 }
 
-// Delete removes an object by key.
+// Delete removes an object by key using the local WAL.
 func (s *Engine) Delete(tableName, key string) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
+	if s.externalLog != nil {
+		return fmt.Errorf("%w: Delete cannot be called in external-log mode; use ApplyDelete", ErrExternalLogMode)
+	}
+	return s.deleteKey(tableName, key, 0)
+}
 
+// ApplyDelete removes an object at caller-supplied log position lsn in external-log mode.
+// Positions must strictly increase across all ApplyPut and ApplyDelete calls.
+func (s *Engine) ApplyDelete(tableName, key string, lsn uint64) error {
+	if s.isFailed() {
+		return s.failErr()
+	}
+	if s.externalLog == nil {
+		return fmt.Errorf("%w: ApplyDelete requires external-log mode; use Delete", ErrLocalWALMode)
+	}
+	return s.deleteKey(tableName, key, lsn)
+}
+
+func (s *Engine) deleteKey(tableName, key string, lsn uint64) error {
 	s.writerMu.Lock()
 	defer s.writerMu.Unlock()
+
+	if s.isFailed() {
+		return s.failErr()
+	}
+	if s.externalLog != nil {
+		if err := s.validateExternalLSN(lsn); err != nil {
+			return err
+		}
+	}
 
 	qKey := qualifyKey(tableName, key)
 
@@ -2074,36 +2277,37 @@ func (s *Engine) Delete(tableName, key string) error {
 	entry, exists := s.keyIndex[qKey]
 	s.keyMu.RUnlock()
 	if !exists {
+		if s.externalLog != nil {
+			s.lastAppliedLSN.Store(lsn)
+		}
 		return nil
 	}
 
-	rec := Record{
-		Type: RecordTypeDelete,
-		Key:  qKey,
-	}
-	lsn, err := s.wal.AppendRecord(&rec)
-	if err != nil {
-		s.setFailed(err)
-		return s.failErr()
+	if s.externalLog == nil {
+		rec := Record{
+			Type: RecordTypeDelete,
+			Key:  qKey,
+		}
+		var appendErr error
+		lsn, appendErr = s.wal.AppendRecord(&rec)
+		if appendErr != nil {
+			s.setFailed(appendErr)
+			return s.failErr()
+		}
 	}
 
 	if err := s.applyDeleteLocked(qKey, lsn); err != nil {
 		s.setFailed(err)
 		return s.failErr()
 	}
-
-	// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
-	if entry.IsOversize && entry.OversizeFileName != "" && !s.isInFlight(entry.OversizeFileName) {
-		if err := s.wal.SyncThrough(lsn); err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
-		if err := s.removeOversizeFileByName(entry.OversizeFileName); err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
+	if s.externalLog != nil {
+		s.lastAppliedLSN.Store(lsn)
 	}
 
+	// Invariants 1 & 3: delete only after durable; skip files being written in flight (see removeOversizeFileByName).
+	if entry.IsOversize {
+		return s.removeSupersededOversizeLocked(entry.OversizeFileName, lsn)
+	}
 	return nil
 }
 
@@ -2198,6 +2402,9 @@ func (s *Engine) Sync() error {
 	if s.isFailed() {
 		return s.failErr()
 	}
+	if s.externalLog != nil {
+		return fmt.Errorf("%w: Sync cannot be called in external-log mode", ErrExternalLogMode)
+	}
 	if err := s.wal.Sync(); err != nil {
 		s.setFailed(err)
 		return s.failErr()
@@ -2212,6 +2419,9 @@ func (s *Engine) Checkpoint() error {
 	}
 
 	if err := s.cp.Checkpoint(); err != nil {
+		if errors.Is(err, ErrNotDurable) {
+			return err
+		}
 		s.setFailed(err)
 		return s.failErr()
 	}

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -61,6 +62,8 @@ type RecoveryResult struct {
 	// each older page at the first record whose LSN is above the older page's LSN.
 	SupersededPages map[string][]KeyIndexEntry
 	MaxLSN          uint64
+	// MaxHeapLSN is the highest LSN across all winning page copies discovered in heap.db.
+	MaxHeapLSN      uint64
 	NextLogicalPage uint64
 	RedoStartLSN    uint64
 	// RedoStartPosition records the segment and byte offset of the first WAL record
@@ -226,30 +229,45 @@ type RecoveryOptions struct {
 	// RecoveryStartLSN is the start LSN for recovery read from meta.db.
 	// When non-zero, recovery replays the log starting from this LSN.
 	RecoveryStartLSN uint64
+	// ExternalLog skips fsyncing and scanning local .wal files during recovery.
+	ExternalLog bool
+}
+
+func fsyncWALDirectory(fs FS, walDir string) error {
+	// Item 10: Fsync every existing WAL segment and walDir before trusting them.
+	entries, err := fs.ReadDir(walDir)
+	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("failed to read WAL directory: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".wal") {
+			segPath := filepath.Join(walDir, entry.Name())
+			f, openErr := fs.Open(segPath)
+			if openErr != nil {
+				return fmt.Errorf("failed to open WAL segment %s for fsync: %w", entry.Name(), openErr)
+			}
+			syncErr := f.Sync()
+			closeErr := f.Close()
+			if err := errors.Join(syncErr, closeErr); err != nil {
+				return fmt.Errorf("failed to fsync WAL segment %s: %w", entry.Name(), err)
+			}
+		}
+	}
+	if err := fs.SyncDir(walDir); err != nil {
+		return fmt.Errorf("failed to fsync WAL directory: %w", err)
+	}
+	return nil
 }
 
 // Recover scans the heap file, filters out foreign and torn copies, finds the WAL redo start LSN,
 // and rebuilds the in-memory indexes and allocator state.
 func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte, options RecoveryOptions) (*RecoveryResult, error) {
-	// Item 10: Fsync every existing WAL segment and walDir before trusting them
-	entries, err := fs.ReadDir(walDir)
-	if err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".wal") {
-				segPath := filepath.Join(walDir, entry.Name())
-				f, openErr := fs.Open(segPath)
-				if openErr != nil {
-					return nil, fmt.Errorf("failed to open WAL segment %s for fsync: %w", entry.Name(), openErr)
-				}
-				syncErr := f.Sync()
-				closeErr := f.Close()
-				if err := errors.Join(syncErr, closeErr); err != nil {
-					return nil, fmt.Errorf("failed to fsync WAL segment %s: %w", entry.Name(), err)
-				}
-			}
-		}
-		if err := fs.SyncDir(walDir); err != nil {
-			return nil, fmt.Errorf("failed to fsync WAL directory: %w", err)
+	if !options.ExternalLog {
+		if err := fsyncWALDirectory(fs, walDir); err != nil {
+			return nil, err
 		}
 	}
 
@@ -537,6 +555,20 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	if redoStartLSN == 0 {
 		redoStartLSN = 1
 	}
+	if options.ExternalLog {
+		return &RecoveryResult{
+			DBID:              dbID,
+			PageDescs:         pageDescs,
+			Buddy:             buddy,
+			KeyIndex:          keyIndex,
+			EmptyLogicalPages: emptyPages,
+			SupersededPages:   supersededPages,
+			MaxHeapLSN:        maxHeapLSN,
+			NextLogicalPage:   maxRecoveredLogicalPage + 1,
+			RedoStartLSN:      redoStartLSN,
+		}, nil
+	}
+
 	var maxWAL_LSN uint64
 	var redoStartPosition *LogPosition
 
@@ -582,6 +614,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		EmptyLogicalPages: emptyPages,
 		SupersededPages:   supersededPages,
 		MaxLSN:            maxWAL_LSN,
+		MaxHeapLSN:        maxHeapLSN,
 		NextLogicalPage:   maxRecoveredLogicalPage + 1,
 		RedoStartLSN:      redoStartLSN,
 		RedoStartPosition: redoStartPosition,

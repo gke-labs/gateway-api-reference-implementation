@@ -17,6 +17,7 @@ package engine
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 // Checkpointer coordinates non-blocking checkpoints between the block pool, heap file, and WAL.
@@ -34,6 +35,9 @@ type Checkpointer struct {
 
 	// pageCounter is the monotonic write counter in the latest valid record.
 	pageCounter uint64
+
+	// recoveryStartLSN is the latest recovery start LSN durably written to meta.db.
+	recoveryStartLSN atomic.Uint64
 }
 
 // NewCheckpointer creates a new Checkpointer.
@@ -69,6 +73,7 @@ func (c *Checkpointer) writeRecoveryPageLocked(redoStartLSN uint64) error {
 
 	c.activePageIndex = targetIndex
 	c.pageCounter = nextCounter
+	c.recoveryStartLSN.Store(redoStartLSN)
 	return nil
 }
 
@@ -136,6 +141,14 @@ func (c *Checkpointer) Checkpoint() error {
 	// 2-3. Flush dirty pages, fsync heap file, and release deferred frees
 	if err := c.flushPagesLocked(); err != nil {
 		return fmt.Errorf("checkpoint failed to flush dirty pages: %w", err)
+	}
+
+	// Confirm redoStartLSN is durable in the log before advancing meta.db so recovery
+	// never skips unconfirmed tail positions when no dirty pages were flushed.
+	if c.wal != nil && redoStartLSN > 0 {
+		if err := c.wal.SyncThrough(redoStartLSN); err != nil {
+			return fmt.Errorf("checkpoint failed to confirm log durability through LSN %d: %w", redoStartLSN, err)
+		}
 	}
 
 	// 4. Write the recovery start LSN page to meta.db only after the heap fsync completes,

@@ -319,7 +319,7 @@ func (bp *BlockPool) sweepIdleDirtyPages() {
 	}
 	bp.mu.Unlock()
 
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrNotDurable) {
 		bp.fail(fmt.Errorf("background idle sweep failed: %w", err))
 		return
 	}
@@ -826,7 +826,15 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 	// Re-acquire pool mutex
 	bp.mu.Lock()
 
+	flushErr := errors.Join(syncErr, writeErr)
+	transientNotDurable := flushErr != nil && errors.Is(flushErr, ErrNotDurable)
+
 	for _, desc := range chunk {
+		if transientNotDurable && desc.flushingFirstLSN > 0 && (desc.DirtyLSN == 0 || desc.flushingFirstLSN < desc.DirtyLSN) {
+			// Restore the pre-flush DirtyLSN if a concurrent writer advanced it while
+			// this flush was in flight, because the flush wrote nothing to disk.
+			desc.DirtyLSN = desc.flushingFirstLSN
+		}
 		desc.InFlight = false
 		desc.flushingLSN = 0
 		desc.flushingFirstLSN = 0
@@ -834,7 +842,6 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 	}
 	bp.cond.Broadcast()
 
-	flushErr := errors.Join(syncErr, writeErr)
 	if flushErr != nil {
 		// Reclaim allocated blocks on failure
 		var freeErrs []error
@@ -846,7 +853,7 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 		if len(freeErrs) > 0 {
 			flushErr = errors.Join(flushErr, fmt.Errorf("failed to free batch blocks on flush failure: %w", errors.Join(freeErrs...)))
 		}
-		if bp.onFailure != nil {
+		if bp.onFailure != nil && (len(freeErrs) > 0 || !transientNotDurable) {
 			bp.onFailure(flushErr)
 		}
 		return flushErr
