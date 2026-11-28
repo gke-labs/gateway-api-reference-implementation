@@ -52,17 +52,17 @@ var (
 // Addresses: The Gateway's addresses are the internal addresses of every node that runs
 // a data-plane pod owned by the Gateway's Deployment, sorted and deduplicated.
 type HostPortAddressProvider struct {
+	// reader is used for uncached reads of Pods, ReplicaSets, and Nodes.
+	// When nil at construction, SetupWatches populates it once during manager
+	// registration before GatewayAddresses runs concurrently.
 	reader  client.Reader
 	wrapped *singlepod.AddressProvider
 }
 
 // New creates a new HostPortAddressProvider wrapping a singlepod.AddressProvider
 // configured with WithNoService() and the host-port Deployment mutator.
-// The reader is required for uncached reads of Pods, ReplicaSets, and Nodes.
+// When reader is nil, SetupWatches populates it from the manager's uncached API reader.
 func New(client client.Client, reader client.Reader, controllerNamespace string, options ...singlepod.Option) (*HostPortAddressProvider, error) {
-	if reader == nil {
-		return nil, fmt.Errorf("reader is required for HostPortAddressProvider")
-	}
 	if controllerNamespace == "" {
 		return nil, fmt.Errorf("controllerNamespace is required for HostPortAddressProvider")
 	}
@@ -81,6 +81,10 @@ func New(client client.Client, reader client.Reader, controllerNamespace string,
 // GatewayAddresses reconciles the Gateway's data-plane infrastructure and returns
 // addresses and readiness status based on the nodes running the Gateway's data-plane pods.
 func (provider *HostPortAddressProvider) GatewayAddresses(ctx context.Context, gateway *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+	if provider.reader == nil {
+		return nil, state.GatewayReadiness{}, fmt.Errorf("reader is required for HostPortAddressProvider")
+	}
+
 	// 0. Validate that listeners do not exceed one HTTP port and one HTTPS/TLS port.
 	httpPorts := make(map[gatewayv1.PortNumber]struct{})
 	httpsPorts := make(map[gatewayv1.PortNumber]struct{})
@@ -296,8 +300,12 @@ func (provider *HostPortAddressProvider) SupportedAddressTypes() []gatewayv1.Add
 	return nil
 }
 
-// SetupWatches registers watches on managed resources with the Gateway controller.
+// SetupWatches captures the manager's uncached API reader when no reader was supplied
+// to New and registers watches on managed resources with the Gateway controller.
 func (provider *HostPortAddressProvider) SetupWatches(manager ctrl.Manager, builder *builder.Builder) error {
+	if manager != nil && provider.reader == nil {
+		provider.reader = manager.GetAPIReader()
+	}
 	return provider.wrapped.SetupWatches(manager, builder)
 }
 

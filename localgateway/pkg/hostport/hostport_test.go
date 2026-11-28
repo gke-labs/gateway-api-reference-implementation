@@ -24,6 +24,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -715,14 +716,87 @@ func TestHostPortAddressProvider_SetupWatches(t *testing.T) {
 	}
 }
 
-func TestHostPortAddressProvider_NewRequiresReader(t *testing.T) {
+type fakeWatchManager struct {
+	ctrl.Manager
+	client client.Client
+	reader client.Reader
+}
+
+func (m *fakeWatchManager) GetClient() client.Client       { return m.client }
+func (m *fakeWatchManager) GetAPIReader() client.Reader    { return m.reader }
+func (m *fakeWatchManager) GetScheme() *runtime.Scheme     { return m.client.Scheme() }
+func (m *fakeWatchManager) GetRESTMapper() meta.RESTMapper { return m.client.RESTMapper() }
+
+func TestHostPortAddressProvider_NilReaderFailsWithoutSetupWatches(t *testing.T) {
 	testClient := setupTestClient(t)
 	provider, err := New(testClient, nil, "default")
-	if err == nil {
-		t.Fatalf("expected error when reader is nil, got nil")
+	if err != nil {
+		t.Fatalf("expected New with nil reader to succeed for deferred wiring, got: %v", err)
 	}
-	if provider != nil {
-		t.Fatalf("expected nil provider when reader is nil, got %+v", provider)
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+			UID:       types.UID("test-uid"),
+		},
+	}
+	_, _, err = provider.GatewayAddresses(t.Context(), gateway, nil)
+	if err == nil {
+		t.Fatalf("expected error from GatewayAddresses when reader is nil, got nil")
+	}
+	if !strings.Contains(err.Error(), "reader is required") {
+		t.Fatalf("expected error mentioning missing reader, got: %v", err)
+	}
+}
+
+func TestHostPortAddressProvider_SetupWatchesPopulatesReader(t *testing.T) {
+	testClient := setupTestClient(t)
+	provider, err := New(nil, nil, "default")
+	if err != nil {
+		t.Fatalf("expected New with nil client and reader to succeed, got: %v", err)
+	}
+
+	watchManager := &fakeWatchManager{
+		client: testClient,
+		reader: testClient,
+	}
+	controllerBuilder := ctrl.NewControllerManagedBy(watchManager)
+	if err := provider.SetupWatches(watchManager, controllerBuilder); err != nil {
+		t.Fatalf("SetupWatches failed: %v", err)
+	}
+
+	gateway := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "deferred-gw",
+			Namespace: "default",
+			UID:       types.UID("deferred-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+	_, readiness, err := provider.GatewayAddresses(t.Context(), gateway, nil)
+	if err != nil {
+		t.Fatalf("GatewayAddresses failed after SetupWatches populated reader: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected readiness.Ready=false before data-plane pod is scheduled")
+	}
+
+	var deployment appsv1.Deployment
+	deploymentKey := types.NamespacedName{
+		Namespace: gateway.Namespace,
+		Name:      state.ResourceNameForGateway(gateway.Name),
+	}
+	if err := testClient.Get(t.Context(), deploymentKey, &deployment); err != nil {
+		t.Fatalf("expected Deployment to be created after SetupWatches wired client and reader: %v", err)
 	}
 }
 

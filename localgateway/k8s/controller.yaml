@@ -10,14 +10,41 @@ metadata:
   name: localgateway-controller
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes", "gateways", "gatewayclasses", "referencegrants"]
+  resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants", "listenersets"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status"]
-  verbs: ["update", "patch"]
-- apiGroups: [""]
-  resources: ["services", "namespaces", "configmaps", "nodes"]
+  resources: ["tlsroutes", "grpcroutes", "tcproutes", "udproutes"]
   verbs: ["get", "list", "watch"]
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status", "tlsroutes/status", "grpcroutes/status", "tcproutes/status", "udproutes/status"]
+  verbs: ["update", "patch"]
+# Per-Gateway host-port data-plane provisioning.
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["services", "namespaces", "secrets"]
+  verbs: ["get", "list", "watch"]
+# The controller copies the SPIFFE trust bundle into each Gateway namespace for data planes connecting to the internal API.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch", "create", "patch"]
+# Uncached reads used by HostPortAddressProvider to discover scheduled data-plane pods and their Node internal IPs.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["tokenreviews"]
+  verbs: ["create"]
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["create", "patch", "update"]
@@ -26,6 +53,17 @@ rules:
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["apiextensions.k8s.io"]
   resources: ["customresourcedefinitions"]
+  resourceNames:
+  - "gatewayclasses.gateway.networking.k8s.io"
+  - "gateways.gateway.networking.k8s.io"
+  - "httproutes.gateway.networking.k8s.io"
+  - "tlsroutes.gateway.networking.k8s.io"
+  - "grpcroutes.gateway.networking.k8s.io"
+  - "tcproutes.gateway.networking.k8s.io"
+  - "udproutes.gateway.networking.k8s.io"
+  - "backendtlspolicies.gateway.networking.k8s.io"
+  - "listenersets.gateway.networking.k8s.io"
+  - "referencegrants.gateway.networking.k8s.io"
   verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -42,9 +80,8 @@ subjects:
   namespace: default
 ---
 # Role allowing the controller to manage only its DNS data plane configuration Secret (localgateway-dns).
-# The Role, RoleBinding and Deployment share the default namespace (matching DefaultConfigSecretNamespace in dnsconfig).
-# If installed into another namespace, update metadata.namespace on the Role, RoleBinding, and Deployment,
-# and subjects[0].namespace on the RoleBinding.
+# All namespaced resources in this manifest (ServiceAccounts, Roles, RoleBindings, the gari-credentials Job,
+# the gari-controller Service, and the controller Deployment) must share one namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -77,6 +114,109 @@ metadata:
 spec:
   controllerName: github.com/gke-labs/gateway-api-reference-implementation/localgateway
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gari-credentials
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gari-credentials
+  namespace: default
+rules:
+# Read verbs are restricted by resourceNames to the SPIFFE authority and SVID Secrets.
+# Kubernetes RBAC cannot limit 'create' operations by resource name because the resource name
+# is assigned upon creation. Therefore, the create rule permits creating any Secret in this
+# namespace beyond these names, while read access remains restricted to
+# gari-spiffe-authority and gari-controller-svid.
+# Note on authority key access: only the Job is intended to read the authority private key Secret
+# (gari-spiffe-authority). However, the controller's ClusterRole above currently grants
+# get/list/watch on all Secrets cluster-wide, meaning the controller technically has read access
+# as well; narrowing controller Secret RBAC is an open maintainer follow-up.
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames:
+  - "gari-spiffe-authority"
+  - "gari-controller-svid"
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create"]
+# Read access is restricted by resourceNames to the SPIFFE trust bundle ConfigMap.
+# As noted above, 'create' cannot be restricted by name in Kubernetes RBAC, allowing creation
+# of any ConfigMap in this namespace beyond this single name, while read access
+# remains restricted to gari-spiffe-bundle.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames:
+  - "gari-spiffe-bundle"
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gari-credentials
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gari-credentials
+subjects:
+- kind: ServiceAccount
+  name: gari-credentials
+  namespace: default
+---
+# The Job creates the cluster's SPIFFE credentials.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gari-credentials
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: gari-credentials
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+      - name: init-credentials
+        image: gari-credentials:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gari-controller
+  namespace: default
+spec:
+  selector:
+    app: localgateway-controller
+  ports:
+  - name: internal-api
+    port: 8443
+    targetPort: 8443
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -95,35 +235,34 @@ spec:
         app: localgateway-controller
     spec:
       serviceAccountName: localgateway-controller
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: controller
         image: localgateway:latest
         imagePullPolicy: IfNotPresent
-        args:
-        - --controller-name=github.com/gke-labs/gateway-api-reference-implementation/localgateway
-        - --proxy-bind-address=:80
         env:
-        - name: NODE_NAME
+        - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
-              fieldPath: spec.nodeName
+              fieldPath: metadata.namespace
+        - name: DATAPLANE_IMAGE
+          value: gari-controller:latest
+        args:
+        - --controller-name=github.com/gke-labs/gateway-api-reference-implementation/localgateway
+        - --dataplane-image=$(DATAPLANE_IMAGE)
+        - --internal-api-bind-address=:8443
+        - --internal-api-tls-cert-file=/etc/gari/svid/svid.pem
+        - --internal-api-tls-key-file=/etc/gari/svid/svid_key.pem
         ports:
-        - name: http
-          containerPort: 80
-        - name: mdns
-          containerPort: 5353
-          protocol: UDP
         - name: metrics
           containerPort: 8999
+        - name: internal-api
+          containerPort: 8443
         securityContext:
-          # Note: allowPrivilegeEscalation must not be set to false; doing so
-          # clears the process's effective capability set and prevents the
-          # non-root user (65532) from using the binary's cap_net_bind_service capability.
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
           capabilities:
-            add:
-            - NET_BIND_SERVICE
+            drop:
+            - ALL
         readinessProbe:
           httpGet:
             path: /readyz
@@ -136,3 +275,11 @@ spec:
             port: 8999
           initialDelaySeconds: 5
           periodSeconds: 10
+        volumeMounts:
+        - name: svid
+          mountPath: /etc/gari/svid
+          readOnly: true
+      volumes:
+      - name: svid
+        secret:
+          secretName: gari-controller-svid
