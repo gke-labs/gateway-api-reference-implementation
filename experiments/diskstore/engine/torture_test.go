@@ -16,6 +16,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -27,6 +28,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/xts"
 )
@@ -856,5 +858,439 @@ func TestTortureMatrix(t *testing.T) {
 				runTortureWorkload(t, config, seed)
 			}
 		})
+	}
+}
+
+type versionedValue struct {
+	sequence uint64
+	exists   bool
+	value    []byte
+}
+
+// concurrentModel records every key version that the single writer starts or completes.
+// Readers and List callers check two invariants against this history:
+//  1. Get returns a version from that key's history at or after the latest write
+//     completed when Get began, and no later than the latest write started when
+//     Get returned.
+//  2. List returns a point-in-time snapshot matching one sequence in that same
+//     interval across all keys.
+type concurrentModel struct {
+	mu                sync.Mutex
+	startedSequence   uint64
+	completedSequence uint64
+	history           map[string][]versionedValue
+}
+
+func newConcurrentModel(keys []string) *concurrentModel {
+	history := make(map[string][]versionedValue, len(keys))
+	for _, key := range keys {
+		history[key] = []versionedValue{{sequence: 0, exists: false}}
+	}
+	return &concurrentModel{history: history}
+}
+
+func (m *concurrentModel) completed() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.completedSequence
+}
+
+func (m *concurrentModel) beginWrite(key string, exists bool, value []byte) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.startedSequence++
+	sequence := m.startedSequence
+	m.history[key] = append(m.history[key], versionedValue{sequence: sequence, exists: exists, value: value})
+	return sequence
+}
+
+func (m *concurrentModel) endWrite(sequence uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.completedSequence = sequence
+}
+
+func (m *concurrentModel) checkGet(key string, minSequence uint64, gotExists bool, gotValue []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	maxSequence := m.startedSequence
+	versions := m.history[key]
+	startIndex := len(versions) - 1
+	for startIndex > 0 && versions[startIndex].sequence > minSequence {
+		startIndex--
+	}
+	for i := startIndex; i < len(versions) && versions[i].sequence <= maxSequence; i++ {
+		if versions[i].exists == gotExists && (!gotExists || bytes.Equal(versions[i].value, gotValue)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("Get(%q) returned exists=%v len=%d, outside key history for sequences [%d, %d]",
+		key, gotExists, len(gotValue), minSequence, maxSequence)
+}
+
+func (m *concurrentModel) checkList(keys []string, minSequence uint64, items []RecordItem) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	maxSequence := m.startedSequence
+	got := make(map[string][]byte, len(items))
+	for _, item := range items {
+		if _, known := m.history[item.Key]; !known {
+			return fmt.Errorf("List returned unknown key %q", item.Key)
+		}
+		if _, duplicate := got[item.Key]; duplicate {
+			return fmt.Errorf("List returned duplicate key %q", item.Key)
+		}
+		got[item.Key] = item.Payload
+	}
+	for sequence := minSequence; sequence <= maxSequence; sequence++ {
+		matched := true
+		for _, key := range keys {
+			versions := m.history[key]
+			expected := versions[0]
+			for i := len(versions) - 1; i >= 0; i-- {
+				if versions[i].sequence <= sequence {
+					expected = versions[i]
+					break
+				}
+			}
+			gotValue, gotExists := got[key]
+			if gotExists != expected.exists || (gotExists && !bytes.Equal(gotValue, expected.value)) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return nil
+		}
+	}
+	return fmt.Errorf("List returned %d keys, matching no model state in sequences [%d, %d]",
+		len(items), minSequence, maxSequence)
+}
+
+func captureGoroutineDump() string {
+	for size := 64 * 1024; ; size *= 2 {
+		buffer := make([]byte, size)
+		if written := runtime.Stack(buffer, true); written < len(buffer) {
+			return string(buffer[:written])
+		}
+	}
+}
+
+// runConcurrentTorture runs readers, List callers, one writer, and the
+// checkpointer against one engine without injecting faults. When beforeWorkers
+// is non-nil, the runner calls it after seeding keys and invokes its returned
+// release function after the watchdog fires or on teardown.
+func runConcurrentTorture(t testing.TB, seed int64, writerOperations int, stallTimeout time.Duration, beforeWorkers func(*Engine) func()) {
+	t.Helper()
+	const (
+		tableName      = "concurrent_torture_table"
+		numKeys        = 32
+		maxValueBlocks = 4
+		numReaders     = 4
+		numListers     = 2
+	)
+	rerunCommand := fmt.Sprintf("DISKSTORE_TORTURE_SEED=%d go test -race -v -run '^TestConcurrentTorture$' ./experiments/diskstore/engine", seed)
+	failRun := func(cause error) {
+		t.Helper()
+		t.Fatalf("concurrent torture failure: seed=%d: %v\nRerun with:\n  %s", seed, cause, rerunCommand)
+	}
+
+	keys := make([]string, numKeys)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k%d", i)
+	}
+	model := newConcurrentModel(keys)
+
+	faultFS := NewFaultFS(NewMemFS())
+	store, openErr := Open(
+		WithFS(faultFS),
+		WithDir("concurrent_torture"),
+		WithNumPoolBlocks(48),
+		WithCompressionCodec(CodecNone),
+		WithWALMaxSegmentSize(16*1024),
+		WithCreate(),
+	)
+	if openErr != nil {
+		failRun(fmt.Errorf("Open: %w", openErr))
+	}
+
+	var failed, abandoned bool
+	defer func() {
+		if abandoned {
+			return
+		}
+		if failed {
+			TestHookFail(store, errors.New("concurrent torture failed"))
+			if closeErr := store.Close(); closeErr != nil {
+				// Close errors during failed teardown are expected.
+			}
+			return
+		}
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("concurrent torture cleanup: Close failed: %v", closeErr)
+		}
+	}()
+
+	writerRandom := rand.New(rand.NewSource(seed))
+	existingLengths := make(map[string]int, len(keys))
+	for _, key := range keys {
+		value := generateTortureValue(writerRandom, maxValueBlocks, 0)
+		sequence := model.beginWrite(key, true, value)
+		if putErr := store.Put(tableName, key, value); putErr != nil {
+			failed = true
+			failRun(fmt.Errorf("seed Put(%q): %w", key, putErr))
+		}
+		model.endWrite(sequence)
+		existingLengths[key] = len(value)
+	}
+
+	var releaseOnce sync.Once
+	releaseHook := func() {}
+	if beforeWorkers != nil {
+		unlock := beforeWorkers(store)
+		releaseHook = func() { releaseOnce.Do(unlock) }
+		defer releaseHook()
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	firstErr := make(chan error, 1)
+	abort := func(err error) {
+		select {
+		case firstErr <- err:
+		default:
+		}
+		cancel()
+	}
+	checkHealthy := func(role string) bool {
+		if err := store.Err(); err != nil {
+			abort(fmt.Errorf("%s observed failed engine: %w", role, err))
+			return false
+		}
+		select {
+		case <-store.Failed():
+			abort(fmt.Errorf("%s observed failed engine: %w", role, ErrFailed))
+			return false
+		default:
+			return true
+		}
+	}
+
+	var totalCompleted, writerCompleted atomic.Int64
+	var writerFinished atomic.Bool
+	var wg sync.WaitGroup
+
+	// Single writer executing Put and Delete operations.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			writerFinished.Store(true)
+			cancel()
+		}()
+		for operationIndex := 1; operationIndex <= writerOperations && ctx.Err() == nil; operationIndex++ {
+			key := keys[writerRandom.Intn(len(keys))]
+			if writerRandom.Intn(5) == 0 {
+				sequence := model.beginWrite(key, false, nil)
+				if deleteErr := store.Delete(tableName, key); deleteErr != nil {
+					abort(fmt.Errorf("writer op %d Delete(%q): %w", operationIndex, key, deleteErr))
+					return
+				}
+				model.endWrite(sequence)
+				delete(existingLengths, key)
+			} else {
+				value := generateTortureValue(writerRandom, maxValueBlocks, existingLengths[key])
+				sequence := model.beginWrite(key, true, value)
+				if putErr := store.Put(tableName, key, value); putErr != nil {
+					abort(fmt.Errorf("writer op %d Put(%q): %w", operationIndex, key, putErr))
+					return
+				}
+				model.endWrite(sequence)
+				existingLengths[key] = len(value)
+			}
+			if !checkHealthy(fmt.Sprintf("writer op %d", operationIndex)) {
+				return
+			}
+			writerCompleted.Add(1)
+			totalCompleted.Add(1)
+		}
+	}()
+
+	// Concurrent Get readers.
+	for readerIndex := 0; readerIndex < numReaders; readerIndex++ {
+		wg.Add(1)
+		go func(readerSeed int64) {
+			defer wg.Done()
+			readerRandom := rand.New(rand.NewSource(readerSeed))
+			for ctx.Err() == nil {
+				key := keys[readerRandom.Intn(len(keys))]
+				minSequence := model.completed()
+				gotValue, gotExists, getErr := store.Get(tableName, key)
+				if getErr != nil {
+					abort(fmt.Errorf("Get(%q): %w", key, getErr))
+					return
+				}
+				if checkErr := model.checkGet(key, minSequence, gotExists, gotValue); checkErr != nil {
+					abort(checkErr)
+					return
+				}
+				if !checkHealthy("reader") {
+					return
+				}
+				totalCompleted.Add(1)
+			}
+		}(seed + int64(readerIndex) + 1)
+	}
+
+	// Concurrent List callers.
+	for listerIndex := 0; listerIndex < numListers; listerIndex++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				minSequence := model.completed()
+				items, listErr := store.List(tableName)
+				if listErr != nil {
+					abort(fmt.Errorf("List: %w", listErr))
+					return
+				}
+				if checkErr := model.checkList(keys, minSequence, items); checkErr != nil {
+					abort(checkErr)
+					return
+				}
+				if !checkHealthy("List caller") {
+					return
+				}
+				totalCompleted.Add(1)
+			}
+		}()
+	}
+
+	// Concurrent checkpointer.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for ctx.Err() == nil {
+			if checkpointErr := store.Checkpoint(); checkpointErr != nil {
+				abort(fmt.Errorf("Checkpoint: %w", checkpointErr))
+				return
+			}
+			if !checkHealthy("checkpointer") {
+				return
+			}
+			totalCompleted.Add(1)
+			runtime.Gosched()
+		}
+	}()
+
+	workersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(workersDone)
+	}()
+
+	// Watchdog fails the test with a goroutine dump when no operation completes or the writer stalls.
+	ticker := time.NewTicker(min(max(stallTimeout/5, 10*time.Millisecond), 100*time.Millisecond))
+	defer ticker.Stop()
+
+	lastTotal, lastWriter := int64(0), int64(0)
+	lastTotalTime := time.Now()
+	lastWriterTime := lastTotalTime
+	var watchdogErr error
+
+watchdogLoop:
+	for {
+		select {
+		case <-workersDone:
+			break watchdogLoop
+		case now := <-ticker.C:
+			total := totalCompleted.Load()
+			if total != lastTotal {
+				lastTotal, lastTotalTime = total, now
+			} else if now.Sub(lastTotalTime) >= stallTimeout {
+				watchdogErr = fmt.Errorf("watchdog: no operation completed for %s (total=%d)\n\ngoroutine dump:\n%s",
+					stallTimeout, total, captureGoroutineDump())
+				break watchdogLoop
+			}
+			writes := writerCompleted.Load()
+			if writes != lastWriter {
+				lastWriter, lastWriterTime = writes, now
+			} else if !writerFinished.Load() && now.Sub(lastWriterTime) >= stallTimeout {
+				watchdogErr = fmt.Errorf("watchdog: writer completed no operation for %s (writes=%d, total=%d)\n\ngoroutine dump:\n%s",
+					stallTimeout, writes, total, captureGoroutineDump())
+				break watchdogLoop
+			}
+		}
+	}
+
+	if watchdogErr != nil {
+		abort(watchdogErr)
+		releaseHook()
+		grace := 200 * time.Millisecond
+		if beforeWorkers != nil {
+			grace = 2 * time.Second
+		}
+		select {
+		case <-workersDone:
+		case <-time.After(grace):
+			abandoned = true
+		}
+		failed = true
+		failRun(watchdogErr)
+	}
+
+	select {
+	case recordedErr := <-firstErr:
+		failed = true
+		failRun(recordedErr)
+	default:
+	}
+	if violations := faultFS.Violations(); len(violations) > 0 {
+		failed = true
+		failRun(violations[0])
+	}
+	if !checkHealthy("final check") {
+		failed = true
+		failRun(<-firstErr)
+	}
+}
+
+func TestConcurrentTorture(t *testing.T) {
+	seeds := []int64{0, 1, 2, 3}
+	if os.Getenv("DISKSTORE_TORTURE_SEED") != "" || os.Getenv("DISKSTORE_TORTURE_SEEDS") != "" {
+		seeds = tortureSeeds(t)
+	} else if !testing.Short() {
+		seeds = []int64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+	}
+	for _, seed := range seeds {
+		seed := seed
+		t.Run(fmt.Sprintf("seed_%d", seed), func(t *testing.T) {
+			runConcurrentTorture(t, seed, 200, 3*time.Second, nil)
+		})
+	}
+}
+
+func TestConcurrentTorture_WatchdogFires(t *testing.T) {
+	holdBlockPoolLock := func(store *Engine) func() {
+		store.bp.mu.Lock()
+		return store.bp.mu.Unlock
+	}
+
+	recorder := &recordingTB{TB: t}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runConcurrentTorture(recorder, 7, 50, 100*time.Millisecond, holdBlockPoolLock)
+	}()
+	wg.Wait()
+
+	if !recorder.failed {
+		t.Fatalf("expected watchdog to fail concurrent torture run when lock is held")
+	}
+	for _, want := range []string{"watchdog:", "goroutine ", "DISKSTORE_TORTURE_SEED=7"} {
+		if !strings.Contains(recorder.message, want) {
+			t.Fatalf("expected failure message to contain %q, got:\n%s", want, recorder.message)
+		}
 	}
 }
