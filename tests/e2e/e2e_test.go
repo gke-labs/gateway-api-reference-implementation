@@ -28,8 +28,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/gke-labs/gateway-api-reference-implementation/spiffe"
 )
 
 func TestGatewayAPI(t *testing.T) {
