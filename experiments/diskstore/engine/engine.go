@@ -1997,7 +1997,7 @@ func (s *Engine) Get(tableName, key string) ([]byte, bool, error) {
 		if matched {
 			return val, true, nil
 		}
-		if err != nil && s.isFailed() {
+		if err != nil && (s.isFailed() || errors.Is(err, ErrNotDurable)) {
 			return nil, false, err
 		}
 
@@ -2041,7 +2041,7 @@ func (s *Engine) getLocked(tableName, key string) ([]byte, bool, error) {
 
 	val, matched, err := s.readIndexEntry(key, qKey, entry)
 	if err != nil {
-		if errors.Is(err, ErrCorruptStore) {
+		if errors.Is(err, ErrCorruptStore) || errors.Is(err, ErrNotDurable) {
 			return nil, false, err
 		}
 		s.setFailed(err)

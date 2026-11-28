@@ -266,6 +266,61 @@ func TestExternalLog_WriteAheadRule(t *testing.T) {
 		}
 	})
 
+	t.Run("Get returns transient ErrNotDurable on read-triggered eviction without failing the engine", func(t *testing.T) {
+		memFS := NewMemFS()
+		faultFS := NewFaultFS(memFS)
+		var watermark atomic.Uint64
+		watermark.Store(1)
+		faultFS.SetMaxFsyncedLSN(1)
+
+		store := openExternalStore(
+			t,
+			faultFS,
+			"wal_rule_get_evict",
+			ExternalLogConfig{DurableLSN: watermark.Load},
+			WithCreate(),
+			WithNumPoolBlocks(16),
+			WithCompressionCodec(CodecNone),
+		)
+		defer closeStore(t, store)
+
+		// Put k0 (LSN 1) and flush/evict it to disk so reading k0 later must pin from disk.
+		firstValue := bytes.Repeat([]byte("first-"), 1000) // 6 KiB -> 2-block multi-block page
+		if err := store.ApplyPut("t", "k0", firstValue, 1); err != nil {
+			t.Fatalf("ApplyPut(k0) failed: %v", err)
+		}
+		if err := store.Checkpoint(); err != nil {
+			t.Fatalf("Checkpoint(1) failed: %v", err)
+		}
+
+		// Fill all 16 pool blocks with dirty pages whose LSN exceeds the watermark (1),
+		// evicting the clean page for k0 along the way.
+		pagePayload := bytes.Repeat([]byte("dirty-"), 1000) // 6 KiB -> 2 blocks each
+		for index := uint64(2); index <= 9; index++ {
+			key := "dirty-" + string(rune('a'+index))
+			if err := store.ApplyPut("t", key, pagePayload, index); err != nil {
+				t.Fatalf("ApplyPut(%s) failed: %v", key, err)
+			}
+		}
+
+		// Reading evicted k0 must evict a dirty page (LSN > 1), which returns ErrNotDurable
+		// without permanently failing the engine.
+		if _, _, err := store.Get("t", "k0"); !errors.Is(err, ErrNotDurable) {
+			t.Fatalf("expected ErrNotDurable from Get on evicted page while watermark lags, got: %v", err)
+		}
+		if violations := faultFS.Violations(); len(violations) > 0 {
+			t.Fatalf("unexpected FaultFS rule violations: %v", violations)
+		}
+
+		// Advancing the watermark lets Get succeed on the same engine instance.
+		watermark.Store(9)
+		faultFS.SetMaxFsyncedLSN(9)
+		gotValue, exists, err := store.Get("t", "k0")
+		if err != nil || !exists || !bytes.Equal(gotValue, firstValue) {
+			t.Fatalf("expected Get(k0) to succeed after advancing watermark, got exists=%v err=%v", exists, err)
+		}
+	})
+
 	t.Run("metadata-only checkpoint checks watermark and succeeds once watermark advances", func(t *testing.T) {
 		memFS := NewMemFS()
 		var watermark atomic.Uint64
