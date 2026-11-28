@@ -89,6 +89,11 @@ func TestExtractHostnames(t *testing.T) {
 								Hostname: &hostHTTP,
 							},
 							{
+								Name:     "http-no-host",
+								Protocol: gatewayv1.HTTPProtocolType,
+								Hostname: nil,
+							},
+							{
 								Name:     "tcp-listener",
 								Protocol: gatewayv1.TCPProtocolType,
 							},
@@ -117,6 +122,11 @@ func TestExtractHostnames(t *testing.T) {
 								Protocol: gatewayv1.HTTPSProtocolType,
 								Hostname: &host1,
 							},
+							{
+								Name:     "http-listener",
+								Protocol: gatewayv1.HTTPProtocolType,
+								Hostname: &hostHTTP,
+							},
 						},
 					},
 				},
@@ -125,6 +135,7 @@ func TestExtractHostnames(t *testing.T) {
 				"*.example.com",
 				"api.example.org",
 				"app.example.com",
+				"http.example.com",
 				"tls.example.com",
 			},
 		},
