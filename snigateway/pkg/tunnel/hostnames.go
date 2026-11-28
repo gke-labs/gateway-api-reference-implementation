@@ -22,7 +22,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
-// ExtractHostnames extracts the set of unique SNI hostnames from all HTTPS and TLS listeners
+// ExtractHostnames extracts the set of unique SNI hostnames from all HTTPS, TLS, and HTTP listeners
 // across the provided Gateways. Listeners without hostnames cannot be routed by SNI and are skipped.
 func ExtractHostnames(gateways []*gatewayv1.Gateway) []string {
 	seen := make(map[string]bool)
@@ -35,7 +35,8 @@ func ExtractHostnames(gateways []*gatewayv1.Gateway) []string {
 		for _, l := range gw.Spec.Listeners {
 			proto := string(l.Protocol)
 			if !strings.EqualFold(proto, string(gatewayv1.HTTPSProtocolType)) &&
-				!strings.EqualFold(proto, string(gatewayv1.TLSProtocolType)) {
+				!strings.EqualFold(proto, string(gatewayv1.TLSProtocolType)) &&
+				!strings.EqualFold(proto, string(gatewayv1.HTTPProtocolType)) {
 				continue
 			}
 

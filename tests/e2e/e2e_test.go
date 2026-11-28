@@ -584,6 +584,50 @@ spec:
 	if !hasInternalAPIAddress {
 		t.Errorf("Expected data-plane container to have --internal-api-address flag, args: %v", container.Args)
 	}
+
+	// 12. Verify Gateway with only an HTTP listener and its own hostname routes through the frontend
+	host, gw, route, pod := "http-only.example.com", "http-only-gw", "http-only-route", "test-client-http-only"
+
+	defer func() {
+		h.DeletePod(pod)
+		h.RunCmd("kubectl", "delete", "httproute", route, "--namespace=default", "--ignore-not-found")
+		h.RunCmd("kubectl", "delete", "gateway", gw, "--namespace=default", "--ignore-not-found")
+	}()
+
+	h.KubectlApplyContent(fmt.Sprintf(`
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: %s
+  namespace: default
+spec:
+  gatewayClassName: reference-class
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    hostname: %s
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: %s
+  namespace: default
+spec:
+  parentRefs:
+  - name: %s
+  rules:
+  - backendRefs:
+    - name: backend
+      port: 8080
+`, gw, host, route, gw))
+
+	addr, _ := h.WaitForGatewayAddress(gw, "default", 1*time.Minute)
+	h.KubectlApplyContent(h.ClientManifestWithArgs(pod, fmt.Sprintf("http://%s", addr), host))
+	h.WaitForPodSuccess(pod, 1*time.Minute)
+	if logs := h.GetPodLogs(pod); !strings.Contains(logs, "Status: 200 OK") {
+		t.Errorf("expected 200 OK for HTTP-only Gateway %s, got: %s", host, logs)
+	}
 }
 
 func runCmdAllowError(h *Harness, name string, args ...string) string {
