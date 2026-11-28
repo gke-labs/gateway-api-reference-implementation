@@ -126,11 +126,12 @@ metadata:
   name: gari-credentials
   namespace: default
 rules:
-# Read verbs are restricted by resourceNames to the SPIFFE authority and SVID Secrets.
+# Read and update verbs are restricted by resourceNames. The Job reads the authority Secret
+# without update permission and reads or updates the controller SVID Secret for renewal.
 # Kubernetes RBAC cannot limit 'create' operations by resource name because the resource name
 # is assigned upon creation. Therefore, the create rule permits creating any Secret in this
-# namespace beyond these names, while read access remains restricted to
-# gari-spiffe-authority and gari-controller-svid.
+# namespace beyond these names, while read and update access remains restricted to
+# gari-spiffe-authority (get only) and gari-controller-svid (get and update).
 # Note on authority key access: only the Job is intended to read the authority private key Secret
 # (gari-spiffe-authority). However, the controller's ClusterRole above currently grants
 # get/list/watch on all Secrets cluster-wide, meaning the controller technically has read access
@@ -139,8 +140,12 @@ rules:
   resources: ["secrets"]
   resourceNames:
   - "gari-spiffe-authority"
-  - "gari-controller-svid"
   verbs: ["get"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames:
+  - "gari-controller-svid"
+  verbs: ["get", "update"]
 - apiGroups: [""]
   resources: ["secrets"]
   verbs: ["create"]
@@ -203,6 +208,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        args:
+        - --identity=namespace=$(POD_NAMESPACE),service-account=gari-controller
 ---
 apiVersion: v1
 kind: Service

@@ -72,7 +72,13 @@ func getConditionFromStatus(status *gatewayv1.GatewayStatus, condType string) *m
 }
 
 func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nodeName, ip string, extraConditions []corev1.PodCondition) *corev1.Pod {
-	if err := spiffe.EnsureCredentials(t.Context(), c, "default"); err != nil {
+	if err := spiffe.EnsureCredentials(t.Context(), c, spiffe.Options{
+		AuthorityNamespace: "default",
+		Identities: []spiffe.Identity{{
+			Namespace:      "default",
+			ServiceAccount: spiffe.ControllerServiceAccountName,
+		}},
+	}); err != nil {
 		t.Fatalf("ensuring credentials: %v", err)
 	}
 
@@ -1396,7 +1402,13 @@ func TestGateway_PeriodicResyncPrunesOrphanedEndpoints(t *testing.T) {
 		},
 	})
 
-	if err := spiffe.EnsureCredentials(t.Context(), env.Client, "default"); err != nil {
+	if err := spiffe.EnsureCredentials(t.Context(), env.Client, spiffe.Options{
+		AuthorityNamespace: "default",
+		Identities: []spiffe.Identity{{
+			Namespace:      "default",
+			ServiceAccount: spiffe.ControllerServiceAccountName,
+		}},
+	}); err != nil {
 		t.Fatalf("ensuring credentials: %v", err)
 	}
 
@@ -1912,7 +1924,13 @@ func TestGateway_DeleteDetachesEndpoints_EnvTest(t *testing.T) {
 		},
 	})
 
-	if err := spiffe.EnsureCredentials(t.Context(), env.Client, "default"); err != nil {
+	if err := spiffe.EnsureCredentials(t.Context(), env.Client, spiffe.Options{
+		AuthorityNamespace: "default",
+		Identities: []spiffe.Identity{{
+			Namespace:      "default",
+			ServiceAccount: spiffe.ControllerServiceAccountName,
+		}},
+	}); err != nil {
 		t.Fatalf("ensuring credentials: %v", err)
 	}
 

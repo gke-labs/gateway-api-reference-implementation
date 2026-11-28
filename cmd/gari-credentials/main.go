@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 
@@ -30,25 +31,44 @@ import (
 
 func main() {
 	ctx := ctrl.SetupSignalHandler()
-	if err := run(ctx); err != nil {
+	if err := run(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context) error {
-	namespace := os.Getenv("POD_NAMESPACE")
+func parseFlags(args []string) (spiffe.Options, error) {
+	options := spiffe.DefaultOptions()
+	flagSet := flag.NewFlagSet("gari-credentials", flag.ContinueOnError)
+	spiffe.BindFlags(flagSet, &options)
+	if err := flagSet.Parse(args); err != nil {
+		return spiffe.Options{}, err
+	}
+	if flagSet.NArg() > 0 {
+		return spiffe.Options{}, fmt.Errorf("unexpected positional arguments: %v", flagSet.Args())
+	}
+	if options.AuthorityNamespace == "" {
+		return spiffe.Options{}, errors.New("--authority-namespace flag or POD_NAMESPACE environment variable is required")
+	}
+	if len(options.Identities) == 0 {
+		return spiffe.Options{}, errors.New("at least one --identity flag is required")
+	}
+	return options, nil
+}
+
+func run(ctx context.Context, args []string) error {
+	options, err := parseFlags(args)
+	if err != nil {
+		return err
+	}
 	restConfig, err := ctrl.GetConfig()
 	if err != nil {
 		return fmt.Errorf("getting kubeconfig for credentials: %w", err)
 	}
-	return runWithConfig(ctx, restConfig, namespace)
+	return runWithConfig(ctx, restConfig, options)
 }
 
-func runWithConfig(ctx context.Context, restConfig *rest.Config, namespace string) error {
-	if namespace == "" {
-		return errors.New("POD_NAMESPACE environment variable is required")
-	}
+func runWithConfig(ctx context.Context, restConfig *rest.Config, options spiffe.Options) error {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		return fmt.Errorf("adding corev1 to scheme: %w", err)
@@ -57,5 +77,5 @@ func runWithConfig(ctx context.Context, restConfig *rest.Config, namespace strin
 	if err != nil {
 		return fmt.Errorf("creating client for credentials: %w", err)
 	}
-	return spiffe.EnsureCredentials(ctx, kubeClient, namespace)
+	return spiffe.EnsureCredentials(ctx, kubeClient, options)
 }

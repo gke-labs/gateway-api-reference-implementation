@@ -563,7 +563,14 @@ func assertProductionDeployment(t *testing.T, deploy *appsv1.Deployment, expecte
 
 func createBundleConfigMap(t *testing.T, c client.Client) {
 	t.Helper()
-	if err := spiffe.EnsureCredentials(t.Context(), c, "default"); err != nil {
+	err := spiffe.EnsureCredentials(t.Context(), c, spiffe.Options{
+		AuthorityNamespace: "default",
+		Identities: []spiffe.Identity{{
+			Namespace:      "default",
+			ServiceAccount: spiffe.ControllerServiceAccountName,
+		}},
+	})
+	if err != nil {
 		t.Fatalf("creating bundle ConfigMap: %v", err)
 	}
 }
