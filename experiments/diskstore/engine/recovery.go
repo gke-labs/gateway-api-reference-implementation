@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -61,6 +62,7 @@ type RecoveryResult struct {
 	// each older page at the first record whose LSN is above the older page's LSN.
 	SupersededPages map[string][]KeyIndexEntry
 	MaxLSN          uint64
+	MaxHeapLSN      uint64
 	NextLogicalPage uint64
 	RedoStartLSN    uint64
 	// RedoStartPosition records the segment and byte offset of the first WAL record
@@ -226,30 +228,38 @@ type RecoveryOptions struct {
 	// RecoveryStartLSN is the start LSN for recovery read from meta.db.
 	// When non-zero, recovery replays the log starting from this LSN.
 	RecoveryStartLSN uint64
+	// ExternalLog skips fsyncing and scanning local .wal files during recovery.
+	ExternalLog bool
 }
 
 // Recover scans the heap file, filters out foreign and torn copies, finds the WAL redo start LSN,
 // and rebuilds the in-memory indexes and allocator state.
 func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte, options RecoveryOptions) (*RecoveryResult, error) {
-	// Item 10: Fsync every existing WAL segment and walDir before trusting them
-	entries, err := fs.ReadDir(walDir)
-	if err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".wal") {
-				segPath := filepath.Join(walDir, entry.Name())
-				f, openErr := fs.Open(segPath)
-				if openErr != nil {
-					return nil, fmt.Errorf("failed to open WAL segment %s for fsync: %w", entry.Name(), openErr)
-				}
-				syncErr := f.Sync()
-				closeErr := f.Close()
-				if err := errors.Join(syncErr, closeErr); err != nil {
-					return nil, fmt.Errorf("failed to fsync WAL segment %s: %w", entry.Name(), err)
+	if !options.ExternalLog {
+		// Item 10: Fsync every existing WAL segment and walDir before trusting them
+		entries, err := fs.ReadDir(walDir)
+		if err != nil {
+			if !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("failed to read WAL directory: %w", err)
+			}
+		} else {
+			for _, entry := range entries {
+				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".wal") {
+					segPath := filepath.Join(walDir, entry.Name())
+					f, openErr := fs.Open(segPath)
+					if openErr != nil {
+						return nil, fmt.Errorf("failed to open WAL segment %s for fsync: %w", entry.Name(), openErr)
+					}
+					syncErr := f.Sync()
+					closeErr := f.Close()
+					if err := errors.Join(syncErr, closeErr); err != nil {
+						return nil, fmt.Errorf("failed to fsync WAL segment %s: %w", entry.Name(), err)
+					}
 				}
 			}
-		}
-		if err := fs.SyncDir(walDir); err != nil {
-			return nil, fmt.Errorf("failed to fsync WAL directory: %w", err)
+			if err := fs.SyncDir(walDir); err != nil {
+				return nil, fmt.Errorf("failed to fsync WAL directory: %w", err)
+			}
 		}
 	}
 
@@ -540,38 +550,40 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 	var maxWAL_LSN uint64
 	var redoStartPosition *LogPosition
 
-	walScanIterator, err := NewWALIterator(fs, walDir, dbID, 1, WALIteratorOptions{
-		EncryptionKey: options.EncryptionKey,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create WAL scan iterator: %w", err)
-	}
-	for {
-		rec, err := walScanIterator.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
+	if !options.ExternalLog {
+		walScanIterator, err := NewWALIterator(fs, walDir, dbID, 1, WALIteratorOptions{
+			EncryptionKey: options.EncryptionKey,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("error during WAL scan: %w", err)
+			return nil, fmt.Errorf("failed to create WAL scan iterator: %w", err)
 		}
-		if redoStartPosition == nil && rec.LSN >= redoStartLSN {
-			position := walScanIterator.lastRecordPosition
-			redoStartPosition = &position
+		for {
+			rec, err := walScanIterator.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("error during WAL scan: %w", err)
+			}
+			if redoStartPosition == nil && rec.LSN >= redoStartLSN {
+				position := walScanIterator.lastRecordPosition
+				redoStartPosition = &position
+			}
+			if rec.LSN > maxWAL_LSN {
+				maxWAL_LSN = rec.LSN
+			}
 		}
-		if rec.LSN > maxWAL_LSN {
-			maxWAL_LSN = rec.LSN
+		if closeErr := walScanIterator.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to close WAL scan iterator: %w", closeErr)
 		}
-	}
-	if closeErr := walScanIterator.Close(); closeErr != nil {
-		return nil, fmt.Errorf("failed to close WAL scan iterator: %w", closeErr)
-	}
 
-	// Under the write-ahead rule, a heap page with LSN L can only be on disk
-	// if the WAL was fsynced through L. If WAL replay ends below the highest
-	// page LSN found in the heap, records that the engine acknowledged are
-	// missing, which indicates provable corruption rather than an unacknowledged torn tail.
-	if maxWAL_LSN < maxHeapLSN {
-		return nil, fmt.Errorf("%w: WAL replay ended at LSN %d below highest heap page LSN %d", ErrCorruptWAL, maxWAL_LSN, maxHeapLSN)
+		// Under the write-ahead rule, a heap page with LSN L can only be on disk
+		// if the WAL was fsynced through L. If WAL replay ends below the highest
+		// page LSN found in the heap, records that the engine acknowledged are
+		// missing, which indicates provable corruption rather than an unacknowledged torn tail.
+		if maxWAL_LSN < maxHeapLSN {
+			return nil, fmt.Errorf("%w: WAL replay ended at LSN %d below highest heap page LSN %d", ErrCorruptWAL, maxWAL_LSN, maxHeapLSN)
+		}
 	}
 
 	return &RecoveryResult{
@@ -582,6 +594,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		EmptyLogicalPages: emptyPages,
 		SupersededPages:   supersededPages,
 		MaxLSN:            maxWAL_LSN,
+		MaxHeapLSN:        maxHeapLSN,
 		NextLogicalPage:   maxRecoveredLogicalPage + 1,
 		RedoStartLSN:      redoStartLSN,
 		RedoStartPosition: redoStartPosition,
@@ -694,4 +707,82 @@ func (s *Engine) replayWAL(redoStartLSN uint64, redoStartPosition *LogPosition, 
 		return fmt.Errorf("failed to create WAL redo iterator: %w", err)
 	}
 	return s.replay(walRedoIterator, superseded)
+}
+
+// ExternalRecord represents a logical mutation yielded by an external log during recovery replay.
+type ExternalRecord struct {
+	Type    RecordType
+	LSN     uint64
+	Table   string
+	Key     string
+	Payload []byte
+}
+
+// ExternalLogIterator reads logical mutations forward in strictly increasing LSN order.
+type ExternalLogIterator interface {
+	io.Closer
+	Next() (ExternalRecord, error)
+}
+
+type externalReplayIterator struct {
+	engine  *Engine
+	inner   ExternalLogIterator
+	lastLSN uint64
+}
+
+func (it *externalReplayIterator) Next() (Record, error) {
+	externalRecord, err := it.inner.Next()
+	if err != nil {
+		return Record{}, err
+	}
+	if externalRecord.LSN == 0 || externalRecord.LSN <= it.lastLSN {
+		return Record{}, fmt.Errorf("%w: got %d, previous %d", ErrNonMonotonicLSN, externalRecord.LSN, it.lastLSN)
+	}
+	it.lastLSN = externalRecord.LSN
+	qualifiedKey := qualifyKey(externalRecord.Table, externalRecord.Key)
+
+	switch externalRecord.Type {
+	case RecordTypeDelete:
+		return Record{Type: RecordTypeDelete, LSN: externalRecord.LSN, Key: qualifiedKey}, nil
+	case RecordTypePut:
+		if len(qualifiedKey) > 65535 {
+			return Record{}, ErrObjectOversize
+		}
+		stored, err := it.engine.compress(externalRecord.Payload)
+		if err != nil {
+			return Record{}, err
+		}
+		if fitsInMultiBlockPage(len(qualifiedKey), len(stored)) {
+			return Record{Type: RecordTypePut, LSN: externalRecord.LSN, Key: qualifiedKey, Payload: stored}, nil
+		}
+		it.engine.keyMu.RLock()
+		existing, inIndex := it.engine.keyIndex[qualifiedKey]
+		it.engine.keyMu.RUnlock()
+		if inIndex {
+			if pageLSN, ok := it.engine.bp.PageLSN(existing.LogicalPage); ok && pageLSN >= externalRecord.LSN {
+				return Record{Type: RecordTypePutPointer, LSN: externalRecord.LSN, Key: qualifiedKey}, nil
+			}
+		}
+		pointerPayload, fileName, err := it.engine.writeOversizePointer(qualifiedKey, stored)
+		if err != nil {
+			return Record{}, err
+		}
+		it.engine.unregisterInFlight(fileName)
+		return Record{Type: RecordTypePutPointer, LSN: externalRecord.LSN, Key: qualifiedKey, Payload: pointerPayload}, nil
+	default:
+		return Record{}, fmt.Errorf("%w: unsupported external record type %d", ErrCorruptRecord, externalRecord.Type)
+	}
+}
+
+func (it *externalReplayIterator) Close() error {
+	return it.inner.Close()
+}
+
+// replayExternal adapts an ExternalLogIterator into a LogIterator and replays it through replay.
+func (s *Engine) replayExternal(iterator ExternalLogIterator, superseded map[string][]KeyIndexEntry) (uint64, error) {
+	adapted := &externalReplayIterator{engine: s, inner: iterator}
+	if err := s.replay(adapted, superseded); err != nil {
+		return 0, err
+	}
+	return adapted.lastLSN, nil
 }

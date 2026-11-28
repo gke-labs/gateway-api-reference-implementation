@@ -150,10 +150,12 @@ type blockRun struct {
 // and write-ahead rule enforcement.
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
 type BlockPool struct {
-	file     File
-	wal      Log
-	buddy    *BuddyAllocator
-	directIO DirectIO
+	file        File
+	wal         Log
+	waitDurable func(lsn uint64) error
+	maxLSN      func() uint64
+	buddy       *BuddyAllocator
+	directIO    DirectIO
 	// heapCipher is the AES-256-XTS cipher used for heap block encryption.
 	// A nil cipher means the store is not encrypted.
 	heapCipher *xts.Cipher
@@ -214,6 +216,10 @@ type BlockPoolOptions struct {
 	// A nil cipher means the store is not encrypted.
 	HeapCipher *xts.Cipher
 	OnFailure  func(error)
+	// WaitDurable enforces the write-ahead rule before flushing dirty pages when wal is nil.
+	WaitDurable func(lsn uint64) error
+	// MaxLSN returns the highest LSN applied to the engine when wal is nil.
+	MaxLSN func() uint64
 }
 
 // NewBlockPool initializes a fixed-size block pool backed by a single pointer-free byte arena.
@@ -241,6 +247,8 @@ func NewBlockPool(file File, wal Log, buddy *BuddyAllocator, dbID [16]byte, opti
 	bp := &BlockPool{
 		file:                 file,
 		wal:                  wal,
+		waitDurable:          options.WaitDurable,
+		maxLSN:               options.MaxLSN,
 		buddy:                buddy,
 		directIO:             NewDirectIO(),
 		heapCipher:           options.HeapCipher,
@@ -808,10 +816,14 @@ func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 		desc.Mu.Unlock()
 	}
 
-	// Sync WAL once per batch through maxLSN
+	// Enforce the write-ahead rule once per batch through maxLSN.
 	var syncErr error
-	if bp.wal != nil && maxLSN > 0 {
-		syncErr = bp.wal.SyncThrough(maxLSN)
+	if maxLSN > 0 {
+		if bp.waitDurable != nil {
+			syncErr = bp.waitDurable(maxLSN)
+		} else if bp.wal != nil {
+			syncErr = bp.wal.SyncThrough(maxLSN)
+		}
 	}
 
 	// Single direct I/O write for the entire contiguous block run
@@ -1001,7 +1013,9 @@ func (bp *BlockPool) DirtyPageTableAndLSN() (map[uint64]uint64, uint64) {
 		}
 	}
 	maxLSN := uint64(0)
-	if bp.wal != nil {
+	if bp.maxLSN != nil {
+		maxLSN = bp.maxLSN()
+	} else if bp.wal != nil {
 		maxLSN = bp.wal.MaxLSN()
 	}
 	return dpt, maxLSN
