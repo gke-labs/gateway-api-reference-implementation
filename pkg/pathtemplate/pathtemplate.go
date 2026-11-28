@@ -89,7 +89,7 @@ func parseSegment(raw string, variables map[string]struct{}) (segment, error) {
 		return segment{kind: segmentLiteral, value: raw}, nil
 	}
 	name, expression, hasEquals := strings.Cut(raw[1:len(raw)-1], "=")
-	if !validDotted(name, '_', false) {
+	if !validVariableName(name) {
 		return segment{}, fmt.Errorf("invalid variable %q", raw)
 	}
 	if _, exists := variables[name]; exists {
@@ -159,26 +159,42 @@ func (t *Template) CompareSpecificity(other *Template) int {
 	return 0
 }
 
-// QueryMode controls how a redirect handles incoming query parameters.
+// QueryMode controls how a redirect combines incoming query parameters with Target.Query.
+// An empty QueryMode defaults to QueryReplace when Target.Query is non-empty and
+// QueryPreserve otherwise.
 type QueryMode string
 
 const (
+	// QueryPreserve emits the incoming query when non-empty, and otherwise emits Target.Query.
 	QueryPreserve QueryMode = "preserve"
-	QueryAppend   QueryMode = "append"
-	QueryReplace  QueryMode = "replace"
-	QueryDrop     QueryMode = "drop"
+	// QueryAppend emits Target.Query followed by the incoming query, joined with "&" when both are non-empty.
+	QueryAppend QueryMode = "append"
+	// QueryReplace emits only Target.Query and discards the incoming query.
+	QueryReplace QueryMode = "replace"
+	// QueryDrop removes all query parameters from the redirect, ignoring both the incoming query and Target.Query.
+	QueryDrop QueryMode = "drop"
 )
 
 // Target describes a structured redirect destination.
 //
-// Invariant: NewMatcher validates Scheme and Hostname as static values and never
-// expands captures into them, preventing open redirects.
+// Invariants:
+//   - NewMatcher validates Scheme and Hostname as static values and never expands captures into them, preventing open redirects.
+//   - Scheme and Hostname must both be set or both be empty.
+//   - When Scheme and Hostname are empty, Path must be non-empty and must not expand to a protocol-relative path starting with "//".
 type Target struct {
-	Scheme    string
-	Hostname  string
-	Path      string
-	Query     string
-	Fragment  string
+	// Scheme is the static redirect scheme, either "http" or "https". It must be paired with Hostname.
+	Scheme string
+	// Hostname is the static redirect host without a scheme, port, or path. It must be paired with Scheme.
+	Hostname string
+	// Path is the target path template. When non-empty, it must start with a single "/" and must not contain "?" or "#".
+	Path string
+	// Query is the target query template without a leading "?" or any "#".
+	// Literal percent-encoded sequences stay intact while expanded captures are query-escaped.
+	Query string
+	// Fragment is the target fragment template without "#".
+	Fragment string
+	// QueryMode selects how incoming query parameters combine with Query.
+	// When empty, it defaults to QueryReplace if Query is non-empty and QueryPreserve otherwise.
 	QueryMode QueryMode
 }
 
@@ -194,9 +210,11 @@ type targetPart struct {
 }
 
 type compiledRule struct {
-	template *Template
-	target   Target
-	parts    [3][]targetPart // path, query, fragment
+	template      *Template
+	target        Target
+	pathParts     []targetPart
+	queryParts    []targetPart
+	fragmentParts []targetPart
 }
 
 // Matcher evaluates compiled redirect rules in specificity order, breaking ties
@@ -229,8 +247,11 @@ func compileRule(rule Rule) (compiledRule, error) {
 	target := rule.Target
 	if (target.Scheme == "") != (target.Hostname == "") ||
 		(target.Scheme != "" && target.Scheme != "http" && target.Scheme != "https") ||
-		(target.Hostname != "" && !validDotted(target.Hostname, '-', true)) {
+		(target.Hostname != "" && !validHostname(target.Hostname)) {
 		return compiledRule{}, fmt.Errorf("invalid target scheme %q or hostname %q", target.Scheme, target.Hostname)
+	}
+	if target.Scheme == "" && target.Path == "" {
+		return compiledRule{}, fmt.Errorf("target must specify scheme and hostname or path")
 	}
 	if target.Path != "" && (target.Path[0] != '/' || strings.HasPrefix(target.Path, "//") || strings.ContainsAny(target.Path, "?#")) {
 		return compiledRule{}, fmt.Errorf("invalid target path %q", target.Path)
@@ -248,18 +269,33 @@ func compileRule(rule Rule) (compiledRule, error) {
 	default:
 		return compiledRule{}, fmt.Errorf("invalid query mode %q", target.QueryMode)
 	}
-	var parsed [3][]targetPart
-	for i, raw := range [3]string{target.Path, target.Query, target.Fragment} {
-		parts, err := parseTarget(raw, template.variables)
-		if err != nil {
-			return compiledRule{}, fmt.Errorf("invalid target %q: %w", raw, err)
-		}
-		parsed[i] = parts
+	pathParts, err := parseTarget(target.Path, template.variables)
+	if err != nil {
+		return compiledRule{}, fmt.Errorf("invalid target path %q: %w", target.Path, err)
 	}
-	return compiledRule{template: template, target: target, parts: parsed}, nil
+	if target.Scheme == "" && canExpandProtocolRelative(pathParts, template.multiVariable()) {
+		return compiledRule{}, fmt.Errorf("relative target path %q can expand to a protocol-relative URL", target.Path)
+	}
+	queryParts, err := parseTarget(target.Query, template.variables)
+	if err != nil {
+		return compiledRule{}, fmt.Errorf("invalid target query %q: %w", target.Query, err)
+	}
+	fragmentParts, err := parseTarget(target.Fragment, template.variables)
+	if err != nil {
+		return compiledRule{}, fmt.Errorf("invalid target fragment %q: %w", target.Fragment, err)
+	}
+	return compiledRule{
+		template:      template,
+		target:        target,
+		pathParts:     pathParts,
+		queryParts:    queryParts,
+		fragmentParts: fragmentParts,
+	}, nil
 }
 
 // Match returns the expanded redirect URL from the most specific matching rule.
+// Match expects incomingQuery to be a raw percent-encoded query string without
+// a leading "?", such as http.Request.URL.RawQuery.
 // Match escapes captures with path escaping in path and fragment components and
 // with query escaping in query components, while preserving literal percent-encoding
 // in target templates and emitting query parameters before any fragment.
@@ -273,18 +309,39 @@ func (m *Matcher) Match(requestPath, incomingQuery string) (string, bool) {
 		if rule.target.Scheme != "" {
 			builder.WriteString(rule.target.Scheme + "://" + rule.target.Hostname)
 		}
-		builder.WriteString(expandParts(rule.parts[0], captures, escapePath))
-		if query := combineQuery(rule.target.QueryMode, expandParts(rule.parts[1], captures, url.QueryEscape), incomingQuery); query != "" {
+		builder.WriteString(expandParts(rule.pathParts, captures, escapePath))
+		if query := combineQuery(rule.target.QueryMode, expandParts(rule.queryParts, captures, url.QueryEscape), incomingQuery); query != "" {
 			builder.WriteByte('?')
 			builder.WriteString(query)
 		}
-		if fragment := expandParts(rule.parts[2], captures, escapePath); fragment != "" {
+		if fragment := expandParts(rule.fragmentParts, captures, escapePath); fragment != "" {
 			builder.WriteByte('#')
 			builder.WriteString(fragment)
 		}
 		return builder.String(), true
 	}
 	return "", false
+}
+
+func (t *Template) multiVariable() string {
+	if len(t.segments) > 0 && t.segments[len(t.segments)-1].kind == segmentMulti {
+		return t.segments[len(t.segments)-1].value
+	}
+	return ""
+}
+
+func canExpandProtocolRelative(parts []targetPart, multiVariable string) bool {
+	if multiVariable == "" {
+		return false
+	}
+	var expanded strings.Builder
+	for _, part := range parts {
+		expanded.WriteString(part.literal)
+		if part.variable != "" && part.variable != multiVariable {
+			expanded.WriteByte('x')
+		}
+	}
+	return strings.HasPrefix(expanded.String(), "//")
 }
 
 func parseTarget(raw string, variables map[string]struct{}) ([]targetPart, error) {
@@ -346,14 +403,31 @@ func escapePath(value string) string {
 	return strings.Join(parts, "/")
 }
 
-func validDotted(value string, extra byte, hostname bool) bool {
-	for _, label := range strings.Split(value, ".") {
-		if label == "" || (!hostname && label[0] >= '0' && label[0] <= '9') || (hostname && (label[0] == '-' || label[len(label)-1] == '-')) {
+func isASCIIAlphanumeric(character byte) bool {
+	return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9')
+}
+
+func validVariableName(name string) bool {
+	for _, part := range strings.Split(name, ".") {
+		if part == "" || (part[0] >= '0' && part[0] <= '9') {
+			return false
+		}
+		for i := 0; i < len(part); i++ {
+			if !isASCIIAlphanumeric(part[i]) && part[i] != '_' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validHostname(hostname string) bool {
+	for _, label := range strings.Split(hostname, ".") {
+		if label == "" || label[0] == '-' || label[len(label)-1] == '-' {
 			return false
 		}
 		for i := 0; i < len(label); i++ {
-			character := label[i]
-			if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == extra) {
+			if !isASCIIAlphanumeric(label[i]) && label[i] != '-' {
 				return false
 			}
 		}

@@ -589,9 +589,22 @@ func TestInvalidTemplates(t *testing.T) {
 
 func TestInvalidTargets(t *testing.T) {
 	cases := []struct {
-		name   string
-		target pathtemplate.Target
+		name    string
+		pattern string
+		target  pathtemplate.Target
 	}{
+		{
+			name:   "empty target",
+			target: pathtemplate.Target{},
+		},
+		{
+			name:   "relative target with only query",
+			target: pathtemplate.Target{Query: "q={a}"},
+		},
+		{
+			name:   "relative target with only fragment",
+			target: pathtemplate.Target{Fragment: "{a}"},
+		},
 		{
 			name:   "scheme without hostname",
 			target: pathtemplate.Target{Scheme: "https", Path: "/{a}"},
@@ -631,6 +644,21 @@ func TestInvalidTargets(t *testing.T) {
 		{
 			name:   "protocol-relative target path",
 			target: pathtemplate.Target{Path: "//evil.com/{a}"},
+		},
+		{
+			name:    "relative target expanding to protocol-relative URL when multi-segment is empty",
+			pattern: "/{host}/{rest=**}",
+			target:  pathtemplate.Target{Path: "/{rest}/{host}"},
+		},
+		{
+			name:    "relative target expanding to double slash when multi-segment is empty",
+			pattern: "/{host}/{rest=**}",
+			target:  pathtemplate.Target{Path: "/{rest}/"},
+		},
+		{
+			name:    "relative target with repeated leading multi-segment before slash",
+			pattern: "/{host}/{rest=**}",
+			target:  pathtemplate.Target{Path: "/{rest}{rest}/{host}"},
 		},
 		{
 			name:   "query delimiter in target path",
@@ -684,12 +712,49 @@ func TestInvalidTargets(t *testing.T) {
 
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
+			pattern := testCase.pattern
+			if pattern == "" {
+				pattern = "/{a}"
+			}
 			if _, err := pathtemplate.NewMatcher(pathtemplate.Rule{
-				Pattern: "/{a}",
+				Pattern: pattern,
 				Target:  testCase.target,
 			}); err == nil {
 				t.Errorf("NewMatcher succeeded for %s, want error", testCase.name)
 			}
 		})
+	}
+}
+
+func TestRelativeTargetMultiSegmentSafeCases(t *testing.T) {
+	// Leading multi-segment without a following "/" cannot expand to "//".
+	relativeMatcher, err := pathtemplate.NewMatcher(pathtemplate.Rule{
+		Pattern: "/{host}/{rest=**}",
+		Target:  pathtemplate.Target{Path: "/{rest}"},
+	})
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	if got, ok := relativeMatcher.Match("/evil.com/", ""); !ok || got != "/" {
+		t.Errorf("Match(/evil.com/) = (%q, %v), want (\"/\", true)", got, ok)
+	}
+	if got, ok := relativeMatcher.Match("/evil.com/sub/page", ""); !ok || got != "/sub/page" {
+		t.Errorf("Match(/evil.com/sub/page) = (%q, %v), want (\"/sub/page\", true)", got, ok)
+	}
+
+	// Absolute targets keep static scheme and hostname so "/{rest}/{host}" is not protocol-relative.
+	absoluteMatcher, err := pathtemplate.NewMatcher(pathtemplate.Rule{
+		Pattern: "/{host}/{rest=**}",
+		Target: pathtemplate.Target{
+			Scheme:   "https",
+			Hostname: "example.com",
+			Path:     "/{rest}/{host}",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewMatcher failed for absolute target: %v", err)
+	}
+	if got, ok := absoluteMatcher.Match("/site/dir", ""); !ok || got != "https://example.com/dir/site" {
+		t.Errorf("Match(/site/dir) = (%q, %v), want (\"https://example.com/dir/site\", true)", got, ok)
 	}
 }
