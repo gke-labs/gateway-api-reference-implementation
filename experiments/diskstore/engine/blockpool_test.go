@@ -1784,3 +1784,212 @@ func TestBlockPool_ConcurrentAllocateAndFlushAllDirty(t *testing.T) {
 		}
 	}
 }
+
+func decodePageLSNs(data []byte) map[uint64][]uint64 {
+	written := make(map[uint64][]uint64)
+	for offset := 0; offset+BlockSize <= len(data); offset += BlockSize {
+		header, err := DecodeBlockHeader(data[offset : offset+BlockSize])
+		if err != nil || header.BlockIndex != 0 {
+			continue
+		}
+		written[header.LogicalPage] = append(written[header.LogicalPage], header.LSN)
+	}
+	return written
+}
+
+func readHeapPageLSNs(t *testing.T, heapFile File) map[uint64][]uint64 {
+	t.Helper()
+	heapSize, err := heapFile.Size()
+	if err != nil {
+		t.Fatalf("heapFile.Size failed: %v", err)
+	}
+	heapBytes := make([]byte, heapSize)
+	if heapSize > 0 {
+		if _, err := heapFile.ReadAt(heapBytes, 0); err != nil {
+			t.Fatalf("heapFile.ReadAt failed: %v", err)
+		}
+	}
+	return decodePageLSNs(heapBytes)
+}
+
+func startHeldMultiChunkFlush(t *testing.T, totalPages, blocksPerPage, extraPoolBlocks int) (File, *WAL, *BlockPool, uint64, func() error) {
+	t.Helper()
+	faultFS := NewFaultFS(NewMemFS())
+	var dbID [16]byte
+	copy(dbID[:], "bp-chunk-recheck")
+
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0, WALOptions{})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := wal.Close(); err != nil {
+			t.Errorf("wal.Close failed: %v", err)
+		}
+	})
+
+	heapFile, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := heapFile.Close(); err != nil {
+			t.Errorf("heapFile.Close failed: %v", err)
+		}
+	})
+
+	pool := NewBlockPool(heapFile, wal, NewBuddyAllocator(1024), dbID, BlockPoolOptions{
+		NumPoolBlocks: totalPages*blocksPerPage + extraPoolBlocks,
+	})
+	t.Cleanup(func() {
+		if err := pool.Close(); err != nil {
+			t.Errorf("pool.Close failed: %v", err)
+		}
+	})
+
+	for pageID := uint64(1); pageID <= uint64(totalPages); pageID++ {
+		lsn := pageID * 10
+		if err := wal.Append(Record{Type: RecordTypePut, LSN: lsn, Key: fmt.Sprintf("k%d", pageID), Payload: []byte("v")}); err != nil {
+			t.Fatalf("wal.Append page %d failed: %v", pageID, err)
+		}
+		handle, err := pool.AllocateNewPage(pageID, blocksPerPage, lsn)
+		if err != nil {
+			t.Fatalf("AllocateNewPage %d failed: %v", pageID, err)
+		}
+		handle.Unpin()
+	}
+
+	firstChunkStarted := make(chan map[uint64][]uint64, 1)
+	releaseFirstChunk := make(chan struct{})
+	var holdOnce sync.Once
+	faultFS.SetBeforeWriteAt(func(path string, payload []byte, _ int64) {
+		if filepath.Base(path) != "heap.db" {
+			return
+		}
+		holdOnce.Do(func() {
+			firstChunkStarted <- decodePageLSNs(payload)
+			<-releaseFirstChunk
+		})
+	})
+
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- pool.FlushAllDirty()
+	}()
+
+	var releaseOnce sync.Once
+	finishFlush := func() error {
+		releaseOnce.Do(func() { close(releaseFirstChunk) })
+		return <-flushDone
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() {
+			close(releaseFirstChunk)
+			<-flushDone
+		})
+	})
+
+	firstChunkPages := <-firstChunkStarted
+	for pageID := uint64(1); pageID <= uint64(totalPages); pageID++ {
+		if len(firstChunkPages[pageID]) == 0 {
+			return heapFile, wal, pool, pageID, finishFlush
+		}
+	}
+	t.Fatalf("expected at least one page outside the first chunk (got %d pages)", len(firstChunkPages))
+	return nil, nil, nil, 0, nil
+}
+
+func TestBlockPool_FlushBatchSkipsPagePinnedBetweenChunks(t *testing.T) {
+	// Six 128-block pages total 768 blocks (> MaxBatchBlocks = 512), so
+	// FlushAllDirty writes four pages in the first chunk and two in the second.
+	const (
+		totalPages    = 6
+		blocksPerPage = 128
+	)
+	heapFile, _, pool, pinnedPage, finishFlush := startHeldMultiChunkFlush(t, totalPages, blocksPerPage, 0)
+
+	pinnedHandle, err := pool.PinPage(pinnedPage)
+	if err != nil {
+		t.Fatalf("PinPage(%d) failed: %v", pinnedPage, err)
+	}
+	var unpinOnce sync.Once
+	unpin := func() { unpinOnce.Do(pinnedHandle.Unpin) }
+	defer unpin()
+
+	if err := finishFlush(); err != nil {
+		t.Fatalf("FlushAllDirty failed: %v", err)
+	}
+
+	written := readHeapPageLSNs(t, heapFile)
+	if len(written[pinnedPage]) != 0 {
+		t.Fatalf("FlushAllDirty wrote pinned later-chunk page %d to heap.db (LSNs %v)", pinnedPage, written[pinnedPage])
+	}
+	for pageID := uint64(1); pageID <= totalPages; pageID++ {
+		if pageID == pinnedPage {
+			continue
+		}
+		if len(written[pageID]) != 1 || written[pageID][0] != pageID*10 {
+			t.Fatalf("page %d written LSNs = %v, want [%d]", pageID, written[pageID], pageID*10)
+		}
+	}
+
+	dirtyPageTable, _ := pool.DirtyPageTableAndLSN()
+	if dirtyPageTable[pinnedPage] != pinnedPage*10 {
+		t.Fatalf("DirtyPageTable[%d] = %d, want %d", pinnedPage, dirtyPageTable[pinnedPage], pinnedPage*10)
+	}
+
+	// Unpinning the page lets the next FlushAllDirty write it.
+	unpin()
+	if err := pool.FlushAllDirty(); err != nil {
+		t.Fatalf("second FlushAllDirty failed: %v", err)
+	}
+	writtenAfterUnpin := readHeapPageLSNs(t, heapFile)
+	if len(writtenAfterUnpin[pinnedPage]) != 1 || writtenAfterUnpin[pinnedPage][0] != pinnedPage*10 {
+		t.Fatalf("page %d written LSNs after unpin = %v, want [%d]", pinnedPage, writtenAfterUnpin[pinnedPage], pinnedPage*10)
+	}
+}
+
+func TestBlockPool_FlushBatchSkipsPageReplacedBetweenChunks(t *testing.T) {
+	const (
+		totalPages     = 6
+		blocksPerPage  = 128
+		replacementLSN = uint64(1000)
+	)
+	// Leave spare pool blocks so AllocateNewPage does not evict while chunk 1 is held.
+	heapFile, wal, pool, replacedPage, finishFlush := startHeldMultiChunkFlush(t, totalPages, blocksPerPage, blocksPerPage)
+	if err := wal.Append(Record{Type: RecordTypePut, LSN: replacementLSN, Key: "replaced", Payload: []byte("v2")}); err != nil {
+		t.Fatalf("wal.Append replacement failed: %v", err)
+	}
+
+	// Replace the later-chunk page while chunk 1 is in flight, then unpin the
+	// replacement so only the stale descriptor lacks pool blocks.
+	replacementHandle, err := pool.AllocateNewPage(replacedPage, blocksPerPage, replacementLSN)
+	if err != nil {
+		t.Fatalf("AllocateNewPage replacement for %d failed: %v", replacedPage, err)
+	}
+	replacementHandle.Unpin()
+
+	if err := finishFlush(); err != nil {
+		t.Fatalf("FlushAllDirty failed: %v", err)
+	}
+
+	heapSize, err := heapFile.Size()
+	if err != nil {
+		t.Fatalf("heapFile.Size failed: %v", err)
+	}
+	wantSize := int64((totalPages - 1) * blocksPerPage * BlockSize)
+	if heapSize != wantSize {
+		t.Fatalf("heap.db size = %d, want %d (replaced page must not be written)", heapSize, wantSize)
+	}
+	if written := readHeapPageLSNs(t, heapFile); len(written[replacedPage]) != 0 {
+		t.Fatalf("FlushAllDirty wrote replaced page %d to heap.db (LSNs %v)", replacedPage, written[replacedPage])
+	}
+
+	if err := pool.FlushAllDirty(); err != nil {
+		t.Fatalf("second FlushAllDirty failed: %v", err)
+	}
+	writtenAfterSecond := readHeapPageLSNs(t, heapFile)
+	if len(writtenAfterSecond[replacedPage]) != 1 || writtenAfterSecond[replacedPage][0] != replacementLSN {
+		t.Fatalf("replaced page %d written LSNs = %v, want [%d]", replacedPage, writtenAfterSecond[replacedPage], replacementLSN)
+	}
+}
