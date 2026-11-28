@@ -5958,12 +5958,18 @@ func TestHTTPListener_AllInOneModeConflict(t *testing.T) {
 		},
 	}
 
+	gatewayAddresses := map[types.NamespacedName][]gatewayv1.GatewayStatusAddress{
+		{Namespace: "default", Name: gw1.Name}: {{Value: "192.0.2.1"}},
+		{Namespace: "default", Name: gw2.Name}: {{Value: "192.0.2.2"}},
+	}
+
 	// 1. With AllInOneMode: true
 	inputsAllInOne := ModelInputs{
-		Gateways:       []*gatewayv1.Gateway{gw2, gw1}, // pass in reverse order to ensure sorting works
-		GatewayClasses: []*gatewayv1.GatewayClass{gc},
-		ControllerName: "test-controller",
-		AllInOneMode:   true,
+		Gateways:         []*gatewayv1.Gateway{gw2, gw1}, // pass in reverse order to ensure sorting works
+		GatewayClasses:   []*gatewayv1.GatewayClass{gc},
+		GatewayAddresses: gatewayAddresses,
+		ControllerName:   "test-controller",
+		AllInOneMode:     true,
 	}
 
 	outputsAllInOne := ComputeOutputs(inputsAllInOne)
@@ -6004,10 +6010,11 @@ func TestHTTPListener_AllInOneModeConflict(t *testing.T) {
 
 	// 2. With AllInOneMode: false (singlepod mode)
 	inputsSinglePod := ModelInputs{
-		Gateways:       []*gatewayv1.Gateway{gw1, gw2},
-		GatewayClasses: []*gatewayv1.GatewayClass{gc},
-		ControllerName: "test-controller",
-		AllInOneMode:   false,
+		Gateways:         []*gatewayv1.Gateway{gw1, gw2},
+		GatewayClasses:   []*gatewayv1.GatewayClass{gc},
+		GatewayAddresses: gatewayAddresses,
+		ControllerName:   "test-controller",
+		AllInOneMode:     false,
 	}
 
 	outputsSinglePod := ComputeOutputs(inputsSinglePod)
@@ -6080,6 +6087,10 @@ func TestHTTPListener_AllInOneModeConflict_Hostnameless(t *testing.T) {
 	inputsAllInOne := ModelInputs{
 		Gateways:       []*gatewayv1.Gateway{gw2, gw1},
 		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		GatewayAddresses: map[types.NamespacedName][]gatewayv1.GatewayStatusAddress{
+			{Namespace: "default", Name: gw1.Name}: {{Value: "192.0.2.1"}},
+			{Namespace: "default", Name: gw2.Name}: {{Value: "192.0.2.2"}},
+		},
 		ControllerName: "test-controller",
 		AllInOneMode:   true,
 	}
@@ -6217,6 +6228,12 @@ func TestHTTPListener_AllInOneModeConflict_WildcardVsExact(t *testing.T) {
 	inputs := ModelInputs{
 		Gateways:       []*gatewayv1.Gateway{gw4, gw3, gw2, gw1},
 		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		GatewayAddresses: map[types.NamespacedName][]gatewayv1.GatewayStatusAddress{
+			{Namespace: "default", Name: gw1.Name}: {{Value: "192.0.2.1"}},
+			{Namespace: "default", Name: gw2.Name}: {{Value: "192.0.2.2"}},
+			{Namespace: "default", Name: gw3.Name}: {{Value: "192.0.2.3"}},
+			{Namespace: "default", Name: gw4.Name}: {{Value: "192.0.2.4"}},
+		},
 		ControllerName: "test-controller",
 		AllInOneMode:   true,
 	}
@@ -6344,6 +6361,10 @@ func TestHTTPSAndTLSListener_AllInOneModeConflict(t *testing.T) {
 	inputs := ModelInputs{
 		Gateways:       []*gatewayv1.Gateway{gw2, gw1},
 		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		GatewayAddresses: map[types.NamespacedName][]gatewayv1.GatewayStatusAddress{
+			{Namespace: "default", Name: gw1.Name}: {{Value: "192.0.2.1"}},
+			{Namespace: "default", Name: gw2.Name}: {{Value: "192.0.2.2"}},
+		},
 		Secrets:        map[types.NamespacedName]*corev1.Secret{{Namespace: "default", Name: "tls-secret"}: secret},
 		ControllerName: "test-controller",
 		AllInOneMode:   true,
@@ -6443,6 +6464,9 @@ func TestListener_OverlappingTLSConfig(t *testing.T) {
 		inputs := ModelInputs{
 			Gateways:       []*gatewayv1.Gateway{gw},
 			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			GatewayAddresses: map[types.NamespacedName][]gatewayv1.GatewayStatusAddress{
+				{Namespace: "default", Name: gw.Name}: {{Value: "192.0.2.1"}},
+			},
 			Secrets: map[types.NamespacedName]*corev1.Secret{
 				{Namespace: "default", Name: "cert-1"}: secret1,
 			},
@@ -6513,6 +6537,9 @@ func TestListener_OverlappingTLSConfig(t *testing.T) {
 		inputs := ModelInputs{
 			Gateways:       []*gatewayv1.Gateway{gw},
 			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			GatewayAddresses: map[types.NamespacedName][]gatewayv1.GatewayStatusAddress{
+				{Namespace: "default", Name: gw.Name}: {{Value: "192.0.2.1"}},
+			},
 			Secrets: map[types.NamespacedName]*corev1.Secret{
 				{Namespace: "default", Name: "cert-1"}: secret1,
 				{Namespace: "default", Name: "cert-2"}: secret2,

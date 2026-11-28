@@ -3209,6 +3209,17 @@ func ComputeDesiredGatewayStatus(
 
 	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, provisioningErrors, supportedAddressTypes, resolvedRefsCond, parametersError)
 
+	acceptedCondition := FindCondition(desiredConditions, string(gatewayv1.GatewayConditionAccepted))
+	gatewayAccepted := acceptedCondition != nil && acceptedCondition.Status == metav1.ConditionTrue
+	programmedCondition := FindCondition(desiredConditions, string(gatewayv1.GatewayConditionProgrammed))
+	gatewayNotProgrammed := gatewayAccepted &&
+		programmedCondition != nil &&
+		programmedCondition.Status != metav1.ConditionTrue
+	var gatewayNotProgrammedMessage string
+	if gatewayNotProgrammed {
+		gatewayNotProgrammedMessage = fmt.Sprintf("Gateway is not programmed (%s): %s", programmedCondition.Reason, programmedCondition.Message)
+	}
+
 	var desiredListenerStatuses []gatewayv1.ListenerStatus
 	for _, l := range gw.Spec.Listeners {
 		var matchedEl *EffectiveListener
@@ -3227,6 +3238,18 @@ func ComputeDesiredGatewayStatus(
 			attachedRoutes = matchedEl.AttachedRoutes
 			conds = make([]metav1.Condition, len(matchedEl.ListenerInfo.Conditions))
 			copy(conds, matchedEl.ListenerInfo.Conditions)
+
+			if gatewayNotProgrammed {
+				if listenerProgrammed := FindCondition(conds, string(gatewayv1.ListenerConditionProgrammed)); listenerProgrammed != nil && listenerProgrammed.Status == metav1.ConditionTrue {
+					SetCondition(&conds, NewCondition(
+						string(gatewayv1.ListenerConditionProgrammed),
+						programmedCondition.Status,
+						string(gatewayv1.ListenerReasonPending),
+						gatewayNotProgrammedMessage,
+						gw.Generation,
+					))
+				}
+			}
 		}
 
 		desiredListenerStatuses = append(desiredListenerStatuses, gatewayv1.ListenerStatus{
@@ -3237,15 +3260,7 @@ func ComputeDesiredGatewayStatus(
 		})
 	}
 
-	gwAccepted := false
-	for _, cond := range desiredConditions {
-		if cond.Type == string(gatewayv1.GatewayConditionAccepted) && cond.Status == metav1.ConditionTrue {
-			gwAccepted = true
-			break
-		}
-	}
-
-	if !gwAccepted {
+	if !gatewayAccepted {
 		desiredAddresses = nil
 	}
 

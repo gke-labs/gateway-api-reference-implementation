@@ -3525,3 +3525,180 @@ func TestState_ListenerSetProgrammedFollowsParentGateway_ReasonMappingAndUnaccep
 		t.Errorf("expected unaccepted ListenerSet to stay Programmed=False/NotAllowed, got %+v", disallowedProgrammed)
 	}
 }
+
+func TestState_GatewayListenerProgrammedFollowsGateway_NoAddress(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gatewayClass, gateway, _ := newGatewayAndListenerSetFixtures()
+	gatewayKey := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
+
+	st.UpsertGatewayClass(gatewayClass)
+	st.UpsertGateway(gateway)
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gatewayKey)
+	if !ok || len(status.Listeners) != 1 {
+		t.Fatalf("expected desired Gateway status with 1 listener, got ok=%v listeners=%d", ok, len(status.Listeners))
+	}
+	gatewayAccepted := findCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if gatewayAccepted == nil || gatewayAccepted.Status != metav1.ConditionTrue {
+		t.Fatalf("expected Gateway Accepted=True, got %+v", gatewayAccepted)
+	}
+	gatewayProgrammed := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if gatewayProgrammed == nil || gatewayProgrammed.Status != metav1.ConditionFalse ||
+		gatewayProgrammed.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Fatalf("expected Gateway Programmed=False/AddressNotAssigned, got %+v", gatewayProgrammed)
+	}
+
+	listenerAccepted := findCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionAccepted))
+	if listenerAccepted == nil || listenerAccepted.Status != metav1.ConditionTrue {
+		t.Errorf("expected listener Accepted=True, got %+v", listenerAccepted)
+	}
+	listenerProgrammed := findCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if listenerProgrammed == nil || listenerProgrammed.Status != metav1.ConditionFalse ||
+		listenerProgrammed.Reason != string(gatewayv1.ListenerReasonPending) ||
+		!strings.Contains(listenerProgrammed.Message, string(gatewayv1.GatewayReasonAddressNotAssigned)) ||
+		!strings.Contains(listenerProgrammed.Message, gatewayProgrammed.Message) {
+		t.Errorf("expected listener Programmed=False/Pending naming Gateway reason and message, got %+v", listenerProgrammed)
+	}
+
+	st.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.Recompute()
+
+	status, ok = st.GetDesiredGatewayStatus(gatewayKey)
+	if !ok || len(status.Listeners) != 1 {
+		t.Fatalf("expected desired Gateway status after address assignment, got ok=%v listeners=%d", ok, len(status.Listeners))
+	}
+	listenerProgrammed = findCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if listenerProgrammed == nil || listenerProgrammed.Status != metav1.ConditionTrue ||
+		listenerProgrammed.Reason != string(gatewayv1.ListenerReasonProgrammed) {
+		t.Errorf("expected listener Programmed=True/Programmed after address assignment, got %+v", listenerProgrammed)
+	}
+}
+
+func TestState_GatewayListenerProgrammedFollowsGateway_PublishError(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	publishError := errors.New("simulated publish failure")
+	mockPublisher := &mockDataplanePublisher{publishErr: publishError}
+	st.SetDataplanePublisher(mockPublisher)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	startErrors := make(chan error, 1)
+	go func() {
+		startErrors <- st.Start(ctx)
+	}()
+
+	gatewayClass, gateway, _ := newGatewayAndListenerSetFixtures()
+	gatewayKey := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
+
+	st.UpsertGatewayClass(gatewayClass)
+	st.UpsertGateway(gateway)
+	st.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gatewayKey)
+		if !ok || len(status.Listeners) != 1 {
+			return false
+		}
+		gatewayAccepted := findCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+		listenerProgrammed := findCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		return gatewayAccepted != nil && gatewayAccepted.Status == metav1.ConditionTrue &&
+			listenerProgrammed != nil && listenerProgrammed.Status == metav1.ConditionFalse &&
+			listenerProgrammed.Reason == string(gatewayv1.ListenerReasonPending) &&
+			strings.Contains(listenerProgrammed.Message, string(gatewayv1.GatewayReasonPending)) &&
+			strings.Contains(listenerProgrammed.Message, publishError.Error())
+	})
+
+	mockPublisher.setPublishErr(nil)
+
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(gatewayKey)
+		if !ok || len(status.Listeners) != 1 {
+			return false
+		}
+		listenerProgrammed := findCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		return listenerProgrammed != nil && listenerProgrammed.Status == metav1.ConditionTrue &&
+			listenerProgrammed.Reason == string(gatewayv1.ListenerReasonProgrammed)
+	})
+
+	cancel()
+	if err := <-startErrors; err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+}
+
+func TestState_GatewayListenerProgrammedFollowsGateway_PreservesSpecificReasons(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gatewayClass, gateway, _ := newGatewayAndListenerSetFixtures()
+	gateway.Spec.Listeners = []gatewayv1.Listener{
+		{Name: "valid-http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+		{
+			Name:     "invalid-https",
+			Port:     443,
+			Protocol: gatewayv1.HTTPSProtocolType,
+			TLS: &gatewayv1.ListenerTLSConfig{
+				CertificateRefs: []gatewayv1.SecretObjectReference{{Name: "missing-secret"}},
+			},
+		},
+		{Name: "reserved-tcp", Port: DataPlaneHTTPPort, Protocol: gatewayv1.TCPProtocolType},
+		{Name: "conflict-a", Port: 8081, Protocol: gatewayv1.HTTPProtocolType, Hostname: Ptr(gatewayv1.Hostname("dup.example.com"))},
+		{Name: "conflict-b", Port: 8081, Protocol: gatewayv1.HTTPProtocolType, Hostname: Ptr(gatewayv1.Hostname("dup.example.com"))},
+	}
+
+	gatewayKey := types.NamespacedName{Namespace: gateway.Namespace, Name: gateway.Name}
+	st.UpsertGatewayClass(gatewayClass)
+	st.UpsertGateway(gateway)
+	st.SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayProvisioningErrors(gatewayKey, nil, &ConditionError{
+		Type:    string(gatewayv1.GatewayConditionProgrammed),
+		Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
+		Message: "Requested address cannot be bound",
+	})
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gatewayKey)
+	if !ok || len(status.Listeners) != 5 {
+		t.Fatalf("expected desired Gateway status with 5 listeners, got ok=%v listeners=%d", ok, len(status.Listeners))
+	}
+
+	listenerByName := make(map[gatewayv1.SectionName]gatewayv1.ListenerStatus, len(status.Listeners))
+	for _, listenerStatus := range status.Listeners {
+		listenerByName[listenerStatus.Name] = listenerStatus
+	}
+
+	validProgrammed := findCondition(listenerByName["valid-http"].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if validProgrammed == nil || validProgrammed.Status != metav1.ConditionFalse ||
+		validProgrammed.Reason != string(gatewayv1.ListenerReasonPending) ||
+		!strings.Contains(validProgrammed.Message, string(gatewayv1.GatewayReasonAddressNotUsable)) ||
+		!strings.Contains(validProgrammed.Message, "Requested address cannot be bound") {
+		t.Errorf("expected valid-http Programmed=False/Pending naming AddressNotUsable and message, got %+v", validProgrammed)
+	}
+
+	invalidProgrammed := findCondition(listenerByName["invalid-https"].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if invalidProgrammed == nil || invalidProgrammed.Status != metav1.ConditionFalse ||
+		invalidProgrammed.Reason != string(gatewayv1.ListenerReasonInvalid) ||
+		strings.Contains(invalidProgrammed.Message, "Gateway is not programmed") {
+		t.Errorf("expected invalid-https to keep Invalid reason and original message, got %+v", invalidProgrammed)
+	}
+
+	reservedProgrammed := findCondition(listenerByName["reserved-tcp"].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if reservedProgrammed == nil || reservedProgrammed.Status != metav1.ConditionFalse ||
+		reservedProgrammed.Reason != string(gatewayv1.ListenerReasonPortUnavailable) ||
+		strings.Contains(reservedProgrammed.Message, "Gateway is not programmed") {
+		t.Errorf("expected reserved-tcp to keep PortUnavailable reason and original message, got %+v", reservedProgrammed)
+	}
+
+	conflictProgrammed := findCondition(listenerByName["conflict-b"].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if conflictProgrammed == nil || conflictProgrammed.Status != metav1.ConditionFalse ||
+		conflictProgrammed.Reason != string(gatewayv1.ListenerReasonHostnameConflict) ||
+		strings.Contains(conflictProgrammed.Message, "Gateway is not programmed") {
+		t.Errorf("expected conflict-b to keep HostnameConflict reason and original message, got %+v", conflictProgrammed)
+	}
+}

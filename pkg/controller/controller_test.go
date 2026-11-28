@@ -3081,6 +3081,7 @@ func TestGatewayReconciler_CertificateSource_Served(t *testing.T) {
 
 	st.UpsertGatewayClass(gwClass)
 	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
 	outputs := st.Recompute()
 
 	client := fake.NewClientBuilder().
@@ -3196,6 +3197,7 @@ func TestGatewayReconciler_CertificateSource_PendingThenAvailable(t *testing.T) 
 
 	st.UpsertGatewayClass(gwClass)
 	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3483,6 +3485,7 @@ func TestGatewayReconciler_CertificateSource_CertificateRefsTogetherWithOption(t
 	st.UpsertSecret(secret)
 	st.UpsertGatewayClass(gwClass)
 	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
 	outputs := st.Recompute()
 
 	client := fake.NewClientBuilder().
@@ -4207,6 +4210,7 @@ func TestGatewayReconciler_PreservesForeignConditions(t *testing.T) {
 	}
 
 	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
 	st.Recompute()
 
 	client := fake.NewClientBuilder().
