@@ -34,9 +34,9 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
+	"github.com/gke-labs/gateway-api-reference-implementation/spiffe"
 )
 
 func TestGARI_Integration_SinglePodProvisioning(t *testing.T) {
