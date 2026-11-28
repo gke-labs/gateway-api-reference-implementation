@@ -72,8 +72,8 @@ func TestRun_MultiNamespaceAndIdempotent(t *testing.T) {
 		betaNamespace   = "test-gari-beta"
 	)
 	for _, namespace := range []string{issuerNamespace, alphaNamespace, betaNamespace} {
-		namespaceObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
-		if err := env.Client.Create(ctx, namespaceObj); err != nil && !apierrors.IsAlreadyExists(err) {
+		namespaceObject := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+		if err := env.Client.Create(ctx, namespaceObject); err != nil && !apierrors.IsAlreadyExists(err) {
 			t.Fatalf("failed to create test namespace %s: %v", namespace, err)
 		}
 	}
@@ -111,11 +111,11 @@ func TestRun_MultiNamespaceAndIdempotent(t *testing.T) {
 	}
 
 	// Second run is idempotent.
-	authorityRV := authoritySecret.ResourceVersion
-	alphaBundleRV := alphaBundle.ResourceVersion
-	betaBundleRV := betaBundle.ResourceVersion
-	alphaSVIDRV := alphaSVID.ResourceVersion
-	betaSVIDRV := betaSVID.ResourceVersion
+	authorityResourceVersion := authoritySecret.ResourceVersion
+	alphaBundleResourceVersion := alphaBundle.ResourceVersion
+	betaBundleResourceVersion := betaBundle.ResourceVersion
+	alphaSVIDResourceVersion := alphaSVID.ResourceVersion
+	betaSVIDResourceVersion := betaSVID.ResourceVersion
 
 	if err := runWithConfig(ctx, env.Config, options); err != nil {
 		t.Fatalf("runWithConfig second run failed: %v", err)
@@ -137,11 +137,11 @@ func TestRun_MultiNamespaceAndIdempotent(t *testing.T) {
 		t.Fatalf("failed to re-get beta SVID secret: %v", err)
 	}
 
-	if authoritySecret.ResourceVersion != authorityRV ||
-		alphaBundle.ResourceVersion != alphaBundleRV ||
-		betaBundle.ResourceVersion != betaBundleRV ||
-		alphaSVID.ResourceVersion != alphaSVIDRV ||
-		betaSVID.ResourceVersion != betaSVIDRV {
+	if authoritySecret.ResourceVersion != authorityResourceVersion ||
+		alphaBundle.ResourceVersion != alphaBundleResourceVersion ||
+		betaBundle.ResourceVersion != betaBundleResourceVersion ||
+		alphaSVID.ResourceVersion != alphaSVIDResourceVersion ||
+		betaSVID.ResourceVersion != betaSVIDResourceVersion {
 		t.Errorf("expected no ResourceVersion changes on second run")
 	}
 }

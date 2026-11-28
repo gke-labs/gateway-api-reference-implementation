@@ -163,6 +163,12 @@ type pendingSVID struct {
 	existing *corev1.Secret
 }
 
+type authorityMaterial struct {
+	key     *ecdsa.PrivateKey
+	cert    *x509.Certificate
+	certPEM []byte
+}
+
 // EnsureCredentials reconciles the trust domain authority Secret, per-namespace trust bundle
 // ConfigMaps, and per-workload X.509-SVID Secrets described by options.
 //
@@ -193,9 +199,34 @@ func EnsureCredentials(ctx context.Context, kubeClient client.Client, options Op
 		hasAuthoritySecret = false
 	}
 
+	missingBundles, err := findMissingBundles(ctx, kubeClient, resolved.Identities)
+	if err != nil {
+		return err
+	}
+	pendingSVIDs, err := findPendingSVIDs(ctx, kubeClient, resolved.Identities, now, resolved.RenewBefore)
+	if err != nil {
+		return err
+	}
+
+	// If all objects exist and all SVIDs are valid outside the renewal window, change nothing.
+	if hasAuthoritySecret && len(missingBundles) == 0 && len(pendingSVIDs) == 0 {
+		return nil
+	}
+
+	authority, err := ensureAuthority(ctx, kubeClient, namespace, hasAuthoritySecret, &authoritySecret, now)
+	if err != nil {
+		return err
+	}
+	if err := createMissingBundles(ctx, kubeClient, missingBundles, authority.certPEM); err != nil {
+		return err
+	}
+	return writePendingSVIDs(ctx, kubeClient, authority, pendingSVIDs, now)
+}
+
+func findMissingBundles(ctx context.Context, kubeClient client.Client, identities []Identity) ([]client.ObjectKey, error) {
 	missingBundles := make([]client.ObjectKey, 0)
 	seenBundles := make(map[client.ObjectKey]bool)
-	for _, identity := range resolved.Identities {
+	for _, identity := range identities {
 		bundleKey := client.ObjectKey{Namespace: identity.Namespace, Name: identity.BundleConfigMapName}
 		if seenBundles[bundleKey] {
 			continue
@@ -204,94 +235,92 @@ func EnsureCredentials(ctx context.Context, kubeClient client.Client, options Op
 		var bundleConfigMap corev1.ConfigMap
 		if err := kubeClient.Get(ctx, bundleKey, &bundleConfigMap); err != nil {
 			if !apierrors.IsNotFound(err) {
-				return fmt.Errorf("reading bundle configmap %s/%s: %w", bundleKey.Namespace, bundleKey.Name, err)
+				return nil, fmt.Errorf("reading bundle configmap %s/%s: %w", bundleKey.Namespace, bundleKey.Name, err)
 			}
 			missingBundles = append(missingBundles, bundleKey)
 			continue
 		}
 		if bundleConfigMap.Data[BundleDataKey] == "" {
-			return fmt.Errorf("bundle configmap %s/%s: missing required key %q", bundleKey.Namespace, bundleKey.Name, BundleDataKey)
+			return nil, fmt.Errorf("bundle configmap %s/%s: missing required key %q", bundleKey.Namespace, bundleKey.Name, BundleDataKey)
 		}
 	}
+	return missingBundles, nil
+}
 
-	pendingSVIDs := make([]pendingSVID, 0, len(resolved.Identities))
-	for _, identity := range resolved.Identities {
+func findPendingSVIDs(ctx context.Context, kubeClient client.Client, identities []Identity, now time.Time, renewBefore time.Duration) ([]pendingSVID, error) {
+	pendingSVIDs := make([]pendingSVID, 0, len(identities))
+	for _, identity := range identities {
 		var existingSecret corev1.Secret
 		if err := kubeClient.Get(ctx, client.ObjectKey{Namespace: identity.Namespace, Name: identity.SecretName}, &existingSecret); err != nil {
 			if !apierrors.IsNotFound(err) {
-				return fmt.Errorf("reading SVID secret %s/%s: %w", identity.Namespace, identity.SecretName, err)
+				return nil, fmt.Errorf("reading SVID secret %s/%s: %w", identity.Namespace, identity.SecretName, err)
 			}
 			pendingSVIDs = append(pendingSVIDs, pendingSVID{identity: identity})
 			continue
 		}
 		certPEM := existingSecret.Data[SVIDCertDataKey]
 		if len(certPEM) == 0 {
-			return fmt.Errorf("SVID secret %s/%s: missing required certificate %q", identity.Namespace, identity.SecretName, SVIDCertDataKey)
+			return nil, fmt.Errorf("SVID secret %s/%s: missing required certificate %q", identity.Namespace, identity.SecretName, SVIDCertDataKey)
 		}
 		if len(existingSecret.Data[SVIDKeyDataKey]) == 0 {
-			return fmt.Errorf("SVID secret %s/%s: missing required key %q", identity.Namespace, identity.SecretName, SVIDKeyDataKey)
+			return nil, fmt.Errorf("SVID secret %s/%s: missing required key %q", identity.Namespace, identity.SecretName, SVIDKeyDataKey)
 		}
 		cert, err := parseCertificatePEM(certPEM)
 		if err != nil {
-			return fmt.Errorf("SVID secret %s/%s: failed to parse certificate: %w", identity.Namespace, identity.SecretName, err)
+			return nil, fmt.Errorf("SVID secret %s/%s: failed to parse certificate: %w", identity.Namespace, identity.SecretName, err)
 		}
-		if !cert.NotAfter.After(now.Add(resolved.RenewBefore)) {
+		if !cert.NotAfter.After(now.Add(renewBefore)) {
 			secretCopy := existingSecret
 			pendingSVIDs = append(pendingSVIDs, pendingSVID{identity: identity, existing: &secretCopy})
 		}
 	}
+	return pendingSVIDs, nil
+}
 
-	// If all objects exist and all SVIDs are valid outside the renewal window, change nothing.
-	if hasAuthoritySecret && len(missingBundles) == 0 && len(pendingSVIDs) == 0 {
-		return nil
-	}
-
-	var (
-		authorityKey     *ecdsa.PrivateKey
-		authorityCert    *x509.Certificate
-		authorityCertPEM []byte
-		authorityKeyPEM  []byte
-	)
-
+func ensureAuthority(ctx context.Context, kubeClient client.Client, namespace string, hasAuthoritySecret bool, authoritySecret *corev1.Secret, now time.Time) (*authorityMaterial, error) {
 	if hasAuthoritySecret {
-		authorityKeyPEM = authoritySecret.Data[AuthorityKeyDataKey]
+		authorityKeyPEM := authoritySecret.Data[AuthorityKeyDataKey]
 		if len(authorityKeyPEM) == 0 {
-			return fmt.Errorf("authority secret %s/%s: missing required key %q", namespace, AuthoritySecretName, AuthorityKeyDataKey)
+			return nil, fmt.Errorf("authority secret %s/%s: missing required key %q", namespace, AuthoritySecretName, AuthorityKeyDataKey)
 		}
-		authorityKey, err = parseECPrivateKeyPEM(authorityKeyPEM)
+		authorityKey, err := parseECPrivateKeyPEM(authorityKeyPEM)
 		if err != nil {
-			return fmt.Errorf("authority secret %s/%s: failed to parse private key: %w", namespace, AuthoritySecretName, err)
+			return nil, fmt.Errorf("authority secret %s/%s: failed to parse private key: %w", namespace, AuthoritySecretName, err)
 		}
 
-		authorityCertPEM = authoritySecret.Data[AuthorityCertDataKey]
+		authorityCertPEM := authoritySecret.Data[AuthorityCertDataKey]
 		if len(authorityCertPEM) == 0 {
-			return fmt.Errorf("authority secret %s/%s: missing required certificate %q", namespace, AuthoritySecretName, AuthorityCertDataKey)
+			return nil, fmt.Errorf("authority secret %s/%s: missing required certificate %q", namespace, AuthoritySecretName, AuthorityCertDataKey)
 		}
-		authorityCert, err = parseCertificatePEM(authorityCertPEM)
+		authorityCert, err := parseCertificatePEM(authorityCertPEM)
 		if err != nil {
-			return fmt.Errorf("authority secret %s/%s: failed to parse certificate: %w", namespace, AuthoritySecretName, err)
+			return nil, fmt.Errorf("authority secret %s/%s: failed to parse certificate: %w", namespace, AuthoritySecretName, err)
 		}
-	} else {
-		authorityKey, authorityCert, authorityCertPEM, authorityKeyPEM, err = generateAuthority(now)
-		if err != nil {
-			return fmt.Errorf("generating authority: %w", err)
-		}
-		newAuthoritySecret := corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      AuthoritySecretName,
-				Namespace: namespace,
-			},
-			Type: corev1.SecretTypeOpaque,
-			Data: map[string][]byte{
-				AuthorityKeyDataKey:  authorityKeyPEM,
-				AuthorityCertDataKey: authorityCertPEM,
-			},
-		}
-		if err := kubeClient.Create(ctx, &newAuthoritySecret); err != nil {
-			return fmt.Errorf("creating authority secret %s/%s: %w", namespace, AuthoritySecretName, err)
-		}
+		return &authorityMaterial{key: authorityKey, cert: authorityCert, certPEM: authorityCertPEM}, nil
 	}
 
+	authorityKey, authorityCert, authorityCertPEM, authorityKeyPEM, err := generateAuthority(now)
+	if err != nil {
+		return nil, fmt.Errorf("generating authority: %w", err)
+	}
+	newAuthoritySecret := corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      AuthoritySecretName,
+			Namespace: namespace,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			AuthorityKeyDataKey:  authorityKeyPEM,
+			AuthorityCertDataKey: authorityCertPEM,
+		},
+	}
+	if err := kubeClient.Create(ctx, &newAuthoritySecret); err != nil {
+		return nil, fmt.Errorf("creating authority secret %s/%s: %w", namespace, AuthoritySecretName, err)
+	}
+	return &authorityMaterial{key: authorityKey, cert: authorityCert, certPEM: authorityCertPEM}, nil
+}
+
+func createMissingBundles(ctx context.Context, kubeClient client.Client, missingBundles []client.ObjectKey, authorityCertPEM []byte) error {
 	for _, bundleKey := range missingBundles {
 		configMap := corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
@@ -306,7 +335,10 @@ func EnsureCredentials(ctx context.Context, kubeClient client.Client, options Op
 			return fmt.Errorf("creating bundle configmap %s/%s: %w", bundleKey.Namespace, bundleKey.Name, err)
 		}
 	}
+	return nil
+}
 
+func writePendingSVIDs(ctx context.Context, kubeClient client.Client, authority *authorityMaterial, pendingSVIDs []pendingSVID, now time.Time) error {
 	for _, item := range pendingSVIDs {
 		identity := item.identity
 		spiffeID, err := SPIFFEID(TrustDomain, identity.Namespace, identity.ServiceAccount)
@@ -318,7 +350,7 @@ func EnsureCredentials(ctx context.Context, kubeClient client.Client, options Op
 			return fmt.Errorf("building service DNS names for %s/%s: %w", identity.Namespace, identity.ServiceName, err)
 		}
 
-		svidCertPEM, svidKeyPEM, err := generateSVIDCertificate(authorityCert, authorityKey, spiffeID, dnsNames, now)
+		svidCertPEM, svidKeyPEM, err := generateSVIDCertificate(authority.cert, authority.key, spiffeID, dnsNames, now)
 		if err != nil {
 			return fmt.Errorf("generating SVID certificate for %s/%s: %w", identity.Namespace, identity.SecretName, err)
 		}
@@ -345,7 +377,6 @@ func EnsureCredentials(ctx context.Context, kubeClient client.Client, options Op
 			return fmt.Errorf("creating SVID secret %s/%s: %w", identity.Namespace, identity.SecretName, err)
 		}
 	}
-
 	return nil
 }
 

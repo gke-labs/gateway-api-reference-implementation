@@ -249,8 +249,8 @@ func TestEnsureCredentials_MultiNamespaceAndMTLS(t *testing.T) {
 		betaNamespace   = "workload-beta"
 	)
 	for _, namespace := range []string{issuerNamespace, alphaNamespace, betaNamespace} {
-		namespaceObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
-		if err := env.Client.Create(ctx, namespaceObj); err != nil && !apierrors.IsAlreadyExists(err) {
+		namespaceObject := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+		if err := env.Client.Create(ctx, namespaceObject); err != nil && !apierrors.IsAlreadyExists(err) {
 			t.Fatalf("failed to create namespace %s: %v", namespace, err)
 		}
 	}
@@ -352,12 +352,12 @@ func TestEnsureCredentials_MultiNamespaceAndMTLS(t *testing.T) {
 	}
 
 	// Re-running is idempotent across all namespaces.
-	authorityRV := authoritySecret.ResourceVersion
-	alphaBundleRV := alphaBundle.ResourceVersion
-	betaBundleRV := betaBundle.ResourceVersion
-	frontendRV := frontendSecret.ResourceVersion
-	workerRV := workerSecret.ResourceVersion
-	backendRV := backendSecret.ResourceVersion
+	authorityResourceVersion := authoritySecret.ResourceVersion
+	alphaBundleResourceVersion := alphaBundle.ResourceVersion
+	betaBundleResourceVersion := betaBundle.ResourceVersion
+	frontendResourceVersion := frontendSecret.ResourceVersion
+	workerResourceVersion := workerSecret.ResourceVersion
+	backendResourceVersion := backendSecret.ResourceVersion
 
 	if err := spiffe.EnsureCredentials(ctx, env.Client, options); err != nil {
 		t.Fatalf("EnsureCredentials idempotent run failed: %v", err)
@@ -382,12 +382,12 @@ func TestEnsureCredentials_MultiNamespaceAndMTLS(t *testing.T) {
 		t.Fatalf("re-get backend SVID: %v", err)
 	}
 
-	if authoritySecret.ResourceVersion != authorityRV ||
-		alphaBundle.ResourceVersion != alphaBundleRV ||
-		betaBundle.ResourceVersion != betaBundleRV ||
-		frontendSecret.ResourceVersion != frontendRV ||
-		workerSecret.ResourceVersion != workerRV ||
-		backendSecret.ResourceVersion != backendRV {
+	if authoritySecret.ResourceVersion != authorityResourceVersion ||
+		alphaBundle.ResourceVersion != alphaBundleResourceVersion ||
+		betaBundle.ResourceVersion != betaBundleResourceVersion ||
+		frontendSecret.ResourceVersion != frontendResourceVersion ||
+		workerSecret.ResourceVersion != workerResourceVersion ||
+		backendSecret.ResourceVersion != backendResourceVersion {
 		t.Errorf("expected no ResourceVersion changes on idempotent multi-namespace run")
 	}
 }
@@ -402,8 +402,8 @@ func TestEnsureCredentials_Renewal(t *testing.T) {
 		betaNamespace   = "renew-beta"
 	)
 	for _, namespace := range []string{issuerNamespace, alphaNamespace, betaNamespace} {
-		namespaceObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
-		if err := env.Client.Create(ctx, namespaceObj); err != nil && !apierrors.IsAlreadyExists(err) {
+		namespaceObject := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+		if err := env.Client.Create(ctx, namespaceObject); err != nil && !apierrors.IsAlreadyExists(err) {
 			t.Fatalf("failed to create namespace %s: %v", namespace, err)
 		}
 	}
@@ -516,14 +516,14 @@ func TestEnsureCredentials_Renewal(t *testing.T) {
 	}
 
 	// Running again immediately after renewal is idempotent.
-	renewedAlphaRV := alphaAfter.ResourceVersion
+	renewedAlphaResourceVersion := alphaAfter.ResourceVersion
 	if err := spiffe.EnsureCredentials(ctx, env.Client, renewalOptions); err != nil {
 		t.Fatalf("post-renewal idempotent run failed: %v", err)
 	}
 	if err := env.Client.Get(ctx, client.ObjectKey{Namespace: alphaNamespace, Name: "alpha-svid"}, &alphaAfter); err != nil {
 		t.Fatalf("re-get alpha SVID after idempotent run: %v", err)
 	}
-	if alphaAfter.ResourceVersion != renewedAlphaRV {
+	if alphaAfter.ResourceVersion != renewedAlphaResourceVersion {
 		t.Errorf("renewed alpha SVID modified on immediate re-run")
 	}
 }
@@ -566,7 +566,7 @@ func TestParseIdentityAndBindFlags(t *testing.T) {
 		t.Errorf("identity[1] = %+v, want %+v", options.Identities[1], wantSecond)
 	}
 
-	invalidSpecs := []string{
+	invalidSpecifications := []string{
 		"",
 		"namespace=ns-a",
 		"service-account=app-a",
@@ -575,9 +575,9 @@ func TestParseIdentityAndBindFlags(t *testing.T) {
 		"namespace=,service-account=app-a",
 		"not-a-key-value",
 	}
-	for _, spec := range invalidSpecs {
-		if _, err := spiffe.ParseIdentity(spec); err == nil {
-			t.Errorf("ParseIdentity(%q) succeeded, want error", spec)
+	for _, specification := range invalidSpecifications {
+		if _, err := spiffe.ParseIdentity(specification); err == nil {
+			t.Errorf("ParseIdentity(%q) succeeded, want error", specification)
 		}
 	}
 }

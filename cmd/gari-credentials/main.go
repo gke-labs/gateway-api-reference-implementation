@@ -69,9 +69,6 @@ func run(ctx context.Context, args []string) error {
 }
 
 func runWithConfig(ctx context.Context, restConfig *rest.Config, options spiffe.Options) error {
-	if options.AuthorityNamespace == "" {
-		return errors.New("--authority-namespace flag or POD_NAMESPACE environment variable is required")
-	}
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		return fmt.Errorf("adding corev1 to scheme: %w", err)
