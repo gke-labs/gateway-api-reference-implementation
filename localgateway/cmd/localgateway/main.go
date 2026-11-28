@@ -24,11 +24,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/address"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/dnsconfig"
-	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
+	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/hostport"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 )
 
 const (
@@ -36,137 +36,121 @@ const (
 	DefaultControllerName = "github.com/gke-labs/gateway-api-reference-implementation/localgateway"
 )
 
-// Config contains localgateway-specific configuration flags.
+// Config holds localgateway-specific controller flags.
 type Config struct {
-	// Interface is the network interface to query for LAN IP addresses.
-	Interface string
-
-	// NodeName is the Kubernetes node name for fallback address resolution.
-	NodeName string
-
-	// MDNSPort is the UDP port for mDNS publishing (defaults to 5353).
-	MDNSPort int
+	// DataplaneImage is the container image used for provisioned per-Gateway data-plane Deployments.
+	DataplaneImage string
 }
 
-// BuildOptions parses args and constructs gari.Options and localgateway Config.
-func BuildOptions(args []string) (gari.Options, Config, error) {
-	fs := flag.NewFlagSet("localgateway", flag.ContinueOnError)
+// DefaultConfig returns the default Config populated from environment variables.
+func DefaultConfig() Config {
+	defaultImage := os.Getenv("GARI_IMAGE")
+	if defaultImage == "" {
+		defaultImage = singlepod.DefaultDataplaneImage
+	}
+	return Config{
+		DataplaneImage: defaultImage,
+	}
+}
 
-	gariOpts := gari.DefaultOptions()
-	cfg := Config{
-		NodeName: os.Getenv("NODE_NAME"),
-		MDNSPort: mdns.DefaultPort,
+// BindFlags registers localgateway and GARI controller flags on flagSet.
+func BindFlags(flagSet *flag.FlagSet, options *gari.Options, config *Config) {
+	if config.DataplaneImage == "" {
+		config.DataplaneImage = DefaultConfig().DataplaneImage
 	}
 
-	// Defaults tailored for localgateway all-in-one hostNetwork mode
-	gariOpts.ControllerName = DefaultControllerName
-	gariOpts.ProxyAddr = ":80"
-	gariOpts.ProxyHTTPSAddr = ""
-	gariOpts.ProxyHTTP3Addr = ""
-	gariOpts.LeaderElection = false
-	gariOpts.LeaderElectionID = "localgateway-controller"
+	flagSet.StringVar(&options.MetricsAddr, "metrics-bind-address", options.MetricsAddr, "The address the metric endpoint binds to.")
+	flagSet.StringVar(&options.HealthProbeBindAddress, "health-probe-bind-address", options.HealthProbeBindAddress, "The address the probe endpoint binds to.")
+	flagSet.StringVar(&options.ControllerName, "controller-name", options.ControllerName, "The GatewayClass controller name managed by this instance.")
+	flagSet.StringVar(&config.DataplaneImage, "dataplane-image", config.DataplaneImage, "The container image to use for provisioned per-Gateway data-plane Deployments.")
+	flagSet.BoolVar(&options.LeaderElection, "leader-elect", options.LeaderElection, "Enable leader election for controller manager.")
+	flagSet.StringVar(&options.LeaderElectionID, "leader-election-id", options.LeaderElectionID, "The ID used for leader election.")
+	gari.BindInternalAPIFlags(flagSet, options)
+}
 
-	// Flags binding directly to gari.Options using the field's own value as default
-	fs.StringVar(&gariOpts.MetricsAddr, "metrics-bind-address", gariOpts.MetricsAddr, "The address the metric endpoint binds to.")
-	fs.StringVar(&gariOpts.HealthProbeBindAddress, "health-probe-bind-address", gariOpts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
-	fs.StringVar(&gariOpts.ProxyAddr, "proxy-bind-address", gariOpts.ProxyAddr, "The host network address the HTTP proxy listens on.")
-	fs.StringVar(&gariOpts.ControllerName, "controller-name", gariOpts.ControllerName, "The GatewayClass controller name managed by this instance.")
-	fs.BoolVar(&gariOpts.LeaderElection, "leader-elect", gariOpts.LeaderElection, "Enable leader election for controller manager.")
-	fs.StringVar(&gariOpts.LeaderElectionID, "leader-election-id", gariOpts.LeaderElectionID, "The ID used for leader election.")
+// BuildOptions parses command-line arguments and returns gari.Options configured
+// for the localgateway host-port controller.
+func BuildOptions(args []string) (gari.Options, error) {
+	flagSet := flag.NewFlagSet("localgateway", flag.ContinueOnError)
 
-	// Flags binding directly to localgateway Config struct using the field's own value as default
-	fs.StringVar(&cfg.Interface, "interface", cfg.Interface, "Network interface to read LAN IP addresses from (e.g. eth0). If unset, node addresses are used.")
-	fs.StringVar(&cfg.NodeName, "node-name", cfg.NodeName, "Kubernetes node name for looking up LAN IP addresses when --interface is unset.")
-	fs.IntVar(&cfg.MDNSPort, "mdns-port", cfg.MDNSPort, "UDP port for mDNS publishing.")
+	options := gari.DefaultOptions()
+	options.ControllerName = DefaultControllerName
+	options.ProxyAddr = ""
+	options.ProxyHTTPSAddr = ""
+	options.ProxyHTTP3Addr = ""
+	options.LeaderElection = false
+	options.LeaderElectionID = "localgateway-controller"
+
+	config := DefaultConfig()
+	BindFlags(flagSet, &options, &config)
 
 	logConfig := textlogger.NewConfig()
-	logConfig.AddFlags(fs)
+	logConfig.AddFlags(flagSet)
 
-	if err := fs.Parse(args); err != nil {
-		return gari.Options{}, Config{}, err
+	if err := flagSet.Parse(args); err != nil {
+		return gari.Options{}, err
 	}
 
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
 
-	// Hostname and protocol validation hook
-	gariOpts.ListenerValidator = validation.ValidateListener
+	controllerNamespace, err := gari.ProvisioningControllerNamespace(options)
+	if err != nil {
+		return gari.Options{}, err
+	}
 
-	// Address provider: AddressProvider implements controller.AddressWatcher to capture
-	// the manager's client during controller registration.
-	addrProvider := address.NewAddressProvider(address.Options{
-		InterfaceName: cfg.Interface,
-		NodeName:      cfg.NodeName,
-	})
-	gariOpts.AddressProvider = addrProvider
+	options.ListenerValidator = validation.ValidateListener
 
-	return gariOpts, cfg, nil
-}
+	addressProvider, err := hostport.New(
+		nil,
+		nil,
+		controllerNamespace,
+		singlepod.WithDataplaneImage(config.DataplaneImage),
+	)
+	if err != nil {
+		return gari.Options{}, fmt.Errorf("creating host-port address provider: %w", err)
+	}
+	options.AddressProvider = addressProvider
 
-// uncachedReaderClient wraps a client.Client and overrides Get to read directly from the API server.
-// Reading through mgr.GetAPIReader() avoids triggering controller-runtime's cache informer to start
-// an unbounded cluster-wide watch on Secrets, which is forbidden by the narrowed single-Secret RBAC rule.
-type uncachedReaderClient struct {
-	// Client is the underlying controller-runtime client used for writes and non-Get operations.
-	client.Client
-
-	// reader is the uncached API reader used for direct GET operations against the API server.
-	reader client.Reader
-}
-
-// Get performs an uncached read of the object directly from the API server.
-func (c *uncachedReaderClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	return c.reader.Get(ctx, key, obj, opts...)
-}
-
-// WirePublisher connects an mDNS Publisher to GARI options and registers it as a manager Runnable.
-func WirePublisher(opts *gari.Options, pub *mdns.Publisher) {
-	opts.GatewayStatusHook = pub.StatusHook
-	opts.OnGatewaysUpdate = pub.OnGatewaysUpdate
-	opts.SetupWithManager = func(mgr ctrl.Manager, s *gari.Server) error {
-		pub.SetEnqueueGateway(s.EnqueueGateway)
-		if err := mgr.Add(pub); err != nil {
-			return fmt.Errorf("failed to register mDNS publisher with manager: %w", err)
-		}
-
+	options.SetupWithManager = func(manager ctrl.Manager, server *gari.Server) error {
 		uncachedClient := &uncachedReaderClient{
-			Client: mgr.GetClient(),
-			reader: mgr.GetAPIReader(),
+			Client: manager.GetClient(),
+			reader: manager.GetAPIReader(),
 		}
-		dnsPublisher := dnsconfig.NewPublisher(uncachedClient, dnsconfig.DefaultConfigSecretNamespace, dnsconfig.DefaultConfigSecretName, s.State())
-		if err := mgr.Add(dnsPublisher); err != nil {
+		dnsPublisher := dnsconfig.NewPublisher(uncachedClient, controllerNamespace, dnsconfig.DefaultConfigSecretName, server.State())
+		if err := manager.Add(dnsPublisher); err != nil {
 			return fmt.Errorf("failed to register dns config publisher with manager: %w", err)
 		}
 		return nil
 	}
+
+	return options, nil
+}
+
+// uncachedReaderClient wraps a client.Client and sends Get calls through an uncached
+// API reader so the DNS config publisher reads its Secret directly from the API server.
+type uncachedReaderClient struct {
+	client.Client
+	reader client.Reader
+}
+
+// Get reads the object directly from the API server without using the controller cache.
+func (c *uncachedReaderClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return c.reader.Get(ctx, key, obj, opts...)
 }
 
 func main() {
-	opts, cfg, err := BuildOptions(os.Args[1:])
+	options, err := BuildOptions(os.Args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to parse options: %v\n", err)
 		os.Exit(1)
 	}
 
 	ctx := ctrl.SetupSignalHandler()
-	setupLog := ctrl.Log.WithName("setup")
-	setupLog.Info("Starting localgateway controller (all-in-one hostNetwork)", "controllerName", opts.ControllerName, "proxyAddr", opts.ProxyAddr)
+	setupLogger := ctrl.Log.WithName("setup")
+	setupLogger.Info("Starting localgateway controller", "controllerName", options.ControllerName)
 
-	// Build mDNS publisher upfront before starting GARI
-	addrProvider, _ := opts.AddressProvider.(*address.AddressProvider)
-	pub, err := mdns.NewPublisher(mdns.PublisherOptions{
-		Interface:       cfg.Interface,
-		Port:            cfg.MDNSPort,
-		AddressProvider: addrProvider,
-	})
-	if err != nil {
-		setupLog.Error(err, "failed to start mDNS publisher")
-		os.Exit(1)
-	}
-
-	WirePublisher(&opts, pub)
-
-	if err := gari.Run(ctx, opts); err != nil {
-		setupLog.Error(err, "fatal error running localgateway")
+	if err := gari.Run(ctx, options); err != nil {
+		setupLogger.Error(err, "fatal error running localgateway")
 		os.Exit(1)
 	}
 }

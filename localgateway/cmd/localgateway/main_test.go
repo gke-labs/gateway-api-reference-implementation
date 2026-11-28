@@ -18,13 +18,16 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,349 +37,150 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/address"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/dnsconfig"
-	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
+	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/hostport"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/dataplane/push"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/spiffe"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 )
 
+func requiredInternalAPIArgs() []string {
+	return []string{
+		"--internal-api-bind-address=:8443",
+		"--internal-api-tls-cert-file=/etc/gari/svid/svid.pem",
+		"--internal-api-tls-key-file=/etc/gari/svid/svid_key.pem",
+	}
+}
+
 func TestBuildOptions(t *testing.T) {
 	t.Run("default options", func(t *testing.T) {
-		opts, cfg, err := BuildOptions([]string{})
+		t.Setenv("POD_NAMESPACE", "default")
+
+		options, err := BuildOptions(requiredInternalAPIArgs())
 		if err != nil {
 			t.Fatalf("BuildOptions failed: %v", err)
 		}
 
-		if opts.ControllerName != DefaultControllerName {
-			t.Errorf("expected ControllerName %q, got %q", DefaultControllerName, opts.ControllerName)
+		if options.ControllerName != DefaultControllerName {
+			t.Errorf("ControllerName = %q, want %q", options.ControllerName, DefaultControllerName)
 		}
-		if opts.ProxyAddr != ":80" {
-			t.Errorf("expected ProxyAddr %q, got %q", ":80", opts.ProxyAddr)
+		if options.ProxyAddr != "" {
+			t.Errorf("ProxyAddr = %q, want empty", options.ProxyAddr)
 		}
-		if opts.ProxyHTTPSAddr != "" {
-			t.Errorf("expected empty ProxyHTTPSAddr, got %q", opts.ProxyHTTPSAddr)
+		if options.ProxyHTTPSAddr != "" {
+			t.Errorf("ProxyHTTPSAddr = %q, want empty", options.ProxyHTTPSAddr)
 		}
-		if opts.ProxyHTTP3Addr != "" {
-			t.Errorf("expected empty ProxyHTTP3Addr, got %q", opts.ProxyHTTP3Addr)
+		if options.ProxyHTTP3Addr != "" {
+			t.Errorf("ProxyHTTP3Addr = %q, want empty", options.ProxyHTTP3Addr)
 		}
-		if opts.LeaderElection {
-			t.Errorf("expected LeaderElection false")
+		if options.LeaderElection {
+			t.Errorf("LeaderElection = true, want false")
 		}
-		if opts.LeaderElectionID != "localgateway-controller" {
-			t.Errorf("expected LeaderElectionID 'localgateway-controller', got %q", opts.LeaderElectionID)
+		if options.LeaderElectionID != "localgateway-controller" {
+			t.Errorf("LeaderElectionID = %q, want %q", options.LeaderElectionID, "localgateway-controller")
 		}
-		if opts.MetricsAddr != ":8999" {
-			t.Errorf("expected MetricsAddr :8999, got %q", opts.MetricsAddr)
+		if options.MetricsAddr != ":8999" {
+			t.Errorf("MetricsAddr = %q, want %q", options.MetricsAddr, ":8999")
 		}
-		if opts.HealthProbeBindAddress != ":8999" {
-			t.Errorf("expected HealthProbeBindAddress :8999, got %q", opts.HealthProbeBindAddress)
+		if options.HealthProbeBindAddress != ":8999" {
+			t.Errorf("HealthProbeBindAddress = %q, want %q", options.HealthProbeBindAddress, ":8999")
 		}
-		if cfg.Interface != "" {
-			t.Errorf("expected empty cfg.Interface, got %q", cfg.Interface)
+		if options.InternalAPIBindAddress != ":8443" {
+			t.Errorf("InternalAPIBindAddress = %q, want %q", options.InternalAPIBindAddress, ":8443")
 		}
-		if cfg.MDNSPort != 5353 {
-			t.Errorf("expected MDNSPort 5353, got %d", cfg.MDNSPort)
-		}
-
-		// Ensure listener validator and address provider are set
-		if opts.ListenerValidator == nil {
+		if options.ListenerValidator == nil {
 			t.Errorf("expected ListenerValidator to be set")
 		}
-		if opts.AddressProvider == nil {
-			t.Errorf("expected AddressProvider to be set")
+		if _, ok := options.AddressProvider.(*hostport.HostPortAddressProvider); !ok {
+			t.Errorf("AddressProvider = %T, want *hostport.HostPortAddressProvider", options.AddressProvider)
+		}
+		if options.GatewayStatusHook != nil {
+			t.Errorf("expected GatewayStatusHook to be nil")
+		}
+		if options.OnGatewaysUpdate != nil {
+			t.Errorf("expected OnGatewaysUpdate to be nil")
+		}
+		if options.SetupWithManager == nil {
+			t.Errorf("expected SetupWithManager to be set")
 		}
 	})
 
 	t.Run("custom flags", func(t *testing.T) {
-		args := []string{
+		t.Setenv("POD_NAMESPACE", "gateway-system")
+
+		args := append(requiredInternalAPIArgs(),
 			"--controller-name=example.org/custom-gw",
-			"--proxy-bind-address=:8080",
-			"--interface=eth0",
-			"--node-name=worker-node",
+			"--dataplane-image=example.org/gari-dataplane:v2",
 			"--leader-elect=true",
 			"--leader-election-id=custom-lead",
-			"--mdns-port=5354",
-		}
+			"--metrics-bind-address=:9090",
+			"--health-probe-bind-address=:9091",
+		)
 
-		opts, cfg, err := BuildOptions(args)
+		options, err := BuildOptions(args)
 		if err != nil {
 			t.Fatalf("BuildOptions failed: %v", err)
 		}
 
-		if opts.ControllerName != "example.org/custom-gw" {
-			t.Errorf("expected custom controller name, got %q", opts.ControllerName)
+		if options.ControllerName != "example.org/custom-gw" {
+			t.Errorf("ControllerName = %q, want %q", options.ControllerName, "example.org/custom-gw")
 		}
-		if opts.ProxyAddr != ":8080" {
-			t.Errorf("expected :8080, got %q", opts.ProxyAddr)
+		if !options.LeaderElection {
+			t.Errorf("LeaderElection = false, want true")
 		}
-		if cfg.Interface != "eth0" {
-			t.Errorf("expected eth0, got %q", cfg.Interface)
+		if options.LeaderElectionID != "custom-lead" {
+			t.Errorf("LeaderElectionID = %q, want %q", options.LeaderElectionID, "custom-lead")
 		}
-		if cfg.NodeName != "worker-node" {
-			t.Errorf("expected worker-node, got %q", cfg.NodeName)
+		if options.MetricsAddr != ":9090" {
+			t.Errorf("MetricsAddr = %q, want %q", options.MetricsAddr, ":9090")
 		}
-		if cfg.MDNSPort != 5354 {
-			t.Errorf("expected MDNSPort 5354, got %d", cfg.MDNSPort)
-		}
-		if !opts.LeaderElection {
-			t.Errorf("expected LeaderElection true")
-		}
-		if opts.LeaderElectionID != "custom-lead" {
-			t.Errorf("expected custom-lead, got %q", opts.LeaderElectionID)
-		}
-	})
-}
-
-// TestLocalGateway_E2E_AppLocalCompiledRoute verifies what GARI compiles from the Kubernetes objects:
-// 1. The listener for `app.local` is Accepted and Programmed.
-// 2. The HTTPRoute attaches to the Gateway listener.
-// 3. The compiled route maps `app.local` to `app-service.default.svc.cluster.local:<port>`.
-// 4. The address provider reports the node LAN IP.
-func TestLocalGateway_E2E_AppLocalCompiledRoute(t *testing.T) {
-	ctx := t.Context()
-
-	nodeIP := "192.168.1.100"
-	backendPort := int32(8080)
-	proxyPort := 80
-
-	// 1. Build localgateway options
-	opts, _, err := BuildOptions([]string{})
-	if err != nil {
-		t.Fatalf("BuildOptions failed: %v", err)
-	}
-
-	// AddressProvider reporting configured interface LAN IP
-	addrProvider := address.NewAddressProvider(address.Options{
-		InterfaceName: "eth0",
-		InterfaceAddrsFunc: func(name string) ([]net.Addr, error) {
-			return []net.Addr{
-				&net.IPNet{IP: net.ParseIP(nodeIP), Mask: net.CIDRMask(24, 32)},
-			}, nil
-		},
-	})
-	opts.AddressProvider = addrProvider
-
-	// 2. Initialize Kubernetes resources
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = gatewayv1.Install(scheme)
-
-	gc := &gatewayv1.GatewayClass{
-		ObjectMeta: metav1.ObjectMeta{Name: "localgateway"},
-		Spec: gatewayv1.GatewayClassSpec{
-			ControllerName: gatewayv1.GatewayController(DefaultControllerName),
-		},
-	}
-
-	appLocalHostname := gatewayv1.Hostname("app.local")
-	gwKey := types.NamespacedName{Namespace: "default", Name: "local-gw"}
-	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: gwKey.Namespace,
-			Name:      gwKey.Name,
-		},
-		Spec: gatewayv1.GatewaySpec{
-			GatewayClassName: "localgateway",
-			Listeners: []gatewayv1.Listener{
-				{
-					Name:     "http",
-					Port:     gatewayv1.PortNumber(proxyPort),
-					Protocol: gatewayv1.HTTPProtocolType,
-					Hostname: &appLocalHostname,
-				},
-			},
-		},
-	}
-
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "app-service",
-		},
-		Spec: corev1.ServiceSpec{
-			Ports: []corev1.ServicePort{
-				{
-					Port: backendPort,
-				},
-			},
-		},
-	}
-
-	portNum := gatewayv1.PortNumber(backendPort)
-	routeKey := types.NamespacedName{Namespace: "default", Name: "app-route"}
-	route := &gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: routeKey.Namespace,
-			Name:      routeKey.Name,
-		},
-		Spec: gatewayv1.HTTPRouteSpec{
-			CommonRouteSpec: gatewayv1.CommonRouteSpec{
-				ParentRefs: []gatewayv1.ParentReference{
-					{
-						Name: "local-gw",
-					},
-				},
-			},
-			Hostnames: []gatewayv1.Hostname{appLocalHostname},
-			Rules: []gatewayv1.HTTPRouteRule{
-				{
-					BackendRefs: []gatewayv1.HTTPBackendRef{
-						{
-							BackendRef: gatewayv1.BackendRef{
-								BackendObjectReference: gatewayv1.BackendObjectReference{
-									Name: "app-service",
-									Port: &portNum,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	st := state.NewState()
-	p := proxy.NewProxy()
-
-	st.SetControllerName(DefaultControllerName)
-	st.SetListenerValidator(opts.ListenerValidator)
-	st.SetProxy(p)
-
-	// Feed resources to state
-	st.UpsertGatewayClass(gc)
-	st.UpsertGateway(gw)
-	st.UpsertService(svc)
-	st.UpsertHTTPRoute(route)
-	st.SetSynced(true)
-	outputs := st.Recompute()
-	if outputs == nil {
-		t.Fatalf("st.Recompute returned nil outputs")
-	}
-
-	// 1. Assert the listener is Accepted and Programmed
-	t.Run("listener is Accepted and Programmed", func(t *testing.T) {
-		cg := outputs.CompiledGateways[gwKey]
-		if cg == nil {
-			t.Fatalf("expected compiled gateway for %v", gwKey)
-		}
-		if len(cg.EffectiveListeners) != 1 {
-			t.Fatalf("expected 1 effective listener, got %d", len(cg.EffectiveListeners))
-		}
-		el := cg.EffectiveListeners[0]
-		if !el.IsAccepted() {
-			t.Errorf("expected listener IsAccepted() to be true")
-		}
-		if !el.IsProgrammed() {
-			t.Errorf("expected listener IsProgrammed() to be true")
-		}
-
-		accCond := state.FindCondition(el.ListenerInfo.Conditions, string(gatewayv1.ListenerConditionAccepted))
-		if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.ListenerReasonAccepted) {
-			t.Errorf("expected Accepted=True/Accepted, got %+v", accCond)
-		}
-
-		progCond := state.FindCondition(el.ListenerInfo.Conditions, string(gatewayv1.ListenerConditionProgrammed))
-		if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
-			t.Errorf("expected Programmed=True/Programmed, got %+v", progCond)
+		if options.HealthProbeBindAddress != ":9091" {
+			t.Errorf("HealthProbeBindAddress = %q, want %q", options.HealthProbeBindAddress, ":9091")
 		}
 	})
 
-	// 2. Assert the route attaches
-	t.Run("route attaches", func(t *testing.T) {
-		cg := outputs.CompiledGateways[gwKey]
-		if cg.EffectiveListeners[0].AttachedRoutes != 1 {
-			t.Errorf("expected 1 attached route, got %d", cg.EffectiveListeners[0].AttachedRoutes)
-		}
+	t.Run("missing POD_NAMESPACE fails", func(t *testing.T) {
+		t.Setenv("POD_NAMESPACE", "")
 
-		routeStatus, ok := outputs.HTTPRouteStatuses[routeKey]
-		if !ok || len(routeStatus.Parents) != 1 {
-			t.Fatalf("expected 1 parent in route status, got %+v", routeStatus)
+		_, err := BuildOptions(requiredInternalAPIArgs())
+		if err == nil {
+			t.Fatalf("expected error when POD_NAMESPACE is empty, got nil")
 		}
-		parent := routeStatus.Parents[0]
-		accCond := state.FindCondition(parent.Conditions, string(gatewayv1.RouteConditionAccepted))
-		if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.RouteReasonAccepted) {
-			t.Errorf("expected Route Accepted=True/Accepted, got %+v", accCond)
+		if !strings.Contains(err.Error(), "POD_NAMESPACE") {
+			t.Errorf("error = %q, want mention of POD_NAMESPACE", err.Error())
 		}
 	})
 
-	// 3. Assert the compiled route maps app.local to app-service.default.svc.cluster.local:<port>
-	t.Run("compiled route maps app.local to service DNS", func(t *testing.T) {
-		if len(outputs.ProxyRoutes) != 1 {
-			t.Fatalf("expected 1 proxy route, got %d", len(outputs.ProxyRoutes))
-		}
-		pr := outputs.ProxyRoutes[0]
-		if len(pr.Hostnames) != 1 || pr.Hostnames[0].Hostname != "app.local" {
-			t.Errorf("expected proxy route hostnames ['app.local'], got %+v", pr.Hostnames)
-		}
+	t.Run("missing internal API flags fails", func(t *testing.T) {
+		t.Setenv("POD_NAMESPACE", "default")
 
-		if len(pr.Rules) != 1 || len(pr.Rules[0].Backends) != 1 {
-			t.Fatalf("expected 1 rule with 1 backend, got %+v", pr.Rules)
+		_, err := BuildOptions([]string{})
+		if err == nil {
+			t.Fatalf("expected error when internal API flags are missing, got nil")
 		}
-		backend := pr.Rules[0].Backends[0]
-		expectedHost := "app-service.default.svc.cluster.local"
-		if backend.Host != expectedHost {
-			t.Errorf("expected backend host %q, got %q", expectedHost, backend.Host)
-		}
-		if backend.Port != backendPort {
-			t.Errorf("expected backend port %d, got %d", backendPort, backend.Port)
+		if !strings.Contains(err.Error(), "--internal-api-bind-address") {
+			t.Errorf("error = %q, want mention of --internal-api-bind-address", err.Error())
 		}
 	})
 
-	// 4. Assert address provider reports node LAN IP
-	t.Run("address provider reports node LAN IP", func(t *testing.T) {
-		addrs, readiness, err := addrProvider.GatewayAddresses(ctx, gw, nil)
-		if err != nil {
-			t.Fatalf("GatewayAddresses failed: %v", err)
-		}
-		if !readiness.Ready {
-			t.Fatalf("expected address provider ready=true")
-		}
-		if len(addrs) == 0 || addrs[0].Value != nodeIP {
-			t.Fatalf("expected address provider to report node IP %s, got %+v", nodeIP, addrs)
+	t.Run("removed proxy and mdns flags rejected", func(t *testing.T) {
+		t.Setenv("POD_NAMESPACE", "default")
+
+		for _, removedFlag := range []string{
+			"--proxy-bind-address=:80",
+			"--interface=eth0",
+			"--node-name=worker-node",
+			"--mdns-port=5353",
+		} {
+			args := append(requiredInternalAPIArgs(), removedFlag)
+			if _, err := BuildOptions(args); err == nil {
+				t.Errorf("expected BuildOptions to reject removed flag %q", removedFlag)
+			}
 		}
 	})
-}
-
-// TestLocalGateway_WirePublisher verifies that WirePublisher hooks the mDNS Publisher
-// into GatewayStatusHook, OnGatewaysUpdate, and SetupWithManager.
-func TestLocalGateway_WirePublisher(t *testing.T) {
-	opts, _, err := BuildOptions([]string{})
-	if err != nil {
-		t.Fatalf("BuildOptions failed: %v", err)
-	}
-
-	rawConn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		t.Fatalf("failed to bind test socket: %v", err)
-	}
-	defer rawConn.Close()
-	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
-
-	pub, err := mdns.NewPublisher(mdns.PublisherOptions{
-		Port:        ephemeralPort,
-		IPv4Conn:    rawConn,
-		Ephemeral:   true,
-		DisableIPv6: true,
-	})
-	if err != nil {
-		t.Fatalf("NewPublisher failed: %v", err)
-	}
-	defer pub.Close()
-
-	WirePublisher(&opts, pub)
-
-	if opts.GatewayStatusHook == nil {
-		t.Errorf("expected GatewayStatusHook to be set")
-	}
-	if opts.OnGatewaysUpdate == nil {
-		t.Errorf("expected OnGatewaysUpdate to be set")
-	}
-	if opts.SetupWithManager == nil {
-		t.Errorf("expected SetupWithManager to be set")
-	}
 }
 
 type wireTestManager struct {
@@ -387,48 +191,48 @@ type wireTestManager struct {
 
 func (m *wireTestManager) GetClient() client.Client    { return m.client }
 func (m *wireTestManager) GetAPIReader() client.Reader { return m.client }
-func (m *wireTestManager) Add(r manager.Runnable) error {
-	m.runnables = append(m.runnables, r)
+func (m *wireTestManager) Add(runnable manager.Runnable) error {
+	m.runnables = append(m.runnables, runnable)
 	if m.Manager != nil {
-		return m.Manager.Add(r)
+		return m.Manager.Add(runnable)
 	}
 	return nil
 }
 
-// TestLocalGateway_WirePublisher_PublishesDNSConfig verifies that WirePublisher hooks
-// the DNS config publisher into the manager and publishes the configuration Secret.
-func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
+// TestLocalGateway_WiredControllerSetup verifies that BuildOptions wires:
+//  1. HostPortAddressProvider with its client and uncached reader via SetupWatches,
+//     provisioning a host-port Deployment (with no Service) pointing to the internal API.
+//  2. dnsconfig.Publisher on the manager, writing localgateway-dns into POD_NAMESPACE.
+//  3. Single-label .local listener validation and HTTPRoute compilation without a Published condition.
+func TestLocalGateway_WiredControllerSetup(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	opts, _, err := BuildOptions([]string{})
+	controllerNamespace := "gateway-system"
+	customDataplaneImage := "example.org/gari-dataplane:v1"
+	t.Setenv("POD_NAMESPACE", controllerNamespace)
+
+	args := append(requiredInternalAPIArgs(), "--dataplane-image="+customDataplaneImage)
+	options, err := BuildOptions(args)
 	if err != nil {
 		t.Fatalf("BuildOptions failed: %v", err)
 	}
 
-	rawConn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		t.Fatalf("failed to bind test socket: %v", err)
-	}
-	defer rawConn.Close()
-	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
-
-	mdnsPublisher, err := mdns.NewPublisher(mdns.PublisherOptions{
-		Port:        ephemeralPort,
-		IPv4Conn:    rawConn,
-		Ephemeral:   true,
-		DisableIPv6: true,
-	})
-	if err != nil {
-		t.Fatalf("NewPublisher failed: %v", err)
-	}
-	defer mdnsPublisher.Close()
-
-	WirePublisher(&opts, mdnsPublisher)
-
 	env := testenv.Start(t)
 
-	fakeClient := fake.NewClientBuilder().WithScheme(env.Scheme).Build()
+	bundleConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: controllerNamespace,
+			Name:      spiffe.BundleConfigMapName,
+		},
+		Data: map[string]string{
+			spiffe.BundleDataKey: "test-trust-bundle",
+		},
+	}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(env.Scheme).
+		WithObjects(bundleConfigMap).
+		Build()
 
 	skipNameValidation := true
 	realManager, err := ctrl.NewManager(env.Config, ctrl.Options{
@@ -447,27 +251,32 @@ func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
 		client:  fakeClient,
 	}
 
-	opts.LeaderElection = false
-	opts.DisableStatusUpdates = true
-	opts.Manager = mockManager
-	opts.Scheme = env.Scheme
-	server, err := gari.NewWithManager(mockManager, opts)
+	options.LeaderElection = false
+	options.Manager = mockManager
+	options.Scheme = env.Scheme
+	server, err := gari.NewWithManager(mockManager, options)
 	if err != nil {
 		t.Fatalf("NewWithManager failed: %v", err)
 	}
 
-	publisherErrChan := make(chan error, 1)
+	var dnsPublisher *dnsconfig.Publisher
 	for _, runnable := range mockManager.runnables {
-		if dnsPublisher, ok := runnable.(*dnsconfig.Publisher); ok {
-			go func(publisher *dnsconfig.Publisher) {
-				publisherErrChan <- publisher.Start(ctx)
-			}(dnsPublisher)
+		if candidate, ok := runnable.(*dnsconfig.Publisher); ok {
+			dnsPublisher = candidate
+			break
 		}
 	}
+	if dnsPublisher == nil {
+		t.Fatalf("expected dnsconfig.Publisher to be registered with manager")
+	}
 
+	publisherErrors := make(chan error, 1)
+	go func() {
+		publisherErrors <- dnsPublisher.Start(ctx)
+	}()
 	t.Cleanup(func() {
 		cancel()
-		if err := <-publisherErrChan; err != nil {
+		if err := <-publisherErrors; err != nil {
 			t.Errorf("dnsPublisher.Start returned unexpected error: %v", err)
 		}
 	})
@@ -478,14 +287,14 @@ func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
 			ControllerName: gatewayv1.GatewayController(DefaultControllerName),
 		},
 	}
-	server.State().UpsertGatewayClass(gatewayClass)
 
-	hostname := gatewayv1.Hostname("app.local")
-	gatewayKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	appLocalHostname := gatewayv1.Hostname("app.local")
+	gatewayKey := types.NamespacedName{Namespace: "default", Name: "local-gw"}
 	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: gatewayKey.Namespace,
 			Name:      gatewayKey.Name,
+			UID:       types.UID("local-gw-uid"),
 		},
 		Spec: gatewayv1.GatewaySpec{
 			GatewayClassName: "localgateway",
@@ -494,24 +303,154 @@ func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
 					Name:     "http",
 					Port:     80,
 					Protocol: gatewayv1.HTTPProtocolType,
-					Hostname: &hostname,
+					Hostname: &appLocalHostname,
 				},
 			},
 		},
 	}
+
+	backendPort := int32(8080)
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "app-service",
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{Port: backendPort},
+			},
+		},
+	}
+
+	routePort := gatewayv1.PortNumber(backendPort)
+	routeKey := types.NamespacedName{Namespace: "default", Name: "app-route"}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: routeKey.Namespace,
+			Name:      routeKey.Name,
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{Name: "local-gw"},
+				},
+			},
+			Hostnames: []gatewayv1.Hostname{appLocalHostname},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "app-service",
+									Port: &routePort,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	server.State().UpsertGatewayClass(gatewayClass)
 	server.State().UpsertGateway(gateway)
+	server.State().UpsertService(service)
+	server.State().UpsertHTTPRoute(route)
 	server.State().SetGatewayAddresses(gatewayKey, []gatewayv1.GatewayStatusAddress{{Value: "192.168.1.100"}})
 	server.State().SetSynced(true)
-	server.State().Recompute()
+	outputs := server.State().Recompute()
+	if outputs == nil {
+		t.Fatalf("State.Recompute returned nil outputs")
+	}
 
+	compiledGateway := outputs.CompiledGateways[gatewayKey]
+	if compiledGateway == nil {
+		t.Fatalf("expected compiled gateway for %v", gatewayKey)
+	}
+
+	// 1. Verify listener is Accepted and Programmed, with no Published condition.
+	if len(compiledGateway.EffectiveListeners) != 1 {
+		t.Fatalf("expected 1 effective listener, got %d", len(compiledGateway.EffectiveListeners))
+	}
+	effectiveListener := compiledGateway.EffectiveListeners[0]
+	if !effectiveListener.IsAccepted() || !effectiveListener.IsProgrammed() {
+		t.Errorf("expected listener Accepted and Programmed, got conditions %+v", effectiveListener.ListenerInfo.Conditions)
+	}
+	if publishedCondition := state.FindCondition(effectiveListener.ListenerInfo.Conditions, "Published"); publishedCondition != nil {
+		t.Errorf("expected no Published listener condition, got %+v", publishedCondition)
+	}
+
+	// 2. Verify HTTPRoute attaches and compiles app.local -> app-service.default.svc.cluster.local:8080.
+	if effectiveListener.AttachedRoutes != 1 {
+		t.Errorf("AttachedRoutes = %d, want 1", effectiveListener.AttachedRoutes)
+	}
+	if len(outputs.ProxyRoutes) != 1 {
+		t.Fatalf("expected 1 compiled proxy route, got %d", len(outputs.ProxyRoutes))
+	}
+	if backend := outputs.ProxyRoutes[0].Rules[0].Backends[0]; backend.Host != "app-service.default.svc.cluster.local" || backend.Port != backendPort {
+		t.Errorf("compiled backend = %s:%d, want app-service.default.svc.cluster.local:%d", backend.Host, backend.Port, backendPort)
+	}
+
+	// 3. Verify HostPortAddressProvider was wired via SetupWatches and provisions a host-port Deployment with no Service.
+	_, readiness, err := options.AddressProvider.GatewayAddresses(ctx, gateway, compiledGateway.EffectiveListeners)
+	if err != nil {
+		t.Fatalf("GatewayAddresses failed: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected readiness.Ready=false before data-plane pod is scheduled")
+	}
+
+	resourceKey := types.NamespacedName{
+		Namespace: gateway.Namespace,
+		Name:      state.ResourceNameForGateway(gateway.Name),
+	}
+	var deployment appsv1.Deployment
+	if err := fakeClient.Get(ctx, resourceKey, &deployment); err != nil {
+		t.Fatalf("expected host-port Deployment %v to be created: %v", resourceKey, err)
+	}
+	var provisionedService corev1.Service
+	if err := fakeClient.Get(ctx, resourceKey, &provisionedService); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no Service for host-port Gateway, got err=%v", err)
+	}
+
+	if len(deployment.Spec.Template.Spec.Containers) == 0 {
+		t.Fatalf("expected dataplane container in Deployment")
+	}
+	dataplaneContainer := deployment.Spec.Template.Spec.Containers[0]
+	if dataplaneContainer.Image != customDataplaneImage {
+		t.Errorf("dataplane container image = %q, want %q", dataplaneContainer.Image, customDataplaneImage)
+	}
+
+	expectedHost, err := spiffe.ServiceClusterDNSName(spiffe.ControllerServiceName, controllerNamespace)
+	if err != nil {
+		t.Fatalf("ServiceClusterDNSName failed: %v", err)
+	}
+	expectedInternalAPIArg := "--internal-api-address=" + net.JoinHostPort(expectedHost, strconv.Itoa(push.InternalAPIPort))
+	if !slices.Contains(dataplaneContainer.Args, expectedInternalAPIArg) {
+		t.Errorf("expected %q in dataplane args, got %v", expectedInternalAPIArg, dataplaneContainer.Args)
+	}
+
+	var foundHTTPPort bool
+	for _, port := range dataplaneContainer.Ports {
+		if port.HostPort == 80 && port.ContainerPort == singlepod.DataPlaneHTTPPort {
+			foundHTTPPort = true
+			break
+		}
+	}
+	if !foundHTTPPort {
+		t.Errorf("expected hostPort 80 -> containerPort %d in %+v", singlepod.DataPlaneHTTPPort, dataplaneContainer.Ports)
+	}
+
+	// 4. Verify dnsconfig.Publisher publishes localgateway-dns into controllerNamespace.
 	deadline := time.After(2 * time.Second)
 	for {
 		var secret corev1.Secret
-		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "localgateway-dns"}, &secret); err == nil {
+		if err := fakeClient.Get(ctx, types.NamespacedName{Namespace: controllerNamespace, Name: dnsconfig.DefaultConfigSecretName}, &secret); err == nil {
 			if len(secret.Data[dnsconfig.ConfigSecretDataKey]) > 0 {
-				var config dnsconfig.Config
-				if err := json.Unmarshal(secret.Data[dnsconfig.ConfigSecretDataKey], &config); err == nil {
-					if len(config.Records) == 1 && config.Records[0].Name == "app.local" {
+				var dnsConfig dnsconfig.Config
+				if err := json.Unmarshal(secret.Data[dnsconfig.ConfigSecretDataKey], &dnsConfig); err == nil {
+					if len(dnsConfig.Records) == 1 && dnsConfig.Records[0].Name == "app.local" {
 						break
 					}
 				}
@@ -519,33 +458,8 @@ func TestLocalGateway_WirePublisher_PublishesDNSConfig(t *testing.T) {
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("timeout waiting for localgateway-dns Secret through WirePublisher")
+			t.Fatalf("timeout waiting for %s/%s Secret", controllerNamespace, dnsconfig.DefaultConfigSecretName)
 		case <-time.After(10 * time.Millisecond):
 		}
-	}
-}
-
-// TestLocalGateway_MDNSPortOccupiedFailsStartup verifies that if the mDNS port is already taken,
-// starting the publisher fails clearly without touching real port 5353.
-func TestLocalGateway_MDNSPortOccupiedFailsStartup(t *testing.T) {
-	// Occupy a random ephemeral port first
-	blocker, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		t.Fatalf("failed to bind test socket: %v", err)
-	}
-	occupiedPort := blocker.LocalAddr().(*net.UDPAddr).Port
-	defer blocker.Close()
-
-	_, err = mdns.NewPublisher(mdns.PublisherOptions{
-		Port:        occupiedPort,
-		DisableIPv6: true,
-	})
-	if err == nil {
-		t.Fatalf("expected NewPublisher to fail on occupied port %d, but succeeded", occupiedPort)
-	}
-
-	expectedSub := "is already in use (host avahi-daemon must be stopped or bound elsewhere)"
-	if !strings.Contains(err.Error(), expectedSub) {
-		t.Fatalf("expected error containing %q, got: %v", expectedSub, err)
 	}
 }
